@@ -22,9 +22,21 @@ LOGGER_MIDDLEWARE_ENABLED = (
 LOGGER_MIDDLEWARE_SHOW_HEADERS = (
     os.getenv("LOGGER_MIDDLEWARE_SHOW_HEADERS", "False").lower() == "true"
 )
+LOGGER_MIDDLEWARE_SHOW_QUERY_PARAMS = (
+    os.getenv("LOGGER_MIDDLEWARE_SHOW_QUERY_PARAMS", "True").lower() == "true"
+)
+LOGGER_MIDDLEWARE_SHOW_BODY = (
+    os.getenv("LOGGER_MIDDLEWARE_SHOW_BODY", "True").lower() == "true"
+)
+LOGGER_MIDDLEWARE_SHOW_PATH_PARAMS = (
+    os.getenv("LOGGER_MIDDLEWARE_SHOW_PATH_PARAMS", "True").lower() == "true"
+)
 LOGGER_EXCEPTIONS_ENABLED = (
     os.getenv("LOGGER_EXCEPTIONS_ENABLED", "False").lower() == "true"
 )
+
+# ======= Docs variables ======= #
+DOCS_ENABLED = os.getenv("DOCS_ENABLED", "True").lower() == "true"
 
 
 # ======= Database variables ======= #
