@@ -41,6 +41,14 @@ DOCS_ENABLED = os.getenv("DOCS_ENABLED", "True").lower() == "true"
 # ======= Rate limiting variables ======= #
 RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "100/minute")
 
+# ======= Pagination variables ======= #
+# Máximo de elementos por página. Hardcap en código: 200.
+# Si PAGINATION_MAX_SIZE supera 200, se ignora y se usa 200.
+PAGINATION_MAX_SIZE: int = min(int(os.getenv("PAGINATION_MAX_SIZE", "50")), 200)
+
+# ======= Request size variables ======= #
+REQUEST_MAX_SIZE_MB: float = float(os.getenv("REQUEST_MAX_SIZE_MB", "10"))
+
 # ======= CORS variables ======= #
 _cors_origins_raw = os.getenv("CORS_ORIGINS", "*")
 CORS_ORIGINS: list[str] = [

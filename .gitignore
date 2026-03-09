@@ -69,6 +69,10 @@ dmypy.json
 # === Logs ===
 *.log
 
+# === Uploads (archivos temporales — se procesan y eliminan, no se versionar) ===
+uploads/*
+!uploads/.gitkeep
+
 # === OS Generated ===
 .DS_Store
 Thumbs.db
