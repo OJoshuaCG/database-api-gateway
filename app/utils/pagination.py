@@ -1,5 +1,4 @@
-import math
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastapi import Depends, Query
 
@@ -13,17 +12,18 @@ class PaginationParams:
     """
     Dependencia de paginación reutilizable en cualquier endpoint.
 
-    Uso en un route:
-        from app.utils.pagination import PaginationDep, paginate
+    Provee page, size y offset listos para usar en consultas SQL.
+    Para construir la respuesta paginada usar 'paginated()' de app.utils.response.
 
-        @router.get("/users")
+    Uso en un route:
+        from app.utils.pagination import PaginationDep
+        from app.utils.response import ApiResponse, paginated
+
+        @router.get("/users", response_model=ApiResponse[list[UserOut]])
         async def list_users(pagination: PaginationDep):
-            users = user_model.find_all(
-                limit=pagination.size,
-                offset=pagination.offset,
-            )
-            total = user_model.count()
-            return paginate(users, total=total, pagination=pagination)
+            users = model.find_all(limit=pagination.size, offset=pagination.offset)
+            total = model.count()
+            return paginated(users, total=total, pagination=pagination)
 
     Query params aceptados:
         ?page=1&size=20
@@ -47,47 +47,3 @@ class PaginationParams:
 
 # Alias de tipo para usar en signatures de endpoints
 PaginationDep = Annotated[PaginationParams, Depends(PaginationParams)]
-
-
-def paginate(
-    data: list[Any],
-    total: int,
-    pagination: PaginationParams,
-) -> dict:
-    """
-    Construye la respuesta paginada estándar.
-
-    Args:
-        data:       Lista de elementos de la página actual.
-        total:      Total de registros (resultado de COUNT en BD).
-        pagination: Instancia de PaginationParams obtenida via Depends.
-
-    Returns:
-        Dict con 'data' y 'pagination' meta.
-
-    Ejemplo de respuesta:
-        {
-            "data": [...],
-            "pagination": {
-                "page": 1,
-                "size": 20,
-                "total": 150,
-                "pages": 8,
-                "has_next": true,
-                "has_prev": false
-            }
-        }
-    """
-    pages = math.ceil(total / pagination.size) if total > 0 else 0
-
-    return {
-        "data": data,
-        "pagination": {
-            "page": pagination.page,
-            "size": pagination.size,
-            "total": total,
-            "pages": pages,
-            "has_next": pagination.page < pages,
-            "has_prev": pagination.page > 1,
-        },
-    }
