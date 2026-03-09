@@ -20,16 +20,20 @@ from app.exceptions import (
 )
 from app.middleware.ContextMiddleware import ContextMiddleware
 from app.middleware.LoggerMiddleware import LoggerMiddleware
+from app.middleware.RequestSizeMiddleware import RequestSizeMiddleware
 
 
-def create_versioned_app(version: str) -> FastAPI:
+def create_versioned_app(
+    version: str,
+    excluded_request_size_paths: list[str] | None = None,
+) -> FastAPI:
     """
     Factory que crea una sub-aplicación FastAPI completamente configurada
     para una versión específica de la API.
 
     Cada versión tiene:
     - Su propia documentación en /docs y /redoc
-    - Todos los middlewares (CORS, Context, Logger, RateLimit)
+    - Todos los middlewares (CORS, Context, Logger, RateLimit, RequestSize)
     - Todos los exception handlers
 
     Uso en main.py:
@@ -37,8 +41,17 @@ def create_versioned_app(version: str) -> FastAPI:
         v1_app.include_router(v1_router)
         app.mount("/api/v1", v1_app)
 
+        # Con rutas excluidas del validador de tamaño:
+        v1_app = create_versioned_app(
+            "v1",
+            excluded_request_size_paths=["/special-upload"],
+        )
+
     Args:
-        version: Etiqueta de versión (ej: "v1", "v2")
+        version:                      Etiqueta de versión (ej: "v1", "v2")
+        excluded_request_size_paths:  Rutas exactas que omiten el middleware
+                                      de validación de tamaño de request.
+                                      Se define a nivel de código.
     """
     versioned = FastAPI(
         title=f"{APP_NAME} {version.upper()}",
@@ -59,6 +72,10 @@ def create_versioned_app(version: str) -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+    versioned.add_middleware(
+        RequestSizeMiddleware,
+        excluded_paths=excluded_request_size_paths or [],
     )
 
     # === Rate limiter
