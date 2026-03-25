@@ -37,6 +37,9 @@ LOGGER_EXCEPTIONS_ENABLED = (
 
 # ======= Docs variables ======= #
 DOCS_ENABLED = os.getenv("DOCS_ENABLED", "True").lower() == "true"
+DOCS_PASSWORD_ENABLED = os.getenv("DOCS_PASSWORD_ENABLED", "False").lower() == "true"
+DOCS_USER = os.getenv("DOCS_USER", "admin")
+DOCS_PASSWORD = os.getenv("DOCS_PASSWORD", "")
 
 # ======= Rate limiting variables ======= #
 RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "100/minute")
