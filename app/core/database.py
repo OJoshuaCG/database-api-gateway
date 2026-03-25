@@ -8,7 +8,56 @@ from app.exceptions.AppHttpException import AppHttpException
 from app.utils import dict_utils
 
 
+def _get_engine_kwargs(engine_prefix: str) -> dict:
+    """
+    Retorna kwargs para create_engine según el motor de base de datos.
+
+    Motores soportados:
+      - mysql / mariadb  → charset utf8mb4, init_command
+      - postgresql       → connect_timeout
+      - sqlite           → check_same_thread=False
+    """
+    base = {
+        "pool_size": 10,
+        "max_overflow": 20,
+        "pool_recycle": 1800,   # recicla conexiones cada 30 min
+        "pool_pre_ping": True,  # verifica la conexión antes de usarla (evita stale connections)
+    }
+
+    if engine_prefix in ("mysql", "mariadb"):
+        base["connect_args"] = {
+            "charset": "utf8mb4",
+            "init_command": "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+        }
+    elif engine_prefix == "postgresql":
+        base["connect_args"] = {"connect_timeout": 10}
+    elif engine_prefix == "sqlite":
+        base["connect_args"] = {"check_same_thread": False}
+
+    return base
+
+
 class Database:
+    """
+    Singleton de conexión a base de datos.
+
+    El engine y el pool de conexiones se crean UNA sola vez y se comparten
+    entre todas las instancias durante el ciclo de vida de la aplicación.
+    Esto evita la apertura de múltiples conexiones por request y el
+    acumulamiento de conexiones en estado sleep en el servidor de base de datos.
+
+    Uso:
+        db = Database()   # siempre retorna la misma instancia
+    """
+
+    _instance: "Database | None" = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
     def __init__(
         self,
         db_name: str = DB_NAME,
@@ -18,6 +67,9 @@ class Database:
         db_port: int = DB_PORT,
         db_engine: str = DB_ENGINE,
     ):
+        if self._initialized:
+            return
+
         self.__db_name: str = db_name
         self.__db_user: str = db_user
         self.__db_pass: str = db_pass
@@ -25,21 +77,18 @@ class Database:
         self.__db_port: str = db_port
         self.__db_engine: str = db_engine
 
-        # DB_URL = f"mysql+pymysql://{self.__db_name}:{self.__db_pass}@{self.__db_host}:{self.__db_port}/{self.__db_name}"
-        DB_URL = f"{self.__db_engine}://{self.__db_user}:{self.__db_pass}@{self.__db_host}:{self.__db_port}/{self.__db_name}"
+        engine_prefix = db_engine.split("+")[0].lower()
 
-        self.engine = create_engine(
-            DB_URL,
-            pool_size=10,
-            max_overflow=20,
-            pool_recycle=180,
-            pool_pre_ping=True,
-            connect_args={
-                "charset": "utf8mb4",
-                "init_command": "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
-            },
-        )
-        self.SessionLocal = sessionmaker(bind=self.engine)
+        if engine_prefix == "sqlite":
+            DB_URL = f"{db_engine}:///{db_name}"
+        else:
+            DB_URL = f"{db_engine}://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
+
+        engine_kwargs = _get_engine_kwargs(engine_prefix)
+
+        self.engine = create_engine(DB_URL, **engine_kwargs)
+        self.SessionLocal = sessionmaker(bind=self.engine, autocommit=False, autoflush=False)
+        self._initialized = True
 
     @contextmanager
     def get_session(self):
@@ -48,8 +97,6 @@ class Database:
             yield session
         finally:
             session.close()
-            self.SessionLocal.close_all()
-            self.engine.dispose()
 
     def get_declarative_base_session(self):
         """
@@ -83,8 +130,8 @@ class Database:
             try:
                 _query = text(query)
                 result = session.execute(_query, params)
-                # if commit:
-                session.commit()  # Commit the transaction
+                session.commit()
+
                 if fetchone:
                     row = result.fetchone()
                     return dict(row._mapping) if row else None
@@ -92,12 +139,13 @@ class Database:
                     return [dict(row._mapping) for row in result.fetchall()]
 
                 if hasattr(result, "lastrowid") and result.lastrowid:
-                    last_inserted_id = result.lastrowid
-                    return last_inserted_id
+                    return result.lastrowid
                 return result.rowcount
+
+            except AppHttpException:
+                raise
             except Exception as e:
-                session.rollback()  # Rollback the transaction in case of an error
-                session.close()
+                session.rollback()
                 context = {
                     "error_type": type(e).__name__,
                     "query": query,
@@ -112,7 +160,7 @@ class Database:
                     context["params"] = dict_utils._sanitize_dict(e.params)
 
                 raise AppHttpException(
-                    message="Ocurrio un error inesperado en el servidorB",
+                    message="Ocurrio un error inesperado en el servidor",
                     status_code=500,
                     context=context,
                 )
@@ -125,55 +173,44 @@ class Database:
                     cursor.callproc(procedure_name, params)
                     results = []
 
-                    # Procesar el primer result set
-                    if cursor.description:  # Si tiene columnas
+                    if cursor.description:
                         rows = cursor.fetchall()
                         columns = [desc[0] for desc in cursor.description]
                         results.append(
                             [dict(zip(columns, row, strict=False)) for row in rows]
                         )
 
-                    # Procesar result sets adicionales
                     while cursor.nextset():
-                        if cursor.description:  # Si tiene columnas
+                        if cursor.description:
                             rows = cursor.fetchall()
                             columns = [desc[0] for desc in cursor.description]
                             results.append(
                                 [dict(zip(columns, row, strict=False)) for row in rows]
                             )
 
-                    conn.commit()
-                    cursor.close()
-
                     if not results:
-                        results = False
-                    elif len(results) == 1:
-                        results = results[0]
+                        return False
+                    return results[0] if len(results) == 1 else results
 
-                    return results
                 finally:
                     cursor.close()
-                    self.SessionLocal.close_all()
-                    self.engine.dispose()
 
+        except AppHttpException:
+            raise
         except Exception as e:
-            # conn.rollback()
-            # conn.close()
-            self.SessionLocal.close_all()
-            self.engine.dispose()
+            context = {"error_type": type(e).__name__}
 
-            context = {
-                "error_type": type(e).__name__,
-            }
-            context["error_code"] = str(e.args[0])
-            context["message"] = str(e.args[1])
+            if e.args:
+                context["error_code"] = str(e.args[0])
+            if len(e.args) > 1:
+                context["message"] = str(e.args[1])
 
             if procedure_name:
                 context["sp"] = procedure_name
             if params:
                 context["params"] = dict_utils._sanitize_dict(params)
 
-            if e.args[0] == 1644:  # Error customizado desde MariaDB, signal 45000
+            if e.args and e.args[0] == 1644:
                 raise AppHttpException(
                     f"Ocurrio un error inesperado en el servidor: {e.args[1]}",
                     status_code=500,
@@ -181,13 +218,10 @@ class Database:
                 )
 
             raise AppHttpException(
-                message="Ocurrio un error inesperado en el servidorB",
+                message="Ocurrio un error inesperado en el servidor",
                 status_code=500,
                 context=context,
             )
-
-        finally:
-            conn.close()
 
     def get_host(self):
         return self.__db_host
