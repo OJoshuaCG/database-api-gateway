@@ -70,3 +70,15 @@ DB_PASS = os.getenv("DB_PASS", "password")
 DB_NAME = os.getenv("DB_NAME", "database")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_ENGINE = os.getenv("DB_ENGINE", "sqlite")
+
+# ======= Startup validation ======= #
+if not SECRET_KEY:
+    if APP_ENV == "production":
+        raise ValueError(
+            "SECRET_KEY no está definido. "
+            "Establece la variable de entorno SECRET_KEY antes de iniciar en producción."
+        )
+    import logging as _logging
+    _logging.warning(
+        "SECRET_KEY no está definido. Define SECRET_KEY en tu .env para evitar este aviso."
+    )
