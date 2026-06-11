@@ -12,10 +12,12 @@ from app.core.environments import (
     LOGGER_MIDDLEWARE_SHOW_QUERY_PARAMS,
 )
 from app.core.logger import get_logger
+from app.utils.dict_utils import _sanitize_dict
 
 logger = get_logger()
 
-_SENSITIVE_PATHS = {"/user/login"}
+# Rutas cuyo body se oculta por completo (son íntegramente credenciales).
+_SENSITIVE_PATHS = {"/api/v1/auth/login"}
 
 
 class LoggerMiddleware(BaseHTTPMiddleware):
@@ -55,9 +57,12 @@ class LoggerMiddleware(BaseHTTPMiddleware):
             f"Request: {method} {display_path}",
         ]
         if LOGGER_MIDDLEWARE_SHOW_BODY:
-            request_parts.append(
-                f"Body: {'<cannot show>' if path in _SENSITIVE_PATHS else body}"
-            )
+            if path in _SENSITIVE_PATHS:
+                safe_body = "<cannot show>"
+            else:
+                # Enmascara campos sensibles (password, root_password, token, ...)
+                safe_body = _sanitize_dict(body) if isinstance(body, dict) else body
+            request_parts.append(f"Body: {safe_body}")
         if LOGGER_MIDDLEWARE_SHOW_QUERY_PARAMS:
             request_parts.append(
                 f"Query: {query_string if query_string else '<no parameters>'}"
