@@ -7,8 +7,10 @@ from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 
 from app.core.environments import (
+    APP_ENV,
     APP_NAME,
     CORS_ORIGINS,
     DOCS_ENABLED,
@@ -16,6 +18,8 @@ from app.core.environments import (
     DOCS_PASSWORD_ENABLED,
     DOCS_USER,
     LOGGER_MIDDLEWARE_ENABLED,
+    SESSION_MAX_AGE,
+    SESSION_SECRET,
 )
 from app.core.limiter import limiter
 from app.exceptions import (
@@ -123,6 +127,16 @@ def create_versioned_app(
     versioned.add_middleware(
         RequestSizeMiddleware,
         excluded_paths=excluded_request_size_paths or [],
+    )
+    # SessionMiddleware: cookie de sesión firmada (httpOnly) para la autenticación
+    # del admin. Se añade al final para quedar como capa más externa.
+    versioned.add_middleware(
+        SessionMiddleware,
+        secret_key=SESSION_SECRET,
+        session_cookie="gw_session",
+        max_age=SESSION_MAX_AGE,
+        same_site="lax",
+        https_only=(APP_ENV == "production"),
     )
 
     # === Rate limiter

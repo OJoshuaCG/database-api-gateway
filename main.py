@@ -1,8 +1,22 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
+from app.core import remote_engine
+from app.core.auth import bootstrap_admin
 from app.core.versioned_app import create_versioned_app
 from app.routes.health import router as health_router
 from app.routes.v1.routes import router as v1_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Arranque: sembrar el administrador único si no existe.
+    bootstrap_admin()
+    yield
+    # Apagado: liberar los engines de conexión a servidores destino.
+    remote_engine.dispose_all()
+
 
 # === Main app
 # Solo gestiona rutas no versionadas (/health).
@@ -12,6 +26,7 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
+    lifespan=lifespan,
 )
 
 app.include_router(health_router)
