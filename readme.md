@@ -1,404 +1,258 @@
-# FastAPI Template
+# Database API Gateway
 
-> **Plantilla profesional de FastAPI lista para producción, con arquitectura MVC, versionado de API, seguridad, utilidades y mejores prácticas integradas.**
+> **Gateway de administración de servidores de bases de datos.** Permite registrar
+> múltiples servidores remotos (MySQL, MariaDB, PostgreSQL) y, mediante una credencial
+> *pseudo-root*, gestionar usuarios del motor, bases de datos y permisos, además de
+> inspeccionar la **estructura** de las tablas (nunca los datos).
 
-## Características
-
-| Categoría | Funcionalidad |
-|---|---|
-| **Arquitectura** | Patrón MVC (Routes → Controllers → Models), API versionada por sub-apps |
-| **Respuestas** | Envelope estándar (`ApiResponse[T]`) con helpers `success()`, `paginated()`, `empty()` |
-| **Middlewares** | Context, Logger (configurable), CORS, Rate Limiting, Request Size |
-| **Seguridad** | JWT (`JWTService`), cifrado Fernet (`CryptoService`), gestión de secretos |
-| **Base de Datos** | SQLAlchemy 2.0, SQL directo, Stored Procedures, pool de conexiones |
-| **Migraciones** | Alembic configurado y listo para usar |
-| **Errores** | Handlers globales para `AppHttpException`, `RequestValidationError`, `RateLimitExceeded` |
-| **Paginación** | `PaginationDep` inyectable con `Depends()`, respuesta estandarizada |
-| **File Upload** | `save_upload()` / `save_uploads()` con validación de tipo y tamaño |
-| **Logging** | Logger centralizado con trazabilidad por Request ID |
-| **Configuración** | Variables de entorno centralizadas en `environments.py` |
+Construido sobre una plantilla profesional de FastAPI (arquitectura MVC, versionado de
+API, middlewares, manejo de errores y utilidades). El estado actual corresponde a la
+**Iteración 1** del [roadmap](docs/plans/README.md).
 
 ---
 
-## Inicio Rápido
+## ¿Qué hace?
 
-### 1. Clonar y preparar
+El sistema separa dos planos:
 
-```bash
-git clone <tu-repositorio>
-cd fastapi-template
+- **Plano de control (este gateway):** FastAPI + su propia base de datos de metadatos
+  (ORM + Alembic). Guarda el *inventario*: servidores, y a futuro usuarios, bases de
+  datos y modelos. **No** guarda datos de las BDs gestionadas.
+- **Plano gestionado (servidores destino):** los servidores reales MySQL/MariaDB/
+  PostgreSQL. El gateway se conecta con la credencial pseudo-root para administrar
+  usuarios, bases de datos, permisos e introspeccionar estructura.
 
-# Si inicias un proyecto nuevo desde esta plantilla:
-rm -rf .git && git init
+```
+                 ┌──────────────────────────────┐
+   Admin  ──────▶│   Database API Gateway        │
+ (sesión)        │   FastAPI + BD de metadatos   │
+                 └───────────────┬───────────────┘
+                                 │ pseudo-root (cifrada)
+              ┌──────────────────┼──────────────────┐
+              ▼                  ▼                  ▼
+        MySQL/MariaDB       PostgreSQL          MySQL ...
+        (servidor 1)        (servidor 2)        (servidor N)
 ```
 
-### 2. Instalar uv (gestor de paquetes)
+## Capacidades (Iteración 1)
+
+| Categoría | Funcionalidad |
+|---|---|
+| **Servidores** | Registrar/editar/eliminar servidores destino; probar conexión (`test-connection`) |
+| **Introspección** | Listar bases de datos y usuarios reales; listar tablas y ver el **schema** de una tabla (columnas, PK, FK, índices) — sin leer datos |
+| **Multi-motor** | Adaptadores para MySQL, MariaDB y PostgreSQL tras una interfaz común |
+| **Seguridad SQL** | Validación + quoting de identificadores (anti-inyección); valores parametrizados o escapados |
+| **Credenciales** | Cifrado en reposo con Fernet derivado de `SECRET_KEY` |
+| **Autenticación** | Sesión httpOnly firmada + administrador único, detrás de `get_current_admin` |
+| **Base (template)** | `ApiResponse[T]`, `AppHttpException`, middlewares, rate limiting, paginación, logging con Request ID |
+
+> Lo que se construye después (usuarios/BDs/modelos, migraciones, aprovisionamiento,
+> SSH, clonado) está documentado en [`docs/plans/`](docs/plans/README.md).
+
+---
+
+## Inicio rápido
+
+### 1. Instalar dependencias
 
 ```bash
-# Linux / macOS
+# uv (gestor de paquetes) — si no lo tienes:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Windows (PowerShell)
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-### 3. Instalar dependencias
-
-```bash
 uv sync
 ```
 
-### 4. Configurar entorno
+### 2. Configurar entorno
 
 ```bash
 cp .env.example .env
 ```
 
-Editar `.env` con tus valores (ver [Variables de Entorno](#variables-de-entorno)).
+Edita `.env`. Variables mínimas para arrancar:
 
-### 5. Ejecutar
+```env
+APP_ENV=development
+SECRET_KEY=...            # python -c "import secrets; print(secrets.token_hex(32))"
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=cambia-esto   # obligatorio en producción
 
-```bash
-# Desarrollo con hot-reload
-uv run uvicorn main:app --reload
-
-# Puerto específico
-uv run uvicorn main:app --reload --host 0.0.0.0 --port 8080
+# BD de METADATOS del gateway (usar MySQL/MariaDB en producción)
+DB_ENGINE=mysql+pymysql
+DB_HOST=localhost
+DB_USER=gateway
+DB_PASS=...
+DB_NAME=gateway
+DB_PORT=3306
 ```
 
-### 6. Verificar
+### 3. Migrar y arrancar
+
+```bash
+uv run alembic upgrade head          # crea las tablas del inventario + admin
+uv run uvicorn main:app --reload
+```
+
+Al arrancar se **siembra el administrador** desde `ADMIN_USERNAME`/`ADMIN_PASSWORD`
+si no existe.
+
+### 4. Usar la API
+
+```bash
+# Login (guarda la cookie de sesión)
+curl -c cookies.txt -X POST http://localhost:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"cambia-esto"}'
+
+# Registrar un servidor destino
+curl -b cookies.txt -X POST http://localhost:8000/api/v1/servers \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"mysql-prod","host":"10.0.0.5","port":3306,"engine":"mysql","root_username":"root","root_password":"***"}'
+
+# Probar conexión e introspeccionar
+curl -b cookies.txt -X POST http://localhost:8000/api/v1/servers/1/test-connection
+curl -b cookies.txt http://localhost:8000/api/v1/servers/1/databases
+```
 
 | URL | Descripción |
 |---|---|
-| `http://localhost:8000/health` | Health check |
+| `GET /health` | Health check (público) |
 | `http://localhost:8000/api/v1/docs` | Swagger UI v1 |
 | `http://localhost:8000/api/v1/redoc` | ReDoc v1 |
-| `http://localhost:8000/api/v1/test/ping` | Endpoint de prueba |
 
 ---
 
-## Variables de Entorno
+## API v1
 
-Todas las variables se documentan en `.env.example`. A continuación el resumen completo:
+Todos los endpoints (salvo `login`) requieren sesión de administrador.
+
+| Método | Ruta | Descripción | Toca el motor |
+|---|---|---|---|
+| POST | `/api/v1/auth/login` | Inicia sesión (rate-limit 5/min) | — |
+| POST | `/api/v1/auth/logout` | Cierra sesión | — |
+| GET | `/api/v1/auth/me` | Admin actual | — |
+| GET | `/api/v1/servers` | Lista servidores (paginado) | no |
+| POST | `/api/v1/servers` | Registra un servidor | no |
+| GET | `/api/v1/servers/{id}` | Detalle (sin credencial) | no |
+| PATCH | `/api/v1/servers/{id}` | Actualiza (re-cifra password si se envía) | no |
+| DELETE | `/api/v1/servers/{id}` | Elimina del inventario | no |
+| POST | `/api/v1/servers/{id}/test-connection` | Prueba la conexión | **sí** |
+| GET | `/api/v1/servers/{id}/databases` | Lista BDs reales | **sí** |
+| GET | `/api/v1/servers/{id}/users` | Lista usuarios del motor | **sí** |
+| GET | `/api/v1/servers/{id}/databases/{db}/tables` | Lista tablas | **sí** |
+| GET | `/api/v1/servers/{id}/databases/{db}/tables/{tabla}/schema` | Estructura de la tabla | **sí** |
+
+Las respuestas usan el envelope estándar `ApiResponse[T]`; los errores devuelven
+`{"detail": {...}}`. Ver [Formato de Respuestas](docs/features/response-format.md).
+
+---
+
+## Variables de entorno
+
+Resumen de las **propias del gateway** (las del template están en `.env.example`):
 
 ```env
-# ======= Application =======
-APP_ENV=development          # development | production
-APP_NAME="FastAPI Project"
-SECRET_KEY=tu_clave_secreta  # python -c "import secrets; print(secrets.token_hex(32))"
+# ======= Crypto =======
+CRYPTO_KEY_SALT=db-gateway-static-salt   # sal NO secreta para derivar la clave Fernet
 
-# ======= Logger =======
-LOGGER_LEVEL=INFO
-LOGGER_MIDDLEWARE_ENABLED=True
-LOGGER_MIDDLEWARE_SHOW_HEADERS=False
-LOGGER_MIDDLEWARE_SHOW_QUERY_PARAMS=True
-LOGGER_MIDDLEWARE_SHOW_BODY=True
-LOGGER_MIDDLEWARE_SHOW_PATH_PARAMS=True   # False = reemplaza URL con template de ruta
-LOGGER_EXCEPTIONS_ENABLED=False
+# ======= Conexión a servidores destino =======
+REMOTE_CONNECT_TIMEOUT=10                # segundos para abrir conexión TCP
+REMOTE_STATEMENT_TIMEOUT_MS=15000        # ms de ejecución de una sentencia remota
 
-# ======= Docs =======
-DOCS_ENABLED=True            # False = desactiva /docs, /redoc y /openapi.json
-
-# ======= Rate Limiting =======
-RATE_LIMIT_DEFAULT=100/minute  # second | minute | hour | day
-
-# ======= Pagination =======
-PAGINATION_MAX_SIZE=50       # Máximo items/página. Hard cap en código: 200.
-
-# ======= Request Size =======
-REQUEST_MAX_SIZE_MB=10       # Aplica a POST, PUT, PATCH
-
-# ======= CORS =======
-CORS_ORIGINS=*               # Separados por coma. Nota: * + credentials no funciona en browsers.
-
-# ======= Database =======
-DB_HOST=localhost
-DB_USER=username
-DB_PASS=password
-DB_NAME=database
-DB_PORT=3306
-DB_ENGINE=sqlite             # sqlite | mysql+pymysql | postgresql+psycopg2
+# ======= Admin / Sesión =======
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=                          # OBLIGATORIO en producción
+SESSION_SECRET=                          # si vacío, se deriva de SECRET_KEY
+SESSION_MAX_AGE=28800                    # duración de la sesión (s); 8h
 ```
+
+`SECRET_KEY` es obligatoria en producción y se usa también para derivar la clave de
+cifrado de credenciales.
 
 ---
 
-## Estructura del Proyecto
+## Estructura del proyecto
+
+Sobre la base del template, la Iteración 1 añade (✚):
 
 ```
-fastapi-template/
+database-api-gateway/
 ├── app/
 │   ├── core/
-│   │   ├── context.py          # ContextVars de request (Request ID, IP, método, etc.)
-│   │   ├── database.py         # Clase Database (SQL directo, ORM, Stored Procedures)
-│   │   ├── environments.py     # Todas las variables de entorno centralizadas
-│   │   ├── limiter.py          # Singleton de slowapi Limiter (rate limiting)
-│   │   ├── logger.py           # get_logger() centralizado
-│   │   └── versioned_app.py    # Factory create_versioned_app() para sub-apps versionadas
-│   ├── controllers/
-│   │   └── user_controller.py  # Ejemplo de controller (CRUD de usuarios)
-│   ├── exceptions/
-│   │   ├── AppHttpException.py     # Excepción HTTP personalizada con tracking
-│   │   ├── HandlerExceptions.py    # Handlers globales (App, Validation, RateLimit, Generic)
-│   │   └── __init__.py
-│   ├── middleware/
-│   │   ├── ContextMiddleware.py    # Genera Request ID, establece ContextVars
-│   │   ├── LoggerMiddleware.py     # Logging de requests/responses
-│   │   └── RequestSizeMiddleware.py # Valida tamaño máximo de body
+│   │   ├── crypto.py          ✚ Cifrado Fernet de credenciales
+│   │   ├── remote_engine.py   ✚ Conexión dinámica a servidores destino
+│   │   ├── auth.py            ✚ Sesión + get_current_admin + bootstrap admin
+│   │   ├── database.py          Conexión a la BD de metadatos del gateway (singleton)
+│   │   ├── environments.py      Variables de entorno centralizadas
+│   │   ├── limiter.py / logger.py / context.py / versioned_app.py
+│   ├── services/
+│   │   └── db_admin/          ✚ Administración de servidores destino
+│   │       ├── base_adapter.py   ServerAdapter (ABC) + introspección
+│   │       ├── mysql_adapter.py  MySQLAdapter / MariaDBAdapter
+│   │       ├── postgres_adapter.py PostgresAdapter
+│   │       ├── identifiers.py     Validación/quoting anti-inyección
+│   │       ├── dtos.py / factory.py
 │   ├── models/
-│   │   ├── base.py             # DeclarativeBase, TimestampMixin (SQLAlchemy 2.0)
-│   │   ├── user.py             # Modelo ORM de ejemplo (para Alembic)
-│   │   ├── user_model.py       # Modelo de datos SQL directo (para MVC)
-│   │   └── __init__.py         # CRÍTICO: exportar modelos para Alembic
-│   ├── routes/
-│   │   ├── health.py           # GET /health (sin versión, sin rate limiting)
-│   │   └── v1/
-│   │       ├── routes.py       # Agregador de rutas v1
-│   │       └── test.py         # Endpoints de ejemplo y testing
-│   ├── security/
-│   │   ├── crypto.py           # CryptoService (Fernet — cifrado reversible)
-│   │   ├── jwt_service.py      # JWTService (crear y verificar tokens)
-│   │   └── secrets.py          # SecretManager (generar y derivar claves)
+│   │   ├── server.py          ✚ Modelo ORM Server
+│   │   ├── enums.py           ✚ EngineType, ServerStatus
+│   │   ├── base.py / user.py / user_model.py / __init__.py
+│   ├── controllers/
+│   │   ├── server_controller.py ✚ / auth_controller.py ✚
+│   ├── routes/v1/
+│   │   ├── servers.py         ✚ / auth.py ✚ / routes.py / test.py
+│   ├── schemas/               ✚ Schemas Pydantic (server, auth)
 │   └── utils/
-│       ├── dict_utils.py       # _sanitize_dict() (uso interno)
-│       ├── file_upload.py      # save_upload() / save_uploads()
-│       ├── pagination.py       # PaginationParams, PaginationDep
-│       └── response.py         # ApiResponse[T], success(), paginated(), empty()
-├── uploads/                    # Archivos temporales (ignorado por git, excepto .gitkeep)
-├── alembic/                    # Migraciones de base de datos
-├── docs/                       # Documentación detallada
-├── main.py                     # Punto de entrada: monta sub-apps y /health
-├── pyproject.toml
-└── .env.example
+│       ├── security.py        ✚ Hashing Argon2
+│       ├── dict_utils.py        Sanitización de secretos (logs/errores)
+│       └── response.py / pagination.py / file_upload.py
+├── tests/                     ✚ Suite pytest (85 tests)
+├── docs/
+│   ├── features/                Documentación por feature
+│   └── plans/                 ✚ Roadmap (Iteraciones 2+)
+├── alembic/                     Migraciones
+├── main.py                      Punto de entrada (lifespan: bootstrap admin)
+└── pyproject.toml
 ```
 
 ---
 
-## Arquitectura: API Versionada
-
-Cada versión de la API es una **sub-aplicación FastAPI independiente** con sus propios middlewares, handlers y documentación.
-
-```
-main.py
-├── GET /health              ← sin versión, sin rate limiting
-└── /api/v1  ←──────────────── v1_app (create_versioned_app("v1"))
-    ├── GET  /docs           ← Swagger de v1
-    ├── GET  /redoc          ← ReDoc de v1
-    └── /test/...            ← rutas de negocio v1
-```
-
-### Agregar v2
-
-```python
-# main.py
-from app.routes.v2.routes import router as v2_router
-
-v2_app = create_versioned_app("v2")
-v2_app.include_router(v2_router)
-app.mount("/api/v2", v2_app)
-```
-
-Crear `app/routes/v2/routes.py` con los nuevos routers. Las rutas v1 no se afectan.
-
----
-
-## Patrones de Uso
-
-### Respuestas Estándar
-
-```python
-from app.utils.response import ApiResponse, success, paginated, empty
-
-# Respuesta simple
-@router.get("/{id}", response_model=ApiResponse[UserOut])
-async def get_user(id: int):
-    user = controller.get_user(id)
-    return success(data=user)
-
-# Con mensaje
-    return success(data=user, message="Usuario creado exitosamente")
-
-# Paginada
-@router.get("/", response_model=ApiResponse[list[UserOut]])
-async def list_users(pagination: PaginationDep):
-    users = model.find_all(limit=pagination.size, offset=pagination.offset)
-    total = model.count()
-    return paginated(users, total=total, pagination=pagination)
-
-# Sin contenido (DELETE)
-@router.delete("/{id}", response_model=ApiResponse[None])
-async def delete_user(id: int):
-    controller.delete_user(id)
-    return empty("Usuario eliminado exitosamente")
-```
-
-**Formato de respuesta exitosa:**
-```json
-{"data": {"id": 1, "name": "John"}}
-{"data": [...], "pagination": {"page": 1, "size": 20, "total": 150, "pages": 8, "has_next": true, "has_prev": false}}
-{"message": "Usuario eliminado exitosamente"}
-```
-
-**Formato de error** (independiente del envelope):
-```json
-{"detail": {"msg": "Usuario no encontrado", "type": "AppHttpException"}}
-{"detail": {"msg": "Error de validación en: email, age", "type": "RequestValidationError"}}
-{"detail": {"msg": "Demasiadas solicitudes. Límite: 100 per 1 minute", "type": "RateLimitExceeded"}}
-```
-
-### Paginación
-
-```python
-from app.utils.pagination import PaginationDep
-from app.utils.response import ApiResponse, paginated
-
-@router.get("/users", response_model=ApiResponse[list[dict]])
-async def list_users(pagination: PaginationDep):
-    # pagination.page   → número de página (desde 1)
-    # pagination.size   → items por página
-    # pagination.offset → listo para SQL: LIMIT size OFFSET offset
-    users = model.find_all(limit=pagination.size, offset=pagination.offset)
-    total = model.count()
-    return paginated(users, total=total, pagination=pagination)
-```
-
-Query params: `GET /users?page=2&size=10`
-
-### File Upload
-
-```python
-from fastapi import File, UploadFile
-from pathlib import Path
-from app.utils.file_upload import save_upload, save_uploads
-from app.utils.response import ApiResponse, success
-
-@router.post("/avatar", response_model=ApiResponse[dict])
-async def upload_avatar(file: UploadFile = File(...)):
-    file_info = await save_upload(
-        file,
-        allowed_types=["image/jpeg", "image/png", "image/webp"],
-        max_size_mb=2,
-    )
-    file_path = Path(file_info["path"])
-    try:
-        content = file_path.read_bytes()
-        # Subir a S3, procesar imagen, etc.
-        return success(data={"url": "..."}, message="Avatar actualizado")
-    finally:
-        if file_path.exists():
-            file_path.unlink()  # Siempre eliminar el temporal
-```
-
-### Excepciones
-
-```python
-from app.exceptions import AppHttpException
-
-raise AppHttpException(
-    message="Usuario no encontrado",
-    status_code=404,
-    context={"user_id": user_id}  # Solo visible en APP_ENV=development
-)
-```
-
-### Rate Limiting por Ruta
-
-```python
-from fastapi import Request
-from app.core.limiter import limiter
-
-@router.post("/login")
-@limiter.limit("5/minute")          # Límite específico para este endpoint
-async def login(request: Request):  # request es requerido por slowapi
-    ...
-```
-
-### Context (Request ID, IP, etc.)
-
-```python
-from app.core.context import current_http_identifier, current_request_ip
-
-request_id = current_http_identifier.get()
-client_ip  = current_request_ip.get()
-```
-
----
-
-## Flujo de una Request
-
-```
-Cliente
-  ↓
-RequestSizeMiddleware  → rechaza si body > REQUEST_MAX_SIZE_MB (POST/PUT/PATCH)
-  ↓
-CORSMiddleware         → agrega headers CORS, maneja preflight OPTIONS
-  ↓
-ContextMiddleware      → genera Request ID, establece ContextVars
-  ↓
-LoggerMiddleware       → inicia timer, loguea request
-  ↓
-SlowAPIMiddleware      → verifica rate limit por IP
-  ↓
-ExceptionMiddleware    → captura excepciones → handlers → JSONResponse
-  ↓
-Endpoint               → Controller → Model → Database
-  ↓
-(respuesta sube por el mismo stack en orden inverso)
-  ↓
-LoggerMiddleware       → loguea response (status, duración)
-  ↓
-ContextMiddleware      → inyecta X-Request-ID en headers, limpia contexto
-  ↓
-Cliente recibe respuesta con header X-Request-ID
-```
-
----
-
-## Comandos de Referencia
+## Testing
 
 ```bash
-# Desarrollo
-uv run uvicorn main:app --reload
-uv run uvicorn main:app --reload --host 0.0.0.0 --port 8080
-
-# Dependencias
-uv add <paquete>
-uv add --group dev <paquete>
-uv remove <paquete>
-uv sync
-
-# Migraciones
-uv run alembic revision --autogenerate -m "descripción"
-uv run alembic upgrade head
-uv run alembic downgrade -1
-uv run alembic current
-uv run alembic history
+uv run pytest            # 85 tests (identifiers, crypto, remote_engine, auth, API, ...)
+uv run pytest -q tests/test_api_servers.py
 ```
+
+La suite usa SQLite como BD de metadatos (no requiere infraestructura). La
+introspección contra MySQL/PostgreSQL reales debe validarse en tu entorno
+(ver [deuda técnica](docs/plans/00-deuda-tecnica-y-pendientes.md)).
 
 ---
 
 ## Documentación
 
-- [Inicio Rápido](docs/getting-started.md)
-- [Estructura del Proyecto](docs/project-structure.md)
-- [API Versionada](docs/features/api-versioning.md)
-- [Respuestas Estándar](docs/features/response-format.md)
-- [Paginación](docs/features/pagination.md)
-- [File Upload](docs/features/file-upload.md)
-- [Rate Limiting](docs/features/rate-limiting.md)
-- [CORS](docs/features/cors.md)
-- [Middlewares](docs/features/middlewares.md)
-- [Sistema de Logging](docs/features/logging.md)
-- [Manejo de Excepciones](docs/features/exceptions.md)
+### Módulos del gateway (Iteración 1)
+- [Gestión de servidores e introspección](docs/features/server-management.md)
+- [Capa de conexión remota y adaptadores](docs/features/remote-connections.md)
+- [Cifrado de credenciales](docs/features/encryption.md)
+- [Autenticación (sesión + admin)](docs/features/authentication.md)
+
+### Base (template)
+- [Inicio Rápido](docs/getting-started.md) · [Estructura](docs/project-structure.md)
+- [API Versionada](docs/features/api-versioning.md) · [Respuestas](docs/features/response-format.md)
+- [Paginación](docs/features/pagination.md) · [Rate Limiting](docs/features/rate-limiting.md)
+- [CORS](docs/features/cors.md) · [Middlewares](docs/features/middlewares.md)
+- [Logging](docs/features/logging.md) · [Excepciones](docs/features/exceptions.md)
 - [Base de Datos](docs/features/database.md)
-- [Migraciones](README_MIGRATIONS.md)
+
+### Roadmap
+- [Planes futuros (Iteraciones 2+)](docs/plans/README.md)
+
+---
 
 ## Tecnologías
 
-- **[FastAPI](https://fastapi.tiangolo.com/)** — Framework web moderno y rápido
-- **[SQLAlchemy 2.0](https://docs.sqlalchemy.org/)** — ORM y SQL toolkit
-- **[Alembic](https://alembic.sqlalchemy.org/)** — Migraciones de base de datos
-- **[Pydantic v2](https://docs.pydantic.dev/)** — Validación de datos y schemas
-- **[slowapi](https://github.com/laurentS/slowapi)** — Rate limiting para Starlette/FastAPI
-- **[uv](https://github.com/astral-sh/uv)** — Gestor de paquetes ultrarrápido
-- **[Ruff](https://docs.astral.sh/ruff/)** — Linter y formateador extremadamente rápido
-- **Python 3.13+**
+- **[FastAPI](https://fastapi.tiangolo.com/)** + **[SQLAlchemy 2.0](https://docs.sqlalchemy.org/)** + **[Alembic](https://alembic.sqlalchemy.org/)**
+- **[Pydantic v2](https://docs.pydantic.dev/)** · **[slowapi](https://github.com/laurentS/slowapi)** (rate limiting)
+- **[cryptography](https://cryptography.io/)** (Fernet) · **[argon2-cffi](https://argon2-cffi.readthedocs.io/)** (hashing)
+- **[PyMySQL](https://pymysql.readthedocs.io/)** (MySQL/MariaDB) · **[psycopg 3](https://www.psycopg.org/psycopg3/)** (PostgreSQL)
+- **[pytest](https://docs.pytest.org/)** + **[httpx](https://www.python-httpx.org/)** · **[uv](https://github.com/astral-sh/uv)** · Python 3.13+
