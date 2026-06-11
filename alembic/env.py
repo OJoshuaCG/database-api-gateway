@@ -15,7 +15,14 @@ from sqlalchemy import engine_from_config, pool
 from alembic import context
 
 # Importar configuración del proyecto
-from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+from app.core.environments import (
+    DB_ENGINE,
+    DB_HOST,
+    DB_NAME,
+    DB_PASS,
+    DB_PORT,
+    DB_USER,
+)
 
 # Importar Base con todos los modelos registrados
 # CRÍTICO: Todos los modelos deben estar importados en app/models/__init__.py
@@ -46,13 +53,32 @@ def get_url() -> str:
     """
     Construye la URL de la base de datos desde variables de entorno.
 
-    Usa las mismas variables que app.core.database.Database para garantizar
-    consistencia en la configuración.
-
-    Returns:
-        str: URL de conexión MySQL con charset utf8mb4
+    Respeta DB_ENGINE (mysql+pymysql, postgresql+psycopg, sqlite, ...) igual que
+    app.core.database.Database, para que las migraciones funcionen con el mismo
+    motor configurado para la aplicación.
     """
-    return f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
+    engine_prefix = DB_ENGINE.split("+")[0].lower()
+    if engine_prefix == "sqlite":
+        return f"{DB_ENGINE}:///{DB_NAME}"
+    suffix = "?charset=utf8mb4" if engine_prefix in ("mysql", "mariadb") else ""
+    return f"{DB_ENGINE}://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}{suffix}"
+
+
+def _connect_args() -> dict:
+    """connect_args según el motor (mismas opciones que app.core.database)."""
+    engine_prefix = DB_ENGINE.split("+")[0].lower()
+    if engine_prefix in ("mysql", "mariadb"):
+        return {
+            "charset": "utf8mb4",
+            "init_command": "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+        }
+    if engine_prefix == "sqlite":
+        return {"check_same_thread": False}
+    return {}
+
+
+def _is_sqlite() -> bool:
+    return DB_ENGINE.split("+")[0].lower() == "sqlite"
 
 
 def run_migrations_offline() -> None:
@@ -75,6 +101,7 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         compare_type=True,  # Detecta cambios en tipos de datos
         compare_server_default=True,  # Detecta cambios en valores default
+        render_as_batch=_is_sqlite(),  # SQLite requiere batch mode para ALTER
     )
 
     with context.begin_transaction():
@@ -96,10 +123,7 @@ def run_migrations_online() -> None:
         configuration,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
-        connect_args={
-            "charset": "utf8mb4",
-            "init_command": "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
-        },
+        connect_args=_connect_args(),
     )
 
     with connectable.connect() as connection:
@@ -108,6 +132,7 @@ def run_migrations_online() -> None:
             target_metadata=target_metadata,
             compare_type=True,  # Detecta cambios en tipos de datos
             compare_server_default=True,  # Detecta cambios en valores default
+            render_as_batch=_is_sqlite(),  # SQLite requiere batch mode para ALTER
         )
 
         with context.begin_transaction():

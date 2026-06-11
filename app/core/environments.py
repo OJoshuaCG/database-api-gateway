@@ -71,6 +71,26 @@ DB_NAME = os.getenv("DB_NAME", "database")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_ENGINE = os.getenv("DB_ENGINE", "sqlite")
 
+# ======= Crypto variables ======= #
+# Sal NO secreta usada para derivar la clave Fernet desde SECRET_KEY (HKDF).
+# Cambiarla invalida todos los secretos ya cifrados.
+CRYPTO_KEY_SALT = os.getenv("CRYPTO_KEY_SALT", "db-gateway-static-salt")
+
+# ======= Remote server connection variables ======= #
+# Timeout (segundos) para abrir conexión TCP a un servidor destino.
+REMOTE_CONNECT_TIMEOUT = int(os.getenv("REMOTE_CONNECT_TIMEOUT", "10"))
+# Timeout (milisegundos) de ejecución de una sentencia remota (DDL/DCL/introspección).
+REMOTE_STATEMENT_TIMEOUT_MS = int(os.getenv("REMOTE_STATEMENT_TIMEOUT_MS", "15000"))
+
+# ======= Admin / Session variables ======= #
+# Admin único que se siembra al arrancar si no existe ninguno en la BD.
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+# Secreto para firmar la cookie de sesión. Si está vacío, se deriva de SECRET_KEY.
+SESSION_SECRET = os.getenv("SESSION_SECRET") or SECRET_KEY or "insecure-dev-session-secret"
+# Duración de la sesión en segundos (default 8 horas).
+SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE", "28800"))
+
 # ======= Startup validation ======= #
 if not SECRET_KEY:
     if APP_ENV == "production":
@@ -81,4 +101,10 @@ if not SECRET_KEY:
     import logging as _logging
     _logging.warning(
         "SECRET_KEY no está definido. Define SECRET_KEY en tu .env para evitar este aviso."
+    )
+
+if not ADMIN_PASSWORD and APP_ENV == "production":
+    raise ValueError(
+        "ADMIN_PASSWORD no está definido. "
+        "Establece ADMIN_PASSWORD para sembrar el administrador antes de iniciar en producción."
     )
