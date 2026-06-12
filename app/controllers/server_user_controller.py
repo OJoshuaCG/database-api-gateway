@@ -250,7 +250,12 @@ class ServerUserController:
         return result
 
     def delete_server_user(
-        self, user_id: int, *, drop_remote: bool, admin: dict | None = None
+        self,
+        user_id: int,
+        *,
+        drop_remote: bool,
+        confirm_username: str | None = None,
+        admin: dict | None = None,
     ) -> None:
         session = self._session()
         try:
@@ -276,6 +281,28 @@ class ServerUserController:
             session.close()
 
         if drop_remote:
+            # Confirmación explícita (doble intención) para DROP USER en el motor:
+            # el cliente debe repetir el username exacto.
+            if confirm_username != username:
+                raise AppHttpException(
+                    message=(
+                        "Confirmación requerida: para ejecutar DROP USER en el motor, "
+                        "'confirm_username' debe coincidir exactamente con el username."
+                    ),
+                    status_code=422,
+                    context={"server_user_id": user_id, "required": "confirm_username == username"},
+                )
+            # Auditar la INTENCIÓN antes de la acción irreversible.
+            audit.record(
+                "server_user.delete",
+                status="attempt",
+                admin=admin,
+                target_type="server_user",
+                target_id=user_id,
+                server_id=server_id,
+                touched_engine=True,
+                detail="DROP USER solicitado (confirmado)",
+            )
             try:
                 get_adapter(target).drop_user(username, host)
             except AppHttpException:

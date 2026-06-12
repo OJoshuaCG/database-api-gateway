@@ -36,6 +36,16 @@ from app.middleware.RequestSizeMiddleware import RequestSizeMiddleware
 _http_basic = HTTPBasic()
 
 
+def cors_allow_credentials(origins: list[str]) -> bool:
+    """
+    Las cookies de sesión NO pueden viajar con CORS comodín: los navegadores rechazan
+    ``Access-Control-Allow-Credentials: true`` junto con ``Access-Control-Allow-Origin: *``,
+    y reflejar el origin sería un vector de CSRF asistido por CORS. Solo permitimos
+    credenciales cuando hay una lista EXPLÍCITA de orígenes.
+    """
+    return bool(origins) and "*" not in origins
+
+
 def _verify_docs_credentials(credentials: HTTPBasicCredentials = Depends(_http_basic)):
     """Verifica usuario y contraseña para acceder a la documentación."""
     valid_user = secrets.compare_digest(credentials.username.encode(), DOCS_USER.encode())
@@ -120,7 +130,9 @@ def create_versioned_app(
     versioned.add_middleware(
         CORSMiddleware,
         allow_origins=CORS_ORIGINS,
-        allow_credentials=True,
+        # Solo se permiten credenciales (cookie de sesión) con orígenes explícitos.
+        # Con CORS_ORIGINS="*" esto queda en False para no exponer la sesión cross-origin.
+        allow_credentials=cors_allow_credentials(CORS_ORIGINS),
         allow_methods=["*"],
         allow_headers=["*"],
     )

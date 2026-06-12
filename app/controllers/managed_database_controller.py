@@ -249,7 +249,12 @@ class ManagedDatabaseController:
         return result
 
     def delete_database(
-        self, db_id: int, *, drop_remote: bool, admin: dict | None = None
+        self,
+        db_id: int,
+        *,
+        drop_remote: bool,
+        confirm_name: str | None = None,
+        admin: dict | None = None,
     ) -> None:
         session = self._session()
         try:
@@ -261,6 +266,29 @@ class ManagedDatabaseController:
             session.close()
 
         if drop_remote:
+            # Confirmación explícita (doble intención) para una operación IRREVERSIBLE:
+            # el cliente debe repetir el nombre exacto de la BD.
+            if confirm_name != db_name:
+                raise AppHttpException(
+                    message=(
+                        "Confirmación requerida: para ejecutar DROP DATABASE en el motor, "
+                        "'confirm_name' debe coincidir exactamente con el nombre de la base de datos."
+                    ),
+                    status_code=422,
+                    context={"managed_database_id": db_id, "required": "confirm_name == name"},
+                )
+            # Auditar la INTENCIÓN antes de la acción irreversible (queda traza aunque
+            # el proceso muera entre el DROP y el registro del resultado).
+            audit.record(
+                "managed_database.delete",
+                status="attempt",
+                admin=admin,
+                target_type="managed_database",
+                target_id=db_id,
+                server_id=server_id,
+                touched_engine=True,
+                detail="DROP DATABASE solicitado (confirmado)",
+            )
             get_adapter(target).drop_database(db_name)
 
         session = self._session()
@@ -308,6 +336,10 @@ class ManagedDatabaseController:
                     old_host=old_host,
                 )
             except AppHttpException:
+                # PostgreSQL aplica ALTER OWNER, GRANT y REVOKE en pasos no atómicos
+                # (distintas conexiones/BDs): un fallo a mitad puede dejar el motor en
+                # estado parcial mientras el inventario conserva el dueño anterior. Se
+                # registra para reconciliación posterior (ver docs/plans/06).
                 audit.record(
                     "managed_database.reassign_owner",
                     status="error",
@@ -316,7 +348,7 @@ class ManagedDatabaseController:
                     target_id=db_id,
                     server_id=server_id,
                     touched_engine=True,
-                    detail="fallo al reasignar el propietario en el motor",
+                    detail="fallo al reasignar propietario en el motor; posible estado parcial (revisar/reconciliar)",
                 )
                 raise
 

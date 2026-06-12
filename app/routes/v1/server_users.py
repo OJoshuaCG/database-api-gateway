@@ -68,10 +68,16 @@ def update_server_user(
 
 @router.delete("/{user_id}", response_model=ApiResponse[None])
 def delete_server_user(
-    admin: AdminDep, user_id: int, drop_remote: bool = Query(False)
+    admin: AdminDep,
+    user_id: int,
+    drop_remote: bool = Query(False),
+    confirm_username: str | None = Query(
+        None,
+        description="Obligatorio si drop_remote=true: repetir el username exacto para confirmar el DROP USER en el motor.",
+    ),
 ):
     ServerUserController().delete_server_user(
-        user_id, drop_remote=drop_remote, admin=admin
+        user_id, drop_remote=drop_remote, confirm_username=confirm_username, admin=admin
     )
     return empty("Usuario eliminado.")
 

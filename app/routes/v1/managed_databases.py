@@ -71,9 +71,17 @@ def update_database(admin: AdminDep, db_id: int, payload: ManagedDatabaseUpdate)
 
 
 @router.delete("/{db_id}", response_model=ApiResponse[None])
-def delete_database(admin: AdminDep, db_id: int, drop_remote: bool = Query(False)):
+def delete_database(
+    admin: AdminDep,
+    db_id: int,
+    drop_remote: bool = Query(False),
+    confirm_name: str | None = Query(
+        None,
+        description="Obligatorio si drop_remote=true: repetir el nombre exacto de la BD para confirmar el DROP en el motor.",
+    ),
+):
     ManagedDatabaseController().delete_database(
-        db_id, drop_remote=drop_remote, admin=admin
+        db_id, drop_remote=drop_remote, confirm_name=confirm_name, admin=admin
     )
     return empty("Base de datos eliminada.")
 

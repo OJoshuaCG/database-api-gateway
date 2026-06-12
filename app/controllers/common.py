@@ -9,6 +9,7 @@ abrir la conexión; nunca se persiste, serializa ni loguea.
 """
 
 from app.core.crypto import CryptoConfigError, CryptoError, decrypt
+from app.core.environments import REMOTE_SSL_MODE
 from app.core.remote_engine import ServerTarget
 from app.exceptions import AppHttpException
 from app.models.enums import EngineType
@@ -52,4 +53,5 @@ def build_target(server: Server) -> ServerTarget:
         port=server.port,
         admin_user=server.root_username,
         admin_password=password,
+        ssl_mode=REMOTE_SSL_MODE,
     )

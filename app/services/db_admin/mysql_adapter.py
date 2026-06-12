@@ -94,12 +94,24 @@ class MySQLAdapter(ServerAdapter):
             [f"DROP DATABASE {db}"], op="drop_database", extra={"database": db_name}
         )
 
+    def _user_at_host(self, username: str, host: str) -> str:
+        """
+        Construye el identificador ``'user'@'host'`` de MySQL con DOBLE defensa:
+        validación por whitelist (arriba) Y quoting como string literal (aquí). En
+        MySQL ambas partes son string literals, así que se escapan con
+        ``quote_string_literal`` en vez de comillas manuales (nunca confiar solo en
+        la whitelist; ver app/services/db_admin/identifiers.py).
+        """
+        user_lit = quote_string_literal(username, self.dialect)
+        host_lit = quote_string_literal(host, self.dialect)
+        return f"{user_lit}@{host_lit}"
+
     def create_user(self, username, password, host="%") -> None:
         validate_identifier(username, self.dialect, "usuario")
         validate_host(host)
         pwd = quote_string_literal(password, self.dialect)
         self._execute_server(
-            [f"CREATE USER '{username}'@'{host}' IDENTIFIED BY {pwd}"],
+            [f"CREATE USER {self._user_at_host(username, host)} IDENTIFIED BY {pwd}"],
             op="create_user",
             extra={"username": username},
         )
@@ -108,7 +120,7 @@ class MySQLAdapter(ServerAdapter):
         validate_identifier(username, self.dialect, "usuario")
         validate_host(host)
         self._execute_server(
-            [f"DROP USER '{username}'@'{host}'"],
+            [f"DROP USER {self._user_at_host(username, host)}"],
             op="drop_user",
             extra={"username": username},
         )
@@ -118,7 +130,7 @@ class MySQLAdapter(ServerAdapter):
         validate_host(host)
         pwd = quote_string_literal(new_password, self.dialect)
         self._execute_server(
-            [f"ALTER USER '{username}'@'{host}' IDENTIFIED BY {pwd}"],
+            [f"ALTER USER {self._user_at_host(username, host)} IDENTIFIED BY {pwd}"],
             op="change_password",
             extra={"username": username},
         )
@@ -131,7 +143,7 @@ class MySQLAdapter(ServerAdapter):
         db = quote_identifier(db_name, self.dialect)
         self._execute_server(
             [
-                f"GRANT {privs} ON {db}.* TO '{username}'@'{host}'",
+                f"GRANT {privs} ON {db}.* TO {self._user_at_host(username, host)}",
                 "FLUSH PRIVILEGES",
             ],
             op="grant_database",
@@ -146,7 +158,7 @@ class MySQLAdapter(ServerAdapter):
         db = quote_identifier(db_name, self.dialect)
         self._execute_server(
             [
-                f"REVOKE {privs} ON {db}.* FROM '{username}'@'{host}'",
+                f"REVOKE {privs} ON {db}.* FROM {self._user_at_host(username, host)}",
                 "FLUSH PRIVILEGES",
             ],
             op="revoke_database",

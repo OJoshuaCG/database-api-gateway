@@ -82,18 +82,35 @@ def _effective_database(dialect: str, database: str | None) -> str | None:
     return _ADMIN_DB.get(dialect)
 
 
-def _connect_args(dialect: str) -> dict[str, Any]:
+# Valores que DESHABILITAN TLS (sin cifrado). Cualquier otro valor lo fuerza.
+_SSL_DISABLED = {"", "disable", "disabled", "off", "false", "0", "none"}
+# sslmode válidos de PostgreSQL/psycopg.
+_PG_SSLMODES = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+
+
+def _connect_args(dialect: str, ssl_mode: str | None = None) -> dict[str, Any]:
+    mode = (ssl_mode or "").strip().lower()
+    ssl_enabled = mode not in _SSL_DISABLED
+
     if dialect in ("mysql", "mariadb"):
         # pymysql: timeouts a nivel de socket cubren conexión y ejecución.
         stmt_timeout_s = max(1, REMOTE_STATEMENT_TIMEOUT_MS // 1000)
-        return {
+        args: dict[str, Any] = {
             "connect_timeout": REMOTE_CONNECT_TIMEOUT,
             "read_timeout": stmt_timeout_s,
             "write_timeout": stmt_timeout_s,
             "charset": "utf8mb4",
         }
+        if ssl_enabled:
+            # Un dict ``ssl`` no vacío fuerza TLS en pymysql. Sin material de CA en el
+            # inventario, ciframos el transporte sin verificar el certificado
+            # (equivalente a 'require'). La verificación de CA (verify-ca/verify-full)
+            # requiere modelar el certificado del servidor — ver docs/plans/00.
+            args["ssl"] = {"check_hostname": False}
+        return args
+
     # postgresql (psycopg v3): connect_timeout + statement/lock timeout por sesión.
-    return {
+    args = {
         "connect_timeout": REMOTE_CONNECT_TIMEOUT,
         "options": (
             f"-c statement_timeout={REMOTE_STATEMENT_TIMEOUT_MS} "
@@ -101,6 +118,11 @@ def _connect_args(dialect: str) -> dict[str, Any]:
             f"-c idle_in_transaction_session_timeout={REMOTE_STATEMENT_TIMEOUT_MS}"
         ),
     }
+    if ssl_enabled:
+        # psycopg aplica sslmode nativamente. Si el valor no es uno conocido, forzamos
+        # 'require' (cifra el transporte) como mínimo seguro.
+        args["sslmode"] = mode if mode in _PG_SSLMODES else "require"
+    return args
 
 
 def _build_engine(target: ServerTarget, effective_db: str | None) -> Engine:
@@ -116,7 +138,7 @@ def _build_engine(target: ServerTarget, effective_db: str | None) -> Engine:
     return create_engine(
         url,
         poolclass=NullPool,
-        connect_args=_connect_args(target.dialect),
+        connect_args=_connect_args(target.dialect, target.ssl_mode),
     )
 
 

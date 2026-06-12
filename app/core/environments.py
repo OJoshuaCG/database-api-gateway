@@ -81,6 +81,13 @@ CRYPTO_KEY_SALT = os.getenv("CRYPTO_KEY_SALT", "db-gateway-static-salt")
 REMOTE_CONNECT_TIMEOUT = int(os.getenv("REMOTE_CONNECT_TIMEOUT", "10"))
 # Timeout (milisegundos) de ejecución de una sentencia remota (DDL/DCL/introspección).
 REMOTE_STATEMENT_TIMEOUT_MS = int(os.getenv("REMOTE_STATEMENT_TIMEOUT_MS", "15000"))
+# Política TLS hacia los motores DESTINO (la credencial pseudo-root viaja por aquí).
+# Vacío/None/"disable" => sin TLS (comportamiento histórico). Recomendado en producción:
+#   - PostgreSQL: "require" | "verify-ca" | "verify-full" (psycopg lo aplica nativamente).
+#   - MySQL/MariaDB: cualquier valor distinto de "disable" fuerza TLS cifrando el
+#     transporte (sin verificación de CA todavía; ver docs/plans/00).
+# Aplica como política GLOBAL a todos los servidores destino.
+REMOTE_SSL_MODE = (os.getenv("REMOTE_SSL_MODE", "") or "").strip() or None
 
 # ======= Admin / Session variables ======= #
 # Admin único que se siembra al arrancar si no existe ninguno en la BD.
@@ -107,4 +114,13 @@ if not ADMIN_PASSWORD and APP_ENV == "production":
     raise ValueError(
         "ADMIN_PASSWORD no está definido. "
         "Establece ADMIN_PASSWORD para sembrar el administrador antes de iniciar en producción."
+    )
+
+# La autenticación es por cookie de sesión (allow_credentials=True). Con CORS_ORIGINS="*"
+# el navegador rechaza enviar credenciales y reflejar el origin sería inseguro (CSRF
+# asistido por CORS). En producción EXIGIMOS orígenes explícitos.
+if APP_ENV == "production" and "*" in CORS_ORIGINS:
+    raise ValueError(
+        "CORS_ORIGINS no puede ser '*' en producción: la auth por cookie requiere una "
+        "lista explícita de orígenes (p. ej. CORS_ORIGINS=https://panel.midominio.com)."
     )
