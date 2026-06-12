@@ -47,8 +47,11 @@ def test_quote_identifier_postgres_escapes_doublequote():
 
 
 def test_quote_string_literal_mysql():
-    assert ident.quote_string_literal("a'b", "mysql") == "'a\\'b'"
+    # La comilla simple se DOBLA (''), seguro en cualquier sql_mode.
+    assert ident.quote_string_literal("a'b", "mysql") == "'a''b'"
     assert ident.quote_string_literal("a\\b", "mysql") == "'a\\\\b'"
+    # Un intento de romper el literal queda neutralizado (no hay quote suelto).
+    assert ident.quote_string_literal("x'; DROP USER y; --", "mysql") == "'x''; DROP USER y; --'"
 
 
 def test_quote_string_literal_postgres():
