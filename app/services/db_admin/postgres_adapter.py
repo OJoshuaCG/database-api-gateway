@@ -149,3 +149,22 @@ class PostgresAdapter(ServerAdapter):
             op="revoke_database",
             extra={"username": username, "database": db_name},
         )
+
+    def reassign_database_owner(
+        self, db_name, new_owner, *, new_host="%", old_owner=None, old_host="%"
+    ) -> None:
+        # En PostgreSQL la propiedad es NATIVA: ALTER DATABASE ... OWNER TO ...
+        validate_identifier(db_name, self.dialect, "base de datos")
+        validate_identifier(new_owner, self.dialect, "usuario")
+        db = quote_identifier(db_name, self.dialect)
+        role = quote_identifier(new_owner, self.dialect)
+        self._execute_server(
+            [f"ALTER DATABASE {db} OWNER TO {role}"],
+            op="reassign_database_owner",
+            extra={"database": db_name, "new_owner": new_owner},
+        )
+        # Otorgar al nuevo dueño el acceso de dos niveles (CONNECT + schema/tablas).
+        self.grant_database(new_owner, db_name)
+        # Revocar el acceso del anterior (la propiedad nativa ya cambió arriba).
+        if old_owner:
+            self.revoke_database(old_owner, db_name)

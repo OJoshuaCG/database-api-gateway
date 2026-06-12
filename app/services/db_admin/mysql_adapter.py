@@ -153,6 +153,9 @@ class MySQLAdapter(ServerAdapter):
             extra={"username": username, "database": db_name},
         )
 
+    # reassign_database_owner: usa la implementación por defecto del base
+    # (revoke al anterior + grant al nuevo), correcta para MySQL/MariaDB.
+
 
 class MariaDBAdapter(MySQLAdapter):
     dialect = "mariadb"

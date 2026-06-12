@@ -90,6 +90,28 @@ class ServerAdapter(ABC):
         self, username: str, db_name: str, host: str = "%", privileges: str = "ALL PRIVILEGES",
     ) -> None: ...
 
+    def reassign_database_owner(
+        self,
+        db_name: str,
+        new_owner: str,
+        *,
+        new_host: str = "%",
+        old_owner: str | None = None,
+        old_host: str = "%",
+    ) -> None:
+        """
+        Reasigna la propiedad de una BD al usuario ``new_owner``.
+
+        Implementación por defecto (propiedad LÓGICA vía privilegios, válida para
+        MySQL/MariaDB): revoca al propietario anterior (si se indica) y otorga al
+        nuevo. PostgreSQL la sobreescribe para usar OWNER nativo (ALTER DATABASE).
+        La semántica de "propiedad" es específica de cada motor, por eso vive en el
+        adapter y nunca en el controller.
+        """
+        if old_owner:
+            self.revoke_database(old_owner, db_name, host=old_host)
+        self.grant_database(new_owner, db_name, host=new_host)
+
     # ------------------------------------------------------------------ #
     # Concreto: conexión e introspección (read-only, cross-dialect)       #
     # ------------------------------------------------------------------ #

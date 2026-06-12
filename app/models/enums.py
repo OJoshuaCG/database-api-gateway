@@ -17,3 +17,18 @@ class ServerStatus(str, enum.Enum):
     active = "active"
     inactive = "inactive"
     unreachable = "unreachable"
+
+
+class ProvisionStatus(str, enum.Enum):
+    """
+    Consistencia entre el inventario del gateway y el motor real (BDs gestionadas).
+
+    El flujo de aprovisionamiento inserta en estado ``pending``, ejecuta el DDL/DCL
+    remoto y pasa a ``active`` (éxito) o ``error`` (falla, con detalle en notas; el
+    registro se conserva para auditoría/reintento, sin rollback silencioso).
+    """
+
+    pending = "pending"    # registrada en el inventario, aún no creada en el motor
+    active = "active"      # creada/aprovisionada correctamente en el motor
+    error = "error"        # la operación remota falló (ver notas)
+    archived = "archived"  # retirada del uso sin borrarse del inventario

@@ -103,7 +103,10 @@ def quote_string_literal(value: str, dialect: str) -> str:
             message="El valor contiene un byte nulo no permitido.", status_code=422
         )
     if dialect in ("mysql", "mariadb"):
-        escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+        # Doblar la comilla simple ('') escapa el quote en CUALQUIER sql_mode,
+        # incluido NO_BACKSLASH_ESCAPES (donde '\'' NO escaparía y permitiría
+        # romper el literal). El backslash se dobla para el sql_mode por defecto.
+        escaped = value.replace("\\", "\\\\").replace("'", "''")
         return "'" + escaped + "'"
     # postgresql: doblar comilla simple; usar E'' si hay backslash.
     escaped = value.replace("'", "''")
