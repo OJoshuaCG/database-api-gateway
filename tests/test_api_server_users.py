@@ -204,6 +204,35 @@ def test_delete_drop_remote_calls_drop_user(admin_client, monkeypatch):
     uid = admin_client.post(
         "/api/v1/server-users", json={"server_id": sid, "username": "todrop"}
     ).json()["data"]["id"]
-    r = admin_client.delete(f"/api/v1/server-users/{uid}?drop_remote=true")
+    # Confirmación explícita: confirm_username debe coincidir con el username.
+    r = admin_client.delete(
+        f"/api/v1/server-users/{uid}?drop_remote=true&confirm_username=todrop"
+    )
     assert r.status_code == 200
     assert dropped == [("todrop", "%")]
+
+
+def test_delete_drop_remote_requires_confirmation(admin_client, monkeypatch):
+    """Sin confirm_username correcto, NO se ejecuta DROP USER en el motor → 422."""
+    import app.controllers.server_user_controller as suc
+
+    dropped = []
+
+    class FakeAdapter:
+        def drop_user(self, username, host):
+            dropped.append((username, host))
+
+    monkeypatch.setattr(suc, "get_adapter", lambda target: FakeAdapter())
+    sid = _make_server(admin_client, name="sj", port=3319)
+    uid = admin_client.post(
+        "/api/v1/server-users", json={"server_id": sid, "username": "noconfirm"}
+    ).json()["data"]["id"]
+
+    assert admin_client.delete(
+        f"/api/v1/server-users/{uid}?drop_remote=true"
+    ).status_code == 422
+    assert admin_client.delete(
+        f"/api/v1/server-users/{uid}?drop_remote=true&confirm_username=wrong"
+    ).status_code == 422
+    assert dropped == []
+    assert admin_client.get(f"/api/v1/server-users/{uid}").status_code == 200
