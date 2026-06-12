@@ -3,29 +3,38 @@
 Planes a futuro del proyecto. Cada documento es autocontenido: contexto, alcance,
 modelo de datos/endpoints, decisiones, riesgos, pasos y verificación.
 
-> Estado a **2026-06-11**: **Iteración 1 completada** (infra, cifrado, capa de
-> conexión remota multi-motor, adaptadores, modelo `Server`, auth de sesión + admin,
-> API de servers + introspección). Suite de 85 tests en verde. Ver `CLAUDE.md` y el
-> plan original en `~/.claude/plans/`.
+> Estado a **2026-06-12**: **Iteraciones 1 y 2 completadas**. Iteración 1 (infra,
+> cifrado, capa de conexión remota multi-motor, adaptadores, modelo `Server`, auth de
+> sesión + admin, API de servers + introspección). Iteración 2 (inventario completo:
+> `ServerUser`/`DatabaseModel`/`ManagedDatabase` + API que crea/gestiona usuarios, BDs
+> y permisos en los motores destino, con auditoría básica). Suite de **123 tests en
+> verde**. Ver `CLAUDE.md` y el plan original en `~/.claude/plans/`.
 
 ## Estado actual (Iteración 1 — hecho)
 
 - `app/core/crypto.py` — cifrado Fernet de credenciales (derivado de `SECRET_KEY`).
 - `app/core/remote_engine.py` — conexión dinámica por servidor (NullPool, cache, timeouts, mapeo de errores).
-- `app/services/db_admin/` — `ServerAdapter` + `MySQLAdapter`/`PostgresAdapter` + `identifiers` (anti-inyección). **Los métodos de escritura (create/drop user/db, grants) YA están implementados**, sin endpoint todavía.
+- `app/services/db_admin/` — `ServerAdapter` + `MySQLAdapter`/`PostgresAdapter` + `identifiers` (anti-inyección). **Los métodos de escritura (create/drop user/db, grants) YA están implementados** y conectados a endpoints en la Iteración 2.
 - `app/models/server.py` + migración Alembic + auth (`app/core/auth.py`) + API (`/api/v1/servers`, `/auth`).
+
+## Estado actual (Iteración 2 — hecho)
+
+- Modelos ORM `ServerUser`, `DatabaseModel`, `ManagedDatabase` (+ `enums`) y migración Alembic `iteration_2`.
+- Controllers + schemas + routes: `/server-users`, `/database-models`, `/managed-databases` (CRUD GW + flujo GW+REMOTE `CREATE/DROP USER`, `CREATE/DROP DATABASE`, `GRANT`, reasignación de propietario).
+- Consistencia GW↔motor con `status=pending→active|error` (sin rollback silencioso) y validación cruzada owner↔server.
+- **Auditoría base** (plan 06 #1): `app/models/audit_log.py` + `app/services/audit.py` (best-effort, sin secretos), integrada en los controllers mutantes.
 
 ## Orden recomendado
 
 | # | Plan | Depende de | Estado |
 |---|------|-----------|--------|
-| 00 | [Deuda técnica y pendientes de Iteración 1](00-deuda-tecnica-y-pendientes.md) | — | Pendiente |
-| 01 | [Iteración 2 — Inventario completo y aprovisionamiento de usuarios/BDs](01-iteracion-2-inventario-y-aprovisionamiento.md) | 00 (parcial) | Pendiente |
+| 00 | [Deuda técnica y pendientes de Iteración 1](00-deuda-tecnica-y-pendientes.md) | — | 🟡 Parcial (ver doc) |
+| 01 | [Iteración 2 — Inventario completo y aprovisionamiento de usuarios/BDs](01-iteracion-2-inventario-y-aprovisionamiento.md) | 00 (parcial) | ✅ Completado |
 | 02 | [Migraciones de modelos (blueprints versionados)](02-migraciones-de-modelos.md) | 01 | Pendiente |
 | 03 | [Aprovisionamiento de servidores (API/Terraform)](03-aprovisionamiento-servidores.md) | 01 | Pendiente |
 | 04 | [Instalación de motor vía SSH](04-instalacion-motor-ssh.md) | 03 | Pendiente |
 | 05 | [Clonado de bases de datos entre servidores](05-clonado-de-bases-de-datos.md) | 01, 02 | Pendiente |
-| 06 | [Operación: seguridad, auditoría y observabilidad](06-operacion-seguridad-observabilidad.md) | transversal | Continuo |
+| 06 | [Operación: seguridad, auditoría y observabilidad](06-operacion-seguridad-observabilidad.md) | transversal | 🟡 Continuo (auditoría base ✅) |
 
 ## Diagrama de dependencias
 

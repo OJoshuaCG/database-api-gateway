@@ -1,6 +1,13 @@
 # 01 — Iteración 2: Inventario completo y aprovisionamiento de usuarios/BDs
 
-**Estado:** Pendiente · **Depende de:** 00 (parcial) · **Esfuerzo:** alto
+**Estado:** ✅ Completado (2026-06-12) · **Depende de:** 00 (parcial) · **Esfuerzo:** alto
+
+> **Implementado:** modelos `ServerUser`/`DatabaseModel`/`ManagedDatabase` (+ `enums`),
+> migración Alembic `iteration_2`, controllers, schemas y routes (`/server-users`,
+> `/database-models`, `/managed-databases`) con flujo GW+REMOTE (crear/borrar usuarios y
+> BDs, grants, reasignar propietario), consistencia `status=pending→active|error`,
+> validación cruzada owner↔server y auditoría base (plan 06 #1). Cubierto por tests de
+> API. **Pendiente de cierre:** verificación end-to-end contra motores reales (ver plan 00).
 
 ## Objetivo
 

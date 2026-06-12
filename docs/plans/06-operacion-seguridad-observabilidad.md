@@ -5,7 +5,14 @@
 Capacidades de plataforma que sostienen a las demás iteraciones. Conviene introducir
 las primeras dos (auditoría y jobs) **junto con** la Iteración 2, porque 02–05 las necesitan.
 
-## 1. Auditoría (prioridad ALTA — junto con Iter. 2)
+## 1. Auditoría (prioridad ALTA — junto con Iter. 2) — ✅ IMPLEMENTADA (base)
+
+> **Hecho (2026-06-12):** `app/models/audit_log.py` (tabla `audit_log`) + `app/services/audit.py`
+> (helper `record(...)`, best-effort: un fallo al auditar nunca rompe la operación; toma
+> Request ID e IP de los ContextVars; `detail` sin secretos). Integrada en los controllers
+> mutantes (p. ej. `managed_database.create/update/delete/reassign_owner`). **Pendiente:**
+> ampliar cobertura a todas las acciones futuras (migraciones, instalación, clonado) y
+> evaluar inmutabilidad reforzada (append-only / retención).
 
 Toda operación sensible (crear/borrar usuario o BD, grants, migraciones, instalar motor,
 aprovisionar, clonar) debe quedar registrada de forma inmutable.
@@ -58,8 +65,9 @@ credenciales de proveedor cloud, passwords pseudo-root de muchos servidores):
 
 - **Logs estructurados** (ya hay logger + request id). Considerar formato JSON para ingestión.
 - **Métricas** (Prometheus): latencia por endpoint, fallos por servidor destino, jobs en cola.
-- **Health/readiness** ampliado: el `/health` actual no comprueba la BD del gateway; añadir un
-  readiness que verifique conectividad a la BD de metadatos.
+- ✅ **Health/readiness** (2026-06-12): `/health` = liveness; `/health/ready` = readiness
+  que hace `SELECT 1` contra la BD de metadatos y devuelve 503 si no es alcanzable
+  (endpoint `def`, corre en threadpool). Falta: métricas Prometheus.
 - **Sentry** ya está disponible como dependencia transitiva; evaluar activarlo para errores.
 
 ## 6. Reconciliación inventario ↔ realidad
@@ -74,7 +82,9 @@ sin mutar sin confirmación. Útil tras adopciones manuales o fallos parciales (
 
 - Rate limiting por ruta en operaciones sensibles (no solo login).
 - CSRF tokens para mutaciones si hay frontend en navegador (hoy `same_site=lax`).
-- Confirmación explícita (doble paso) para operaciones destructivas (drop database, destroy server).
+- ✅ Confirmación explícita (doble intención) para DROP DATABASE/USER (2026-06-12):
+  `drop_remote=true` exige `confirm_name`/`confirm_username` == nombre exacto del objeto,
+  validado antes de tocar el motor. Pendiente: `destroy server` (roadmap 3+).
 - Revisión de permisos del usuario pseudo-root (mínimo privilegio necesario por operación).
 
 ## Orden sugerido de adopción

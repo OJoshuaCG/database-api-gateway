@@ -1,9 +1,18 @@
 # 00 — Deuda técnica y pendientes de la Iteración 1
 
-**Estado:** Pendiente · **Depende de:** — · **Esfuerzo:** bajo
+**Estado:** 🟡 Parcial · **Depende de:** — · **Esfuerzo:** bajo
 
 Cierra los cabos sueltos detectados en la revisión de la Iteración 1 antes de
 construir sobre ella. Ninguno bloquea avanzar, pero conviene resolverlos pronto.
+
+> **Avance a 2026-06-12:** resueltos el ítem 4 (CORS, ✅) y el ítem 5 `SESSION_SECRET`
+> (parcial). Además, fuera de este doc se endurecieron bloqueantes de la revisión de
+> producción: TLS hacia los motores (`REMOTE_SSL_MODE`), doble confirmación en DROP
+> DATABASE/USER, compensación de fallo parcial en `create_database`, readiness honesto
+> (`/health/ready`) y quoting de `'user'@'host'` en MySQL. Siguen **pendientes** los de
+> prioridad ALTA: ítem 1 (verificación contra motores reales) e ítem 2 (regenerar
+> migración contra MySQL — ambas siguen autogeneradas sobre SQLite con `batch_alter_table`).
+> Ítems 3 y 5c/filtros de `GET /servers` siguen sin abordarse.
 
 ## Tareas
 
@@ -38,14 +47,15 @@ no-ASCII. Si se necesita introspeccionar BDs existentes con esos nombres, devuel
 - **Decisión a confirmar:** ¿los nombres de BD/usuario los controla siempre el gateway?
   Si es así, no hace falta tocar nada.
 
-### 4. CORS + cookies de sesión (MEDIA)
+### 4. CORS + cookies de sesión (MEDIA) — ✅ RESUELTO (2026-06-12)
 `allow_credentials=True` es incompatible con `CORS_ORIGINS="*"` en navegadores.
 
-- **Acción:** documentar/forzar que, con un frontend en navegador, `CORS_ORIGINS`
-  liste orígenes específicos (no `*`).
+- **Hecho:** `versioned_app.cors_allow_credentials()` desactiva `allow_credentials`
+  cuando los orígenes incluyen `*` (o están vacíos), y `environments.py` **aborta el
+  arranque en producción** si `CORS_ORIGINS` contiene `*`. Cubierto por `test_hardening`.
 
 ### 5. Endurecimientos menores (BAJA)
-- `SESSION_SECRET` idealmente distinto de `SECRET_KEY` (hoy cae a `SECRET_KEY` si está vacío).
+- ✅ `SESSION_SECRET` ya es una variable propia (`environments.py`); sigue cayendo a `SECRET_KEY` si está vacío, así que en producción **debe** definirse por separado.
 - Considerar tokens CSRF para las operaciones mutantes (hoy mitigado con `same_site=lax`).
 - Filtros de listado en `GET /servers` (`?engine=&status=&is_active=`) — quedaron diferidos.
 
