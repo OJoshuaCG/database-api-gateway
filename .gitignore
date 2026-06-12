@@ -79,4 +79,5 @@ Thumbs.db
 
 .secrets.baseline
 
-.claude/
+.claude/worktrees
+.claude/settings.local.json
