@@ -123,6 +123,58 @@ docker compose exec db mariadb -u root -p
 
 ---
 
+## Probar motores destino (perfil `test`)
+
+Además de la BD de **metadatos** (`db`, MariaDB — donde corren las migraciones de Alembic),
+el compose incluye dos **servidores destino de prueba** que el gateway puede administrar.
+Solo arrancan con el perfil `test`, así que NO contaminan un despliegue de producción.
+
+| Servicio          | Imagen        | Rol                                         | Puerto host |
+|-------------------|---------------|---------------------------------------------|-------------|
+| `db`              | `mariadb:11`  | BD de metadatos (Alembic)                   | —           |
+| `target-mariadb`  | `mariadb:11`  | Motor DESTINO de prueba (se administra)     | `13306`     |
+| `target-postgres` | `postgres:16` | Motor DESTINO de prueba (se administra)     | `15432`     |
+
+```bash
+# Levantar TODO, incluidos los motores destino de prueba
+docker compose --profile test up -d --build
+
+# (sin --profile test solo arrancan db + api + nginx)
+```
+
+Variables requeridas en `.env` (ver `.env.docker.example`):
+`TARGET_MARIADB_ROOT_PASS`, `TARGET_MARIADB_GW_PASS`, `TARGET_POSTGRES_PASSWORD`.
+
+### Registrar los destinos en el gateway
+
+`root` de MariaDB queda restringido a localhost (default seguro); por eso el init-script
+`docker/init/mariadb/01-gateway-admin.sh` crea `gw_admin`@'%' con privilegios pseudo-root.
+PostgreSQL acepta `postgres` desde la red por defecto.
+
+```bash
+# 1. Login como admin (guarda la cookie de sesión)
+curl -c cookies.txt -X POST http://localhost/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<ADMIN_PASSWORD>"}'
+
+# 2. Registrar el destino MariaDB
+curl -b cookies.txt -X POST http://localhost/api/v1/servers \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"mariadb-test","engine":"mariadb","host":"target-mariadb","port":3306,
+       "root_username":"gw_admin","root_password":"<TARGET_MARIADB_GW_PASS>"}'
+
+# 3. Registrar el destino PostgreSQL
+curl -b cookies.txt -X POST http://localhost/api/v1/servers \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"postgres-test","engine":"postgresql","host":"target-postgres","port":5432,
+       "root_username":"postgres","root_password":"<TARGET_POSTGRES_PASSWORD>"}'
+```
+
+> Los hosts `target-mariadb` / `target-postgres` resuelven por DNS interno de Docker
+> (red `backend`), por eso el contenedor `api` los alcanza por nombre de servicio.
+
+---
+
 ## Configurar SSL con HTTPS (Let's Encrypt)
 
 ### Paso 1: Apuntar el dominio al servidor
