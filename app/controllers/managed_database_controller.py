@@ -148,7 +148,7 @@ class ManagedDatabaseController:
                     status_code=422,
                     context={"model_id": data["model_id"]},
                 )
-            owner_username, owner_host = owner.username, owner.host
+            owner_username = owner.username
             target = build_target(server) if provision else None
 
             md = ManagedDatabase(
@@ -182,7 +182,12 @@ class ManagedDatabaseController:
 
         if provision:
             adapter = get_adapter(target)
-            # 1) Crear la BD. Si falla, no quedó nada en el motor: marcar error y salir.
+            # Crear la BD en el motor. POLÍTICA: NO se otorga ningún privilegio al
+            # propietario por defecto — un usuario sin privilegios no recibe ninguno
+            # (jamás ALL PRIVILEGES; eso solo lo tiene la credencial pseudo-root de la
+            # conexión). Los permisos se asignan después de forma explícita y granular.
+            # En PostgreSQL el propietario queda como OWNER NATIVO de la BD (es la
+            # propiedad, no un GRANT). Si CREATE falla, no quedó nada en el motor.
             try:
                 adapter.create_database(
                     db_name, charset=charset, collation=collation, owner=owner_username
@@ -202,40 +207,6 @@ class ManagedDatabaseController:
                     server_id=server_id,
                     touched_engine=True,
                     detail="fallo al crear la BD en el motor",
-                )
-                raise
-            # 2) Otorgar permisos al propietario. Si falla, la BD YA existe en el motor:
-            #    COMPENSAR con DROP (la BD recién creada está vacía, es seguro) para no
-            #    dejar una BD huérfana. Un fallo del DROP de compensación se reporta pero
-            #    no enmascara el error original.
-            try:
-                adapter.grant_database(owner_username, db_name, host=owner_host)
-            except AppHttpException:
-                compensated = False
-                try:
-                    adapter.drop_database(db_name)
-                    compensated = True
-                except AppHttpException:
-                    pass
-                detail = (
-                    "El GRANT al propietario falló; la BD recién creada fue revertida (DROP)."
-                    if compensated
-                    else "El GRANT falló y el DROP de compensación también: la BD quedó HUÉRFANA en el motor (requiere intervención)."
-                )
-                self._set_status(db_id, ProvisionStatus.error, detail=detail)
-                audit.record(
-                    "managed_database.create",
-                    status="error",
-                    admin=admin,
-                    target_type="managed_database",
-                    target_id=db_id,
-                    server_id=server_id,
-                    touched_engine=True,
-                    detail=(
-                        "fallo en GRANT; BD revertida con DROP"
-                        if compensated
-                        else "fallo en GRANT; BD HUÉRFANA (DROP de compensación falló)"
-                    ),
                 )
                 raise
             self._set_status(db_id, ProvisionStatus.active)

@@ -149,7 +149,9 @@ def test_reassign_owner_other_server_conflict(admin_client):
     assert r.status_code == 409
 
 
-def test_provision_creates_and_grants(admin_client, monkeypatch):
+def test_provision_creates_without_granting(admin_client, monkeypatch):
+    """Provisionar CREA la BD pero NO otorga privilegios al propietario (política:
+    sin privilegios por defecto; jamás ALL PRIVILEGES)."""
     import app.controllers.managed_database_controller as mdc
 
     calls = []
@@ -171,7 +173,8 @@ def test_provision_creates_and_grants(admin_client, monkeypatch):
     assert r.status_code == 201, r.text
     assert r.json()["data"]["status"] == "active"
     assert ("create_database", "prov_db", "powner") in calls
-    assert ("grant_database", "powner", "prov_db") in calls
+    # NINGÚN grant automático: el propietario no recibe privilegios por defecto.
+    assert not any(c[0] == "grant_database" for c in calls)
 
 
 def test_provision_failure_marks_error(admin_client, monkeypatch):
@@ -251,37 +254,9 @@ def test_delete_drop_remote_requires_confirmation(admin_client, monkeypatch):
     assert admin_client.get(f"/api/v1/managed-databases/{did}").status_code == 200
 
 
-def test_provision_grant_failure_compensates_with_drop(admin_client, monkeypatch):
-    """Si CREATE DATABASE OK pero GRANT falla, se DROPea la BD para no dejarla huérfana."""
-    import app.controllers.managed_database_controller as mdc
-
-    calls = []
-
-    class FakeAdapter:
-        def create_database(self, name, charset=None, collation=None, owner=None):
-            calls.append(("create_database", name))
-
-        def grant_database(self, username, db_name, host="%", privileges="ALL PRIVILEGES"):
-            raise AppHttpException("grant rechazado", 502)
-
-        def drop_database(self, name):
-            calls.append(("drop_database", name))
-
-    monkeypatch.setattr(mdc, "get_adapter", lambda target: FakeAdapter())
-    sid = _server(admin_client, 5471)
-    oid = _owner(admin_client, sid, "comp_owner")
-    r = admin_client.post(
-        "/api/v1/managed-databases?provision=true",
-        json={"server_id": sid, "owner_id": oid, "name": "comp_db"},
-    )
-    assert r.status_code == 502
-    # Se creó y luego se revirtió con DROP (compensación).
-    assert ("create_database", "comp_db") in calls
-    assert ("drop_database", "comp_db") in calls
-    # El registro queda en estado 'error' con detalle de reversión.
-    data = admin_client.get(f"/api/v1/managed-databases?server_id={sid}").json()["data"]
-    assert data[0]["status"] == "error"
-    assert "revertida" in (data[0]["notes"] or "")
+# NOTA: el test de compensación de GRANT se eliminó porque ya no hay paso de GRANT
+# automático en create_database (política: sin privilegios por defecto). Crear la BD
+# es ahora la única operación remota; su fallo se cubre en test_provision_failure_marks_error.
 
 
 def test_reassign_provision_calls_engine(admin_client, monkeypatch):
