@@ -20,6 +20,7 @@ from app.models.base import Base, TimestampMixin
 from app.models.database_model import DatabaseModel
 from app.models.enums import EngineType, ProvisionStatus, ServerStatus
 from app.models.managed_database import ManagedDatabase
+from app.models.privilege import Privilege
 from app.models.server import Server
 from app.models.server_user import ServerUser
 from app.models.user import User
@@ -33,6 +34,7 @@ __all__ = [
     "DatabaseModel",
     "ManagedDatabase",
     "AuditLog",
+    "Privilege",
     "EngineType",
     "ServerStatus",
     "ProvisionStatus",
