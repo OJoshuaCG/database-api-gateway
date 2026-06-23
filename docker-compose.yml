@@ -66,12 +66,65 @@ services:
     networks:
       - frontend
 
+  # ── Motor DESTINO de prueba: MariaDB (perfil "test") ──────────────────────────
+  # NO es la BD de metadatos. Es un servidor que el gateway ADMINISTRA: se registra
+  # vía POST /api/v1/servers (engine=mariadb, host=target-mariadb, port=3306) y sobre
+  # él se prueban crear/borrar BDs y usuarios. Solo arranca con:
+  #   docker compose --profile test up -d --build
+  target-mariadb:
+    image: mariadb:11
+    profiles: ["test"]
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${TARGET_MARIADB_ROOT_PASS:?TARGET_MARIADB_ROOT_PASS requerido para el perfil test}
+      # Leído por el init-script que crea el admin del gateway accesible desde la red.
+      TARGET_MARIADB_GW_PASS: ${TARGET_MARIADB_GW_PASS:?TARGET_MARIADB_GW_PASS requerido para el perfil test}
+    volumes:
+      - target_mariadb_data:/var/lib/mysql
+      # Crea gw_admin@'%' al primer arranque (volumen vacío). root queda en localhost.
+      - ./docker/init/mariadb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "13306:3306"   # opcional: inspección desde el host con un cliente local
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--su-mysql", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - backend
+
+  # ── Motor DESTINO de prueba: PostgreSQL (perfil "test") ───────────────────────
+  # El superusuario `postgres` es alcanzable desde la red por defecto (la imagen
+  # genera pg_hba con host all all all + scram). Registrar como:
+  #   engine=postgresql, host=target-postgres, port=5432, root_username=postgres
+  target-postgres:
+    image: postgres:16
+    profiles: ["test"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${TARGET_POSTGRES_PASSWORD:?TARGET_POSTGRES_PASSWORD requerido para el perfil test}
+    volumes:
+      - target_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "15432:5432"   # opcional: inspección desde el host con un cliente local
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - backend
+
 volumes:
-  mariadb_data:   # Datos persistentes de MariaDB
-  uploads_data:   # Archivos subidos por la aplicación
-  nginx_logs:     # Logs de acceso/error de Nginx
-  certbot_www:    # Directorio para verificación ACME (Let's Encrypt)
-  certbot_certs:  # Certificados SSL generados por Certbot
+  mariadb_data:          # Datos persistentes de la BD de metadatos (MariaDB)
+  uploads_data:          # Archivos subidos por la aplicación
+  nginx_logs:            # Logs de acceso/error de Nginx
+  certbot_www:           # Directorio para verificación ACME (Let's Encrypt)
+  certbot_certs:         # Certificados SSL generados por Certbot
+  target_mariadb_data:   # Datos del motor destino de prueba (MariaDB)
+  target_postgres_data:  # Datos del motor destino de prueba (PostgreSQL)
 
 networks:
   backend:   # Red interna: API ↔ MariaDB (no expuesta al exterior)
