@@ -53,5 +53,7 @@ def build_target(server: Server) -> ServerTarget:
         port=server.port,
         admin_user=server.root_username,
         admin_password=password,
-        ssl_mode=REMOTE_SSL_MODE,
+        # TLS por conexión: si el servidor define ssl_mode, se usa; si no, cae al
+        # global REMOTE_SSL_MODE (que por defecto es None => se omite TLS).
+        ssl_mode=server.ssl_mode if server.ssl_mode is not None else REMOTE_SSL_MODE,
     )

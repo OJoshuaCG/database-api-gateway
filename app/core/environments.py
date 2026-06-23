@@ -1,3 +1,4 @@
+import ipaddress
 import os
 from pathlib import Path
 
@@ -88,6 +89,21 @@ REMOTE_STATEMENT_TIMEOUT_MS = int(os.getenv("REMOTE_STATEMENT_TIMEOUT_MS", "1500
 #     transporte (sin verificación de CA todavía; ver docs/plans/00).
 # Aplica como política GLOBAL a todos los servidores destino.
 REMOTE_SSL_MODE = (os.getenv("REMOTE_SSL_MODE", "") or "").strip() or None
+
+# ======= Anti-SSRF (validación de host destino) ======= #
+# Si True (default), al registrar/editar un Server se rechazan destinos peligrosos
+# (loopback, link-local/metadata 169.254.169.254, multicast, reservados). Los rangos
+# privados se permiten por defecto (las BD suelen ser internas).
+REMOTE_SSRF_GUARD_ENABLED = os.getenv("REMOTE_SSRF_GUARD_ENABLED", "True").lower() == "true"
+# Allowlist OPCIONAL de CIDRs. Si se define, el host destino DEBE resolver dentro de
+# alguno (allowlist estricta). Vacío = sin allowlist (solo aplica la denylist de arriba).
+# Ej: REMOTE_ALLOWED_CIDRS=10.0.0.0/8,192.168.0.0/16
+_allowed_cidrs_raw = os.getenv("REMOTE_ALLOWED_CIDRS", "")
+REMOTE_ALLOWED_CIDRS = [
+    ipaddress.ip_network(c.strip(), strict=False)
+    for c in _allowed_cidrs_raw.split(",")
+    if c.strip()
+]
 
 # ======= Admin / Session variables ======= #
 # Admin único que se siembra al arrancar si no existe ninguno en la BD.

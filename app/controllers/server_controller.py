@@ -13,7 +13,15 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.crypto import CryptoConfigError, CryptoError, decrypt, encrypt
 from app.core.database import Database
-from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+from app.core.net_guard import validate_remote_host
+from app.core.environments import (
+    DB_HOST,
+    DB_NAME,
+    DB_PASS,
+    DB_PORT,
+    DB_USER,
+    REMOTE_SSL_MODE,
+)
 from app.core import remote_engine
 from app.core.remote_engine import ServerTarget
 from app.exceptions import AppHttpException
@@ -43,6 +51,7 @@ class ServerController:
             "port": s.port,
             "engine": s.engine,
             "root_username": s.root_username,
+            "ssl_mode": s.ssl_mode,
             "status": s.status,
             "is_active": s.is_active,
             "notes": s.notes,
@@ -107,6 +116,8 @@ class ServerController:
             session.close()
 
     def create_server(self, data: dict) -> dict:
+        # Anti-SSRF: validar el destino ANTES de persistir/conectar.
+        validate_remote_host(data["host"])
         session = self._session()
         try:
             server = Server(
@@ -116,6 +127,7 @@ class ServerController:
                 engine=EngineType(data["engine"]),
                 root_username=data["root_username"],
                 root_password_encrypted=self._encrypt_password(data["root_password"]),
+                ssl_mode=data.get("ssl_mode"),
                 notes=data.get("notes"),
                 is_active=data.get("is_active", True),
             )
@@ -135,10 +147,13 @@ class ServerController:
             session.close()
 
     def update_server(self, server_id: int, data: dict) -> dict:
+        # Anti-SSRF: si cambia el host, validar el nuevo destino.
+        if data.get("host") is not None:
+            validate_remote_host(data["host"])
         session = self._session()
         try:
             server = self._get_or_404(session, server_id)
-            for field in ("name", "host", "port", "notes", "is_active", "root_username"):
+            for field in ("name", "host", "port", "notes", "is_active", "root_username", "ssl_mode"):
                 if field in data:
                     setattr(server, field, data[field])
             if data.get("engine") is not None:
@@ -201,6 +216,8 @@ class ServerController:
                 port=server.port,
                 admin_user=server.root_username,
                 admin_password=password,
+                # TLS por conexión: el del servidor manda; si no tiene, cae al global.
+                ssl_mode=server.ssl_mode if server.ssl_mode is not None else REMOTE_SSL_MODE,
             )
         finally:
             session.close()
