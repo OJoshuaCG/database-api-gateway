@@ -20,6 +20,23 @@ services:
     networks:
       - backend
 
+  # ── Valkey ────────────────────────────────────────────────────────────────────
+  # Backend del rate limiting (SlowAPI) compartido entre workers/réplicas. Valkey es
+  # el fork OSI (BSD-3) de Redis, wire-compatible: el cliente `redis` y el esquema
+  # `redis://` funcionan sin cambios de código. Solo contadores efímeros: sin
+  # persistencia (save off, appendonly no).
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - backend
+
   # ── FastAPI ──────────────────────────────────────────────────────────────────
   api:
     build:
@@ -36,12 +53,18 @@ services:
       # para garantizar que la app use los servicios Docker correctos
       DB_ENGINE: mysql+pymysql
       DB_HOST: db
+      # Rate limiting compartido entre workers vía Valkey (servicio de abajo).
+      # El esquema redis:// es el protocolo (RESP); Valkey lo habla igual.
+      RATE_LIMIT_REDIS_ENABLED: "True"
+      RATE_LIMIT_REDIS_URL: redis://valkey:6379
     volumes:
       - uploads_data:/app/uploads
     expose:
       - "8000"
     depends_on:
       db:
+        condition: service_healthy
+      valkey:
         condition: service_healthy
     networks:
       - backend
