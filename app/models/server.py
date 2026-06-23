@@ -56,6 +56,16 @@ class Server(Base, TimestampMixin):
         comment="Password pseudo-root CIFRADO (Fernet). Nunca se expone ni se loguea",
     )
 
+    ssl_mode: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+        comment=(
+            "Política TLS hacia ESTE servidor. NULL/vacío = sin TLS. PostgreSQL: "
+            "require|verify-ca|verify-full|prefer|allow|disable. MySQL/MariaDB: "
+            "cualquier valor distinto de 'disable' cifra el transporte."
+        ),
+    )
+
     status: Mapped[ServerStatus] = mapped_column(
         SQLAEnum(ServerStatus, native_enum=False, length=20),
         nullable=False,

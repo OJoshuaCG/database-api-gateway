@@ -7,9 +7,24 @@ pseudo-root (ni cifrada ni descifrada). Solo se informa `has_root_password`.
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.enums import EngineType, ServerStatus
+
+# Modos TLS válidos hacia el motor destino. None/"" => sin TLS (se omite el paso).
+_SSL_MODES = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+
+
+def _normalize_ssl_mode(value: str | None) -> str | None:
+    """None o vacío => None (sin TLS). En otro caso debe ser un modo válido."""
+    if value is None:
+        return None
+    v = value.strip().lower()
+    if v == "":
+        return None
+    if v not in _SSL_MODES:
+        raise ValueError(f"ssl_mode inválido. Use uno de: {', '.join(sorted(_SSL_MODES))}")
+    return v
 
 
 class ServerCreate(BaseModel):
@@ -20,8 +35,12 @@ class ServerCreate(BaseModel):
     root_username: str = Field(..., min_length=1, max_length=128)
     # Entra en texto plano; el controller lo cifra antes de persistir.
     root_password: str = Field(..., min_length=1)
+    # TLS por conexión: si se especifica, se usa; si no, se omite. Opcional.
+    ssl_mode: str | None = Field(None, description="disable|allow|prefer|require|verify-ca|verify-full")
     notes: str | None = None
     is_active: bool = True
+
+    _v_ssl = field_validator("ssl_mode")(staticmethod(_normalize_ssl_mode))
 
 
 class ServerUpdate(BaseModel):
@@ -32,8 +51,11 @@ class ServerUpdate(BaseModel):
     root_username: str | None = Field(None, min_length=1, max_length=128)
     # Si se provee, se re-cifra; si se omite, no cambia.
     root_password: str | None = Field(None, min_length=1)
+    ssl_mode: str | None = Field(None, description="disable|allow|prefer|require|verify-ca|verify-full")
     notes: str | None = None
     is_active: bool | None = None
+
+    _v_ssl = field_validator("ssl_mode")(staticmethod(_normalize_ssl_mode))
 
 
 class ServerOut(BaseModel):
@@ -45,6 +67,7 @@ class ServerOut(BaseModel):
     port: int
     engine: EngineType
     root_username: str
+    ssl_mode: str | None = None
     status: ServerStatus
     is_active: bool
     notes: str | None = None

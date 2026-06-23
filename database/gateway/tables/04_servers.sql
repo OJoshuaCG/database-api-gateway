@@ -10,6 +10,7 @@ CREATE TABLE servers (
 	engine VARCHAR(20) NOT NULL COMMENT 'Motor de base de datos: mysql | mariadb | postgresql', 
 	root_username VARCHAR(128) NOT NULL COMMENT 'Usuario pseudo-root para administrar el servidor', 
 	root_password_encrypted TEXT NOT NULL COMMENT 'Password pseudo-root CIFRADO (Fernet). Nunca se expone ni se loguea', 
+	ssl_mode VARCHAR(20) COMMENT 'Política TLS hacia ESTE servidor. NULL/vacío = sin TLS. PostgreSQL: require|verify-ca|verify-full|prefer|allow|disable. MySQL/MariaDB: cualquier valor distinto de ''disable'' cifra el transporte.', 
 	status VARCHAR(20) NOT NULL COMMENT 'Estado operativo del servidor en el inventario' DEFAULT 'active', 
 	is_active BOOL NOT NULL COMMENT 'Permite deshabilitar el servidor sin borrarlo (soft-disable)' DEFAULT '1', 
 	notes TEXT COMMENT 'Notas adicionales sobre el servidor', 
