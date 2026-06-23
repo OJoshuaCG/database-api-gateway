@@ -23,6 +23,9 @@ os.environ.update(
         "APP_ENV": "development",
         "LOGGER_MIDDLEWARE_ENABLED": "False",
         "LOGGER_EXCEPTIONS_ENABLED": "False",
+        # Los tests registran servidores con 127.0.0.1 como dummy; el guard anti-SSRF
+        # se prueba aparte (tests/test_ssrf_guard.py) activándolo explícitamente.
+        "REMOTE_SSRF_GUARD_ENABLED": "False",
     }
 )
 

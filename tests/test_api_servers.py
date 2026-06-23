@@ -87,3 +87,30 @@ def test_introspection_invalid_identifier_422(admin_client, server_payload):
 
 def test_introspection_requires_existing_server(admin_client):
     assert admin_client.post("/api/v1/servers/12345/test-connection").status_code == 404
+
+
+# --------------------------- TLS por servidor (ssl_mode) --------------------- #
+def test_ssl_mode_default_is_none(admin_client, server_payload):
+    data = admin_client.post("/api/v1/servers", json=server_payload(port=3500)).json()["data"]
+    assert data["ssl_mode"] is None  # sin TLS si no se especifica
+
+
+def test_ssl_mode_persisted_and_normalized(admin_client, server_payload):
+    data = admin_client.post(
+        "/api/v1/servers", json=server_payload(port=3501, ssl_mode="REQUIRE")
+    ).json()["data"]
+    assert data["ssl_mode"] == "require"  # normalizado a minúsculas
+
+
+def test_ssl_mode_invalid_422(admin_client, server_payload):
+    r = admin_client.post(
+        "/api/v1/servers", json=server_payload(port=3502, ssl_mode="bogus")
+    )
+    assert r.status_code == 422
+
+
+def test_ssl_mode_update(admin_client, server_payload):
+    sid = admin_client.post("/api/v1/servers", json=server_payload(port=3503)).json()["data"]["id"]
+    upd = admin_client.patch(f"/api/v1/servers/{sid}", json={"ssl_mode": "verify-full"})
+    assert upd.status_code == 200
+    assert upd.json()["data"]["ssl_mode"] == "verify-full"
