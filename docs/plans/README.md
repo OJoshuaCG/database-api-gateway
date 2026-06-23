@@ -35,6 +35,7 @@ modelo de datos/endpoints, decisiones, riesgos, pasos y verificación.
 | 04 | [Instalación de motor vía SSH](04-instalacion-motor-ssh.md) | 03 | Pendiente |
 | 05 | [Clonado de bases de datos entre servidores](05-clonado-de-bases-de-datos.md) | 01, 02 | Pendiente |
 | 06 | [Operación: seguridad, auditoría y observabilidad](06-operacion-seguridad-observabilidad.md) | transversal | 🟡 Continuo (auditoría base ✅) |
+| 07 | [Gestión granular de permisos (GRANT/REVOKE cross-engine)](07-gestion-granular-de-permisos.md) | 01 | 🟡 En progreso (catálogo + tabla `privileges` ✅) |
 
 ## Diagrama de dependencias
 
