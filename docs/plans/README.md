@@ -36,6 +36,7 @@ modelo de datos/endpoints, decisiones, riesgos, pasos y verificación.
 | 05 | [Clonado de bases de datos entre servidores](05-clonado-de-bases-de-datos.md) | 01, 02 | Pendiente |
 | 06 | [Operación: seguridad, auditoría y observabilidad](06-operacion-seguridad-observabilidad.md) | transversal | 🟡 Continuo (auditoría base ✅) |
 | 07 | [Gestión granular de permisos (GRANT/REVOKE cross-engine)](07-gestion-granular-de-permisos.md) | 01 | 🟡 En progreso (catálogo + tabla `privileges` ✅) |
+| 08 | [Production readiness: estado y bloqueantes](08-production-readiness.md) | transversal | 🔴 NO listo (ver bloqueantes) |
 
 ## Diagrama de dependencias
 
