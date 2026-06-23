@@ -7,12 +7,14 @@ from app.core.auth import bootstrap_admin
 from app.core.versioned_app import create_versioned_app
 from app.routes.health import router as health_router
 from app.routes.v1.routes import router as v1_router
+from app.services.privilege_catalog import seed_privileges
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Arranque: sembrar el administrador único si no existe.
+    # Arranque: sembrar el administrador único y el catálogo de privilegios.
     bootstrap_admin()
+    seed_privileges()
     yield
     # Apagado: liberar los engines de conexión a servidores destino.
     remote_engine.dispose_all()
