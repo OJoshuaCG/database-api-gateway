@@ -4,7 +4,28 @@ directamente en las respuestas de la API (`ApiResponse[T]`). NUNCA contienen
 datos de filas de las tablas gestionadas: solo estructura/metadatos.
 """
 
+import enum
+
 from pydantic import BaseModel
+
+
+class GrantLevel(str, enum.Enum):
+    """
+    Nivel de entidad sobre el que se otorga/revoca un privilegio.
+
+    Fase 1 (object-level): DATABASE, SCHEMA (solo PG), TABLE, COLUMN,
+    SEQUENCE (solo PG), ROUTINE. GLOBAL y los niveles raros (TYPE, LANGUAGE,
+    FDW, ...) y la membresía de roles se incorporan en fases posteriores
+    (ver docs/plans/07-gestion-granular-de-permisos.md).
+    """
+
+    GLOBAL = "global"
+    DATABASE = "database"
+    SCHEMA = "schema"
+    TABLE = "table"
+    COLUMN = "column"
+    SEQUENCE = "sequence"
+    ROUTINE = "routine"
 
 
 class ConnectionInfo(BaseModel):
