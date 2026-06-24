@@ -73,6 +73,8 @@ best-effort: nunca rompe la operación de negocio.
 | PATCH | `/server-users/{id}?provision=true` | GW+motor si cambia password (`ALTER USER`) |
 | DELETE | `/server-users/{id}?drop_remote=true` | GW+motor (`DROP USER`; bloquea si posee BDs) |
 | GET | `/server-users/{id}/databases` | GW (BDs que posee) |
+| POST | `/server-users/{id}/grants` | GW+motor (`GRANT`/`REVOKE` granular por nivel y objeto) |
+| POST | `/server-users/provision` | GW+motor (crear usuario + aprovisionar + grants iniciales en una sola llamada) |
 
 ### Blueprints — `/database-models`
 CRUD estándar (`GET`/`POST`/`GET {id}`/`PATCH {id}`/`DELETE {id}`) — todo **GW** — más
@@ -99,11 +101,67 @@ Ningún `*Out` expone passwords: `ServerUserOut` informa `has_password: bool`.
 | Reasignar owner | revoca al anterior + otorga al nuevo (`grant_database`, aún default `ALL` — pendiente de cablear al catálogo, Plan 07) | `ALTER DATABASE ... OWNER TO` + re-grant + revoca al anterior |
 | `charset`/`collation` | se usan | se ignoran (encoding fijo UTF8) |
 
-> **Política de privilegios (actualizada):** crear una BD/usuario **no otorga ningún
-> privilegio** por defecto (jamás `ALL PRIVILEGES`; eso solo lo tiene la credencial
-> pseudo-root de conexión). Los privilegios se asignan **explícitamente**. El catálogo de
-> privilegios controlados por motor está en `GET /api/v1/privileges` (ver `privileges`).
-> La gestión GRANT/REVOKE granular real está **en construcción** (Plan 07).
+> **Política de privilegios:** crear una BD o un usuario **no otorga ningún privilegio**
+> por defecto (jamás `ALL PRIVILEGES`; eso solo lo tiene la credencial pseudo-root de
+> conexión). Los privilegios se asignan **explícitamente** mediante
+> `POST /api/v1/server-users/{user_id}/grants`. El catálogo de privilegios controlados
+> por motor está en `GET /api/v1/privileges` (ver `privileges`). Ver también la sección
+> [Gestión de permisos sobre la base de datos](#gestión-de-permisos-sobre-la-base-de-datos).
+
+## Gestión de permisos sobre la base de datos
+
+### Sin privilegios automáticos al crear
+
+Crear una `ManagedDatabase` (con o sin `?provision=true`) **no otorga ningún privilegio**
+al owner sobre esa base de datos:
+
+- **PostgreSQL:** el owner queda registrado como `OWNER` nativo de la BD (derechos de
+  propiedad implícitos sobre la BD en sí), pero sin entradas en ACL y sin acceso a objetos
+  dentro del schema `public` hasta que se haga un GRANT explícito.
+- **MySQL / MariaDB:** el owner es solo una asociación lógica en el inventario del gateway.
+  El usuario del motor no recibe ningún `GRANT`; no puede conectarse a esa BD ni operar
+  ningún objeto hasta que se otorguen privilegios explícitamente.
+
+### Otorgar permisos: `POST /api/v1/server-users/{user_id}/grants`
+
+Para dar acceso a un usuario sobre una base de datos gestionada:
+
+```http
+POST /api/v1/server-users/{user_id}/grants
+Content-Type: application/json
+
+{
+  "level": "database",
+  "object_ref": { "database": "nombre_bd" },
+  "privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]
+}
+```
+
+El catálogo de privilegios válidos por motor y nivel está en `GET /api/v1/privileges`.
+
+> Ver `docs/features/permissions.md` para la documentación completa del módulo de
+> permisos (niveles, motor-específico, REVOKE, catálogo).
+
+### Flujo de trabajo recomendado: crear BD y dar acceso
+
+**Opción A — flujos separados (usuario ya existe):**
+
+```
+1. POST /api/v1/managed-databases?provision=true     → crea la BD en el motor
+2. POST /api/v1/server-users/{id}/grants             → otorga privilegios sobre la BD
+```
+
+**Opción B — aprovisionamiento unificado (usuario nuevo):**
+
+```
+1. POST /api/v1/managed-databases?provision=true     → crea la BD
+2. POST /api/v1/server-users/provision               → crea el usuario + aprovisiona
+                                                        + aplica initial_grants en una
+                                                        sola llamada
+```
+
+`initial_grants` en el body de `/provision` acepta la misma estructura que `/grants`,
+lo que evita viajes adicionales cuando se aprovisiona un usuario desde cero.
 
 ## Verificación
 
@@ -123,10 +181,11 @@ uv run pytest -q tests/test_api_server_users.py tests/test_api_managed_databases
 
 ### Checklist de verificación contra motores reales (gate de despliegue)
 
-1. **MySQL 8 — dependencia de orden:** `GRANT` **no autocrea** usuarios en MySQL 8. Una
-   `ManagedDatabase` con `provision=true` cuyo `owner` se creó **solo en inventario**
-   (sin `?provision=true`) fallará en el `GRANT` y quedará `status=error`. **Aprovisiona
-   primero el `ServerUser` (`?provision=true`), luego la BD.**
+1. **MySQL 8 — aprovisionar el usuario antes que la BD:** `CREATE DATABASE` no requiere
+   que el owner exista en el motor (la BD se crea sin GRANT automático), pero si
+   posteriormente se otorgan privilegios via `POST /server-users/{id}/grants`, el usuario
+   debe existir en MySQL (`GRANT` **no autocrea** usuarios en MySQL 8). **Siempre
+   aprovisiona el `ServerUser` (`?provision=true`) antes de llamar a `/grants`.**
 2. **MySQL — escape de password:** probar create/change-password con passwords que
    contengan `'` y `\`, con `sql_mode=NO_BACKSLASH_ESCAPES` y sin él (el escape ahora
    dobla la comilla `''`, seguro en ambos modos).
