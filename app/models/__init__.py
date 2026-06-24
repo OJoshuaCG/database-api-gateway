@@ -17,9 +17,11 @@ Ejemplo:
 
 from app.models.audit_log import AuditLog
 from app.models.base import Base, TimestampMixin
+from app.models.crypto_key import CryptoKey
 from app.models.database_model import DatabaseModel
 from app.models.enums import EngineType, ProvisionStatus, ServerStatus
 from app.models.managed_database import ManagedDatabase
+from app.models.permission_profile import PermissionProfile, PermissionProfileItem
 from app.models.privilege import Privilege
 from app.models.server import Server
 from app.models.server_user import ServerUser
@@ -34,7 +36,10 @@ __all__ = [
     "DatabaseModel",
     "ManagedDatabase",
     "AuditLog",
+    "CryptoKey",
     "Privilege",
+    "PermissionProfile",
+    "PermissionProfileItem",
     "EngineType",
     "ServerStatus",
     "ProvisionStatus",
