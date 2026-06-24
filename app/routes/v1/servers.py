@@ -7,8 +7,10 @@ CRUD del inventario (solo BD del gateway) + operaciones contra el servidor desti
 
 from fastapi import APIRouter
 
+from app.controllers.grant_controller import GrantController
 from app.controllers.server_controller import ServerController
 from app.core.auth import AdminDep
+from app.schemas.grant import GrantableRequest, GrantableResult
 from app.schemas.server import ServerCreate, ServerOut, ServerUpdate
 from app.services.db_admin.dtos import ConnectionInfo, EngineUserInfo, TableSchema
 from app.utils.pagination import PaginationDep
@@ -81,3 +83,15 @@ def list_tables(admin: AdminDep, server_id: int, database: str):
 )
 def get_table_schema(admin: AdminDep, server_id: int, database: str, table: str):
     return success(data=ServerController().get_table_schema(server_id, database, table))
+
+
+@router.post("/{server_id}/grantable", response_model=ApiResponse[GrantableResult])
+def check_grantable(admin: AdminDep, server_id: int, payload: GrantableRequest):
+    """Verifica si la credencial admin del servidor puede delegar los privilegios indicados."""
+    can = GrantController().check_grantable(server_id, payload)
+    result = GrantableResult(
+        can_grant=can,
+        level=payload.level,
+        privileges=payload.privileges,
+    )
+    return success(data=result)

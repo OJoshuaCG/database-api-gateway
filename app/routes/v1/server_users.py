@@ -13,8 +13,10 @@ Flags que tocan el motor:
 
 from fastapi import APIRouter, Query
 
+from app.controllers.grant_controller import GrantController
 from app.controllers.server_user_controller import ServerUserController
 from app.core.auth import AdminDep
+from app.schemas.grant import GrantInfo, GrantRequest, GrantableResult, RevokeRequest
 from app.schemas.managed_database import ManagedDatabaseOut
 from app.schemas.server_user import ServerUserCreate, ServerUserOut, ServerUserUpdate
 from app.utils.pagination import PaginationDep
@@ -87,3 +89,37 @@ def delete_server_user(
 )
 def list_user_databases(admin: AdminDep, user_id: int):
     return success(data=ServerUserController().list_user_databases(user_id))
+
+
+# ----------------------- Grants granulares -------------------------------- #
+@router.get("/{user_id}/grants", response_model=ApiResponse[list[GrantInfo]])
+def list_grants(
+    admin: AdminDep,
+    user_id: int,
+    database: str | None = Query(
+        None,
+        description=(
+            "Obligatorio en PostgreSQL: base de datos donde se consultan los grants "
+            "de objeto (tablas/columnas/secuencias/rutinas). En MySQL/MariaDB se ignora."
+        ),
+    ),
+):
+    grants = GrantController().list_grants(user_id, database=database)
+    return success(data=grants)
+
+
+@router.post("/{user_id}/grants", response_model=ApiResponse[dict])
+def grant_object(admin: AdminDep, user_id: int, payload: GrantRequest):
+    result = GrantController().grant_object(user_id, payload, admin=admin)
+    priv_summary = ", ".join(payload.privileges)
+    return success(
+        data=result,
+        message=f"Privilegio(s) otorgado(s): {priv_summary} a nivel {payload.level.value}.",
+    )
+
+
+@router.delete("/{user_id}/grants", response_model=ApiResponse[None])
+def revoke_object(admin: AdminDep, user_id: int, payload: RevokeRequest):
+    GrantController().revoke_object(user_id, payload, admin=admin)
+    priv_summary = ", ".join(payload.privileges)
+    return empty(f"Privilegio(s) revocado(s): {priv_summary} a nivel {payload.level.value}.")
