@@ -25,7 +25,9 @@ from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.exceptions import AppHttpException
 from app.models.managed_database import ManagedDatabase
 from app.models.server_user import ServerUser
+from app.schemas.server_user import GrantApplyResult, GrantOnCreate, ServerUserFullOut, ServerUserOut
 from app.services import audit
+from app.services.db_admin.dtos import EngineUserInfo
 from app.services.db_admin.factory import get_adapter
 
 
@@ -248,6 +250,72 @@ class ServerUserController:
             touched_engine=bool(provision and new_password),
         )
         return result
+
+    def provision_with_grants(
+        self,
+        data: dict,
+        initial_grants: list[GrantOnCreate],
+        *,
+        admin: dict | None = None,
+    ) -> ServerUserFullOut:
+        """
+        Crea y aprovisiona el usuario (igual que create_server_user con provision=True)
+        y luego aplica la lista de grants iniciales. Los grants se aplican best-effort:
+        un fallo no deshace la creación del usuario.
+        """
+        from app.controllers.grant_controller import GrantController
+
+        # 1) Crear el usuario (siempre con provision=True en este endpoint)
+        user_dict = self.create_server_user(data, provision=True, admin=admin)
+
+        # Obtener el user_id recién creado para aplicar grants
+        user_id = user_dict["id"]
+        user_out = ServerUserOut(**user_dict)
+
+        # 2) Aplicar grants best-effort
+        grant_results: list[GrantApplyResult] = []
+        grants_applied = 0
+
+        if initial_grants:
+            # Re-cargar contexto del usuario para el adapter
+            from app.schemas.grant import GrantRequest
+
+            ctrl = GrantController()
+            for grant_spec in initial_grants:
+                req = GrantRequest(
+                    level=grant_spec.level,
+                    object_ref=grant_spec.object_ref,
+                    privileges=grant_spec.privileges,
+                    with_grant_option=grant_spec.with_grant_option,
+                )
+                obj_label = grant_spec.object_ref.table or grant_spec.object_ref.database
+                try:
+                    ctrl.grant_object(user_id, req, admin=admin)
+                    grants_applied += 1
+                    grant_results.append(
+                        GrantApplyResult(
+                            level=grant_spec.level.value,
+                            object=obj_label,
+                            privileges=grant_spec.privileges,
+                            success=True,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    grant_results.append(
+                        GrantApplyResult(
+                            level=grant_spec.level.value,
+                            object=obj_label,
+                            privileges=grant_spec.privileges,
+                            success=False,
+                            error=str(exc),
+                        )
+                    )
+
+        return ServerUserFullOut(
+            user=user_out,
+            grants_applied=grants_applied,
+            grant_results=grant_results,
+        )
 
     def delete_server_user(
         self,

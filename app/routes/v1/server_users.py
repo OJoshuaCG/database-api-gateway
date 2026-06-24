@@ -16,9 +16,9 @@ from fastapi import APIRouter, Query
 from app.controllers.grant_controller import GrantController
 from app.controllers.server_user_controller import ServerUserController
 from app.core.auth import AdminDep
-from app.schemas.grant import GrantInfo, GrantRequest, GrantableResult, RevokeRequest
+from app.schemas.grant import ApplyProfileRequest, ApplyProfileResult, GrantInfo, GrantRequest, GrantableResult, RevokeRequest
 from app.schemas.managed_database import ManagedDatabaseOut
-from app.schemas.server_user import ServerUserCreate, ServerUserOut, ServerUserUpdate
+from app.schemas.server_user import ServerUserCreate, ServerUserFullCreate, ServerUserFullOut, ServerUserOut, ServerUserUpdate
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
@@ -123,3 +123,48 @@ def revoke_object(admin: AdminDep, user_id: int, payload: RevokeRequest):
     GrantController().revoke_object(user_id, payload, admin=admin)
     priv_summary = ", ".join(payload.privileges)
     return empty(f"Privilegio(s) revocado(s): {priv_summary} a nivel {payload.level.value}.")
+
+
+@router.post(
+    "/{user_id}/apply-profile/{profile_id}",
+    response_model=ApiResponse[ApplyProfileResult],
+)
+def apply_profile(
+    admin: AdminDep,
+    user_id: int,
+    profile_id: int,
+    payload: ApplyProfileRequest,
+):
+    """Aplica un perfil de permisos guardado al usuario. Los niveles sin mapeo se omiten."""
+    result = GrantController().apply_profile(user_id, profile_id, payload, admin=admin)
+    msg = f"Perfil '{result.profile_name}' aplicado: {result.grants_applied} grant(s)."
+    if result.errors:
+        msg += f" {len(result.errors)} error(es) parciales."
+    return success(data=result, message=msg)
+
+
+# ──────────────────── Endpoint unificado crear + grants ────────────────────── #
+@router.post(
+    "/provision",
+    response_model=ApiResponse[ServerUserFullOut],
+    status_code=201,
+    summary="Crear usuario + aprovisionar en motor + aplicar grants iniciales",
+)
+def provision_with_grants(admin: AdminDep, payload: ServerUserFullCreate):
+    """
+    Endpoint unificado: crea el usuario en el inventario, lo aprovisiona en el motor
+    destino (CREATE USER) y aplica los ``initial_grants`` indicados. Los grants son
+    best-effort: un fallo en un grant no revierte la creación del usuario.
+    """
+    result = ServerUserController().provision_with_grants(
+        payload.model_dump(exclude={"initial_grants"}),
+        payload.initial_grants,
+        admin=admin,
+    )
+    msg = f"Usuario '{payload.username}' aprovisionado."
+    if result.grants_applied:
+        msg += f" {result.grants_applied} grant(s) aplicado(s)."
+    failed = [r for r in result.grant_results if not r.success]
+    if failed:
+        msg += f" {len(failed)} grant(s) fallido(s)."
+    return success(data=result, message=msg)

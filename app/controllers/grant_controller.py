@@ -15,10 +15,18 @@ from app.controllers.common import build_target, get_server_or_404
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.exceptions import AppHttpException
+from app.models.permission_profile import PermissionProfile, PermissionProfileItem
+from app.models.server import Server
 from app.models.server_user import ServerUser
-from app.schemas.grant import GrantRequest, GrantableRequest, RevokeRequest
+from app.schemas.grant import (
+    ApplyProfileRequest,
+    ApplyProfileResult,
+    GrantRequest,
+    GrantableRequest,
+    RevokeRequest,
+)
 from app.services import audit
-from app.services.db_admin.dtos import EngineUserInfo, GrantInfo
+from app.services.db_admin.dtos import EngineUserInfo, GrantInfo, GrantLevel, ObjectRef
 from app.services.db_admin.factory import get_adapter
 
 
@@ -149,3 +157,98 @@ class GrantController:
             session.close()
         adapter = get_adapter(target)
         return adapter.can_grant(payload.level, payload.object_ref, payload.privileges)
+
+    # ------------------------------------------------------------------ #
+    # Apply permission profile                                             #
+    # ------------------------------------------------------------------ #
+    def apply_profile(
+        self,
+        user_id: int,
+        profile_id: int,
+        payload: ApplyProfileRequest,
+        *,
+        admin: dict | None = None,
+    ) -> ApplyProfileResult:
+        """
+        Aplica un perfil de permisos a un usuario. Para cada item del perfil, busca
+        el ``object_mapping`` correspondiente en el payload y ejecuta ``grant_object``.
+        Los niveles del perfil sin mapeo se omiten (se reportan en ``skipped_levels``).
+        Los errores de grant individuales se capturan para dar visibilidad sin abortar.
+        """
+        session = self._session()
+        try:
+            _, server_id, adapter, grantee = self._load_user_context(session, user_id)
+            # Cargar el perfil
+            profile = session.get(PermissionProfile, profile_id)
+            if not profile:
+                raise AppHttpException(
+                    message="Perfil de permisos no encontrado.",
+                    status_code=404,
+                    context={"profile_id": profile_id},
+                )
+            server = get_server_or_404(session, server_id)
+            engine = server.engine.value if hasattr(server.engine, "value") else str(server.engine)
+            if profile.engine != engine:
+                raise AppHttpException(
+                    message=(
+                        f"El perfil es para motor '{profile.engine}' pero el servidor usa '{engine}'."
+                    ),
+                    status_code=422,
+                    context={"profile_engine": profile.engine, "server_engine": engine},
+                )
+            items = (
+                session.query(PermissionProfileItem)
+                .filter(PermissionProfileItem.profile_id == profile_id)
+                .all()
+            )
+            profile_name = profile.name
+        finally:
+            session.close()
+
+        # Índice de mappings por nivel
+        mapping_index: dict[GrantLevel, ObjectRef] = {
+            m.level: m.object_ref for m in payload.object_mappings
+        }
+
+        grants_applied = 0
+        skipped_levels: list[str] = []
+        errors: list[str] = []
+
+        for item in items:
+            level = GrantLevel(item.level)
+            privileges = [p.strip() for p in item.privileges.split(",") if p.strip()]
+            ref = mapping_index.get(level)
+            if ref is None:
+                skipped_levels.append(level.value)
+                continue
+            try:
+                if not adapter.can_grant(level, ref, privileges):
+                    errors.append(
+                        f"{level.value}: credencial sin permisos suficientes para {privileges}"
+                    )
+                    continue
+                adapter.grant_object(grantee, level, ref, privileges)
+                grants_applied += 1
+            except Exception as exc:  # noqa: BLE001 — best-effort; reportar, no abortar
+                errors.append(f"{level.value}: {exc}")
+
+        audit.record(
+            "server_user.apply_profile",
+            admin=admin,
+            target_type="server_user",
+            target_id=user_id,
+            server_id=server_id,
+            touched_engine=True,
+            detail=(
+                f"profile_id={profile_id} ({profile_name}): "
+                f"{grants_applied} grants aplicados, {len(skipped_levels)} omitidos"
+            ),
+        )
+        return ApplyProfileResult(
+            profile_id=profile_id,
+            profile_name=profile_name,
+            engine=engine,
+            grants_applied=grants_applied,
+            skipped_levels=skipped_levels,
+            errors=errors,
+        )
