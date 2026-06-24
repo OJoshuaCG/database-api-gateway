@@ -9,10 +9,13 @@ Particularidades:
 """
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.remote_engine import map_driver_error, server_connection
+from app.exceptions import AppHttpException
+from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.base_adapter import ServerAdapter
-from app.services.db_admin.dtos import EngineUserInfo
+from app.services.db_admin.dtos import EngineUserInfo, GrantLevel, ObjectRef
 from app.services.db_admin.identifiers import (
     quote_identifier,
     quote_string_literal,
@@ -20,7 +23,6 @@ from app.services.db_admin.identifiers import (
     validate_identifier,
     validate_privileges,
 )
-from sqlalchemy.exc import SQLAlchemyError
 
 _SYSTEM_DATABASES = ("information_schema", "mysql", "performance_schema", "sys")
 _SYSTEM_USERS = (
@@ -167,6 +169,85 @@ class MySQLAdapter(ServerAdapter):
 
     # reassign_database_owner: usa la implementación por defecto del base
     # (revoke al anterior + grant al nuevo), correcta para MySQL/MariaDB.
+
+    # ------------------------- GRANT/REVOKE granular -------------------------- #
+    def _object_clause(
+        self, level: GrantLevel, ref: ObjectRef, canonical: list[str]
+    ) -> tuple[str, str]:
+        """
+        Construye ``(priv_clause, on_target)`` para MySQL/MariaDB. Los identificadores
+        del objeto son PREEXISTENTES (allow_existing) y se quotean; los privilegios
+        vienen del catálogo cerrado (constantes) y se interpolan tal cual.
+        """
+        d = self.dialect
+
+        def q(value: str, kind: str) -> str:
+            return quote_identifier(
+                validate_identifier(value, d, kind, allow_existing=True), d
+            )
+
+        if level == GrantLevel.DATABASE:
+            db = q(self._require_field(ref.database, "database"), "base de datos")
+            return ", ".join(canonical), f"{db}.*"
+        if level in (GrantLevel.TABLE, GrantLevel.COLUMN):
+            db = q(self._require_field(ref.database, "database"), "base de datos")
+            tbl = q(self._require_field(ref.table, "table"), "tabla")
+            target = f"{db}.{tbl}"
+            if level == GrantLevel.TABLE:
+                return ", ".join(canonical), target
+            # COLUMN: cada privilegio lleva la lista de columnas (validadas una a una).
+            if not ref.columns:
+                raise AppHttpException(
+                    message="Se requieren columnas para un permiso a nivel columna.",
+                    status_code=422,
+                )
+            col_list = "(" + ", ".join(q(c, "columna") for c in ref.columns) + ")"
+            return ", ".join(f"{p} {col_list}" for p in canonical), target
+        if level == GrantLevel.ROUTINE:
+            db = q(self._require_field(ref.database, "database"), "base de datos")
+            kind = self._routine_kind(ref.routine)
+            fn = q(self._require_field(ref.routine.name, "routine.name"), "rutina")
+            return ", ".join(canonical), f"{kind} {db}.{fn}"
+        raise AppHttpException(
+            message="Nivel de permiso no soportado para este motor.",
+            status_code=422,
+            context={"level": level.value, "dialect": d},
+        )
+
+    def _grantee(self, grantee: EngineUserInfo) -> str:
+        validate_identifier(grantee.username, self.dialect, "usuario", allow_existing=True)
+        host = grantee.host or "%"
+        validate_host(host)
+        return self._user_at_host(grantee.username, host)
+
+    def grant_object(
+        self, grantee, level, object_ref, privileges, *, with_grant_option=False
+    ) -> None:
+        canonical, _ = priv_catalog.validate_privileges(privileges, self.dialect, level)
+        # "GRANT OPTION" se confiere con la cláusula WITH GRANT OPTION, no como
+        # privilegio en sí (`GRANT GRANT OPTION ...` sería inválido). Si queda vacío,
+        # se usa USAGE (otorga la grant option sin otros privilegios).
+        wgo = with_grant_option
+        privs = [p for p in canonical if p != "GRANT OPTION"]
+        if "GRANT OPTION" in canonical:
+            wgo = True
+        if not privs:
+            privs = ["USAGE"]
+        priv_clause, on_target = self._object_clause(level, object_ref, privs)
+        stmt = f"GRANT {priv_clause} ON {on_target} TO {self._grantee(grantee)}"
+        if wgo:
+            stmt += " WITH GRANT OPTION"
+        self._execute_server(
+            [stmt], op="grant_object", extra={"username": grantee.username, "level": level.value}
+        )
+
+    def revoke_object(self, grantee, level, object_ref, privileges) -> None:
+        canonical, _ = priv_catalog.validate_privileges(privileges, self.dialect, level)
+        priv_clause, on_target = self._object_clause(level, object_ref, canonical)
+        stmt = f"REVOKE {priv_clause} ON {on_target} FROM {self._grantee(grantee)}"
+        self._execute_server(
+            [stmt], op="revoke_object", extra={"username": grantee.username, "level": level.value}
+        )
 
 
 class MariaDBAdapter(MySQLAdapter):

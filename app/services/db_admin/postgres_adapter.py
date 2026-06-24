@@ -15,8 +15,10 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.remote_engine import map_driver_error, server_connection
+from app.exceptions import AppHttpException
+from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.base_adapter import ServerAdapter
-from app.services.db_admin.dtos import EngineUserInfo
+from app.services.db_admin.dtos import EngineUserInfo, GrantLevel, ObjectRef
 from app.services.db_admin.identifiers import (
     quote_identifier,
     quote_string_literal,
@@ -168,3 +170,90 @@ class PostgresAdapter(ServerAdapter):
         # Revocar el acceso del anterior (la propiedad nativa ya cambió arriba).
         if old_owner:
             self.revoke_database(old_owner, db_name)
+
+    # ------------------------- GRANT/REVOKE granular -------------------------- #
+    def _qualified(self, ref: ObjectRef, name: str, kind: str) -> str:
+        """``"schema"."objeto"`` (schema default 'public'). Identificadores preexistentes."""
+        schema = self._require_field(ref.db_schema or "public", "schema")
+        validate_identifier(schema, self.dialect, "esquema", allow_existing=True)
+        validate_identifier(name, self.dialect, kind, allow_existing=True)
+        return (
+            f"{quote_identifier(schema, self.dialect)}."
+            f"{quote_identifier(name, self.dialect)}"
+        )
+
+    def _object_clause(
+        self, level: GrantLevel, ref: ObjectRef, canonical: list[str]
+    ) -> tuple[str, str, bool]:
+        """
+        Devuelve ``(priv_clause, on_target, server_level)``. ``server_level=True`` →
+        ejecutar a nivel servidor (DATABASE); en otro caso, conectado a la BD del ref.
+        """
+        d = self.dialect
+
+        def q(value: str, kind: str) -> str:
+            return quote_identifier(
+                validate_identifier(value, d, kind, allow_existing=True), d
+            )
+
+        if level == GrantLevel.DATABASE:
+            db = q(self._require_field(ref.database, "database"), "base de datos")
+            return ", ".join(canonical), f"DATABASE {db}", True
+        if level == GrantLevel.SCHEMA:
+            s = q(self._require_field(ref.db_schema or "public", "schema"), "esquema")
+            return ", ".join(canonical), f"SCHEMA {s}", False
+        if level in (GrantLevel.TABLE, GrantLevel.COLUMN):
+            target = self._qualified(ref, self._require_field(ref.table, "table"), "tabla")
+            if level == GrantLevel.TABLE:
+                return ", ".join(canonical), f"TABLE {target}", False
+            if not ref.columns:
+                raise AppHttpException(
+                    message="Se requieren columnas para un permiso a nivel columna.",
+                    status_code=422,
+                )
+            col_list = "(" + ", ".join(q(c, "columna") for c in ref.columns) + ")"
+            return ", ".join(f"{p} {col_list}" for p in canonical), target, False
+        if level == GrantLevel.SEQUENCE:
+            target = self._qualified(ref, self._require_field(ref.sequence, "sequence"), "secuencia")
+            return ", ".join(canonical), f"SEQUENCE {target}", False
+        if level == GrantLevel.ROUTINE:
+            kind = self._routine_kind(ref.routine)
+            target = self._qualified(ref, self._require_field(ref.routine.name, "routine.name"), "rutina")
+            return ", ".join(canonical), f"{kind} {target}", False
+        raise AppHttpException(
+            message="Nivel de permiso no soportado para este motor.",
+            status_code=422,
+            context={"level": level.value, "dialect": d},
+        )
+
+    def _build_dcl(self, verb: str, grantee, level, ref, privileges) -> tuple[str, str, bool]:
+        canonical, _ = priv_catalog.validate_privileges(privileges, self.dialect, level)
+        priv_clause, on_target, server_level = self._object_clause(level, ref, canonical)
+        role = quote_identifier(
+            validate_identifier(grantee.username, self.dialect, "usuario", allow_existing=True),
+            self.dialect,
+        )
+        connector = "TO" if verb == "GRANT" else "FROM"
+        return f"{verb} {priv_clause} ON {on_target} {connector} {role}", on_target, server_level
+
+    def grant_object(
+        self, grantee, level, object_ref, privileges, *, with_grant_option=False
+    ) -> None:
+        stmt, _on, server_level = self._build_dcl("GRANT", grantee, level, object_ref, privileges)
+        if with_grant_option:
+            stmt += " WITH GRANT OPTION"
+        extra = {"username": grantee.username, "level": level.value}
+        if server_level:
+            self._execute_server([stmt], op="grant_object", extra=extra)
+        else:
+            db = self._require_field(object_ref.database, "database")
+            self._execute_database(db, [stmt], op="grant_object", extra=extra)
+
+    def revoke_object(self, grantee, level, object_ref, privileges) -> None:
+        stmt, _on, server_level = self._build_dcl("REVOKE", grantee, level, object_ref, privileges)
+        extra = {"username": grantee.username, "level": level.value}
+        if server_level:
+            self._execute_server([stmt], op="revoke_object", extra=extra)
+        else:
+            db = self._require_field(object_ref.database, "database")
+            self._execute_database(db, [stmt], op="revoke_object", extra=extra)
