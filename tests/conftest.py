@@ -39,6 +39,7 @@ def client():
     TestClient con esquema fresco (drop+create) y admin sembrado por el lifespan.
     Rate limiting desactivado para evitar 429 entre pruebas.
     """
+    from app.core import crypto
     from app.core.database import Database
     from app.core.limiter import limiter
     from app.models import Base
@@ -46,6 +47,10 @@ def client():
     db = Database()
     Base.metadata.drop_all(db.engine)
     Base.metadata.create_all(db.engine)
+
+    # Esquema fresco → invalidar la DEK cacheada para aislar los tests entre sí
+    # (evita arrastrar una DEK rotada en un test previo).
+    crypto.reset_dek_cache()
 
     limiter.enabled = False
 

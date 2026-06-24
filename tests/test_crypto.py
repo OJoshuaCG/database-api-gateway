@@ -44,6 +44,6 @@ def test_decrypt_with_different_key_fails(monkeypatch):
     from cryptography.fernet import Fernet
 
     other = Fernet(base64.urlsafe_b64encode(b"x" * 32))
-    monkeypatch.setattr(crypto, "get_fernet", lambda: other)
+    monkeypatch.setattr(crypto, "_active_dek", lambda: other)
     with pytest.raises(crypto.CryptoError):
         crypto.decrypt(token)
