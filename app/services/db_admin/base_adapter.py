@@ -28,7 +28,9 @@ from app.services.db_admin.dtos import (
     ConnectionInfo,
     EngineUserInfo,
     ForeignKeyInfo,
+    GrantLevel,
     IndexInfo,
+    ObjectRef,
     TableSchema,
 )
 from app.services.db_admin.identifiers import validate_identifier
@@ -37,8 +39,37 @@ from app.services.db_admin.identifiers import validate_identifier
 class ServerAdapter(ABC):
     dialect: str
 
+    # Tipos de rutina admitidos en grants de EXECUTE/ALTER ROUTINE.
+    _ROUTINE_KINDS = frozenset({"FUNCTION", "PROCEDURE"})
+
     def __init__(self, target: ServerTarget):
         self.target = target
+
+    # ---- Helpers de validación de object_ref (compartidos por los adapters) --- #
+    @staticmethod
+    def _require_field(value: str | None, kind: str) -> str:
+        if not value:
+            raise AppHttpException(
+                message=f"Falta '{kind}' para la operación de permiso.",
+                status_code=422,
+                context={"missing": kind},
+            )
+        return value
+
+    @classmethod
+    def _routine_kind(cls, routine) -> str:
+        if routine is None:
+            raise AppHttpException(
+                message="Falta la rutina (routine) para el grant.", status_code=422
+            )
+        kind = (routine.kind or "").upper()
+        if kind not in cls._ROUTINE_KINDS:
+            raise AppHttpException(
+                message="Tipo de rutina inválido (use FUNCTION o PROCEDURE).",
+                status_code=422,
+                context={"allowed": sorted(cls._ROUTINE_KINDS)},
+            )
+        return kind
 
     # ------------------------------------------------------------------ #
     # Específico de dialecto                                              #
@@ -90,6 +121,29 @@ class ServerAdapter(ABC):
         self, username: str, db_name: str, host: str = "%", privileges: str = "ALL PRIVILEGES",
     ) -> None: ...
 
+    # ---- GRANT/REVOKE GRANULAR (Plan 07) — por nivel de objeto ---------------- #
+    @abstractmethod
+    def grant_object(
+        self,
+        grantee: EngineUserInfo,
+        level: GrantLevel,
+        object_ref: ObjectRef,
+        privileges: list[str],
+        *,
+        with_grant_option: bool = False,
+    ) -> None:
+        """Otorga ``privileges`` al ``grantee`` sobre el objeto del ``object_ref``."""
+
+    @abstractmethod
+    def revoke_object(
+        self,
+        grantee: EngineUserInfo,
+        level: GrantLevel,
+        object_ref: ObjectRef,
+        privileges: list[str],
+    ) -> None:
+        """Revoca ``privileges`` del ``grantee`` sobre el objeto del ``object_ref``."""
+
     def reassign_database_owner(
         self,
         db_name: str,
@@ -128,7 +182,8 @@ class ServerAdapter(ABC):
         )
 
     def list_tables(self, database: str) -> list[str]:
-        validate_identifier(database, self.dialect, "base de datos")
+        # Introspección de un objeto PREEXISTENTE: whitelist ampliada (nombres legados).
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         schema = self._inspect_schema(database)
         try:
             with database_connection(self.target, database) as conn:
@@ -139,8 +194,8 @@ class ServerAdapter(ABC):
             )
 
     def get_table_schema(self, database: str, table: str) -> TableSchema:
-        validate_identifier(database, self.dialect, "base de datos")
-        validate_identifier(table, self.dialect, "tabla")
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        validate_identifier(table, self.dialect, "tabla", allow_existing=True)
         schema = self._inspect_schema(database)
         try:
             with database_connection(self.target, database) as conn:

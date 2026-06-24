@@ -6,7 +6,7 @@ datos de filas de las tablas gestionadas: solo estructura/metadatos.
 
 import enum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class GrantLevel(str, enum.Enum):
@@ -37,6 +37,31 @@ class ConnectionInfo(BaseModel):
 class EngineUserInfo(BaseModel):
     username: str
     host: str | None = None  # solo MySQL/MariaDB
+
+
+class RoutineRef(BaseModel):
+    """Identidad de una rutina para grants de EXECUTE/ALTER ROUTINE."""
+
+    kind: str  # FUNCTION | PROCEDURE
+    name: str
+
+
+class ObjectRef(BaseModel):
+    """
+    Objeto destino de un GRANT/REVOKE. Los campos relevantes dependen del nivel:
+    DATABASE→database; SCHEMA(PG)→database+schema; TABLE/COLUMN→database[+schema]+table
+    (+columns); SEQUENCE(PG)→database+schema+sequence; ROUTINE→database[+schema]+routine.
+    `schema` solo aplica a PostgreSQL (default 'public').
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    database: str | None = None
+    db_schema: str | None = Field(default=None, alias="schema")
+    table: str | None = None
+    columns: list[str] = Field(default_factory=list)
+    sequence: str | None = None
+    routine: RoutineRef | None = None
 
 
 class ColumnInfo(BaseModel):
