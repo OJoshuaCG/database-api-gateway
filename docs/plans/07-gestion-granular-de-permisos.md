@@ -1,6 +1,6 @@
 # 07 — Gestión granular de permisos (GRANT/REVOKE cross-engine)
 
-**Estado:** 🔵 Diseño · **Depende de:** 01 (inventario) ✅ · **Esfuerzo:** alto · **Criticidad:** alta (DCL dinámico)
+**Estado:** 🟡 Fase 1 implementada — Fase 2/3 pendiente · **Depende de:** 01 (inventario) ✅ · **Esfuerzo:** alto · **Criticidad:** alta (DCL dinámico)
 
 Hoy el gateway solo otorga permisos **a nivel de base de datos completa** (`grant_database`/
 `revoke_database`) con una validación de privilegios **laxa** (regex que acepta cualquier
@@ -176,11 +176,13 @@ Todas con `ApiResponse[T]`, `AppHttpException`, admin autenticado, y `def` (I/O 
 
 ## 8. Fases
 
-- **Fase 1 (núcleo seguro):** whitelists por motor/nivel + tabla de compatibilidad; reemplazo
+- **Fase 1 (núcleo seguro) 🟡:** whitelists por motor/nivel + tabla de compatibilidad; reemplazo
   de `validate_privileges`; `grant_object`/`revoke_object`/`list_grants`/`can_grant`; niveles
   DATABASE, SCHEMA(PG), TABLE, COLUMN, SEQUENCE(PG), ROUTINE(EXECUTE); privilegios object-level
   (ALLOW) + GATE con confirmación; DENY de admin; ampliación de `AuditLog` + migración;
   endpoints `/grants` y `/grantable`; tests de contrato contra **motores reales** (Docker).
+  — Parcialmente completo: endpoints y adapters listos y verificados; **AuditLog ampliado y
+  tests de integración formales pendientes** (ver §11).
 - **Fase 2:** membresía de roles (`GRANT rol TO rol`), default privileges generalizados a
   objetos futuros (sequences/functions), `MAINTAIN`/roles predefinidos gateados, endpoint de
   atributos de cuenta.
@@ -234,11 +236,61 @@ Todas con `ApiResponse[T]`, `AppHttpException`, admin autenticado, y `def` (I/O 
   (DATABASE a nivel servidor; el resto conectado a la BD). Privilegios validados contra
   el catálogo cerrado; identificadores quoteados; columnas validadas una a una;
   `GRANT OPTION` → cláusula `WITH GRANT OPTION` (MySQL). 23 tests del DCL generado.
-- **Pendiente del keystone (requiere MOTORES REALES / Docker):** `can_grant`
-  (pre-chequeo de capability del grantor — introspección `SHOW GRANTS`/`has_*_privilege`/
-  `aclexplode`), `list_grants`, `AuditLog` ampliado + migración, y endpoints
-  `/server-users/{id}/grants` + `/servers/{id}/grantable` (con confirmación GATE,
-  anti auto-lockout, auditoría). `can_grant` y la verificación NO se pueden completar/
-  validar sobre SQLite. **Bloquean** la APLICACIÓN de perfiles a usuarios y el
-  **endpoint unificado** crear-usuario+permisos.
-```
+- **`list_grants` (introspección en vivo):** implementado en `MySQLAdapter`/`MariaDBAdapter`
+  y `PostgresAdapter`. MariaDB: UNION de 4 vistas `information_schema`
+  (`USER_PRIVILEGES`, `SCHEMA_PRIVILEGES`, `TABLE_PRIVILEGES`, `COLUMN_PRIVILEGES`).
+  PostgreSQL: UNION de `role_table_grants`, `role_column_grants`, `role_routine_grants`,
+  `role_usage_grants`; **requiere** parámetro `database` (422 si no se pasa).
+  Verificado contra `gw-it-mariadb` (127.0.0.1:33061) y `gw-it-postgres` (127.0.0.1:54321).
+- **`can_grant` (pre-chequeo de capability del grantor):** implementado en ambos adapters.
+  MariaDB: consulta `USER_PRIVILEGES` de `CURRENT_USER` con `IS_GRANTABLE='YES'`; bugfix:
+  `GRANT OPTION` nunca aparece como `PRIVILEGE_TYPE` — se detecta con `bool(grantable)`.
+  PostgreSQL: check de `rolsuper` primero; si no, `has_*_privilege(current_user, obj,
+  'PRIV WITH GRANT OPTION')`. Verificado contra motores reales.
+- **Endpoints GRANT/REVOKE/LIST/GRANTABLE/PROVISION/APPLY-PROFILE (22 checks MariaDB,
+  16 checks PostgreSQL — todos OK):**
+  - `GET /api/v1/server-users/{id}/grants?database=` — introspección de grants efectivos
+    (`list_grants`).
+  - `POST /api/v1/server-users/{id}/grants` — otorgar privilegios con pre-check
+    `can_grant` → 403 si el admin no puede delegar.
+  - `DELETE /api/v1/server-users/{id}/grants` — revocar privilegios.
+  - `POST /api/v1/servers/{id}/grantable` — verificar capability del admin del gateway.
+  - `POST /api/v1/server-users/provision` — crear usuario + aprovisionar + grants
+    iniciales (best-effort: grants fallan sin abortar el provisioning).
+  - `POST /api/v1/server-users/{id}/apply-profile/{profile_id}` — aplicar perfil
+    guardado (best-effort).
+  Schemas Pydantic: `app/schemas/grant.py` (`GrantRequest`, `RevokeRequest`,
+  `GrantableRequest`, `GrantableResult`, `LevelObjectMapping`, `ApplyProfileRequest`,
+  `ApplyProfileResult`); `app/schemas/server_user.py` (`GrantOnCreate`,
+  `ServerUserFullCreate`, `GrantApplyResult`, `ServerUserFullOut`).
+  Controllers: `app/controllers/grant_controller.py`,
+  `app/controllers/server_user_controller.py` (`provision_with_grants`).
+- **Estado de tests:** 251/251 tests pytest en verde. Scripts de verificación end-to-end
+  corridos contra motores reales (stack Docker). Catálogo cerrado cableado a todos los
+  flujos DCL.
+
+---
+
+## 11. Pendiente (Fase 1 incompleto)
+
+Los siguientes ítems forman parte del alcance de la Fase 1 pero **no se implementaron** en
+este incremento:
+
+- **`AuditLog` ampliado:** agregar campos granulares (`grantee`, `privilege`,
+  `object_level`, `object_name`, `with_grant_option`, `grantor`) al modelo existente +
+  migración Alembic correspondiente. Hoy las operaciones DCL se registran en el log
+  genérico pero sin los campos específicos de DCL.
+- **Tests de integración formales:** batería `@pytest.mark.integration` parametrizada por
+  motor (MariaDB / PostgreSQL) que ejecute cada combinación de GRANT/REVOKE/LIST en el
+  stack Docker. Hoy la verificación fue manual con scripts end-to-end; no está
+  automatizada en CI.
+- **Anti auto-lockout explícito (código):** la regla "rechazar REVOKE cuyo `grantee`
+  resuelva a la credencial del gateway" (§6 punto 6) fue verificada implícitamente por el
+  motor (el motor lo rechaza), pero no existe guard explícito en el controller que devuelva
+  un 409 con mensaje claro antes de intentar la operación.
+- **CASCADE en REVOKE con confirmación:** actualmente no soportado. `REVOKE ... CASCADE`
+  sería bloqueante (RESTRICT por defecto); diseño e implementación con confirmación
+  pendientes (§6 punto 7).
+- **Fase 2/3:** membresía de roles (`GRANT rol TO rol`), default privileges generalizados,
+  niveles raros PG (type/lang/FDW/large object/parameter), administrativos split de
+  MariaDB, reconciliación inventario↔motor (ver §8 Fases).
