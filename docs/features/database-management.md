@@ -40,7 +40,8 @@ Patrón sin rollback silencioso:
 ```
 ManagedDatabase.create(provision=true):
     INSERT status=pending
-    → CREATE DATABASE + GRANT al owner
+    → CREATE DATABASE  (SIN GRANT: el propietario NO recibe privilegios por defecto;
+                        en PostgreSQL queda como OWNER nativo, en MySQL/MariaDB sin nada)
          éxito → status=active
          falla → status=error (detalle en notes), se conserva el registro, error HTTP al cliente
 
@@ -81,7 +82,7 @@ CRUD estándar (`GET`/`POST`/`GET {id}`/`PATCH {id}`/`DELETE {id}`) — todo **G
 | Método | Ruta | Alcance |
 |---|---|---|
 | GET | `/managed-databases?server_id=&owner_id=&model_id=&status=` | GW |
-| POST | `/managed-databases?provision=true` | GW+motor (`CREATE DATABASE` + `GRANT` al owner) |
+| POST | `/managed-databases?provision=true` | GW+motor (`CREATE DATABASE`; **sin GRANT** automático) |
 | GET | `/managed-databases/{id}` | GW |
 | PATCH | `/managed-databases/{id}` | GW (metadatos del inventario) |
 | DELETE | `/managed-databases/{id}?drop_remote=true` | GW+motor (`DROP DATABASE`) |
@@ -93,10 +94,16 @@ Ningún `*Out` expone passwords: `ServerUserOut` informa `has_password: bool`.
 
 | Tema | MySQL / MariaDB | PostgreSQL |
 |---|---|---|
-| Crear BD | `CREATE DATABASE ... CHARACTER SET ...` | `CREATE DATABASE ... OWNER <role> ENCODING 'UTF8' TEMPLATE template0` |
-| Propiedad | lógica: `GRANT ALL ON db.*` al owner | nativa: `OWNER` + `GRANT` de dos niveles (DATABASE + SCHEMA/TABLES) |
-| Reasignar owner | revoca al anterior + otorga al nuevo (default del base adapter) | `ALTER DATABASE ... OWNER TO` + re-grant + revoca al anterior |
+| Crear BD | `CREATE DATABASE ... CHARACTER SET ...` (sin GRANT al owner) | `CREATE DATABASE ... OWNER <role> ENCODING 'UTF8' TEMPLATE template0` |
+| Propiedad | lógica: asociación en metadatos del gateway (el owner **no** recibe privilegios automáticos) | nativa: `OWNER` (`ALTER DATABASE ... OWNER TO`) |
+| Reasignar owner | revoca al anterior + otorga al nuevo (`grant_database`, aún default `ALL` — pendiente de cablear al catálogo, Plan 07) | `ALTER DATABASE ... OWNER TO` + re-grant + revoca al anterior |
 | `charset`/`collation` | se usan | se ignoran (encoding fijo UTF8) |
+
+> **Política de privilegios (actualizada):** crear una BD/usuario **no otorga ningún
+> privilegio** por defecto (jamás `ALL PRIVILEGES`; eso solo lo tiene la credencial
+> pseudo-root de conexión). Los privilegios se asignan **explícitamente**. El catálogo de
+> privilegios controlados por motor está en `GET /api/v1/privileges` (ver `privileges`).
+> La gestión GRANT/REVOKE granular real está **en construcción** (Plan 07).
 
 ## Verificación
 

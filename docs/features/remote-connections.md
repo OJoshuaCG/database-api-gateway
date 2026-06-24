@@ -23,7 +23,7 @@ descifrado** (el controller lo descifra en memoria) y esta capa nunca lo loguea.
 
 ```python
 ServerTarget(server_id=1, dialect="mysql", host="10.0.0.5",
-             port=3306, admin_user="root", admin_password="...")
+             port=3306, admin_user="root", admin_password="...", ssl_mode="require")
 ```
 
 ### Fábrica y cache de engines
@@ -43,6 +43,17 @@ engine = remote_engine.get_engine(target, "mi_basede") # conexión a una BD conc
   PostgreSQL conecta a `postgres`. Una BD concreta se usa para introspección y grants de PG.
 - **Timeouts por dialecto:** `REMOTE_CONNECT_TIMEOUT` (TCP) y `REMOTE_STATEMENT_TIMEOUT_MS`
   (ejecución). En MySQL vía `read_timeout`; en PostgreSQL vía `statement_timeout`/`lock_timeout`.
+- **TLS por servidor (`ssl_mode`):** cada `Server` define su política TLS hacia el motor
+  (`require | verify-ca | verify-full | prefer | allow | disable`); vacío/None = **sin TLS**.
+  Si no se define, cae al fallback global `REMOTE_SSL_MODE`. `_connect_args` lo traduce al
+  driver con estas diferencias importantes:
+  - **PostgreSQL:** aplica `sslmode` nativamente; con `require` **rechaza** la conexión si el
+    servidor no tiene TLS.
+  - **MySQL/MariaDB:** solo **cifra** el transporte (sin verificación de CA). ⚠️ Con `require`
+    **NO rechaza**: si el servidor no soporta TLS, pymysql cae a **texto plano en silencio**
+    (se comporta como `PREFERRED`). Limitación conocida — ver `docs/plans/08-production-readiness.md` (#3).
+  - `verify-ca`/`verify-full` aún **no** modelan material de CA por servidor → protegen de
+    sniffing pasivo, no de MitM activo.
 
 ### Context managers
 
@@ -101,9 +112,11 @@ adapter.list_tables("app")             # list[str]
 adapter.get_table_schema("app", "users")  # TableSchema
 ```
 
-**Métodos de escritura** (implementados, sin endpoint aún — Iteración 2):
+**Métodos de escritura** (expuestos vía API en la Iteración 2):
 `create_database`, `drop_database`, `create_user`, `drop_user`, `change_password`,
-`grant_database`, `revoke_database`.
+`grant_database`, `revoke_database`. Nota: `create_database` ya **no** otorga privilegios
+al owner por defecto (política "sin privilegios por defecto"; ver
+[database-management.md](database-management.md)).
 
 ### Diferencias entre motores que encapsula
 
