@@ -80,8 +80,10 @@ def test_test_connection_unreachable_502(admin_client, server_payload):
 
 def test_introspection_invalid_identifier_422(admin_client, server_payload):
     sid = admin_client.post("/api/v1/servers", json=server_payload()).json()["data"]["id"]
-    # No necesita conectar: la validación del identificador ocurre antes.
-    r = admin_client.get(f"/api/v1/servers/{sid}/databases/bad-name/tables")
+    # Nombre con caracteres peligrosos (`;`): rechazado antes de conectar, incluso con
+    # la whitelist ampliada de introspección. (Un nombre legado como `bad-name` SÍ es
+    # válido ahora — deuda #3 — y procedería a conectar.)
+    r = admin_client.get(f"/api/v1/servers/{sid}/databases/bad;name/tables")
     assert r.status_code == 422
 
 

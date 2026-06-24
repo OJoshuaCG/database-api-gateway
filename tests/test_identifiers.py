@@ -81,3 +81,27 @@ def test_privileges_validation():
     assert ident.validate_privileges("SELECT, INSERT") == "SELECT, INSERT"
     with pytest.raises(AppHttpException):
         ident.validate_privileges("SELECT; DROP")
+
+
+# --- Deuda #3: whitelist ampliada para introspección de objetos preexistentes --- #
+@pytest.mark.parametrize("name", ["my-db", "my.db", "3legacy", "with$dollar", "a-b.c_d"])
+def test_existing_names_allowed_only_with_flag(name):
+    # Con allow_existing=True pasan (nombres legados con - . dígito inicial $).
+    assert ident.validate_identifier(name, "mysql", allow_existing=True) == name
+    # Con la whitelist estricta (para objetos que el gateway crea) se rechazan.
+    with pytest.raises(AppHttpException):
+        ident.validate_identifier(name, "mysql")
+
+
+@pytest.mark.parametrize(
+    "name", ["bad;name", "back`tick", 'quo"te', "with space", "back\\slash", "a\x00b"]
+)
+def test_dangerous_chars_rejected_even_for_existing(name):
+    # Incluso con allow_existing, los caracteres peligrosos siguen prohibidos.
+    with pytest.raises(AppHttpException):
+        ident.validate_identifier(name, "mysql", allow_existing=True)
+
+
+def test_existing_whitelist_still_enforces_length():
+    with pytest.raises(AppHttpException):
+        ident.validate_identifier("a" * 64, "mysql", allow_existing=True)
