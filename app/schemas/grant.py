@@ -30,5 +30,40 @@ class GrantableResult(BaseModel):
     privileges: list[str]
 
 
+# ─── Apply-profile endpoint ────────────────────────────────────────────────── #
+
+class LevelObjectMapping(BaseModel):
+    """Mapeo de un nivel de permiso a un objeto concreto para aplicar un perfil."""
+    level: GrantLevel
+    object_ref: ObjectRef
+
+
+class ApplyProfileRequest(BaseModel):
+    """
+    Parámetros para aplicar un perfil de permisos a un usuario. Para cada nivel
+    definido en el perfil, se debe proveer el objeto destino (BD, tabla, etc.).
+    Los niveles del perfil sin mapeo se omiten (se reportan como 'skipped').
+    """
+    object_mappings: list[LevelObjectMapping] = Field(
+        default_factory=list,
+        description=(
+            "Lista de (nivel → objeto) para cada nivel del perfil que se quiere aplicar. "
+            "Niveles del perfil sin mapeo son omitidos."
+        ),
+    )
+
+
+class ApplyProfileResult(BaseModel):
+    profile_id: int
+    profile_name: str
+    engine: str
+    grants_applied: int
+    skipped_levels: list[str]
+    errors: list[str]
+
+
 # Re-export GrantInfo as the list-grants output type.
-__all__ = ["GrantRequest", "RevokeRequest", "GrantableRequest", "GrantableResult", "GrantInfo"]
+__all__ = [
+    "GrantRequest", "RevokeRequest", "GrantableRequest", "GrantableResult",
+    "GrantInfo", "LevelObjectMapping", "ApplyProfileRequest", "ApplyProfileResult",
+]
