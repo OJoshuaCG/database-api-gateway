@@ -12,7 +12,7 @@ Leyenda: ✅ hecho · 🟡 parcial · ⛔ pendiente.
 ## P0 — Bloqueantes antes de CUALQUIER exposición
 
 ### #1 ⛔ Verificación contra motores reales = CERO
-Toda la suite (191 tests) corre sobre **SQLite**, que no soporta GRANT/REVOKE/CREATE
+Toda la suite (201 tests) corre sobre **SQLite**, que no soporta GRANT/REVOKE/CREATE
 USER ni la introspección por dialecto. **Ninguna** operación DDL/DCL se ha ejecutado
 contra MySQL/MariaDB/PostgreSQL reales, ni las migraciones, ni el stack Docker.
 - **Validar:** levantar `docker compose --profile test up --build`; confirmar
@@ -47,11 +47,15 @@ contra MySQL/MariaDB/PostgreSQL reales, ni las migraciones, ni el stack Docker.
 - **Decisión:** NO se añadió guard que obligue TLS en producción (es opcional por
   conexión, por decisión de producto).
 
-### #4 ⛔ SSRF — sin allowlist de destino
-`POST /servers` acepta `host`/`port` arbitrarios y el gateway abre conexión real → un
-admin (o sesión robada / CSRF) puede apuntar a `169.254.169.254` (metadata cloud),
-`localhost` o servicios internos. **Pendiente de decisión del usuario:** qué rangos
-permitir (y rechazar loopback/link-local/metadata/privados por defecto).
+### #4 ✅ SSRF — allowlist de destino (IMPLEMENTADO)
+`app/core/net_guard.py` valida el host al registrar/editar un `Server`: rechaza
+**loopback, link-local/metadata (`169.254.169.254`), multicast, no especificados y
+reservados**; resuelve hostnames por DNS. Los rangos **privados se permiten por defecto**
+(las BD destino suelen ser internas); allowlist estricta **opcional** vía
+`REMOTE_ALLOWED_CIDRS`. Conmutable con `REMOTE_SSRF_GUARD_ENABLED` (default True).
+Tests: `tests/test_ssrf_guard.py`.
+- ⚠️ **Caveat:** valida en el REGISTRO, no protege de DNS-rebinding (revalidar la IP
+  justo antes de conectar = mejora futura).
 
 ### #5 ⛔ Gestión y rotación de secretos
 - La clave Fernet de `.env.docker` (real, ya tocó disco) debe tratarse como **quemada**;
@@ -75,7 +79,10 @@ permitir (y rechazar loopback/link-local/metadata/privados por defecto).
     **evasión del rate limit**; restringir a la IP de nginx.
   - `HEALTHCHECK` del Dockerfile apunta a `/health` (liveness); debería usar
     `/health/ready`.
-- **Rate limit en memoria por worker** ⛔: con multi-worker, habilitar backend Redis.
+- **Rate limit con backend compartido** ✅: **Valkey** (fork OSI de Redis, wire-compatible)
+  en `docker-compose.yml`; el `api` usa `RATE_LIMIT_REDIS_ENABLED=True` →
+  `redis://valkey:6379`. Resuelve el bypass multi-worker. (Sigue pendiente subir
+  `WORKERS` y desplegar el propio Valkey en HA.)
 - **Plan 07 incompleto** 🟡: solo catálogo/validación; faltan los endpoints reales de
   GRANT/REVOKE granular. No anunciar "gestión de permisos" como lista.
 
@@ -97,7 +104,7 @@ Anti-inyección de identificadores (doble capa); no fuga de credenciales
 (`map_driver_error`, `ServerOut`); Argon2 + login `5/minute` + 401 genérico; guards de
 arranque en prod para SECRET_KEY/ADMIN_PASSWORD/CORS; DROP con doble confirmación;
 readiness probe `/health/ready`; catálogo de privilegios validado (whitelist cerrada);
-191 tests verdes en la capa de inventario/lógica pura; cadena Alembic con una sola cabeza.
+201 tests verdes en la capa de inventario/lógica pura; cadena Alembic con una sola cabeza.
 
 ---
 

@@ -218,7 +218,27 @@ Todas con `ApiResponse[T]`, `AppHttpException`, admin autenticado, y `def` (I/O 
   generada desde el ORM (`database/generate_schema.py`) — tablas, `schema.sql`, seed del
   catálogo y carpetas reservadas para vistas/procedimientos/triggers. Alembic sigue
   siendo la fuente de verdad.
-- **Pendiente:** adapters `grant_object`/`revoke_object`/`list_grants`/`can_grant`,
-  `AuditLog` ampliado + migración, endpoints `/grants` + `/grantable`, y verificación
-  contra motores reales (Docker).
+- **Perfiles de permisos (plantillas):** tablas `permission_profiles` +
+  `permission_profile_items` (`app/models/permission_profile.py`) + migración
+  `d4e5f6a7b8c9_permission_profiles`. CRUD completo en `/api/v1/permission-profiles`
+  (GET/POST/GET{id}/PATCH/DELETE). **DECISIÓN: clasificados POR MOTOR** — los privilegios
+  no son portables entre motores, así que cada perfil tiene `engine` y sus items se
+  **validan contra el catálogo cerrado** de ese motor al crearse (privilegio inválido/
+  DENY/nivel no soportado → 422). **Modelo SNAPSHOT**: un perfil es solo una plantilla
+  (nivel → privilegios); asignarlo aplicará los GRANT en el momento, SIN relación viva
+  usuario↔perfil. Un item con privilegios GATE expone `requires_confirmation=true`. 12 tests.
+- **GRANT/REVOKE granular — primitivo de adapter (keystone, incremento 1):**
+  `grant_object`/`revoke_object` en `base_adapter` (abstractos) + `MySQLAdapter`/
+  `MariaDBAdapter` y `PostgresAdapter`. DTOs `ObjectRef`/`RoutineRef`. Niveles: MySQL
+  DATABASE/TABLE/COLUMN/ROUTINE; PG DATABASE/SCHEMA/TABLE/COLUMN/SEQUENCE/ROUTINE
+  (DATABASE a nivel servidor; el resto conectado a la BD). Privilegios validados contra
+  el catálogo cerrado; identificadores quoteados; columnas validadas una a una;
+  `GRANT OPTION` → cláusula `WITH GRANT OPTION` (MySQL). 23 tests del DCL generado.
+- **Pendiente del keystone (requiere MOTORES REALES / Docker):** `can_grant`
+  (pre-chequeo de capability del grantor — introspección `SHOW GRANTS`/`has_*_privilege`/
+  `aclexplode`), `list_grants`, `AuditLog` ampliado + migración, y endpoints
+  `/server-users/{id}/grants` + `/servers/{id}/grantable` (con confirmación GATE,
+  anti auto-lockout, auditoría). `can_grant` y la verificación NO se pueden completar/
+  validar sobre SQLite. **Bloquean** la APLICACIÓN de perfiles a usuarios y el
+  **endpoint unificado** crear-usuario+permisos.
 ```
