@@ -64,6 +64,15 @@ class ObjectRef(BaseModel):
     routine: RoutineRef | None = None
 
 
+class GrantInfo(BaseModel):
+    """Un privilegio efectivo de un grantee (resultado de la introspección)."""
+
+    level: GrantLevel
+    object: str | None = None  # objeto cualificado (p.ej. "appdb.items"); None = global
+    privileges: list[str]
+    with_grant_option: bool = False
+
+
 class ColumnInfo(BaseModel):
     name: str
     type: str

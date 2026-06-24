@@ -28,6 +28,7 @@ from app.services.db_admin.dtos import (
     ConnectionInfo,
     EngineUserInfo,
     ForeignKeyInfo,
+    GrantInfo,
     GrantLevel,
     IndexInfo,
     ObjectRef,
@@ -143,6 +144,28 @@ class ServerAdapter(ABC):
         privileges: list[str],
     ) -> None:
         """Revoca ``privileges`` del ``grantee`` sobre el objeto del ``object_ref``."""
+
+    @abstractmethod
+    def list_grants(
+        self, grantee: EngineUserInfo, database: str | None = None
+    ) -> list[GrantInfo]:
+        """
+        Introspecciona los privilegios efectivos del ``grantee``. En PostgreSQL los
+        grants de objeto son POR BASE DE DATOS: ``database`` es necesario para ver
+        tablas/columnas/secuencias/rutinas; en MySQL/MariaDB se ignora (info_schema
+        es a nivel servidor).
+        """
+
+    @abstractmethod
+    def can_grant(
+        self, level: GrantLevel, object_ref: ObjectRef, privileges: list[str]
+    ) -> bool:
+        """
+        ¿La credencial del gateway (grantor) puede DELEGAR ``privileges`` sobre el
+        objeto? Pre-chequeo de capability: superusuario/owner o privilegio con grant
+        option. Se consulta ANTES de ejecutar el GRANT (el error del motor es la red
+        secundaria).
+        """
 
     def reassign_database_owner(
         self,
