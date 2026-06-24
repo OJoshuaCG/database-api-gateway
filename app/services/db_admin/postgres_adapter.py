@@ -14,11 +14,11 @@ Particularidades frente a MySQL:
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.core.remote_engine import map_driver_error, server_connection
+from app.core.remote_engine import database_connection, map_driver_error, server_connection
 from app.exceptions import AppHttpException
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.base_adapter import ServerAdapter
-from app.services.db_admin.dtos import EngineUserInfo, GrantLevel, ObjectRef
+from app.services.db_admin.dtos import EngineUserInfo, GrantInfo, GrantLevel, ObjectRef
 from app.services.db_admin.identifiers import (
     quote_identifier,
     quote_string_literal,
@@ -257,3 +257,100 @@ class PostgresAdapter(ServerAdapter):
         else:
             db = self._require_field(object_ref.database, "database")
             self._execute_database(db, [stmt], op="revoke_object", extra=extra)
+
+    _LIST_GRANTS_SQL = (
+        "SELECT 'table' AS lvl, table_schema || '.' || table_name AS obj, privilege_type AS p, is_grantable AS g "
+        "  FROM information_schema.role_table_grants WHERE grantee = :g "
+        "UNION ALL SELECT 'column', table_schema || '.' || table_name || '(' || column_name || ')', "
+        "  privilege_type, is_grantable FROM information_schema.role_column_grants WHERE grantee = :g "
+        "UNION ALL SELECT 'routine', routine_schema || '.' || routine_name, privilege_type, is_grantable "
+        "  FROM information_schema.role_routine_grants WHERE grantee = :g "
+        "UNION ALL SELECT 'sequence', object_schema || '.' || object_name, privilege_type, is_grantable "
+        "  FROM information_schema.role_usage_grants WHERE grantee = :g AND object_type = 'SEQUENCE'"
+    )
+
+    def list_grants(self, grantee, database=None) -> list[GrantInfo]:
+        validate_identifier(grantee.username, self.dialect, "usuario", allow_existing=True)
+        if not database:
+            raise AppHttpException(
+                message="En PostgreSQL se requiere 'database' para listar los grants de objeto.",
+                status_code=422,
+            )
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        try:
+            with database_connection(self.target, database) as conn:
+                rows = conn.execute(text(self._LIST_GRANTS_SQL), {"g": grantee.username}).fetchall()
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="list_grants", target=self.target, extra={"username": grantee.username}
+            )
+        agg: dict[tuple[str, str], dict] = {}
+        for lvl, obj, priv, grantable in rows:
+            entry = agg.setdefault((lvl, obj), {"privs": set(), "wgo": False})
+            entry["privs"].add(priv)
+            if str(grantable).upper() == "YES":
+                entry["wgo"] = True
+        return [
+            GrantInfo(level=GrantLevel(lvl), object=obj, privileges=sorted(e["privs"]), with_grant_option=e["wgo"])
+            for (lvl, obj), e in agg.items()
+            if e["privs"]
+        ]
+
+    # has_*_privilege por nivel (para can_grant de grantors NO superusuario).
+    _HAS_FN = {
+        GrantLevel.DATABASE: "has_database_privilege",
+        GrantLevel.SCHEMA: "has_schema_privilege",
+        GrantLevel.TABLE: "has_table_privilege",
+        GrantLevel.COLUMN: "has_table_privilege",  # aprox. a nivel tabla
+        GrantLevel.SEQUENCE: "has_sequence_privilege",
+        GrantLevel.ROUTINE: "has_function_privilege",
+    }
+
+    def can_grant(self, level, object_ref, privileges) -> bool:
+        canonical, _ = priv_catalog.validate_privileges(privileges, self.dialect, level)
+        try:
+            with server_connection(self.target) as conn:
+                is_super = conn.execute(
+                    text("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+                ).scalar()
+        except SQLAlchemyError as exc:
+            raise map_driver_error(exc, op="can_grant", target=self.target)
+        if is_super:
+            return True
+        # Grantor NO superusuario: exigir el privilegio CON grant option para cada uno.
+        fn = self._HAS_FN.get(level)
+        if fn is None:
+            return False
+        if level == GrantLevel.DATABASE:
+            obj_expr = self._require_field(object_ref.database, "database")
+            runner = server_connection(self.target)
+        else:
+            obj_expr = self._can_grant_object_name(level, object_ref)
+            runner = database_connection(self.target, self._require_field(object_ref.database, "database"))
+        checks = [p for p in canonical if p not in ("ALL PRIVILEGES",)]
+        try:
+            with runner as conn:
+                for priv in checks or ["USAGE"]:
+                    ok = conn.execute(
+                        text(f"SELECT {fn}(current_user, :obj, :priv)"),
+                        {"obj": obj_expr, "priv": f"{priv} WITH GRANT OPTION"},
+                    ).scalar()
+                    if not ok:
+                        return False
+        except SQLAlchemyError as exc:
+            raise map_driver_error(exc, op="can_grant", target=self.target)
+        return True
+
+    def _can_grant_object_name(self, level, ref) -> str:
+        """Nombre de objeto para has_*_privilege (validado)."""
+        schema = self._require_field(ref.db_schema or "public", "schema")
+        validate_identifier(schema, self.dialect, "esquema", allow_existing=True)
+        if level == GrantLevel.SCHEMA:
+            return schema
+        name = {
+            GrantLevel.TABLE: ref.table, GrantLevel.COLUMN: ref.table,
+            GrantLevel.SEQUENCE: ref.sequence,
+            GrantLevel.ROUTINE: ref.routine.name if ref.routine else None,
+        }.get(level)
+        validate_identifier(self._require_field(name, "objeto"), self.dialect, "objeto", allow_existing=True)
+        return f"{schema}.{name}"

@@ -15,7 +15,7 @@ from app.core.remote_engine import map_driver_error, server_connection
 from app.exceptions import AppHttpException
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.base_adapter import ServerAdapter
-from app.services.db_admin.dtos import EngineUserInfo, GrantLevel, ObjectRef
+from app.services.db_admin.dtos import EngineUserInfo, GrantInfo, GrantLevel, ObjectRef
 from app.services.db_admin.identifiers import (
     quote_identifier,
     quote_string_literal,
@@ -248,6 +248,68 @@ class MySQLAdapter(ServerAdapter):
         self._execute_server(
             [stmt], op="revoke_object", extra={"username": grantee.username, "level": level.value}
         )
+
+    _LIST_GRANTS_SQL = (
+        "SELECT 'global' AS lvl, NULL AS obj, PRIVILEGE_TYPE AS p, IS_GRANTABLE AS g "
+        "  FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = :g "
+        "UNION ALL SELECT 'database', TABLE_SCHEMA, PRIVILEGE_TYPE, IS_GRANTABLE "
+        "  FROM information_schema.SCHEMA_PRIVILEGES WHERE GRANTEE = :g "
+        "UNION ALL SELECT 'table', CONCAT(TABLE_SCHEMA, '.', TABLE_NAME), PRIVILEGE_TYPE, IS_GRANTABLE "
+        "  FROM information_schema.TABLE_PRIVILEGES WHERE GRANTEE = :g "
+        "UNION ALL SELECT 'column', CONCAT(TABLE_SCHEMA, '.', TABLE_NAME, '(', COLUMN_NAME, ')'), "
+        "  PRIVILEGE_TYPE, IS_GRANTABLE FROM information_schema.COLUMN_PRIVILEGES WHERE GRANTEE = :g"
+    )
+
+    def list_grants(self, grantee, database=None) -> list[GrantInfo]:
+        validate_identifier(grantee.username, self.dialect, "usuario", allow_existing=True)
+        host = grantee.host or "%"
+        validate_host(host)
+        grantee_lit = f"'{grantee.username}'@'{host}'"
+        try:
+            with server_connection(self.target) as conn:
+                rows = conn.execute(text(self._LIST_GRANTS_SQL), {"g": grantee_lit}).fetchall()
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="list_grants", target=self.target, extra={"username": grantee.username}
+            )
+        agg: dict[tuple[str, str | None], dict] = {}
+        for lvl, obj, priv, grantable in rows:
+            entry = agg.setdefault((lvl, obj), {"privs": set(), "wgo": False})
+            # USAGE = "sin privilegios"; no es informativo en un listado.
+            if priv != "USAGE":
+                entry["privs"].add(priv)
+            if str(grantable).upper() == "YES":
+                entry["wgo"] = True
+        return [
+            GrantInfo(level=GrantLevel(lvl), object=obj, privileges=sorted(e["privs"]), with_grant_option=e["wgo"])
+            for (lvl, obj), e in agg.items()
+            if e["privs"]
+        ]
+
+    def can_grant(self, level, object_ref, privileges) -> bool:
+        canonical, _ = priv_catalog.validate_privileges(privileges, self.dialect, level)
+        # Privilegios GRANTABLES del grantor (CURRENT_USER) a nivel GLOBAL — cubre la
+        # credencial pseudo-root. Conservador para grantors limitados (refuerzo: el
+        # error del motor es la red secundaria al ejecutar).
+        sql = text(
+            "SELECT PRIVILEGE_TYPE FROM information_schema.USER_PRIVILEGES "
+            "WHERE GRANTEE = CONCAT(QUOTE(SUBSTRING_INDEX(CURRENT_USER(), '@', 1)), '@', "
+            "QUOTE(SUBSTRING_INDEX(CURRENT_USER(), '@', -1))) AND IS_GRANTABLE = 'YES'"
+        )
+        try:
+            with server_connection(self.target) as conn:
+                grantable = {r[0].upper() for r in conn.execute(sql)}
+        except SQLAlchemyError as exc:
+            raise map_driver_error(exc, op="can_grant", target=self.target)
+        if "ALL PRIVILEGES" in canonical:
+            # Delegar ALL PRIVILEGES requiere IS_GRANTABLE='YES' en algo (grantable no vacío).
+            return bool(grantable)
+        needed = {p for p in canonical if p not in ("GRANT OPTION", "USAGE")}
+        if "GRANT OPTION" in canonical and not grantable:
+            # "GRANT OPTION" nunca aparece como PRIVILEGE_TYPE; tener grantable vacío
+            # significa que no se puede delegar grant option.
+            return False
+        return needed.issubset(grantable)
 
 
 class MariaDBAdapter(MySQLAdapter):
