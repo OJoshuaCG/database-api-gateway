@@ -15,7 +15,7 @@ from datetime import datetime
 
 from sqlalchemy import DateTime
 from sqlalchemy import Enum as SQLAEnum
-from sqlalchemy import ForeignKey, Integer, Text
+from sqlalchemy import ForeignKey, Index, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -25,6 +25,13 @@ from app.models.enums import MigrationStatus
 class DatabaseMigrationHistory(Base, TimestampMixin):
     __tablename__ = "database_migration_history"
     __table_args__ = (
+        # Índice compuesto para el patrón real de consulta del historial de una BD:
+        # WHERE managed_database_id = ? ORDER BY applied_at DESC (cubre filtro + orden).
+        Index(
+            "ix_dmh_managed_db_applied_at",
+            "managed_database_id",
+            "applied_at",
+        ),
         {"comment": "Historial de aplicación/rollback de migraciones por BD gestionada"},
     )
 
@@ -36,7 +43,8 @@ class DatabaseMigrationHistory(Base, TimestampMixin):
         Integer,
         ForeignKey("managed_databases.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
+        # El índice compuesto (managed_database_id, applied_at) de __table_args__
+        # cubre los filtros por managed_database_id por su prefijo izquierdo.
         comment="BD gestionada sobre la que se aplicó la migración",
     )
 

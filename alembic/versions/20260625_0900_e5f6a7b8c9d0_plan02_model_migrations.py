@@ -52,8 +52,7 @@ def upgrade() -> None:
         sa.UniqueConstraint('model_id', 'version', name='uq_model_migrations_model_version'),
         comment='Migraciones versionadas (deltas SQL) de cada blueprint',
     )
-    with op.batch_alter_table('model_migrations', schema=None) as batch_op:
-        batch_op.create_index(batch_op.f('ix_model_migrations_model_id'), ['model_id'], unique=False)
+    # Sin índice propio sobre model_id: el UNIQUE(model_id, version) lo cubre.
 
     op.create_table(
         'database_migration_history',
@@ -83,18 +82,17 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint('id', name=op.f('pk_database_migration_history')),
         comment='Historial de aplicación/rollback de migraciones por BD gestionada',
     )
-    with op.batch_alter_table('database_migration_history', schema=None) as batch_op:
-        batch_op.create_index(batch_op.f('ix_database_migration_history_managed_database_id'),
-                              ['managed_database_id'], unique=False)
-        batch_op.create_index(batch_op.f('ix_database_migration_history_model_migration_id'),
-                              ['model_migration_id'], unique=False)
+    # Índice compuesto (managed_database_id, applied_at): cubre filtro + orden del
+    # historial por BD. El prefijo izquierdo sirve también los filtros por solo BD.
+    op.create_index('ix_dmh_managed_db_applied_at', 'database_migration_history',
+                    ['managed_database_id', 'applied_at'], unique=False)
+    op.create_index(op.f('ix_database_migration_history_model_migration_id'),
+                    'database_migration_history', ['model_migration_id'], unique=False)
 
 
 def downgrade() -> None:
-    with op.batch_alter_table('database_migration_history', schema=None) as batch_op:
-        batch_op.drop_index(batch_op.f('ix_database_migration_history_model_migration_id'))
-        batch_op.drop_index(batch_op.f('ix_database_migration_history_managed_database_id'))
+    op.drop_index(op.f('ix_database_migration_history_model_migration_id'),
+                  table_name='database_migration_history')
+    op.drop_index('ix_dmh_managed_db_applied_at', table_name='database_migration_history')
     op.drop_table('database_migration_history')
-    with op.batch_alter_table('model_migrations', schema=None) as batch_op:
-        batch_op.drop_index(batch_op.f('ix_model_migrations_model_id'))
     op.drop_table('model_migrations')

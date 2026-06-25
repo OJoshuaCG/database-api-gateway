@@ -44,7 +44,8 @@ class ModelMigration(Base, TimestampMixin):
         Integer,
         ForeignKey("database_models.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
+        # Sin index propio: el UniqueConstraint(model_id, version) ya sirve los
+        # filtros por model_id (prefijo izquierdo) en los 3 motores.
         comment="Blueprint al que pertenece esta migración",
     )
 
