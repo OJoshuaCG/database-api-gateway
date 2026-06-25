@@ -26,9 +26,23 @@ from app.services import audit
 from app.services.db_admin.sql_dialect import RollbackGenerator, SqlTranslator
 
 
-def compute_checksum(up_sql: str, up_sql_mysql: str | None, up_sql_postgresql: str | None) -> str:
-    """SHA256 de las tres variantes de up_sql. Detecta alteración post-escritura."""
-    payload = (up_sql or "") + (up_sql_mysql or "") + (up_sql_postgresql or "")
+def compute_checksum(
+    up_sql: str,
+    up_sql_mysql: str | None,
+    up_sql_postgresql: str | None,
+    down_sql: str | None = None,
+) -> str:
+    """
+    SHA256 de TODO el SQL ejecutable de la migración (up + variantes + rollback).
+
+    Incluir ``down_sql`` es CRÍTICO: el rollback ejecuta DDL destructivo, así que su
+    integridad debe protegerse igual que la del ``up_sql``. Detecta alteración directa
+    de la fila en la BD de metadatos del gateway antes de ejecutar nada en el motor.
+
+    Separadores ``\\x1f`` entre campos para evitar colisiones por concatenación.
+    """
+    parts = [up_sql or "", up_sql_mysql or "", up_sql_postgresql or "", down_sql or ""]
+    payload = "\x1f".join(parts)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -175,11 +189,16 @@ class ModelMigrationController:
                 up_sql_postgresql=up_pg,
                 down_sql=down_sql,
                 down_sql_suggested=suggested,
-                checksum=compute_checksum(up_sql, up_mysql, up_pg),
+                checksum=compute_checksum(up_sql, up_mysql, up_pg, down_sql),
             )
             session.add(migration)
             try:
-                session.commit()
+                # flush hace visible la nueva migración a _bump_model_version y
+                # detecta el conflicto de versión, todo en la MISMA transacción.
+                session.flush()
+                # Mantener current_version del blueprint = versión más reciente subida.
+                self._bump_model_version(session, model_id)
+                session.commit()  # inserción + current_version en un único commit atómico
             except IntegrityError as exc:
                 session.rollback()
                 raise AppHttpException(
@@ -188,9 +207,6 @@ class ModelMigrationController:
                     context={"model_id": model_id, "version": data["version"]},
                 ) from exc
             session.refresh(migration)
-
-            # Mantener current_version del blueprint = versión más reciente subida.
-            self._bump_model_version(session, model_id)
 
             result = self._serialize(migration)
             migration_id = migration.id
@@ -238,8 +254,10 @@ class ModelMigrationController:
             if "up_sql_postgresql" in data:
                 m.up_sql_postgresql = data["up_sql_postgresql"]
 
-            # Recalcular checksum si cambió alguna variante de SQL.
-            m.checksum = compute_checksum(m.up_sql, m.up_sql_mysql, m.up_sql_postgresql)
+            # Recalcular checksum si cambió alguna variante de SQL o el rollback.
+            m.checksum = compute_checksum(
+                m.up_sql, m.up_sql_mysql, m.up_sql_postgresql, m.down_sql
+            )
             session.commit()
             session.refresh(m)
             result = self._serialize(m)
@@ -269,8 +287,9 @@ class ModelMigrationController:
                     context={"model_id": model_id, "version": version},
                 )
             session.delete(m)
-            session.commit()
+            session.flush()  # el borrado debe verse antes de recalcular current_version
             self._bump_model_version(session, model_id)
+            session.commit()  # borrado + current_version en un único commit
         finally:
             session.close()
         audit.record(
@@ -286,7 +305,12 @@ class ModelMigrationController:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _bump_model_version(session, model_id: int) -> None:
-        """Fija current_version del blueprint a la migración más reciente (o 0.0.0)."""
+        """
+        Fija current_version del blueprint a la migración más reciente (o 0.0.0).
+
+        NO commitea: el llamador lo hace en la misma transacción que la
+        inserción/borrado de la migración (atomicidad).
+        """
         latest = (
             session.query(ModelMigration.version)
             .filter(ModelMigration.model_id == model_id)
@@ -296,4 +320,3 @@ class ModelMigrationController:
         model = session.get(DatabaseModel, model_id)
         if model is not None:
             model.current_version = latest[0] if latest else "0.0.0"
-            session.commit()
