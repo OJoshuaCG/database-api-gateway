@@ -1,42 +1,96 @@
 # 02 — Migraciones de modelos (blueprints versionados)
 
-**Estado:** Pendiente · **Depende de:** 01 · **Esfuerzo:** alto
+**Estado:** ✅ Implementado y verificado contra motores reales (MySQL 8 + PostgreSQL 16) ·
+**Depende de:** 01 ✅ · **Esfuerzo:** alto · **Última revisión:** 2026-06-25
+
+> Implementación: 289 tests en verde (35 nuevos) + verificación e2e completa contra
+> contenedores MySQL/PostgreSQL (apply/rollback/status/stamp/checksum/translation).
+> Gotcha clave resuelto: el advisory lock abría una transacción que dejaba la
+> migración sin commitear; la conexión del runner corre en **AUTOCOMMIT** (el lock de
+> sesión sobrevive). Ver `app/services/db_admin/migrations.py`.
 
 ## Objetivo
 
-Permitir que un **modelo** (Whatsapp, SMS, Llamadas…) defina una estructura
-versionada (tablas, vistas, stored procedures, triggers) y poder **aplicar/migrar**
-esa estructura sobre las N bases de datos que replican el modelo, sabiendo en todo
-momento qué versión tiene cada BD.
+Permitir que un **modelo/blueprint** (Whatsapp, SMS, Llamadas…) defina una estructura versionada
+(tablas, vistas, stored procedures, triggers) y poder **aplicar/migrar** esa estructura sobre las
+N bases de datos que replican el modelo, sabiendo en todo momento qué versión tiene cada BD.
 
-## Estrategia recomendada: scripts SQL versionados (estilo Flyway)
+---
 
-Cada modelo tiene una secuencia ordenada de migraciones DDL versionadas. El gateway
-aplica a cada BD las que le falten y registra el historial. Determinista, auditable
-y soporta SP/vistas/triggers (a diferencia de un diff de estructura).
+## Principio Arquitectónico
 
-> Alternativa descartada para v1: BD canónica de referencia + diff/sync (más frágil
-> con SP/triggers). Se puede ofrecer como utilidad complementaria más adelante.
+**Alembic es la primitiva de migración embebida. El gateway construye la orquestación sobre ella.**
+
+| Responsabilidad | Quién la resuelve |
+|----------------|-------------------|
+| Tabla de versión en cada BD administrada (`_gw_v_{slug}`) | Alembic (`MigrationContext`) |
+| Grafo de revisiones, orden, `stamp`, modo offline `--sql` | Alembic |
+| Ejecución del SQL de migración en la BD destino | `MigrationRunner` vía adapters |
+| Fan-out sobre N BDs (iterar, conectar, llamar Alembic) | `MigrationRunner` |
+| Locking por BD (advisory locks antes de migrar) | `MigrationRunner` |
+| Espejo de versiones en gateway DB (dashboard sin abrir N conexiones) | `database_migration_history` |
+| Checksum de integridad (Alembic no lo trae) | `MigrationRunner` |
+| Auto-traducción SQL entre motores | `sqlglot` |
+| Auto-generación de `down_sql` sugerido | `RollbackGenerator` |
+| Convención para SP/vistas/triggers | Migración nueva por cada cambio (ver abajo) |
+
+---
+
+## Estrategia: scripts SQL versionados con Alembic como librería
+
+Cada modelo tiene una secuencia ordenada de revisiones. Al subir una migración via API,
+el gateway genera el archivo Python de Alembic en `migrations/{model_slug}/versions/`
+(fuente ejecutable) pero el SQL fuente de verdad vive en `model_migrations` (reconstruible).
+Alembic aplica en orden, registra la versión en `_gw_v_{slug}` dentro de cada BD administrada.
+
+> No se usa autogenerate en runtime ni archivos Python como fuente de verdad persistente.
+> Los .py son generados desde la BD del gateway al aplicar, reconstituibles en contenedores.
+
+---
+
+## Decisiones de diseño confirmadas
+
+| Tema | Decisión |
+|------|----------|
+| Naming entidad | `DatabaseModel` no se renombra ("etiqueta" = término coloquial) |
+| Alembic uso | `command.upgrade` + `MigrationContext` vía `env.py` con conexión inyectada |
+| SQL cross-engine | `sqlglot` auto-traduce; overrides `up_sql_mysql`/`up_sql_postgresql` opcionales |
+| `down_sql` | `sqlglot` genera `down_sql_suggested`; admin confirma via PATCH antes de ser ejecutable |
+| Formato SQL | Deltas incrementales; la primera migración puede ser el esquema completo inicial |
+| Almacenamiento | Tabla `model_migrations` en BD del gateway (fuente de verdad) |
+| Versión en BD administrada | Alembic → tabla `_gw_v_{model_slug}` dentro de cada BD administrada |
+| Log histórico | `database_migration_history` en gateway (auditoría + espejo para dashboard) |
+| Formato de versión | Entero con padding `0001`, `0002`… (lexicográfico = cronológico) |
+| Thread-safety | Fan-out masivo usa `multiprocessing`, no threads (Plan 06) |
+| Locking | Advisory locks por BD: `pg_advisory_lock` / `GET_LOCK` MySQL |
+| `apply-all` | Stub síncrono con `?max_databases=N` en Plan 02; async multiprocessing en Plan 06 |
+
+---
 
 ## Modelo de datos (extiende el de 01)
 
 ### `ModelMigration` (`model_migrations`)
+
 | Campo | Tipo | Notas |
-|---|---|---|
+|-------|------|-------|
 | `id` | PK | |
 | `model_id` | FK→`database_models.id` CASCADE | |
-| `version` | `String(50)` | p.ej. `0001`, `1.2.0`; orden estable |
-| `name` | `String(200)` | descripción corta |
-| `up_sql` | `Text` | DDL idempotente para aplicar |
-| `down_sql` | `Text` nullable | reversa (opcional) |
-| `checksum` | `String(64)` | hash del `up_sql` para detectar alteraciones |
+| `version` | `String(10)` | `"0001"`, `"0002"`… padding de 4 dígitos mínimo |
+| `name` | `String(200)` | Descripción corta |
+| `up_sql` | `Text` | SQL que el admin subió (fuente de verdad) |
+| `up_sql_mysql` | `Text` nullable | Override manual MySQL/MariaDB |
+| `up_sql_postgresql` | `Text` nullable | Override manual PostgreSQL |
+| `down_sql_suggested` | `Text` nullable | Auto-generado por `RollbackGenerator` (para revisión) |
+| `down_sql` | `Text` nullable | Confirmado por admin (null hasta que lo apruebe via PATCH) |
+| `checksum` | `String(64)` | `SHA256(up_sql + up_sql_mysql + up_sql_postgresql)` |
 | timestamps | | |
 
-Constraint: `UniqueConstraint("model_id","version")`.
+`UniqueConstraint("model_id", "version")`.
 
 ### `DatabaseMigrationHistory` (`database_migration_history`)
+
 | Campo | Tipo | Notas |
-|---|---|---|
+|-------|------|-------|
 | `id` | PK | |
 | `managed_database_id` | FK→`managed_databases.id` CASCADE | |
 | `model_migration_id` | FK→`model_migrations.id` | |
@@ -45,45 +99,213 @@ Constraint: `UniqueConstraint("model_id","version")`.
 | `error` | `Text` nullable | |
 | `execution_ms` | `Integer` nullable | |
 
-`ManagedDatabase.model_version` pasa a reflejar la última migración aplicada.
+`ManagedDatabase.model_version` refleja la última migración `applied` exitosamente
+(actualizado por el runner, espejo de `_gw_v_{slug}` en la BD administrada).
+
+---
+
+## Estructura de scripts Alembic por modelo
+
+```
+migrations/
+├── _shared/
+│   └── env.py                        # env.py compartido, inyección de conexión
+├── whatsapp/
+│   └── versions/
+│       ├── 0001_esquema_inicial.py   # generado desde model_migrations al aplicar
+│       └── 0002_agregar_telefono.py
+└── sms/
+    └── versions/
+        └── 0001_esquema_sms.py
+```
+
+### `migrations/_shared/env.py`
+
+```python
+from alembic import context
+
+config = context.config
+target_metadata = None  # NO autogenerate — SQL directo
+
+def run_migrations_online():
+    connection = config.attributes.get("connection")
+    if connection is None:
+        raise RuntimeError("'connection' no inyectada en config.attributes")
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        version_table=config.attributes["version_table"],  # "_gw_v_{slug}"
+        transaction_per_migration=True,
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+run_migrations_online()
+```
+
+### Script Python generado (ejemplo)
+
+```python
+# migrations/whatsapp/versions/0002_agregar_telefono.py
+revision = "0002"
+down_revision = "0001"
+
+def upgrade():
+    op.execute("ALTER TABLE users ADD COLUMN phone VARCHAR(20)")
+
+def downgrade():
+    op.execute("ALTER TABLE users DROP COLUMN phone")
+    # Si no hay down_sql confirmado → lanza NotImplementedError
+```
+
+---
 
 ## Componentes
 
-- **`MigrationRunner`** (`app/services/db_admin/migrations.py`): calcula migraciones
-  pendientes para una BD (las del modelo con `version` > la aplicada y no presentes
-  en el historial), las aplica en orden dentro de la BD destino y registra historial.
-- Reutiliza `database_connection(target, db)` del adapter. Para MySQL muchas sentencias
-  DDL hacen commit implícito; para PostgreSQL, envolver en transacción cuando sea posible.
-- Validar `checksum` antes de aplicar (rechazar si una migración ya aplicada cambió).
+### `MigrationRunner` (`app/services/db_admin/migrations.py`)
+
+```python
+class MigrationRunner:
+    def _make_config(self, model_slug, connection) -> Config:
+        cfg = Config()
+        cfg.set_main_option("script_location", f"migrations/{model_slug}")
+        cfg.attributes["connection"] = connection
+        cfg.attributes["version_table"] = f"_gw_v_{model_slug}"
+        return cfg
+
+    def ensure_script_files(self, model_slug, migrations, engine_type): ...
+    def get_current_version(self, connection, model_slug) -> str | None: ...
+    def acquire_lock(self, connection, managed_db_id, engine_type): ...
+    def release_lock(self, connection, managed_db_id, engine_type): ...
+    def apply_pending(self, managed_db, migrations, up_to_version=None) -> list[MigrationResult]: ...
+    def rollback_last(self, managed_db) -> MigrationResult: ...
+    def stamp(self, managed_db, version: str): ...  # marcar sin ejecutar
+```
+
+### `SqlTranslator` + `RollbackGenerator` (`app/services/db_admin/sql_dialect.py`)
+
+- `SqlTranslator.translate(sql, to_engine)` — usa `sqlglot.transpile()`, retorna `str | None`
+- `RollbackGenerator.generate(sql)` — infiere inverso para CREATE→DROP, ADD COLUMN→DROP COLUMN; `None` para operaciones destructivas
+
+---
 
 ## API (`/api/v1`)
 
 | Método | Path | Descripción |
-|---|---|---|
-| GET/POST | `/database-models/{id}/migrations` | listar/crear migraciones del modelo |
-| GET | `/managed-databases/{id}/migrations/status` | versión actual vs. pendientes |
-| POST | `/managed-databases/{id}/migrations/apply` | aplica pendientes (o hasta `?version=`) |
-| POST | `/database-models/{id}/migrations/apply-all` | aplica a TODAS las BDs del modelo (job en background — ver plan 06) |
-| POST | `/managed-databases/{id}/migrations/rollback` | revierte la última (si hay `down_sql`) |
+|--------|------|-------------|
+| GET/POST | `/database-models/{id}/migrations` | Listar/crear migraciones del modelo |
+| GET | `/database-models/{id}/migrations/{version}` | Detalle de versión |
+| PATCH | `/database-models/{id}/migrations/{version}` | Confirmar `down_sql` o añadir override de variante |
+| DELETE | `/database-models/{id}/migrations/{version}` | Solo si no hay historial `applied` |
+| GET | `/managed-databases/{id}/migrations/status` | Versión actual + pendientes |
+| POST | `/managed-databases/{id}/migrations/apply` | Aplica pendientes (`?version=0003` para target) |
+| POST | `/managed-databases/{id}/migrations/rollback` | `command.downgrade -1` (409 si no hay `down_sql`) |
+| POST | `/managed-databases/{id}/migrations/stamp` | Marcar versión sin ejecutar (BDs pre-existentes) |
+| POST | `/database-models/{id}/migrations/apply-all` | Aplica a todas las BDs del modelo (`?max_databases=10`) |
 
-## Decisiones a confirmar
+### Respuesta de `POST /migrations` (crear versión)
 
-- **Origen de las migraciones:** ¿se cargan vía API (texto SQL), desde archivos en repo,
-  o ambas? Recomendado: API + posibilidad de import desde archivos.
-- **Aislamiento de SP/triggers/`DELIMITER`:** los SP MySQL usan `DELIMITER`, que es del
-  cliente, no del servidor. Hay que ejecutarlos sentencia a sentencia respetando el
-  cuerpo (usar el driver con `multi`/separación adecuada, no `DELIMITER`).
-- **Aplicación masiva:** debe ser un job en background con reporte por BD (plan 06).
+```json
+{
+  "version": "0002", "name": "Agregar teléfono",
+  "up_sql": "ALTER TABLE users ADD COLUMN phone VARCHAR(20)",
+  "down_sql": null,
+  "down_sql_suggested": "ALTER TABLE users DROP COLUMN phone",
+  "translated": {
+    "mysql": "ALTER TABLE users ADD COLUMN phone VARCHAR(20)",
+    "postgresql": "ALTER TABLE users ADD COLUMN phone VARCHAR(20)"
+  },
+  "checksum": "abc123..."
+}
+```
 
-## Riesgos
+El admin revisa `down_sql_suggested` y llama `PATCH` si desea confirmarlo.
 
-- Una migración fallida a mitad puede dejar la BD inconsistente → registrar `failed`,
-  detener esa BD, continuar con las demás, y exponer el detalle.
-- DDL no transaccional en MySQL: documentar que una migración debe ser lo más atómica
-  e idempotente posible.
+---
+
+## Gotchas y traps operacionales
+
+### `alembic.context` no es thread-safe
+`alembic.context` es un proxy global de módulo. `command.upgrade` con múltiples tenants en
+threads del mismo proceso produce corrupción silenciosa. **Fan-out masivo → `multiprocessing`,
+no `threading`.** En Plan 02 (stub síncrono) no es problema; crítico en Plan 06.
+
+### MySQL DDL no es transaccional
+`CREATE TABLE`, `ALTER TABLE` hacen commit implícito. Si una migración de 5 sentencias falla
+en la 3, la BD queda inconsistente y Alembic no avanza la versión. Diseñar migraciones
+idempotentes (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`).
+Registrar `failed`, dejar para inspección manual, continuar con las demás BDs.
+
+### SP / vistas / triggers: no hay "repeatable"
+Alembic no re-aplica automáticamente un objeto cuando su definición cambia (Liquibase sí tiene
+`runOnChange`). Convención: crear una migración nueva por cada cambio de SP/vista:
+```sql
+DROP PROCEDURE IF EXISTS nombre;
+CREATE PROCEDURE nombre() BEGIN ... END;
+```
+
+### DELIMITER en stored procedures MySQL
+`DELIMITER $$` es una directiva del cliente MySQL, no del servidor. PyMySQL no la entiende.
+Los SP deben subirse sin `DELIMITER`, con el cuerpo completo como una sentencia:
+```sql
+CREATE PROCEDURE sp_nombre() BEGIN SELECT 1; END
+```
+
+### Drift / tampering
+Alembic no verifica que las migraciones aplicadas no hayan cambiado (Flyway/Liquibase sí).
+El gateway valida `checksum` de `model_migrations` antes de aplicar: si el SQL fue alterado
+después de aplicarse en alguna BD, rechaza con error bloqueante.
+
+### Locking obligatorio
+Dos workers migrando la misma BD = doble aplicación o corrupción. Adquirir advisory lock
+antes de `command.upgrade`, liberar siempre en finally:
+- PostgreSQL: `SELECT pg_advisory_lock({managed_db_id})`
+- MySQL: `SELECT GET_LOCK('gw_migrate_{managed_db_id}', 30)`
+
+---
+
+## Qué hay en cada BD
+
+```
+BD administrada "ventas" (servidor MySQL):
+  _gw_v_whatsapp   ← Alembic (version_num = '0003')
+  users, orders    ← tablas creadas por las migraciones
+
+Gateway BD:
+  model_migrations             ← SQL + checksum (fuente de verdad)
+  database_migration_history   ← log auditoría / espejo para dashboard
+
+Filesystem gateway:
+  migrations/whatsapp/versions/  ← archivos .py generados desde model_migrations
+```
+
+---
+
+## Orden de implementación
+
+1. `uv add sqlglot`
+2. Modelos ORM: `model_migration.py`, `database_migration_history.py` + `enums.py` + `__init__.py`
+3. Migración Alembic del gateway: `uv run alembic revision --autogenerate -m "plan02 model migrations"`
+4. `migrations/_shared/env.py`
+5. `SqlTranslator` + `RollbackGenerator` + tests unitarios
+6. `MigrationRunner` (generación scripts, apply, rollback, stamp, locking) + tests unitarios
+7. Schemas Pydantic (`app/schemas/model_migration.py`)
+8. Controller de migraciones del blueprint
+9. Extender controllers `ManagedDatabase` y `DatabaseModel`
+10. Routes + registrar en `v1/__init__.py`
+11. Tests de integración (testcontainers MySQL + PG)
+
+---
 
 ## Verificación
 
-- Crear modelo con 2 migraciones, crear 2 BDs del modelo, aplicar, verificar estructura
-  e historial en ambas; cambiar una migración aplicada → detección por checksum;
-  aplicar masivo y revisar el reporte por BD.
+1. POST migración v0001 → respuesta incluye `translated.postgresql` + `down_sql_suggested`
+2. PATCH confirma `down_sql`; POST v0002 (ALTER ADD COLUMN)
+3. Crear BD MySQL, asignar blueprint → `/status` muestra `current_version: null`, 2 pendientes
+4. `apply` → Alembic crea `_gw_v_{slug}` en BD MySQL; `model_version=0002`
+5. BD PostgreSQL → `apply` usa variantes PG auto-traducidas
+6. Modificar `up_sql` post-aplicación → checksum mismatch → error bloqueante
+7. `rollback` → `command.downgrade -1`; `model_version=0001`
+8. `stamp` en BD pre-existente → marca sin ejecutar
+9. `apply-all` → todas las BDs del blueprint actualizadas
+10. Dos workers simultáneos → advisory lock → serialización correcta
