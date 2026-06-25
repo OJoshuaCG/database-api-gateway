@@ -32,3 +32,17 @@ class ProvisionStatus(str, enum.Enum):
     active = "active"      # creada/aprovisionada correctamente en el motor
     error = "error"        # la operación remota falló (ver notas)
     archived = "archived"  # retirada del uso sin borrarse del inventario
+
+
+class MigrationStatus(str, enum.Enum):
+    """
+    Resultado de aplicar/revertir una migración de blueprint sobre una BD gestionada.
+
+    Se registra en ``database_migration_history`` (espejo de auditoría del gateway).
+    El estado de versión REAL de la BD destino lo mantiene Alembic en su tabla
+    ``_gw_v_{slug}`` dentro de la propia BD gestionada; este enum solo describe el
+    desenlace de cada intento.
+    """
+
+    applied = "applied"  # la migración se aplicó/revirtió correctamente
+    failed = "failed"    # la migración falló (ver ``error``); BD posiblemente sucia
