@@ -59,13 +59,21 @@ Tests: `tests/test_ssrf_guard.py`.
 - ⚠️ **Caveat:** valida en el REGISTRO, no protege de DNS-rebinding (revalidar la IP
   justo antes de conectar = mejora futura).
 
-### #5 ⛔ Gestión y rotación de secretos
-- La clave Fernet de `.env.docker` (real, ya tocó disco) debe tratarse como **quemada**;
-  generar `SECRET_KEY`/`CRYPTO_KEY_SALT` nuevos e independientes desde un gestor de
-  secretos (no `.env` en disco).
-- **No existe** mecanismo de **rotación Fernet** (MultiFernet + re-cifrado). Hoy rotar la
-  clave invalidaría todas las credenciales cifradas. Diseñarlo antes de cargar
-  credenciales de producción reales.
+### #5 🟡 Gestión y rotación de secretos
+- ✅ **Rotación DEK implementada (2026-06-24):** envelope encryption KEK/DEK funcional.
+  `POST /api/v1/admin/crypto/rotate` rota la DEK y re-cifra todas las credenciales en una
+  transacción atómica sin cambiar `SECRET_KEY` ni requerir reinicio.
+- ✅ **MultiFernet (2026-06-25):** tokens cifrados con DEKs anteriores se pueden descifrar
+  durante la ventana post-rotación (carga activa + 2 DEKs inactivas recientes).
+- ✅ **Auto-bootstrap DEK en arranque (2026-06-25):** sistema fresco genera y persiste la
+  primera DEK al arrancar (sin necesidad de llamar `/rotate` manualmente).
+- ✅ **SESSION_SECRET guard en producción (2026-06-25):** arranque falla si `SESSION_SECRET`
+  no está definido en `APP_ENV=production`.
+- ⛔ **Pendiente:**
+  - La clave `CRYPTO_KEY_SALT` del `.env.docker` de prueba debe regenerarse (quemada).
+  - No existe integración con gestor de secretos externo (Vault, AWS SM, etc.) para
+    `SECRET_KEY`/`SESSION_SECRET` — siguen leyéndose de variables de entorno.
+  - `SESSION_SECRET` sigue en el env del host (no en secreto gestionado).
 
 ---
 
