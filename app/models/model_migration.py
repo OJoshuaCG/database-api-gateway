@@ -52,7 +52,7 @@ class ModelMigration(Base, TimestampMixin):
     version: Mapped[str] = mapped_column(
         String(10),
         nullable=False,
-        comment="Versión secuencial con padding ('0001', '0002'…); orden lexicográfico",
+        comment="Versión secuencial con padding ('0001', '0002'…); se ordena NUMÉRICAMENTE",
     )
 
     name: Mapped[str] = mapped_column(
@@ -84,7 +84,7 @@ class ModelMigration(Base, TimestampMixin):
     checksum: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
-        comment="SHA256(up_sql + up_sql_mysql + up_sql_postgresql) — detecta alteración",
+        comment="SHA256(up_sql + variantes + down_sql + version) — detecta alteración",
     )
 
     def __repr__(self) -> str:
