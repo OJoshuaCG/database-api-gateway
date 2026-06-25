@@ -83,9 +83,16 @@ class MigrationResult:
 
 
 def version_table_name(slug: str) -> str:
-    """Nombre de la tabla de versión Alembic en la BD destino: ``_gw_v_{slug}``."""
+    """
+    Nombre de la tabla de versión Alembic en la BD destino: ``_gw_v_{slug}``.
+
+    Truncado a 63 chars: es el límite de identificador de PostgreSQL (NAMEDATALEN-1);
+    MySQL/MariaDB admiten 64, así que 63 es seguro en los tres motores y evita que
+    PostgreSQL trunque silenciosamente y el nombre deje de coincidir entre escritura
+    y lectura.
+    """
     safe = "".join(c if (c.isalnum() or c == "_") else "_" for c in slug.lower())
-    return f"_gw_v_{safe}"[:64]
+    return f"_gw_v_{safe}"[:63]
 
 
 class MigrationRunner:
@@ -211,15 +218,30 @@ class MigrationRunner:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _lock_key(managed_db_id: int) -> int:
-        return managed_db_id
+        # int() explícito: blinda la interpolación en el SQL del lock aunque un
+        # llamador interno futuro pase un str (defensa en profundidad; el path param
+        # de FastAPI ya es int).
+        return int(managed_db_id)
 
     def _acquire_lock(self, conn, engine: EngineType, managed_db_id: int) -> None:
+        key = self._lock_key(managed_db_id)
         if engine == EngineType.postgresql:
-            conn.exec_driver_sql(f"SELECT pg_advisory_lock({self._lock_key(managed_db_id)})")
+            conn.exec_driver_sql(f"SELECT pg_advisory_lock({key})")
         else:
-            conn.exec_driver_sql(
-                f"SELECT GET_LOCK('gw_migrate_{managed_db_id}', 30)"
-            )
+            # GET_LOCK devuelve 1 si lo obtuvo, 0 si expiró el timeout, NULL si error.
+            # NO asumir éxito: si no se obtuvo, abortar (otro proceso está migrando).
+            got = conn.exec_driver_sql(
+                f"SELECT GET_LOCK('gw_migrate_{key}', 30)"
+            ).scalar()
+            if got != 1:
+                raise AppHttpException(
+                    message=(
+                        "No se pudo adquirir el lock de migración de la BD "
+                        "(¿otra migración en curso?). Reintente más tarde."
+                    ),
+                    status_code=409,
+                    context={"managed_database_id": key},
+                )
 
     def _release_lock(self, conn, engine: EngineType, managed_db_id: int) -> None:
         try:
