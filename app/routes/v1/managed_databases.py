@@ -19,7 +19,7 @@ from app.schemas.managed_database import (
     ManagedDatabaseUpdate,
     ReassignOwnerIn,
 )
-from app.schemas.model_migration import MigrationStatusOut
+from app.schemas.model_migration import MigrationHistoryOut, MigrationStatusOut
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
@@ -128,8 +128,21 @@ def apply_migrations(
 
 
 @router.post("/{db_id}/migrations/rollback", response_model=ApiResponse[dict])
-def rollback_migration(admin: AdminDep, db_id: int):
-    result = ManagedMigrationController().rollback(db_id, admin=admin)
+def rollback_migration(
+    admin: AdminDep,
+    db_id: int,
+    confirm_version: str = Query(
+        ...,
+        pattern=r"^\d{4,10}$",
+        description=(
+            "Confirmación obligatoria (operación DESTRUCTIVA): repetir la versión "
+            "actual de la BD que se va a revertir."
+        ),
+    ),
+):
+    result = ManagedMigrationController().rollback(
+        db_id, confirm_version=confirm_version, admin=admin
+    )
     return success(data=result, message="Rollback ejecutado.")
 
 
@@ -141,3 +154,14 @@ def stamp_migration(
 ):
     result = ManagedMigrationController().stamp(db_id, version, admin=admin)
     return success(data=result, message="Versión marcada (stamp).")
+
+
+@router.get(
+    "/{db_id}/migrations/history",
+    response_model=ApiResponse[list[MigrationHistoryOut]],
+)
+def migration_history(admin: AdminDep, db_id: int, pagination: PaginationDep):
+    items, total = ManagedMigrationController().history(
+        db_id, limit=pagination.size, offset=pagination.offset
+    )
+    return paginated(items, total=total, pagination=pagination)

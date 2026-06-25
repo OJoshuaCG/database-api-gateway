@@ -94,7 +94,7 @@ class ManagedMigrationController:
     def _verify_integrity(specs: list[MigrationSpec]) -> None:
         for spec in specs:
             expected = compute_checksum(
-                spec.up_sql, spec.up_sql_mysql, spec.up_sql_postgresql
+                spec.up_sql, spec.up_sql_mysql, spec.up_sql_postgresql, spec.down_sql
             )
             if expected != spec.checksum:
                 raise AppHttpException(
@@ -165,12 +165,27 @@ class ManagedMigrationController:
             detail=f"apply hasta {up_to_version or 'head'}",
         )
 
-        results = self.runner.apply(
-            target, db_name=db_name, slug=slug, engine=engine,
-            managed_db_id=db_id, specs=specs, up_to_version=up_to_version,
-        )
+        try:
+            results = self.runner.apply(
+                target, db_name=db_name, slug=slug, engine=engine,
+                managed_db_id=db_id, specs=specs, up_to_version=up_to_version,
+            )
+        except AppHttpException as exc:
+            # Fallo de conexión/motor ANTES de aplicar ninguna migración: no hay
+            # resultado por-migración que registrar en el historial, pero dejamos
+            # traza del desenlace en auditoría (el "attempt" ya quedó arriba).
+            audit.record(
+                "migration.apply", status="error", admin=admin,
+                target_type="managed_database", target_id=db_id, server_id=server_id,
+                touched_engine=True,
+                detail=f"fallo al aplicar (HTTP {getattr(exc, 'status_code', '?')})",
+            )
+            raise
+
         self._record_history(db_id, results)
-        self._sync_model_version(db_id, results)
+        # model_version se SINCRONIZA releyendo la fuente de verdad (la tabla de
+        # versión que Alembic mantiene en la BD destino), no la contabilidad local.
+        self._sync_model_version_from_engine(db_id, target, db_name, slug)
 
         failed = any(r.status == "failed" for r in results)
         audit.record(
@@ -182,16 +197,21 @@ class ManagedMigrationController:
         )
         return {
             "managed_database_id": db_id,
+            "database_name": db_name,
+            "server_id": server_id,
             "applied_count": sum(1 for r in results if r.status == "applied"),
             "failed": failed,
             "results": [self._result_dict(r) for r in results],
         }
 
-    def rollback(self, db_id: int, *, admin: dict | None = None) -> dict:
+    def rollback(
+        self, db_id: int, *, confirm_version: str | None = None, admin: dict | None = None
+    ) -> dict:
         session = self._session()
         try:
             md, server, model = self._load_context(session, db_id)
             specs = self._load_specs(session, model.id)
+            self._verify_integrity(specs)  # el rollback ejecuta DDL destructivo
             slug, engine = model.slug, EngineType(engine_value(server))
             db_name, server_id = md.name, md.server_id
             target = build_target(server)
@@ -205,6 +225,18 @@ class ManagedMigrationController:
                 message="La BD no tiene ninguna migración aplicada para revertir.",
                 status_code=409,
                 context={"managed_database_id": db_id},
+            )
+        # Doble intención para una operación DESTRUCTIVA (puede perder datos): el
+        # cliente debe repetir la versión exacta a revertir, igual que confirm_name
+        # en DROP DATABASE.
+        if confirm_version != current:
+            raise AppHttpException(
+                message=(
+                    "Confirmación requerida: para revertir, 'confirm_version' debe "
+                    f"coincidir con la versión actual de la BD ({current})."
+                ),
+                status_code=422,
+                context={"managed_database_id": db_id, "required": "confirm_version == current"},
             )
         spec = next((s for s in specs if s.version == current), None)
         if spec is None or not spec.down_sql:
@@ -246,6 +278,7 @@ class ManagedMigrationController:
         try:
             md, server, model = self._load_context(session, db_id)
             specs = self._load_specs(session, model.id)
+            self._verify_integrity(specs)
             slug, engine = model.slug, EngineType(engine_value(server))
             db_name, server_id = md.name, md.server_id
             target = build_target(server)
@@ -295,21 +328,23 @@ class ManagedMigrationController:
         finally:
             session.close()
 
+        # Nombres/servidores de las BDs cargados de UNA vez (evita N+1 por BD).
+        meta = self._load_db_meta(db_ids)
         items: list[dict] = []
         for db_id in db_ids:
-            item = {"managed_database_id": db_id, "applied": [], "ok": False}
+            name, srv = meta.get(db_id, (None, None))
+            item = {
+                "managed_database_id": db_id, "database_name": name, "server_id": srv,
+                "applied": [], "ok": False,
+            }
             try:
                 # Reutiliza el flujo individual (carga, integridad, runner, historial).
                 out = self.apply(db_id, admin=admin)
                 item["ok"] = not out["failed"]
                 item["applied"] = out["results"]
-                item["database_name"] = self._db_name(db_id)
-                item["server_id"] = self._server_id(db_id)
             except AppHttpException as exc:
                 item["ok"] = False
                 item["error"] = exc.message
-                item["database_name"] = self._db_name(db_id)
-                item["server_id"] = self._server_id(db_id)
             items.append(item)
 
         audit.record(
@@ -323,6 +358,54 @@ class ManagedMigrationController:
             "processed": len(db_ids),
             "results": items,
         }
+
+    # ------------------------------------------------------------------ #
+    # Historial (lectura)                                                 #
+    # ------------------------------------------------------------------ #
+    def history(self, db_id: int, *, limit: int, offset: int) -> tuple[list[dict], int]:
+        """Historial de aplicaciones de migraciones de una BD (más reciente primero)."""
+        session = self._session()
+        try:
+            if session.get(ManagedDatabase, db_id) is None:
+                raise AppHttpException(
+                    message="Base de datos gestionada no encontrada.",
+                    status_code=404,
+                    context={"managed_database_id": db_id},
+                )
+            q = (
+                session.query(DatabaseMigrationHistory, ModelMigration.version)
+                .outerjoin(
+                    ModelMigration,
+                    ModelMigration.id == DatabaseMigrationHistory.model_migration_id,
+                )
+                .filter(DatabaseMigrationHistory.managed_database_id == db_id)
+            )
+            total = q.count()
+            rows = (
+                q.order_by(
+                    DatabaseMigrationHistory.applied_at.desc(),
+                    DatabaseMigrationHistory.id.desc(),
+                )
+                .limit(limit)
+                .offset(offset)
+                .all()
+            )
+            items = [
+                {
+                    "id": h.id,
+                    "managed_database_id": h.managed_database_id,
+                    "model_migration_id": h.model_migration_id,
+                    "version": version,
+                    "applied_at": h.applied_at,
+                    "status": h.status.value if hasattr(h.status, "value") else h.status,
+                    "error": h.error,
+                    "execution_ms": h.execution_ms,
+                }
+                for h, version in rows
+            ]
+            return items, total
+        finally:
+            session.close()
 
     # ------------------------------------------------------------------ #
     # Persistencia de resultados                                          #
@@ -347,11 +430,15 @@ class ManagedMigrationController:
         finally:
             session.close()
 
-    def _sync_model_version(self, db_id: int, results: list[MigrationResult]) -> None:
-        """model_version = última versión aplicada con éxito (si la hubo)."""
-        applied = [r.version for r in results if r.status == "applied"]
-        if applied:
-            self._set_model_version(db_id, max(applied))
+    def _sync_model_version_from_engine(
+        self, db_id: int, target, db_name: str, slug: str
+    ) -> None:
+        """
+        Sincroniza model_version releyendo la FUENTE DE VERDAD: la tabla de versión
+        que Alembic mantiene dentro de la BD destino (no la contabilidad local).
+        """
+        current = self.runner.get_current_version(target, db_name, slug)
+        self._set_model_version(db_id, current)
 
     def _set_model_version(self, db_id: int, version: str | None) -> None:
         session = self._session()
@@ -363,19 +450,20 @@ class ManagedMigrationController:
         finally:
             session.close()
 
-    def _db_name(self, db_id: int) -> str | None:
+    def _load_db_meta(self, db_ids: list[int]) -> dict[int, tuple[str, int]]:
+        """Carga (name, server_id) de varias BDs en una sola query."""
+        if not db_ids:
+            return {}
         session = self._session()
         try:
-            md = session.get(ManagedDatabase, db_id)
-            return md.name if md else None
-        finally:
-            session.close()
-
-    def _server_id(self, db_id: int) -> int | None:
-        session = self._session()
-        try:
-            md = session.get(ManagedDatabase, db_id)
-            return md.server_id if md else None
+            rows = (
+                session.query(
+                    ManagedDatabase.id, ManagedDatabase.name, ManagedDatabase.server_id
+                )
+                .filter(ManagedDatabase.id.in_(db_ids))
+                .all()
+            )
+            return {r.id: (r.name, r.server_id) for r in rows}
         finally:
             session.close()
 

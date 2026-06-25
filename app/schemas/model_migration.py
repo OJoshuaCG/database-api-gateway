@@ -89,6 +89,21 @@ class MigrationResultOut(BaseModel):
     execution_ms: int
 
 
+class MigrationHistoryOut(BaseModel):
+    """Entrada del historial de aplicación de migraciones de una BD gestionada."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    managed_database_id: int
+    model_migration_id: int
+    version: str | None = None  # versión de la migración (join), si existe
+    applied_at: datetime
+    status: str
+    error: str | None = None
+    execution_ms: int | None = None
+
+
 class ApplyAllItemOut(BaseModel):
     """Resultado del apply masivo para una BD del blueprint."""
 
