@@ -1,13 +1,55 @@
 # 02 — Migraciones de modelos (blueprints versionados)
 
-**Estado:** ✅ Implementado y verificado contra motores reales (MySQL 8 + PostgreSQL 16) ·
+**Estado:** ✅ Implementado · endurecido tras revisión (seguridad/DBA/senior) ·
 **Depende de:** 01 ✅ · **Esfuerzo:** alto · **Última revisión:** 2026-06-25
 
-> Implementación: 289 tests en verde (35 nuevos) + verificación e2e completa contra
-> contenedores MySQL/PostgreSQL (apply/rollback/status/stamp/checksum/translation).
-> Gotcha clave resuelto: el advisory lock abría una transacción que dejaba la
-> migración sin commitear; la conexión del runner corre en **AUTOCOMMIT** (el lock de
-> sesión sobrevive). Ver `app/services/db_admin/migrations.py`.
+> **Verificación:** 292 tests unitarios en verde (SQLite). El flujo completo
+> (apply/history/rollback con confirm/stamp/checksum/traducción) está verificado e2e
+> contra **MySQL 8, MariaDB 11 y PostgreSQL 16** reales mediante el script MANUAL
+> `scripts/verify_migrations_e2e.py` (requiere Docker). Los tests de integración
+> canónicos con **testcontainers para CI siguen pendientes** (los posee
+> gateway-testing-qa; ver docs/plans/08 P1).
+>
+> **Gotcha clave:** el advisory lock abría una transacción que dejaba la migración sin
+> commitear; la conexión del runner corre en **AUTOCOMMIT** (el lock de SESIÓN
+> sobrevive). Ver `app/services/db_admin/migrations.py`.
+
+## Endurecimiento aplicado tras revisión (2026-06-25)
+
+- **Seguridad — integridad del rollback:** el `checksum` ahora cubre `down_sql`
+  además de `up_sql` y variantes; `_verify_integrity` se invoca también en
+  `rollback` y `stamp` (antes solo en `apply`).
+- **Seguridad — doble intención:** `rollback` exige `?confirm_version=<versión actual>`
+  (operación destructiva), igual que `confirm_name` en DROP DATABASE.
+- **Correctitud:** tras `apply`, `model_version` se sincroniza releyendo la fuente de
+  verdad (`_gw_v_{slug}` en la BD destino), no la contabilidad local; `create`/`delete`
+  de migración usan un único commit atómico (inserción/borrado + `current_version`).
+- **Robustez:** en MySQL/MariaDB se verifica el retorno de `GET_LOCK` (409 si no se
+  adquirió); el nombre de la tabla de versión se trunca a 63 (límite de PostgreSQL).
+- **DBA:** índice compuesto `(managed_database_id, applied_at)` para el historial;
+  índice redundante de `model_id` eliminado (lo cubre el UNIQUE compuesto); la
+  migración usa `op.create_index` plano (no `batch`, que es solo para SQLite).
+- **Observabilidad:** nuevo `GET /managed-databases/{id}/migrations/history` (paginado).
+
+## Tradeoff conocido: AUTOCOMMIT vs atomicidad DDL
+
+El runner corre en AUTOCOMMIT, necesario para que el advisory lock de sesión no
+envuelva la migración en una transacción no commiteada. Consecuencia: se renuncia a
+la atomicidad DDL transaccional que **PostgreSQL** sí soportaría. Una migración
+multi-sentencia que falle a mitad deja estado parcial (igual que MySQL, cuyo DDL
+autocommitea siempre). Mitigación: las migraciones deben ser **idempotentes**
+(`CREATE TABLE IF NOT EXISTS`, etc.) y la cadena se detiene en el primer fallo.
+Mejora futura (no bloqueante): estrategia por motor con `pg_advisory_xact_lock` +
+DDL transaccional real en PostgreSQL.
+
+## Cuándo escribir `up_sql_postgresql` manual (matriz de equivalencia)
+
+sqlglot auto-traduce el `up_sql` (estilo MySQL) a PostgreSQL para DDL común
+(`AUTO_INCREMENT`→`IDENTITY`, backticks→comillas, `DATETIME`→`TIMESTAMP`). Requieren
+**override manual** `up_sql_postgresql` (sqlglot no los resuelve de forma fiable):
+`ENUM(...)` inline, `ON UPDATE CURRENT_TIMESTAMP` (en PG es un trigger), `UNSIGNED`/
+`ZEROFILL`, `ALTER TABLE ... MODIFY ... AUTO_INCREMENT`, y rutinas `BEGIN…END` con
+`;` internos (el splitter no las parte; subir como un solo delta o usar override).
 
 ## Objetivo
 
