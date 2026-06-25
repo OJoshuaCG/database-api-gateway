@@ -15,21 +15,24 @@ Integridad: antes de tocar el motor se re-valida el ``checksum`` de cada migraci
 """
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
-from app.controllers.model_migration_controller import compute_checksum
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
-from app.models.enums import EngineType, MigrationStatus
+from app.models.enums import EngineType, MigrationStatus, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.services import audit
+from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
 from app.services.db_admin.migrations import (
     MigrationResult,
     MigrationRunner,
     MigrationSpec,
 )
+
+logger = get_logger(__name__)
 
 
 class ManagedMigrationController:
@@ -73,10 +76,9 @@ class ManagedMigrationController:
         rows = (
             session.query(ModelMigration)
             .filter(ModelMigration.model_id == model_id)
-            .order_by(ModelMigration.version.asc())
             .all()
         )
-        return [
+        specs = [
             MigrationSpec(
                 id=r.id,
                 version=r.version,
@@ -89,12 +91,16 @@ class ManagedMigrationController:
             )
             for r in rows
         ]
+        # Orden NUMÉRICO de versión (no lexicográfico): status/latest dependen de él.
+        specs.sort(key=lambda s: version_sort_key(s.version))
+        return specs
 
     @staticmethod
     def _verify_integrity(specs: list[MigrationSpec]) -> None:
         for spec in specs:
             expected = compute_checksum(
-                spec.up_sql, spec.up_sql_mysql, spec.up_sql_postgresql, spec.down_sql
+                spec.up_sql, spec.up_sql_mysql, spec.up_sql_postgresql,
+                spec.down_sql, spec.version,
             )
             if expected != spec.checksum:
                 raise AppHttpException(
@@ -137,7 +143,13 @@ class ManagedMigrationController:
     # Aplicación                                                          #
     # ------------------------------------------------------------------ #
     def apply(
-        self, db_id: int, *, up_to_version: str | None = None, admin: dict | None = None
+        self,
+        db_id: int,
+        *,
+        up_to_version: str | None = None,
+        force: bool = False,
+        dry_run: bool = False,
+        admin: dict | None = None,
     ) -> dict:
         session = self._session()
         try:
@@ -146,6 +158,7 @@ class ManagedMigrationController:
             self._verify_integrity(specs)
             slug, engine = model.slug, EngineType(engine_value(server))
             db_name, server_id = md.name, md.server_id
+            quarantined = md.status == ProvisionStatus.error
             target = build_target(server)
         finally:
             session.close()
@@ -157,23 +170,65 @@ class ManagedMigrationController:
                 context={"model_id": model.id},
             )
 
-        # Auditar la INTENCIÓN antes de tocar el motor.
+        # ROB1 — cuarentena: una migración fallida previa pudo dejar la BD en estado
+        # parcial (DDL no transaccional en MySQL). Se exige inspección + force=true.
+        self._guard_quarantine(db_id, quarantined, force, dry_run)
+
+        if dry_run:
+            return self._dry_run_plan(db_id, db_name, server_id, target, slug, specs, up_to_version)
+
+        return self._run_apply(
+            db_id, db_name=db_name, server_id=server_id, target=target,
+            engine=engine, slug=slug, specs=specs,
+            up_to_version=up_to_version, was_quarantined=quarantined, admin=admin,
+        )
+
+    @staticmethod
+    def _guard_quarantine(db_id: int, quarantined: bool, force: bool, dry_run: bool) -> None:
+        if quarantined and not force and not dry_run:
+            raise AppHttpException(
+                message=(
+                    "La BD está en cuarentena por un fallo de migración previo. "
+                    "Inspeccione el estado real y reintente con force=true."
+                ),
+                status_code=409,
+                context={"managed_database_id": db_id, "required": "force=true"},
+            )
+
+    def _dry_run_plan(
+        self, db_id, db_name, server_id, target, slug, specs, up_to_version
+    ) -> dict:
+        """Calcula el plan (pendientes) SIN tocar el motor más que para leer la versión."""
+        current = self.runner.get_current_version(target, db_name, slug)
+        pending = self.runner.compute_pending(current, specs, up_to_version)
+        return {
+            "managed_database_id": db_id,
+            "database_name": db_name,
+            "server_id": server_id,
+            "dry_run": True,
+            "current_version": current,
+            "pending_versions": [s.version for s in pending],
+            "pending_count": len(pending),
+        }
+
+    def _run_apply(
+        self, db_id, *, db_name, server_id, target, engine, slug, specs,
+        up_to_version, was_quarantined, admin,
+    ) -> dict:
+        """Ejecuta el apply real sobre UNA BD ya cargada/validada (reutilizable por apply_all)."""
         audit.record(
             "migration.apply", status="attempt", admin=admin,
             target_type="managed_database", target_id=db_id, server_id=server_id,
-            touched_engine=True,
-            detail=f"apply hasta {up_to_version or 'head'}",
+            touched_engine=True, detail=f"apply hasta {up_to_version or 'head'}",
         )
-
         try:
             results = self.runner.apply(
                 target, db_name=db_name, slug=slug, engine=engine,
                 managed_db_id=db_id, specs=specs, up_to_version=up_to_version,
             )
         except AppHttpException as exc:
-            # Fallo de conexión/motor ANTES de aplicar ninguna migración: no hay
-            # resultado por-migración que registrar en el historial, pero dejamos
-            # traza del desenlace en auditoría (el "attempt" ya quedó arriba).
+            # Fallo ANTES de aplicar ninguna migración (conexión/lock): no hay
+            # resultado por-migración que registrar; dejamos traza en auditoría.
             audit.record(
                 "migration.apply", status="error", admin=admin,
                 target_type="managed_database", target_id=db_id, server_id=server_id,
@@ -183,11 +238,14 @@ class ManagedMigrationController:
             raise
 
         self._record_history(db_id, results)
-        # model_version se SINCRONIZA releyendo la fuente de verdad (la tabla de
-        # versión que Alembic mantiene en la BD destino), no la contabilidad local.
+        # model_version se SINCRONIZA releyendo la fuente de verdad (tabla de versión
+        # que Alembic mantiene en la BD destino), no la contabilidad local.
         self._sync_model_version_from_engine(db_id, target, db_name, slug)
 
         failed = any(r.status == "failed" for r in results)
+        # ROB1 — marcar/limpiar cuarentena según el desenlace.
+        self._set_quarantine(db_id, failed, results)
+
         audit.record(
             "migration.apply", status="error" if failed else "success", admin=admin,
             target_type="managed_database", target_id=db_id, server_id=server_id,
@@ -201,6 +259,7 @@ class ManagedMigrationController:
             "server_id": server_id,
             "applied_count": sum(1 for r in results if r.status == "applied"),
             "failed": failed,
+            "quarantined": failed,
             "results": [self._result_dict(r) for r in results],
         }
 
@@ -287,7 +346,7 @@ class ManagedMigrationController:
 
         self.runner.stamp(
             target, db_name=db_name, slug=slug, engine=engine,
-            specs=specs, version=version,
+            managed_db_id=db_id, specs=specs, version=version,
         )
         self._set_model_version(db_id, version)
         audit.record(
@@ -298,11 +357,21 @@ class ManagedMigrationController:
         return self.status(db_id)
 
     def apply_all(
-        self, model_id: int, *, max_databases: int, admin: dict | None = None
+        self,
+        model_id: int,
+        *,
+        max_databases: int,
+        force: bool = False,
+        dry_run: bool = False,
+        admin: dict | None = None,
     ) -> dict:
         """
         Aplica las pendientes a TODAS las BDs del blueprint (síncrono, acotado).
         Continúa con las demás BDs aunque una falle. El job asíncrono es del Plan 06.
+
+        Optimización (evita trabajo N+1): carga y verifica ``specs`` UNA sola vez y
+        cachea el ``ServerTarget`` por servidor (la credencial se descifra una vez por
+        servidor, no por BD).
         """
         session = self._session()
         try:
@@ -312,50 +381,82 @@ class ManagedMigrationController:
                     message="Blueprint no encontrado.", status_code=404,
                     context={"model_id": model_id},
                 )
+            slug = model.slug
+            specs = self._load_specs(session, model_id)
             total = (
                 session.query(ManagedDatabase)
                 .filter(ManagedDatabase.model_id == model_id)
                 .count()
             )
-            db_ids = [
-                r.id
-                for r in session.query(ManagedDatabase.id)
+            db_rows = (
+                session.query(
+                    ManagedDatabase.id, ManagedDatabase.name,
+                    ManagedDatabase.server_id, ManagedDatabase.status,
+                )
                 .filter(ManagedDatabase.model_id == model_id)
                 .order_by(ManagedDatabase.id.asc())
                 .limit(max_databases)
                 .all()
-            ]
+            )
+            dbs = [(r.id, r.name, r.server_id, r.status) for r in db_rows]
+            # ServerTarget + engine por servidor distinto (descifra credencial 1×/servidor).
+            targets: dict[int, tuple] = {}
+            for sid in {d[2] for d in dbs}:
+                srv = get_server_or_404(session, sid)
+                targets[sid] = (build_target(srv), EngineType(engine_value(srv)))
         finally:
             session.close()
 
-        # Nombres/servidores de las BDs cargados de UNA vez (evita N+1 por BD).
-        meta = self._load_db_meta(db_ids)
+        if not specs:
+            raise AppHttpException(
+                message="El blueprint no tiene migraciones definidas.",
+                status_code=422,
+                context={"model_id": model_id},
+            )
+        self._verify_integrity(specs)  # una sola vez para todo el lote
+
         items: list[dict] = []
-        for db_id in db_ids:
-            name, srv = meta.get(db_id, (None, None))
+        for db_id, name, server_id, status in dbs:
+            target, engine = targets[server_id]
             item = {
-                "managed_database_id": db_id, "database_name": name, "server_id": srv,
-                "applied": [], "ok": False,
+                "managed_database_id": db_id, "database_name": name,
+                "server_id": server_id, "applied": [], "ok": False,
             }
             try:
-                # Reutiliza el flujo individual (carga, integridad, runner, historial).
-                out = self.apply(db_id, admin=admin)
-                item["ok"] = not out["failed"]
-                item["applied"] = out["results"]
+                quarantined = status == ProvisionStatus.error
+                self._guard_quarantine(db_id, quarantined, force, dry_run)
+                if dry_run:
+                    plan = self._dry_run_plan(
+                        db_id, name, server_id, target, slug, specs, None
+                    )
+                    item["ok"] = True
+                    item["pending_versions"] = plan["pending_versions"]
+                    item["dry_run"] = True
+                else:
+                    out = self._run_apply(
+                        db_id, db_name=name, server_id=server_id, target=target,
+                        engine=engine, slug=slug, specs=specs, up_to_version=None,
+                        was_quarantined=quarantined, admin=admin,
+                    )
+                    item["ok"] = not out["failed"]
+                    item["applied"] = out["results"]
             except AppHttpException as exc:
-                item["ok"] = False
                 item["error"] = exc.message
+            except Exception as exc:  # noqa: BLE001 — una BD no debe abortar el lote
+                logger.warning("apply_all: error inesperado en BD %s: %s", db_id, exc,
+                               exc_info=True)
+                item["error"] = f"error inesperado: {type(exc).__name__}"
             items.append(item)
 
         audit.record(
             "migration.apply_all", admin=admin, target_type="database_model",
             target_id=model_id, touched_engine=True,
-            detail=f"{len(db_ids)}/{total} BDs procesadas",
+            detail=f"{len(dbs)}/{total} BDs procesadas" + (" (dry-run)" if dry_run else ""),
         )
         return {
             "model_id": model_id,
             "total_databases": total,
-            "processed": len(db_ids),
+            "processed": len(dbs),
             "results": items,
         }
 
@@ -450,20 +551,31 @@ class ManagedMigrationController:
         finally:
             session.close()
 
-    def _load_db_meta(self, db_ids: list[int]) -> dict[int, tuple[str, int]]:
-        """Carga (name, server_id) de varias BDs en una sola query."""
-        if not db_ids:
-            return {}
+    def _set_quarantine(
+        self, db_id: int, failed: bool, results: list[MigrationResult]
+    ) -> None:
+        """
+        ROB1 — marca/limpia la cuarentena de la BD según el desenlace del apply:
+        - failed → status=error + nota con la versión que falló (posible estado parcial).
+        - éxito tras haber estado en error → vuelve a active y limpia la nota.
+        """
         session = self._session()
         try:
-            rows = (
-                session.query(
-                    ManagedDatabase.id, ManagedDatabase.name, ManagedDatabase.server_id
+            md = session.get(ManagedDatabase, db_id)
+            if md is None:
+                return
+            if failed:
+                bad = next((r for r in results if r.status == "failed"), None)
+                md.status = ProvisionStatus.error
+                md.notes = (
+                    f"Migración {bad.version if bad else '?'} falló; posible estado "
+                    f"parcial. Inspeccione y reintente con force=true."
                 )
-                .filter(ManagedDatabase.id.in_(db_ids))
-                .all()
-            )
-            return {r.id: (r.name, r.server_id) for r in rows}
+                session.commit()
+            elif md.status == ProvisionStatus.error:
+                md.status = ProvisionStatus.active
+                md.notes = None
+                session.commit()
         finally:
             session.close()
 
