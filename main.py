@@ -15,6 +15,10 @@ async def lifespan(app: FastAPI):
     # Arranque: sembrar el administrador único y el catálogo de privilegios.
     bootstrap_admin()
     seed_privileges()
+    # Asegurar una DEK persistida (envelope encryption) en sistema fresco; idempotente.
+    from app.core import crypto as _crypto
+
+    _crypto.bootstrap_dek()
     yield
     # Apagado: liberar los engines de conexión a servidores destino.
     remote_engine.dispose_all()

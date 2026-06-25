@@ -24,7 +24,7 @@ import base64
 import threading
 from functools import lru_cache
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -67,14 +67,23 @@ def _get_kek() -> Fernet:
 # DEK activa (cache en proceso, invalidable tras rotación)                     #
 # --------------------------------------------------------------------------- #
 _dek_lock = threading.Lock()
-_dek_cache: Fernet | None = None
+_dek_cache: MultiFernet | None = None
+
+# Cuántas DEKs INACTIVAS recientes se cargan además de la activa. Necesario para que,
+# durante la ventana posterior a una rotación, un token que aún se cifró con la DEK
+# anterior (p. ej. una escritura concurrente justo antes de rotar, o un re-cifrado que
+# no alcanzó cierta fila) siga siendo descifrable vía MultiFernet. La DEK ACTIVA siempre
+# es la primera del MultiFernet, así que `encrypt()` jamás usa una clave vieja.
+_DEK_HISTORY_SIZE = 2
 
 
-def _load_active_dek_key() -> bytes:
+def _load_dek_keys() -> list[bytes]:
     """
-    Clave DEK activa en claro (bytes). Si no hay fila activa (o no hay BD/tabla, p.ej.
-    en tests puros de crypto o en migraciones), cae a la clave derivada de la KEK
-    (comportamiento pre-envelope, retrocompatible).
+    Carga la DEK activa + hasta _DEK_HISTORY_SIZE DEKs inactivas recientes.
+    Retorna lista de claves en bytes: activa primero, luego inactivas por id desc.
+
+    Fallback a la clave derivada de la KEK si no hay BD/tabla disponible (sistema
+    pre-envelope, migraciones o tests puros de crypto) — retrocompatible.
     """
     try:
         from app.core.database import Database
@@ -82,29 +91,44 @@ def _load_active_dek_key() -> bytes:
 
         session = Database().get_declarative_base_session()
         try:
-            row = (
+            # Activa primero, luego las inactivas más recientes (ventana post-rotación).
+            active = (
                 session.query(CryptoKey)
                 .filter(CryptoKey.is_active.is_(True))
                 .order_by(CryptoKey.id.desc())
                 .first()
             )
+            inactive = (
+                session.query(CryptoKey)
+                .filter(CryptoKey.is_active.is_(False))
+                .order_by(CryptoKey.id.desc())
+                .limit(_DEK_HISTORY_SIZE)
+                .all()
+            )
         finally:
             session.close()
-        if row is not None:
-            return _get_kek().decrypt(row.dek_wrapped.encode("utf-8"))
+        rows = ([active] if active else []) + inactive
+        if rows:
+            kek = _get_kek()
+            return [kek.decrypt(r.dek_wrapped.encode("utf-8")) for r in rows]
     except CryptoConfigError:
         raise
     except Exception:
         # Sin BD/tabla disponible: usar la KEK como DEK (pre-envelope).
         pass
-    return _kek_key()
+    return [_kek_key()]
 
 
-def _active_dek() -> Fernet:
+def _active_dek() -> MultiFernet:
+    """
+    MultiFernet con la DEK activa primero (la usada para CIFRAR) y las DEKs recientes
+    detrás (solo para DESCIFRAR tokens emitidos con una clave anterior aún no re-cifrada).
+    """
     global _dek_cache
     with _dek_lock:
         if _dek_cache is None:
-            _dek_cache = Fernet(_load_active_dek_key())
+            keys = _load_dek_keys()
+            _dek_cache = MultiFernet([Fernet(k) for k in keys])
         return _dek_cache
 
 
@@ -146,10 +170,49 @@ def try_decrypt(token: str | None) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
+# Bootstrap de la DEK inicial                                                  #
+# --------------------------------------------------------------------------- #
+def bootstrap_dek() -> bool:
+    """
+    Asegura que exista una DEK en BD. En sistema fresco (sin DEK), genera y almacena
+    una DEK nueva envuelta por la KEK. Idempotente: si ya hay una DEK activa, no hace nada.
+    Retorna True si creó una nueva DEK, False si ya existía o no hay BD disponible.
+
+    Pensado para llamarse en el arranque (lifespan): así un despliegue limpio pasa a usar
+    una DEK persistida y envuelta desde el primer cifrado, sin requerir un /rotate manual
+    ni depender del fallback "KEK como DEK".
+    """
+    try:
+        from app.core.database import Database
+        from app.models.crypto_key import CryptoKey
+
+        session = Database().get_declarative_base_session()
+        try:
+            existing = (
+                session.query(CryptoKey).filter(CryptoKey.is_active.is_(True)).first()
+            )
+            if existing:
+                return False
+            _, new_wrapped = new_data_key()
+            session.add(CryptoKey(dek_wrapped=new_wrapped, is_active=True))
+            session.commit()
+        finally:
+            session.close()
+        # El proceso debe empezar a usar la DEK recién persistida.
+        reset_dek_cache()
+        return True
+    except CryptoConfigError:
+        raise
+    except Exception:
+        # Sin BD/tabla disponible (migraciones, tests puros): no es fatal, no-op.
+        return False
+
+
+# --------------------------------------------------------------------------- #
 # Primitivas para la rotación (usadas por app/services/crypto_rotation.py)     #
 # --------------------------------------------------------------------------- #
-def current_data_key() -> Fernet:
-    """DEK activa actual (para descifrar lo existente durante una rotación)."""
+def current_data_key() -> MultiFernet:
+    """DEK activa actual (con historial reciente para MultiFernet). Para rotación."""
     return _active_dek()
 
 
