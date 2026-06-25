@@ -28,6 +28,7 @@ from __future__ import annotations
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,11 +42,15 @@ from app.core.logger import get_logger
 from app.core.remote_engine import ServerTarget, database_connection, map_driver_error
 from app.exceptions import AppHttpException
 from app.models.enums import EngineType
+from app.services.db_admin.migration_integrity import validate_version, version_sort_key
 from app.services.db_admin.sql_dialect import (
     RollbackGenerator,
     SqlTranslator,
     split_sql_statements,
 )
+
+# Timeout (s) que esperan los advisory locks por BD antes de rendirse → 409.
+_LOCK_TIMEOUT_S = 30
 
 logger = get_logger(__name__)
 
@@ -131,7 +136,11 @@ class MigrationRunner:
     ) -> None:
         """Escribe un .py de Alembic por migración, con el SQL ya por motor."""
         prev: str | None = None
-        for spec in sorted(specs, key=lambda s: s.version):
+        # Orden NUMÉRICO (no lexicográfico): "9999" < "10000" debe respetarse.
+        for spec in sorted(specs, key=lambda s: version_sort_key(s.version)):
+            # Re-validar version antes de usarla en un path: los datos vienen de la BD
+            # del gateway; un tampering directo podría inyectar '../' (anti-traversal).
+            validate_version(spec.version)
             up = self.select_up_sql(spec, engine)
             down = self.select_down_sql(spec, engine)
             (versions_dir / f"rev_{spec.version}.py").write_text(
@@ -203,12 +212,19 @@ class MigrationRunner:
     def compute_pending(
         current: str | None, specs: list[MigrationSpec], up_to_version: str | None = None
     ) -> list[MigrationSpec]:
-        """Migraciones con version > current (y <= up_to_version), ordenadas asc."""
+        """Migraciones con version > current (y <= up_to_version), ordenadas asc.
+
+        Comparación NUMÉRICA: el orden lexicográfico de strings de ancho variable es
+        incorrecto ("10000" < "9999") y provocaría saltar migraciones silenciosamente.
+        """
+        cur = version_sort_key(current) if current is not None else None
+        upto = version_sort_key(up_to_version) if up_to_version is not None else None
         out = []
-        for spec in sorted(specs, key=lambda s: s.version):
-            if current is not None and spec.version <= current:
+        for spec in sorted(specs, key=lambda s: version_sort_key(s.version)):
+            v = version_sort_key(spec.version)
+            if cur is not None and v <= cur:
                 continue
-            if up_to_version is not None and spec.version > up_to_version:
+            if upto is not None and v > upto:
                 continue
             out.append(spec)
         return out
@@ -224,35 +240,98 @@ class MigrationRunner:
         return int(managed_db_id)
 
     def _acquire_lock(self, conn, engine: EngineType, managed_db_id: int) -> None:
+        """
+        Advisory lock por BD con semántica HOMOGÉNEA entre motores: si no se obtiene
+        dentro de ``_LOCK_TIMEOUT_S``, se aborta con 409 (no se bloquea indefinidamente
+        ni se asume el lock). MySQL: GET_LOCK con timeout. PostgreSQL: pg_try_advisory_lock
+        en sondeo (pg_advisory_lock bloqueante no respeta lock_timeout).
+        """
         key = self._lock_key(managed_db_id)
         if engine == EngineType.postgresql:
-            conn.exec_driver_sql(f"SELECT pg_advisory_lock({key})")
-        else:
-            # GET_LOCK devuelve 1 si lo obtuvo, 0 si expiró el timeout, NULL si error.
-            # NO asumir éxito: si no se obtuvo, abortar (otro proceso está migrando).
-            got = conn.exec_driver_sql(
-                f"SELECT GET_LOCK('gw_migrate_{key}', 30)"
-            ).scalar()
-            if got != 1:
-                raise AppHttpException(
-                    message=(
-                        "No se pudo adquirir el lock de migración de la BD "
-                        "(¿otra migración en curso?). Reintente más tarde."
-                    ),
-                    status_code=409,
-                    context={"managed_database_id": key},
-                )
+            deadline = time.monotonic() + _LOCK_TIMEOUT_S
+            while True:
+                got = conn.exec_driver_sql(f"SELECT pg_try_advisory_lock({key})").scalar()
+                if got:  # True => adquirido
+                    return
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.5)
+            raise self._lock_busy(key)
+        # MySQL/MariaDB: GET_LOCK devuelve 1 si lo obtuvo, 0 si expiró, NULL si error.
+        got = conn.exec_driver_sql(
+            f"SELECT GET_LOCK('gw_migrate_{key}', {_LOCK_TIMEOUT_S})"
+        ).scalar()
+        if got != 1:
+            raise self._lock_busy(key)
+
+    @staticmethod
+    def _lock_busy(key: int) -> AppHttpException:
+        return AppHttpException(
+            message=(
+                "No se pudo adquirir el lock de migración de la BD "
+                "(¿otra migración en curso?). Reintente más tarde."
+            ),
+            status_code=409,
+            context={"managed_database_id": key},
+        )
 
     def _release_lock(self, conn, engine: EngineType, managed_db_id: int) -> None:
+        key = self._lock_key(managed_db_id)
         try:
             if engine == EngineType.postgresql:
-                conn.exec_driver_sql(
-                    f"SELECT pg_advisory_unlock({self._lock_key(managed_db_id)})"
-                )
+                conn.exec_driver_sql(f"SELECT pg_advisory_unlock({key})")
             else:
-                conn.exec_driver_sql(f"SELECT RELEASE_LOCK('gw_migrate_{managed_db_id}')")
+                conn.exec_driver_sql(f"SELECT RELEASE_LOCK('gw_migrate_{key}')")
         except SQLAlchemyError:
-            logger.warning("No se pudo liberar el advisory lock de la BD %s", managed_db_id)
+            logger.warning("No se pudo liberar el advisory lock de la BD %s", key)
+
+    # ------------------------------------------------------------------ #
+    # Preparación común (tempdir + conexión AUTOCOMMIT + lock + Config)    #
+    # ------------------------------------------------------------------ #
+    @contextmanager
+    def _prepared(
+        self,
+        target: ServerTarget,
+        *,
+        db_name: str,
+        slug: str,
+        engine: EngineType,
+        specs: list[MigrationSpec],
+        managed_db_id: int,
+        op: str,
+    ):
+        """
+        Context manager que centraliza el preámbulo de toda operación del runner:
+        genera los archivos de revisión en un tempdir, abre la conexión a la BD destino
+        en AUTOCOMMIT, adquiere el advisory lock por BD y arma la ``Config``. Cede
+        ``(conn, cfg, version_table)`` y, al salir, libera el lock y limpia el tempdir.
+
+        AUTOCOMMIT: cada sentencia (DDL, escritura de la tabla de versión, advisory
+        lock) commitea al instante en MySQL y PostgreSQL — evita que el SELECT del lock
+        abra una transacción que Alembic no commitea y se perdería al cerrar.
+
+        Mapea errores de driver a AppHttpException con el ``op`` correspondiente.
+        """
+        version_table = version_table_name(slug)
+        with tempfile.TemporaryDirectory(prefix="gw_mig_") as tmp:
+            versions_dir = Path(tmp) / "versions"
+            versions_dir.mkdir()
+            self._write_revision_files(versions_dir, specs, engine)
+            try:
+                with database_connection(target, db_name) as conn:
+                    conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+                    self._acquire_lock(conn, engine, managed_db_id)
+                    try:
+                        cfg = self._make_config(versions_dir, conn, version_table)
+                        yield conn, cfg, version_table
+                    finally:
+                        self._release_lock(conn, engine, managed_db_id)
+            except AppHttpException:
+                raise
+            except SQLAlchemyError as exc:
+                raise map_driver_error(
+                    exc, op=op, target=target, extra={"database": db_name}
+                )
 
     # ------------------------------------------------------------------ #
     # Aplicación de migraciones                                           #
@@ -272,39 +351,18 @@ class MigrationRunner:
         Aplica las migraciones pendientes en orden. Se detiene en la primera que
         falle (la BD queda en la última versión aplicada con éxito).
         """
-        version_table = version_table_name(slug)
         results: list[MigrationResult] = []
-
-        with tempfile.TemporaryDirectory(prefix="gw_mig_") as tmp:
-            versions_dir = Path(tmp) / "versions"
-            versions_dir.mkdir()
-            self._write_revision_files(versions_dir, specs, engine)
-
-            try:
-                with database_connection(target, db_name) as conn:
-                    # AUTOCOMMIT: cada sentencia (DDL, escritura de la tabla de versión,
-                    # advisory lock) commitea al instante en MySQL y PostgreSQL. Evita
-                    # que el SELECT del advisory lock abra una transacción que Alembic no
-                    # commitea y que se perdería al cerrar la conexión. Consistente con
-                    # el DDL/DCL remoto del resto del proyecto (_execute_database).
-                    conn = conn.execution_options(isolation_level="AUTOCOMMIT")
-                    self._acquire_lock(conn, engine, managed_db_id)
-                    try:
-                        cfg = self._make_config(versions_dir, conn, version_table)
-                        current = self._read_current(conn, version_table)
-                        pending = self.compute_pending(current, specs, up_to_version)
-
-                        for spec in pending:
-                            result = self._apply_one(cfg, spec)
-                            results.append(result)
-                            if result.status == "failed":
-                                break  # no continuar tras un fallo
-                    finally:
-                        self._release_lock(conn, engine, managed_db_id)
-            except SQLAlchemyError as exc:
-                raise map_driver_error(
-                    exc, op="migration_apply", target=target, extra={"database": db_name}
-                )
+        with self._prepared(
+            target, db_name=db_name, slug=slug, engine=engine, specs=specs,
+            managed_db_id=managed_db_id, op="migration_apply",
+        ) as (conn, cfg, version_table):
+            current = self._read_current(conn, version_table)
+            pending = self.compute_pending(current, specs, up_to_version)
+            for spec in pending:
+                result = self._apply_one(cfg, spec)
+                results.append(result)
+                if result.status == "failed":
+                    break  # no continuar tras un fallo
         return results
 
     def _apply_one(self, cfg: Config, spec: MigrationSpec) -> MigrationResult:
@@ -340,61 +398,43 @@ class MigrationRunner:
         Revierte la última migración aplicada (``downgrade -1``). El llamador debe
         verificar ANTES que esa migración tenga ``down_sql`` confirmado (409 si no).
         """
-        version_table = version_table_name(slug)
-        with tempfile.TemporaryDirectory(prefix="gw_mig_") as tmp:
-            versions_dir = Path(tmp) / "versions"
-            versions_dir.mkdir()
-            self._write_revision_files(versions_dir, specs, engine)
-
+        with self._prepared(
+            target, db_name=db_name, slug=slug, engine=engine, specs=specs,
+            managed_db_id=managed_db_id, op="migration_rollback",
+        ) as (conn, cfg, version_table):
+            current = self._read_current(conn, version_table)
+            if current is None:
+                raise AppHttpException(
+                    message="La BD no tiene ninguna migración aplicada.",
+                    status_code=409,
+                    context={"database": db_name},
+                )
+            spec = next((s for s in specs if s.version == current), None)
+            if spec is None:
+                raise AppHttpException(
+                    message="La versión actual de la BD no existe en el blueprint.",
+                    status_code=409,
+                    context={"database": db_name, "current": current},
+                )
+            t0 = time.monotonic()
             try:
-                with database_connection(target, db_name) as conn:
-                    conn = conn.execution_options(isolation_level="AUTOCOMMIT")
-                    self._acquire_lock(conn, engine, managed_db_id)
-                    try:
-                        current = self._read_current(conn, version_table)
-                        if current is None:
-                            raise AppHttpException(
-                                message="La BD no tiene ninguna migración aplicada.",
-                                status_code=409,
-                                context={"database": db_name},
-                            )
-                        spec = next((s for s in specs if s.version == current), None)
-                        if spec is None:
-                            raise AppHttpException(
-                                message="La versión actual de la BD no existe en el blueprint.",
-                                status_code=409,
-                                context={"database": db_name, "current": current},
-                            )
-                        cfg = self._make_config(versions_dir, conn, version_table)
-                        t0 = time.monotonic()
-                        try:
-                            with _ALEMBIC_LOCK:
-                                command.downgrade(cfg, "-1")
-                            ms = int((time.monotonic() - t0) * 1000)
-                            return MigrationResult(
-                                migration_id=spec.id, version=spec.version,
-                                status="applied", error=None, execution_ms=ms,
-                                applied_at=datetime.now(timezone.utc),
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            ms = int((time.monotonic() - t0) * 1000)
-                            logger.warning(
-                                "Falló el rollback de %s: %s", spec.version, exc,
-                                exc_info=True,
-                            )
-                            return MigrationResult(
-                                migration_id=spec.id, version=spec.version,
-                                status="failed", error=_clean_error(exc),
-                                execution_ms=ms, applied_at=datetime.now(timezone.utc),
-                            )
-                    finally:
-                        self._release_lock(conn, engine, managed_db_id)
-            except AppHttpException:
-                raise
-            except SQLAlchemyError as exc:
-                raise map_driver_error(
-                    exc, op="migration_rollback", target=target,
-                    extra={"database": db_name},
+                with _ALEMBIC_LOCK:
+                    command.downgrade(cfg, "-1")
+                ms = int((time.monotonic() - t0) * 1000)
+                return MigrationResult(
+                    migration_id=spec.id, version=spec.version,
+                    status="applied", error=None, execution_ms=ms,
+                    applied_at=datetime.now(timezone.utc),
+                )
+            except Exception as exc:  # noqa: BLE001
+                ms = int((time.monotonic() - t0) * 1000)
+                logger.warning(
+                    "Falló el rollback de %s: %s", spec.version, exc, exc_info=True
+                )
+                return MigrationResult(
+                    migration_id=spec.id, version=spec.version,
+                    status="failed", error=_clean_error(exc),
+                    execution_ms=ms, applied_at=datetime.now(timezone.utc),
                 )
 
     def stamp(
@@ -404,6 +444,7 @@ class MigrationRunner:
         db_name: str,
         slug: str,
         engine: EngineType,
+        managed_db_id: int,
         specs: list[MigrationSpec],
         version: str,
     ) -> None:
@@ -414,21 +455,12 @@ class MigrationRunner:
                 status_code=422,
                 context={"version": version},
             )
-        version_table = version_table_name(slug)
-        with tempfile.TemporaryDirectory(prefix="gw_mig_") as tmp:
-            versions_dir = Path(tmp) / "versions"
-            versions_dir.mkdir()
-            self._write_revision_files(versions_dir, specs, engine)
-            try:
-                with database_connection(target, db_name) as conn:
-                    conn = conn.execution_options(isolation_level="AUTOCOMMIT")
-                    cfg = self._make_config(versions_dir, conn, version_table)
-                    with _ALEMBIC_LOCK:
-                        command.stamp(cfg, version)
-            except SQLAlchemyError as exc:
-                raise map_driver_error(
-                    exc, op="migration_stamp", target=target, extra={"database": db_name}
-                )
+        with self._prepared(
+            target, db_name=db_name, slug=slug, engine=engine, specs=specs,
+            managed_db_id=managed_db_id, op="migration_stamp",
+        ) as (_conn, cfg, _vt):
+            with _ALEMBIC_LOCK:
+                command.stamp(cfg, version)
 
     # ------------------------------------------------------------------ #
     # Helpers                                                             #

@@ -11,8 +11,7 @@ La aplicación sobre BDs gestionadas vive en ``ManagedDatabaseController`` (toca
 motor) usando ``MigrationRunner``.
 """
 
-import hashlib
-
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import Database
@@ -23,27 +22,17 @@ from app.models.database_model import DatabaseModel
 from app.models.enums import EngineType
 from app.models.model_migration import ModelMigration
 from app.services import audit
+from app.services.db_admin.migration_integrity import compute_checksum
 from app.services.db_admin.sql_dialect import RollbackGenerator, SqlTranslator
 
-
-def compute_checksum(
-    up_sql: str,
-    up_sql_mysql: str | None,
-    up_sql_postgresql: str | None,
-    down_sql: str | None = None,
-) -> str:
-    """
-    SHA256 de TODO el SQL ejecutable de la migración (up + variantes + rollback).
-
-    Incluir ``down_sql`` es CRÍTICO: el rollback ejecuta DDL destructivo, así que su
-    integridad debe protegerse igual que la del ``up_sql``. Detecta alteración directa
-    de la fila en la BD de metadatos del gateway antes de ejecutar nada en el motor.
-
-    Separadores ``\\x1f`` entre campos para evitar colisiones por concatenación.
-    """
-    parts = [up_sql or "", up_sql_mysql or "", up_sql_postgresql or "", down_sql or ""]
-    payload = "\x1f".join(parts)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+# Orden NUMÉRICO de versión en SQL: (longitud, valor) equivale al orden entero para
+# strings de solo dígitos (incl. con ceros a la izquierda), evitando el bug del orden
+# lexicográfico ("9999" > "10000"). Cross-engine (length() existe en los 4 motores).
+_VERSION_ORDER_ASC = (func.length(ModelMigration.version), ModelMigration.version)
+_VERSION_ORDER_DESC = (
+    func.length(ModelMigration.version).desc(),
+    ModelMigration.version.desc(),
+)
 
 
 class ModelMigrationController:
@@ -152,7 +141,7 @@ class ModelMigrationController:
             self._model_or_404(session, model_id)
             q = session.query(ModelMigration).filter(ModelMigration.model_id == model_id)
             total = q.count()
-            rows = q.order_by(ModelMigration.version.asc()).limit(limit).offset(offset).all()
+            rows = q.order_by(*_VERSION_ORDER_ASC).limit(limit).offset(offset).all()
             return [self._serialize_summary(r) for r in rows], total
         finally:
             session.close()
@@ -189,7 +178,9 @@ class ModelMigrationController:
                 up_sql_postgresql=up_pg,
                 down_sql=down_sql,
                 down_sql_suggested=suggested,
-                checksum=compute_checksum(up_sql, up_mysql, up_pg, down_sql),
+                checksum=compute_checksum(
+                    up_sql, up_mysql, up_pg, down_sql, data["version"]
+                ),
             )
             session.add(migration)
             try:
@@ -256,7 +247,7 @@ class ModelMigrationController:
 
             # Recalcular checksum si cambió alguna variante de SQL o el rollback.
             m.checksum = compute_checksum(
-                m.up_sql, m.up_sql_mysql, m.up_sql_postgresql, m.down_sql
+                m.up_sql, m.up_sql_mysql, m.up_sql_postgresql, m.down_sql, m.version
             )
             session.commit()
             session.refresh(m)
@@ -314,7 +305,7 @@ class ModelMigrationController:
         latest = (
             session.query(ModelMigration.version)
             .filter(ModelMigration.model_id == model_id)
-            .order_by(ModelMigration.version.desc())
+            .order_by(*_VERSION_ORDER_DESC)
             .first()
         )
         model = session.get(DatabaseModel, model_id)
