@@ -7,11 +7,12 @@ Crea/otorga/borra BDs reales en el motor destino. Flags que tocan el motor:
 - ``?provision=true`` en reassign-owner → re-grant / ALTER OWNER en el motor.
 """
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 
 from app.controllers.managed_database_controller import ManagedDatabaseController
 from app.controllers.managed_migration_controller import ManagedMigrationController
 from app.core.auth import AdminDep
+from app.core.limiter import limiter
 from app.models.enums import ProvisionStatus
 from app.schemas.managed_database import (
     ManagedDatabaseCreate,
@@ -114,7 +115,9 @@ def migration_status(admin: AdminDep, db_id: int):
 
 
 @router.post("/{db_id}/migrations/apply", response_model=ApiResponse[dict])
+@limiter.limit("10/minute")
 def apply_migrations(
+    request: Request,
     admin: AdminDep,
     db_id: int,
     version: str | None = Query(
@@ -122,13 +125,24 @@ def apply_migrations(
         pattern=r"^\d{4,10}$",
         description="Aplicar solo hasta esta versión (inclusive). Por defecto: todas.",
     ),
+    force: bool = Query(
+        False, description="Override de cuarentena tras un fallo previo (inspeccionado)."
+    ),
+    dry_run: bool = Query(
+        False, description="No aplica: devuelve el plan (versión actual + pendientes)."
+    ),
 ):
-    result = ManagedMigrationController().apply(db_id, up_to_version=version, admin=admin)
-    return success(data=result, message="Migraciones aplicadas.")
+    result = ManagedMigrationController().apply(
+        db_id, up_to_version=version, force=force, dry_run=dry_run, admin=admin
+    )
+    msg = "Plan de migración (dry-run)." if dry_run else "Migraciones aplicadas."
+    return success(data=result, message=msg)
 
 
 @router.post("/{db_id}/migrations/rollback", response_model=ApiResponse[dict])
+@limiter.limit("10/minute")
 def rollback_migration(
+    request: Request,
     admin: AdminDep,
     db_id: int,
     confirm_version: str = Query(
@@ -147,7 +161,9 @@ def rollback_migration(
 
 
 @router.post("/{db_id}/migrations/stamp", response_model=ApiResponse[MigrationStatusOut])
+@limiter.limit("10/minute")
 def stamp_migration(
+    request: Request,
     admin: AdminDep,
     db_id: int,
     version: str = Query(..., pattern=r"^\d{4,10}$", description="Versión a marcar"),

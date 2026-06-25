@@ -5,11 +5,12 @@ CRUD de migraciones sobre el inventario del gateway (NO toca motores) y el apply
 masivo (síncrono, acotado) sobre todas las BDs del blueprint.
 """
 
-from fastapi import APIRouter, Path, Query
+from fastapi import APIRouter, Path, Query, Request
 
 from app.controllers.managed_migration_controller import ManagedMigrationController
 from app.controllers.model_migration_controller import ModelMigrationController
 from app.core.auth import AdminDep
+from app.core.limiter import limiter
 from app.schemas.model_migration import (
     ApplyAllOut,
     ModelMigrationCreate,
@@ -52,15 +53,22 @@ def create_migration(admin: AdminDep, model_id: int, payload: ModelMigrationCrea
     "/{model_id}/migrations/apply-all",
     response_model=ApiResponse[ApplyAllOut],
 )
+@limiter.limit("3/minute")
 def apply_all(
+    request: Request,
     admin: AdminDep,
     model_id: int,
     max_databases: int = Query(10, ge=1, le=100, description="Cota de BDs a procesar"),
+    force: bool = Query(False, description="Override de cuarentena en cada BD."),
+    dry_run: bool = Query(
+        False, description="No aplica: devuelve el plan por BD (pendientes)."
+    ),
 ):
     result = ManagedMigrationController().apply_all(
-        model_id, max_databases=max_databases, admin=admin
+        model_id, max_databases=max_databases, force=force, dry_run=dry_run, admin=admin
     )
-    return success(data=result, message="Aplicación masiva ejecutada.")
+    msg = "Plan masivo (dry-run)." if dry_run else "Aplicación masiva ejecutada."
+    return success(data=result, message=msg)
 
 
 @router.get(

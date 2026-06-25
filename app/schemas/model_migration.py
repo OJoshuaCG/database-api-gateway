@@ -4,18 +4,21 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-# Versión: solo dígitos, mínimo 4 (padding). Orden lexicográfico = cronológico.
+# Versión: solo dígitos (4–10). Se compara/ordena NUMÉRICAMENTE (no lexicográfico).
 _VERSION = r"^\d{4,10}$"
+# Cota de tamaño del SQL de una migración (256 KB). Falla temprano con 422 en vez de
+# depender solo del límite global de tamaño de request (RequestSizeMiddleware).
+_MAX_SQL = 262_144
 
 
 class ModelMigrationCreate(BaseModel):
     version: str = Field(..., pattern=_VERSION, description="Secuencial con padding: 0001, 0002…")
     name: str = Field(..., min_length=1, max_length=200)
-    up_sql: str = Field(..., min_length=1, description="Delta SQL base (estilo MySQL de referencia)")
-    up_sql_mysql: str | None = Field(None, description="Override manual MySQL/MariaDB (opcional)")
-    up_sql_postgresql: str | None = Field(None, description="Override manual PostgreSQL (opcional)")
+    up_sql: str = Field(..., min_length=1, max_length=_MAX_SQL, description="Delta SQL base (estilo MySQL de referencia)")
+    up_sql_mysql: str | None = Field(None, max_length=_MAX_SQL, description="Override manual MySQL/MariaDB (opcional)")
+    up_sql_postgresql: str | None = Field(None, max_length=_MAX_SQL, description="Override manual PostgreSQL (opcional)")
     down_sql: str | None = Field(
-        None,
+        None, max_length=_MAX_SQL,
         description="Rollback confirmado (opcional). Si se omite, se sugiere uno auto-generado.",
     )
 
@@ -24,9 +27,9 @@ class ModelMigrationPatch(BaseModel):
     """Confirma el rollback o añade overrides DESPUÉS de crear la migración."""
 
     name: str | None = Field(None, min_length=1, max_length=200)
-    down_sql: str | None = Field(None, description="Confirma el rollback de esta versión")
-    up_sql_mysql: str | None = Field(None, description="Añade/actualiza override MySQL")
-    up_sql_postgresql: str | None = Field(None, description="Añade/actualiza override PostgreSQL")
+    down_sql: str | None = Field(None, max_length=_MAX_SQL, description="Confirma el rollback de esta versión")
+    up_sql_mysql: str | None = Field(None, max_length=_MAX_SQL, description="Añade/actualiza override MySQL")
+    up_sql_postgresql: str | None = Field(None, max_length=_MAX_SQL, description="Añade/actualiza override PostgreSQL")
 
 
 class ModelMigrationSummary(BaseModel):
@@ -105,13 +108,15 @@ class MigrationHistoryOut(BaseModel):
 
 
 class ApplyAllItemOut(BaseModel):
-    """Resultado del apply masivo para una BD del blueprint."""
+    """Resultado del apply masivo para una BD del blueprint (apply o dry-run)."""
 
     managed_database_id: int
-    database_name: str
-    server_id: int
+    database_name: str | None = None
+    server_id: int | None = None
     ok: bool
     applied: list[MigrationResultOut] = Field(default_factory=list)
+    dry_run: bool = False
+    pending_versions: list[str] = Field(default_factory=list)
     error: str | None = None
 
 
