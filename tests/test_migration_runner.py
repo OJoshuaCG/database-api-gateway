@@ -69,6 +69,19 @@ def test_compute_pending():
     assert r.compute_pending("0003", specs) == []
 
 
+def test_compute_pending_numeric_not_lexicographic():
+    """Regresión P3: cruzar de 4 a 5 dígitos no debe saltar la migración nueva."""
+    r = MigrationRunner()
+    specs = [_spec("9999", "a"), _spec("10000", "b")]
+    # current=9999 → 10000 está PENDIENTE (lexicográficamente "10000" < "9999").
+    assert [s.version for s in r.compute_pending("9999", specs)] == ["10000"]
+    # Orden de aplicación numérico.
+    assert [s.version for s in r.compute_pending(None, specs)] == ["9999", "10000"]
+    # Ancho mixto: 0099 (99) < 00100 (100).
+    mixed = [_spec("00100", "x"), _spec("0099", "y")]
+    assert [s.version for s in r.compute_pending(None, mixed)] == ["0099", "00100"]
+
+
 def test_write_revision_files_chains_down_revision():
     r = MigrationRunner()
     specs = [_spec("0001", "CREATE TABLE a (id INT)"),

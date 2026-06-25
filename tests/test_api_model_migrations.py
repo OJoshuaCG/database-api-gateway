@@ -85,6 +85,26 @@ def test_create_on_missing_model_404(admin_client):
     assert _create_migration(admin_client, 9999).status_code == 404
 
 
+def test_up_sql_too_large_422(admin_client):
+    model_id = _new_model(admin_client, slug="toobig", name="TooBig")
+    huge = "SELECT 1; " + ("x" * 262_200)
+    assert _create_migration(admin_client, model_id, up_sql=huge).status_code == 422
+
+
+def test_version_ordering_is_numeric(admin_client):
+    """Regresión P3: list y current_version ordenan numéricamente, no lexicográfico."""
+    model_id = _new_model(admin_client, slug="numorder", name="NumOrder")
+    _create_migration(admin_client, model_id, version="0009")
+    _create_migration(admin_client, model_id, version="00010",
+                      up_sql="ALTER TABLE users ADD COLUMN c INT")
+    items = admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations"
+    ).json()["data"]
+    assert [i["version"] for i in items] == ["0009", "00010"]  # 9 < 10
+    m = admin_client.get(f"/api/v1/database-models/{model_id}").json()["data"]
+    assert m["current_version"] == "00010"  # max numérico, no "0009"
+
+
 # --------------------------------------------------------------------------- #
 # List / Get                                                                   #
 # --------------------------------------------------------------------------- #
