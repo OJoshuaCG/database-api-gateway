@@ -10,6 +10,7 @@ Crea/otorga/borra BDs reales en el motor destino. Flags que tocan el motor:
 from fastapi import APIRouter, Query
 
 from app.controllers.managed_database_controller import ManagedDatabaseController
+from app.controllers.managed_migration_controller import ManagedMigrationController
 from app.core.auth import AdminDep
 from app.models.enums import ProvisionStatus
 from app.schemas.managed_database import (
@@ -18,6 +19,7 @@ from app.schemas.managed_database import (
     ManagedDatabaseUpdate,
     ReassignOwnerIn,
 )
+from app.schemas.model_migration import MigrationStatusOut
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
@@ -99,3 +101,43 @@ def reassign_owner(
         db_id, payload.owner_id, provision=provision, admin=admin
     )
     return success(data=updated, message="Propietario reasignado.")
+
+
+# --------------------------------------------------------------------------- #
+# Migraciones del blueprint sobre ESTA BD (tocan el motor destino vía Alembic) #
+# --------------------------------------------------------------------------- #
+@router.get(
+    "/{db_id}/migrations/status", response_model=ApiResponse[MigrationStatusOut]
+)
+def migration_status(admin: AdminDep, db_id: int):
+    return success(data=ManagedMigrationController().status(db_id))
+
+
+@router.post("/{db_id}/migrations/apply", response_model=ApiResponse[dict])
+def apply_migrations(
+    admin: AdminDep,
+    db_id: int,
+    version: str | None = Query(
+        None,
+        pattern=r"^\d{4,10}$",
+        description="Aplicar solo hasta esta versión (inclusive). Por defecto: todas.",
+    ),
+):
+    result = ManagedMigrationController().apply(db_id, up_to_version=version, admin=admin)
+    return success(data=result, message="Migraciones aplicadas.")
+
+
+@router.post("/{db_id}/migrations/rollback", response_model=ApiResponse[dict])
+def rollback_migration(admin: AdminDep, db_id: int):
+    result = ManagedMigrationController().rollback(db_id, admin=admin)
+    return success(data=result, message="Rollback ejecutado.")
+
+
+@router.post("/{db_id}/migrations/stamp", response_model=ApiResponse[MigrationStatusOut])
+def stamp_migration(
+    admin: AdminDep,
+    db_id: int,
+    version: str = Query(..., pattern=r"^\d{4,10}$", description="Versión a marcar"),
+):
+    result = ManagedMigrationController().stamp(db_id, version, admin=admin)
+    return success(data=result, message="Versión marcada (stamp).")
