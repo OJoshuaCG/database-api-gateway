@@ -139,6 +139,19 @@ def test_patch_override_changes_checksum_and_translation(admin_client):
     assert data["translated"]["postgresql"] == "CREATE TABLE users (id SERIAL PRIMARY KEY)"
 
 
+def test_checksum_covers_down_sql(admin_client):
+    """Confirmar el down_sql cambia el checksum (integridad cubre el rollback)."""
+    model_id = _new_model(admin_client, slug="cksdown", name="CksDown")
+    before = _create_migration(admin_client, model_id).json()["data"]
+    assert before["down_sql"] is None
+    after = admin_client.patch(
+        f"/api/v1/database-models/{model_id}/migrations/0001",
+        json={"down_sql": "DROP TABLE IF EXISTS users"},
+    ).json()["data"]
+    assert after["down_sql"] == "DROP TABLE IF EXISTS users"
+    assert after["checksum"] != before["checksum"]
+
+
 # --------------------------------------------------------------------------- #
 # Delete                                                                       #
 # --------------------------------------------------------------------------- #
@@ -150,4 +163,40 @@ def test_delete_migration(admin_client):
     ).status_code == 200
     assert admin_client.get(
         f"/api/v1/database-models/{model_id}/migrations/0001"
+    ).status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Historial (lectura, solo BD del gateway)                                     #
+# --------------------------------------------------------------------------- #
+def _server(admin_client, port, **ov) -> int:
+    payload = {
+        "name": f"srv{port}", "host": "10.0.0.9", "port": port,
+        "engine": "postgresql", "root_username": "root", "root_password": "rootpw",
+    }
+    payload.update(ov)
+    return admin_client.post("/api/v1/servers", json=payload).json()["data"]["id"]
+
+
+def _owner(admin_client, server_id, username="owner1") -> int:
+    return admin_client.post(
+        "/api/v1/server-users", json={"server_id": server_id, "username": username}
+    ).json()["data"]["id"]
+
+
+def test_history_empty_for_fresh_db(admin_client):
+    sid = _server(admin_client, 5470)
+    oid = _owner(admin_client, sid, "histowner")
+    db_id = admin_client.post(
+        "/api/v1/managed-databases",
+        json={"server_id": sid, "owner_id": oid, "name": "hist_db"},
+    ).json()["data"]["id"]
+    r = admin_client.get(f"/api/v1/managed-databases/{db_id}/migrations/history")
+    assert r.status_code == 200
+    assert r.json()["data"] == []
+
+
+def test_history_missing_db_404(admin_client):
+    assert admin_client.get(
+        "/api/v1/managed-databases/9999/migrations/history"
     ).status_code == 404
