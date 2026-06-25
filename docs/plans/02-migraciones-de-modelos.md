@@ -1,18 +1,44 @@
 # 02 — Migraciones de modelos (blueprints versionados)
 
-**Estado:** ✅ Implementado · endurecido tras revisión (seguridad/DBA/senior) ·
+**Estado:** ✅ Implementado · endurecido + auditoría técnica remediada ·
 **Depende de:** 01 ✅ · **Esfuerzo:** alto · **Última revisión:** 2026-06-25
 
-> **Verificación:** 292 tests unitarios en verde (SQLite). El flujo completo
-> (apply/history/rollback con confirm/stamp/checksum/traducción) está verificado e2e
-> contra **MySQL 8, MariaDB 11 y PostgreSQL 16** reales mediante el script MANUAL
-> `scripts/verify_migrations_e2e.py` (requiere Docker). Los tests de integración
-> canónicos con **testcontainers para CI siguen pendientes** (los posee
+> **Verificación:** 310 tests unitarios en verde (SQLite). El flujo completo
+> (apply/dry-run/history/rollback con confirm/stamp/checksum/cuarentena/traducción)
+> está verificado e2e contra **MySQL 8, MariaDB 11 y PostgreSQL 16** reales mediante
+> el script MANUAL `scripts/verify_migrations_e2e.py` (requiere Docker). Los tests de
+> integración canónicos con **testcontainers para CI siguen pendientes** (los posee
 > gateway-testing-qa; ver docs/plans/08 P1).
 >
 > **Gotcha clave:** el advisory lock abría una transacción que dejaba la migración sin
 > commitear; la conexión del runner corre en **AUTOCOMMIT** (el lock de SESIÓN
 > sobrevive). Ver `app/services/db_admin/migrations.py`.
+
+## Auditoría técnica remediada (2026-06-25)
+
+Tras una auditoría formal (0 críticos, 6 mayores, 7 menores, 3 sugerencias) se
+corrigieron **todos** los hallazgos de código:
+
+| Hallazgo | Severidad | Corrección |
+|---|---|---|
+| Orden de versión lexicográfico → salto silencioso de migraciones al cruzar de 4 a 5 dígitos | MAYOR | Comparación/orden **numérico** (`version_sort_key`) en runner y SQL (`length(), version`) |
+| `version` fuera del checksum + usada en path → traversal si la BD del gateway es comprometida | MAYOR | `validate_version` en el runner antes de construir el path + `version` incluida en el checksum |
+| Estado "sucio" tras fallo parcial sin cuarentena | MAYOR | Fallo → `status=error` + nota; re-`apply` exige `force=true`; éxito limpia la cuarentena |
+| `apply-all` síncrono y trabajo N+1 (specs/integridad/credencial por BD) | MAYOR/DB | `specs` + integridad **una vez**; `ServerTarget` cacheado por servidor |
+| `apply-all` abortaba el lote ante error inesperado | MENOR | `except Exception` por BD (continúa el lote) |
+| Sin rate-limit en operaciones destructivas | MENOR | `apply`/`rollback`/`stamp` `10/min`; `apply-all` `3/min` |
+| Lock PG bloqueante asimétrico vs MySQL | MENOR | `pg_try_advisory_lock` con sondeo/timeout → 409 homogéneo |
+| Sin cota de tamaño de SQL | MENOR | `max_length=256 KB` en el schema |
+| `compute_checksum` acoplado en un controller | SUGERENCIA | Movido a `app/services/db_admin/migration_integrity.py` |
+| Boilerplate por operación en el runner | SUGERENCIA | Context manager `_prepared` (tempdir + AUTOCOMMIT + lock + Config) |
+| Tabla de historial sin endpoint de lectura | (previo) | `GET /managed-databases/{id}/migrations/history` |
+| Falta de preview antes de aplicar DDL masivo | SUGERENCIA | `?dry_run=true` en `apply` y `apply-all` |
+
+**Pendientes arquitectónicos (NO de código) — diferidos al Plan 06:** fan-out
+asíncrono real de `apply-all` con background jobs, y reducir el `_ALEMBIC_LOCK`
+global a multiprocessing (hoy serializa `command.*` en todo el proceso). Mitigados por
+ahora: `apply-all` acotado por `max_databases` (≤100) + rate-limit, y el lock global es
+correcto aunque no óptimo. Tests de integración en CI con testcontainers: pendientes.
 
 ## Endurecimiento aplicado tras revisión (2026-06-25)
 
