@@ -141,6 +141,15 @@ def run_for(c, engine_key):
     check("status: current None", st["current_version"] is None)
     check("status: 2 pending", st["pending_count"] == 2)
 
+    # 5b) Dry-run: devuelve el plan sin tocar el motor.
+    dr = c.post(f"/api/v1/managed-databases/{db_id}/migrations/apply?dry_run=true")
+    check("dry-run HTTP 200", dr.status_code == 200)
+    drd = dr.json()["data"]
+    check("dry-run: 2 pendientes, no aplicado",
+          drd.get("dry_run") is True and drd["pending_count"] == 2)
+    st_after_dry = c.get(f"/api/v1/managed-databases/{db_id}/migrations/status").json()["data"]
+    check("dry-run no mutó la BD (sigue current None)", st_after_dry["current_version"] is None)
+
     # 6) Apply all pending.
     ap = c.post(f"/api/v1/managed-databases/{db_id}/migrations/apply")
     check("apply HTTP 200", ap.status_code == 200)
@@ -204,6 +213,38 @@ def run_for(c, engine_key):
     cols3 = [col["name"] for col in (insp3.get_columns("orders") if engine_key != "postgresql"
                                      else insp3.get_columns("orders", schema="public"))]
     check("stamp did NOT alter schema (status col remains)", "status" in cols3)
+
+    # 13) ROB1 — cuarentena: una migración que FALLA en el motor pone la BD en
+    # cuarentena (status=error) y bloquea el siguiente apply salvo force=true.
+    q_slug = f"qtest-{engine_key}"
+    q_mid = c.post("/api/v1/database-models",
+                   json={"name": f"Q-{engine_key}", "slug": q_slug}).json()["data"]["id"]
+    c.post(f"/api/v1/database-models/{q_mid}/migrations", json={
+        "version": "0001", "name": "ok", "up_sql": "CREATE TABLE q_ok (id INT)"})
+    c.post(f"/api/v1/database-models/{q_mid}/migrations", json={
+        "version": "0002", "name": "bad", "up_sql": "CREATE TABLE (((sintaxis invalida"})
+    q_db = f"vqt_{engine_key[:2]}"
+    try:
+        with server_engine(engine_key).connect() as conn:
+            conn.execution_options(isolation_level="AUTOCOMMIT").execute(
+                text(f"DROP DATABASE IF EXISTS {q_db}"))
+    except Exception:
+        pass
+    q_db_id = c.post("/api/v1/managed-databases?provision=true", json={
+        "server_id": sid, "owner_id": oid, "name": q_db, "model_id": q_mid,
+    }).json()["data"]["id"]
+
+    qa = c.post(f"/api/v1/managed-databases/{q_db_id}/migrations/apply")
+    qad = qa.json()["data"]
+    check("quarantine: 0001 aplicada, 0002 falla", qad["applied_count"] == 1 and qad["failed"] is True)
+    check("quarantine: respuesta marca quarantined", qad.get("quarantined") is True)
+    md_state = c.get(f"/api/v1/managed-databases/{q_db_id}").json()["data"]
+    check("quarantine: status=error en inventario", md_state["status"] == "error")
+    blocked = c.post(f"/api/v1/managed-databases/{q_db_id}/migrations/apply")
+    check("quarantine: re-apply sin force -> 409", blocked.status_code == 409)
+    forced = c.post(f"/api/v1/managed-databases/{q_db_id}/migrations/apply?force=true")
+    check("quarantine: force bypassa el guard (200, vuelve a fallar)",
+          forced.status_code == 200 and forced.json()["data"]["failed"] is True)
 
     return mid
 
