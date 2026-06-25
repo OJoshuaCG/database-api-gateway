@@ -132,6 +132,15 @@ if not ADMIN_PASSWORD and APP_ENV == "production":
         "Establece ADMIN_PASSWORD para sembrar el administrador antes de iniciar en producción."
     )
 
+# En producción la firma de la cookie de sesión NO debe derivarse de SECRET_KEY: si una
+# sola clave se filtra, comprometería sesión y cifrado a la vez. Exigimos un secreto
+# de sesión independiente y explícito.
+if APP_ENV == "production" and not os.getenv("SESSION_SECRET"):
+    raise ValueError(
+        "SESSION_SECRET no está definido. "
+        "En producción SESSION_SECRET debe ser independiente de SECRET_KEY."
+    )
+
 # La autenticación es por cookie de sesión (allow_credentials=True). Con CORS_ORIGINS="*"
 # el navegador rechaza enviar credenciales y reflejar el origin sería inseguro (CSRF
 # asistido por CORS). En producción EXIGIMOS orígenes explícitos.
