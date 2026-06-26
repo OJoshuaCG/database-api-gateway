@@ -222,24 +222,46 @@ curl -b cookies.txt -X POST http://localhost/api/v1/server-users/7/grants \
 
 ### `DELETE /api/v1/server-users/{user_id}/grants` 🔒 🔌
 
-Revoca privilegios. El cuerpo viaja en el `DELETE` (`RevokeRequest`, igual que
-`GrantRequest` pero sin `with_grant_option`).
+Revoca privilegios. El cuerpo viaja en el `DELETE` (`RevokeRequest`).
 
 **Body** (`RevokeRequest`):
 
-| Campo | Tipo | Requerido |
+| Campo | Tipo | Requerido | Notas |
+|---|---|---|---|
+| `level` | `GrantLevel` | sí | |
+| `object_ref` | `ObjectRef` | sí | |
+| `privileges` | list[string] | sí (mínimo 1) | |
+| `cascade` | bool | no (default `false`) | **Solo PostgreSQL**: revoca en cascada los privilegios re-delegados. En MySQL/MariaDB → `422`. |
+
+**Query params:**
+
+| Param | Tipo | Notas |
 |---|---|---|
-| `level` | `GrantLevel` | sí |
-| `object_ref` | `ObjectRef` | sí |
-| `privileges` | list[string] | sí (mínimo 1) |
+| `confirm_grantee` | string | **Obligatorio si `cascade=true`**: repetir el username del grantee (doble confirmación de operación GATE). |
+
+**Errores específicos:**
+
+- `409` — el `grantee` es la propia credencial del gateway (guard anti auto-lockout): no se permite revocarle privilegios a la cuenta pseudo-root de conexión.
+- `422` — `cascade=true` en MySQL/MariaDB (no soportado), o falta `confirm_grantee` cuando `cascade=true`.
+
+> **Auditoría:** todo REVOKE registra una fila de **intención** (`status="attempt"`,
+> fail-closed) antes de ejecutar, con campos DCL granulares (`grantee`, `privilege`,
+> `object_level`, `object_name`, `grantor`), y el resultado (`success`/`error`) después.
 
 **Respuesta** `200` — `ApiResponse[None]`.
 
 ```bash
+# REVOKE simple
 curl -b cookies.txt -X DELETE http://localhost/api/v1/server-users/7/grants \
   -H 'Content-Type: application/json' \
   -d '{ "level": "table", "object_ref": { "database": "app_prod", "table": "items" },
         "privileges": ["DELETE"] }'
+
+# REVOKE ... CASCADE (PostgreSQL) — exige confirmación
+curl -b cookies.txt -X DELETE "http://localhost/api/v1/server-users/7/grants?confirm_grantee=analista" \
+  -H 'Content-Type: application/json' \
+  -d '{ "level": "table", "object_ref": { "database": "app_prod", "schema": "public", "table": "items" },
+        "privileges": ["SELECT"], "cascade": true }'
 ```
 
 ```json
