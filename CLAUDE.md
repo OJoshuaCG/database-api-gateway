@@ -510,9 +510,40 @@ uv remove <paquete>
 uv sync
 ```
 
+## Módulo de Migraciones de Blueprints (Plan 02)
+
+Sistema de **migraciones versionadas de blueprints** (`DatabaseModel`): el admin sube
+deltas SQL por API y el gateway los aplica/revierte/marca sobre las N bases de datos
+gestionadas que replican el blueprint. **NO usa el `alembic/` del gateway**: usa Alembic
+como **librería embebida** contra cada BD destino (archivos en `migrations/_shared/`,
+distinto de `alembic/`). Guía de uso: `docs/features/model-migrations.md`.
+
+Archivos del módulo:
+- **Servicios** (`app/services/db_admin/`):
+  - `migrations.py` — `MigrationRunner` (Alembic embebido, advisory lock por BD,
+    conexión en AUTOCOMMIT, archivos de revisión en tempdir, dry-run, cuarentena).
+  - `sql_dialect.py` — `SqlTranslator` (MySQL→PostgreSQL con sqlglot), `RollbackGenerator`,
+    `split_sql_statements`.
+  - `migration_integrity.py` — `compute_checksum`, `validate_version` (anti path-traversal),
+    `version_sort_key` (orden NUMÉRICO, no lexicográfico).
+- **Modelos**: `app/models/model_migration.py` (`ModelMigration`),
+  `app/models/database_migration_history.py` (espejo de auditoría) + enum `MigrationStatus`.
+- **Controllers**: `model_migration_controller.py` (CRUD del blueprint, NO toca el motor),
+  `managed_migration_controller.py` (apply/rollback/stamp/status/history/apply-all, SÍ toca
+  el motor).
+- **Rutas**: `app/routes/v1/model_migrations.py` + endpoints `/migrations/*` en
+  `app/routes/v1/managed_databases.py`.
+
+Gotchas clave: el runner corre en **AUTOCOMMIT** (el advisory lock de sesión sobrevive y
+no deja una transacción sin commitear); las versiones se comparan/ordenan **numéricamente**;
+el `rollback` exige `?confirm_version=` (operación destructiva). Verificación e2e contra
+motores reales: `scripts/verify_migrations_e2e.py` (manual, requiere Docker).
+
 ## Documentación
 
-- `docs/` — documentación completa por feature
+- `docs/` — documentación completa por feature (ver `docs/features/model-migrations.md`
+  para migraciones de blueprints)
+- `README_MIGRATIONS.md` — migraciones Alembic de la **BD del gateway** (distinto del módulo de blueprints)
 - `readme.md` — instalación y uso general
 - FastAPI genera Swagger en `/api/v1/docs` y ReDoc en `/api/v1/redoc`
 - Documentación deshabilitada si `DOCS_ENABLED=False`
