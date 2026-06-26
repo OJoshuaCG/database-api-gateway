@@ -46,8 +46,10 @@ El sistema separa dos planos:
 | **Autenticación** | Sesión httpOnly firmada + administrador único, detrás de `get_current_admin` |
 | **Base (template)** | `ApiResponse[T]`, `AppHttpException`, middlewares, rate limiting, paginación, logging con Request ID |
 
-> Lo que se construye después (usuarios/BDs/modelos, migraciones, aprovisionamiento,
-> SSH, clonado) está documentado en [`docs/plans/`](docs/plans/README.md).
+> Ya implementado además de la Iteración 1: inventario de usuarios/BDs/blueprints,
+> permisos granulares y el **versionado de blueprints** — ver
+> [Migraciones de Blueprints](docs/features/model-migrations.md). Lo que sigue
+> (aprovisionamiento, SSH, clonado) está en [`docs/plans/`](docs/plans/README.md).
 
 ---
 

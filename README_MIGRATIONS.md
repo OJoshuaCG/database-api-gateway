@@ -1,5 +1,15 @@
 # Guía de Migraciones con Alembic
 
+> ⚠️ **Dos sistemas de migración distintos — no confundir:**
+>
+> | Sistema | Qué migra | Cómo | Documentación |
+> |---|---|---|---|
+> | **Migraciones del gateway** (este documento) | El esquema de la **BD de metadatos del gateway** (tablas `servers`, `managed_databases`, `model_migrations`…) | Alembic estándar vía CLI: `uv run alembic …`, archivos en `alembic/versions/` | este README |
+> | **Migraciones de blueprints** (Plan 02) | El esquema SQL versionado del admin aplicado a las **BDs gestionadas** (destino) | API (`/api/v1/.../migrations/*`), Alembic **embebido** contra cada BD destino, archivos en `migrations/_shared/` | [`docs/features/model-migrations.md`](docs/features/model-migrations.md) |
+>
+> Este documento cubre **solo el primero**. Para versionar el esquema de los blueprints y
+> aplicarlo a las bases de datos administradas, ver la guía de Migraciones de Blueprints.
+
 Este proyecto utiliza **Alembic** para gestionar las migraciones de base de datos de forma automática y versionada.
 
 ## Tabla de Contenidos
