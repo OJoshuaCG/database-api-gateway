@@ -241,7 +241,13 @@ class MySQLAdapter(ServerAdapter):
             [stmt], op="grant_object", extra={"username": grantee.username, "level": level.value}
         )
 
-    def revoke_object(self, grantee, level, object_ref, privileges) -> None:
+    def revoke_object(self, grantee, level, object_ref, privileges, *, cascade=False) -> None:
+        if cascade:
+            raise AppHttpException(
+                message="MySQL/MariaDB no soporta REVOKE ... CASCADE.",
+                status_code=422,
+                context={"dialect": self.dialect},
+            )
         canonical, _ = priv_catalog.validate_privileges(privileges, self.dialect, level)
         priv_clause, on_target = self._object_clause(level, object_ref, canonical)
         stmt = f"REVOKE {priv_clause} ON {on_target} FROM {self._grantee(grantee)}"

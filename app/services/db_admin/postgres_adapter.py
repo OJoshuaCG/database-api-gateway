@@ -249,8 +249,10 @@ class PostgresAdapter(ServerAdapter):
             db = self._require_field(object_ref.database, "database")
             self._execute_database(db, [stmt], op="grant_object", extra=extra)
 
-    def revoke_object(self, grantee, level, object_ref, privileges) -> None:
+    def revoke_object(self, grantee, level, object_ref, privileges, *, cascade=False) -> None:
         stmt, _on, server_level = self._build_dcl("REVOKE", grantee, level, object_ref, privileges)
+        if cascade:
+            stmt += " CASCADE"  # default del motor es RESTRICT
         extra = {"username": grantee.username, "level": level.value}
         if server_level:
             self._execute_server([stmt], op="revoke_object", extra=extra)

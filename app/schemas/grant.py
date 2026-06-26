@@ -16,6 +16,14 @@ class RevokeRequest(BaseModel):
     level: GrantLevel
     object_ref: ObjectRef
     privileges: list[str] = Field(min_length=1)
+    cascade: bool = Field(
+        default=False,
+        description=(
+            "Solo PostgreSQL: revoca en cascada los privilegios que el grantee haya "
+            "re-delegado. Operación GATE: exige confirmación (query 'confirm_grantee'). "
+            "MySQL/MariaDB no lo soporta (422). Por defecto RESTRICT."
+        ),
+    )
 
 
 class GrantableRequest(BaseModel):

@@ -119,8 +119,21 @@ def grant_object(admin: AdminDep, user_id: int, payload: GrantRequest):
 
 
 @router.delete("/{user_id}/grants", response_model=ApiResponse[None])
-def revoke_object(admin: AdminDep, user_id: int, payload: RevokeRequest):
-    GrantController().revoke_object(user_id, payload, admin=admin)
+def revoke_object(
+    admin: AdminDep,
+    user_id: int,
+    payload: RevokeRequest,
+    confirm_grantee: str | None = Query(
+        None,
+        description=(
+            "Obligatorio si payload.cascade=true: repetir el username del grantee para "
+            "confirmar el REVOKE ... CASCADE (operación destructiva, solo PostgreSQL)."
+        ),
+    ),
+):
+    GrantController().revoke_object(
+        user_id, payload, confirm_grantee=confirm_grantee, admin=admin
+    )
     priv_summary = ", ".join(payload.privileges)
     return empty(f"Privilegio(s) revocado(s): {priv_summary} a nivel {payload.level.value}.")
 

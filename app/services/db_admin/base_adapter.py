@@ -142,8 +142,16 @@ class ServerAdapter(ABC):
         level: GrantLevel,
         object_ref: ObjectRef,
         privileges: list[str],
+        *,
+        cascade: bool = False,
     ) -> None:
-        """Revoca ``privileges`` del ``grantee`` sobre el objeto del ``object_ref``."""
+        """
+        Revoca ``privileges`` del ``grantee`` sobre el objeto del ``object_ref``.
+
+        ``cascade`` solo aplica a PostgreSQL (revoca en cascada los privilegios que el
+        ``grantee`` haya delegado a su vez). En MySQL/MariaDB no existe y debe
+        rechazarse. Por defecto ``RESTRICT`` (no cascada).
+        """
 
     @abstractmethod
     def list_grants(
