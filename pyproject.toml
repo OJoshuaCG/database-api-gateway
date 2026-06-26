@@ -29,3 +29,6 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "integration: pruebas que requieren motores de BD reales (Docker). Se saltan si los engines no son alcanzables. Ejecutar con `-m integration`.",
+]

@@ -182,3 +182,24 @@ def test_pg_invalid_privileges_for_table_rejected(privs):
     with pytest.raises(AppHttpException) as exc:
         a.grant_object(R, GrantLevel.TABLE, ObjectRef(database="app", table="t"), privs)
     assert exc.value.status_code == 422
+
+
+# ------------------------------- CASCADE ------------------------------------- #
+def test_pg_revoke_cascade_appends_clause():
+    a, cap = _pg()
+    a.revoke_object(R, GrantLevel.TABLE, ObjectRef(database="app", table="t"), ["SELECT"], cascade=True)
+    assert cap["database"] == [("app", 'REVOKE SELECT ON TABLE "public"."t" FROM "r" CASCADE')]
+
+
+def test_pg_revoke_without_cascade_is_restrict_default():
+    a, cap = _pg()
+    a.revoke_object(R, GrantLevel.TABLE, ObjectRef(database="app", table="t"), ["SELECT"])
+    # Sin CASCADE explícito: el motor usa RESTRICT por defecto (no se añade cláusula).
+    assert cap["database"] == [("app", 'REVOKE SELECT ON TABLE "public"."t" FROM "r"')]
+
+
+def test_mysql_revoke_cascade_rejected_422():
+    a, _ = _mysql()
+    with pytest.raises(AppHttpException) as exc:
+        a.revoke_object(U, GrantLevel.TABLE, ObjectRef(database="app", table="t"), ["SELECT"], cascade=True)
+    assert exc.value.status_code == 422
