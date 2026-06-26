@@ -1,6 +1,6 @@
 # 07 — Gestión granular de permisos (GRANT/REVOKE cross-engine)
 
-**Estado:** 🟡 Fase 1 implementada — Fase 2/3 pendiente · **Depende de:** 01 (inventario) ✅ · **Esfuerzo:** alto · **Criticidad:** alta (DCL dinámico)
+**Estado:** ✅ Fase 1 completa (cierre 2026-06-26) — Fase 2/3 pendiente · **Depende de:** 01 (inventario) ✅ · **Esfuerzo:** alto · **Criticidad:** alta (DCL dinámico)
 
 Hoy el gateway solo otorga permisos **a nivel de base de datos completa** (`grant_database`/
 `revoke_database`) con una validación de privilegios **laxa** (regex que acepta cualquier
@@ -176,13 +176,13 @@ Todas con `ApiResponse[T]`, `AppHttpException`, admin autenticado, y `def` (I/O 
 
 ## 8. Fases
 
-- **Fase 1 (núcleo seguro) 🟡:** whitelists por motor/nivel + tabla de compatibilidad; reemplazo
+- **Fase 1 (núcleo seguro) ✅:** whitelists por motor/nivel + tabla de compatibilidad; reemplazo
   de `validate_privileges`; `grant_object`/`revoke_object`/`list_grants`/`can_grant`; niveles
   DATABASE, SCHEMA(PG), TABLE, COLUMN, SEQUENCE(PG), ROUTINE(EXECUTE); privilegios object-level
-  (ALLOW) + GATE con confirmación; DENY de admin; ampliación de `AuditLog` + migración;
-  endpoints `/grants` y `/grantable`; tests de contrato contra **motores reales** (Docker).
-  — Parcialmente completo: endpoints y adapters listos y verificados; **AuditLog ampliado y
-  tests de integración formales pendientes** (ver §11).
+  (ALLOW) + GATE; DENY de admin; ampliación de `AuditLog` + migración + auditoría de intención
+  fail-closed; anti auto-lockout (409); CASCADE en REVOKE con confirmación; endpoints `/grants`
+  y `/grantable`; tests unitarios de guards/auditoría + tests de integración contra **motores
+  reales** (Docker). — **Completa** (cierre 2026-06-26, ver §11).
 - **Fase 2:** membresía de roles (`GRANT rol TO rol`), default privileges generalizados a
   objetos futuros (sequences/functions), `MAINTAIN`/roles predefinidos gateados, endpoint de
   atributos de cuenta.
@@ -271,26 +271,32 @@ Todas con `ApiResponse[T]`, `AppHttpException`, admin autenticado, y `def` (I/O 
 
 ---
 
-## 11. Pendiente (Fase 1 incompleto)
+## 11. Cierre de Fase 1 (2026-06-26) ✅
 
-Los siguientes ítems forman parte del alcance de la Fase 1 pero **no se implementaron** en
-este incremento:
+Los pendientes de Fase 1 listados en versiones previas de este plan **ya se
+implementaron** (310 → 327 tests; 321 pasan, 6 de integración se saltan sin Docker):
 
-- **`AuditLog` ampliado:** agregar campos granulares (`grantee`, `privilege`,
-  `object_level`, `object_name`, `with_grant_option`, `grantor`) al modelo existente +
-  migración Alembic correspondiente. Hoy las operaciones DCL se registran en el log
-  genérico pero sin los campos específicos de DCL.
-- **Tests de integración formales:** batería `@pytest.mark.integration` parametrizada por
-  motor (MariaDB / PostgreSQL) que ejecute cada combinación de GRANT/REVOKE/LIST en el
-  stack Docker. Hoy la verificación fue manual con scripts end-to-end; no está
-  automatizada en CI.
-- **Anti auto-lockout explícito (código):** la regla "rechazar REVOKE cuyo `grantee`
-  resuelva a la credencial del gateway" (§6 punto 6) fue verificada implícitamente por el
-  motor (el motor lo rechaza), pero no existe guard explícito en el controller que devuelva
-  un 409 con mensaje claro antes de intentar la operación.
-- **CASCADE en REVOKE con confirmación:** actualmente no soportado. `REVOKE ... CASCADE`
-  sería bloqueante (RESTRICT por defecto); diseño e implementación con confirmación
-  pendientes (§6 punto 7).
-- **Fase 2/3:** membresía de roles (`GRANT rol TO rol`), default privileges generalizados,
-  niveles raros PG (type/lang/FDW/large object/parameter), administrativos split de
-  MariaDB, reconciliación inventario↔motor (ver §8 Fases).
+- **`AuditLog` ampliado:** campos granulares (`grantee`, `privilege`, `object_level`,
+  `object_name`, `with_grant_option`, `grantor`) en `app/models/audit_log.py` +
+  migración Alembic `f6a7b8c9d0e1` (down_revision `e5f6a7b8c9d0`). `audit.record()`
+  los acepta; `grant_object`/`revoke_object`/`apply_profile` los rellenan.
+- **Auditoría de intención fail-closed (§6.5):** `audit.record_intent()` escribe
+  `status="attempt"` ANTES de ejecutar todo REVOKE y los GRANT GATE; si no persiste,
+  lanza 500 y aborta (no best-effort).
+- **Anti auto-lockout explícito (§6.6):** guard en `GrantController.revoke_object` que
+  devuelve **409** si el `grantee` coincide (case-insensitive) con `server.root_username`
+  antes de tocar el motor.
+- **CASCADE en REVOKE con confirmación (§6.7):** `RevokeRequest.cascade` + query
+  `confirm_grantee` (repetir el username). PostgreSQL añade `CASCADE`; MySQL/MariaDB →
+  422 (no soportado). Default `RESTRICT`.
+- **Tests de integración formales:** `tests/test_grants_integration.py`
+  (`@pytest.mark.integration`, marker registrado en `pyproject.toml`) parametrizado por
+  motor; ejercita GRANT/REVOKE/LIST y CASCADE contra engines reales. Tests unitarios de
+  los guards y la auditoría en `tests/test_grant_guards.py` (SQLite, sin Docker).
+
+### Pendiente real (Fase 2/3)
+
+- **Fase 2:** membresía de roles (`GRANT rol TO rol`), confirmación de tokens GATE en
+  GRANT, default privileges generalizados, endpoint de atributos de cuenta.
+- **Fase 3:** niveles raros PG (type/lang/FDW/large object/parameter), administrativos
+  split de MariaDB, reconciliación inventario↔motor (ver §8 Fases).

@@ -522,7 +522,7 @@ datos. Recurso de nivel superior (no anidado bajo `/servers`); se filtra con
 | `GET` | `/api/v1/server-users/{user_id}/databases` | — | Lista las BDs cuyo owner es este usuario. |
 | `GET` | `/api/v1/server-users/{user_id}/grants` | `database?` (oblig. en PG) | 🔌 Permisos efectivos del usuario (introspección del motor). |
 | `POST` | `/api/v1/server-users/{user_id}/grants` | — | 🔌 Otorga privilegios a un nivel/objeto. |
-| `DELETE` | `/api/v1/server-users/{user_id}/grants` | — | 🔌 Revoca privilegios (cuerpo en el `DELETE`). |
+| `DELETE` | `/api/v1/server-users/{user_id}/grants` | `confirm_grantee?` | 🔌 Revoca privilegios (cuerpo en el `DELETE`; `cascade?` solo PG). |
 | `POST` | `/api/v1/server-users/{user_id}/apply-profile/{profile_id}` | — | 🔌 Aplica un [perfil de permisos](#11-perfiles-de-permisos-permission-profiles). |
 | `POST` | `/api/v1/server-users/provision` | — | 🔌 Crea + aprovisiona el usuario + aplica grants iniciales (`201`). |
 
@@ -599,13 +599,24 @@ curl -b cookies.txt -X POST https://<host>/api/v1/server-users/7/grants \
 
 #### `DELETE /api/v1/server-users/{user_id}/grants`
 
-Revoca privilegios. **Body** (`RevokeRequest`): `{ level, object_ref, privileges: list[str] }`.
+Revoca privilegios. **Body** (`RevokeRequest`): `{ level, object_ref, privileges: list[str], cascade?: bool }`.
+**Query**: `confirm_grantee` (str) — obligatorio si `cascade=true`: repetir el username del grantee.
 Respuesta `ApiResponse[None]`.
 
+- `409` si el `grantee` es la propia credencial del gateway (anti auto-lockout).
+- `cascade=true` solo en PostgreSQL (revoca privilegios re-delegados); en MySQL/MariaDB → `422`.
+- Sin `confirm_grantee` cuando `cascade=true` → `422`.
+
 ```bash
+# REVOKE simple
 curl -b cookies.txt -X DELETE https://<host>/api/v1/server-users/7/grants \
   -H "Content-Type: application/json" \
   -d '{ "level": "table", "object_ref": { "database": "app_prod", "table": "items" }, "privileges": ["DELETE"] }'
+
+# REVOKE ... CASCADE (PostgreSQL) — exige confirmación
+curl -b cookies.txt -X DELETE "https://<host>/api/v1/server-users/7/grants?confirm_grantee=analista" \
+  -H "Content-Type: application/json" \
+  -d '{ "level": "table", "object_ref": { "database": "app_prod", "schema": "public", "table": "items" }, "privileges": ["SELECT"], "cascade": true }'
 ```
 
 #### `POST /api/v1/server-users/{user_id}/apply-profile/{profile_id}`

@@ -1,6 +1,8 @@
-# Permisos Granulares (Plan 07 — Fase 1)
+# Permisos Granulares (Plan 07 — Fase 1 ✅)
 
 El módulo de permisos granulares permite otorgar, revocar y consultar privilegios de objetos de base de datos sobre usuarios del motor registrados en el gateway. Opera directamente sobre el motor destino (MariaDB/MySQL o PostgreSQL) a través del admin de conexión configurado en el servidor, con un catálogo cerrado de privilegios que garantiza que ningún token del usuario se interpola directamente en el DCL.
+
+> **Fase 1 cerrada (2026-06-26):** además del núcleo GRANT/REVOKE/LIST, incluye auditoría DCL granular, auditoría de intención fail-closed, guard anti auto-lockout y `REVOKE ... CASCADE` con confirmación. Ver [Pendiente (roadmap Fase 2-3)](#pendiente-roadmap-fase-2-3).
 
 ---
 
@@ -10,7 +12,7 @@ El módulo de permisos granulares permite otorgar, revocar y consultar privilegi
 |----------|-------------------------------------------------------------|----------------|---------------------------------------------------------------------------|
 | `GET`    | `/api/v1/server-users/{user_id}/grants`                     | Sesión admin   | Lista los permisos actuales del usuario en el motor.                     |
 | `POST`   | `/api/v1/server-users/{user_id}/grants`                     | Sesión admin   | Otorga privilegios sobre un objeto (GRANT).                              |
-| `DELETE` | `/api/v1/server-users/{user_id}/grants`                     | Sesión admin   | Revoca privilegios sobre un objeto (REVOKE).                             |
+| `DELETE` | `/api/v1/server-users/{user_id}/grants`                     | Sesión admin   | Revoca privilegios sobre un objeto (REVOKE). Body opcional `cascade`; query `confirm_grantee` si `cascade=true`. |
 | `POST`   | `/api/v1/server-users/{user_id}/apply-profile/{profile_id}` | Sesión admin   | Aplica un perfil de permisos preconfigurado al usuario (best-effort).    |
 | `POST`   | `/api/v1/server-users/provision`                            | Sesión admin   | Crea usuario en el inventario + provisiona en el motor + grants iniciales.|
 | `POST`   | `/api/v1/servers/{server_id}/grantable`                     | Sesión admin   | Verifica si el admin de conexión puede otorgar los privilegios dados.    |
@@ -126,11 +128,32 @@ Devuelve un array de objetos `GrantInfo`:
 
 El REVOKE no pre-chequea `can_grant` porque revocar no requiere `WITH GRANT OPTION`: solo exige que el admin haya sido quien otorgó el privilegio (o sea superuser). La red de seguridad es el propio error del motor.
 
+**Guards previos (antes de tocar el motor):**
+
+- **Anti auto-lockout (409):** se rechaza el REVOKE cuyo `grantee` coincida (case-insensitive) con la credencial pseudo-root del gateway (`server.root_username`). Revocarle privilegios a la propia cuenta de conexión dejaría al gateway sin acceso al motor. Para degradar esa cuenta hay que hacerlo fuera del gateway.
+- **CASCADE con confirmación (solo PostgreSQL):** `cascade: true` en el body revoca en cascada los privilegios que el `grantee` haya re-delegado. Es una operación GATE: exige repetir el username del grantee en el query param `confirm_grantee` (si no coincide → 422). En MySQL/MariaDB no existe `CASCADE` → 422. Por defecto el motor usa `RESTRICT`.
+
+**Auditoría de intención (fail-closed):** *todo* REVOKE registra primero una fila `status="attempt"` en `audit_log` con los campos DCL granulares (`grantee`, `privilege`, `object_level`, `object_name`, `grantor`). Si esa escritura no se persiste, la operación se **aborta** (no es best-effort). Tras ejecutar se registra el resultado (`success`/`error`).
+
 > **Nota sobre el cliente:** `DELETE` con body JSON requiere pasarlo explícitamente:
 > ```python
 > requests.request("DELETE", url, json=payload, headers=headers)
 > ```
 > Los clientes HTTP que ignoran el body en DELETE pueden generar un 422 por falta de campos requeridos.
+
+**Request (con CASCADE en PostgreSQL):**
+
+```http
+DELETE /api/v1/server-users/42/grants?confirm_grantee=analista
+Content-Type: application/json
+
+{
+  "level": "table",
+  "object_ref": { "database": "mi_app", "schema": "public", "table": "pedidos" },
+  "privileges": ["INSERT"],
+  "cascade": true
+}
+```
 
 **Request:**
 
@@ -372,7 +395,7 @@ Si `lookup` falla (token no está en el catálogo para ese motor y nivel) → 42
 | Clase  | Descripción                                                                                     | Comportamiento              |
 |--------|-------------------------------------------------------------------------------------------------|-----------------------------|
 | `ALLOW`| Privilegios de objeto estándar (SELECT, INSERT, USAGE, EXECUTE…).                               | Se otorgan directamente.    |
-| `GATE` | Privilegios ampliados (ALL PRIVILEGES, GRANT OPTION, PG MAINTAIN). Requieren doble confirmación.| Pasarán por confirmación en Fase 2; hoy se aceptan si el caller lo envía explícitamente. |
+| `GATE` | Privilegios ampliados (ALL PRIVILEGES, GRANT OPTION, PG MAINTAIN). Operaciones sensibles.| En GRANT se aceptan explícitamente y se **audita la intención** (fail-closed) antes de ejecutar. En REVOKE, `CASCADE` exige doble confirmación (`confirm_grantee`). |
 | `DENY` | Privilegios administrativos (SUPER, FILE, REPLICATION, SUPERUSER, CREATEROLE…).                | Rechazados con 422 siempre, en cualquier nivel. |
 
 ### Referencia de código
@@ -431,18 +454,23 @@ En `apply_profile`, este mismo pre-chequeo corre por ítem (best-effort): un ite
 
 ---
 
-## Pendiente (deuda Fase 1 / roadmap Fase 2-3)
+## Pendiente (roadmap Fase 2-3)
 
-### Deuda Fase 1
+### Fase 1 — cerrada ✅
 
-- **AuditLog granular:** los eventos `grant_object`, `revoke_object` y `apply_profile` se registran en el log de auditoría genérico (`audit.record`), pero no en una tabla de auditoría específica de grants con detalle de objeto/privilegio consultable por API.
-- **Tests de integración formales:** la verificación actual cubre 22 checks MariaDB + 16 PostgreSQL (end-to-end en sandbox). Los tests de integración contra motores reales con Testcontainers están pendientes.
+Todos los pendientes de Fase 1 se completaron (2026-06-26):
+
+- **AuditLog granular:** `audit_log` incluye los campos `grantee`, `privilege`, `object_level`, `object_name`, `with_grant_option`, `grantor` (migración `f6a7b8c9d0e1`). Los eventos `grant_object`/`revoke_object`/`apply_profile` los rellenan.
+- **Auditoría de intención fail-closed:** `audit.record_intent()` registra `status="attempt"` antes de ejecutar todo REVOKE y los GRANT GATE; si no persiste, la operación se aborta.
+- **Anti auto-lockout (409):** se rechaza el REVOKE a la propia credencial del gateway.
+- **CASCADE en REVOKE con confirmación:** soportado en PostgreSQL con `confirm_grantee` (GATE); MySQL/MariaDB → 422.
+- **Tests de integración formales:** `tests/test_grants_integration.py` (`@pytest.mark.integration`), parametrizado por motor, ejercita GRANT/REVOKE/LIST y CASCADE contra engines reales (se saltan si no hay Docker).
 
 ### Fase 2 (planificada)
 
 - **Membresía de roles:** endpoints para añadir/quitar usuarios a roles/grupos del motor (`GRANT role TO user`).
-- **Confirmación de tokens GATE:** flujo de doble confirmación para `ALL PRIVILEGES` y `GRANT OPTION` (actualmente se procesan sin paso extra).
-- **Revocación en cascada:** `REVOKE ... CASCADE` en PostgreSQL para revocar privilegios propagados via WITH GRANT OPTION.
+- **Confirmación de tokens GATE en GRANT:** doble confirmación para `ALL PRIVILEGES`/`GRANT OPTION` al otorgar (hoy se auditan como intención pero se aceptan sin paso extra).
+- **Default privileges:** `ALTER DEFAULT PRIVILEGES` para objetos futuros; endpoint de atributos de cuenta (`CREATEDB`, `CREATE USER`).
 
 ### Fase 3 (backlog)
 

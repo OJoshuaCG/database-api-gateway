@@ -35,7 +35,7 @@ modelo de datos/endpoints, decisiones, riesgos, pasos y verificación.
 | 04 | [Instalación de motor vía SSH](04-instalacion-motor-ssh.md) | 03 | Pendiente |
 | 05 | [Clonado de bases de datos entre servidores](05-clonado-de-bases-de-datos.md) | 01, 02 | Pendiente |
 | 06 | [Operación: seguridad, auditoría y observabilidad](06-operacion-seguridad-observabilidad.md) | transversal | 🟡 Continuo (auditoría base ✅) |
-| 07 | [Gestión granular de permisos (GRANT/REVOKE cross-engine)](07-gestion-granular-de-permisos.md) | 01 | 🟡 Fase 1 implementada (endpoints GRANT/REVOKE/LIST/GRANTABLE/PROVISION + perfiles) — Fase 2/3 pendiente |
+| 07 | [Gestión granular de permisos (GRANT/REVOKE cross-engine)](07-gestion-granular-de-permisos.md) | 01 | ✅ Fase 1 completa (GRANT/REVOKE/LIST/GRANTABLE/PROVISION + perfiles + auditoría DCL granular + anti-lockout + CASCADE) — Fase 2/3 pendiente |
 | 08 | [Production readiness: estado y bloqueantes](08-production-readiness.md) | transversal | 🔴 NO listo (ver bloqueantes) |
 
 ## Diagrama de dependencias
