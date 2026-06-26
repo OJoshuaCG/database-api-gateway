@@ -30,7 +30,7 @@ modelo de datos/endpoints, decisiones, riesgos, pasos y verificación.
 |---|------|-----------|--------|
 | 00 | [Deuda técnica y pendientes de Iteración 1](00-deuda-tecnica-y-pendientes.md) | — | 🟡 Parcial (ver doc) |
 | 01 | [Iteración 2 — Inventario completo y aprovisionamiento de usuarios/BDs](01-iteracion-2-inventario-y-aprovisionamiento.md) | 00 (parcial) | ✅ Completado |
-| 02 | [Migraciones de modelos (blueprints versionados)](02-migraciones-de-modelos.md) | 01 | Pendiente |
+| 02 | [Migraciones de modelos (blueprints versionados)](02-migraciones-de-modelos.md) | 01 | ✅ Completado (implementado + auditoría remediada; e2e MySQL 8 / MariaDB 11 / PostgreSQL 16) |
 | 03 | [Aprovisionamiento de servidores (API/Terraform)](03-aprovisionamiento-servidores.md) | 01 | Pendiente |
 | 04 | [Instalación de motor vía SSH](04-instalacion-motor-ssh.md) | 03 | Pendiente |
 | 05 | [Clonado de bases de datos entre servidores](05-clonado-de-bases-de-datos.md) | 01, 02 | Pendiente |

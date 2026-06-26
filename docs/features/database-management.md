@@ -15,7 +15,7 @@ Tres modelos ORM nuevos en la BD de metadatos del gateway:
 | Modelo | Tabla | Rol |
 |---|---|---|
 | `ServerUser` | `server_users` | Usuario real del motor (el **propietario**): `'user'@'host'` en MySQL, ROLE con LOGIN en PostgreSQL. Password opcional, **cifrado Fernet**. |
-| `DatabaseModel` | `database_models` | **Blueprint/categoría** lógica (p. ej. "Whatsapp", "SMS"). Metadato; el versionado real es Iteración 3. |
+| `DatabaseModel` | `database_models` | **Blueprint/categoría** lógica versionada (p. ej. "Whatsapp", "SMS"). Define migraciones SQL que el gateway aplica a las BDs que lo replican — ver [Migraciones de Blueprints](model-migrations.md) (Plan 02 implementado). |
 | `ManagedDatabase` | `managed_databases` | **BD real** creada en un servidor. Pertenece a exactamente **un** `ServerUser` del mismo servidor; opcionalmente replica un blueprint. |
 
 **Reglas de integridad:**
@@ -208,5 +208,6 @@ uv run pytest -q tests/test_api_server_users.py tests/test_api_managed_databases
 
 ## Próximos pasos
 
-Versionado y migración real de blueprints (`DatabaseModel`), clonado de BDs entre
-servidores y aprovisionamiento de infraestructura — ver `docs/plans/` (Iteraciones 3+).
+El versionado y la migración de blueprints (`DatabaseModel`) ya está implementado: ver
+[Migraciones de Blueprints](model-migrations.md). El clonado de BDs entre servidores y el
+aprovisionamiento de infraestructura siguen en `docs/plans/` (Iteraciones 3+).
