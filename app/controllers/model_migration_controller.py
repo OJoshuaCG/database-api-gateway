@@ -74,6 +74,7 @@ class ModelMigrationController:
             "source_engine": m.source_engine,
             "is_baseline": m.is_baseline,
             "has_non_portable": m.has_non_portable,
+            "reviewed": m.reviewed,
             "created_at": m.created_at,
             "updated_at": m.updated_at,
         }
@@ -89,6 +90,8 @@ class ModelMigrationController:
             "has_postgresql_override": m.up_sql_postgresql is not None,
             "has_rollback": m.down_sql is not None,
             "checksum": m.checksum,
+            "is_baseline": m.is_baseline,
+            "reviewed": m.reviewed,
             "created_at": m.created_at,
         }
 
@@ -279,6 +282,7 @@ class ModelMigrationController:
                 source_engine=source_engine,
                 is_baseline=True,
                 has_non_portable=dump.has_non_portable,
+                reviewed=False,  # R1: DDL capturado del motor → requiere aprobación antes de aplicar
             )
             session.add(migration)
             session.commit()
@@ -354,6 +358,12 @@ class ModelMigrationController:
                 m.up_sql_mysql = data["up_sql_mysql"]
             if "up_sql_postgresql" in data:
                 m.up_sql_postgresql = data["up_sql_postgresql"]
+            # R1: aprobación del baseline (revisión del DDL capturado). No es un campo
+            # de SQL, así que se permite aunque la migración ya esté aplicada en alguna BD.
+            reviewed_approved = False
+            if data.get("reviewed") is not None:
+                reviewed_approved = bool(data["reviewed"]) and not m.reviewed
+                m.reviewed = bool(data["reviewed"])
 
             # Recalcular checksum si cambió alguna variante de SQL o el rollback.
             m.checksum = compute_checksum(
@@ -371,6 +381,14 @@ class ModelMigrationController:
             target_id=model_id,
             detail=f"migración {version} actualizada",
         )
+        if reviewed_approved:
+            audit.record(
+                "migration.review",
+                admin=admin,
+                target_type="database_model",
+                target_id=model_id,
+                detail=f"baseline {version} revisado y aprobado para aplicar",
+            )
         return result
 
     def delete_migration(self, model_id: int, version: str, *, admin: dict | None = None) -> None:

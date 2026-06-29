@@ -158,6 +158,7 @@ class ManagedMigrationController:
             self._verify_integrity(specs)
             slug, engine = model.slug, EngineType(engine_value(server))
             self._guard_cross_engine(session, model.id, engine)
+            self._guard_reviewed_baseline(session, model.id)
             db_name, server_id = md.name, md.server_id
             quarantined = md.status == ProvisionStatus.error
             target = build_target(server)
@@ -224,6 +225,35 @@ class ManagedMigrationController:
                 ),
                 status_code=422,
                 context={"source_engine": row.source_engine, "target_engine": engine.value},
+            )
+
+    @staticmethod
+    def _guard_reviewed_baseline(session, model_id: int) -> None:
+        """
+        R1: un baseline de SNAPSHOT contiene DDL capturado del motor (potencialmente no
+        confiable). Bloquea (409) ``apply``/``apply-all`` mientras el blueprint tenga un
+        baseline ``reviewed=false``: un admin debe revisar el SQL y aprobarlo
+        (PATCH reviewed=true). NO afecta a ``stamp`` (que no ejecuta SQL).
+        """
+        rows = (
+            session.query(ModelMigration.version)
+            .filter(
+                ModelMigration.model_id == model_id,
+                ModelMigration.is_baseline.is_(True),
+                ModelMigration.reviewed.is_(False),
+            )
+            .all()
+        )
+        if rows:
+            versions = [r[0] for r in rows]
+            raise AppHttpException(
+                message=(
+                    f"El blueprint tiene un baseline de snapshot SIN revisar ({', '.join(versions)}). "
+                    "Contiene DDL capturado del motor: revísalo y apruébalo "
+                    "(PATCH reviewed=true en esa versión) antes de aplicar."
+                ),
+                status_code=409,
+                context={"model_id": model_id, "unreviewed_baseline": versions},
             )
 
     @staticmethod
@@ -514,6 +544,7 @@ class ManagedMigrationController:
                 )
             slug = model.slug
             specs = self._load_specs(session, model_id)
+            self._guard_reviewed_baseline(session, model_id)
             total = (
                 session.query(ManagedDatabase)
                 .filter(ManagedDatabase.model_id == model_id)

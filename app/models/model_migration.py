@@ -110,6 +110,18 @@ class ModelMigration(Base, TimestampMixin):
         comment="True si incluye objetos procedurales (rutinas/triggers/events) no traducibles cross-engine",
     )
 
+    reviewed: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default="1",
+        comment=(
+            "Aprobación del admin (R1): las migraciones escritas a mano nacen True; un "
+            "baseline de SNAPSHOT (DDL capturado del motor) nace False y NO se puede "
+            "aplicar hasta que se revise y apruebe (PATCH reviewed=true)"
+        ),
+    )
+
     def __repr__(self) -> str:
         return (
             f"<ModelMigration(id={self.id}, model_id={self.model_id}, "

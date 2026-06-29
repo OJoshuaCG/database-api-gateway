@@ -241,6 +241,68 @@ def test_from_snapshot_creates_baseline(admin_client, server_payload, monkeypatc
     assert "CREATE TABLE clientes" in m["up_sql"]
 
 
+def test_from_snapshot_baseline_is_unreviewed(admin_client, server_payload, monkeypatch):
+    sid = _make_server(admin_client, server_payload)
+    monkeypatch.setattr(sc, "get_adapter", lambda target: _FakeAdapter(dump=_sample_dump()))
+    r = admin_client.post(
+        "/api/v1/database-models/from-snapshot",
+        json={"server_id": sid, "database": "legacy", "name": "Rv", "slug": "rv"},
+    )
+    assert r.status_code == 201, r.text
+    model_id = r.json()["data"]["model"]["id"]
+    # R1: el baseline de snapshot nace SIN revisar.
+    r = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0001")
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["reviewed"] is False
+    assert r.json()["data"]["is_baseline"] is True
+
+
+def test_unreviewed_baseline_blocks_apply_until_approved(
+    admin_client, server_payload, monkeypatch
+):
+    from app.services.db_admin.migrations import MigrationRunner
+
+    sid = _make_server(admin_client, server_payload)
+    monkeypatch.setattr(sc, "get_adapter", lambda target: _FakeAdapter(dump=_sample_dump()))
+    r = admin_client.post(
+        "/api/v1/database-models/from-snapshot",
+        json={"server_id": sid, "database": "legacy", "name": "Gate", "slug": "gate"},
+    )
+    model_id = r.json()["data"]["model"]["id"]
+    owner = _make_user(admin_client, sid, "owner1")
+    db_id = _make_managed(admin_client, sid, owner, "appdb", model_id=model_id)
+
+    # 1) Apply bloqueado: baseline de snapshot sin revisar → 409 (sin tocar el motor).
+    r = admin_client.post(f"/api/v1/managed-databases/{db_id}/migrations/apply")
+    assert r.status_code == 409, r.text
+    assert "sin revisar" in r.text.lower() or "baseline" in r.text.lower()
+
+    # 2) Aprobar el baseline tras revisar su DDL.
+    r = admin_client.patch(
+        f"/api/v1/database-models/{model_id}/migrations/0001", json={"reviewed": True}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["reviewed"] is True
+
+    # 3) Ahora el apply procede (runner mockeado: sin motor real).
+    monkeypatch.setattr(MigrationRunner, "get_current_version", lambda self, *a, **k: None)
+    monkeypatch.setattr(MigrationRunner, "apply", lambda self, *a, **k: [])
+    r = admin_client.post(f"/api/v1/managed-databases/{db_id}/migrations/apply")
+    assert r.status_code == 200, r.text
+
+
+def test_handwritten_migration_is_reviewed_by_default(admin_client):
+    r = admin_client.post("/api/v1/database-models", json={"name": "hw", "slug": "hw"})
+    model_id = r.json()["data"]["id"]
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations",
+        json={"version": "0001", "name": "x", "up_sql": "CREATE TABLE t (id INT PRIMARY KEY)"},
+    )
+    assert r.status_code == 201, r.text
+    # Escrita a mano por el admin → nace revisada (no la bloquea el gate R1).
+    assert r.json()["data"]["reviewed"] is True
+
+
 def test_from_snapshot_empty_db_422(admin_client, server_payload, monkeypatch):
     sid = _make_server(admin_client, server_payload)
     empty_dump = StructureDump(database="vacia", source_engine="mysql", statements=[])

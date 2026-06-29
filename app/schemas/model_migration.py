@@ -30,6 +30,10 @@ class ModelMigrationPatch(BaseModel):
     down_sql: str | None = Field(None, max_length=_MAX_SQL, description="Confirma el rollback de esta versión")
     up_sql_mysql: str | None = Field(None, max_length=_MAX_SQL, description="Añade/actualiza override MySQL")
     up_sql_postgresql: str | None = Field(None, max_length=_MAX_SQL, description="Añade/actualiza override PostgreSQL")
+    reviewed: bool | None = Field(
+        None,
+        description="Aprueba (true) un baseline de snapshot tras revisar su DDL — habilita su apply (R1)",
+    )
 
 
 class ModelMigrationSummary(BaseModel):
@@ -45,6 +49,8 @@ class ModelMigrationSummary(BaseModel):
     has_postgresql_override: bool
     has_rollback: bool
     checksum: str
+    is_baseline: bool = False
+    reviewed: bool = True
     created_at: datetime
 
 
@@ -72,6 +78,9 @@ class ModelMigrationOut(BaseModel):
     is_baseline: bool = False
     has_non_portable: bool = Field(
         False, description="True si incluye objetos procedurales no traducibles cross-engine"
+    )
+    reviewed: bool = Field(
+        True, description="False = baseline de snapshot pendiente de revisión; no aplicable hasta aprobarse (R1)"
     )
     created_at: datetime
     updated_at: datetime
