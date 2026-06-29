@@ -103,3 +103,38 @@ class TableSchema(BaseModel):
     primary_key: list[str]
     foreign_keys: list[ForeignKeyInfo]
     indexes: list[IndexInfo]
+
+
+# --------------------------------------------------------------------------- #
+# Snapshot estructural (Plan 09) — dump de DDL para crear un blueprint baseline #
+# --------------------------------------------------------------------------- #
+class DumpStatement(BaseModel):
+    """Una sentencia DDL del dump estructural, etiquetada por tipo de objeto."""
+
+    object_type: str  # table | view | materialized_view | routine | trigger | sequence | type | extension | event
+    name: str
+    ddl: str
+
+
+class StructureDump(BaseModel):
+    """
+    Dump estructural COMPLETO de una BD (solo estructura, jamás filas).
+
+    ``statements`` ya viene en ORDEN DE DEPENDENCIA listo para re-aplicar
+    (extensions/types → tablas → secuencias → rutinas → vistas → triggers → events).
+    ``has_non_portable`` indica que incluye objetos procedurales (rutinas/triggers/
+    eventos) cuyo cuerpo NO es traducible cross-engine por sqlglot: el blueprint
+    resultante queda atado a ``source_engine``.
+    """
+
+    database: str
+    source_engine: str  # 'mysql' | 'mariadb' | 'postgresql'
+    statements: list[DumpStatement]
+    has_non_portable: bool = False
+
+    @property
+    def object_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for s in self.statements:
+            counts[s.object_type] = counts.get(s.object_type, 0) + 1
+        return counts

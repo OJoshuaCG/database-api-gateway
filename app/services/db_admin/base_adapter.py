@@ -11,6 +11,7 @@ en el contrato e implementadas por cada subclase, pero NO se exponen vía API en
 Iteración 1 (solo se usarán a partir de la Iteración 2).
 """
 
+import re
 from abc import ABC, abstractmethod
 
 from sqlalchemy import inspect, text
@@ -73,6 +74,27 @@ class ServerAdapter(ABC):
         return kind
 
     # ------------------------------------------------------------------ #
+    # Snapshot: sanitización de DEFINER/owner (compartida; Plan 09)       #
+    # ------------------------------------------------------------------ #
+    # MySQL: DEFINER=`user`@`host`  |  SQL SECURITY DEFINER (vistas/rutinas/triggers).
+    _DEFINER_RE = re.compile(
+        r"\s+DEFINER\s*=\s*(`[^`]*`@`[^`]*`|'[^']*'@'[^']*'|\"[^\"]*\"@\"[^\"]*\"|\S+)",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _strip_definer_clause(cls, ddl: str) -> str:
+        """
+        Quita la cláusula ``DEFINER=...`` de un DDL capturado (MySQL/MariaDB).
+
+        Capturar el DEFINER literal haría fallar el re-apply en otro servidor donde ese
+        usuario no existe. Tras quitarlo, el motor usa el invocador/owner del destino.
+        ``SQL SECURITY DEFINER`` se deja intacto (es válido y no referencia un usuario
+        concreto); el riesgo de escalada se documenta para revisión del admin.
+        """
+        return cls._DEFINER_RE.sub("", ddl)
+
+    # ------------------------------------------------------------------ #
     # Específico de dialecto                                              #
     # ------------------------------------------------------------------ #
     @abstractmethod
@@ -90,6 +112,15 @@ class ServerAdapter(ABC):
     @abstractmethod
     def list_users(self) -> list[EngineUserInfo]:
         """Lista usuarios/roles del motor, excluyendo los internos."""
+
+    @abstractmethod
+    def dump_structure(self, database: str) -> "StructureDump":
+        """
+        Dump estructural COMPLETO de la BD (tablas, vistas, rutinas, triggers, y
+        según motor: secuencias, tipos, extensiones, events). SOLO estructura, jamás
+        filas. Las sentencias vienen YA en orden de dependencia para re-aplicarse.
+        Plan 09 (adopción + snapshot como blueprint baseline).
+        """
 
     # ------------------------------------------------------------------ #
     # Escritura (contrato; uso por API a partir de la Iteración 2)        #
