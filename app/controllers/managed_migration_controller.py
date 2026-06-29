@@ -157,6 +157,7 @@ class ManagedMigrationController:
             specs = self._load_specs(session, model.id)
             self._verify_integrity(specs)
             slug, engine = model.slug, EngineType(engine_value(server))
+            self._guard_cross_engine(session, model.id, engine)
             db_name, server_id = md.name, md.server_id
             quarantined = md.status == ProvisionStatus.error
             target = build_target(server)
@@ -168,6 +169,20 @@ class ManagedMigrationController:
                 message="El blueprint no tiene migraciones definidas.",
                 status_code=422,
                 context={"model_id": model.id},
+            )
+
+        # Versión objetivo inexistente: evita aplicar silenciosamente "todo lo ≤ X"
+        # cuando X no es una versión real del blueprint. Comparación NUMÉRICA.
+        if up_to_version is not None and version_sort_key(up_to_version) not in {
+            version_sort_key(s.version) for s in specs
+        }:
+            raise AppHttpException(
+                message=(
+                    f"La versión objetivo {up_to_version} no existe en el blueprint. "
+                    f"Versiones disponibles: {', '.join(s.version for s in specs)}."
+                ),
+                status_code=422,
+                context={"target_version": up_to_version, "model_id": model.id},
             )
 
         # ROB1 — cuarentena: una migración fallida previa pudo dejar la BD en estado
@@ -182,6 +197,34 @@ class ManagedMigrationController:
             engine=engine, slug=slug, specs=specs,
             up_to_version=up_to_version, was_quarantined=quarantined, admin=admin,
         )
+
+    @staticmethod
+    def _guard_cross_engine(session, model_id: int, engine: EngineType) -> None:
+        """
+        Plan 09: un baseline de snapshot con objetos NO portables (rutinas/triggers/
+        events) queda atado a su ``source_engine`` (sqlglot no transpila código
+        procedural). Bloquea (422) aplicar ese blueprint a un servidor de otro motor.
+        """
+        row = (
+            session.query(ModelMigration)
+            .filter(
+                ModelMigration.model_id == model_id,
+                ModelMigration.has_non_portable.is_(True),
+                ModelMigration.source_engine.isnot(None),
+            )
+            .first()
+        )
+        if row and row.source_engine != engine.value:
+            raise AppHttpException(
+                message=(
+                    f"El blueprint tiene un baseline de snapshot del motor "
+                    f"'{row.source_engine}' con objetos no portables (rutinas/triggers): "
+                    f"no puede aplicarse a un servidor '{engine.value}'. Genere un baseline "
+                    "específico para este motor."
+                ),
+                status_code=422,
+                context={"source_engine": row.source_engine, "target_engine": engine.value},
+            )
 
     @staticmethod
     def _guard_quarantine(db_id: int, quarantined: bool, force: bool, dry_run: bool) -> None:
@@ -201,13 +244,18 @@ class ManagedMigrationController:
         """Calcula el plan (pendientes) SIN tocar el motor más que para leer la versión."""
         current = self.runner.get_current_version(target, db_name, slug)
         pending = self.runner.compute_pending(current, specs, up_to_version)
+        pending_versions = [s.version for s in pending]
         return {
             "managed_database_id": db_id,
             "database_name": db_name,
             "server_id": server_id,
             "dry_run": True,
-            "current_version": current,
-            "pending_versions": [s.version for s in pending],
+            "from_version": current,
+            "current_version": current,  # alias retrocompatible
+            "to_version": pending_versions[-1] if pending_versions else current,
+            "target_version": up_to_version,
+            "no_op": len(pending) == 0,
+            "pending_versions": pending_versions,
             "pending_count": len(pending),
         }
 
@@ -216,6 +264,8 @@ class ManagedMigrationController:
         up_to_version, was_quarantined, admin,
     ) -> dict:
         """Ejecuta el apply real sobre UNA BD ya cargada/validada (reutilizable por apply_all)."""
+        # Versión ANTES de aplicar (read-only) para reportar el salto from→to.
+        from_version = self.runner.get_current_version(target, db_name, slug)
         audit.record(
             "migration.apply", status="attempt", admin=admin,
             target_type="managed_database", target_id=db_id, server_id=server_id,
@@ -253,19 +303,39 @@ class ManagedMigrationController:
             detail=f"{sum(1 for r in results if r.status=='applied')} aplicadas"
                    + (" (con fallo)" if failed else ""),
         )
+        applied = [r for r in results if r.status == "applied"]
+        to_version = applied[-1].version if applied else from_version
         return {
             "managed_database_id": db_id,
             "database_name": db_name,
             "server_id": server_id,
-            "applied_count": sum(1 for r in results if r.status == "applied"),
+            "from_version": from_version,
+            "to_version": to_version,
+            "target_version": up_to_version,
+            "applied_count": len(applied),
             "failed": failed,
             "quarantined": failed,
+            "no_op": len(results) == 0 and not failed,
+            "pending_versions": [r.version for r in results],
             "results": [self._result_dict(r) for r in results],
         }
 
     def rollback(
-        self, db_id: int, *, confirm_version: str | None = None, admin: dict | None = None
+        self,
+        db_id: int,
+        *,
+        confirm_version: str | None = None,
+        target_version: str | None = None,
+        admin: dict | None = None,
     ) -> dict:
+        """
+        Revierte una BD a ``target_version`` de forma SECUENCIAL en una sola llamada
+        (análogo a apply, hacia atrás): el sistema detecta qué downgrades hay que
+        aplicar y los ejecuta en orden. Si ``target_version`` se omite, revierte solo
+        la última migración (compatibilidad). Operación DESTRUCTIVA: exige
+        ``confirm_version == versión actual`` (doble intención) y que TODO el camino
+        tenga ``down_sql`` confirmado (409 si falta alguno).
+        """
         session = self._session()
         try:
             md, server, model = self._load_context(session, db_id)
@@ -277,7 +347,6 @@ class ManagedMigrationController:
         finally:
             session.close()
 
-        # Verificar que la versión ACTUAL tenga rollback confirmado (409 si no).
         current = self.runner.get_current_version(target, db_name, slug)
         if current is None:
             raise AppHttpException(
@@ -285,51 +354,113 @@ class ManagedMigrationController:
                 status_code=409,
                 context={"managed_database_id": db_id},
             )
-        # Doble intención para una operación DESTRUCTIVA (puede perder datos): el
-        # cliente debe repetir la versión exacta a revertir, igual que confirm_name
-        # en DROP DATABASE.
+        # Doble intención: el cliente repite la versión ACTUAL (de la que parte).
         if confirm_version != current:
             raise AppHttpException(
                 message=(
-                    "Confirmación requerida: para revertir, 'confirm_version' debe "
-                    f"coincidir con la versión actual de la BD ({current})."
+                    "Confirmación requerida: 'confirm_version' debe coincidir con la "
+                    f"versión actual de la BD ({current})."
                 ),
                 status_code=422,
                 context={"managed_database_id": db_id, "required": "confirm_version == current"},
             )
-        spec = next((s for s in specs if s.version == current), None)
-        if spec is None or not spec.down_sql:
+
+        cur_key = version_sort_key(current)
+        spec_keys = {version_sort_key(s.version) for s in specs}
+
+        # Determinar el destino del rollback.
+        if target_version is None:
+            # Compat: revertir UNA migración (la actual). Destino = versión existente
+            # inmediatamente inferior, o base (None) si la actual es la primera.
+            below = sorted(
+                (s.version for s in specs if version_sort_key(s.version) < cur_key),
+                key=version_sort_key,
+            )
+            dest = below[-1] if below else None
+        else:
+            tkey = version_sort_key(target_version)
+            if tkey >= cur_key:
+                raise AppHttpException(
+                    message=(
+                        f"La versión objetivo ({target_version}) debe ser ANTERIOR a la "
+                        f"actual ({current}). Para avanzar usa /migrations/apply."
+                    ),
+                    status_code=422,
+                    context={"target_version": target_version, "current": current},
+                )
+            if tkey not in spec_keys:
+                raise AppHttpException(
+                    message=f"La versión objetivo {target_version} no existe en el blueprint.",
+                    status_code=422,
+                    context={"target_version": target_version, "model_id": model.id},
+                )
+            dest = target_version
+
+        # Camino a revertir: versiones con dest < v <= current (las que se desharán).
+        dest_key = version_sort_key(dest) if dest is not None else None
+        path = sorted(
+            (
+                s for s in specs
+                if version_sort_key(s.version) <= cur_key
+                and (dest_key is None or version_sort_key(s.version) > dest_key)
+            ),
+            key=lambda s: version_sort_key(s.version),
+            reverse=True,
+        )
+        # Fail-closed: TODO el camino debe tener down_sql confirmado ANTES de ejecutar
+        # (evita un rollback que falle a mitad por un downgrade no definido).
+        missing = [s.version for s in path if not s.down_sql]
+        if missing:
             raise AppHttpException(
-                message=f"La migración {current} no tiene rollback (down_sql) confirmado.",
+                message=(
+                    "No se puede revertir: las versiones "
+                    f"{', '.join(missing)} no tienen rollback (down_sql) confirmado. "
+                    "Confírmalo con PATCH en cada migración."
+                ),
                 status_code=409,
-                context={"managed_database_id": db_id, "version": current},
+                context={"managed_database_id": db_id, "missing_down_sql": missing},
             )
 
         audit.record(
             "migration.rollback", status="attempt", admin=admin,
             target_type="managed_database", target_id=db_id, server_id=server_id,
-            touched_engine=True, detail=f"rollback de {current}",
+            touched_engine=True, detail=f"rollback {current} -> {dest or 'base'}",
         )
-        result = self.runner.rollback_last(
+        results = self.runner.rollback_to(
             target, db_name=db_name, slug=slug, engine=engine,
-            managed_db_id=db_id, specs=specs,
+            managed_db_id=db_id, specs=specs, to_version=dest,
         )
-        # La versión tras el rollback se re-lee del motor (fuente de verdad).
+        self._record_history(db_id, results)
+        # La versión tras el rollback se RE-LEE del motor (fuente de verdad) y se
+        # sincroniza en el inventario del gateway.
         new_current = self.runner.get_current_version(target, db_name, slug)
         self._set_model_version(db_id, new_current)
 
+        failed = any(r.status == "failed" for r in results)
+        self._set_quarantine(db_id, failed, results)
+        reverted = [r for r in results if r.status == "applied"]
+
         audit.record(
             "migration.rollback",
-            status="success" if result.status == "applied" else "error",
+            status="error" if failed else "success",
             admin=admin, target_type="managed_database", target_id=db_id,
             server_id=server_id, touched_engine=True,
-            detail=f"rollback {current} -> {new_current or 'base'} ({result.status})",
+            detail=f"{len(reverted)} revertida(s): {current} -> {new_current or 'base'}"
+                   + (" (con fallo)" if failed else ""),
         )
         return {
             "managed_database_id": db_id,
-            "rolled_back_version": current,
-            "current_version": new_current,
-            "result": self._result_dict(result),
+            "database_name": db_name,
+            "server_id": server_id,
+            "from_version": current,
+            "to_version": new_current,
+            "target_version": dest,
+            "reverted_count": len(reverted),
+            "reverted_versions": [r.version for r in reverted],
+            "failed": failed,
+            "quarantined": failed,
+            "no_op": len(results) == 0,
+            "results": [self._result_dict(r) for r in results],
         }
 
     def stamp(self, db_id: int, version: str, *, admin: dict | None = None) -> dict:
