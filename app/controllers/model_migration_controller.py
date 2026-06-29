@@ -163,6 +163,25 @@ class ModelMigrationController:
     # ------------------------------------------------------------------ #
     # Escritura                                                           #
     # ------------------------------------------------------------------ #
+    # Reintentos al autoasignar versión: ante colisión por concurrencia (varios
+    # colaboradores creando a la vez), se recalcula el siguiente número y se reintenta.
+    _AUTO_VERSION_RETRIES = 5
+
+    @staticmethod
+    def _next_version(session, model_id: int) -> str:
+        """
+        Siguiente versión secuencial del blueprint = (máximo numérico actual) + 1, con
+        padding a 4 dígitos ('0001', '0002'…). Usa el orden NUMÉRICO, no lexicográfico.
+        """
+        latest = (
+            session.query(ModelMigration.version)
+            .filter(ModelMigration.model_id == model_id)
+            .order_by(*_VERSION_ORDER_DESC)
+            .first()
+        )
+        next_n = (int(latest[0]) + 1) if latest else 1
+        return f"{next_n:04d}"
+
     def create_migration(self, model_id: int, data: dict, *, admin: dict | None = None) -> dict:
         session = self._session()
         try:
@@ -175,38 +194,60 @@ class ModelMigrationController:
             # Sugerir rollback solo si el admin no proporcionó uno explícito.
             suggested = self._rollback.generate(up_sql)
 
-            migration = ModelMigration(
-                model_id=model_id,
-                version=data["version"],
-                name=data["name"],
-                up_sql=up_sql,
-                up_sql_mysql=up_mysql,
-                up_sql_postgresql=up_pg,
-                down_sql=down_sql,
-                down_sql_suggested=suggested,
-                checksum=compute_checksum(
-                    up_sql, up_mysql, up_pg, down_sql, data["version"]
-                ),
-            )
-            session.add(migration)
-            try:
-                # flush hace visible la nueva migración a _bump_model_version y
-                # detecta el conflicto de versión, todo en la MISMA transacción.
-                session.flush()
-                # Mantener current_version del blueprint = versión más reciente subida.
-                self._bump_model_version(session, model_id)
-                session.commit()  # inserción + current_version en un único commit atómico
-            except IntegrityError as exc:
-                session.rollback()
+            # Versión: explícita si el admin la pasó; si no, autoasignada (secuencial).
+            explicit_version = data.get("version")
+            attempts = 1 if explicit_version else self._AUTO_VERSION_RETRIES
+            migration = None
+            last_exc: IntegrityError | None = None
+            for _ in range(attempts):
+                version = explicit_version or self._next_version(session, model_id)
+                migration = ModelMigration(
+                    model_id=model_id,
+                    version=version,
+                    name=data["name"],
+                    up_sql=up_sql,
+                    up_sql_mysql=up_mysql,
+                    up_sql_postgresql=up_pg,
+                    down_sql=down_sql,
+                    down_sql_suggested=suggested,
+                    # El checksum cubre la versión: se recalcula en cada intento.
+                    checksum=compute_checksum(up_sql, up_mysql, up_pg, down_sql, version),
+                )
+                session.add(migration)
+                try:
+                    # flush hace visible la migración a _bump_model_version y detecta el
+                    # conflicto de versión (UNIQUE) en la MISMA transacción.
+                    session.flush()
+                    self._bump_model_version(session, model_id)
+                    session.commit()  # inserción + current_version en un único commit
+                    break
+                except IntegrityError as exc:
+                    session.rollback()
+                    last_exc = exc
+                    if explicit_version:
+                        # Versión EXPLÍCITA duplicada → 409 (no se reintenta).
+                        raise AppHttpException(
+                            message="Ya existe una migración con esa versión en el blueprint.",
+                            status_code=409,
+                            context={"model_id": model_id, "version": explicit_version},
+                        ) from exc
+                    # Autoasignada: colisión por concurrencia → recomputar y reintentar.
+                    continue
+            else:
+                # Se agotaron los reintentos en modo autónomo (alta concurrencia).
                 raise AppHttpException(
-                    message="Ya existe una migración con esa versión en el blueprint.",
+                    message=(
+                        "No se pudo asignar una versión secuencial por concurrencia alta. "
+                        "Reintenta la operación."
+                    ),
                     status_code=409,
-                    context={"model_id": model_id, "version": data["version"]},
-                ) from exc
-            session.refresh(migration)
+                    context={"model_id": model_id},
+                ) from last_exc
 
+            session.refresh(migration)
             result = self._serialize(migration)
             migration_id = migration.id
+            assigned_version = migration.version
         finally:
             session.close()
         audit.record(
@@ -214,7 +255,7 @@ class ModelMigrationController:
             admin=admin,
             target_type="database_model",
             target_id=model_id,
-            detail=f"migración {data['version']} creada (id={migration_id})",
+            detail=f"migración {assigned_version} creada (id={migration_id})",
         )
         return result
 

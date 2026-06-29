@@ -44,6 +44,45 @@ def test_create_returns_translation_and_suggested_rollback(admin_client):
     assert len(data["checksum"]) == 64
 
 
+def _create_auto(admin_client, model_id, up_sql="CREATE TABLE t (id INT PRIMARY KEY)", name="m"):
+    """Crea una migración SIN pasar 'version' (autoasignación secuencial)."""
+    return admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations",
+        json={"name": name, "up_sql": up_sql},
+    )
+
+
+def test_version_autoassigned_when_omitted(admin_client):
+    model_id = _new_model(admin_client, slug="auto", name="Auto")
+    versions = []
+    for _ in range(3):
+        r = _create_auto(admin_client, model_id)
+        assert r.status_code == 201, r.text
+        versions.append(r.json()["data"]["version"])
+    assert versions == ["0001", "0002", "0003"]
+    # El blueprint refleja la última autoasignada.
+    m = admin_client.get(f"/api/v1/database-models/{model_id}").json()["data"]
+    assert m["current_version"] == "0003"
+
+
+def test_autoassign_is_max_plus_one_not_count(admin_client):
+    model_id = _new_model(admin_client, slug="mix", name="Mix")
+    # Versión explícita alta; la autoasignación debe seguir desde max+1, no desde count.
+    assert _create_migration(admin_client, model_id, version="0005").status_code == 201
+    r = _create_auto(admin_client, model_id)
+    assert r.status_code == 201, r.text
+    assert r.json()["data"]["version"] == "0006"
+
+
+def test_explicit_version_still_honored_and_duplicate_409(admin_client):
+    model_id = _new_model(admin_client, slug="exp", name="Exp")
+    assert _create_migration(admin_client, model_id, version="0003").status_code == 201
+    # Explícita respetada (aunque no haya 0001/0002).
+    assert _create_auto(admin_client, model_id).json()["data"]["version"] == "0004"
+    # Explícita duplicada → 409.
+    assert _create_migration(admin_client, model_id, version="0003").status_code == 409
+
+
 def test_create_bumps_model_current_version(admin_client):
     model_id = _new_model(admin_client, slug="sms", name="SMS")
     _create_migration(admin_client, model_id, version="0001")

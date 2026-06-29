@@ -12,7 +12,14 @@ _MAX_SQL = 262_144
 
 
 class ModelMigrationCreate(BaseModel):
-    version: str = Field(..., pattern=_VERSION, description="Secuencial con padding: 0001, 0002…")
+    version: str | None = Field(
+        None,
+        pattern=_VERSION,
+        description=(
+            "Opcional: si se omite, el gateway asigna automáticamente la SIGUIENTE versión "
+            "secuencial (max+1). Pásala solo si quieres fijarla manualmente (0001, 0002…)."
+        ),
+    )
     name: str = Field(..., min_length=1, max_length=200)
     up_sql: str = Field(..., min_length=1, max_length=_MAX_SQL, description="Delta SQL base (estilo MySQL de referencia)")
     up_sql_mysql: str | None = Field(None, max_length=_MAX_SQL, description="Override manual MySQL/MariaDB (opcional)")
