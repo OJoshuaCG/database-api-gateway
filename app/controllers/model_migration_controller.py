@@ -71,6 +71,9 @@ class ModelMigrationController:
             "down_sql_suggested": m.down_sql_suggested,
             "translated": self._translated(m),
             "checksum": m.checksum,
+            "source_engine": m.source_engine,
+            "is_baseline": m.is_baseline,
+            "has_non_portable": m.has_non_portable,
             "created_at": m.created_at,
             "updated_at": m.updated_at,
         }
@@ -211,6 +214,113 @@ class ModelMigrationController:
             detail=f"migración {data['version']} creada (id={migration_id})",
         )
         return result
+
+    def create_from_snapshot(self, data: dict, *, admin: dict | None = None) -> dict:
+        """
+        Crea un blueprint NUEVO cuyo baseline (v0001) es el snapshot estructural de una
+        BD existente (Plan 09, modo 3). El dump lo produce el adapter del motor
+        (estructura, nunca filas); aquí solo se persiste metadata.
+
+        El baseline queda en el override del motor de origen (NO se auto-traduce) y se
+        etiqueta ``source_engine``/``has_non_portable``: si trae objetos procedurales,
+        el blueprint queda atado a su motor (sqlglot no transpila PL/pgSQL ↔ MySQL). El
+        DDL es un BORRADOR revisable: las rutinas con ``;`` internos pueden requerir
+        ajuste antes de aplicar (ver docs/plans/02 sobre el splitter).
+        """
+        from app.controllers.server_controller import ServerController
+
+        # 1) Dump EN VIVO (lee el motor; solo estructura).
+        dump = ServerController().snapshot(data["server_id"], data["database"])
+        if not dump.statements:
+            raise AppHttpException(
+                message="La base de datos no tiene objetos estructurales que fotografiar.",
+                status_code=422,
+                context={"database": data["database"]},
+            )
+
+        source_engine = dump.source_engine
+        baseline_sql = "\n\n".join(
+            f"{s.ddl.rstrip().rstrip(';')};" for s in dump.statements
+        )
+        version = "0001"
+        up_mysql = baseline_sql if source_engine in ("mysql", "mariadb") else None
+        up_pg = baseline_sql if source_engine == "postgresql" else None
+
+        session = self._session()
+        try:
+            model = DatabaseModel(
+                name=data["name"],
+                slug=data["slug"],
+                description=data.get("description"),
+                current_version=version,
+                is_active=True,
+            )
+            session.add(model)
+            try:
+                session.flush()  # asigna id y detecta conflicto de name/slug
+            except IntegrityError as exc:
+                session.rollback()
+                raise AppHttpException(
+                    message="Ya existe un blueprint con ese nombre o slug.",
+                    status_code=409,
+                    context={"slug": data.get("slug")},
+                ) from exc
+
+            migration = ModelMigration(
+                model_id=model.id,
+                version=version,
+                name=data.get("baseline_name") or "Snapshot baseline",
+                up_sql=baseline_sql,
+                up_sql_mysql=up_mysql,
+                up_sql_postgresql=up_pg,
+                down_sql=None,
+                down_sql_suggested=None,
+                checksum=compute_checksum(baseline_sql, up_mysql, up_pg, None, version),
+                source_engine=source_engine,
+                is_baseline=True,
+                has_non_portable=dump.has_non_portable,
+            )
+            session.add(migration)
+            session.commit()
+            session.refresh(model)
+            model_result = self._serialize_model(model)
+            model_id = model.id
+        finally:
+            session.close()
+
+        audit.record(
+            "database_model.from_snapshot",
+            admin=admin,
+            target_type="database_model",
+            target_id=model_id,
+            server_id=data["server_id"],
+            touched_engine=True,  # se leyó la estructura del motor
+            detail=(
+                f"baseline desde snapshot de '{data['database']}' "
+                f"({source_engine}, {len(dump.statements)} objetos)"
+            ),
+        )
+        return {
+            "model": model_result,
+            "baseline_version": version,
+            "source_engine": source_engine,
+            "has_non_portable": dump.has_non_portable,
+            "object_counts": dump.object_counts,
+            "statements_captured": len(dump.statements),
+        }
+
+    @staticmethod
+    def _serialize_model(m: DatabaseModel) -> dict:
+        return {
+            "id": m.id,
+            "name": m.name,
+            "slug": m.slug,
+            "description": m.description,
+            "current_version": m.current_version,
+            "is_active": m.is_active,
+            "created_at": m.created_at,
+            "updated_at": m.updated_at,
+        }
 
     def update_migration(
         self, model_id: int, version: str, data: dict, *, admin: dict | None = None
