@@ -144,3 +144,45 @@ def test_full_upgrade_downgrade_stamp_cycle_sqlite():
             cfg = r._make_config(vdir, conn, vt)
             command.stamp(cfg, "0002")
             assert r._read_current(conn, vt) == "0002"
+
+
+def test_sequential_downgrade_to_target_version_sqlite():
+    """
+    Mecánica del rollback secuencial: estando en 0004, bajar a 0001 en pasos
+    ordenados (igual que rollback_to) deja la versión en 0001 y revierte el esquema.
+    Prueba directamente que la versión SÍ se actualiza tras varios downgrades.
+    """
+    r = MigrationRunner()
+    specs = [
+        _spec("0001", "CREATE TABLE a (id INTEGER PRIMARY KEY)", down="DROP TABLE a"),
+        _spec("0002", "CREATE TABLE b (id INTEGER PRIMARY KEY)", down="DROP TABLE b"),
+        _spec("0003", "CREATE TABLE c (id INTEGER PRIMARY KEY)", down="DROP TABLE c"),
+        _spec("0004", "CREATE TABLE d (id INTEGER PRIMARY KEY)", down="DROP TABLE d"),
+    ]
+    dbfile = tempfile.mktemp(suffix=".db")
+    engine = create_engine(f"sqlite:///{dbfile}")
+    vt = version_table_name("seqdown")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        vdir = Path(tmp) / "versions"
+        vdir.mkdir()
+        r._write_revision_files(vdir, specs, EngineType.mysql)
+        with engine.connect() as conn:
+            cfg = r._make_config(vdir, conn, vt)
+            command.upgrade(cfg, "0004")
+            assert r._read_current(conn, vt) == "0004"
+            assert {"a", "b", "c", "d"}.issubset(set(inspect(conn).get_table_names()))
+
+            # Bajar SECUENCIALMENTE hasta 0001 (revierte 0004, 0003, 0002).
+            reverted = []
+            current = r._read_current(conn, vt)
+            from app.services.db_admin.migration_integrity import version_sort_key
+            while current is not None and version_sort_key(current) > version_sort_key("0001"):
+                command.downgrade(cfg, "-1")
+                reverted.append(current)
+                current = r._read_current(conn, vt)
+
+            assert reverted == ["0004", "0003", "0002"]
+            assert r._read_current(conn, vt) == "0001"          # versión actualizada
+            tables = set(inspect(conn).get_table_names())
+            assert "a" in tables and not {"b", "c", "d"} & tables  # esquema revertido

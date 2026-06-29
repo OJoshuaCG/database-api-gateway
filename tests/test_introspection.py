@@ -34,6 +34,11 @@ class _SqliteTestAdapter(ServerAdapter):
     def list_users(self):
         return []
 
+    def dump_structure(self, database):  # no ejercitado aquí (Plan 09)
+        from app.services.db_admin.dtos import StructureDump
+
+        return StructureDump(database=database, source_engine=self.dialect, statements=[])
+
     def create_database(self, *a, **k): ...
     def drop_database(self, *a, **k): ...
     def create_user(self, *a, **k): ...
