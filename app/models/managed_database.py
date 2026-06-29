@@ -83,6 +83,14 @@ class ManagedDatabase(Base, TimestampMixin):
         Text, nullable=True, comment="Notas / detalle de error de aprovisionamiento"
     )
 
+    origin: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="provisioned",
+        server_default="provisioned",
+        comment="Origen del registro: 'provisioned' (creada por el gateway) | 'adopted' (preexistente, adoptada — Plan 09)",
+    )
+
     def __repr__(self) -> str:
         return (
             f"<ManagedDatabase(id={self.id}, name='{self.name}', "

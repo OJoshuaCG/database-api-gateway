@@ -21,7 +21,7 @@ Rollback:
   ``None`` el endpoint de rollback responde 409.
 """
 
-from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -85,6 +85,29 @@ class ModelMigration(Base, TimestampMixin):
         String(64),
         nullable=False,
         comment="SHA256(up_sql + variantes + down_sql + version) — detecta alteración",
+    )
+
+    # ---- Plan 09: trazabilidad de migraciones generadas por SNAPSHOT ---------- #
+    source_engine: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+        comment="Motor de origen si proviene de un snapshot ('mysql'|'mariadb'|'postgresql'); NULL = portable",
+    )
+
+    is_baseline: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+        comment="True si es el baseline inicial generado por snapshot (Plan 09)",
+    )
+
+    has_non_portable: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+        comment="True si incluye objetos procedurales (rutinas/triggers/events) no traducibles cross-engine",
     )
 
     def __repr__(self) -> str:
