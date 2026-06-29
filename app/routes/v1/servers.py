@@ -11,8 +11,13 @@ from app.controllers.grant_controller import GrantController
 from app.controllers.server_controller import ServerController
 from app.core.auth import AdminDep
 from app.schemas.grant import GrantableRequest, GrantableResult
-from app.schemas.server import ServerCreate, ServerOut, ServerUpdate
-from app.services.db_admin.dtos import ConnectionInfo, EngineUserInfo, TableSchema
+from app.schemas.server import ReconcileResult, ServerCreate, ServerOut, ServerUpdate
+from app.services.db_admin.dtos import (
+    ConnectionInfo,
+    EngineUserInfo,
+    StructureDump,
+    TableSchema,
+)
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
@@ -67,6 +72,28 @@ def list_databases(admin: AdminDep, server_id: int):
 @router.get("/{server_id}/users", response_model=ApiResponse[list[EngineUserInfo]])
 def list_users(admin: AdminDep, server_id: int):
     return success(data=ServerController().list_users(server_id))
+
+
+@router.get("/{server_id}/reconcile", response_model=ApiResponse[ReconcileResult])
+def reconcile(admin: AdminDep, server_id: int):
+    """
+    Cruza el plano EN VIVO (motor) con el INVENTARIO (gateway): marca cada BD/usuario
+    como managed | unmanaged (adoptable) | orphan (borrado por fuera). Read-only.
+    """
+    return success(data=ServerController().reconcile(server_id))
+
+
+@router.get(
+    "/{server_id}/databases/{database}/snapshot",
+    response_model=ApiResponse[StructureDump],
+)
+def snapshot_database(admin: AdminDep, server_id: int, database: str):
+    """
+    Snapshot estructural EN VIVO de una BD (tablas, vistas, rutinas, triggers, etc.).
+    Solo estructura, nunca filas. Es la PREVIEW (no persiste): para fijarlo como
+    blueprint baseline use POST /database-models/from-snapshot.
+    """
+    return success(data=ServerController().snapshot(server_id, database))
 
 
 @router.get(

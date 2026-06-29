@@ -15,12 +15,18 @@ from app.core.auth import AdminDep
 from app.core.limiter import limiter
 from app.models.enums import ProvisionStatus
 from app.schemas.managed_database import (
+    AdoptDatabaseIn,
     ManagedDatabaseCreate,
     ManagedDatabaseOut,
     ManagedDatabaseUpdate,
     ReassignOwnerIn,
 )
-from app.schemas.model_migration import MigrationHistoryOut, MigrationStatusOut
+from app.schemas.model_migration import (
+    MigrationApplyOut,
+    MigrationHistoryOut,
+    MigrationRollbackOut,
+    MigrationStatusOut,
+)
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
@@ -58,6 +64,16 @@ def create_database(
     if provision:
         msg = "Base de datos creada y aprovisionada en el motor."
     return success(data=created, message=msg)
+
+
+@router.post("/adopt", response_model=ApiResponse[ManagedDatabaseOut], status_code=201)
+def adopt_database(admin: AdminDep, payload: AdoptDatabaseIn):
+    """
+    Adopta una BD que YA existe en el motor (Plan 09): registra metadata sin ejecutar
+    CREATE DATABASE. 404 si la BD no existe; 409 si ya está en el inventario.
+    """
+    created = ManagedDatabaseController().adopt_database(payload.model_dump(), admin=admin)
+    return success(data=created, message="Base de datos existente adoptada al inventario.")
 
 
 @router.get("/{db_id}", response_model=ApiResponse[ManagedDatabaseOut])
@@ -114,7 +130,7 @@ def migration_status(admin: AdminDep, db_id: int):
     return success(data=ManagedMigrationController().status(db_id))
 
 
-@router.post("/{db_id}/migrations/apply", response_model=ApiResponse[dict])
+@router.post("/{db_id}/migrations/apply", response_model=ApiResponse[MigrationApplyOut])
 @limiter.limit("10/minute")
 def apply_migrations(
     request: Request,
@@ -123,7 +139,12 @@ def apply_migrations(
     version: str | None = Query(
         None,
         pattern=r"^\d{4,10}$",
-        description="Aplicar solo hasta esta versión (inclusive). Por defecto: todas.",
+        description=(
+            "Versión objetivo (inclusive). En UNA sola llamada aplica secuencialmente, en "
+            "orden, TODAS las migraciones pendientes hasta esta versión. Si se omite, aplica "
+            "hasta la ÚLTIMA disponible. Forward-only: una versión ≤ la actual no aplica nada "
+            "(para revertir, usa /rollback). 422 si la versión no existe en el blueprint."
+        ),
     ),
     force: bool = Query(
         False, description="Override de cuarentena tras un fallo previo (inspeccionado)."
@@ -135,11 +156,31 @@ def apply_migrations(
     result = ManagedMigrationController().apply(
         db_id, up_to_version=version, force=force, dry_run=dry_run, admin=admin
     )
-    msg = "Plan de migración (dry-run)." if dry_run else "Migraciones aplicadas."
+    msg = _apply_message(result, dry_run=dry_run)
     return success(data=result, message=msg)
 
 
-@router.post("/{db_id}/migrations/rollback", response_model=ApiResponse[dict])
+def _apply_message(result: dict, *, dry_run: bool) -> str:
+    """Mensaje legible del resultado de apply (real o dry-run)."""
+    frm, to = result.get("from_version"), result.get("to_version")
+    target = result.get("target_version")
+    pend = result.get("pending_versions") or []
+    if dry_run:
+        if result.get("no_op"):
+            return f"Plan (dry-run): la BD ya está al día en {frm or 'sin versión'}; nada pendiente."
+        return f"Plan (dry-run): {len(pend)} pendiente(s) — {frm or '∅'} → {to}: {', '.join(pend)}."
+    if result.get("no_op"):
+        if target is not None:
+            return (
+                f"La versión solicitada ({target}) ya está aplicada o es anterior a la actual "
+                f"({frm}): no se aplica nada (usa /rollback para revertir)."
+            )
+        return f"La BD ya está en la versión más reciente ({frm or 'sin versión'}); nada que aplicar."
+    suffix = " (con fallo: revisa cuarentena)" if result.get("failed") else ""
+    return f"Aplicadas {result.get('applied_count', 0)} migración(es): {frm or '∅'} → {to}.{suffix}"
+
+
+@router.post("/{db_id}/migrations/rollback", response_model=ApiResponse[MigrationRollbackOut])
 @limiter.limit("10/minute")
 def rollback_migration(
     request: Request,
@@ -150,14 +191,39 @@ def rollback_migration(
         pattern=r"^\d{4,10}$",
         description=(
             "Confirmación obligatoria (operación DESTRUCTIVA): repetir la versión "
-            "actual de la BD que se va a revertir."
+            "ACTUAL de la BD desde la que se parte."
+        ),
+    ),
+    target_version: str | None = Query(
+        None,
+        pattern=r"^\d{4,10}$",
+        description=(
+            "Versión destino a la que revertir (debe ser ANTERIOR a la actual). En UNA "
+            "sola llamada aplica secuencialmente, en orden, todos los downgrades "
+            "necesarios. Si se omite, revierte solo la última. 409 si alguna migración "
+            "del camino no tiene down_sql confirmado; 422 si la versión no existe o no "
+            "es anterior a la actual."
         ),
     ),
 ):
     result = ManagedMigrationController().rollback(
-        db_id, confirm_version=confirm_version, admin=admin
+        db_id, confirm_version=confirm_version, target_version=target_version, admin=admin
     )
-    return success(data=result, message="Rollback ejecutado.")
+    return success(data=result, message=_rollback_message(result))
+
+
+def _rollback_message(result: dict) -> str:
+    """Mensaje legible del resultado de rollback."""
+    frm, to = result.get("from_version"), result.get("to_version")
+    n = result.get("reverted_count", 0)
+    if result.get("no_op"):
+        return f"Nada que revertir: la BD ya está en {frm or 'base'}."
+    if result.get("failed"):
+        return (
+            f"Rollback con fallo: revertidas {n}, la BD quedó en {to or 'base'}. "
+            "Revisa la cuarentena."
+        )
+    return f"Revertidas {n} migración(es): {frm} → {to or 'base'}."
 
 
 @router.post("/{db_id}/migrations/stamp", response_model=ApiResponse[MigrationStatusOut])

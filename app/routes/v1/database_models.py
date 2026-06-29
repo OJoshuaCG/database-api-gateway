@@ -4,14 +4,18 @@ Endpoints de DatabaseModels (blueprints/categorías).
 CRUD puro sobre el inventario del gateway (no toca ningún motor).
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from app.controllers.database_model_controller import DatabaseModelController
+from app.controllers.model_migration_controller import ModelMigrationController
 from app.core.auth import AdminDep
+from app.core.limiter import limiter
 from app.schemas.database_model import (
     DatabaseModelCreate,
     DatabaseModelOut,
     DatabaseModelUpdate,
+    FromSnapshotIn,
+    FromSnapshotOut,
 )
 from app.schemas.managed_database import ManagedDatabaseOut
 from app.utils.pagination import PaginationDep
@@ -32,6 +36,19 @@ def list_models(admin: AdminDep, pagination: PaginationDep):
 def create_model(admin: AdminDep, payload: DatabaseModelCreate):
     created = DatabaseModelController().create_model(payload.model_dump(), admin=admin)
     return success(data=created, message="Blueprint creado.")
+
+
+@router.post("/from-snapshot", response_model=ApiResponse[FromSnapshotOut], status_code=201)
+@limiter.limit("10/minute")
+def create_from_snapshot(request: Request, admin: AdminDep, payload: FromSnapshotIn):
+    """
+    Crea un blueprint NUEVO cuyo baseline (v0001) es el snapshot estructural de una BD
+    existente (Plan 09, modo 3). Lee la estructura del motor (nunca filas) y la fija
+    como migración baseline. Si incluye objetos procedurales, el baseline queda atado a
+    su motor de origen (no aplicable cross-engine).
+    """
+    result = ModelMigrationController().create_from_snapshot(payload.model_dump(), admin=admin)
+    return success(data=result, message="Blueprint baseline creado desde snapshot.")
 
 
 @router.get("/{model_id}", response_model=ApiResponse[DatabaseModelOut])

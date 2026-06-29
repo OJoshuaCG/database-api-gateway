@@ -18,7 +18,7 @@ from app.controllers.server_user_controller import ServerUserController
 from app.core.auth import AdminDep
 from app.schemas.grant import ApplyProfileRequest, ApplyProfileResult, GrantInfo, GrantRequest, GrantableResult, RevokeRequest
 from app.schemas.managed_database import ManagedDatabaseOut
-from app.schemas.server_user import ServerUserCreate, ServerUserFullCreate, ServerUserFullOut, ServerUserOut, ServerUserUpdate
+from app.schemas.server_user import AdoptUserIn, ServerUserCreate, ServerUserFullCreate, ServerUserFullOut, ServerUserOut, ServerUserUpdate
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
@@ -48,6 +48,16 @@ def create_server_user(
     if provision:
         msg = "Usuario creado y aprovisionado en el motor."
     return success(data=created, message=msg)
+
+
+@router.post("/adopt", response_model=ApiResponse[ServerUserOut], status_code=201)
+def adopt_server_user(admin: AdminDep, payload: AdoptUserIn):
+    """
+    Adopta un usuario/rol que YA existe en el motor (Plan 09): registra metadata sin
+    CREATE USER ni password. 404 si no existe en el motor; 409 si ya está adoptado.
+    """
+    created = ServerUserController().adopt_user(payload.model_dump(), admin=admin)
+    return success(data=created, message="Usuario existente adoptado al inventario.")
 
 
 @router.get("/{user_id}", response_model=ApiResponse[ServerUserOut])
