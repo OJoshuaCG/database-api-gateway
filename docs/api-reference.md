@@ -1015,9 +1015,9 @@ asignado (`422` si no). Rate limit **10/min** en `apply`/`rollback`/`stamp`.
 
 | Parámetro | Tipo | Default | Detalle |
 |---|---|---|---|
-| `version` | string \| null | — | Patrón `^\d{4,10}$`. Aplica solo **hasta** esa versión (inclusive). |
+| `version` | string \| null | — | Patrón `^\d{4,10}$`. Versión objetivo: en **una llamada** aplica todas las pendientes hasta ella (o hasta la última si se omite). Forward-only; `422` si no existe. |
 | `force` | bool | `false` | Reintenta una BD en **cuarentena** (tras inspección). |
-| `dry_run` | bool | `false` | No aplica: devuelve `current_version` + `pending_versions`. |
+| `dry_run` | bool | `false` | No aplica: devuelve el plan (`from_version` + `pending_versions`). |
 
 **Estado (`status`)** — `MigrationStatusOut`:
 
@@ -1037,34 +1037,45 @@ curl -X POST "https://<host>/api/v1/managed-databases/5/migrations/apply?dry_run
 ```
 ```json
 { "data": { "managed_database_id": 5, "database_name": "app_prod", "server_id": 42,
-            "dry_run": true, "current_version": null,
-            "pending_versions": ["0001","0002"], "pending_count": 2 } }
+            "dry_run": true, "from_version": null, "to_version": "0002", "target_version": null,
+            "no_op": false, "pending_versions": ["0001","0002"] } }
 ```
 
-**Aplicar:**
+**Aplicar:** respuesta `MigrationApplyOut` con el salto `from_version`→`to_version`.
 
 ```bash
 curl -X POST https://<host>/api/v1/managed-databases/5/migrations/apply -b cookies.txt
 ```
 ```json
 { "data": { "managed_database_id": 5, "database_name": "app_prod", "server_id": 42,
-            "applied_count": 2, "failed": false, "quarantined": false,
+            "from_version": null, "to_version": "0002", "target_version": null,
+            "applied_count": 2, "failed": false, "quarantined": false, "no_op": false,
+            "pending_versions": ["0001","0002"],
             "results": [ { "migration_id": 1, "version": "0001", "status": "applied", "error": null, "execution_ms": 42 },
                          { "migration_id": 2, "version": "0002", "status": "applied", "error": null, "execution_ms": 31 } ] },
-  "message": "Migraciones aplicadas." }
+  "message": "Aplicadas 2 migración(es): ∅ → 0002." }
 ```
 
-**Rollback (DESTRUCTIVO — doble confirmación):** `confirm_version` debe igualar la versión
-actual de la BD; si no, `422`. Si esa versión no tiene `down_sql` confirmado, `409`.
+> `422` si la `version` objetivo no existe en el blueprint · `409` si hay un **baseline de
+> snapshot sin revisar** (R1: apruébalo con `PATCH .../{version}` `{"reviewed": true}`).
+
+**Rollback (DESTRUCTIVO — doble confirmación), target-based y secuencial:** `confirm_version` debe
+igualar la versión actual; `target_version` (opcional, anterior a la actual) revierte
+secuencialmente hasta ahí en **una llamada** (sin él, revierte solo la última).
 
 ```bash
-curl -X POST "https://<host>/api/v1/managed-databases/5/migrations/rollback?confirm_version=0002" -b cookies.txt
+# Estando en 0010, revertir hasta 0007 (deshace 0010, 0009, 0008):
+curl -X POST "https://<host>/api/v1/managed-databases/5/migrations/rollback?confirm_version=0010&target_version=0007" -b cookies.txt
 ```
 ```json
-{ "data": { "managed_database_id": 5, "rolled_back_version": "0002", "current_version": "0001",
-            "result": { "migration_id": 2, "version": "0002", "status": "applied", "execution_ms": 28 } },
-  "message": "Rollback ejecutado." }
+{ "data": { "managed_database_id": 5, "from_version": "0010", "to_version": "0007",
+            "target_version": "0007", "reverted_count": 3,
+            "reverted_versions": ["0010","0009","0008"], "failed": false, "no_op": false },
+  "message": "Revertidas 3 migración(es): 0010 → 0007." }
 ```
+
+> `422` si `confirm_version` no coincide con la actual o `target_version` no es anterior/no existe ·
+> `409` si **alguna** versión del camino no tiene `down_sql` confirmado.
 
 **Historial:**
 

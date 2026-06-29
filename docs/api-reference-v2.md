@@ -7,7 +7,9 @@
 > - **Lote B — migraciones de blueprints (11 endpoints, Plan 02):** deltas SQL versionados por
 >   blueprint y su aplicación/rollback/stamp/historial sobre las BDs gestionadas.
 >
-> Con ambos lotes, la API funcional asciende a **58 endpoints** (excluyendo `/test`).
+> Con ambos lotes, la API funcional llega a **58 endpoints** (excluyendo `/test`). El **Plan 09**
+> (adopción, reconciliación y snapshot) añade **5 más** → **63 endpoints**; su detalle vive en
+> [`api-reference-v3.md`](api-reference-v3.md).
 >
 > Las convenciones (base URL `/api/v1`, envelope `ApiResponse[T]`, autenticación por
 > cookie, códigos de error, paginación) son las mismas del documento original —
@@ -540,29 +542,37 @@ NUMÉRICAMENTE**, no lexicográficamente: usa un ancho consistente para evitar a
 
 | Campo | Tipo | Requerido (Create) | Detalle |
 |---|---|---|---|
-| `version` | string | sí | patrón `^\d{4,10}$` |
+| `version` | string \| null | **no** | `^\d{4,10}$`. **Si se omite, el gateway autoasigna la siguiente secuencial** (`max+1`). Pásala solo para fijarla a mano. |
 | `name` | string | sí | 1–200 |
 | `up_sql` | string | sí | delta SQL base, estilo MySQL; 1–262144 (256 KB) |
 | `up_sql_mysql` | string \| null | no | override manual MySQL/MariaDB |
 | `up_sql_postgresql` | string \| null | no | override manual PostgreSQL |
 | `down_sql` | string \| null | no | rollback **confirmado**; sin él, el rollback da `409` |
 
-`ModelMigrationPatch` acepta `name?`, `down_sql?`, `up_sql_mysql?`, `up_sql_postgresql?`.
-El `up_sql`/variantes **no** se pueden cambiar si la migración ya se aplicó en alguna BD (`409`).
+`ModelMigrationPatch` acepta `name?`, `down_sql?`, `up_sql_mysql?`, `up_sql_postgresql?`,
+`reviewed?` (aprueba un baseline de snapshot — ver R1 abajo). El `up_sql`/variantes **no** se
+pueden cambiar si la migración ya se aplicó en alguna BD (`409`).
 
 ### `ModelMigrationOut` (detalle) / `ModelMigrationSummary` (lista)
 
 `ModelMigrationOut`: `{ id, model_id, version, name, up_sql, up_sql_mysql?, up_sql_postgresql?,
-down_sql?, down_sql_suggested?, translated: {mysql, postgresql}, checksum, created_at, updated_at }`.
+down_sql?, down_sql_suggested?, translated: {mysql, postgresql}, checksum, source_engine?,
+is_baseline, has_non_portable, reviewed, created_at, updated_at }`.
 
 - `translated` — el `up_sql` **auto-traducido** por motor con `sqlglot` (lo que realmente se
   ejecutaría). Los overrides manuales tienen prioridad sobre la traducción.
 - `down_sql_suggested` — rollback **sugerido** automáticamente para operaciones aditivas
   (CREATE TABLE → DROP TABLE, ADD COLUMN → DROP COLUMN). Revísalo y confírmalo con `PATCH`.
 - `checksum` — SHA256 de todo el SQL + versión; el gateway lo re-valida antes de aplicar.
+- `source_engine` / `is_baseline` / `has_non_portable` — metadatos de un baseline generado por
+  **snapshot** (Plan 09): motor de origen, si es el baseline inicial y si trae objetos
+  procedurales no portables cross-engine.
+- `reviewed` — **R1 (seguridad):** un baseline de snapshot nace `false` (DDL capturado del motor)
+  y **no se puede aplicar** hasta aprobarlo (`PATCH reviewed=true`). Las migraciones escritas a
+  mano nacen `true`.
 
 `ModelMigrationSummary` (lista): `{ id, model_id, version, name, has_mysql_override,
-has_postgresql_override, has_rollback, checksum, created_at }`.
+has_postgresql_override, has_rollback, checksum, is_baseline, reviewed, created_at }`.
 
 ---
 
@@ -577,12 +587,15 @@ Lista paginada (`page`, `size`) de `ModelMigrationSummary`, en orden de versión
 ### `POST /api/v1/database-models/{model_id}/migrations` 🔒
 
 Crea una migración (`201`). **Body:** `ModelMigrationCreate`. La respuesta incluye
-`translated` (por motor) y `down_sql_suggested`.
+`translated` (por motor) y `down_sql_suggested`. **`version` es opcional**: si se omite, el
+gateway asigna la siguiente secuencial (`max+1`) de forma autónoma y segura ante concurrencia
+(reintenta si dos colaboradores colisionan). Pásala solo para fijarla a mano.
 
 ```bash
+# Sin "version" → autoasignada (recomendado). Inclúyela solo si quieres fijarla.
 curl -b cookies.txt -X POST http://localhost/api/v1/database-models/3/migrations \
   -H 'Content-Type: application/json' \
-  -d '{ "version": "0001", "name": "Esquema inicial",
+  -d '{ "name": "Esquema inicial",
         "up_sql": "CREATE TABLE orders (id INT AUTO_INCREMENT PRIMARY KEY, total INT)" }'
 ```
 ```json
@@ -595,8 +608,8 @@ curl -b cookies.txt -X POST http://localhost/api/v1/database-models/3/migrations
   "message": "Migración creada." }
 ```
 
-> Errores: `404` blueprint inexistente · `409` versión duplicada · `422` patrón de versión,
-> SQL vacío o >256 KB.
+> Errores: `404` blueprint inexistente · `409` versión **explícita** duplicada (la autoasignada
+> reintenta) · `422` patrón de versión, SQL vacío o >256 KB.
 
 ### `GET /api/v1/database-models/{model_id}/migrations/{version}` 🔒
 
@@ -604,14 +617,21 @@ Detalle (`ModelMigrationOut`). `404` si no existe esa versión.
 
 ### `PATCH /api/v1/database-models/{model_id}/migrations/{version}` 🔒
 
-Confirma `down_sql` o añade overrides. **Body:** `ModelMigrationPatch`.
+Confirma `down_sql`, añade overrides o **aprueba un baseline de snapshot** (`reviewed: true`,
+R1). **Body:** `ModelMigrationPatch`.
 
 ```bash
+# Confirmar el rollback de la versión:
 curl -b cookies.txt -X PATCH http://localhost/api/v1/database-models/3/migrations/0001 \
   -H 'Content-Type: application/json' -d '{ "down_sql": "DROP TABLE IF EXISTS orders" }'
+
+# Aprobar un baseline de snapshot para habilitar su apply (R1):
+curl -b cookies.txt -X PATCH http://localhost/api/v1/database-models/3/migrations/0001 \
+  -H 'Content-Type: application/json' -d '{ "reviewed": true }'
 ```
 
-> `409` si intentas cambiar el SQL de una migración ya aplicada en alguna BD.
+> `409` si intentas cambiar el SQL de una migración ya aplicada en alguna BD. `reviewed` y
+> `name`/`down_sql` sí se pueden ajustar aunque esté aplicada.
 
 ### `DELETE /api/v1/database-models/{model_id}/migrations/{version}` 🔒
 
@@ -652,49 +672,67 @@ pending_count, pending_versions[] }`.
 
 ### `POST /api/v1/managed-databases/{db_id}/migrations/apply` 🔒 🔌
 
-Aplica las pendientes en orden numérico; se detiene en la primera que falle.
+En **UNA sola llamada** aplica secuencialmente, en orden numérico, **todas** las pendientes hasta
+`version` (o hasta la última si se omite); se detiene en la primera que falle. **Forward-only**:
+una `version` ≤ la actual no aplica nada (para retroceder, usa `rollback`).
 
 | Query | Tipo | Default | Detalle |
 |---|---|---|---|
-| `version` | string \| null | — | `^\d{4,10}$`. Aplica solo **hasta** esa versión (inclusive). |
+| `version` | string \| null | — | `^\d{4,10}$`. Versión objetivo (inclusive). Omitir = hasta la última. `422` si no existe en el blueprint. |
 | `force` | bool | `false` | Reintenta una BD en **cuarentena** tras inspección. |
-| `dry_run` | bool | `false` | No aplica: devuelve `current_version` + `pending_versions`. |
+| `dry_run` | bool | `false` | No aplica: devuelve el plan (`from_version` + `pending_versions`). |
 
-**Respuesta** (apply real): `{ managed_database_id, database_name, server_id, applied_count,
-failed, quarantined, results: [{ migration_id, version, status, error?, execution_ms }] }`.
-Con `dry_run=true`: `{ …, dry_run: true, current_version, pending_versions[], pending_count }`.
+**Respuesta** `200` — `MigrationApplyOut` `{ managed_database_id, database_name, server_id,
+from_version, to_version, target_version, applied_count, failed, quarantined, no_op, dry_run,
+pending_versions[], results: [{ migration_id, version, status, error?, execution_ms }] }`.
+`from_version`→`to_version` reportan el salto real; `no_op=true` si no había nada que aplicar.
 
 ```bash
 curl -b cookies.txt -X POST http://localhost/api/v1/managed-databases/5/migrations/apply
 ```
 ```json
 { "data": { "managed_database_id": 5, "database_name": "app_prod", "server_id": 42,
-            "applied_count": 2, "failed": false, "quarantined": false,
+            "from_version": null, "to_version": "0002", "target_version": null,
+            "applied_count": 2, "failed": false, "quarantined": false, "no_op": false,
+            "pending_versions": ["0001","0002"],
             "results": [ { "migration_id": 1, "version": "0001", "status": "applied", "execution_ms": 42 },
                          { "migration_id": 2, "version": "0002", "status": "applied", "execution_ms": 31 } ] },
-  "message": "Migraciones aplicadas." }
+  "message": "Aplicadas 2 migración(es): ∅ → 0002." }
 ```
 
-> Errores: `422` BD sin blueprint / blueprint sin migraciones · `409` cuarentena (sin `force`),
-> lock ocupado, o checksum alterado · `502`/`504` motor inalcanzable.
+> Errores: `422` BD sin blueprint / blueprint sin migraciones / `version` objetivo inexistente ·
+> `409` cuarentena (sin `force`), lock ocupado, checksum alterado, o **baseline de snapshot sin
+> revisar** (R1) · `502`/`504` motor inalcanzable.
 
 ### `POST /api/v1/managed-databases/{db_id}/migrations/rollback` 🔒 🔌
 
-Revierte la última aplicada. **DESTRUCTIVO** — `confirm_version` (query, obligatorio) debe
-igualar la versión actual de la BD.
+Revierte SECUENCIALMENTE, en **una sola llamada**, hasta `target_version` (espejo de `apply`).
+**DESTRUCTIVO** — doble intención.
+
+| Query | Tipo | Default | Detalle |
+|---|---|---|---|
+| `confirm_version` | string | **obligatorio** | `^\d{4,10}$`. Debe igualar la versión ACTUAL de la BD (de la que se parte). |
+| `target_version` | string \| null | — | `^\d{4,10}$`. Destino (anterior a la actual). Si se omite, revierte **solo la última**. |
+
+**Respuesta** `200` — `MigrationRollbackOut` `{ managed_database_id, database_name, server_id,
+from_version, to_version, target_version, reverted_count, reverted_versions[], failed,
+quarantined, no_op, results[] }`. `reverted_versions` van de la más reciente a la más antigua.
 
 ```bash
+# Estando en 0010, revertir hasta 0007 (deshace 0010, 0009, 0008) en UNA llamada:
 curl -b cookies.txt -X POST \
-  "http://localhost/api/v1/managed-databases/5/migrations/rollback?confirm_version=0002"
+  "http://localhost/api/v1/managed-databases/5/migrations/rollback?confirm_version=0010&target_version=0007"
 ```
 ```json
-{ "data": { "managed_database_id": 5, "rolled_back_version": "0002", "current_version": "0001",
-            "result": { "version": "0002", "status": "applied", "execution_ms": 28 } },
-  "message": "Rollback ejecutado." }
+{ "data": { "managed_database_id": 5, "from_version": "0010", "to_version": "0007",
+            "target_version": "0007", "reverted_count": 3,
+            "reverted_versions": ["0010","0009","0008"], "failed": false, "no_op": false },
+  "message": "Revertidas 3 migración(es): 0010 → 0007." }
 ```
 
-> `422` si `confirm_version` falta o no coincide con la versión actual · `409` si esa versión
-> no tiene `down_sql` confirmado o la BD no tiene nada aplicado.
+> `422` si `confirm_version` falta/no coincide con la actual, o si `target_version` no es anterior
+> a la actual o no existe · `409` si **alguna** versión del camino no tiene `down_sql` confirmado,
+> o la BD no tiene nada aplicado.
 
 ### `POST /api/v1/managed-databases/{db_id}/migrations/stamp` 🔒 🔌
 

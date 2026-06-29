@@ -826,10 +826,13 @@ necesita.
 
 ### Ejemplos
 
-**1) Listado para el select (sin SQL) — trae todas con `?size=200`:**
+**1) Listado para el select (sin SQL) — paginado:**
 ```bash
-curl "https://<host>/api/v1/database-models/8/migrations?size=200" -b cookies.txt
+curl "https://<host>/api/v1/database-models/8/migrations?page=1&size=50" -b cookies.txt
 ```
+> El listado es **paginado**: `size` está acotado por `PAGINATION_MAX_SIZE` (por defecto **50**,
+> tope duro 200). Si un blueprint tiene más versiones que `size`, recorre las páginas con `page`
+> (usa `pagination.total`/`pages` de la respuesta). No asumas que una sola llamada trae todas.
 ```json
 { "data": [
     { "id": 1, "model_id": 8, "version": "0001", "name": "Esquema inicial",
