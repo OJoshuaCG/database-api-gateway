@@ -193,6 +193,73 @@ class ServerUserController:
         )
         return result
 
+    def adopt_user(self, data: dict, *, admin: dict | None = None) -> dict:
+        """
+        Adopta un usuario/rol que YA existe en el motor (Plan 09): registra metadata
+        SIN ejecutar CREATE USER y SIN password (``has_password=false`` hasta que se
+        rote). Verifica la existencia real (404 si no). Idempotente: 409 si ya está.
+        """
+        session = self._session()
+        try:
+            server = get_server_or_404(session, data["server_id"])
+            target = build_target(server)  # descifra con la sesión abierta
+            username = data["username"]
+            host = data.get("host") or "%"
+            server_id = server.id
+        finally:
+            session.close()
+
+        # Verificar existencia REAL en el motor (solo lectura). En PostgreSQL no hay
+        # host: se matchea por username; en MySQL/MariaDB por (username, host).
+        is_pg = target.dialect == "postgresql"
+        live = get_adapter(target).list_users()
+        exists = any(
+            u.username == username and (is_pg or (u.host or "%") == host) for u in live
+        )
+        if not exists:
+            raise AppHttpException(
+                message="El usuario no existe en el motor; no hay nada que adoptar.",
+                status_code=404,
+                context={"username": username, "host": None if is_pg else host},
+            )
+
+        session = self._session()
+        try:
+            user = ServerUser(
+                server_id=server_id,
+                username=username,
+                host=host,
+                password_encrypted=None,
+                notes=data.get("notes"),
+                is_active=True,
+            )
+            session.add(user)
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                raise AppHttpException(
+                    message="Ya existe un usuario con ese nombre y host en el servidor (¿ya adoptado?).",
+                    status_code=409,
+                    context={"username": username},
+                ) from exc
+            session.refresh(user)
+            result = self._serialize(user)
+            user_id = user.id
+        finally:
+            session.close()
+
+        audit.record(
+            "server_user.adopt",
+            admin=admin,
+            target_type="server_user",
+            target_id=user_id,
+            server_id=server_id,
+            touched_engine=False,
+            detail="usuario existente adoptado al inventario",
+        )
+        return result
+
     def update_server_user(
         self, user_id: int, data: dict, *, provision: bool, admin: dict | None = None
     ) -> dict:
