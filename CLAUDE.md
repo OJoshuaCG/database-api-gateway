@@ -535,9 +535,33 @@ Archivos del módulo:
   `app/routes/v1/managed_databases.py`.
 
 Gotchas clave: el runner corre en **AUTOCOMMIT** (el advisory lock de sesión sobrevive y
-no deja una transacción sin commitear); las versiones se comparan/ordenan **numéricamente**;
-el `rollback` exige `?confirm_version=` (operación destructiva). Verificación e2e contra
-motores reales: `scripts/verify_migrations_e2e.py` (manual, requiere Docker).
+no deja una transacción sin commitear); las versiones se comparan/ordenan **numéricamente**.
+Comportamientos (actualizados): `version` al crear es **opcional** → autoasignación secuencial
+(`max+1`, con reintento ante colisión); `apply?version=X` aplica en **una llamada** todas las
+pendientes hasta X (forward-only); `rollback` es **target-based** (`?confirm_version=` obligatorio
++ `?target_version=` opcional → revierte secuencialmente; valida `down_sql` de todo el camino);
+un baseline de snapshot exige aprobación (`reviewed`) antes de aplicar. La respuesta de `apply`/
+`rollback` es tipada (`MigrationApplyOut`/`MigrationRollbackOut`, con `from_version`→`to_version`).
+Verificación e2e contra motores reales (`scripts/verify_migrations_e2e.py`, requiere Docker):
+**ejecutada — 153 checks / 0 fallos** (cubre Plan 02 + Plan 09 + UX).
+
+## Módulo de Adopción, Reconciliación y Snapshot (Plan 09)
+
+Puente entre el **plano en vivo** (motor real) y el **inventario** del gateway. Guía de uso:
+`docs/features/adoption-reconcile-snapshot.md`; detalle frontend: `docs/api-reference-v3.md`.
+
+- **Endpoints**: `GET /servers/{id}/reconcile` (clasifica managed/unmanaged/orphan),
+  `POST /managed-databases/adopt` y `POST /server-users/adopt` (registran objetos preexistentes SIN
+  ejecutar DDL; `origin='adopted'`), `GET /servers/{id}/databases/{db}/snapshot` (dump estructural,
+  solo estructura), `POST /database-models/from-snapshot` (blueprint baseline desde snapshot).
+- **Adapters** (`app/services/db_admin/`): `dump_structure()` por motor (MySQL `SHOW CREATE *`;
+  PostgreSQL `pg_get_*def()` + reflexión `CreateTable`), orden topológico, `_strip_definer_clause`;
+  DTOs `StructureDump`/`DumpStatement` en `dtos.py`.
+- **Modelos**: `ManagedDatabase.origin`; `ModelMigration.source_engine/is_baseline/has_non_portable/
+  reviewed`.
+- **Gotchas**: un baseline de snapshot nace `reviewed=False` y `apply` da 409 hasta aprobarlo (R1);
+  si trae objetos procedurales queda atado a `source_engine` (cross-engine guard → 422); el snapshot
+  es DDL **no confiable** del motor (revisar antes de aplicar en masa).
 
 ## Documentación
 

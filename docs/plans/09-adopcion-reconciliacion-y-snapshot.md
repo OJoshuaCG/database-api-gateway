@@ -22,8 +22,15 @@
 >   revalidan el host con `validate_remote_host` ANTES de conectar (no solo al registrar) →
 >   cierra la ventana de DNS-rebinding para todos los endpoints de motor. Cubre también el Plan 08 #4.
 >
+> **Verificación e2e contra motores REALES — ✅ PASÓ (2026-06-29):** `scripts/verify_migrations_e2e.py`
+> (ampliado con `run_plan09`) ejecutó **153 checks / 0 fallos** contra **MySQL 8.0.46, MariaDB 11.8 y
+> PostgreSQL 16.14** (contenedores Docker): reconcile, adopt (DB/usuario, 404/409), snapshot
+> (captura tabla+vista, `source_engine`), from-snapshot + gate `reviewed` (409 → aprobar → aplica DDL
+> real), apply secuencial a versión objetivo (`from→to`), rollback secuencial target-based y
+> autoasignación de versión. Junto con el Plan 02 ya cubierto, **el DDL/DCL real está validado**.
+>
 > **Pendiente (NO bloqueante):** F2 modos 1/2 reutilizan `apply`/`stamp` existentes (sin endpoint
-> nuevo); gate e2e manual con Docker (`scripts/verify_migrations_e2e.py`).
+> nuevo); integrar el e2e en CI con testcontainers (Plan 08 P1).
 
 > Este plan extiende el inventario (Plan 01) y el módulo de migraciones de blueprints
 > (Plan 02). No introduce un motor nuevo: **reutiliza** la introspección existente

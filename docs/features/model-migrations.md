@@ -25,7 +25,7 @@ la [capa de conexión remota](remote-connections.md) y la [autenticación](authe
 
 | Campo | Obligatorio | Notas |
 |---|---|---|
-| `version` | sí | Solo dígitos, 4–10 (`0001`, `0002`…). **Orden numérico**: mantén un ancho consistente |
+| `version` | **no** | Solo dígitos, 4–10. **Si se omite, el gateway autoasigna la siguiente secuencial** (`max+1`); pásala solo para fijarla. Orden numérico |
 | `name` | sí | Descripción corta (≤200) |
 | `up_sql` | sí | Delta SQL base, **estilo MySQL de referencia**. ≤256 KB |
 | `up_sql_mysql` | no | Override manual para MySQL/MariaDB (si la auto-traducción no basta) |
@@ -33,6 +33,8 @@ la [capa de conexión remota](remote-connections.md) y la [autenticación](authe
 | `down_sql` | no | Rollback **confirmado**. Sin él, `rollback` responde 409 |
 | `down_sql_suggested` | (auto) | Rollback sugerido por el gateway para ops aditivas; revisar y confirmar vía `PATCH` |
 | `checksum` | (auto) | SHA256 de todo el SQL + versión; detecta alteración antes de aplicar |
+| `reviewed` | (auto) | `true` para migraciones escritas a mano; un **baseline de snapshot** (Plan 09) nace `false` y **no se aplica** hasta aprobarlo (`PATCH reviewed=true`) |
+| `source_engine` / `is_baseline` / `has_non_portable` | (auto) | Metadatos de un baseline generado por snapshot (motor de origen; si trae objetos procedurales no portables) |
 
 El gateway **auto-traduce** `up_sql` de MySQL a PostgreSQL con `sqlglot`; el campo
 calculado `translated` muestra el SQL efectivo por motor. Los overrides solo se necesitan
@@ -68,8 +70,8 @@ DELETE /api/v1/database-models/{id}/migrations/{version}  # solo si NO tiene his
 
 ```http
 GET    /api/v1/managed-databases/{id}/migrations/status     # versión actual vs. pendientes
-POST   /api/v1/managed-databases/{id}/migrations/apply      # ?version= ?force= ?dry_run=   (10/min)
-POST   /api/v1/managed-databases/{id}/migrations/rollback   # ?confirm_version= (OBLIGATORIO) (10/min)
+POST   /api/v1/managed-databases/{id}/migrations/apply      # ?version= ?force= ?dry_run= — UNA llamada, secuencial (10/min)
+POST   /api/v1/managed-databases/{id}/migrations/rollback   # ?confirm_version= (OBLIG.) ?target_version= — secuencial (10/min)
 POST   /api/v1/managed-databases/{id}/migrations/stamp      # ?version=  (marca sin ejecutar) (10/min)
 GET    /api/v1/managed-databases/{id}/migrations/history    # historial paginado
 ```
@@ -88,10 +90,10 @@ aunque una falle. El fan-out asíncrono real es del Plan 06.
 ### 1. Crear el blueprint y subir migraciones
 
 ```bash
-# Crear la primera migración (esquema inicial, estilo MySQL)
+# Crear la primera migración (esquema inicial, estilo MySQL).
+# "version" es OPCIONAL: si se omite, el gateway autoasigna la siguiente (0001, 0002…).
 curl -X POST .../api/v1/database-models/1/migrations -b cookie.txt \
   -H 'Content-Type: application/json' -d '{
-    "version": "0001",
     "name": "Esquema inicial",
     "up_sql": "CREATE TABLE orders (id INT AUTO_INCREMENT PRIMARY KEY, total INT)"
   }'
@@ -131,31 +133,38 @@ curl .../api/v1/managed-databases/5/migrations/status -b cookie.txt
 # → { "current_version": null, "pending_count": 1, "pending_versions": ["0001"], ... }
 
 curl -X POST '.../api/v1/managed-databases/5/migrations/apply?dry_run=true' -b cookie.txt
-# → { "dry_run": true, "current_version": null, "pending_versions": ["0001"], "pending_count": 1 }
+# → { "dry_run": true, "from_version": null, "to_version": "0001",
+#     "pending_versions": ["0001"], "no_op": false }
 ```
 
-### 4. Aplicar
+### 4. Aplicar (una sola llamada, secuencial)
 
 ```bash
 curl -X POST .../api/v1/managed-databases/5/migrations/apply -b cookie.txt
-# → { "applied_count": 1, "failed": false, "quarantined": false,
-#     "results": [{ "version": "0001", "status": "applied", "execution_ms": 42 }] }
+# → { "from_version": null, "to_version": "0002", "target_version": null,
+#     "applied_count": 2, "failed": false, "no_op": false,
+#     "pending_versions": ["0001","0002"], "results": [ … ] }
 ```
 
-`?version=0003` aplica solo hasta esa versión (inclusive).
+`?version=0003` aplica en **una sola llamada** todas las pendientes hasta `0003` (inclusive), en
+orden. Forward-only; `422` si la versión no existe; `409` si hay un baseline de snapshot sin
+revisar (R1).
 
-### 5. Historial y rollback
+### 5. Historial y rollback (target-based, secuencial)
 
 ```bash
 curl .../api/v1/managed-databases/5/migrations/history -b cookie.txt
 # → [{ "version": "0001", "status": "applied", "applied_at": "…", "execution_ms": 42 }]
 
-# Rollback DESTRUCTIVO: confirm_version debe igualar la versión actual de la BD
-curl -X POST '.../api/v1/managed-databases/5/migrations/rollback?confirm_version=0001' -b cookie.txt
+# Rollback DESTRUCTIVO: confirm_version = versión actual; target_version = destino (anterior).
+# En UNA llamada revierte secuencialmente todas las necesarias (p. ej. 0010 → 0007).
+curl -X POST '.../api/v1/managed-databases/5/migrations/rollback?confirm_version=0010&target_version=0007' -b cookie.txt
+# → { "from_version": "0010", "to_version": "0007", "reverted_count": 3,
+#     "reverted_versions": ["0010","0009","0008"], "failed": false }
 ```
 
-Sin `confirm_version` (o si no coincide con la versión actual) → **422**. Si la versión
-actual no tiene `down_sql` confirmado → **409**.
+Sin `target_version` revierte solo la última. Sin `confirm_version` (o si no coincide con la
+versión actual) → **422**. Si **alguna** versión del camino no tiene `down_sql` confirmado → **409**.
 
 ### 6. Marcar una BD pre-existente (stamp)
 
@@ -209,9 +218,13 @@ fiable:
 
 - Tests unitarios (SQLite): `tests/test_api_model_migrations.py`,
   `tests/test_migration_runner.py`, `tests/test_migration_integrity.py`,
-  `tests/test_sql_dialect.py`.
-- Verificación e2e contra motores reales (MySQL 8 / MariaDB 11 / PostgreSQL 16):
-  script **manual** `scripts/verify_migrations_e2e.py` (requiere Docker).
+  `tests/test_sql_dialect.py`, `tests/test_api_migrations_apply_flow.py`,
+  `tests/test_api_migrations_rollback_flow.py`.
+- Verificación e2e contra motores reales (MySQL 8 / MariaDB 11 / PostgreSQL 16): script
+  `scripts/verify_migrations_e2e.py` (requiere Docker) — **ejecutado: 153 checks / 0 fallos**
+  (2026-06-29), cubre apply/rollback secuencial, gate `reviewed`, autoasignación de versión y los
+  flujos de [adopción/snapshot](adoption-reconcile-snapshot.md) (Plan 09). Pendiente: integrarlo en
+  CI con testcontainers (Plan 08).
 
 ---
 

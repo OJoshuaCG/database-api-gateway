@@ -209,5 +209,8 @@ uv run pytest -q tests/test_api_server_users.py tests/test_api_managed_databases
 ## Próximos pasos
 
 El versionado y la migración de blueprints (`DatabaseModel`) ya está implementado: ver
-[Migraciones de Blueprints](model-migrations.md). El clonado de BDs entre servidores y el
-aprovisionamiento de infraestructura siguen en `docs/plans/` (Iteraciones 3+).
+[Migraciones de Blueprints](model-migrations.md). Para **adoptar** BDs/usuarios que ya existen en
+el motor (sin recrearlos), **reconciliar** lo real vs lo gestionado y crear blueprints por
+**snapshot**, ver [Adopción, reconciliación y snapshot](adoption-reconcile-snapshot.md) (Plan 09).
+El clonado de BDs entre servidores y el aprovisionamiento de infraestructura siguen en
+`docs/plans/` (Iteraciones 3+).
