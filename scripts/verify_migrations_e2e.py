@@ -78,6 +78,142 @@ def server_engine(engine_key):
     )
 
 
+def _server_exec(engine_key, statements):
+    """Ejecuta DDL a nivel servidor (crear/borrar BDs/usuarios), AUTOCOMMIT."""
+    with server_engine(engine_key).connect() as conn:
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        for s in statements:
+            conn.execute(text(s))
+
+
+def _direct_exec(engine_key, dbname, statements):
+    """Ejecuta DDL conectado a una BD concreta (poblar estructura), AUTOCOMMIT."""
+    with target_engine(engine_key, dbname).connect() as conn:
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        for s in statements:
+            conn.execute(text(s))
+
+
+def _tables(engine_key, dbname):
+    insp = inspect(target_engine(engine_key, dbname).connect())
+    return set(insp.get_table_names() if engine_key != "postgresql"
+              else insp.get_table_names(schema="public"))
+
+
+def run_plan09(c, sid, oid, engine_key):
+    """Plan 09 + UX: reconcile, adopt (DB/user), snapshot, from-snapshot + gate
+    reviewed, apply secuencial a versión objetivo, rollback secuencial y autoversión."""
+    print(f"\n----- PLAN 09 + UX: {engine_key} -----")
+    ek = engine_key
+    adopt_db, adopt_usr = f"p9adopt_{ek[:2]}", f"p9usr_{ek[:2]}"
+    snap_db, seq_db = f"p9snap_{ek[:2]}", f"p9seq_{ek[:2]}"
+
+    # Pre-clean idempotente.
+    for db in (adopt_db, snap_db, seq_db):
+        try:
+            _server_exec(ek, [f"DROP DATABASE IF EXISTS {db}"])
+        except Exception as ex:
+            print("   (pre-clean p9:", ex, ")")
+    try:
+        if ek == "postgresql":
+            _server_exec(ek, [f"DROP ROLE IF EXISTS {adopt_usr}"])
+        else:
+            _server_exec(ek, [f"DROP USER IF EXISTS '{adopt_usr}'@'%'"])
+    except Exception:
+        pass
+
+    # 1) Crear DB + usuario + estructura DIRECTAMENTE en el motor (no gestionados).
+    _server_exec(ek, [f"CREATE DATABASE {adopt_db}"])
+    if ek == "postgresql":
+        _server_exec(ek, [f"CREATE ROLE {adopt_usr} LOGIN PASSWORD 'Pw_123456'"])
+    else:
+        _server_exec(ek, [f"CREATE USER '{adopt_usr}'@'%' IDENTIFIED BY 'Pw_123456'"])
+    _direct_exec(ek, adopt_db, [
+        "CREATE TABLE clientes (id INT PRIMARY KEY, nombre VARCHAR(80))",
+        "CREATE VIEW v_clientes AS SELECT id FROM clientes",
+    ])
+
+    # 2) RECONCILE: el plano en vivo vs el inventario.
+    rec = c.get(f"/api/v1/servers/{sid}/reconcile")
+    check("p9 reconcile 200", rec.status_code == 200)
+    rd = rec.json()["data"]
+    dbstate = {d["name"]: d["state"] for d in rd["databases"]}
+    ustate = {u["username"]: u["state"] for u in rd["users"]}
+    check("p9 reconcile: adopt_db unmanaged", dbstate.get(adopt_db) == "unmanaged")
+    check("p9 reconcile: adopt_usr unmanaged", ustate.get(adopt_usr) == "unmanaged")
+
+    # 3) ADOPT usuario (existe) y luego la BD (owner del mismo servidor).
+    au = c.post("/api/v1/server-users/adopt",
+                json={"server_id": sid, "username": adopt_usr, "host": "%"})
+    check("p9 adopt user 201 sin password",
+          au.status_code == 201 and au.json()["data"]["has_password"] is False)
+    adopt_oid = au.json()["data"]["id"]
+    ad = c.post("/api/v1/managed-databases/adopt",
+                json={"server_id": sid, "name": adopt_db, "owner_id": adopt_oid})
+    check("p9 adopt db 201 origin=adopted",
+          ad.status_code == 201 and ad.json()["data"]["origin"] == "adopted")
+    check("p9 adopt db idempotente 409",
+          c.post("/api/v1/managed-databases/adopt",
+                 json={"server_id": sid, "name": adopt_db, "owner_id": adopt_oid}).status_code == 409)
+    check("p9 adopt db inexistente 404",
+          c.post("/api/v1/managed-databases/adopt",
+                 json={"server_id": sid, "name": "no_existe_xyz", "owner_id": adopt_oid}).status_code == 404)
+
+    # 4) SNAPSHOT de adopt_db (tabla + vista). Solo estructura.
+    snp = c.get(f"/api/v1/servers/{sid}/databases/{adopt_db}/snapshot")
+    check("p9 snapshot 200", snp.status_code == 200)
+    sd = snp.json()["data"]
+    otypes = {s["object_type"] for s in sd["statements"]}
+    check("p9 snapshot captura tabla y vista", "table" in otypes and "view" in otypes)
+    check("p9 snapshot source_engine correcto", sd["source_engine"] == ek)
+
+    # 5) FROM-SNAPSHOT → baseline reviewed=false; apply BLOQUEADO; aprobar; aplicar real.
+    fs = c.post("/api/v1/database-models/from-snapshot",
+                json={"server_id": sid, "database": adopt_db, "name": f"BP9-{ek}", "slug": f"bp9-{ek}"})
+    check("p9 from-snapshot 201", fs.status_code == 201)
+    snap_mid = fs.json()["data"]["model"]["id"]
+    det = c.get(f"/api/v1/database-models/{snap_mid}/migrations/0001").json()["data"]
+    check("p9 baseline reviewed=false (R1)", det["reviewed"] is False and det["is_baseline"] is True)
+    snap_db_id = c.post("/api/v1/managed-databases?provision=true",
+                        json={"server_id": sid, "owner_id": oid, "name": snap_db,
+                              "model_id": snap_mid}).json()["data"]["id"]
+    check("p9 apply baseline sin revisar -> 409 (R1 gate)",
+          c.post(f"/api/v1/managed-databases/{snap_db_id}/migrations/apply").status_code == 409)
+    c.patch(f"/api/v1/database-models/{snap_mid}/migrations/0001", json={"reviewed": True})
+    okap = c.post(f"/api/v1/managed-databases/{snap_db_id}/migrations/apply")
+    check("p9 apply tras aprobar 200",
+          okap.status_code == 200 and okap.json()["data"]["failed"] is False)
+    check("p9 baseline aplicó la tabla del snapshot", "clientes" in _tables(ek, snap_db))
+
+    # 6) APPLY secuencial a versión objetivo + autoversión + ROLLBACK secuencial.
+    seq_mid = c.post("/api/v1/database-models",
+                     json={"name": f"Seq-{ek}", "slug": f"seq-{ek}"}).json()["data"]["id"]
+    for i in (1, 2, 3):
+        # version OMITIDA -> autoasignada (0001, 0002, 0003).
+        c.post(f"/api/v1/database-models/{seq_mid}/migrations",
+               json={"name": f"m{i}", "up_sql": f"CREATE TABLE s{i} (id INT PRIMARY KEY)",
+                     "down_sql": f"DROP TABLE s{i}"})
+    vers = sorted(m["version"] for m in
+                  c.get(f"/api/v1/database-models/{seq_mid}/migrations?size=50").json()["data"])
+    check("p9 autoversión secuencial 0001-0003", vers == ["0001", "0002", "0003"])
+    seq_db_id = c.post("/api/v1/managed-databases?provision=true",
+                       json={"server_id": sid, "owner_id": oid, "name": seq_db,
+                             "model_id": seq_mid}).json()["data"]["id"]
+    a = c.post(f"/api/v1/managed-databases/{seq_db_id}/migrations/apply?version=0002").json()["data"]
+    check("p9 apply a 0002 en UNA llamada (from None -> to 0002, 2 aplicadas)",
+          a["from_version"] is None and a["to_version"] == "0002" and a["applied_count"] == 2)
+    t = _tables(ek, seq_db)
+    check("p9 apply parcial: s1,s2 sí; s3 no", "s1" in t and "s2" in t and "s3" not in t)
+    c.post(f"/api/v1/managed-databases/{seq_db_id}/migrations/apply")  # hasta la última
+    rb = c.post(f"/api/v1/managed-databases/{seq_db_id}/migrations/rollback"
+                f"?confirm_version=0003&target_version=0001")
+    rbd = rb.json()["data"]
+    check("p9 rollback secuencial 0003->0001 (2 revertidas)",
+          rb.status_code == 200 and rbd["to_version"] == "0001" and rbd["reverted_count"] == 2)
+    t2 = _tables(ek, seq_db)
+    check("p9 rollback dejó solo s1", "s1" in t2 and "s2" not in t2 and "s3" not in t2)
+
+
 def run_for(c, engine_key):
     print(f"\n===== ENGINE: {engine_key} =====")
     e = ENGINES[engine_key]
@@ -146,7 +282,7 @@ def run_for(c, engine_key):
     check("dry-run HTTP 200", dr.status_code == 200)
     drd = dr.json()["data"]
     check("dry-run: 2 pendientes, no aplicado",
-          drd.get("dry_run") is True and drd["pending_count"] == 2)
+          drd.get("dry_run") is True and len(drd["pending_versions"]) == 2)
     st_after_dry = c.get(f"/api/v1/managed-databases/{db_id}/migrations/status").json()["data"]
     check("dry-run no mutó la BD (sigue current None)", st_after_dry["current_version"] is None)
 
@@ -184,7 +320,8 @@ def run_for(c, engine_key):
     check("rollback sin confirm_version -> 422", bad.status_code == 422)
     rb = c.post(f"/api/v1/managed-databases/{db_id}/migrations/rollback?confirm_version=0002")
     check("rollback HTTP 200", rb.status_code == 200)
-    check("rollback current=0001", rb.json()["data"]["current_version"] == "0001")
+    # Respuesta de rollback (target-based): from_version -> to_version (Plan 09 UX).
+    check("rollback to_version=0001", rb.json()["data"]["to_version"] == "0001")
     insp2 = inspect(target_engine(engine_key, dbname).connect())
     cols2 = [col["name"] for col in (insp2.get_columns("orders") if engine_key != "postgresql"
                                      else insp2.get_columns("orders", schema="public"))]
@@ -245,6 +382,9 @@ def run_for(c, engine_key):
     forced = c.post(f"/api/v1/managed-databases/{q_db_id}/migrations/apply?force=true")
     check("quarantine: force bypassa el guard (200, vuelve a fallar)",
           forced.status_code == 200 and forced.json()["data"]["failed"] is True)
+
+    # 14) Plan 09 + UX (adopt/reconcile/snapshot/from-snapshot/secuencial/autoversión).
+    run_plan09(c, sid, oid, engine_key)
 
     return mid
 
