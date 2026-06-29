@@ -384,7 +384,7 @@ class MigrationRunner:
                 applied_at=datetime.now(timezone.utc),
             )
 
-    def rollback_last(
+    def rollback_to(
         self,
         target: ServerTarget,
         *,
@@ -393,49 +393,55 @@ class MigrationRunner:
         engine: EngineType,
         managed_db_id: int,
         specs: list[MigrationSpec],
-    ) -> MigrationResult:
+        to_version: str | None,
+    ) -> list[MigrationResult]:
         """
-        Revierte la última migración aplicada (``downgrade -1``). El llamador debe
-        verificar ANTES que esa migración tenga ``down_sql`` confirmado (409 si no).
+        Revierte SECUENCIALMENTE, de la más reciente a la más antigua, todas las
+        migraciones aplicadas hasta dejar la BD en ``to_version`` (``None`` = base:
+        revierte todas). Análogo a ``apply`` pero hacia atrás: aplica ``downgrade -1``
+        repetido y devuelve un resultado por migración revertida. Se detiene en el
+        primer fallo (la BD queda en la última versión revertida con éxito).
+
+        El llamador debe validar ANTES que cada migración del camino tenga ``down_sql``
+        confirmado (si falta, el ``downgrade()`` generado lanza NotImplementedError).
         """
+        results: list[MigrationResult] = []
+        to_key = version_sort_key(to_version) if to_version is not None else None
+        by_version = {s.version: s for s in specs}
         with self._prepared(
             target, db_name=db_name, slug=slug, engine=engine, specs=specs,
             managed_db_id=managed_db_id, op="migration_rollback",
         ) as (conn, cfg, version_table):
             current = self._read_current(conn, version_table)
-            if current is None:
-                raise AppHttpException(
-                    message="La BD no tiene ninguna migración aplicada.",
-                    status_code=409,
-                    context={"database": db_name},
-                )
-            spec = next((s for s in specs if s.version == current), None)
-            if spec is None:
-                raise AppHttpException(
-                    message="La versión actual de la BD no existe en el blueprint.",
-                    status_code=409,
-                    context={"database": db_name, "current": current},
-                )
-            t0 = time.monotonic()
-            try:
-                with _ALEMBIC_LOCK:
-                    command.downgrade(cfg, "-1")
+            while current is not None and (
+                to_key is None or version_sort_key(current) > to_key
+            ):
+                spec = by_version.get(current)
+                mig_id = spec.id if spec else -1
+                t0 = time.monotonic()
+                try:
+                    with _ALEMBIC_LOCK:
+                        command.downgrade(cfg, "-1")
+                except Exception as exc:  # noqa: BLE001 — registrar fallo y detener
+                    ms = int((time.monotonic() - t0) * 1000)
+                    logger.warning("Falló el rollback de %s: %s", current, exc, exc_info=True)
+                    results.append(MigrationResult(
+                        migration_id=mig_id, version=current, status="failed",
+                        error=_clean_error(exc), execution_ms=ms,
+                        applied_at=datetime.now(timezone.utc),
+                    ))
+                    break
                 ms = int((time.monotonic() - t0) * 1000)
-                return MigrationResult(
-                    migration_id=spec.id, version=spec.version,
-                    status="applied", error=None, execution_ms=ms,
-                    applied_at=datetime.now(timezone.utc),
-                )
-            except Exception as exc:  # noqa: BLE001
-                ms = int((time.monotonic() - t0) * 1000)
-                logger.warning(
-                    "Falló el rollback de %s: %s", spec.version, exc, exc_info=True
-                )
-                return MigrationResult(
-                    migration_id=spec.id, version=spec.version,
-                    status="failed", error=_clean_error(exc),
-                    execution_ms=ms, applied_at=datetime.now(timezone.utc),
-                )
+                results.append(MigrationResult(
+                    migration_id=mig_id, version=current, status="applied",
+                    error=None, execution_ms=ms, applied_at=datetime.now(timezone.utc),
+                ))
+                new_current = self._read_current(conn, version_table)
+                # Salvaguarda anti-bucle: si el puntero no se movió, detener.
+                if new_current == current:
+                    break
+                current = new_current
+        return results
 
     def stamp(
         self,
