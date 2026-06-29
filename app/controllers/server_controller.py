@@ -26,8 +26,15 @@ from app.core import remote_engine
 from app.core.remote_engine import ServerTarget
 from app.exceptions import AppHttpException
 from app.models.enums import EngineType, ServerStatus
+from app.models.managed_database import ManagedDatabase
 from app.models.server import Server
-from app.services.db_admin.dtos import ConnectionInfo, EngineUserInfo, TableSchema
+from app.models.server_user import ServerUser
+from app.services.db_admin.dtos import (
+    ConnectionInfo,
+    EngineUserInfo,
+    StructureDump,
+    TableSchema,
+)
 from app.services.db_admin.factory import get_adapter
 
 
@@ -247,3 +254,94 @@ class ServerController:
         return get_adapter(self._build_target(server_id)).get_table_schema(
             database, table
         )
+
+    # ------------------------------------------------------------------ #
+    # Reconciliación (drift) y snapshot — Plan 09                          #
+    # ------------------------------------------------------------------ #
+    def reconcile(self, server_id: int) -> dict:
+        """
+        Cruza el plano EN VIVO (motor) con el INVENTARIO (gateway) y clasifica cada
+        BD/usuario como ``managed`` (en ambos), ``unmanaged`` (solo en el motor →
+        adoptable) u ``orphan`` (solo en el inventario → se borró por fuera).
+        Read-only: no muta nada.
+        """
+        target = self._build_target(server_id)
+        adapter = get_adapter(target)
+        live_dbs = set(adapter.list_databases())
+        live_users = adapter.list_users()
+        is_pg = target.dialect == EngineType.postgresql.value
+
+        session = self._session()
+        try:
+            inv_dbs = (
+                session.query(ManagedDatabase)
+                .filter(ManagedDatabase.server_id == server_id)
+                .all()
+            )
+            inv_users = (
+                session.query(ServerUser)
+                .filter(ServerUser.server_id == server_id)
+                .all()
+            )
+            inv_db_by_name = {d.name: d for d in inv_dbs}
+
+            databases: list[dict] = []
+            for name in sorted(live_dbs | set(inv_db_by_name)):
+                d = inv_db_by_name.get(name)
+                if d and name in live_dbs:
+                    state = "managed"
+                elif d:
+                    state = "orphan"
+                else:
+                    state = "unmanaged"
+                databases.append(
+                    {
+                        "name": name,
+                        "state": state,
+                        "managed_id": d.id if d else None,
+                        "owner_id": d.owner_id if d else None,
+                        "status": (d.status.value if hasattr(d.status, "value") else d.status)
+                        if d
+                        else None,
+                    }
+                )
+
+            # Usuarios: en PG se matchea por username (no hay host); en MySQL por (user, host).
+            def ukey(username: str, host: str | None) -> tuple:
+                return (username,) if is_pg else (username, host or "%")
+
+            inv_user_by_key = {ukey(u.username, u.host): u for u in inv_users}
+            live_keys = {ukey(u.username, u.host) for u in live_users}
+            live_meta = {ukey(u.username, u.host): u for u in live_users}
+
+            users: list[dict] = []
+            for key in sorted(live_keys | set(inv_user_by_key)):
+                u = inv_user_by_key.get(key)
+                in_live = key in live_keys
+                if u and in_live:
+                    state = "managed"
+                elif u:
+                    state = "orphan"
+                else:
+                    state = "unmanaged"
+                if u:
+                    username, host = u.username, u.host
+                else:
+                    live = live_meta[key]
+                    username, host = live.username, live.host
+                users.append(
+                    {
+                        "username": username,
+                        "host": host,
+                        "state": state,
+                        "managed_id": u.id if u else None,
+                    }
+                )
+        finally:
+            session.close()
+
+        return {"server_id": server_id, "databases": databases, "users": users}
+
+    def snapshot(self, server_id: int, database: str) -> StructureDump:
+        """Dump estructural EN VIVO de una BD (solo estructura, nunca filas)."""
+        return get_adapter(self._build_target(server_id)).dump_structure(database)
