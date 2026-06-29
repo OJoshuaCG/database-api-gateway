@@ -389,6 +389,11 @@ curl -X POST https://<host>/api/v1/servers -b cookies.txt \
 
 Estas requieren que el servidor sea alcanzable; pueden devolver `502`/`504`.
 
+> **Seguridad (anti-SSRF):** si `REMOTE_SSRF_GUARD_ENABLED=True`, el host se revalida **al
+> conectar** (no solo al registrar el servidor): un destino que resuelva a loopback,
+> link-local/metadata (169.254.169.254), multicast o reservado se rechaza con `422` en cada
+> operación contra el motor (cierra el DNS-rebinding).
+
 #### `POST /api/v1/servers/{server_id}/test-connection` 🔌
 
 Verifica conectividad y actualiza el `status` del servidor. Respuesta `ConnectionInfo`:
@@ -796,7 +801,7 @@ has_mysql_override, has_postgresql_override, has_rollback, checksum, created_at 
 | `GET` | `/api/v1/database-models/{model_id}/migrations` | Lista paginada (resúmenes). |
 | `POST` | `/api/v1/database-models/{model_id}/migrations` | Crea una migración (`201`). Devuelve `translated` + `down_sql_suggested`. |
 | `GET` | `/api/v1/database-models/{model_id}/migrations/{version}` | Detalle completo. |
-| `PATCH` | `/api/v1/database-models/{model_id}/migrations/{version}` | Confirma `down_sql` / añade overrides. |
+| `PATCH` | `/api/v1/database-models/{model_id}/migrations/{version}` | Confirma `down_sql` / añade overrides / **aprueba un baseline de snapshot** (`reviewed: true`, R1). |
 | `DELETE` | `/api/v1/database-models/{model_id}/migrations/{version}` | Elimina (solo si **no** tiene historial de aplicación; si no, `409`). |
 | `POST` | `/api/v1/database-models/{model_id}/migrations/apply-all` 🔌 | Aplica a **todas** las BDs del blueprint. Rate limit **3/min**. |
 
@@ -974,7 +979,7 @@ asignado (`422` si no). Rate limit **10/min** en `apply`/`rollback`/`stamp`.
 | Método | Ruta | Query | Descripción |
 |---|---|---|---|
 | `GET` | `/api/v1/managed-databases/{db_id}/migrations/status` | — | Versión actual vs. pendientes. |
-| `POST` | `/api/v1/managed-databases/{db_id}/migrations/apply` | `version?`, `force?`, `dry_run?` | **Una sola llamada** aplica secuencialmente, en orden, **todas** las pendientes hasta `version` (o hasta la **última** si se omite). Forward-only (`version` ≤ actual → no-op). `422` si `version` no existe. Respuesta `MigrationApplyOut` con `from_version`→`to_version`. |
+| `POST` | `/api/v1/managed-databases/{db_id}/migrations/apply` | `version?`, `force?`, `dry_run?` | **Una sola llamada** aplica secuencialmente, en orden, **todas** las pendientes hasta `version` (o hasta la **última** si se omite). Forward-only (`version` ≤ actual → no-op). `422` si `version` no existe; `409` si hay un baseline de snapshot sin revisar (R1). Respuesta `MigrationApplyOut` con `from_version`→`to_version`. |
 | `POST` | `/api/v1/managed-databases/{db_id}/migrations/rollback` | `confirm_version` (**obligatorio**), `target_version?` | **Una sola llamada** revierte secuencialmente hasta `target_version` (anterior a la actual); sin él, revierte solo la última. `409` si alguna versión del camino no tiene `down_sql` confirmado. Respuesta `MigrationRollbackOut` con `from_version`→`to_version`. |
 | `POST` | `/api/v1/managed-databases/{db_id}/migrations/stamp` | `version` (**obligatorio**) | Marca una versión **sin ejecutar SQL** (BDs pre-existentes). |
 | `GET` | `/api/v1/managed-databases/{db_id}/migrations/history` | `page`, `size` | Historial paginado de aplicaciones. |

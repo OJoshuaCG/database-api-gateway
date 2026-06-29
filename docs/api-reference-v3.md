@@ -471,6 +471,11 @@ El gateway toma el snapshot estructural y crea un **blueprint nuevo** cuya migra
 (`0001`) contiene ese DDL. El baseline se etiqueta con `source_engine` y `has_non_portable`. Si
 contiene objetos procedurales, **no podrá aplicarse a un motor distinto** (ver §7).
 
+> **⚠ Aprobación requerida (R1):** como el baseline es **DDL capturado del motor** (potencialmente
+> no confiable), nace **`reviewed: false`** y **no se puede aplicar** hasta que un admin lo revise
+> y apruebe con `PATCH …/migrations/0001` `{"reviewed": true}`. Mientras tanto, `apply`/`apply-all`
+> responden **`409`**. Ver §7-ter ("Aprobación de un baseline").
+
 ### Flujo
 ```
 snapshot (§5) → [Guardar como blueprint] → POST /database-models/from-snapshot
@@ -610,6 +615,8 @@ parámetro `version`:
   `/rollback`).
 - **`422`** si `version` no existe en el blueprint.
 - **`?dry_run=true`** → te devuelve el plan (qué se aplicaría) sin tocar la BD.
+- **`409`** si el blueprint tiene un **baseline de snapshot sin revisar** (R1): apruébalo primero
+  (`PATCH …/migrations/{version}` `{"reviewed": true}`, §7-ter).
 
 El gateway internamente calcula la lista ordenada (orden **numérico**, no `"0010" < "0009"`),
 adquiere un lock por BD y aplica una a una, deteniéndose en el primer fallo.
@@ -839,7 +846,7 @@ curl "https://<host>/api/v1/database-models/8/migrations/0002" -b cookies.txt
     "translated": { "mysql": "ALTER TABLE users ADD COLUMN phone VARCHAR(20)",
                     "postgresql": "ALTER TABLE users ADD COLUMN phone VARCHAR(20)" },
     "checksum": "…", "source_engine": null, "is_baseline": false, "has_non_portable": false,
-    "created_at": "…", "updated_at": "…" } }
+    "reviewed": true, "created_at": "…", "updated_at": "…" } }
 ```
 
 **3) Confirmar el `down_sql` (rollback) de una versión vía PATCH:**
@@ -863,12 +870,27 @@ curl "https://<host>/api/v1/managed-databases/11/migrations/status" -b cookies.t
 { "detail": { "msg": "No se puede eliminar una migración con historial de aplicación. Revierta y/o cree una migración compensatoria." } }
 ```
 
+### Aprobación de un baseline (R1 — seguridad)
+Las versiones tienen un campo **`reviewed`**: las escritas a mano nacen `true`; un **baseline de
+snapshot** (`is_baseline: true`, DDL capturado del motor) nace **`false`** y **no se puede
+aplicar** (`apply`/`apply-all` → `409`) hasta que un admin lo revise y apruebe:
+```bash
+curl -X PATCH "https://<host>/api/v1/database-models/8/migrations/0001" -b cookies.txt \
+  -H "Content-Type: application/json" -d '{ "reviewed": true }'
+```
+> 🎨 Visual: muestra un badge **"⚠ pendiente de revisión"** en las versiones con `reviewed: false`,
+> con un botón **"Revisar y aprobar"** que abre el detalle (SQL) y, al confirmar, hace el PATCH.
+> Deshabilita el botón "Aplicar" de cualquier BD de ese blueprint mientras el baseline no esté
+> aprobado (el backend igualmente devuelve `409`).
+
 ### Guards de integridad (importante para la UI)
 - **Editar el SQL efectivo** (`up_sql_*`) de una versión **ya aplicada** en alguna BD → **`409`**:
-  crea una versión nueva para corregir. (El `name`/`down_sql` sí se pueden ajustar.)
+  crea una versión nueva para corregir. (El `name`/`down_sql`/`reviewed` sí se pueden ajustar.)
 - **Eliminar una versión con historial de aplicación** → **`409`**: protege la trazabilidad.
 - **"Reducir" la versión de una BD** NO es borrar la versión del blueprint: es un **rollback**
   (§7-bis). Borrar la *definición* solo aplica a versiones nunca aplicadas.
+- **Baseline de snapshot sin revisar** (`reviewed: false`) → `apply`/`apply-all` dan **`409`**
+  hasta aprobarlo (ver arriba).
 
 ### 🎨 Interpretación visual sugerida
 Layout **maestro-detalle** de dos columnas:

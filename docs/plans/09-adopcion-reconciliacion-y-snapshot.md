@@ -12,10 +12,18 @@
 > `POST /database-models/from-snapshot`. Docs: `api-reference.md` (§6–9, tabla §16 endpoints 59–63)
 > y guía frontend `api-reference-v3.md`.
 >
-> **Pendiente (deuda, NO bloqueante):** F2 modos 1/2 reutilizan `apply`/`stamp` existentes (sin
-> endpoint nuevo); R1 (tratar el baseline de snapshot como DDL no confiable del motor, revisión
-> obligatoria antes de `apply` masivo) y R2 (revalidación de IP anti-SSRF pre-conexión, deuda
-> compartida con Plan 08 #4) quedan como mejoras futuras.
+> **Deuda de seguridad — RESUELTA (2026-06-29):**
+> - **R1 (baseline de snapshot = DDL no confiable):** columna `ModelMigration.reviewed`
+>   (default `True`; el baseline de `from-snapshot` nace `False`). `apply`/`apply-all` rechazan
+>   (409) un baseline sin revisar (`_guard_reviewed_baseline`); se aprueba con
+>   `PATCH …/migrations/{version}` `{"reviewed": true}` (auditado como `migration.review`).
+>   Migración Alembic `b8c9d0e1f2a3`. `stamp` NO se bloquea (no ejecuta SQL).
+> - **R2 (anti-SSRF al conectar):** `remote_engine.server_connection`/`database_connection`
+>   revalidan el host con `validate_remote_host` ANTES de conectar (no solo al registrar) →
+>   cierra la ventana de DNS-rebinding para todos los endpoints de motor. Cubre también el Plan 08 #4.
+>
+> **Pendiente (NO bloqueante):** F2 modos 1/2 reutilizan `apply`/`stamp` existentes (sin endpoint
+> nuevo); gate e2e manual con Docker (`scripts/verify_migrations_e2e.py`).
 
 > Este plan extiende el inventario (Plan 01) y el módulo de migraciones de blueprints
 > (Plan 02). No introduce un motor nuevo: **reutiliza** la introspección existente
