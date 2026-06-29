@@ -26,6 +26,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
 
 from app.core.environments import REMOTE_CONNECT_TIMEOUT, REMOTE_STATEMENT_TIMEOUT_MS
+from app.core.net_guard import validate_remote_host
 from app.exceptions import AppHttpException
 
 # Dialecto de negocio -> dialecto+driver de SQLAlchemy.
@@ -162,7 +163,12 @@ def server_connection(target: ServerTarget):
     """
     Conexión a NIVEL SERVIDOR (listar/crear/borrar BDs y usuarios). AUTOCOMMIT.
     MySQL: sin BD en la URL. PostgreSQL: conectado a 'postgres'.
+
+    SEGURIDAD (anti-SSRF, R2): se revalida el host JUSTO antes de conectar, no solo al
+    registrar el servidor. El driver re-resuelve DNS en cada conexión (NullPool), así que
+    validar aquí cierra la ventana de DNS-rebinding para TODOS los endpoints de motor.
     """
+    validate_remote_host(target.host)
     engine = get_engine(target, None)
     conn = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
     try:
@@ -173,7 +179,8 @@ def server_connection(target: ServerTarget):
 
 @contextmanager
 def database_connection(target: ServerTarget, database: str):
-    """Conexión a una BD CONCRETA (introspección de tablas/schema)."""
+    """Conexión a una BD CONCRETA (introspección/migraciones). Revalida el host (anti-SSRF, R2)."""
+    validate_remote_host(target.host)
     engine = get_engine(target, database)
     conn = engine.connect()
     try:

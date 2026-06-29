@@ -64,3 +64,39 @@ def test_create_server_blocks_loopback_via_api(admin_client, server_payload, mon
     # server_payload usa host=127.0.0.1 (loopback) → debe rechazarse.
     r = admin_client.post("/api/v1/servers", json=server_payload(port=3600))
     assert r.status_code == 422
+
+
+# --------------------- R2: revalidación al CONECTAR --------------------------- #
+def test_server_connection_blocks_dangerous_host(guard_on):
+    """La conexión a nivel servidor revalida el host y bloquea ANTES de conectar."""
+    from app.core.remote_engine import ServerTarget, server_connection
+
+    t = ServerTarget(
+        server_id=1, dialect="mysql", host="169.254.169.254", port=3306,
+        admin_user="u", admin_password="p",
+    )
+    with pytest.raises(AppHttpException) as exc:
+        with server_connection(t):
+            pass
+    assert exc.value.status_code == 422
+
+
+def test_connect_time_revalidation_blocks_rebinding_via_api(
+    admin_client, server_payload, monkeypatch
+):
+    """
+    Anti-rebinding: registrar con el guard OFF un host que LUEGO es peligroso, activar el
+    guard, y comprobar que la operación contra el motor (test-connection) lo bloquea al
+    conectar — no solo en el registro.
+    """
+    # Registro con guard desactivado (conftest) → simula que en ese momento resolvía OK.
+    r = admin_client.post(
+        "/api/v1/servers", json=server_payload(host="169.254.169.254", port=3698)
+    )
+    assert r.status_code == 201, r.text
+    sid = r.json()["data"]["id"]
+
+    # Ahora el guard está activo: la conexión debe revalidar y rechazar (422).
+    monkeypatch.setattr(environments, "REMOTE_SSRF_GUARD_ENABLED", True)
+    r = admin_client.post(f"/api/v1/servers/{sid}/test-connection")
+    assert r.status_code == 422, r.text
