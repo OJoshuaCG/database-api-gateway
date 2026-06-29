@@ -795,7 +795,7 @@ integridad** para no corromper historia ya aplicada.
 |---|---|---|---|
 | `GET` | `/api/v1/database-models/{model_id}/migrations` | `list[ModelMigrationSummary]` (paginado, **sin SQL**) | **Opciones del select** |
 | `GET` | `/api/v1/database-models/{model_id}/migrations/{version}` | `ModelMigrationOut` (**con SQL** + `translated`) | Detalle al seleccionar |
-| `POST` | `/api/v1/database-models/{model_id}/migrations` | `ModelMigrationOut` (`201`) | Crear versión |
+| `POST` | `/api/v1/database-models/{model_id}/migrations` | `ModelMigrationOut` (`201`) | Crear versión (**`version` opcional → autoasignada**) |
 | `PATCH` | `/api/v1/database-models/{model_id}/migrations/{version}` | `ModelMigrationOut` | Confirmar `down_sql` / overrides |
 | `DELETE` | `/api/v1/database-models/{model_id}/migrations/{version}` | — | Eliminar versión |
 | `GET` | `/api/v1/managed-databases/{db_id}/migrations/status` | `MigrationStatusOut` | Versión actual de **una BD** |
@@ -804,6 +804,13 @@ integridad** para no corromper historia ya aplicada.
 > actual es de **una BD**. Son dos preguntas distintas → dos endpoints. El frontend combina en
 > cliente: `list` da las opciones, `status` da `current_version` + `pending_versions` para
 > resaltar/clasificar. No se pasa `db_id` al listado de versiones a propósito.
+
+> **Versión autoasignada (al crear):** `version` en el `POST` es **opcional**. Si se omite, el
+> gateway asigna la **siguiente secuencial** (max+1) de forma autónoma y con reintento ante
+> colisión — pensado para varios colaboradores creando migraciones a la vez (nadie tiene que
+> consultar antes "cuál fue la última"). Pásala solo si quieres fijarla a mano; una versión
+> explícita duplicada da `409`. En la UI: deja el campo "versión" vacío por defecto (placeholder
+> "siguiente: 000N") y muéstralo opcional/avanzado.
 
 ### Qué resuelve
 Separar "catálogo de versiones del blueprint" (ligero, para el select) de "el SQL de una versión"
@@ -849,13 +856,27 @@ curl "https://<host>/api/v1/database-models/8/migrations/0002" -b cookies.txt
     "reviewed": true, "created_at": "…", "updated_at": "…" } }
 ```
 
-**3) Confirmar el `down_sql` (rollback) de una versión vía PATCH:**
+**3) Crear una versión SIN pasar el número (autoasignada — recomendado):** omite `version` y
+el gateway le pone la siguiente secuencial:
+```bash
+curl -X POST "https://<host>/api/v1/database-models/8/migrations" -b cookies.txt \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "Add status", "up_sql": "ALTER TABLE orders ADD COLUMN status VARCHAR(20)" }'
+```
+```json
+{ "data": { "version": "0003", "name": "Add status", "is_baseline": false, "reviewed": true,
+            "down_sql_suggested": "ALTER TABLE orders DROP COLUMN status;", "checksum": "…" },
+  "message": "Migración creada." }
+```
+> Si necesitas fijar la versión a mano, incluye `"version": "0003"`; una duplicada da `409`.
+
+**4) Confirmar el `down_sql` (rollback) de una versión vía PATCH:**
 ```bash
 curl -X PATCH "https://<host>/api/v1/database-models/8/migrations/0002" -b cookies.txt \
   -H "Content-Type: application/json" -d '{ "down_sql": "ALTER TABLE users DROP COLUMN phone" }'
 ```
 
-**4) Versión actual de una BD (para marcar el select):**
+**5) Versión actual de una BD (para marcar el select):**
 ```bash
 curl "https://<host>/api/v1/managed-databases/11/migrations/status" -b cookies.txt
 ```
@@ -865,7 +886,7 @@ curl "https://<host>/api/v1/managed-databases/11/migrations/status" -b cookies.t
             "pending_count": 7, "pending_versions": ["0004","0005","0006","0007","0008","0009","0010"] } }
 ```
 
-**5) Eliminar una versión nunca aplicada → `204/200`; aplicada en alguna BD → `409`:**
+**6) Eliminar una versión nunca aplicada → `204/200`; aplicada en alguna BD → `409`:**
 ```json
 { "detail": { "msg": "No se puede eliminar una migración con historial de aplicación. Revierta y/o cree una migración compensatoria." } }
 ```

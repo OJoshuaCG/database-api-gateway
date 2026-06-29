@@ -775,31 +775,39 @@ con overrides manuales. Detalle conceptual: [feature doc](features/model-migrati
 
 | Campo | Tipo | Requerido | Validación / valores |
 |---|---|---|---|
-| `version` | string | sí | patrón `^\d{4,10}$` (solo dígitos). **Se ordena NUMÉRICAMENTE** — mantén ancho consistente (`0001`, `0002`…) |
+| `version` | string \| null | **no** | patrón `^\d{4,10}$`. **Si se omite, el gateway autoasigna la siguiente secuencial** (`max+1`). Pásala solo para fijarla a mano. Se ordena NUMÉRICAMENTE. |
 | `name` | string | sí | 1–200 caracteres |
 | `up_sql` | string | sí | delta SQL base (estilo MySQL); 1–262144 chars (256 KB) |
 | `up_sql_mysql` | string \| null | no | override manual MySQL/MariaDB; ≤256 KB |
 | `up_sql_postgresql` | string \| null | no | override manual PostgreSQL; ≤256 KB |
 | `down_sql` | string \| null | no | rollback **confirmado**; ≤256 KB. Sin él, el rollback responde `409` |
 
+> **Versión autoasignada (recomendado).** Como la numeración es entera y secuencial, **`version`
+> es opcional**: si se omite, el gateway calcula y asigna **la siguiente** (`max(versión)+1`,
+> p. ej. `0007`) de forma autónoma. Pensado para equipos: con varios colaboradores nadie necesita
+> consultar antes "cuál fue la última". La asignación es **segura ante concurrencia** (reintenta
+> ante colisión con el `UNIQUE` por blueprint). Si pasas `version` manualmente y ya existe → `409`.
+
 `ModelMigrationPatch` (body de `PATCH`): `name?`, `down_sql?`, `up_sql_mysql?`,
-`up_sql_postgresql?`. **No** se puede modificar el SQL de una migración ya aplicada en
-alguna BD (`409`).
+`up_sql_postgresql?`, `reviewed?` (aprueba un baseline de snapshot — R1). **No** se puede
+modificar el SQL de una migración ya aplicada en alguna BD (`409`).
 
 `ModelMigrationOut` (detalle): `{ id, model_id, version, name, up_sql, up_sql_mysql?,
 up_sql_postgresql?, down_sql?, down_sql_suggested?, translated: {mysql, postgresql}, checksum,
-created_at, updated_at }`. `down_sql_suggested` es un rollback **auto-generado** para
-operaciones aditivas (revísalo y confírmalo con `PATCH`).
+source_engine?, is_baseline, has_non_portable, reviewed, created_at, updated_at }`.
+`down_sql_suggested` es un rollback **auto-generado** para operaciones aditivas (revísalo y
+confírmalo con `PATCH`). `reviewed=false` solo en baselines de snapshot pendientes de aprobar (R1).
 
 `ModelMigrationSummary` (item de listado): `{ id, model_id, version, name,
-has_mysql_override, has_postgresql_override, has_rollback, checksum, created_at }`.
+has_mysql_override, has_postgresql_override, has_rollback, checksum, is_baseline, reviewed,
+created_at }`.
 
 #### Endpoints
 
 | Método | Ruta | Descripción |
 |---|---|---|
 | `GET` | `/api/v1/database-models/{model_id}/migrations` | Lista paginada (resúmenes). |
-| `POST` | `/api/v1/database-models/{model_id}/migrations` | Crea una migración (`201`). Devuelve `translated` + `down_sql_suggested`. |
+| `POST` | `/api/v1/database-models/{model_id}/migrations` | Crea una migración (`201`). **`version` es opcional**: si se omite, el gateway autoasigna la siguiente secuencial (max+1). Devuelve `translated` + `down_sql_suggested`. |
 | `GET` | `/api/v1/database-models/{model_id}/migrations/{version}` | Detalle completo. |
 | `PATCH` | `/api/v1/database-models/{model_id}/migrations/{version}` | Confirma `down_sql` / añade overrides / **aprueba un baseline de snapshot** (`reviewed: true`, R1). |
 | `DELETE` | `/api/v1/database-models/{model_id}/migrations/{version}` | Elimina (solo si **no** tiene historial de aplicación; si no, `409`). |
@@ -827,6 +835,25 @@ curl -X POST https://<host>/api/v1/database-models/3/migrations -b cookies.txt \
     "checksum": "…" },
   "message": "Migración creada." }
 ```
+
+**Crear SIN pasar versión (autoasignada — recomendado para equipos):** omite el campo `version`
+y el gateway le pone la siguiente secuencial. Si el blueprint ya tiene `0001`, esta queda `0002`:
+
+```bash
+curl -X POST https://<host>/api/v1/database-models/3/migrations -b cookies.txt \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "Add status", "up_sql": "ALTER TABLE orders ADD COLUMN status VARCHAR(20)" }'
+```
+
+```json
+{ "data": { "version": "0002", "name": "Add status", "reviewed": true, "is_baseline": false,
+            "down_sql_suggested": "ALTER TABLE orders DROP COLUMN status;", "checksum": "…" },
+  "message": "Migración creada." }
+```
+
+> **Concurrencia:** si dos colaboradores crean a la vez sin `version`, el gateway resuelve el
+> empate (reintenta con el siguiente número); ninguno tiene que consultar la última versión.
+> Pasar `version` manualmente sigue siendo válido; una versión explícita duplicada da `409`.
 
 > Cuándo escribir `up_sql_postgresql` manual: `ENUM(...)` inline, `ON UPDATE CURRENT_TIMESTAMP`,
 > `UNSIGNED/ZEROFILL`, `ALTER … MODIFY … AUTO_INCREMENT` y rutinas `BEGIN…END` con `;`
