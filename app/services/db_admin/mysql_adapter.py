@@ -11,11 +11,22 @@ Particularidades:
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.core.remote_engine import map_driver_error, server_connection
+from app.core.remote_engine import (
+    database_connection,
+    map_driver_error,
+    server_connection,
+)
 from app.exceptions import AppHttpException
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.base_adapter import ServerAdapter
-from app.services.db_admin.dtos import EngineUserInfo, GrantInfo, GrantLevel, ObjectRef
+from app.services.db_admin.dtos import (
+    DumpStatement,
+    EngineUserInfo,
+    GrantInfo,
+    GrantLevel,
+    ObjectRef,
+    StructureDump,
+)
 from app.services.db_admin.identifiers import (
     quote_identifier,
     quote_string_literal,
@@ -75,6 +86,161 @@ class MySQLAdapter(ServerAdapter):
         except SQLAlchemyError as exc:
             raise map_driver_error(exc, op="list_users", target=self.target)
         return [EngineUserInfo(username=r.username, host=r.host) for r in rows]
+
+    # ------------------------- snapshot estructural (Plan 09) ----------------- #
+    @staticmethod
+    def _show_create_value(row, candidates: tuple[str, ...], fallback_idx: int) -> str:
+        """Extrae el DDL de una fila de SHOW CREATE por nombre de columna (o índice)."""
+        mapping = row._mapping
+        for key in candidates:
+            if key in mapping:
+                return mapping[key]
+        return row[fallback_idx]
+
+    def dump_structure(self, database: str) -> StructureDump:
+        """
+        Dump estructural de una BD MySQL/MariaDB vía ``SHOW CREATE *``.
+
+        Orden de dependencia: tablas → vistas → rutinas → triggers → events. El
+        ``DEFINER`` se sanea (ver base). Solo estructura, nunca filas.
+        """
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        statements: list[DumpStatement] = []
+        has_non_portable = False
+        try:
+            with database_connection(self.target, database) as conn:
+                # 1) Tablas base (no vistas).
+                tables = [
+                    r[0]
+                    for r in conn.execute(
+                        text(
+                            "SELECT TABLE_NAME FROM information_schema.TABLES "
+                            "WHERE TABLE_SCHEMA = :db AND TABLE_TYPE = 'BASE TABLE' "
+                            "ORDER BY TABLE_NAME"
+                        ),
+                        {"db": database},
+                    ).fetchall()
+                ]
+                for t in tables:
+                    q = quote_identifier(
+                        validate_identifier(t, self.dialect, "tabla", allow_existing=True),
+                        self.dialect,
+                    )
+                    row = conn.execute(text(f"SHOW CREATE TABLE {q}")).fetchone()
+                    ddl = self._show_create_value(row, ("Create Table",), 1)
+                    statements.append(DumpStatement(object_type="table", name=t, ddl=ddl))
+
+                # 2) Vistas.
+                views = [
+                    r[0]
+                    for r in conn.execute(
+                        text(
+                            "SELECT TABLE_NAME FROM information_schema.VIEWS "
+                            "WHERE TABLE_SCHEMA = :db ORDER BY TABLE_NAME"
+                        ),
+                        {"db": database},
+                    ).fetchall()
+                ]
+                for v in views:
+                    q = quote_identifier(
+                        validate_identifier(v, self.dialect, "vista", allow_existing=True),
+                        self.dialect,
+                    )
+                    row = conn.execute(text(f"SHOW CREATE VIEW {q}")).fetchone()
+                    ddl = self._strip_definer_clause(
+                        self._show_create_value(row, ("Create View",), 1)
+                    )
+                    statements.append(DumpStatement(object_type="view", name=v, ddl=ddl))
+
+                # 3) Rutinas (procedures + functions).
+                routines = conn.execute(
+                    text(
+                        "SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES "
+                        "WHERE ROUTINE_SCHEMA = :db ORDER BY ROUTINE_TYPE, ROUTINE_NAME"
+                    ),
+                    {"db": database},
+                ).fetchall()
+                for name, rtype in routines:
+                    kind = "PROCEDURE" if str(rtype).upper() == "PROCEDURE" else "FUNCTION"
+                    q = quote_identifier(
+                        validate_identifier(name, self.dialect, "rutina", allow_existing=True),
+                        self.dialect,
+                    )
+                    row = conn.execute(text(f"SHOW CREATE {kind} {q}")).fetchone()
+                    ddl = self._strip_definer_clause(
+                        self._show_create_value(
+                            row, (f"Create {kind.capitalize()}",), 2
+                        )
+                    )
+                    has_non_portable = True
+                    statements.append(
+                        DumpStatement(object_type="routine", name=name, ddl=ddl)
+                    )
+
+                # 4) Triggers.
+                triggers = [
+                    r[0]
+                    for r in conn.execute(
+                        text(
+                            "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
+                            "WHERE TRIGGER_SCHEMA = :db ORDER BY TRIGGER_NAME"
+                        ),
+                        {"db": database},
+                    ).fetchall()
+                ]
+                for trg in triggers:
+                    q = quote_identifier(
+                        validate_identifier(trg, self.dialect, "trigger", allow_existing=True),
+                        self.dialect,
+                    )
+                    row = conn.execute(text(f"SHOW CREATE TRIGGER {q}")).fetchone()
+                    ddl = self._strip_definer_clause(
+                        self._show_create_value(row, ("SQL Original Statement",), 2)
+                    )
+                    has_non_portable = True
+                    statements.append(
+                        DumpStatement(object_type="trigger", name=trg, ddl=ddl)
+                    )
+
+                # 5) Events (scheduler). information_schema.EVENTS puede no existir en
+                #    instalaciones mínimas; se ignora si la consulta falla.
+                try:
+                    events = [
+                        r[0]
+                        for r in conn.execute(
+                            text(
+                                "SELECT EVENT_NAME FROM information_schema.EVENTS "
+                                "WHERE EVENT_SCHEMA = :db ORDER BY EVENT_NAME"
+                            ),
+                            {"db": database},
+                        ).fetchall()
+                    ]
+                except SQLAlchemyError:
+                    events = []
+                for ev in events:
+                    q = quote_identifier(
+                        validate_identifier(ev, self.dialect, "event", allow_existing=True),
+                        self.dialect,
+                    )
+                    row = conn.execute(text(f"SHOW CREATE EVENT {q}")).fetchone()
+                    ddl = self._strip_definer_clause(
+                        self._show_create_value(row, ("Create Event",), 3)
+                    )
+                    has_non_portable = True
+                    statements.append(
+                        DumpStatement(object_type="event", name=ev, ddl=ddl)
+                    )
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="dump_structure", target=self.target, extra={"database": database}
+            )
+
+        return StructureDump(
+            database=database,
+            source_engine=self.dialect,
+            statements=statements,
+            has_non_portable=has_non_portable,
+        )
 
     # ------------------------- escritura (Iteración 2) ------------------------ #
     def create_database(

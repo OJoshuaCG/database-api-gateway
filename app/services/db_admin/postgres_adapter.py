@@ -11,14 +11,22 @@ Particularidades frente a MySQL:
 - `CREATE/DROP DATABASE` exigen AUTOCOMMIT (ya garantizado por server_connection).
 """
 
-from sqlalchemy import text
+from sqlalchemy import MetaData, Table, text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.schema import CreateTable
 
 from app.core.remote_engine import database_connection, map_driver_error, server_connection
 from app.exceptions import AppHttpException
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.base_adapter import ServerAdapter
-from app.services.db_admin.dtos import EngineUserInfo, GrantInfo, GrantLevel, ObjectRef
+from app.services.db_admin.dtos import (
+    DumpStatement,
+    EngineUserInfo,
+    GrantInfo,
+    GrantLevel,
+    ObjectRef,
+    StructureDump,
+)
 from app.services.db_admin.identifiers import (
     quote_identifier,
     quote_string_literal,
@@ -60,6 +68,183 @@ class PostgresAdapter(ServerAdapter):
         except SQLAlchemyError as exc:
             raise map_driver_error(exc, op="list_users", target=self.target)
         return [EngineUserInfo(username=r.username, host=None) for r in rows]
+
+    # ------------------------- snapshot estructural (Plan 09) ----------------- #
+    def dump_structure(self, database: str) -> StructureDump:
+        """
+        Dump estructural de una BD PostgreSQL (schema ``public``).
+
+        PostgreSQL no tiene ``SHOW CREATE``: las tablas se reconstruyen por reflexión
+        de SQLAlchemy (``CreateTable``) y el resto vía ``pg_get_*def()`` y catálogos.
+        Orden de dependencia: extensiones → tipos → secuencias → tablas → índices →
+        vistas → vistas materializadas → rutinas → triggers. Cada bloque opcional
+        degrada con gracia si la feature no aplica. Solo estructura, nunca filas.
+        """
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        statements: list[DumpStatement] = []
+        has_non_portable = False
+
+        def _safe(conn, sql, params=None):
+            """Ejecuta una consulta de catálogo OPCIONAL; [] si la feature no existe."""
+            try:
+                return conn.execute(text(sql), params or {}).fetchall()
+            except SQLAlchemyError:
+                return []
+
+        try:
+            with database_connection(self.target, database) as conn:
+                # 1) Extensiones (plpgsql viene por defecto: se omite).
+                for (extname,) in _safe(
+                    conn,
+                    "SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' "
+                    "ORDER BY extname",
+                ):
+                    ext = quote_identifier(extname, self.dialect)
+                    statements.append(
+                        DumpStatement(
+                            object_type="extension",
+                            name=extname,
+                            ddl=f"CREATE EXTENSION IF NOT EXISTS {ext}",
+                        )
+                    )
+
+                # 2) Tipos ENUM definidos por el usuario.
+                for typname, labels in _safe(
+                    conn,
+                    "SELECT t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) "
+                    "FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid "
+                    "JOIN pg_namespace n ON n.oid = t.typnamespace "
+                    "WHERE n.nspname = 'public' GROUP BY t.typname ORDER BY t.typname",
+                ):
+                    name_q = quote_identifier(typname, self.dialect)
+                    vals = ", ".join(
+                        quote_string_literal(lbl, self.dialect) for lbl in labels
+                    )
+                    statements.append(
+                        DumpStatement(
+                            object_type="type",
+                            name=typname,
+                            ddl=f"CREATE TYPE {name_q} AS ENUM ({vals})",
+                        )
+                    )
+
+                # 3) Secuencias STANDALONE (no las creadas por columnas serial/identity).
+                for (seqname,) in _safe(
+                    conn,
+                    "SELECT c.relname FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE c.relkind = 'S' AND n.nspname = 'public' "
+                    "AND NOT EXISTS (SELECT 1 FROM pg_depend d "
+                    "                WHERE d.objid = c.oid AND d.deptype = 'a') "
+                    "ORDER BY c.relname",
+                ):
+                    seq_q = quote_identifier(seqname, self.dialect)
+                    statements.append(
+                        DumpStatement(
+                            object_type="sequence",
+                            name=seqname,
+                            ddl=f"CREATE SEQUENCE IF NOT EXISTS {seq_q}",
+                        )
+                    )
+
+                # 4) Tablas (reflexión + compilador CreateTable, en dialecto PG).
+                table_names = [
+                    r[0]
+                    for r in conn.execute(
+                        text(
+                            "SELECT table_name FROM information_schema.tables "
+                            "WHERE table_schema = 'public' AND table_type = 'BASE TABLE' "
+                            "ORDER BY table_name"
+                        )
+                    ).fetchall()
+                ]
+                for tname in table_names:
+                    validate_identifier(tname, self.dialect, "tabla", allow_existing=True)
+                    tbl = Table(tname, MetaData(), autoload_with=conn, schema="public")
+                    ddl = str(CreateTable(tbl).compile(conn.engine)).strip()
+                    statements.append(
+                        DumpStatement(object_type="table", name=tname, ddl=ddl)
+                    )
+
+                # 5) Índices NO respaldados por una constraint (PK/UNIQUE ya van en la tabla).
+                for idxname, idxdef in _safe(
+                    conn,
+                    "SELECT i.indexname, i.indexdef FROM pg_indexes i "
+                    "WHERE i.schemaname = 'public' AND NOT EXISTS "
+                    "(SELECT 1 FROM pg_constraint c WHERE c.conname = i.indexname) "
+                    "ORDER BY i.indexname",
+                ):
+                    statements.append(
+                        DumpStatement(object_type="index", name=idxname, ddl=idxdef)
+                    )
+
+                # 6) Vistas.
+                for vname, vdef in _safe(
+                    conn,
+                    "SELECT table_name, view_definition FROM information_schema.views "
+                    "WHERE table_schema = 'public' ORDER BY table_name",
+                ):
+                    name_q = quote_identifier(vname, self.dialect)
+                    statements.append(
+                        DumpStatement(
+                            object_type="view",
+                            name=vname,
+                            ddl=f"CREATE VIEW {name_q} AS {vdef}",
+                        )
+                    )
+
+                # 7) Vistas materializadas.
+                for mname, mdef in _safe(
+                    conn,
+                    "SELECT matviewname, definition FROM pg_matviews "
+                    "WHERE schemaname = 'public' ORDER BY matviewname",
+                ):
+                    name_q = quote_identifier(mname, self.dialect)
+                    statements.append(
+                        DumpStatement(
+                            object_type="materialized_view",
+                            name=mname,
+                            ddl=f"CREATE MATERIALIZED VIEW {name_q} AS {mdef}",
+                        )
+                    )
+
+                # 8) Funciones y procedures (pg_get_functiondef). NO portables.
+                for (fdef,) in _safe(
+                    conn,
+                    "SELECT pg_get_functiondef(p.oid) FROM pg_proc p "
+                    "JOIN pg_namespace n ON n.oid = p.pronamespace "
+                    "WHERE n.nspname = 'public' AND p.prokind IN ('f', 'p') "
+                    "ORDER BY p.proname",
+                ):
+                    has_non_portable = True
+                    statements.append(
+                        DumpStatement(object_type="routine", name="", ddl=fdef)
+                    )
+
+                # 9) Triggers (pg_get_triggerdef). NO portables.
+                for tgname, tgdef in _safe(
+                    conn,
+                    "SELECT t.tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t "
+                    "JOIN pg_class c ON c.oid = t.tgrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'public' AND NOT t.tgisinternal "
+                    "ORDER BY t.tgname",
+                ):
+                    has_non_portable = True
+                    statements.append(
+                        DumpStatement(object_type="trigger", name=tgname, ddl=tgdef)
+                    )
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="dump_structure", target=self.target, extra={"database": database}
+            )
+
+        return StructureDump(
+            database=database,
+            source_engine=self.dialect,
+            statements=statements,
+            has_non_portable=has_non_portable,
+        )
 
     # ------------------------- escritura (Iteración 2) ------------------------ #
     def create_database(
