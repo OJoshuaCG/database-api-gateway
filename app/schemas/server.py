@@ -74,3 +74,31 @@ class ServerOut(BaseModel):
     has_root_password: bool = False
     created_at: datetime
     updated_at: datetime
+
+
+# ─── Reconciliación (drift): plano en vivo vs inventario del gateway ───────── #
+
+
+class ReconcileDatabaseItem(BaseModel):
+    """Estado de una BD cruzando el motor en vivo con el inventario del gateway."""
+
+    name: str
+    # managed = en motor y en inventario · unmanaged = solo en motor (adoptable)
+    # · orphan = solo en inventario (se borró por fuera)
+    state: str
+    managed_id: int | None = None
+    owner_id: int | None = None
+    status: str | None = None
+
+
+class ReconcileUserItem(BaseModel):
+    username: str
+    host: str | None = None
+    state: str
+    managed_id: int | None = None
+
+
+class ReconcileResult(BaseModel):
+    server_id: int
+    databases: list[ReconcileDatabaseItem]
+    users: list[ReconcileUserItem]

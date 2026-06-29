@@ -33,6 +33,19 @@ class ServerUserUpdate(BaseModel):
     notes: str | None = None
 
 
+class AdoptUserIn(BaseModel):
+    """
+    Adopta un usuario/rol que YA existe en el motor (Plan 09): registra metadata SIN
+    ejecutar CREATE USER y SIN password (has_password=false hasta que se rote). El
+    gateway verifica que el usuario exista realmente en el motor (404 si no).
+    """
+
+    server_id: int = Field(..., ge=1)
+    username: str = Field(..., pattern=_USERNAME)
+    host: str = Field("%", pattern=_HOST, description="Solo MySQL/MariaDB; ignorado en PostgreSQL")
+    notes: str | None = None
+
+
 class ServerUserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

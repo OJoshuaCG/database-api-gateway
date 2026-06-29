@@ -34,3 +34,35 @@ class DatabaseModelOut(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+# ─── Snapshot → blueprint baseline (Plan 09) ──────────────────────────────── #
+
+
+class FromSnapshotIn(BaseModel):
+    """
+    Crea un blueprint NUEVO cuyo baseline (v0001) es el snapshot estructural de una BD
+    existente. El baseline queda atado al motor de origen si incluye objetos
+    procedurales (``has_non_portable``). Solo estructura, nunca datos.
+    """
+
+    server_id: int = Field(..., ge=1)
+    database: str = Field(..., min_length=1, max_length=64, description="BD existente a fotografiar")
+    name: str = Field(..., min_length=1, max_length=100, description="Nombre del blueprint a crear")
+    slug: str = Field(..., min_length=1, max_length=120, pattern=_SLUG)
+    description: str | None = None
+    baseline_name: str = Field(
+        "Snapshot baseline", min_length=1, max_length=200,
+        description="Nombre de la migración baseline (v0001)",
+    )
+
+
+class FromSnapshotOut(BaseModel):
+    """Resultado de from-snapshot: el blueprint creado + resumen del baseline."""
+
+    model: DatabaseModelOut
+    baseline_version: str
+    source_engine: str
+    has_non_portable: bool
+    object_counts: dict[str, int]
+    statements_captured: int

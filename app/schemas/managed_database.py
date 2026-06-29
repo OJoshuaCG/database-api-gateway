@@ -35,6 +35,21 @@ class ReassignOwnerIn(BaseModel):
     owner_id: int = Field(..., ge=1, description="Nuevo propietario (ServerUser del mismo servidor)")
 
 
+class AdoptDatabaseIn(BaseModel):
+    """
+    Adopta una BD que YA existe en el motor (Plan 09): registra metadata SIN ejecutar
+    CREATE DATABASE. El gateway verifica que la BD exista realmente (404 si no).
+    """
+
+    name: str = Field(..., pattern=_DBNAME, description="Nombre EXACTO de la BD existente en el motor")
+    server_id: int = Field(..., ge=1)
+    owner_id: int = Field(..., ge=1, description="ServerUser propietario, del mismo servidor")
+    model_id: int | None = Field(None, ge=1, description="Blueprint a vincular (opcional)")
+    charset: str | None = Field(None, pattern=_CHARSET, description="Opcional (no se aplica DDL)")
+    collation: str | None = Field(None, pattern=_CHARSET)
+    notes: str | None = None
+
+
 class ManagedDatabaseOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -48,5 +63,6 @@ class ManagedDatabaseOut(BaseModel):
     collation: str | None = None
     status: ProvisionStatus
     notes: str | None = None
+    origin: str = "provisioned"
     created_at: datetime
     updated_at: datetime
