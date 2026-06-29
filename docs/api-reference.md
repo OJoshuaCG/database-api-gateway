@@ -4,7 +4,12 @@
 > Documenta cada endpoint, sus parámetros, tipos y valores permitidos, ejemplos de
 > uso (`curl` + JSON) y el orden en que deben consumirse para cumplir cada propósito.
 
-**Versión de la API:** `v1` · **Base URL:** `https://<host>/api/v1` · **Estado:** Iteraciones 1 y 2 + migraciones de blueprints (Plan 02) implementadas (ver [§14](#14-estado-del-proyecto)).
+**Versión de la API:** `v1` · **Base URL:** `https://<host>/api/v1` · **Estado:** Iteraciones 1 y 2 + migraciones de blueprints (Plan 02) + adopción/reconciliación/snapshot (Plan 09) implementadas (ver [§14](#14-estado-del-proyecto)).
+
+> **Novedad (Plan 09):** ahora puedes **reconciliar** lo que existe en el motor frente a lo
+> que gestiona el gateway, **adoptar** BDs/usuarios preexistentes al inventario y crear un
+> **blueprint baseline desde un snapshot estructural**. Guía pensada para frontend con
+> escenarios, flujos y mockups visuales: [`api-reference-v3.md`](api-reference-v3.md).
 
 ---
 
@@ -476,6 +481,59 @@ curl -X POST https://<host>/api/v1/servers/42/grantable -b cookies.txt \
 { "data": { "can_grant": true, "level": "database", "privileges": ["SELECT","INSERT"] } }
 ```
 
+#### `GET /api/v1/servers/{server_id}/reconcile` 🔌 *(Plan 09)*
+
+Cruza el **plano en vivo** (lo que existe en el motor) con el **inventario** (lo que
+gestiona el gateway) y clasifica cada BD y usuario. Read-only. Respuesta `ReconcileResult`:
+
+| Campo | Tipo | Detalle |
+|---|---|---|
+| `server_id` | int | — |
+| `databases` | list | `{name, state, managed_id?, owner_id?, status?}` |
+| `users` | list | `{username, host?, state, managed_id?}` |
+
+`state` ∈ `managed` (en motor **y** en inventario) · `unmanaged` (solo en el motor →
+**adoptable**) · `orphan` (solo en el inventario → se borró por fuera).
+
+```json
+{
+  "data": {
+    "server_id": 42,
+    "databases": [
+      { "name": "app_prod",  "state": "managed",   "managed_id": 7, "owner_id": 3, "status": "active" },
+      { "name": "legacy_crm","state": "unmanaged" },
+      { "name": "ventas_old","state": "orphan",    "managed_id": 9 }
+    ],
+    "users": [ { "username": "app_user", "host": "%", "state": "managed", "managed_id": 4 } ]
+  }
+}
+```
+
+#### `GET /api/v1/servers/{server_id}/databases/{database}/snapshot` 🔌 *(Plan 09)*
+
+Snapshot **estructural** de una BD (tablas, vistas, rutinas, triggers, y según motor
+secuencias/tipos/extensiones/events). **Solo estructura, nunca filas.** Es la *preview*
+(no persiste). Respuesta `StructureDump`:
+
+| Campo | Tipo | Detalle |
+|---|---|---|
+| `database` | string | — |
+| `source_engine` | string | `mysql` \| `mariadb` \| `postgresql` |
+| `statements` | list | `{object_type, name, ddl}` en orden de dependencia |
+| `has_non_portable` | bool | `true` si incluye objetos procedurales (rutinas/triggers/events) |
+
+```json
+{
+  "data": {
+    "database": "legacy_crm", "source_engine": "mysql", "has_non_portable": true,
+    "statements": [
+      { "object_type": "table", "name": "clientes", "ddl": "CREATE TABLE `clientes` (...)" },
+      { "object_type": "view",  "name": "v_top",    "ddl": "CREATE VIEW `v_top` AS ..." }
+    ]
+  }
+}
+```
+
 ---
 
 ## 7. Usuarios del motor (`/server-users`)
@@ -525,6 +583,7 @@ datos. Recurso de nivel superior (no anidado bajo `/servers`); se filtra con
 | `DELETE` | `/api/v1/server-users/{user_id}/grants` | `confirm_grantee?` | 🔌 Revoca privilegios (cuerpo en el `DELETE`; `cascade?` solo PG). |
 | `POST` | `/api/v1/server-users/{user_id}/apply-profile/{profile_id}` | — | 🔌 Aplica un [perfil de permisos](#11-perfiles-de-permisos-permission-profiles). |
 | `POST` | `/api/v1/server-users/provision` | — | 🔌 Crea + aprovisiona el usuario + aplica grants iniciales (`201`). |
+| `POST` | `/api/v1/server-users/adopt` | — | 🔌 **(Plan 09)** Adopta un usuario que **ya existe** en el motor (sin `CREATE USER`, sin password). `404` si no existe; `409` si ya está. |
 
 **Crear y aprovisionar un usuario en el motor** 🔌:
 
@@ -683,6 +742,7 @@ toca ningún motor.** Requiere sesión.
 | `PATCH` | `/api/v1/database-models/{model_id}` | Actualiza. |
 | `DELETE` | `/api/v1/database-models/{model_id}` | Elimina. |
 | `GET` | `/api/v1/database-models/{model_id}/databases` | BDs que replican este blueprint. |
+| `POST` | `/api/v1/database-models/from-snapshot` 🔌 | **(Plan 09)** Crea un blueprint cuyo baseline (`0001`) es el snapshot estructural de una BD existente. Rate limit **10/min**. |
 
 ```bash
 curl -X POST https://<host>/api/v1/database-models -b cookies.txt \
@@ -832,10 +892,13 @@ usa `reassign-owner`).
   "id": 11, "name": "app_prod", "server_id": 42, "owner_id": 7,
   "model_id": 3, "model_version": "1.2.0",
   "charset": "utf8mb4", "collation": "utf8mb4_unicode_ci",
-  "status": "active", "notes": null,
+  "status": "active", "notes": null, "origin": "provisioned",
   "created_at": "2026-06-23T10:00:00Z", "updated_at": "2026-06-23T10:00:00Z"
 }
 ```
+
+> `origin` *(Plan 09)*: `provisioned` (creada por el gateway) | `adopted` (preexistente,
+> registrada con `POST /managed-databases/adopt`).
 
 ### Endpoints
 
@@ -847,6 +910,7 @@ usa `reassign-owner`).
 | `PATCH` | `/api/v1/managed-databases/{db_id}` | — | Actualiza metadata. |
 | `DELETE` | `/api/v1/managed-databases/{db_id}` | `drop_remote=false`, `confirm_name?` | Elimina del inventario. Con `drop_remote=true` 🔌 ejecuta `DROP DATABASE`. |
 | `POST` | `/api/v1/managed-databases/{db_id}/reassign-owner` | `provision=false` | Cambia el owner. Con `provision=true` 🔌 revoca/otorga (o `ALTER OWNER` en PG). |
+| `POST` | `/api/v1/managed-databases/adopt` | — | 🔌 **(Plan 09)** Adopta una BD que **ya existe** en el motor (sin `CREATE DATABASE`; status `active`, `origin=adopted`). `404` si no existe; `409` si ya está. |
 
 **Crear y aprovisionar una BD** 🔌:
 
@@ -910,8 +974,8 @@ asignado (`422` si no). Rate limit **10/min** en `apply`/`rollback`/`stamp`.
 | Método | Ruta | Query | Descripción |
 |---|---|---|---|
 | `GET` | `/api/v1/managed-databases/{db_id}/migrations/status` | — | Versión actual vs. pendientes. |
-| `POST` | `/api/v1/managed-databases/{db_id}/migrations/apply` | `version?`, `force?`, `dry_run?` | Aplica las pendientes (o hasta `version`). |
-| `POST` | `/api/v1/managed-databases/{db_id}/migrations/rollback` | `confirm_version` (**obligatorio**) | Revierte la última aplicada. |
+| `POST` | `/api/v1/managed-databases/{db_id}/migrations/apply` | `version?`, `force?`, `dry_run?` | **Una sola llamada** aplica secuencialmente, en orden, **todas** las pendientes hasta `version` (o hasta la **última** si se omite). Forward-only (`version` ≤ actual → no-op). `422` si `version` no existe. Respuesta `MigrationApplyOut` con `from_version`→`to_version`. |
+| `POST` | `/api/v1/managed-databases/{db_id}/migrations/rollback` | `confirm_version` (**obligatorio**), `target_version?` | **Una sola llamada** revierte secuencialmente hasta `target_version` (anterior a la actual); sin él, revierte solo la última. `409` si alguna versión del camino no tiene `down_sql` confirmado. Respuesta `MigrationRollbackOut` con `from_version`→`to_version`. |
 | `POST` | `/api/v1/managed-databases/{db_id}/migrations/stamp` | `version` (**obligatorio**) | Marca una versión **sin ejecutar SQL** (BDs pre-existentes). |
 | `GET` | `/api/v1/managed-databases/{db_id}/migrations/history` | `page`, `size` | Historial paginado de aplicaciones. |
 
@@ -1372,10 +1436,18 @@ desplegar a toda una familia de BDs, `…/migrations/apply-all`.
 | 56 | POST | `/api/v1/managed-databases/{db_id}/migrations/rollback` | 🔒 | 🔌 |
 | 57 | POST | `/api/v1/managed-databases/{db_id}/migrations/stamp` | 🔒 | 🔌 |
 | 58 | GET | `/api/v1/managed-databases/{db_id}/migrations/history` | 🔒 | 🔌 |
+| 59 | GET | `/api/v1/servers/{server_id}/reconcile` | 🔒 | 🔌 |
+| 60 | GET | `/api/v1/servers/{server_id}/databases/{database}/snapshot` | 🔒 | 🔌 |
+| 61 | POST | `/api/v1/server-users/adopt` | 🔒 | 🔌 |
+| 62 | POST | `/api/v1/managed-databases/adopt` | 🔒 | 🔌 |
+| 63 | POST | `/api/v1/database-models/from-snapshot` | 🔒 | 🔌 |
 
 \* Toca el motor solo cuando el flag (`provision` / `drop_remote`) es `true`. Los grants y
 `provision`/`apply-profile` tocan el motor siempre. Los endpoints **48–58** son el módulo de
 migraciones de blueprints (Plan 02); los `48–52` son CRUD de inventario, el resto tocan el motor.
+Los endpoints **59–63** son el módulo de adopción/reconciliación/snapshot (Plan 09); todos leen
+el motor (solo lectura), salvo que crean metadata en el gateway. Detalle pensado para frontend en
+[`api-reference-v3.md`](api-reference-v3.md).
 
 ---
 

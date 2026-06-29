@@ -37,6 +37,7 @@ modelo de datos/endpoints, decisiones, riesgos, pasos y verificación.
 | 06 | [Operación: seguridad, auditoría y observabilidad](06-operacion-seguridad-observabilidad.md) | transversal | 🟡 Continuo (auditoría base ✅) |
 | 07 | [Gestión granular de permisos (GRANT/REVOKE cross-engine)](07-gestion-granular-de-permisos.md) | 01 | ✅ Fase 1 completa (GRANT/REVOKE/LIST/GRANTABLE/PROVISION + perfiles + auditoría DCL granular + anti-lockout + CASCADE) — Fase 2/3 pendiente |
 | 08 | [Production readiness: estado y bloqueantes](08-production-readiness.md) | transversal | 🔴 NO listo (ver bloqueantes) |
+| 09 | [Adopción de BDs/usuarios existentes, reconciliación (drift) y snapshot estructural](09-adopcion-reconciliacion-y-snapshot.md) | 01, 02 | ✅ Implementado (F1–F4; 329 tests, seguridad sin bloqueantes) |
 
 ## Diagrama de dependencias
 
