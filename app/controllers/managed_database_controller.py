@@ -48,6 +48,7 @@ class ManagedDatabaseController:
             "collation": d.collation,
             "status": d.status,
             "notes": d.notes,
+            "origin": d.origin,
             "created_at": d.created_at,
             "updated_at": d.updated_at,
         }
@@ -219,6 +220,79 @@ class ManagedDatabaseController:
             target_id=db_id,
             server_id=server_id,
             touched_engine=provision,
+        )
+        return result
+
+    def adopt_database(self, data: dict, *, admin: dict | None = None) -> dict:
+        """
+        Adopta una BD que YA existe en el motor (Plan 09): registra metadata SIN
+        ejecutar CREATE DATABASE. Verifica la existencia real (404 si no), exige un
+        propietario válido del mismo servidor y marca ``origin='adopted'`` con estado
+        ``active`` (ya existe). Idempotente: 409 si ya está en el inventario.
+        """
+        session = self._session()
+        try:
+            server = get_server_or_404(session, data["server_id"])
+            self._require_owner_on_server(session, data["owner_id"], server.id)
+            if data.get("model_id") is not None and not session.get(
+                DatabaseModel, data["model_id"]
+            ):
+                raise AppHttpException(
+                    message="El blueprint (model_id) no existe.",
+                    status_code=422,
+                    context={"model_id": data["model_id"]},
+                )
+            db_name, server_id = data["name"], server.id
+            target = build_target(server)  # descifra mientras la sesión sigue abierta
+        finally:
+            session.close()
+
+        # Verificar existencia REAL en el motor (solo lectura; no se ejecuta DDL).
+        live = get_adapter(target).list_databases()
+        if db_name not in live:
+            raise AppHttpException(
+                message="La base de datos no existe en el motor; no hay nada que adoptar.",
+                status_code=404,
+                context={"name": db_name, "server_id": server_id},
+            )
+
+        session = self._session()
+        try:
+            md = ManagedDatabase(
+                name=db_name,
+                server_id=server_id,
+                owner_id=data["owner_id"],
+                model_id=data.get("model_id"),
+                charset=data.get("charset"),
+                collation=data.get("collation"),
+                status=ProvisionStatus.active,
+                origin="adopted",
+                notes=data.get("notes"),
+            )
+            session.add(md)
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                raise AppHttpException(
+                    message="Ya existe una base de datos con ese nombre en el servidor (¿ya adoptada?).",
+                    status_code=409,
+                    context={"name": db_name},
+                ) from exc
+            session.refresh(md)
+            result = self._serialize(md)
+            db_id = md.id
+        finally:
+            session.close()
+
+        audit.record(
+            "managed_database.adopt",
+            admin=admin,
+            target_type="managed_database",
+            target_id=db_id,
+            server_id=server_id,
+            touched_engine=False,
+            detail="BD existente adoptada al inventario",
         )
         return result
 
