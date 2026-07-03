@@ -474,7 +474,8 @@ contiene objetos procedurales, **no podrá aplicarse a un motor distinto** (ver 
 > **⚠ Aprobación requerida (R1):** como el baseline es **DDL capturado del motor** (potencialmente
 > no confiable), nace **`reviewed: false`** y **no se puede aplicar** hasta que un admin lo revise
 > y apruebe con `PATCH …/migrations/0001` `{"reviewed": true}`. Mientras tanto, `apply`/`apply-all`
-> responden **`409`**. Ver §7-ter ("Aprobación de un baseline").
+> responden **`409`**. Ver §7-ter ("Aprobación de un baseline") y la guía dedicada
+> [`api-reference-v4.md`](api-reference-v4.md) (flujo completo de revisión/aprobación).
 
 ### Flujo
 ```
