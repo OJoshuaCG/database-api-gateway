@@ -13,8 +13,10 @@ from app.core.environments import APP_ENV, LOGGER_EXCEPTIONS_ENABLED, ROOT_DIR
 from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 
-if LOGGER_EXCEPTIONS_ENABLED:
-    logger = get_logger(level="WARNING")
+# Se define SIEMPRE (no solo si LOGGER_EXCEPTIONS_ENABLED): definirlo condicionalmente
+# provocaba NameError si el flag se activaba en runtime sin estar activo al importar. El
+# `if LOGGER_EXCEPTIONS_ENABLED:` de cada handler ya controla si realmente se loguea.
+logger = get_logger(level="WARNING")
 
 
 async def app_exception_handler(request: Request, exc: AppHttpException):
@@ -109,7 +111,10 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
     if LOGGER_EXCEPTIONS_ENABLED:
         logger_warning_exception_params = [
-            current_http_identifier.get(),
+            # Identifier "libre" (primer campo, sin etiqueta), como en los demás handlers;
+            # el f-string solo garantiza str. Ya nunca es None: el ContextMiddleware no
+            # resetea el ContextVar, así que sigue disponible aquí (handler de 500).
+            f"{current_http_identifier.get()}",
             f"Exception: {exc.__class__.__name__}",
             f'Message: UNHANDLED EXC. "{str(exc)}"',
             f"File: {trace_info['origin']['file']}",
@@ -117,7 +122,9 @@ async def generic_exception_handler(request: Request, exc: Exception):
             f"Line: {trace_info['origin']['line']}",
             f'Code: "{trace_info["origin"]["code"]}"',
         ]
-        logger.error(" | ".join(logger_warning_exception_params))
+        # Coerción defensiva a str: el handler de errores NUNCA debe romperse al loguear
+        # (un elemento None —p. ej. el RequestID sin contexto— hacía fallar el join).
+        logger.error(" | ".join(str(p) for p in logger_warning_exception_params))
 
     return JSONResponse(status_code=500, content={"detail": detail_error})
 
