@@ -22,9 +22,15 @@ Rollback:
 """
 
 from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
+
+# El SQL de una migración puede ser grande (un snapshot de una BD real puede superar
+# los 64 KB del TEXT de MySQL). LONGTEXT en MySQL/MariaDB (hasta 4 GB); en PostgreSQL y
+# SQLite, TEXT ya es ilimitado. Cota de tamaño a nivel de API: ModelMigrationCreate.
+_SQL_TEXT = Text().with_variant(LONGTEXT(), "mysql", "mariadb")
 
 
 class ModelMigration(Base, TimestampMixin):
@@ -60,23 +66,23 @@ class ModelMigration(Base, TimestampMixin):
     )
 
     up_sql: Mapped[str] = mapped_column(
-        Text, nullable=False, comment="SQL base del delta (dialecto de referencia: MySQL)"
+        _SQL_TEXT, nullable=False, comment="SQL base del delta (dialecto de referencia: MySQL)"
     )
 
     up_sql_mysql: Mapped[str | None] = mapped_column(
-        Text, nullable=True, comment="Override manual para MySQL/MariaDB (opcional)"
+        _SQL_TEXT, nullable=True, comment="Override manual para MySQL/MariaDB (opcional)"
     )
 
     up_sql_postgresql: Mapped[str | None] = mapped_column(
-        Text, nullable=True, comment="Override manual para PostgreSQL (opcional)"
+        _SQL_TEXT, nullable=True, comment="Override manual para PostgreSQL (opcional)"
     )
 
     down_sql_suggested: Mapped[str | None] = mapped_column(
-        Text, nullable=True, comment="Rollback auto-generado (solo sugerencia, no se aplica)"
+        _SQL_TEXT, nullable=True, comment="Rollback auto-generado (solo sugerencia, no se aplica)"
     )
 
     down_sql: Mapped[str | None] = mapped_column(
-        Text,
+        _SQL_TEXT,
         nullable=True,
         comment="Rollback CONFIRMADO por el admin; si es NULL no hay rollback disponible",
     )
