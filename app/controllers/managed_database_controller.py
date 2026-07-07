@@ -23,6 +23,7 @@ from app.exceptions import AppHttpException
 from app.models.database_model import DatabaseModel
 from app.models.enums import ProvisionStatus
 from app.models.managed_database import ManagedDatabase
+from app.models.model_migration import ModelMigration
 from app.models.server_user import ServerUser
 from app.services import audit
 from app.services.db_admin.factory import get_adapter
@@ -62,6 +63,14 @@ class ManagedDatabaseController:
                 context={"managed_database_id": db_id},
             )
         return d
+
+    def _serialize_by_id(self, db_id: int) -> dict:
+        """Re-lee y serializa una BD por id en una sesión propia (estado ya commiteado)."""
+        session = self._session()
+        try:
+            return self._serialize(self._get_or_404(session, db_id))
+        finally:
+            session.close()
 
     def _set_status(
         self, db_id: int, status: ProvisionStatus, *, detail: str | None = None
@@ -230,6 +239,13 @@ class ManagedDatabaseController:
         propietario válido del mismo servidor y marca ``origin='adopted'`` con estado
         ``active`` (ya existe). Idempotente: 409 si ya está en el inventario.
         """
+        adopt_version = data.get("model_version")
+        if adopt_version is not None and data.get("model_id") is None:
+            raise AppHttpException(
+                message="'model_version' requiere 'model_id' (la versión pertenece a un blueprint).",
+                status_code=422,
+                context={"model_version": adopt_version},
+            )
         session = self._session()
         try:
             server = get_server_or_404(session, data["server_id"])
@@ -241,6 +257,23 @@ class ManagedDatabaseController:
                     message="El blueprint (model_id) no existe.",
                     status_code=422,
                     context={"model_id": data["model_id"]},
+                )
+            # Validar la versión de partida ANTES de insertar: así el adopt es atómico y
+            # no deja una BD registrada-pero-sin-marcar si la versión no existe. (El único
+            # fallo posible tras insertar queda siendo la conectividad al motor en el stamp.)
+            if adopt_version is not None and (
+                session.query(ModelMigration.id)
+                .filter(
+                    ModelMigration.model_id == data["model_id"],
+                    ModelMigration.version == adopt_version,
+                )
+                .first()
+                is None
+            ):
+                raise AppHttpException(
+                    message=f"La versión {adopt_version} no existe en el blueprint indicado.",
+                    status_code=422,
+                    context={"model_id": data["model_id"], "model_version": adopt_version},
                 )
             db_name, server_id = data["name"], server.id
             target = build_target(server)  # descifra mientras la sesión sigue abierta
@@ -294,6 +327,20 @@ class ManagedDatabaseController:
             touched_engine=False,
             detail="BD existente adoptada al inventario",
         )
+
+        # Si el admin declaró que la BD ya está en una versión del blueprint, hacemos
+        # 'stamp' de esa versión en el motor (sin ejecutar DDL): así el 'apply' posterior
+        # no reintenta crear objetos que ya existen. Import diferido para evitar ciclo.
+        if adopt_version is not None:
+            from app.controllers.managed_migration_controller import (
+                ManagedMigrationController,
+            )
+
+            # stamp valida que la versión exista en el blueprint (422 si no), marca el
+            # motor y sincroniza model_version. Si falla, la BD queda adoptada pero sin
+            # marcar; el admin puede reintentar POST /{id}/migrations/stamp.
+            ManagedMigrationController().stamp(db_id, adopt_version, admin=admin)
+            result = self._serialize_by_id(db_id)
         return result
 
     def update_database(

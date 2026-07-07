@@ -45,6 +45,16 @@ class AdoptDatabaseIn(BaseModel):
     server_id: int = Field(..., ge=1)
     owner_id: int = Field(..., ge=1, description="ServerUser propietario, del mismo servidor")
     model_id: int | None = Field(None, ge=1, description="Blueprint a vincular (opcional)")
+    model_version: str | None = Field(
+        None,
+        max_length=50,
+        description=(
+            "Versión del blueprint en la que YA se encuentra la BD adoptada. Si se indica, "
+            "el gateway hace 'stamp' de esa versión en el motor (sin ejecutar DDL) para que "
+            "el 'apply' no reintente crear lo que ya existe. Omitir = la BD llega 'en ceros'. "
+            "Requiere 'model_id'."
+        ),
+    )
     charset: str | None = Field(None, pattern=_CHARSET, description="Opcional (no se aplica DDL)")
     collation: str | None = Field(None, pattern=_CHARSET)
     notes: str | None = None
