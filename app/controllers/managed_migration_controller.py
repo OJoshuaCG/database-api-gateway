@@ -510,6 +510,11 @@ class ManagedMigrationController:
             managed_db_id=db_id, specs=specs, version=version,
         )
         self._set_model_version(db_id, version)
+        # El stamp es una AFIRMACIÓN explícita del admin ("esta BD está en la versión X"):
+        # reconcilia el estado, así que también saca a la BD de cuarentena si un apply
+        # previo la dejó en 'error' (p. ej. reintentar CREATE TABLE de una tabla ya
+        # existente tras adoptarla). No ejecuta SQL, solo marca la versión.
+        self._set_quarantine(db_id, failed=False, results=[])
         audit.record(
             "migration.stamp", admin=admin, target_type="managed_database",
             target_id=db_id, server_id=server_id, touched_engine=True,
