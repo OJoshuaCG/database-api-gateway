@@ -28,7 +28,7 @@ regla de propietario y habilitaría DROP sobre objetos no gestionados).
 | Método | Ruta | Qué hace |
 |---|---|---|
 | `GET` | `/api/v1/servers/{id}/reconcile` 🔌 | Cruza en vivo vs inventario; clasifica cada BD/usuario: `managed` · `unmanaged` (adoptable) · `orphan` (borrado por fuera). Read-only. |
-| `POST` | `/api/v1/managed-databases/adopt` 🔌 | Adopta una BD que **ya existe** (sin `CREATE DATABASE`; estado `active`, `origin=adopted`). Exige `owner_id` del mismo servidor. `404` si no existe; `409` si ya está. |
+| `POST` | `/api/v1/managed-databases/adopt` 🔌 | Adopta una BD que **ya existe** (sin `CREATE DATABASE`; estado `active`, `origin=adopted`). Exige `owner_id` del mismo servidor. `model_version` opcional (requiere `model_id`) → hace `stamp` de esa versión al adoptar. `404` si no existe; `409` si ya está; `422` si `model_version` no existe en el blueprint. |
 | `POST` | `/api/v1/server-users/adopt` 🔌 | Adopta un usuario existente (sin `CREATE USER`, sin password → `has_password=false`). |
 | `GET` | `/api/v1/servers/{id}/databases/{db}/snapshot` 🔌 | **Snapshot estructural** (preview): tablas, vistas, rutinas, triggers, y según motor secuencias/tipos/extensiones/events. **Solo estructura, nunca filas**; `DEFINER` saneado. |
 | `POST` | `/api/v1/database-models/from-snapshot` 🔌 | Crea un blueprint cuyo baseline (`0001`) es el snapshot estructural de una BD. Rate limit 10/min. |
@@ -48,9 +48,23 @@ lo revise y apruebe con `PATCH /database-models/{id}/migrations/{version}` `{"re
 ## Los 3 modos para vincular una BD adoptada a migraciones
 
 1. **BD vacía** → `apply` desde `0001` (con `dry_run` primero).
-2. **BD que ya coincide con un blueprint en la versión X** → `stamp` en X (marca sin ejecutar) y
-   sigue con `apply` de ahí en adelante.
+2. **BD que ya coincide con un blueprint en la versión X** → adopta indicando
+   `model_version=X` (ver abajo) **o** `stamp` en X tras adoptar; sigue con `apply` de ahí.
 3. **BD legacy/única** → `from-snapshot` (baseline) → aprobar (`reviewed`) → `stamp`/`apply`.
+
+### `model_version` al adoptar (stamp-on-adopt)
+
+`POST /managed-databases/adopt` acepta un `model_version` opcional (requiere `model_id`):
+declara en qué versión del blueprint **ya se encuentra** la BD. Si se indica, el gateway
+hace el `stamp` de esa versión en el motor (sin ejecutar DDL) en la misma operación, de modo
+que un `apply` posterior no reintente crear objetos que ya existen. La versión se valida
+contra el blueprint **antes** de registrar la BD (`422` si no existe → la BD no queda
+adoptada a medias). Omitir `model_version` = la BD llega "en ceros" (modo 1).
+
+> Por esto **no** se inyecta `IF NOT EXISTS` en el DDL adoptado: el mismo baseline debe poder
+> aplicarse tal cual a BDs nuevas vacías. El conflicto "la tabla ya existe" se resuelve
+> declarando la versión de partida (stamp), no volviendo el DDL idempotente (que enmascararía
+> drift si la estructura viva difiere del baseline).
 
 ## Seguridad
 

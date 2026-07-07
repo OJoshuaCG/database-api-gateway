@@ -540,7 +540,12 @@ Comportamientos (actualizados): `version` al crear es **opcional** → autoasign
 (`max+1`, con reintento ante colisión); `apply?version=X` aplica en **una llamada** todas las
 pendientes hasta X (forward-only); `rollback` es **target-based** (`?confirm_version=` obligatorio
 + `?target_version=` opcional → revierte secuencialmente; valida `down_sql` de todo el camino);
-un baseline de snapshot exige aprobación (`reviewed`) antes de aplicar. La respuesta de `apply`/
+un baseline de snapshot exige aprobación (`reviewed`) antes de aplicar. **Editar/borrar migraciones**:
+`PATCH` puede corregir `up_sql`/overrides **solo si no hubo aplicación EXITOSA** (guard
+`_has_successful_application`, no `_has_history` — un intento fallido no congela el SQL); al cambiar
+`up_sql` hay que reenviar/limpiar los overrides en el mismo PATCH (409 si quedan obsoletos) y se
+regenera `down_sql_suggested`. `DELETE` solo borra la **última** versión (la punta) y sin historial.
+`stamp` además **saca la BD de cuarentena** (`error → active`). La respuesta de `apply`/
 `rollback` es tipada (`MigrationApplyOut`/`MigrationRollbackOut`, con `from_version`→`to_version`).
 Verificación e2e contra motores reales (`scripts/verify_migrations_e2e.py`, requiere Docker):
 **ejecutada — 153 checks / 0 fallos** (cubre Plan 02 + Plan 09 + UX).
@@ -554,6 +559,9 @@ Puente entre el **plano en vivo** (motor real) y el **inventario** del gateway. 
   `POST /managed-databases/adopt` y `POST /server-users/adopt` (registran objetos preexistentes SIN
   ejecutar DDL; `origin='adopted'`), `GET /servers/{id}/databases/{db}/snapshot` (dump estructural,
   solo estructura), `POST /database-models/from-snapshot` (blueprint baseline desde snapshot).
+  `adopt` acepta `model_version` opcional (requiere `model_id`, validada pre-insert): hace **stamp-on-adopt**
+  de esa versión en el motor para que el `apply` posterior no reintente crear lo ya existente. Resuelve el
+  conflicto "la tabla ya existe" sin inyectar `IF NOT EXISTS` (que enmascararía drift).
 - **Adapters** (`app/services/db_admin/`): `dump_structure()` por motor (MySQL `SHOW CREATE *`;
   PostgreSQL `pg_get_*def()` + reflexión `CreateTable`), orden topológico, `_strip_definer_clause`;
   DTOs `StructureDump`/`DumpStatement` en `dtos.py`.

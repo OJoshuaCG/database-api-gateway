@@ -231,11 +231,16 @@ reconcile → (state=unmanaged) → [Adoptar]
 | `server_id` | int | sí | — |
 | `owner_id` | int | sí | `ServerUser` del **mismo** servidor |
 | `model_id` | int | no | Blueprint a vincular (opcional) |
+| `model_version` | string | no | Versión del blueprint en la que **ya está** la BD → hace `stamp` al adoptar. Requiere `model_id`. Validada pre-insert (`422` si no existe). Omitir = BD "en ceros" |
 | `charset`, `collation` | string | no | Opcionales (no se aplica DDL) |
 | `notes` | string | no | — |
 
 **Respuesta** `201` — `ApiResponse[ManagedDatabaseOut]` con `status: "active"`,
-`origin: "adopted"`.
+`origin: "adopted"`. Si se pasó `model_version`, `model_version` viene seteado y la versión
+quedó marcada (`stamp`) en el motor.
+
+**Errores:** `422` si `model_version` viene sin `model_id` o no existe en el blueprint (la BD
+**no** queda registrada); `404` si la BD no existe en el motor; `409` si ya está adoptada.
 
 ### Qué resuelve
 Convierte una BD "invisible" para el gateway en una BD gestionable (migraciones, reasignación de
@@ -266,6 +271,15 @@ curl -X POST https://<host>/api/v1/managed-databases/adopt -b cookies.txt \
   -H "Content-Type: application/json" \
   -d '{ "name": "legacy_crm", "server_id": 42, "owner_id": 3, "model_id": 8 }'
 ```
+
+**2b) Adoptar declarando que la BD ya está en la versión `0003` (stamp-on-adopt):**
+```bash
+curl -X POST https://<host>/api/v1/managed-databases/adopt -b cookies.txt \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "legacy_crm", "server_id": 42, "owner_id": 3, "model_id": 8, "model_version": "0003" }'
+```
+> El `apply` posterior parte de `0003` — no reintenta crear lo que ya existe. Es la forma
+> recomendada para una BD cuyo esquema ya coincide con un blueprint (vs. adoptar y luego `stamp`).
 
 **3) Error — la BD no existe en el motor (`404`):**
 ```json

@@ -62,8 +62,8 @@ routes/v1/managed_databases.py    →  controllers/managed_migration_controller.
 GET    /api/v1/database-models/{id}/migrations            # lista paginada (?page=&size=)
 POST   /api/v1/database-models/{id}/migrations            # crea una versión
 GET    /api/v1/database-models/{id}/migrations/{version}  # detalle (con translated + sugerencia)
-PATCH  /api/v1/database-models/{id}/migrations/{version}  # confirma down_sql / añade overrides
-DELETE /api/v1/database-models/{id}/migrations/{version}  # solo si NO tiene historial de aplicación
+PATCH  /api/v1/database-models/{id}/migrations/{version}  # confirma down_sql / añade overrides / corrige up_sql (si no aplicada)
+DELETE /api/v1/database-models/{id}/migrations/{version}  # solo la ÚLTIMA versión y sin historial de aplicación
 ```
 
 ### Aplicación sobre una BD gestionada (tocan el motor)
@@ -175,6 +175,11 @@ la versión **sin ejecutar SQL**:
 curl -X POST '.../api/v1/managed-databases/5/migrations/stamp?version=0003' -b cookie.txt
 ```
 
+`stamp` es una **afirmación explícita** del admin ("esta BD está en la versión X"): además
+de marcar la versión, **saca la BD de cuarentena** (`status=error → active`) si un `apply`
+previo la dejó ahí. Es la vía correcta para reconciliar una BD adoptada cuyo esquema ya
+coincide con el baseline (evita reintentar un `CREATE TABLE` de algo que ya existe).
+
 ## Matriz de equivalencia DDL
 
 El gateway auto-traduce `up_sql` (MySQL → PostgreSQL) para DDL común. **Escribe un
@@ -195,12 +200,22 @@ fiable:
 
 - **Checksum**: antes de aplicar, el gateway re-valida el `checksum` (cubre SQL + versión).
   Si la fila fue alterada directamente en la BD del gateway → **409** (no aplica SQL no
-  verificado). Una migración con historial de aplicación no puede modificar su SQL.
+  verificado).
+- **Editar `up_sql` (corrección)**: vía `PATCH` puedes corregir `up_sql` (y overrides)
+  **mientras la migración no se haya aplicado EXITOSAMENTE en ninguna BD**. Un intento que
+  solo *falló* no congela el SQL (ninguna BD depende de él) → sí se puede corregir. Si ya
+  hubo una aplicación exitosa → **409**: usa **fix-forward** (nueva migración correctiva).
+  Al cambiar `up_sql` se regenera el `down_sql_suggested`; si existen overrides por-motor
+  debes **reenviarlos corregidos o limpiarlos (null)** en el mismo `PATCH` (409 si no), para
+  que no quede SQL viejo aplicándose en silencio.
+- **Eliminar una versión**: `DELETE` solo permite borrar la **última** versión del blueprint
+  (la punta) y **sin historial** de aplicación (409 en otro caso). Borrar una intermedia
+  dejaría un hueco del que podría depender una versión posterior.
 - **Cuarentena (fallo parcial)**: como el DDL no es transaccional en MySQL/MariaDB (y el
   runner corre en AUTOCOMMIT), una migración multi-sentencia que falla a mitad puede dejar
   estado parcial. El gateway marca la BD con `status=error` + nota; el siguiente `apply`
-  responde **409** hasta que inspecciones y reintentes con **`?force=true`**. Un apply
-  exitoso limpia la cuarentena.
+  responde **409** hasta que inspecciones y reintentes con **`?force=true`**. Un `apply`
+  exitoso —o un `stamp`— limpia la cuarentena.
 - **Recomendación**: escribe migraciones **idempotentes** (`CREATE TABLE IF NOT EXISTS`,
   `ADD COLUMN IF NOT EXISTS`) para que un reintento sea seguro.
 
