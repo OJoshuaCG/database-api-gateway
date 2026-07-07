@@ -34,6 +34,16 @@ class ModelMigrationPatch(BaseModel):
     """Confirma el rollback o añade overrides DESPUÉS de crear la migración."""
 
     name: str | None = Field(None, min_length=1, max_length=200)
+    up_sql: str | None = Field(
+        None,
+        min_length=1,
+        max_length=_MAX_SQL,
+        description=(
+            "Corrige el SQL base del delta (dialecto de referencia: MySQL). SOLO permitido "
+            "si la migración NO se ha aplicado en ninguna BD (409 si ya se aplicó → usa "
+            "fix-forward). Al cambiarlo se regenera el rollback sugerido y el checksum."
+        ),
+    )
     down_sql: str | None = Field(None, max_length=_MAX_SQL, description="Confirma el rollback de esta versión")
     up_sql_mysql: str | None = Field(None, max_length=_MAX_SQL, description="Añade/actualiza override MySQL")
     up_sql_postgresql: str | None = Field(None, max_length=_MAX_SQL, description="Añade/actualiza override PostgreSQL")

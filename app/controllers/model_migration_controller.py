@@ -19,10 +19,10 @@ from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.exceptions import AppHttpException
 from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
-from app.models.enums import EngineType
+from app.models.enums import EngineType, MigrationStatus
 from app.models.model_migration import ModelMigration
 from app.services import audit
-from app.services.db_admin.migration_integrity import compute_checksum
+from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
 from app.services.db_admin.sql_dialect import RollbackGenerator, SqlTranslator
 
 # Orden NUMÉRICO de versión en SQL: (longitud, valor) equivale al orden entero para
@@ -132,6 +132,25 @@ class ModelMigrationController:
         return (
             session.query(DatabaseMigrationHistory)
             .filter(DatabaseMigrationHistory.model_migration_id == migration_id)
+            .first()
+            is not None
+        )
+
+    @staticmethod
+    def _has_successful_application(session, migration_id: int) -> bool:
+        """
+        True si la migración se aplicó EXITOSAMENTE en al menos una BD (status=applied).
+
+        Distinto de ``_has_history``: un intento que solo FALLÓ deja historial pero no
+        cambió ninguna BD, así que su SQL todavía puede corregirse. El SQL solo se
+        congela cuando existe una aplicación exitosa (alguna BD ya depende de él).
+        """
+        return (
+            session.query(DatabaseMigrationHistory)
+            .filter(
+                DatabaseMigrationHistory.model_migration_id == migration_id,
+                DatabaseMigrationHistory.status == MigrationStatus.applied,
+            )
             .first()
             is not None
         )
@@ -374,18 +393,22 @@ class ModelMigrationController:
         try:
             self._model_or_404(session, model_id)
             m = self._migration_or_404(session, model_id, version)
-            applied_anywhere = self._has_history(session, m.id)
+            applied_successfully = self._has_successful_application(session, m.id)
 
-            # El SQL efectivo (overrides) NO puede cambiar si ya se aplicó en alguna BD.
+            # El SQL efectivo (base u overrides) NO puede cambiar si ya se aplicó
+            # EXITOSAMENTE en alguna BD: editarlo aquí no re-ejecuta nada en el motor, así
+            # que la metadata divergiría de lo que realmente corrió. Un intento que solo
+            # falló no congela el SQL (ninguna BD depende de él). Fix-forward si ya se aplicó.
             sql_fields_changing = any(
                 f in data and data[f] is not None
-                for f in ("up_sql_mysql", "up_sql_postgresql")
+                for f in ("up_sql", "up_sql_mysql", "up_sql_postgresql")
             )
-            if applied_anywhere and sql_fields_changing:
+            if applied_successfully and sql_fields_changing:
                 raise AppHttpException(
                     message=(
-                        "La migración ya fue aplicada en alguna BD: no se puede modificar "
-                        "su SQL. Cree una nueva migración para corregir."
+                        "La migración ya fue aplicada exitosamente en alguna BD: no se "
+                        "puede modificar su SQL. Cree una nueva migración para corregir "
+                        "(fix-forward)."
                     ),
                     status_code=409,
                     context={"model_id": model_id, "version": version},
@@ -393,6 +416,30 @@ class ModelMigrationController:
 
             if "name" in data and data["name"] is not None:
                 m.name = data["name"]
+            if "up_sql" in data and data["up_sql"] is not None:
+                # Al cambiar el SQL base, un override por-motor que NO se re-envíe en este
+                # mismo PATCH quedaría obsoleto (gana en _translated sobre el nuevo up_sql).
+                # Exigir intención explícita: reenviar el override corregido o limpiarlo
+                # (null) en la misma llamada. Evita que quede SQL viejo aplicándose en silencio.
+                stale = [
+                    f
+                    for f in ("up_sql_mysql", "up_sql_postgresql")
+                    if getattr(m, f) is not None and f not in data
+                ]
+                if stale:
+                    raise AppHttpException(
+                        message=(
+                            "Al cambiar 'up_sql' debes reenviar (corregido) o limpiar "
+                            f"(null) los overrides que quedarían obsoletos: {', '.join(stale)}."
+                        ),
+                        status_code=409,
+                        context={"model_id": model_id, "version": version, "stale_overrides": stale},
+                    )
+                # Cascade: al corregir el SQL base se regenera el rollback SUGERIDO
+                # (la traducción cross-engine se recalcula al vuelo en _translated, no
+                # hay campo persistido que actualizar). El down_sql CONFIRMADO no se toca.
+                m.up_sql = data["up_sql"]
+                m.down_sql_suggested = self._rollback.generate(m.up_sql)
             if "down_sql" in data:
                 m.down_sql = data["down_sql"]
             if "up_sql_mysql" in data:
@@ -445,6 +492,26 @@ class ModelMigrationController:
                     ),
                     status_code=409,
                     context={"model_id": model_id, "version": version},
+                )
+            # Solo se puede eliminar la ÚLTIMA versión (la punta de la secuencia). Borrar
+            # una intermedia dejaría un hueco y una versión posterior podría depender de
+            # ella (forward-only encadenado). Para tocar una intermedia: edita, o revierte
+            # hasta ahí y recréala.
+            latest = (
+                session.query(ModelMigration.version)
+                .filter(ModelMigration.model_id == model_id)
+                .order_by(*_VERSION_ORDER_DESC)
+                .first()
+            )
+            if latest and version_sort_key(latest[0]) > version_sort_key(m.version):
+                raise AppHttpException(
+                    message=(
+                        f"Solo se puede eliminar la última versión del blueprint "
+                        f"(actual: {latest[0]}). Existen versiones posteriores a {version} "
+                        "que podrían depender de ella."
+                    ),
+                    status_code=409,
+                    context={"model_id": model_id, "version": version, "latest": latest[0]},
                 )
             session.delete(m)
             session.flush()  # el borrado debe verse antes de recalcular current_version
