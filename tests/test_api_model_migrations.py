@@ -225,6 +225,113 @@ def test_delete_migration(admin_client):
     ).status_code == 404
 
 
+def _insert_history_row(managed_db_id, migration_id, status="applied"):
+    """Inserta una fila de historial directamente (sin apply real end-to-end)."""
+    from datetime import datetime
+
+    from app.core.database import Database
+    from app.models.database_migration_history import DatabaseMigrationHistory
+    from app.models.enums import MigrationStatus
+
+    s = Database().get_declarative_base_session()
+    try:
+        s.add(
+            DatabaseMigrationHistory(
+                managed_database_id=managed_db_id,
+                model_migration_id=migration_id,
+                applied_at=datetime.now(),
+                status=MigrationStatus(status),
+                error=None if status == "applied" else "boom",
+                execution_ms=1,
+            )
+        )
+        s.commit()
+    finally:
+        s.close()
+
+
+def _managed_db_for_model(admin_client, model_id, port, name="mdb"):
+    sid = admin_client.post(
+        "/api/v1/servers",
+        json={
+            "name": f"srv{port}", "host": "10.0.0.9", "port": port,
+            "engine": "postgresql", "root_username": "root", "root_password": "rootpw",
+        },
+    ).json()["data"]["id"]
+    oid = admin_client.post(
+        "/api/v1/server-users", json={"server_id": sid, "username": "owner1"}
+    ).json()["data"]["id"]
+    r = admin_client.post(
+        "/api/v1/managed-databases",
+        json={"server_id": sid, "owner_id": oid, "name": name, "model_id": model_id},
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["data"]["id"]
+
+
+def test_delete_migration_with_history_409(admin_client):
+    """Borrar una migración con historial de aplicación (cualquier desenlace) → 409."""
+    model_id = _new_model(admin_client, slug="delhist", name="DelHist")
+    r = _create_migration(admin_client, model_id)
+    mig_id = r.json()["data"]["id"]
+    db_id = _managed_db_for_model(admin_client, model_id, port=5480)
+    _insert_history_row(db_id, mig_id, status="applied")
+
+    r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0001")
+    assert r.status_code == 409, r.text
+    assert "historial" in r.text.lower()
+
+    # Sigue existiendo.
+    assert admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations/0001"
+    ).status_code == 200
+
+
+def test_delete_last_version_recomputes_current_version(admin_client):
+    model_id = _new_model(admin_client, slug="deltip", name="DelTip")
+    _create_migration(admin_client, model_id, version="0001")
+    _create_migration(
+        admin_client, model_id, version="0002",
+        up_sql="ALTER TABLE users ADD COLUMN phone VARCHAR(20)",
+    )
+    m = admin_client.get(f"/api/v1/database-models/{model_id}").json()["data"]
+    assert m["current_version"] == "0002"
+
+    # Borrar la PUNTA (0002, sin historial) → permitido; current_version retrocede.
+    r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0002")
+    assert r.status_code == 200, r.text
+
+    m = admin_client.get(f"/api/v1/database-models/{model_id}").json()["data"]
+    assert m["current_version"] == "0001"
+
+    # Borrar la única migración restante → current_version cae a "0.0.0".
+    r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0001")
+    assert r.status_code == 200, r.text
+    m = admin_client.get(f"/api/v1/database-models/{model_id}").json()["data"]
+    assert m["current_version"] == "0.0.0"
+
+
+def test_delete_intermediate_version_409(admin_client):
+    model_id = _new_model(admin_client, slug="delmid", name="DelMid")
+    _create_migration(admin_client, model_id, version="0001")
+    _create_migration(
+        admin_client, model_id, version="0002",
+        up_sql="ALTER TABLE users ADD COLUMN phone VARCHAR(20)",
+    )
+
+    # 0001 es intermedia (existe 0002 posterior) → 409.
+    r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0001")
+    assert r.status_code == 409, r.text
+    assert "última versión" in r.text.lower() or "solo se puede eliminar" in r.text.lower()
+
+    # No se tocó nada.
+    assert admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations/0001"
+    ).status_code == 200
+    m = admin_client.get(f"/api/v1/database-models/{model_id}").json()["data"]
+    assert m["current_version"] == "0002"
+
+
 # --------------------------------------------------------------------------- #
 # Historial (lectura, solo BD del gateway)                                     #
 # --------------------------------------------------------------------------- #

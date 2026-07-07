@@ -138,6 +138,137 @@ def test_adopt_database_owner_wrong_server_409(
 
 
 # --------------------------------------------------------------------------- #
+# Adopt database + stamp-on-adopt (model_id/model_version)                    #
+# --------------------------------------------------------------------------- #
+def _blueprint_with_migration(admin_client, slug="adopt-bp"):
+    r = admin_client.post("/api/v1/database-models", json={"name": slug, "slug": slug})
+    assert r.status_code == 201, r.text
+    model_id = r.json()["data"]["id"]
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations",
+        json={"version": "0001", "name": "m1", "up_sql": "CREATE TABLE t (id INT PRIMARY KEY)"},
+    )
+    assert r.status_code == 201, r.text
+    return model_id
+
+
+def test_adopt_database_with_model_version_stamps_it(
+    admin_client, server_payload, monkeypatch
+):
+    from app.services.db_admin.migrations import MigrationRunner
+
+    sid = _make_server(admin_client, server_payload, name="srv-stamp-a", port=3421)
+    owner = _make_user(admin_client, sid, "owner1")
+    model_id = _blueprint_with_migration(admin_client, slug="adopt-bp-a")
+
+    monkeypatch.setattr(mdc, "get_adapter", lambda target: _FakeAdapter(dbs=["legacy_a"]))
+    monkeypatch.setattr(MigrationRunner, "stamp", lambda self, *a, **k: None)
+    monkeypatch.setattr(MigrationRunner, "get_current_version", lambda self, *a, **k: "0001")
+
+    r = admin_client.post(
+        "/api/v1/managed-databases/adopt",
+        json={
+            "name": "legacy_a",
+            "server_id": sid,
+            "owner_id": owner,
+            "model_id": model_id,
+            "model_version": "0001",
+        },
+    )
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    assert data["model_id"] == model_id
+    # El controller relee y re-serializa tras el stamp: model_version queda seteado
+    # al valor stampeado (get_current_version mockeado a "0001").
+    assert data["model_version"] == "0001"
+
+    r = admin_client.get(f"/api/v1/managed-databases/{data['id']}")
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["model_version"] == "0001"
+
+
+def test_adopt_database_model_version_without_model_id_422(
+    admin_client, server_payload, monkeypatch
+):
+    sid = _make_server(admin_client, server_payload, name="srv-stamp-b", port=3422)
+    owner = _make_user(admin_client, sid, "owner1")
+    monkeypatch.setattr(mdc, "get_adapter", lambda target: _FakeAdapter(dbs=["legacy_b"]))
+
+    r = admin_client.post(
+        "/api/v1/managed-databases/adopt",
+        json={
+            "name": "legacy_b",
+            "server_id": sid,
+            "owner_id": owner,
+            "model_version": "0001",
+        },
+    )
+    assert r.status_code == 422, r.text
+    assert "model_id" in r.text.lower()
+
+    # La BD NO quedó registrada: no aparece en el listado del servidor.
+    r = admin_client.get(f"/api/v1/managed-databases?server_id={sid}")
+    assert r.status_code == 200, r.text
+    assert r.json()["data"] == []
+
+
+def test_adopt_database_model_version_not_in_blueprint_422(
+    admin_client, server_payload, monkeypatch
+):
+    sid = _make_server(admin_client, server_payload, name="srv-stamp-c", port=3423)
+    owner = _make_user(admin_client, sid, "owner1")
+    model_id = _blueprint_with_migration(admin_client, slug="adopt-bp-c")
+    monkeypatch.setattr(mdc, "get_adapter", lambda target: _FakeAdapter(dbs=["legacy_c"]))
+
+    r = admin_client.post(
+        "/api/v1/managed-databases/adopt",
+        json={
+            "name": "legacy_c",
+            "server_id": sid,
+            "owner_id": owner,
+            "model_id": model_id,
+            "model_version": "9999",  # no existe en el blueprint
+        },
+    )
+    assert r.status_code == 422, r.text
+
+    # No quedó registrada en el inventario (la validación corre ANTES del insert).
+    r = admin_client.get(f"/api/v1/managed-databases?server_id={sid}")
+    assert r.status_code == 200, r.text
+    assert r.json()["data"] == []
+
+
+def test_adopt_database_without_model_version_does_not_stamp(
+    admin_client, server_payload, monkeypatch
+):
+    from app.services.db_admin.migrations import MigrationRunner
+
+    sid = _make_server(admin_client, server_payload, name="srv-stamp-d", port=3424)
+    owner = _make_user(admin_client, sid, "owner1")
+    model_id = _blueprint_with_migration(admin_client, slug="adopt-bp-d")
+    monkeypatch.setattr(mdc, "get_adapter", lambda target: _FakeAdapter(dbs=["legacy_d"]))
+
+    calls = []
+    monkeypatch.setattr(
+        MigrationRunner, "stamp", lambda self, *a, **k: calls.append((a, k))
+    )
+
+    r = admin_client.post(
+        "/api/v1/managed-databases/adopt",
+        json={
+            "name": "legacy_d",
+            "server_id": sid,
+            "owner_id": owner,
+            "model_id": model_id,
+            # sin model_version
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["data"]["model_version"] is None
+    assert calls == []  # nunca se invocó stamp
+
+
+# --------------------------------------------------------------------------- #
 # Adopt user                                                                   #
 # --------------------------------------------------------------------------- #
 def test_adopt_user_success_then_conflict_and_404(
