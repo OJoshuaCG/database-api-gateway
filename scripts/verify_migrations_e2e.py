@@ -5,7 +5,9 @@ Cubre MySQL 8, MariaDB 11 y PostgreSQL 16. El gateway de metadatos corre en SQLi
 (efímero); los contenedores Docker son los servidores DESTINO. Ejercita el camino
 COMPLETO de la API: registrar servidor, crear usuario y BD reales (provision), crear
 blueprint + migraciones, status / apply / history / rollback (con confirm_version) /
-stamp / integridad por checksum, verificando el estado real en cada motor.
+stamp / integridad por checksum, verificando el estado real en cada motor. Incluye
+Plan 09 (adopt/reconcile/snapshot) y el SNAPSHOT SELECTIVO (split by_class + orden FK
+topológico + datos-semilla con upsert idempotente y rollback por PK contra el motor real).
 
 NO es un test de pytest (no se recolecta): requiere Docker y se ejecuta a mano. Los
 tests de integración canónicos con testcontainers para CI están pendientes (los posee
@@ -98,6 +100,12 @@ def _tables(engine_key, dbname):
     insp = inspect(target_engine(engine_key, dbname).connect())
     return set(insp.get_table_names() if engine_key != "postgresql"
               else insp.get_table_names(schema="public"))
+
+
+def _count(engine_key, dbname, table):
+    """COUNT(*) de una tabla (nombre controlado por el script)."""
+    with target_engine(engine_key, dbname).connect() as conn:
+        return conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar()
 
 
 def run_plan09(c, sid, oid, engine_key):
@@ -212,6 +220,77 @@ def run_plan09(c, sid, oid, engine_key):
           rb.status_code == 200 and rbd["to_version"] == "0001" and rbd["reverted_count"] == 2)
     t2 = _tables(ek, seq_db)
     check("p9 rollback dejó solo s1", "s1" in t2 and "s2" not in t2 and "s3" not in t2)
+
+
+def run_snapshot_selective(c, sid, oid, engine_key):
+    """Snapshot SELECTIVO: split by_class + orden FK topológico + datos-semilla
+    (upsert idempotente aplicado en el motor real) + rollback por PK."""
+    from app.services.db_admin.sql_dialect import split_sql_statements
+
+    print(f"\n----- SNAPSHOT SELECTIVO: {engine_key} -----")
+    ek = engine_key
+    src_db, dst_db = f"selsrc_{ek[:2]}", f"seldst_{ek[:2]}"
+    for db in (src_db, dst_db):
+        try:
+            _server_exec(ek, [f"DROP DATABASE IF EXISTS {db}"])
+        except Exception as ex:
+            print("   (pre-clean sel:", ex, ")")
+
+    # 1) BD origen con catálogo (con datos) + tabla dependiente por FK.
+    _server_exec(ek, [f"CREATE DATABASE {src_db}"])
+    _direct_exec(ek, src_db, [
+        "CREATE TABLE estado (id INT PRIMARY KEY, nombre VARCHAR(40))",
+        "CREATE TABLE pedido (id INT PRIMARY KEY, estado_id INT, "
+        "FOREIGN KEY (estado_id) REFERENCES estado(id))",
+        "INSERT INTO estado (id, nombre) VALUES (1, 'nuevo'), (2, 'pagado'), (3, 'enviado')",
+    ])
+
+    # 2) from-snapshot: by_class + datos de 'estado' con rollback confirmado.
+    fs = c.post("/api/v1/database-models/from-snapshot", json={
+        "server_id": sid, "database": src_db, "name": f"Sel-{ek}", "slug": f"sel-{ek}",
+        "layout": "by_class",
+        "data_tables": [{"table": "estado", "mode": "upsert"}],
+        "confirm_data_rollback": True,
+    })
+    check("sel from-snapshot 201", fs.status_code == 201)
+    if fs.status_code != 201:
+        print("   sel from-snapshot:", fs.status_code, fs.text[:300])
+        return
+    fd = fs.json()["data"]
+    mid = fd["model"]["id"]
+    check("sel total_versions=2 (tablas + datos)", fd["total_versions"] == 2)
+    check("sel data_tables_captured=1", fd["data_tables_captured"] == 1)
+    check("sel última versión es kind=data", fd["versions"][-1]["kind"] == "data")
+
+    versions = c.get(f"/api/v1/database-models/{mid}/migrations?size=50").json()["data"]
+    for v in versions:  # aprobar todo (R1)
+        c.patch(f"/api/v1/database-models/{mid}/migrations/{v['version']}", json={"reviewed": True})
+
+    # 3) BD gestionada (provision) con el blueprint → apply.
+    dst_id = c.post("/api/v1/managed-databases?provision=true", json={
+        "server_id": sid, "owner_id": oid, "name": dst_db, "model_id": mid,
+    }).json()["data"]["id"]
+    ap = c.post(f"/api/v1/managed-databases/{dst_id}/migrations/apply")
+    check("sel apply 200 sin fallo", ap.status_code == 200 and ap.json()["data"]["failed"] is False)
+
+    # 4) Estructura (orden FK: estado antes que pedido) + datos sembrados.
+    check("sel tablas estado+pedido creadas", {"estado", "pedido"} <= _tables(ek, dst_db))
+    check("sel datos-semilla insertados (3 filas)", _count(ek, dst_db, "estado") == 3)
+
+    # 5) Idempotencia: re-ejecutar el upsert directamente → sigue 3 filas, sin error.
+    data_ver = [v for v in versions if v["kind"] == "data"][0]["version"]
+    up = c.get(f"/api/v1/database-models/{mid}/migrations/{data_ver}").json()["data"]["up_sql"]
+    _direct_exec(ek, dst_db, split_sql_statements(up))
+    check("sel upsert idempotente (sigue 3 filas)", _count(ek, dst_db, "estado") == 3)
+
+    # 6) Rollback de la versión de datos por PK → 0 filas, tabla intacta.
+    st = c.get(f"/api/v1/managed-databases/{dst_id}/migrations/status").json()["data"]
+    schema_target = max((v["version"] for v in versions if v["kind"] == "schema"), key=int)
+    rb = c.post(f"/api/v1/managed-databases/{dst_id}/migrations/rollback"
+                f"?confirm_version={st['current_version']}&target_version={schema_target}")
+    check("sel rollback datos 200", rb.status_code == 200)
+    check("sel rollback por PK dejó 0 filas", _count(ek, dst_db, "estado") == 0)
+    check("sel rollback conservó la tabla estado", "estado" in _tables(ek, dst_db))
 
 
 def run_for(c, engine_key):
@@ -385,6 +464,9 @@ def run_for(c, engine_key):
 
     # 14) Plan 09 + UX (adopt/reconcile/snapshot/from-snapshot/secuencial/autoversión).
     run_plan09(c, sid, oid, engine_key)
+
+    # 15) Snapshot selectivo (split by_class + orden FK + datos-semilla + rollback por PK).
+    run_snapshot_selective(c, sid, oid, engine_key)
 
     return mid
 

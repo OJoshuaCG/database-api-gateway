@@ -39,6 +39,9 @@ class _SqliteTestAdapter(ServerAdapter):
 
         return StructureDump(database=database, source_engine=self.dialect, statements=[])
 
+    def _estimate_rows(self, conn, table, schema):  # no ejercitado aquí
+        return 0
+
     def create_database(self, *a, **k): ...
     def drop_database(self, *a, **k): ...
     def create_user(self, *a, **k): ...
