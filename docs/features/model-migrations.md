@@ -32,9 +32,10 @@ la [capa de conexión remota](remote-connections.md) y la [autenticación](authe
 | `up_sql_postgresql` | no | Override manual para PostgreSQL |
 | `down_sql` | no | Rollback **confirmado**. Sin él, `rollback` responde 409 |
 | `down_sql_suggested` | (auto) | Rollback sugerido por el gateway para ops aditivas; revisar y confirmar vía `PATCH` |
-| `checksum` | (auto) | SHA256 de todo el SQL + versión; detecta alteración antes de aplicar |
-| `reviewed` | (auto) | `true` para migraciones escritas a mano; un **baseline de snapshot** (Plan 09) nace `false` y **no se aplica** hasta aprobarlo (`PATCH reviewed=true`) |
-| `source_engine` / `is_baseline` / `has_non_portable` | (auto) | Metadatos de un baseline generado por snapshot (motor de origen; si trae objetos procedurales no portables) |
+| `checksum` | (auto) | SHA256 de todo el SQL + versión; detecta alteración antes de aplicar. **No** incluye `kind` (para no invalidar checksums existentes) |
+| `kind` | (auto) | `schema` (DDL, default) o `data` (datos-semilla upsert de un snapshot). Una migración `data` está **atada a `source_engine`** (la sintaxis upsert difiere por motor) y **no se traduce** cross-engine |
+| `reviewed` | (auto) | `true` para migraciones escritas a mano; toda migración generada por **snapshot** (Plan 09) nace `false` y **no se aplica** hasta aprobarla (`PATCH reviewed=true`) |
+| `source_engine` / `is_baseline` / `has_non_portable` | (auto) | Metadatos de una migración generada por snapshot (motor de origen; si trae objetos procedurales no portables). El snapshot puede dividirse en varias versiones — ver [adopción/snapshot](adoption-reconcile-snapshot.md) |
 
 El gateway **auto-traduce** `up_sql` de MySQL a PostgreSQL con `sqlglot`; el campo
 calculado `translated` muestra el SQL efectivo por motor. Los overrides solo se necesitan
