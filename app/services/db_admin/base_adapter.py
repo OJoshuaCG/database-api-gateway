@@ -14,7 +14,7 @@ Iteración 1 (solo se usarán a partir de la Iteración 2).
 import re
 from abc import ABC, abstractmethod
 
-from sqlalchemy import inspect, text
+from sqlalchemy import MetaData, Table, inspect, select, text
 from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 
 from app.core.remote_engine import (
@@ -24,6 +24,7 @@ from app.core.remote_engine import (
     server_connection,
 )
 from app.exceptions import AppHttpException
+from app.services.db_admin import snapshot_data
 from app.services.db_admin.dtos import (
     ColumnInfo,
     ConnectionInfo,
@@ -33,7 +34,10 @@ from app.services.db_admin.dtos import (
     GrantLevel,
     IndexInfo,
     ObjectRef,
+    SeedResult,
+    StructureDump,
     TableSchema,
+    TableStat,
 )
 from app.services.db_admin.identifiers import validate_identifier
 
@@ -120,6 +124,14 @@ class ServerAdapter(ABC):
         según motor: secuencias, tipos, extensiones, events). SOLO estructura, jamás
         filas. Las sentencias vienen YA en orden de dependencia para re-aplicarse.
         Plan 09 (adopción + snapshot como blueprint baseline).
+        """
+
+    @abstractmethod
+    def _estimate_rows(self, conn, table: str, schema: str) -> int:
+        """
+        Estimación de filas de una tabla desde el catálogo (rápida, aproximada; NO
+        cuenta filas). MySQL: ``information_schema.TABLES.TABLE_ROWS``; PostgreSQL:
+        ``pg_class.reltuples``. Solo para informar la selección de datos-semilla.
         """
 
     # ------------------------------------------------------------------ #
@@ -324,6 +336,94 @@ class ServerAdapter(ABC):
             foreign_keys=foreign_keys,
             indexes=indexes,
         )
+
+    # ------------------------------------------------------------------ #
+    # Datos-semilla (snapshot selectivo) — read-only, cross-dialect       #
+    # ------------------------------------------------------------------ #
+    def list_table_stats(self, database: str) -> list[TableStat]:
+        """
+        Estimación por tabla (filas + tiene PK) para informar la selección de datos.
+        Solo métricas del catálogo, NUNCA valores de filas.
+        """
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        schema = self._inspect_schema(database)
+        try:
+            with database_connection(self.target, database) as conn:
+                insp = inspect(conn)
+                out: list[TableStat] = []
+                for t in sorted(insp.get_table_names(schema=schema)):
+                    pk = (
+                        insp.get_pk_constraint(t, schema=schema).get("constrained_columns")
+                        or []
+                    )
+                    out.append(
+                        TableStat(
+                            table=t,
+                            estimated_rows=self._estimate_rows(conn, t, schema),
+                            has_primary_key=bool(pk),
+                        )
+                    )
+                return out
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="list_table_stats", target=self.target, extra={"database": database}
+            )
+
+    def dump_table_data(
+        self,
+        database: str,
+        table: str,
+        *,
+        mode: str = "upsert",
+        max_rows: int,
+        max_bytes: int,
+        batch_rows: int,
+    ) -> SeedResult:
+        """
+        Extrae datos-semilla de UNA tabla como INSERT idempotente + rollback por PK.
+
+        Fail-closed: sin PK, sin filas o si supera los guardrails (filas/bytes) → se
+        OMITE (``included=False`` + ``reason``), nunca se emite SQL parcial. Los topes
+        se acotan además por los techos duros de ``snapshot_data``.
+        """
+        max_rows, max_bytes = snapshot_data.effective_limits(max_rows, max_bytes)
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        validate_identifier(table, self.dialect, "tabla", allow_existing=True)
+        schema = self._inspect_schema(database)
+        try:
+            with database_connection(self.target, database) as conn:
+                insp = inspect(conn)
+                pk = (
+                    insp.get_pk_constraint(table, schema=schema).get("constrained_columns")
+                    or []
+                )
+                if not pk:
+                    return SeedResult(table=table, included=False, reason="no_primary_key")
+                tbl = Table(table, MetaData(), autoload_with=conn, schema=schema)
+                columns = [c.name for c in tbl.columns]
+                # Defensa en dos capas: validar (no solo quotear) los identificadores
+                # reflejados. Un nombre anómalo omite la tabla (fail-closed).
+                try:
+                    for c in columns:
+                        validate_identifier(c, self.dialect, "columna", allow_existing=True)
+                except AppHttpException:
+                    return SeedResult(table=table, included=False, reason="invalid_identifier")
+                order_cols = [tbl.c[c] for c in pk]
+                # Streaming (yield_per) + LIMIT max_rows+1: acota la memoria (no materializa
+                # filas grandes antes del guard de bytes) y detecta "supera el máximo".
+                result = conn.execution_options(
+                    stream_results=True, yield_per=max(1, batch_rows)
+                ).execute(select(tbl).order_by(*order_cols).limit(max_rows + 1))
+                return snapshot_data.build_seed(
+                    dialect=self.dialect, table=table, columns=columns, pk=pk,
+                    rows=result, mode=mode, batch_rows=batch_rows,
+                    max_rows=max_rows, max_bytes=max_bytes,
+                )
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="dump_table_data", target=self.target,
+                extra={"database": database, "table": table},
+            )
 
     # ------------------------------------------------------------------ #
     # Helpers para DDL/DCL (usados por las operaciones de escritura)      #

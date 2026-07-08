@@ -11,7 +11,7 @@ Particularidades frente a MySQL:
 - `CREATE/DROP DATABASE` exigen AUTOCOMMIT (ya garantizado por server_connection).
 """
 
-from sqlalchemy import MetaData, Table, text
+from sqlalchemy import MetaData, Table, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.schema import CreateTable
 
@@ -148,6 +148,7 @@ class PostgresAdapter(ServerAdapter):
                     )
 
                 # 4) Tablas (reflexión + compilador CreateTable, en dialecto PG).
+                insp = inspect(conn)
                 table_names = [
                     r[0]
                     for r in conn.execute(
@@ -162,20 +163,32 @@ class PostgresAdapter(ServerAdapter):
                     validate_identifier(tname, self.dialect, "tabla", allow_existing=True)
                     tbl = Table(tname, MetaData(), autoload_with=conn, schema="public")
                     ddl = str(CreateTable(tbl).compile(conn.engine)).strip()
+                    referred = sorted(
+                        {
+                            fk["referred_table"]
+                            for fk in insp.get_foreign_keys(tname, schema="public")
+                            if fk.get("referred_table") and fk["referred_table"] != tname
+                        }
+                    )
                     statements.append(
-                        DumpStatement(object_type="table", name=tname, ddl=ddl)
+                        DumpStatement(
+                            object_type="table", name=tname, ddl=ddl, depends_on=referred
+                        )
                     )
 
                 # 5) Índices NO respaldados por una constraint (PK/UNIQUE ya van en la tabla).
-                for idxname, idxdef in _safe(
+                for idxname, idxdef, idxtable in _safe(
                     conn,
-                    "SELECT i.indexname, i.indexdef FROM pg_indexes i "
+                    "SELECT i.indexname, i.indexdef, i.tablename FROM pg_indexes i "
                     "WHERE i.schemaname = 'public' AND NOT EXISTS "
                     "(SELECT 1 FROM pg_constraint c WHERE c.conname = i.indexname) "
                     "ORDER BY i.indexname",
                 ):
                     statements.append(
-                        DumpStatement(object_type="index", name=idxname, ddl=idxdef)
+                        DumpStatement(
+                            object_type="index", name=idxname, ddl=idxdef,
+                            depends_on=[idxtable] if idxtable else [],
+                        )
                     )
 
                 # 6) Vistas.
@@ -209,22 +222,23 @@ class PostgresAdapter(ServerAdapter):
                     )
 
                 # 8) Funciones y procedures (pg_get_functiondef). NO portables.
-                for (fdef,) in _safe(
+                #    Se captura proname (rutinas homónimas/overloads comparten nombre).
+                for proname, fdef in _safe(
                     conn,
-                    "SELECT pg_get_functiondef(p.oid) FROM pg_proc p "
+                    "SELECT p.proname, pg_get_functiondef(p.oid) FROM pg_proc p "
                     "JOIN pg_namespace n ON n.oid = p.pronamespace "
                     "WHERE n.nspname = 'public' AND p.prokind IN ('f', 'p') "
                     "ORDER BY p.proname",
                 ):
                     has_non_portable = True
                     statements.append(
-                        DumpStatement(object_type="routine", name="", ddl=fdef)
+                        DumpStatement(object_type="routine", name=proname or "", ddl=fdef)
                     )
 
-                # 9) Triggers (pg_get_triggerdef). NO portables.
-                for tgname, tgdef in _safe(
+                # 9) Triggers (pg_get_triggerdef, depends_on = tabla). NO portables.
+                for tgname, tgdef, on_table in _safe(
                     conn,
-                    "SELECT t.tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t "
+                    "SELECT t.tgname, pg_get_triggerdef(t.oid), c.relname FROM pg_trigger t "
                     "JOIN pg_class c ON c.oid = t.tgrelid "
                     "JOIN pg_namespace n ON n.oid = c.relnamespace "
                     "WHERE n.nspname = 'public' AND NOT t.tgisinternal "
@@ -232,7 +246,10 @@ class PostgresAdapter(ServerAdapter):
                 ):
                     has_non_portable = True
                     statements.append(
-                        DumpStatement(object_type="trigger", name=tgname, ddl=tgdef)
+                        DumpStatement(
+                            object_type="trigger", name=tgname, ddl=tgdef,
+                            depends_on=[on_table] if on_table else [],
+                        )
                     )
         except SQLAlchemyError as exc:
             raise map_driver_error(
@@ -541,3 +558,14 @@ class PostgresAdapter(ServerAdapter):
         }.get(level)
         validate_identifier(self._require_field(name, "objeto"), self.dialect, "objeto", allow_existing=True)
         return f"{schema}.{name}"
+
+    def _estimate_rows(self, conn, table: str, schema: str) -> int:
+        row = conn.execute(
+            text(
+                "SELECT c.reltuples::bigint FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE c.relname = :t AND n.nspname = :s"
+            ),
+            {"t": table, "s": schema},
+        ).scalar()
+        return int(row) if row is not None and row >= 0 else 0

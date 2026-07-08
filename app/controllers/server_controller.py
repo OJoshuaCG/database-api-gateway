@@ -32,8 +32,10 @@ from app.models.server_user import ServerUser
 from app.services.db_admin.dtos import (
     ConnectionInfo,
     EngineUserInfo,
+    SeedResult,
     StructureDump,
     TableSchema,
+    TableStat,
 )
 from app.services.db_admin.factory import get_adapter
 
@@ -345,3 +347,31 @@ class ServerController:
     def snapshot(self, server_id: int, database: str) -> StructureDump:
         """Dump estructural EN VIVO de una BD (solo estructura, nunca filas)."""
         return get_adapter(self._build_target(server_id)).dump_structure(database)
+
+    def table_stats(self, server_id: int, database: str) -> list[TableStat]:
+        """Estimación por tabla (filas + tiene PK) para informar la selección de datos."""
+        return get_adapter(self._build_target(server_id)).list_table_stats(database)
+
+    def snapshot_data(
+        self,
+        server_id: int,
+        database: str,
+        tables: list[str],
+        *,
+        modes: dict[str, str],
+        max_rows: int,
+        max_bytes: int,
+        batch_rows: int,
+    ) -> list[SeedResult]:
+        """
+        Extrae datos-semilla de varias tablas reutilizando un solo target (la credencial
+        se descifra una vez). Cada tabla se rinde como INSERT idempotente + rollback por PK.
+        """
+        adapter = get_adapter(self._build_target(server_id))
+        return [
+            adapter.dump_table_data(
+                database, t, mode=modes.get(t, "upsert"),
+                max_rows=max_rows, max_bytes=max_bytes, batch_rows=batch_rows,
+            )
+            for t in tables
+        ]

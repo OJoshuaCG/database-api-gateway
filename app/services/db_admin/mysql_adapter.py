@@ -109,6 +109,19 @@ class MySQLAdapter(ServerAdapter):
         has_non_portable = False
         try:
             with database_connection(self.target, database) as conn:
+                # Aristas FK entre tablas (una sola consulta) para depends_on / topo-sort.
+                fk_map: dict[str, set[str]] = {}
+                for tname, referred in conn.execute(
+                    text(
+                        "SELECT TABLE_NAME, REFERENCED_TABLE_NAME "
+                        "FROM information_schema.KEY_COLUMN_USAGE "
+                        "WHERE TABLE_SCHEMA = :db AND REFERENCED_TABLE_NAME IS NOT NULL"
+                    ),
+                    {"db": database},
+                ).fetchall():
+                    if referred and referred != tname:
+                        fk_map.setdefault(tname, set()).add(referred)
+
                 # 1) Tablas base (no vistas).
                 tables = [
                     r[0]
@@ -128,7 +141,12 @@ class MySQLAdapter(ServerAdapter):
                     )
                     row = conn.execute(text(f"SHOW CREATE TABLE {q}")).fetchone()
                     ddl = self._show_create_value(row, ("Create Table",), 1)
-                    statements.append(DumpStatement(object_type="table", name=t, ddl=ddl))
+                    statements.append(
+                        DumpStatement(
+                            object_type="table", name=t, ddl=ddl,
+                            depends_on=sorted(fk_map.get(t, set())),
+                        )
+                    )
 
                 # 2) Vistas.
                 views = [
@@ -177,18 +195,19 @@ class MySQLAdapter(ServerAdapter):
                         DumpStatement(object_type="routine", name=name, ddl=ddl)
                     )
 
-                # 4) Triggers.
+                # 4) Triggers (depends_on = tabla sobre la que se define).
                 triggers = [
-                    r[0]
+                    (r[0], r[1])
                     for r in conn.execute(
                         text(
-                            "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
+                            "SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE "
+                            "FROM information_schema.TRIGGERS "
                             "WHERE TRIGGER_SCHEMA = :db ORDER BY TRIGGER_NAME"
                         ),
                         {"db": database},
                     ).fetchall()
                 ]
-                for trg in triggers:
+                for trg, on_table in triggers:
                     q = quote_identifier(
                         validate_identifier(trg, self.dialect, "trigger", allow_existing=True),
                         self.dialect,
@@ -199,7 +218,10 @@ class MySQLAdapter(ServerAdapter):
                     )
                     has_non_portable = True
                     statements.append(
-                        DumpStatement(object_type="trigger", name=trg, ddl=ddl)
+                        DumpStatement(
+                            object_type="trigger", name=trg, ddl=ddl,
+                            depends_on=[on_table] if on_table else [],
+                        )
                     )
 
                 # 5) Events (scheduler). information_schema.EVENTS puede no existir en
@@ -482,6 +504,16 @@ class MySQLAdapter(ServerAdapter):
             # significa que no se puede delegar grant option.
             return False
         return needed.issubset(grantable)
+
+    def _estimate_rows(self, conn, table: str, schema: str) -> int:
+        row = conn.execute(
+            text(
+                "SELECT TABLE_ROWS FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = :s AND TABLE_NAME = :t"
+            ),
+            {"s": schema, "t": table},
+        ).scalar()
+        return int(row) if row is not None else 0
 
 
 class MariaDBAdapter(MySQLAdapter):

@@ -87,13 +87,23 @@ def reconcile(admin: AdminDep, server_id: int):
     "/{server_id}/databases/{database}/snapshot",
     response_model=ApiResponse[StructureDump],
 )
-def snapshot_database(admin: AdminDep, server_id: int, database: str):
+def snapshot_database(
+    admin: AdminDep, server_id: int, database: str, include_data_stats: bool = False
+):
     """
     Snapshot estructural EN VIVO de una BD (tablas, vistas, rutinas, triggers, etc.).
     Solo estructura, nunca filas. Es la PREVIEW (no persiste): para fijarlo como
     blueprint baseline use POST /database-models/from-snapshot.
+
+    Con ``?include_data_stats=true`` agrega ``table_stats`` (estimación de filas y si
+    tiene PK por tabla) para que el frontend informe la selección de datos-semilla. Es
+    opt-in porque implica una consulta extra de catálogo por tabla.
     """
-    return success(data=ServerController().snapshot(server_id, database))
+    ctrl = ServerController()
+    dump = ctrl.snapshot(server_id, database)
+    if include_data_stats:
+        dump = dump.model_copy(update={"table_stats": ctrl.table_stats(server_id, database)})
+    return success(data=dump)
 
 
 @router.get(
