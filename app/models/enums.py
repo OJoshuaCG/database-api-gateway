@@ -46,3 +46,20 @@ class MigrationStatus(str, enum.Enum):
 
     applied = "applied"  # la migración se aplicó/revirtió correctamente
     failed = "failed"    # la migración falló (ver ``error``); BD posiblemente sucia
+
+
+class MigrationKind(str, enum.Enum):
+    """
+    Naturaleza del contenido de una migración de blueprint.
+
+    - ``schema``: DDL (tablas, vistas, rutinas, triggers…). Es el caso por defecto y
+      cubre toda migración escrita a mano o generada por snapshot estructural.
+    - ``data``: DML de datos-semilla (catálogos/tipos) generado desde un snapshot con
+      INSERT idempotente (upsert). Se distingue del esquema porque (a) la UI lo muestra
+      aparte, (b) su rollback se genera por PK (DELETE), y (c) está ATADO al motor de
+      origen (la sintaxis upsert difiere entre MySQL y PostgreSQL): no se traduce
+      cross-engine.
+    """
+
+    schema = "schema"
+    data = "data"

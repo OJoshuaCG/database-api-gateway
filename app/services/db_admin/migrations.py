@@ -73,6 +73,7 @@ class MigrationSpec:
     up_sql_postgresql: str | None
     down_sql: str | None
     checksum: str
+    kind: str = "schema"  # 'schema' | 'data' (los datos no se traducen cross-engine)
 
 
 @dataclass(frozen=True)
@@ -109,21 +110,36 @@ class MigrationRunner:
     # Selección de SQL por motor                                          #
     # ------------------------------------------------------------------ #
     def select_up_sql(self, spec: MigrationSpec, engine: EngineType) -> str:
-        """Override manual si existe; si no, auto-traducción del up_sql base."""
+        """Override manual si existe; si no, auto-traducción del up_sql base.
+
+        Una migración de DATOS (``kind='data'``) NUNCA se auto-traduce: la sintaxis
+        upsert (``ON DUPLICATE KEY UPDATE`` vs ``ON CONFLICT``) no es transpilable con
+        seguridad por sqlglot. Se usa el override del motor de origen; aplicarla a otro
+        motor lo bloquea antes el guard cross-engine del controller.
+        """
         if engine in (EngineType.mysql, EngineType.mariadb):
             return spec.up_sql_mysql or spec.up_sql
         if engine == EngineType.postgresql:
             if spec.up_sql_postgresql:
                 return spec.up_sql_postgresql
+            if spec.kind == "data":
+                return spec.up_sql
             translated = self._translator.translate(spec.up_sql, engine)
             return translated if translated is not None else spec.up_sql
         return spec.up_sql
 
     def select_down_sql(self, spec: MigrationSpec, engine: EngineType) -> str | None:
-        """down_sql confirmado, traducido al motor destino. None si no hay."""
+        """down_sql confirmado, traducido al motor destino. None si no hay.
+
+        Una migración de DATOS (``kind='data'``) NO se traduce: su ``down_sql`` (DELETE por
+        PK) ya está renderizado en el dialecto de origen (identificadores quoteados por
+        motor) y sqlglot, leyéndolo como MySQL, malinterpretaría los identificadores PG
+        entre comillas dobles como literales de cadena. El guard cross-engine garantiza
+        que el destino coincide con ``source_engine``.
+        """
         if not spec.down_sql:
             return None
-        if engine in (EngineType.mysql, EngineType.mariadb):
+        if engine in (EngineType.mysql, EngineType.mariadb) or spec.kind == "data":
             return spec.down_sql
         translated = self._translator.translate(spec.down_sql, engine)
         return translated if translated is not None else spec.down_sql

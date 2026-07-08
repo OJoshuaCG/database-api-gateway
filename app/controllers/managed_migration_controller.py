@@ -14,6 +14,8 @@ Integridad: antes de tocar el motor se re-valida el ``checksum`` de cada migraci
 (detecta alteración directa en la BD del gateway).
 """
 
+from sqlalchemy import or_ as sa_or
+
 from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
@@ -88,6 +90,7 @@ class ManagedMigrationController:
                 up_sql_postgresql=r.up_sql_postgresql,
                 down_sql=r.down_sql,
                 checksum=r.checksum,
+                kind=r.kind,
             )
             for r in rows
         ]
@@ -202,26 +205,38 @@ class ManagedMigrationController:
     @staticmethod
     def _guard_cross_engine(session, model_id: int, engine: EngineType) -> None:
         """
-        Plan 09: un baseline de snapshot con objetos NO portables (rutinas/triggers/
-        events) queda atado a su ``source_engine`` (sqlglot no transpila código
-        procedural). Bloquea (422) aplicar ese blueprint a un servidor de otro motor.
+        Un baseline de snapshot queda atado a su ``source_engine`` en dos casos:
+
+        - objetos NO portables (rutinas/triggers/events): sqlglot no transpila código
+          procedural;
+        - migraciones de DATOS (``kind='data'``): la sintaxis upsert difiere por motor
+          (``ON DUPLICATE KEY UPDATE`` vs ``ON CONFLICT``) y no se traduce.
+
+        En ambos casos, aplicar ese blueprint a un servidor de otro motor se bloquea (422).
         """
         row = (
             session.query(ModelMigration)
             .filter(
                 ModelMigration.model_id == model_id,
-                ModelMigration.has_non_portable.is_(True),
                 ModelMigration.source_engine.isnot(None),
+                sa_or(
+                    ModelMigration.has_non_portable.is_(True),
+                    ModelMigration.kind == "data",
+                ),
             )
             .first()
         )
         if row and row.source_engine != engine.value:
+            reason = (
+                "datos-semilla (INSERT con sintaxis upsert por motor)"
+                if row.kind == "data"
+                else "objetos no portables (rutinas/triggers)"
+            )
             raise AppHttpException(
                 message=(
-                    f"El blueprint tiene un baseline de snapshot del motor "
-                    f"'{row.source_engine}' con objetos no portables (rutinas/triggers): "
-                    f"no puede aplicarse a un servidor '{engine.value}'. Genere un baseline "
-                    "específico para este motor."
+                    f"El blueprint tiene una migración de snapshot del motor "
+                    f"'{row.source_engine}' con {reason}: no puede aplicarse a un servidor "
+                    f"'{engine.value}'. Genere un baseline específico para este motor."
                 ),
                 status_code=422,
                 context={"source_engine": row.source_engine, "target_engine": engine.value},

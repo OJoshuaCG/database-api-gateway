@@ -93,6 +93,18 @@ class ModelMigration(Base, TimestampMixin):
         comment="SHA256(up_sql + variantes + down_sql + version) — detecta alteración",
     )
 
+    # ---- Naturaleza del contenido (esquema vs datos-semilla) ------------------ #
+    kind: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        default="schema",
+        server_default="schema",
+        comment=(
+            "Naturaleza: 'schema' (DDL, default) | 'data' (datos-semilla upsert de un "
+            "snapshot). 'data' está atado a source_engine (sintaxis upsert por motor)"
+        ),
+    )
+
     # ---- Plan 09: trazabilidad de migraciones generadas por SNAPSHOT ---------- #
     source_engine: Mapped[str | None] = mapped_column(
         String(20),

@@ -66,6 +66,7 @@ class ModelMigrationSummary(BaseModel):
     has_postgresql_override: bool
     has_rollback: bool
     checksum: str
+    kind: str = "schema"
     is_baseline: bool = False
     reviewed: bool = True
     created_at: datetime
@@ -89,6 +90,9 @@ class ModelMigrationOut(BaseModel):
         default_factory=dict, description="up_sql traducido por motor (mysql, postgresql)"
     )
     checksum: str
+    kind: str = Field(
+        "schema", description="'schema' (DDL) | 'data' (datos-semilla upsert, atado a source_engine)"
+    )
     source_engine: str | None = Field(
         None, description="Motor de origen si proviene de un snapshot; None = portable (Plan 09)"
     )
