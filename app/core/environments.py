@@ -90,6 +90,23 @@ REMOTE_STATEMENT_TIMEOUT_MS = int(os.getenv("REMOTE_STATEMENT_TIMEOUT_MS", "1500
 # Aplica como política GLOBAL a todos los servidores destino.
 REMOTE_SSL_MODE = (os.getenv("REMOTE_SSL_MODE", "") or "").strip() or None
 
+# ======= Snapshot selectivo: guardrails de datos-semilla ======= #
+# El snapshot puede incluir OPCIONALMENTE datos de tablas de catálogo/tipo (opt-in por
+# tabla) como INSERT idempotente. NO es una herramienta de ETL: estos topes protegen la
+# BD de metadatos del gateway y su memoria. Hay TECHOS DUROS en código
+# (app/services/db_admin/snapshot_data.py) que estas variables no pueden exceder.
+SNAPSHOT_DATA_MAX_ROWS_PER_TABLE = int(os.getenv("SNAPSHOT_DATA_MAX_ROWS_PER_TABLE", "1000"))
+SNAPSHOT_DATA_MAX_BYTES_PER_TABLE = int(
+    os.getenv("SNAPSHOT_DATA_MAX_BYTES_PER_TABLE", str(1024 * 1024))  # 1 MB
+)
+SNAPSHOT_DATA_MAX_TABLES = int(os.getenv("SNAPSHOT_DATA_MAX_TABLES", "25"))
+SNAPSHOT_DATA_BATCH_ROWS = int(os.getenv("SNAPSHOT_DATA_BATCH_ROWS", "500"))
+# Tope de SQL por versión generada (estructura o datos). Distinto de _MAX_SQL (256 KB,
+# solo creación manual); un snapshot legítimo puede ser mayor y la columna es LONGTEXT.
+SNAPSHOT_MAX_SQL_PER_VERSION = int(
+    os.getenv("SNAPSHOT_MAX_SQL_PER_VERSION", str(4 * 1024 * 1024))  # 4 MB
+)
+
 # ======= Anti-SSRF (validación de host destino) ======= #
 # Si True (default), al registrar/editar un Server se rechazan destinos peligrosos
 # (loopback, link-local/metadata 169.254.169.254, multicast, reservados). Los rangos

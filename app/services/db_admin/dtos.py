@@ -114,6 +114,14 @@ class DumpStatement(BaseModel):
     object_type: str  # table | view | materialized_view | routine | trigger | sequence | type | extension | event
     name: str
     ddl: str
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Nombres de TABLAS de las que depende este objeto (FK entre tablas, "
+            "trigger→tabla, índice→tabla). Base para el orden topológico y la validación "
+            "del split manual. Solo aristas baratas/fiables; vistas/rutinas no se parsean."
+        ),
+    )
 
 
 class StructureDump(BaseModel):
@@ -131,6 +139,13 @@ class StructureDump(BaseModel):
     source_engine: str  # 'mysql' | 'mariadb' | 'postgresql'
     statements: list[DumpStatement]
     has_non_portable: bool = False
+    table_stats: "list[TableStat] | None" = Field(
+        default=None,
+        description=(
+            "Estimación de filas por tabla para informar la selección de datos-semilla. "
+            "Solo se llena en el preview con ?include_data_stats=true; NUNCA en el dump base."
+        ),
+    )
 
     @property
     def object_counts(self) -> dict[str, int]:
@@ -138,3 +153,45 @@ class StructureDump(BaseModel):
         for s in self.statements:
             counts[s.object_type] = counts.get(s.object_type, 0) + 1
         return counts
+
+
+# --------------------------------------------------------------------------- #
+# Datos-semilla (snapshot selectivo) — extracción OPT-IN de filas de catálogo   #
+# --------------------------------------------------------------------------- #
+class TableStat(BaseModel):
+    """
+    Estimación por tabla para informar la selección de datos-semilla (preview).
+
+    Solo métricas: NUNCA valores de filas. ``estimated_rows`` es una ESTIMACIÓN del
+    catálogo del motor (``information_schema.TABLES.TABLE_ROWS`` / ``pg_class.reltuples``),
+    no un conteo exacto. ``has_primary_key=False`` => la tabla NO puede sembrarse (el
+    upsert idempotente y el rollback por PK requieren clave primaria).
+    """
+
+    table: str
+    estimated_rows: int
+    has_primary_key: bool
+
+
+class SeedResult(BaseModel):
+    """
+    Datos-semilla de UNA tabla, ya renderizados como SQL idempotente + rollback por PK.
+
+    SEGURIDAD: aunque ``up_sql``/``down_sql`` contienen los valores como literales SQL
+    (destinados a persistirse en la migración de datos), este DTO NO se serializa en las
+    respuestas de la API. ``included=False`` => la tabla se omitió; ``reason`` es un
+    código estable (``no_primary_key`` | ``no_rows`` | ``oversize_rows`` | ``oversize_bytes``).
+    """
+
+    table: str
+    included: bool
+    reason: str | None = None
+    row_count: int = 0
+    primary_key: list[str] = Field(default_factory=list)
+    up_sql: str | None = None
+    down_sql: str | None = None
+
+
+# ``StructureDump.table_stats`` referencia ``TableStat`` (definido más abajo): resolver
+# la forward-ref ahora que el nombre existe en el namespace del módulo.
+StructureDump.model_rebuild()
