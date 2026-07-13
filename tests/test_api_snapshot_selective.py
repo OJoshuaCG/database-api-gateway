@@ -190,6 +190,108 @@ def test_manual_layout_fk_violation_422(admin_client, server_payload, monkeypatc
     body = r.json()
     reasons = {v["reason"] for v in body["detail"]["context"]["violations"]}
     assert "dependency_in_later_version" in reasons
+    # El mensaje (msg) es autocontenido: se devuelve en TODOS los entornos, no solo en
+    # development (a diferencia de context). Debe traer el hint legible, no un genérico.
+    assert "depende de la tabla 'categoria'" in body["detail"]["msg"]
+
+
+def test_manual_layout_violations_carry_readable_hint(admin_client, server_payload, monkeypatch):
+    sid = _make_server(admin_client, server_payload)
+    rows = {"categoria": (["id", "nombre"], ["id"], [(1, "A")])}
+    _patch(monkeypatch, _FakeAdapter(rows=rows))
+    r = _from_snapshot(
+        admin_client, sid, slug="bp-manual-hint",
+        layout="manual",
+        exclude_object_types=["view", "routine"],
+        manual_layout=[
+            {"objects": [{"object_type": "table", "name": "categoria"}]},
+            {"objects": [{"object_type": "table", "name": "producto"}]},
+        ],
+        data_tables=[{"table": "categoria", "mode": "upsert"}],
+    )
+    assert r.status_code == 422, r.text
+    violations = r.json()["detail"]["context"]["violations"]
+    v = next(x for x in violations if x["reason"] == "unassigned_data_table")
+    assert v["object"] == "categoria"
+    assert "hint" in v and "data_tables" in v["hint"]
+    assert "categoria" in r.json()["detail"]["msg"]
+
+
+def test_manual_layout_reports_silently_skipped_data_table(
+    admin_client, server_payload, monkeypatch
+):
+    """
+    Reproduce el caso real reportado: se piden datos de 2 tablas. 'producto' se
+    extrae con éxito pero queda SIN bucket asignado (dispara la violación → 422).
+    'categoria' se omite ANTES de validar el layout (aquí: sin PK), así que NINGUNA
+    violación de layout la menciona. Antes del fix, 'categoria' desaparecía sin
+    explicación de la respuesta de error (exactamente lo reportado).
+    """
+    sid = _make_server(admin_client, server_payload)
+    rows = {
+        "categoria": SeedResult(table="categoria", included=False, reason="no_primary_key"),
+        "producto": (["id", "cat_id"], ["id"], [(1, 1)]),
+    }
+    _patch(monkeypatch, _FakeAdapter(rows=rows))
+    r = _from_snapshot(
+        admin_client, sid, slug="bp-manual-silent",
+        layout="manual",
+        exclude_object_types=["view", "routine"],
+        manual_layout=[
+            {"objects": [{"object_type": "table", "name": "categoria"}]},
+            {"objects": [{"object_type": "table", "name": "producto"}]},
+        ],
+        data_tables=[{"table": "categoria", "mode": "upsert"}, {"table": "producto", "mode": "upsert"}],
+    )
+    assert r.status_code == 422, r.text
+    body = r.json()["detail"]
+    violations = body["context"]["violations"]
+    # 'producto' SÍ genera la violación esperada (se extrajo, pero sin bucket).
+    assert any(v["object"] == "producto" and v["reason"] == "unassigned_data_table" for v in violations)
+    # 'categoria' NUNCA aparece como violación de layout (no llegó a extraerse)...
+    assert not any(v["object"] == "categoria" for v in violations)
+    # ...pero el mensaje (msg, presente en TODOS los entornos) SÍ debe explicar su ausencia.
+    assert "categoria" in body["msg"] and "no_primary_key" in body["msg"]
+    assert body["context"]["skipped_tables"] == [{"table": "categoria", "reason": "no_primary_key"}]
+
+
+def test_manual_layout_empty_data_table_in_own_bucket_is_skipped_not_error(
+    admin_client, server_payload, monkeypatch
+):
+    """
+    Reproduce el caso reportado: layout='manual' con UN bucket dedicado por tabla de datos
+    (patrón recomendado). Si una de esas tablas está vacía, NO debe interrumpir la creación
+    del blueprint: se omite en silencio (reason='no_rows') y el resto continúa con éxito.
+    """
+    sid = _make_server(admin_client, server_payload)
+    rows = {
+        "categoria": (["id", "nombre"], ["id"], [(1, "A")]),
+        # 'producto' no tiene entrada en 'rows' -> _FakeAdapter la devuelve como no_rows.
+    }
+    _patch(monkeypatch, _FakeAdapter(rows=rows))
+    r = _from_snapshot(
+        admin_client, sid, slug="bp-manual-empty-skip",
+        layout="manual",
+        exclude_object_types=["view", "routine"],
+        manual_layout=[
+            {"objects": [{"object_type": "table", "name": "categoria"}]},
+            {"objects": [{"object_type": "table", "name": "producto"}]},
+            {"data_tables": ["categoria"]},
+            {"data_tables": ["producto"]},  # tabla vacía, en su PROPIO bucket
+        ],
+        data_tables=[
+            {"table": "categoria", "mode": "upsert"},
+            {"table": "producto", "mode": "upsert"},
+        ],
+    )
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    assert data["data_tables_captured"] == 1
+    assert data["skipped_tables"] == [{"table": "producto", "reason": "no_rows"}]
+    # Solo se generó la versión de datos de 'categoria' (2 esquema + 1 dato = 3).
+    kinds = [v["kind"] for v in data["versions"]]
+    assert kinds.count("data") == 1
+    assert data["total_versions"] == 3
 
 
 # --------------------------------------------------------------------------- #

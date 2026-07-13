@@ -372,16 +372,14 @@ class ModelMigrationController:
         seed_by_table = {s.table: s for s in seeds}
         if layout == "manual":
             violations = layout_mod.validate_manual_layout(
-                selected, seed_by_table, data.get("manual_layout") or []
+                selected, seed_by_table, data.get("manual_layout") or [],
+                skipped_data_tables={s["table"] for s in skipped},
             )
             if violations:
                 raise AppHttpException(
-                    message=(
-                        "El layout manual no es aplicable (dependencias/orden). "
-                        "Corrige la asignación de objetos a versiones."
-                    ),
+                    message=self._manual_layout_error_message(violations, skipped, data),
                     status_code=422,
-                    context={"violations": violations},
+                    context={"violations": violations, "skipped_tables": skipped},
                 )
         version_plans = layout_mod.build_versions(
             layout=layout,
@@ -443,6 +441,41 @@ class ModelMigrationController:
             "skipped_tables": skipped,
             "versions": version_summaries,
         }
+
+    # Techo de violaciones detalladas en el mensaje (evita un `msg` gigante con layouts
+    # muy rotos; el resto sigue disponible en context.violations en desarrollo).
+    _MAX_VIOLATIONS_IN_MESSAGE = 5
+
+    @classmethod
+    def _manual_layout_error_message(
+        cls, violations: list[dict], skipped: list[dict], data: dict
+    ) -> str:
+        """
+        Arma un ``message`` AUTOCONTENIDO y accionable para el 422 de layout manual.
+
+        A diferencia de ``context`` (que el handler global solo devuelve en
+        ``APP_ENV=="development"``), ``message`` se incluye en TODAS las respuestas de
+        error — por eso el detalle legible va aquí, no solo en ``context.violations``.
+        """
+        lines = [v["hint"] for v in violations[: cls._MAX_VIOLATIONS_IN_MESSAGE]]
+        extra = len(violations) - len(lines)
+        if extra > 0:
+            lines.append(f"(+{extra} problema(s) más; corrige estos primero y reintenta.)")
+        msg = "El layout manual no es aplicable:\n- " + "\n- ".join(lines)
+
+        # Una tabla pedida en 'data_tables' que se omitió ANTES de validar el layout (sin
+        # PK, sin filas, tipo no soportado, etc.) nunca genera una violación de layout —
+        # simplemente no existe para la validación. Sin este aviso, esa tabla "desaparece"
+        # de la respuesta sin explicación.
+        requested = {d["table"] for d in (data.get("data_tables") or [])}
+        silently_skipped = [s for s in skipped if s["table"] in requested]
+        if silently_skipped:
+            detail = ", ".join(f"{s['table']} ({s['reason']})" for s in silently_skipped)
+            msg += (
+                "\nAdemás, estas tablas de 'data_tables' no se pudieron extraer y por eso "
+                f"no aparecen en la lista anterior: {detail}."
+            )
+        return msg
 
     def _extract_seeds(self, sc, server_id, database, selected, data):
         """Extrae los datos-semilla pedidos, aplicando guardrails y on_oversize."""

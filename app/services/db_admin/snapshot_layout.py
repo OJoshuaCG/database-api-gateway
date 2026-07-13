@@ -299,15 +299,102 @@ def _violation(obj: str, obj_type: str, bucket: int, reason: str, **extra) -> di
     return v
 
 
+def _hint(v: dict) -> str:
+    """
+    Mensaje legible en español para una violación, con los datos concretos ya
+    sustituidos (objeto, versión, etc.). Se adjunta a cada violación como ``hint`` y
+    también alimenta el ``message`` del 422 (ver ``create_from_snapshot``), que SÍ se
+    devuelve en todos los entornos (a diferencia de ``context``, solo en desarrollo).
+    """
+    reason = v["reason"]
+    obj, otype, ver = v.get("object") or "", v.get("object_type") or "", v.get("version")
+    if reason == "mixed_schema_and_data":
+        return (
+            f"La versión {ver} mezcla objetos de estructura y tablas de datos; cada "
+            "versión debe ser SOLO de estructura o SOLO de datos."
+        )
+    if reason == "empty_bucket":
+        return f"La versión {ver} está vacía; agrégale objetos o tablas de datos, o quítala de manual_layout."
+    if reason == "duplicate_assignment":
+        return (
+            f"El objeto '{obj}' ({otype}) está asignado a la versión {ver} y también a la "
+            f"{v.get('also_in_version')}; déjalo en una sola versión."
+        )
+    if reason == "duplicate_data_assignment":
+        return (
+            f"La tabla de datos '{obj}' está asignada a la versión {ver} y también a la "
+            f"{v.get('also_in_version')}; déjala en una sola versión."
+        )
+    if reason == "unassigned_object":
+        return (
+            f"El objeto '{obj}' ({otype}) fue seleccionado (include/exclude) pero no se "
+            "asignó a ninguna versión de manual_layout."
+        )
+    if reason == "unknown_object":
+        return (
+            f"La versión {ver} incluye el objeto '{obj}' ({otype}), que no forma parte de "
+            "la selección actual (revisa include_object_types/include_objects/exclude_objects)."
+        )
+    if reason == "unassigned_data_table":
+        return (
+            f"Se pidieron datos de la tabla '{obj}' (en 'data_tables'), pero ninguna versión "
+            "de 'manual_layout' la declara en su lista 'data_tables'. Agrega un bucket con "
+            f"\"data_tables\": [\"{obj}\"] (normalmente al final, después de crear la tabla)."
+        )
+    if reason == "unknown_data_table":
+        return (
+            f"La versión {ver} declara datos de la tabla '{obj}', que no fue solicitada en "
+            "'data_tables'. Agrégala ahí o quita la referencia de este bucket."
+        )
+    if reason == "dependency_in_later_version":
+        return (
+            f"La tabla '{obj}' está en la versión {ver}, pero depende de la tabla "
+            f"'{v.get('depends_on')}', que está en la versión {v.get('dependency_version')} "
+            f"(posterior). Mueve '{v.get('depends_on')}' a la versión {ver} o antes."
+        )
+    if reason == "prerequisite_after_a_table":
+        return (
+            f"El objeto '{obj}' ({otype}) está en la versión {ver}, pero debe ir en la "
+            f"versión {v.get('must_be_at_most')} o antes (los prerequisitos van antes de "
+            "cualquier tabla)."
+        )
+    if reason == "must_be_after_all_tables":
+        return (
+            f"El objeto '{obj}' ({otype}) está en la versión {ver}, pero debe ir en la "
+            f"versión {v.get('must_be_at_least')} o después (después de TODAS las tablas)."
+        )
+    if reason == "schema_after_data":
+        return (
+            f"La versión {ver} es de estructura, pero hay una versión de datos anterior "
+            f"(la {v.get('first_data_version')}). Las versiones de datos deben ir siempre al final."
+        )
+    if reason == "data_table_structure_not_included":
+        return (
+            f"Se pidieron datos de la tabla '{obj}', pero su estructura (CREATE TABLE) no "
+            "está incluida en ninguna versión del blueprint."
+        )
+    if reason == "data_before_table_structure":
+        return (
+            f"Los datos de '{obj}' están en la versión {ver}, pero la estructura de esa "
+            f"tabla está en la versión {v.get('table_structure_version')} (igual o "
+            "posterior). Los datos deben ir DESPUÉS de crear la tabla."
+        )
+    return f"Revisa la asignación de '{obj}' en manual_layout (versión {ver})."
+
+
 def validate_manual_layout(
     selected: list[DumpStatement],
     seed_by_table: dict[str, SeedResult],
     buckets: list[dict],
+    *,
+    skipped_data_tables: set[str] | None = None,
 ) -> list[dict]:
     """
     Valida que un layout manual sea aplicable (forward-only) y devuelve TODAS las
     violaciones. Vacío => válido. Los números de ``version`` en las violaciones son
-    1-based (posición del bucket). Reglas:
+    1-based (posición del bucket). Cada violación incluye ``hint``: mensaje legible en
+    español con los datos ya sustituidos (para que el frontend lo muestre tal cual sin
+    mantener su propia tabla de traducción). Reglas:
 
     1. Cada bucket es de esquema XOR de datos (no mezcla), y no vacío.
     2. Cobertura: todo objeto/tabla seleccionado va en exactamente un bucket; sin
@@ -318,6 +405,12 @@ def validate_manual_layout(
     5. Vistas/matviews/rutinas: en un bucket >= el de TODAS las tablas (conservador).
     6. Datos: los buckets de datos van DESPUÉS de todos los de esquema; la estructura de
        la tabla sembrada debe estar en un bucket ANTERIOR.
+
+    ``skipped_data_tables``: nombres de tablas pedidas en ``data_tables`` que NO llegaron a
+    extraerse (sin filas, sin PK, tipo no soportado, oversize…). Referenciarlas en un bucket
+    NO es una violación (la tabla simplemente no genera versión — se reporta en
+    ``skipped_tables`` de la respuesta, igual que en ``single``/``by_class``); solo es
+    violación (``unknown_data_table``) si el bucket referencia una tabla que NUNCA se pidió.
     """
     violations: list[dict] = []
 
@@ -374,11 +467,14 @@ def validate_manual_layout(
         if key not in selected_keys:
             violations.append(_violation(key[1], key[0], i, "unknown_object"))
 
+    skipped_names = skipped_data_tables or set()
     for table in seed_by_table:
         if table not in data_bucket:
             violations.append(_violation(table, "data", 0, "unassigned_data_table"))
     for table, i in data_bucket.items():
-        if table not in seed_by_table:
+        if table not in seed_by_table and table not in skipped_names:
+            # Referencia a una tabla que NUNCA se pidió en 'data_tables' (typo/omisión real);
+            # si se pidió pero se omitió por un guardrail, NO es violación (ver docstring).
             violations.append(_violation(table, "data", i, "unknown_data_table"))
 
     # --- Dependencias explícitas --------------------------------------------- #
@@ -434,4 +530,6 @@ def validate_manual_layout(
             violations.append(_violation(table, "data", i, "data_before_table_structure",
                                          table_structure_version=tbucket))
 
+    for v in violations:
+        v["hint"] = _hint(v)
     return violations

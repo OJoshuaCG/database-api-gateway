@@ -164,6 +164,38 @@ def test_manual_data_before_schema_is_flagged():
     assert "schema_after_data" in reasons or "data_before_table_structure" in reasons
 
 
+def test_manual_skipped_data_table_in_own_bucket_is_not_a_violation():
+    """
+    Una tabla pedida en 'data_tables' pero omitida por un guardrail (vacía, sin PK, etc.)
+    referenciada en su propio bucket NO debe bloquear la creación: se omite en silencio
+    (igual que en single/by_class), no es un error de layout.
+    """
+    stmts = [_tbl("cat"), _tbl("empty_cat")]
+    buckets = [
+        _bucket(objects=[("table", "cat"), ("table", "empty_cat")]),
+        _bucket(data_tables=["cat"]),
+        _bucket(data_tables=["empty_cat"]),  # 'empty_cat' nunca se extrajo (vacía)
+    ]
+    violations = sl.validate_manual_layout(
+        stmts, {"cat": _seed("cat")}, buckets, skipped_data_tables={"empty_cat"}
+    )
+    assert violations == []
+
+
+def test_manual_data_table_never_requested_is_still_a_violation():
+    """
+    Si el bucket referencia una tabla que NUNCA se pidió en 'data_tables' (ni extraída ni
+    en skipped_data_tables), sigue siendo un error real (typo/omisión del usuario).
+    """
+    stmts = [_tbl("cat")]
+    buckets = [
+        _bucket(objects=[("table", "cat")]),
+        _bucket(data_tables=["cat_typo"]),
+    ]
+    violations = sl.validate_manual_layout(stmts, {}, buckets, skipped_data_tables=set())
+    assert any(v["reason"] == "unknown_data_table" and v["object"] == "cat_typo" for v in violations)
+
+
 # --------------------------------------------------------------------------- #
 # snapshot_data.render_value                                                   #
 # --------------------------------------------------------------------------- #
