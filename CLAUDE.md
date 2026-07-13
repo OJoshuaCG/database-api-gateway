@@ -571,6 +571,49 @@ Puente entre el **plano en vivo** (motor real) y el **inventario** del gateway. 
   si trae objetos procedurales queda atado a `source_engine` (cross-engine guard → 422); el snapshot
   es DDL **no confiable** del motor (revisar antes de aplicar en masa).
 
+## Módulo de Diff de Esquema y Sincronización entre BDs
+
+Compara la **estructura** de dos BDs gestionadas del mismo motor (o MySQL↔MariaDB) y, a partir
+del diff, **adopta** el resultado como nueva versión de blueprint (Opción A) o lo **ejecuta
+directo** ad-hoc (Opción B). Guía de uso: `docs/features/schema-comparison.md`.
+
+- **Arquitectura de 3 capas** (`app/services/db_admin/`): (1) introspección →
+  `ServerAdapter.structural_snapshot(database) -> SchemaSnapshot` (DTOs nuevos en `dtos.py`:
+  tablas extendidas + vistas/rutinas/triggers/secuencias/enums/extensions/events); (2)
+  **diff puro** `schema_diff.py::diff_snapshots(source, target) -> SchemaDiff` (sin motor, 100%
+  testeable — matching por **definición**, no por nombre autogenerado; normalización
+  anti-falsos-positivos de tipos/defaults/collation; clasificación destructiva fail-closed por
+  ítem); (3) `ServerAdapter.render_diff(diff) -> list[RenderedStatement]` (DDL por dialecto).
+- **Endpoints** (`app/routes/v1/schema_comparisons.py`): `POST /schema-comparisons` (snapshotea
+  ambas BDs, diffea, persiste), `GET /schema-comparisons/{id}` (resumen), `GET .../items`
+  (DDL paginado, dry-run obligatorio), `POST .../adopt` (Opción A, requiere `model_id` en el
+  target, reusa `ModelMigrationController.create_migration`), `POST .../execute` (Opción B,
+  409 si el target TIENE `model_id`; `mode: all|all_except_destructive|custom` +
+  `confirm_target_name` + `confirm_token` verificable con
+  `SchemaComparisonController.execution_token(...)`; usa `MigrationRunner.execute_adhoc`, sin
+  Alembic ni `_gw_v_{slug}`).
+- **Modelos**: `SchemaComparison`/`SchemaComparisonItem` (persistidos, con `source_fingerprint`/
+  `target_fingerprint` — anti-TOCTOU: re-snapshotear y recomparar antes de adoptar/ejecutar, 409
+  sin `force` si difiere).
+- **Gotchas**: dirección `source`(deseado)/`target`(a modificar) siempre explícita, nunca
+  inferida; el modo automático `all_except_destructive` excluye TODO lo no-demostrablemente-
+  aditivo (no solo `DROP`: narrowing de tipo, cambio de collation/charset, `possible_rename_of`);
+  objetos procedurales (vistas/rutinas/triggers/events) llevan `requires_individual_review` y
+  **nunca** entran en `all`/`all_except_destructive`, solo `custom`; PostgreSQL cubre solo el
+  schema `public` (`scope_note` en la respuesta); v1 **no** autogenera `RENAME` (DROP+CREATE +
+  heurística `possible_rename_of` advisory). **Límite conocido confirmado contra motor real**:
+  adoptar (Opción A) una rutina/trigger MySQL/MariaDB con cuerpo `BEGIN...END` puede fallar
+  porque `sql_dialect.py::split_sql_statements` (Plan 02) no reconoce ese bloque (solo
+  dollar-quoting de PG) — Opción B no tiene este problema (no vuelve a partir el SQL ya
+  renderizado); ver detalle en la guía de la feature.
+  Verificación e2e contra motores reales (`scripts/verify_schema_diff_e2e.py`, requiere Docker):
+  **ejecutada — 219 checks / 0 fallos** en MySQL/MariaDB/PostgreSQL. Migración Alembic
+  (`schema_comparisons`/`schema_comparison_items`) verificada con ciclo completo
+  upgrade/downgrade/upgrade contra **MariaDB real** (no solo SQLite): se encontró y corrigió
+  un `downgrade()` roto (soltaba un índice FK-backed antes de `drop_table`, que MySQL/MariaDB
+  rechaza) — mismo patrón presente en migraciones anteriores del repo, no corregidas (fuera
+  de alcance; pendiente de auditoría propia).
+
 ## Documentación
 
 - `docs/` — documentación completa por feature (ver `docs/features/model-migrations.md`
