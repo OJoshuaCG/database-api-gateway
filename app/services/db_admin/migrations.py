@@ -260,20 +260,22 @@ class MigrationRunner:
     # Locking (advisory) en la BD destino                                 #
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _lock_key(managed_db_id: int) -> int:
+    def _lock_key(lock_key: int) -> int:
         # int() explícito: blinda la interpolación en el SQL del lock aunque un
-        # llamador interno futuro pase un str (defensa en profundidad; el path param
-        # de FastAPI ya es int).
-        return int(managed_db_id)
+        # llamador interno futuro pase un str (defensa en profundidad). El valor puede
+        # ser un managed_database_id real (positivo) o una clave sintética NEGATIVA de
+        # una BD sin gestionar (ver SchemaComparisonController); en ambos casos ya viene
+        # como int producido por el propio código, nunca texto de usuario.
+        return int(lock_key)
 
-    def _acquire_lock(self, conn, engine: EngineType, managed_db_id: int) -> None:
+    def _acquire_lock(self, conn, engine: EngineType, lock_key: int) -> None:
         """
         Advisory lock por BD con semántica HOMOGÉNEA entre motores: si no se obtiene
         dentro de ``_LOCK_TIMEOUT_S``, se aborta con 409 (no se bloquea indefinidamente
         ni se asume el lock). MySQL: GET_LOCK con timeout. PostgreSQL: pg_try_advisory_lock
         en sondeo (pg_advisory_lock bloqueante no respeta lock_timeout).
         """
-        key = self._lock_key(managed_db_id)
+        key = self._lock_key(lock_key)
         if engine == EngineType.postgresql:
             deadline = time.monotonic() + _LOCK_TIMEOUT_S
             while True:
@@ -299,11 +301,11 @@ class MigrationRunner:
                 "(¿otra migración en curso?). Reintente más tarde."
             ),
             status_code=409,
-            context={"managed_database_id": key},
+            context={"lock_key": key},
         )
 
-    def _release_lock(self, conn, engine: EngineType, managed_db_id: int) -> None:
-        key = self._lock_key(managed_db_id)
+    def _release_lock(self, conn, engine: EngineType, lock_key: int) -> None:
+        key = self._lock_key(lock_key)
         try:
             if engine == EngineType.postgresql:
                 conn.exec_driver_sql(f"SELECT pg_advisory_unlock({key})")
@@ -504,12 +506,19 @@ class MigrationRunner:
         *,
         db_name: str,
         engine: EngineType,
-        managed_db_id: int,
+        lock_key: int,
         statements: list[str],
     ) -> list[StatementResult]:
         """
         Ejecuta ``statements`` DDL directamente sobre la BD destino, UNA por una,
         deteniéndose en el primer fallo (igual que ``_apply_one``).
+
+        ``lock_key`` es la clave del advisory lock por BD: para una BD gestionada es su
+        ``managed_database_id`` (positivo, comparte lock con ``apply``/``rollback`` de esa
+        misma BD); para una BD SIN gestionar es una clave sintética NEGATIVA estable
+        derivada de ``(server_id, database_name)`` (ver ``SchemaComparisonController``),
+        que nunca colisiona con un id real y serializa ejecuciones concurrentes sobre la
+        misma BD física. El controller la resuelve; el runner solo la usa como entero.
 
         Reutiliza las primitivas ya probadas del runner: conexión en AUTOCOMMIT
         (``database_connection``), advisory lock por BD (``_acquire_lock``/
@@ -530,7 +539,7 @@ class MigrationRunner:
         try:
             with database_connection(target, db_name) as conn:
                 conn = conn.execution_options(isolation_level="AUTOCOMMIT")
-                self._acquire_lock(conn, engine, managed_db_id)
+                self._acquire_lock(conn, engine, lock_key)
                 try:
                     for i, stmt in enumerate(statements):
                         t0 = time.monotonic()
@@ -557,7 +566,7 @@ class MigrationRunner:
                             )
                             break  # no continuar tras un fallo (posible estado parcial)
                 finally:
-                    self._release_lock(conn, engine, managed_db_id)
+                    self._release_lock(conn, engine, lock_key)
         except AppHttpException:
             raise
         except SQLAlchemyError as exc:

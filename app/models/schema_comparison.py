@@ -6,9 +6,16 @@ Persistir la comparación (en vez de recalcularla o confiar en un token del clie
 es una decisión de seguridad: el servidor es la ÚNICA fuente de verdad del SQL que
 se ejecutará con la credencial pseudo-root. Guardamos:
 
-- La DIRECCIÓN explícita: ``source_database_id`` (estado deseado/referencia) y
-  ``target_database_id`` (la BD que se modificaría). Todo el DDL derivado es "qué
-  correr sobre TARGET para que quede como SOURCE".
+- La DIRECCIÓN explícita: el par SOURCE (estado deseado/referencia) y TARGET (la BD
+  que se modificaría). Todo el DDL derivado es "qué correr sobre TARGET para que quede
+  como SOURCE". Cada lado se identifica SIEMPRE por su BD física —
+  ``*_server_id`` + ``*_database_name`` (NOT NULL)— y, ADEMÁS, por su
+  ``*_database_id`` (``managed_database_id``) si esa BD está registrada en el
+  inventario, o ``NULL`` si es una BD cruda no gestionada. Esto permite comparar (y con
+  Opción B, ejecutar sobre) cualquier BD de un servidor dado de alta, no solo las
+  adoptadas/provisionadas. Una referencia cruda a una BD que YA está en el inventario
+  se auto-resuelve a su ``managed_database_id`` al crear la comparación (mismo lock,
+  misma cuarentena) para que nunca se trate distinto de pasar el id directamente.
 - Los ``*_fingerprint``: hash estable del snapshot normalizado de cada lado al
   momento de comparar. Antes de adoptar/ejecutar se re-snapshotea y se recompara
   (anti-TOCTOU): si el esquema cambió, se rechaza (409) — sin ``force``.
@@ -37,20 +44,48 @@ class SchemaComparison(Base, TimestampMixin):
         primary_key=True, autoincrement=True, comment="ID único de la comparación"
     )
 
-    source_database_id: Mapped[int] = mapped_column(
+    source_server_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("managed_databases.id", ondelete="CASCADE"),
+        ForeignKey("servers.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="BD de referencia (estado deseado). El diff describe cómo llevar TARGET a este estado",
+        comment="Servidor de la BD source (siempre poblado, aun si la BD no está en inventario)",
     )
 
-    target_database_id: Mapped[int] = mapped_column(
+    target_server_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("managed_databases.id", ondelete="CASCADE"),
+        ForeignKey("servers.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="BD que se modificaría (recibe el DDL derivado)",
+        comment="Servidor de la BD target (siempre poblado, aun si la BD no está en inventario)",
+    )
+
+    source_database_name: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="Nombre de la BD source en el motor (siempre poblado)",
+    )
+
+    target_database_name: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="Nombre de la BD target en el motor (siempre poblado)",
+    )
+
+    source_database_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("managed_databases.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        comment="managed_database_id del source si está en el inventario; NULL si es una BD cruda no registrada",
+    )
+
+    target_database_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("managed_databases.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        comment="managed_database_id del target si está en el inventario; NULL si es una BD cruda no registrada",
     )
 
     source_engine: Mapped[str] = mapped_column(
@@ -100,5 +135,6 @@ class SchemaComparison(Base, TimestampMixin):
     def __repr__(self) -> str:
         return (
             f"<SchemaComparison(id={self.id}, "
-            f"source={self.source_database_id}, target={self.target_database_id})>"
+            f"source={self.source_server_id}/{self.source_database_name}, "
+            f"target={self.target_server_id}/{self.target_database_name})>"
         )

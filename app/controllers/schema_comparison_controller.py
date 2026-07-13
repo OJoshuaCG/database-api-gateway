@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
@@ -41,6 +42,7 @@ from app.core.environments import (
     SCHEMA_COMPARISON_MAX_SQL_BYTES,
     SCHEMA_COMPARISON_TTL_HOURS,
 )
+from app.core.remote_engine import ServerTarget
 from app.exceptions import AppHttpException
 from app.models.enums import EngineType, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
@@ -79,6 +81,51 @@ def _snapshot_fingerprint(snapshot) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True)
+class _ResolvedSide:
+    """
+    Un lado (source|target) ya resuelto a datos planos, desacoplado de la sesión ORM.
+
+    ``managed_id`` es el ``managed_database_id`` si la BD está en el inventario, o
+    ``None`` si es una BD cruda no registrada. ``target`` (``ServerTarget``) lleva la
+    credencial pseudo-root descifrada en memoria — se usa el tiempo mínimo para abrir la
+    conexión y nunca se serializa/loguea.
+    """
+
+    server_id: int
+    database_name: str
+    engine: str
+    target: ServerTarget
+    managed_id: int | None
+    model_id: int | None
+    quarantined: bool
+    # True solo para una referencia CRUDA que no existe (aún) en el inventario: hay que
+    # validar su existencia real en el motor en vivo antes de snapshotear.
+    needs_live_check: bool
+
+
+def _synthetic_lock_key(server_id: int, database_name: str) -> int:
+    """
+    Clave de advisory lock SINTÉTICA para una BD SIN gestionar (sin managed_database_id).
+
+    Propiedades garantizadas (críticas para ``pg_try_advisory_lock``, que interpola el
+    valor DIRECTO en el SQL):
+    - **Siempre negativa** → nunca colisiona con un ``managed_database_id`` real
+      (autoincrement, siempre positivo): un id real y una BD sin gestionar nunca comparten
+      lock por accidente.
+    - **Determinística** para el mismo ``(server_id, database_name)`` → dos ejecuciones
+      concurrentes sobre la MISMA BD física sin gestionar SÍ se serializan entre sí.
+    - **bigint firmado válido**: la magnitud se acota a 62 bits, así que el resultado cae
+      en ``[-2**62, -1]`` (holgado dentro de ``[-2**63, 2**63-1]``).
+
+    El valor lo produce SIEMPRE este código a partir de un hash — nunca es texto de
+    usuario — así que interpolarlo en el SQL del lock es seguro.
+    """
+    digest = hashlib.sha256(f"{server_id}:{database_name}".encode("utf-8")).digest()
+    magnitude = int.from_bytes(digest[:8], "big") & ((1 << 62) - 1)
+    return -(magnitude + 1)  # +1 garantiza estrictamente negativo (nunca 0)
+
+
 class SchemaComparisonController:
     def __init__(self):
         self.db = Database(DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
@@ -99,6 +146,106 @@ class SchemaComparisonController:
                 context={"managed_database_id": db_id},
             )
         return md
+
+    def _resolve_side(
+        self,
+        session,
+        *,
+        database_id: int | None,
+        server_id: int | None,
+        database_name: str | None,
+    ) -> _ResolvedSide:
+        """
+        Resuelve un lado (source|target) a ``_ResolvedSide`` DENTRO de la sesión (la
+        credencial se descifra mientras la sesión sigue abierta). Se asume que el schema
+        Pydantic ya garantizó EXACTAMENTE una representación (id, o server_id+name).
+
+        - Por ``database_id``: ``ManagedDatabase`` por id (404 si no existe) → gestionada.
+        - Por ``(server_id + database_name)``: se resuelve el ``Server`` (404) y se
+          AUTO-RESUELVE contra el inventario: si ya existe un ``ManagedDatabase`` para ese
+          par exacto (garantizado único por ``UniqueConstraint(server_id, name)``), se
+          trata IDÉNTICO a haber pasado su id (mismo ``managed_id`` → mismo lock, misma
+          cuarentena, Opción A disponible). Si no existe, queda "sin gestionar"
+          (``managed_id=None``) y se marca ``needs_live_check`` para validar su existencia
+          real en el motor antes de snapshotear.
+        """
+        if database_id is not None:
+            md = self._db_or_404(session, database_id)
+            server = get_server_or_404(session, md.server_id)
+            return _ResolvedSide(
+                server_id=md.server_id,
+                database_name=md.name,
+                engine=engine_value(server),
+                target=build_target(server),
+                managed_id=md.id,
+                model_id=md.model_id,
+                quarantined=md.status == ProvisionStatus.error,
+                needs_live_check=False,
+            )
+
+        # Referencia cruda: (server_id + database_name).
+        server = get_server_or_404(session, server_id)
+        md = (
+            session.query(ManagedDatabase)
+            .filter(
+                ManagedDatabase.server_id == server_id,
+                ManagedDatabase.name == database_name,
+            )
+            .one_or_none()
+        )
+        if md is not None:
+            # Auto-resolución: la BD cruda YA está en el inventario → trátala como el id.
+            return _ResolvedSide(
+                server_id=server_id,
+                database_name=md.name,
+                engine=engine_value(server),
+                target=build_target(server),
+                managed_id=md.id,
+                model_id=md.model_id,
+                quarantined=md.status == ProvisionStatus.error,
+                needs_live_check=False,
+            )
+        return _ResolvedSide(
+            server_id=server_id,
+            database_name=database_name,
+            engine=engine_value(server),
+            target=build_target(server),
+            managed_id=None,
+            model_id=None,
+            quarantined=False,
+            needs_live_check=True,
+        )
+
+    @staticmethod
+    def _assert_live_exists(side: _ResolvedSide) -> None:
+        """
+        Para una referencia CRUDA no registrada: valida que la BD exista de verdad en el
+        motor en vivo (404 explícito y accionable, en vez de un error opaco del driver al
+        intentar snapshotear una BD inexistente). No-op si la BD ya está en el inventario.
+        """
+        if not side.needs_live_check:
+            return
+        if side.database_name not in get_adapter(side.target).list_databases():
+            raise AppHttpException(
+                message=(
+                    f"La base de datos '{side.database_name}' no existe en el servidor "
+                    f"{side.server_id} (o es una BD del sistema, no gestionable)."
+                ),
+                status_code=404,
+                context={"server_id": side.server_id, "database": side.database_name},
+            )
+
+    @staticmethod
+    def _audit_target_kwargs(managed_id: int | None) -> dict:
+        """
+        kwargs de auditoría (``target_type``/``target_id``) del target: si está en el
+        inventario → ``managed_database`` + su id; si es una BD cruda sin registro →
+        ``server_database`` + ``target_id=None`` (no hay FK que lo represente; el
+        servidor + nombre van en el ``detail``).
+        """
+        if managed_id is not None:
+            return {"target_type": "managed_database", "target_id": managed_id}
+        return {"target_type": "server_database", "target_id": None}
 
     @staticmethod
     def _comparison_or_404(session, comparison_id: int) -> SchemaComparison:
@@ -156,6 +303,10 @@ class SchemaComparisonController:
         )
         return {
             "id": comp.id,
+            "source_server_id": comp.source_server_id,
+            "source_database_name": comp.source_database_name,
+            "target_server_id": comp.target_server_id,
+            "target_database_name": comp.target_database_name,
             "source_database_id": comp.source_database_id,
             "target_database_id": comp.target_database_id,
             "source_engine": comp.source_engine,
@@ -193,46 +344,67 @@ class SchemaComparisonController:
     # Fase 4 — Crear comparación                                          #
     # ------------------------------------------------------------------ #
     def create_comparison(
-        self, source_database_id: int, target_database_id: int, *, admin: dict | None = None
+        self,
+        *,
+        source_database_id: int | None = None,
+        source_server_id: int | None = None,
+        source_database_name: str | None = None,
+        target_database_id: int | None = None,
+        target_server_id: int | None = None,
+        target_database_name: str | None = None,
+        admin: dict | None = None,
     ) -> dict:
-        if source_database_id == target_database_id:
-            raise AppHttpException(
-                message="source y target no pueden ser la misma base de datos.",
-                status_code=422,
-                context={"database_id": source_database_id},
-            )
-
-        # 1) Resolver ambas BDs + servidores + motores DENTRO de la sesión (la credencial
-        #    se descifra mientras la sesión sigue abierta), y validar compatibilidad.
+        # 1) Resolver ambos lados DENTRO de la sesión (la credencial se descifra mientras
+        #    la sesión sigue abierta). Cada lado acepta id de inventario o (server+nombre)
+        #    crudo; una referencia cruda a una BD ya registrada se auto-resuelve a su id.
         session = self._session()
         try:
-            src_md = self._db_or_404(session, source_database_id)
-            tgt_md = self._db_or_404(session, target_database_id)
-            src_server = get_server_or_404(session, src_md.server_id)
-            tgt_server = get_server_or_404(session, tgt_md.server_id)
-            src_engine = engine_value(src_server)
-            tgt_engine = engine_value(tgt_server)
-            if not self._engines_compatible(src_engine, tgt_engine):
-                raise AppHttpException(
-                    message=(
-                        f"Motores incompatibles: no se puede comparar '{src_engine}' con "
-                        f"'{tgt_engine}'. Se permite MySQL↔MariaDB; PostgreSQL solo con PostgreSQL."
-                    ),
-                    status_code=422,
-                    context={"source_engine": src_engine, "target_engine": tgt_engine},
-                )
-            src_target = build_target(src_server)
-            tgt_target = build_target(tgt_server)
-            src_name, tgt_name = src_md.name, tgt_md.name
-            tgt_server_id = tgt_md.server_id
+            src = self._resolve_side(
+                session,
+                database_id=source_database_id,
+                server_id=source_server_id,
+                database_name=source_database_name,
+            )
+            tgt = self._resolve_side(
+                session,
+                database_id=target_database_id,
+                server_id=target_server_id,
+                database_name=target_database_name,
+            )
         finally:
             session.close()
 
-        # 2) Snapshots (motor, solo lectura) + diff PURO + render para el TARGET.
-        source_snap = get_adapter(src_target).structural_snapshot(src_name)
-        target_snap = get_adapter(tgt_target).structural_snapshot(tgt_name)
+        # 2) Identidad física: source y target no pueden ser la MISMA BD. Se compara por
+        #    (server_id, nombre) — así cubre id==id, id vs cruda y cruda vs cruda que
+        #    apunten a la misma BD real (tras la auto-resolución quedan equivalentes).
+        if src.server_id == tgt.server_id and src.database_name == tgt.database_name:
+            raise AppHttpException(
+                message="source y target no pueden ser la misma base de datos.",
+                status_code=422,
+                context={"server_id": tgt.server_id, "database": tgt.database_name},
+            )
+
+        # 3) Compatibilidad de motor (antes de tocar el motor: fail temprano y barato).
+        if not self._engines_compatible(src.engine, tgt.engine):
+            raise AppHttpException(
+                message=(
+                    f"Motores incompatibles: no se puede comparar '{src.engine}' con "
+                    f"'{tgt.engine}'. Se permite MySQL↔MariaDB; PostgreSQL solo con PostgreSQL."
+                ),
+                status_code=422,
+                context={"source_engine": src.engine, "target_engine": tgt.engine},
+            )
+
+        # 4) Existencia real en el motor de las BDs crudas no registradas (404 explícito
+        #    antes de snapshotear). No-op para las que ya están en el inventario.
+        self._assert_live_exists(src)
+        self._assert_live_exists(tgt)
+
+        # 5) Snapshots (motor, solo lectura) + diff PURO + render para el TARGET.
+        source_snap = get_adapter(src.target).structural_snapshot(src.database_name)
+        target_snap = get_adapter(tgt.target).structural_snapshot(tgt.database_name)
         diff = diff_snapshots(source_snap, target_snap)
-        rendered = get_adapter(tgt_target).render_diff(diff)
+        rendered = get_adapter(tgt.target).render_diff(diff)
 
         # 3) Guardrails de tamaño (fail temprano; no materializar payloads enormes).
         if len(rendered) > SCHEMA_COMPARISON_MAX_ITEMS:
@@ -255,17 +427,23 @@ class SchemaComparisonController:
                 context={"bytes": total_bytes, "max": SCHEMA_COMPARISON_MAX_SQL_BYTES},
             )
 
-        # 4) Persistir cabecera + ítems + fingerprints.
+        # 6) Persistir cabecera + ítems + fingerprints. La BD física de cada lado
+        #    (server_id + nombre) se guarda SIEMPRE; el managed_database_id solo si esa
+        #    BD está en el inventario (NULL si es cruda).
         src_fp = _snapshot_fingerprint(source_snap)
         tgt_fp = _snapshot_fingerprint(target_snap)
         expires = _utcnow() + timedelta(hours=SCHEMA_COMPARISON_TTL_HOURS)
         session = self._session()
         try:
             comp = SchemaComparison(
-                source_database_id=source_database_id,
-                target_database_id=target_database_id,
-                source_engine=src_engine,
-                target_engine=tgt_engine,
+                source_server_id=src.server_id,
+                source_database_name=src.database_name,
+                target_server_id=tgt.server_id,
+                target_database_name=tgt.database_name,
+                source_database_id=src.managed_id,
+                target_database_id=tgt.managed_id,
+                source_engine=src.engine,
+                target_engine=tgt.engine,
                 source_fingerprint=src_fp,
                 target_fingerprint=tgt_fp,
                 cross_flavor_warning=diff.cross_flavor_warning,
@@ -304,13 +482,12 @@ class SchemaComparisonController:
         audit.record(
             "schema_comparison.create",
             admin=admin,
-            target_type="managed_database",
-            target_id=target_database_id,
-            server_id=tgt_server_id,
+            **self._audit_target_kwargs(tgt.managed_id),
+            server_id=tgt.server_id,
             touched_engine=True,  # se snapshotearon ambos motores (solo lectura)
             detail=(
-                f"comparación {comp_id}: source={source_database_id} vs "
-                f"target={target_database_id}, {len(rendered)} sentencia(s)"
+                f"comparación {comp_id}: source={src.server_id}/{src.database_name} vs "
+                f"target={tgt.server_id}/{tgt.database_name}, {len(rendered)} sentencia(s)"
             ),
         )
         return result
@@ -364,18 +541,24 @@ class SchemaComparisonController:
     # ------------------------------------------------------------------ #
     # Anti-TOCTOU                                                         #
     # ------------------------------------------------------------------ #
-    def _assert_fingerprint(self, managed_db_id: int, stored_fp: str, *, label: str) -> None:
-        """Re-snapshotea la BD y compara el fingerprint contra el guardado (409 si difiere)."""
+    def _assert_fingerprint(
+        self, server_id: int, database_name: str, stored_fp: str, *, label: str
+    ) -> None:
+        """
+        Re-snapshotea la BD física (``server_id`` + ``database_name``) y compara el
+        fingerprint contra el guardado (409 si difiere). Keying por servidor+nombre —
+        no por ``managed_database_id`` — para funcionar igual con BDs gestionadas y crudas.
+        """
         session = self._session()
         try:
-            md = self._db_or_404(session, managed_db_id)
-            server = get_server_or_404(session, md.server_id)
+            server = get_server_or_404(session, server_id)
             target = build_target(server)
-            db_name = md.name
         finally:
             session.close()
 
-        current_fp = _snapshot_fingerprint(get_adapter(target).structural_snapshot(db_name))
+        current_fp = _snapshot_fingerprint(
+            get_adapter(target).structural_snapshot(database_name)
+        )
         if current_fp != stored_fp:
             raise AppHttpException(
                 message=(
@@ -383,17 +566,19 @@ class SchemaComparisonController:
                     "recalcúlala (POST /schema-comparisons) antes de continuar."
                 ),
                 status_code=409,
-                context={"managed_database_id": managed_db_id, "side": label},
+                context={"server_id": server_id, "database": database_name, "side": label},
             )
 
     def _verify_no_drift(self, comp: SchemaComparison, *, side: str = "target") -> None:
         """Recompara fingerprints del target (y opcionalmente el source) — anti-TOCTOU."""
         self._assert_fingerprint(
-            comp.target_database_id, comp.target_fingerprint, label="target"
+            comp.target_server_id, comp.target_database_name, comp.target_fingerprint,
+            label="target",
         )
         if side == "both":
             self._assert_fingerprint(
-                comp.source_database_id, comp.source_fingerprint, label="source"
+                comp.source_server_id, comp.source_database_name, comp.source_fingerprint,
+                label="source",
             )
 
     # ------------------------------------------------------------------ #
@@ -413,7 +598,30 @@ class SchemaComparisonController:
         try:
             comp = self._comparison_or_404(session, comparison_id)
             self._assert_not_expired(comp)
-            tgt_md = self._db_or_404(session, comp.target_database_id)
+            # Re-resolver el estado ACTUAL del target por (server_id, nombre): la Opción A
+            # solo existe si el target está en el inventario Y tiene blueprint. Se re-resuelve
+            # (no se confía en el managed_database_id persistido, que pudo quedar obsoleto).
+            tgt_md = (
+                session.query(ManagedDatabase)
+                .filter(
+                    ManagedDatabase.server_id == comp.target_server_id,
+                    ManagedDatabase.name == comp.target_database_name,
+                )
+                .one_or_none()
+            )
+            if tgt_md is None:
+                raise AppHttpException(
+                    message=(
+                        "El target no está en el inventario del gateway (es una BD cruda no "
+                        "registrada): la adopción como versión de blueprint (Opción A) no está "
+                        "disponible. Usa /execute (Opción B)."
+                    ),
+                    status_code=422,
+                    context={
+                        "server_id": comp.target_server_id,
+                        "database": comp.target_database_name,
+                    },
+                )
             if tgt_md.model_id is None:
                 raise AppHttpException(
                     message=(
@@ -426,6 +634,7 @@ class SchemaComparisonController:
             model_id = tgt_md.model_id
             target_db_id = tgt_md.id
             target_server_id = tgt_md.server_id
+            target_db_name = tgt_md.name
             target_engine = comp.target_engine
             target_fp = comp.target_fingerprint
             # Extraer los ítems seleccionados YA como datos planos (la sesión se cierra).
@@ -434,7 +643,7 @@ class SchemaComparisonController:
             session.close()
 
         # Anti-TOCTOU antes de derivar/aplicar nada.
-        self._assert_fingerprint(target_db_id, target_fp, label="target")
+        self._assert_fingerprint(target_server_id, target_db_name, target_fp, label="target")
 
         # Ensamblar up_sql (orden de fase) y down_sql (orden inverso).
         selected.sort(key=lambda d: d["seq"])
@@ -574,18 +783,22 @@ class SchemaComparisonController:
     # Fase 6 — Opción B: ejecución directa ad-hoc                          #
     # ------------------------------------------------------------------ #
     @staticmethod
-    def execution_token(target_database_id: int, target_engine: str, resolved: list[dict]) -> str:
+    def execution_token(target_ref: str, target_engine: str, resolved: list[dict]) -> str:
         """
         Token de confirmación verificable: SHA256 del conjunto EXACTO a ejecutar
-        (``target_id`` + ``engine`` + lista ORDENADA de ``(sql, risk_flags)``).
+        (``target_ref`` + ``engine`` + lista ORDENADA de ``(sql, risk_flags)``).
+
+        ``target_ref`` liga el token a la BD física del target de forma UNIFORME para
+        BDs gestionadas y crudas: ``f"{target_server_id}:{target_database_name}"`` (ambos
+        SIEMPRE poblados), en vez del ``managed_database_id`` (que ahora puede ser NULL).
 
         Es un checksum de integridad, no un secreto: liga la confirmación del cliente
         al SQL que realmente vio. Si la selección cambia (o alguien reordena), el token
         no coincide. Se recomputa server-side y solo se usa para COMPARAR; nunca se
-        confía en el valor del cliente para otra cosa. El frontend reproduce este mismo
-        algoritmo sobre el DDL que muestra.
+        confía en el valor del cliente para otra cosa. El cliente obtiene el token de
+        ``/execute-preview`` (no lo recalcula) — este cambio es transparente para él.
         """
-        parts: list[str] = [str(target_database_id), str(target_engine)]
+        parts: list[str] = [str(target_ref), str(target_engine)]
         for d in resolved:
             parts.append(d["sql"])
             parts.append(json.dumps(d["risk"], sort_keys=True))
@@ -668,7 +881,10 @@ class SchemaComparisonController:
         try:
             comp = self._comparison_or_404(session, comparison_id)
             self._assert_not_expired(comp)
-            target_db_id = comp.target_database_id
+            # Ref estable (server+nombre, siempre poblado) para el token; el
+            # managed_database_id es solo informativo para el frontend (puede ser NULL).
+            target_ref = f"{comp.target_server_id}:{comp.target_database_name}"
+            target_managed_id = comp.target_database_id
             target_engine = comp.target_engine
             all_items = (
                 session.query(SchemaComparisonItem)
@@ -687,10 +903,10 @@ class SchemaComparisonController:
                 context={"comparison_id": comparison_id, "mode": mode},
             )
 
-        token = self.execution_token(target_db_id, target_engine, resolved)
+        token = self.execution_token(target_ref, target_engine, resolved)
         return {
             "comparison_id": comparison_id,
-            "target_database_id": target_db_id,
+            "target_database_id": target_managed_id,
             "mode": mode,
             "statements": [
                 {
@@ -720,10 +936,28 @@ class SchemaComparisonController:
         try:
             comp = self._comparison_or_404(session, comparison_id)
             self._assert_not_expired(comp)
-            tgt_md = self._db_or_404(session, comp.target_database_id)
+            target_server_id = comp.target_server_id
+            db_name = comp.target_database_name
+            target_engine = comp.target_engine
+            target_fp = comp.target_fingerprint
+            # Ref estable (server+nombre) para el token: uniforme entre BD gestionada y cruda.
+            target_ref = f"{target_server_id}:{db_name}"
+            # Re-resolver el estado gestionado ACTUAL del target por (server_id, nombre). No
+            # se confía en el managed_database_id persistido: si la BD se adoptó (y le
+            # asignaron blueprint) DESPUÉS de crear la comparación, hay que detectarlo aquí
+            # (el fingerprint no lo capta: adoptar no cambia la estructura). Consistente con
+            # el comportamiento previo, que releía el ManagedDatabase fresco en cada execute.
+            tgt_md = (
+                session.query(ManagedDatabase)
+                .filter(
+                    ManagedDatabase.server_id == target_server_id,
+                    ManagedDatabase.name == db_name,
+                )
+                .one_or_none()
+            )
             # Decisión #3: la ejecución directa está BLOQUEADA si el target tiene blueprint
             # (dejaría la BD desincronizada de su propio blueprint sin que el sistema se entere).
-            if tgt_md.model_id is not None:
+            if tgt_md is not None and tgt_md.model_id is not None:
                 raise AppHttpException(
                     message=(
                         "El target tiene un blueprint asignado: la ejecución directa (Opción B) "
@@ -732,23 +966,28 @@ class SchemaComparisonController:
                     status_code=409,
                     context={"target_database_id": tgt_md.id, "model_id": tgt_md.model_id},
                 )
-            # Confirmación por nombre (doble intención, human-meaningful).
-            if confirm_target_name != tgt_md.name:
+            # Confirmación por nombre (doble intención, human-meaningful) contra el nombre
+            # persistido de la BD física (siempre poblado, gestionada o cruda).
+            if confirm_target_name != db_name:
                 raise AppHttpException(
                     message=(
                         "Confirmación requerida: 'confirm_target_name' debe coincidir "
                         "exactamente con el nombre de la BD target."
                     ),
                     status_code=422,
-                    context={"target_database_id": tgt_md.id, "required": "confirm_target_name == name"},
+                    context={"database": db_name, "required": "confirm_target_name == name"},
                 )
-            target_db_id = tgt_md.id
-            target_server_id = tgt_md.server_id
-            target_engine = comp.target_engine
-            target_fp = comp.target_fingerprint
-            db_name = tgt_md.name
-            quarantined = tgt_md.status == ProvisionStatus.error
-            server = get_server_or_404(session, tgt_md.server_id)
+            # managed_id/cuarentena/lock_key según si la BD está o no en el inventario. Sin
+            # gestionar → no hay concepto de cuarentena (no hay fila que auditar) y el lock
+            # es la clave sintética negativa por (server_id, nombre).
+            managed_id = tgt_md.id if tgt_md is not None else None
+            quarantined = tgt_md is not None and tgt_md.status == ProvisionStatus.error
+            lock_key = (
+                managed_id
+                if managed_id is not None
+                else _synthetic_lock_key(target_server_id, db_name)
+            )
+            server = get_server_or_404(session, target_server_id)
             engine = EngineType(engine_value(server))
             target = build_target(server)
             all_items = (
@@ -769,7 +1008,7 @@ class SchemaComparisonController:
             )
 
         # Confirmación verificable (hash), recomputada server-side sobre el conjunto EXACTO.
-        expected = self.execution_token(target_db_id, target_engine, resolved)
+        expected = self.execution_token(target_ref, target_engine, resolved)
         if confirm_token != expected:
             raise AppHttpException(
                 message=(
@@ -781,7 +1020,8 @@ class SchemaComparisonController:
             )
 
         # Cuarentena: un fallo previo pudo dejar la BD en estado parcial (DDL no
-        # transaccional). Se exige inspección + force=true (igual que apply).
+        # transaccional). Se exige inspección + force=true (igual que apply). Solo aplica
+        # a BDs gestionadas: una BD cruda no tiene fila de estado, "nunca en cuarentena".
         if quarantined and not force:
             raise AppHttpException(
                 message=(
@@ -789,22 +1029,23 @@ class SchemaComparisonController:
                     "reintenta con force=true."
                 ),
                 status_code=409,
-                context={"target_database_id": target_db_id, "required": "force=true"},
+                context={"target_database_id": managed_id, "required": "force=true"},
             )
 
-        # Anti-TOCTOU JUSTO antes de ejecutar.
-        self._assert_fingerprint(target_db_id, target_fp, label="target")
+        # Anti-TOCTOU JUSTO antes de ejecutar (por servidor+nombre; gestionada o cruda).
+        self._assert_fingerprint(target_server_id, db_name, target_fp, label="target")
 
+        managed_note = "gestionada" if managed_id is not None else "sin gestionar"
         # Auditoría fail-closed ANTES de tocar el motor (persiste la intención completa).
         audit.record_intent(
             "schema_comparison.execute",
             admin=admin,
-            target_type="managed_database",
-            target_id=target_db_id,
+            **self._audit_target_kwargs(managed_id),
             server_id=target_server_id,
             detail=(
                 f"execute mode={mode}: {len(resolved)} sentencia(s) de la comparación "
-                f"{comparison_id} sobre '{db_name}' (target sin blueprint)"
+                f"{comparison_id} sobre servidor {target_server_id}/'{db_name}' "
+                f"({managed_note}, sin blueprint)"
             ),
         )
 
@@ -813,7 +1054,7 @@ class SchemaComparisonController:
             target,
             db_name=db_name,
             engine=engine,
-            managed_db_id=target_db_id,
+            lock_key=lock_key,
             statements=statements,
         )
         self._record_item_results(resolved, results)
@@ -824,18 +1065,18 @@ class SchemaComparisonController:
             "schema_comparison.execute",
             status="error" if failed else "success",
             admin=admin,
-            target_type="managed_database",
-            target_id=target_db_id,
+            **self._audit_target_kwargs(managed_id),
             server_id=target_server_id,
             touched_engine=True,
             detail=(
-                f"{applied_count}/{len(resolved)} sentencia(s) aplicada(s)"
+                f"{applied_count}/{len(resolved)} sentencia(s) aplicada(s) sobre "
+                f"servidor {target_server_id}/'{db_name}' ({managed_note})"
                 + (" (con fallo)" if failed else "")
             ),
         )
         return {
             "comparison_id": comparison_id,
-            "target_database_id": target_db_id,
+            "target_database_id": managed_id,
             "mode": mode,
             "total": len(resolved),
             "applied_count": applied_count,

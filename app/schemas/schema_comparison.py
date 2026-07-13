@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.model_migration import MigrationApplyOut, ModelMigrationOut
 
@@ -12,12 +12,80 @@ from app.schemas.model_migration import MigrationApplyOut, ModelMigrationOut
 # Entrada                                                                      #
 # --------------------------------------------------------------------------- #
 class SchemaComparisonCreate(BaseModel):
-    source_database_id: int = Field(
-        ..., ge=1, description="BD de referencia (estado deseado)."
+    """
+    Cada lado (source/target) se identifica de forma INDEPENDIENTE por UNA de dos vías:
+
+    - ``X_database_id``: una ``ManagedDatabase`` ya registrada en el inventario, o
+    - ``X_server_id`` + ``X_database_name``: una BD CRUDA de un servidor dado de alta,
+      aunque nunca se haya registrado en el inventario del gateway.
+
+    El ``model_validator`` exige EXACTAMENTE una de las dos representaciones por lado
+    (nunca ambas, nunca ninguna). Así se puede comparar cualquier BD de un servidor —
+    no solo las adoptadas/provisionadas.
+    """
+
+    source_database_id: int | None = Field(
+        None, ge=1, description="BD de referencia registrada (managed_database_id)."
     )
-    target_database_id: int = Field(
-        ..., ge=1, description="BD que se modificaría (recibe el DDL derivado)."
+    source_server_id: int | None = Field(
+        None, ge=1, description="Servidor del source (con source_database_name, BD cruda)."
     )
+    source_database_name: str | None = Field(
+        None,
+        min_length=1,
+        max_length=64,
+        description="Nombre de la BD source en el motor (con source_server_id, BD cruda).",
+    )
+    target_database_id: int | None = Field(
+        None, ge=1, description="BD a modificar registrada (managed_database_id)."
+    )
+    target_server_id: int | None = Field(
+        None, ge=1, description="Servidor del target (con target_database_name, BD cruda)."
+    )
+    target_database_name: str | None = Field(
+        None,
+        min_length=1,
+        max_length=64,
+        description="Nombre de la BD target en el motor (con target_server_id, BD cruda).",
+    )
+
+    @model_validator(mode="after")
+    def _exactly_one_representation_per_side(self) -> "SchemaComparisonCreate":
+        self._validate_side(
+            "source",
+            self.source_database_id,
+            self.source_server_id,
+            self.source_database_name,
+        )
+        self._validate_side(
+            "target",
+            self.target_database_id,
+            self.target_server_id,
+            self.target_database_name,
+        )
+        return self
+
+    @staticmethod
+    def _validate_side(
+        side: str, database_id: int | None, server_id: int | None, database_name: str | None
+    ) -> None:
+        by_id = database_id is not None
+        by_raw = server_id is not None or database_name is not None
+        if by_id and by_raw:
+            raise ValueError(
+                f"Para '{side}' indica SOLO {side}_database_id, o SOLO "
+                f"({side}_server_id + {side}_database_name), nunca ambas representaciones."
+            )
+        if not by_id and not by_raw:
+            raise ValueError(
+                f"Para '{side}' falta la identificación: indica {side}_database_id, o "
+                f"({side}_server_id + {side}_database_name)."
+            )
+        if by_raw and not (server_id is not None and database_name is not None):
+            raise ValueError(
+                f"Para '{side}' por servidor, {side}_server_id y {side}_database_name "
+                f"son AMBOS obligatorios."
+            )
 
 
 class AdoptComparisonIn(BaseModel):
@@ -92,8 +160,16 @@ class SchemaComparisonSummaryOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    source_database_id: int
-    target_database_id: int
+    # Siempre poblados: identifican la BD física de cada lado (servidor + nombre), venga
+    # el input por managed_database_id o por (server_id + database_name) crudo.
+    source_server_id: int
+    source_database_name: str
+    target_server_id: int
+    target_database_name: str
+    # managed_database_id de cada lado si esa BD está en el inventario; NULL si es una BD
+    # cruda no registrada. El frontend lo usa para saber si mostrar la Opción A (adopt).
+    source_database_id: int | None = None
+    target_database_id: int | None = None
     source_engine: str
     target_engine: str
     cross_flavor_warning: bool = False
@@ -154,7 +230,8 @@ class ExecutePreviewOut(BaseModel):
     """Resultado de resolver un modo/selección: sentencias exactas + token a reenviar."""
 
     comparison_id: int
-    target_database_id: int
+    # NULL si el target es una BD cruda no registrada en el inventario.
+    target_database_id: int | None = None
     mode: str
     statements: list[ExecutePreviewStatementOut] = Field(default_factory=list)
     confirm_token: str
@@ -173,7 +250,8 @@ class ExecuteComparisonOut(BaseModel):
     """Resultado de la ejecución directa ad-hoc (Opción B)."""
 
     comparison_id: int
-    target_database_id: int
+    # NULL si el target es una BD cruda no registrada en el inventario.
+    target_database_id: int | None = None
     mode: str
     total: int = 0
     applied_count: int = 0

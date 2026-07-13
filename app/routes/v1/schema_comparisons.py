@@ -40,7 +40,13 @@ router = APIRouter(prefix="/schema-comparisons", tags=["Schema Comparisons"])
 @limiter.limit("10/minute")
 def create_comparison(request: Request, admin: AdminDep, payload: SchemaComparisonCreate):
     result = SchemaComparisonController().create_comparison(
-        payload.source_database_id, payload.target_database_id, admin=admin
+        source_database_id=payload.source_database_id,
+        source_server_id=payload.source_server_id,
+        source_database_name=payload.source_database_name,
+        target_database_id=payload.target_database_id,
+        target_server_id=payload.target_server_id,
+        target_database_name=payload.target_database_name,
+        admin=admin,
     )
     return success(data=result, message="Comparación de esquema creada.")
 

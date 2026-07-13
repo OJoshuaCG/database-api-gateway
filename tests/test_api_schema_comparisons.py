@@ -111,6 +111,10 @@ class _FakeAdapter:
     def render_diff(self, diff):
         return list(self.rendered)
 
+    def list_databases(self):
+        # Las BDs "reales" del motor son exactamente las que tienen snapshot.
+        return list(self.snaps.keys())
+
 
 def _setup(admin_client, monkeypatch, *, port, target_has_model=False, rendered=None):
     sid = _server(admin_client, port)
@@ -135,7 +139,7 @@ def _create(admin_client, src_id, tgt_id):
     )
 
 
-def _fake_exec_ok(self, target, *, db_name, engine, managed_db_id, statements):
+def _fake_exec_ok(self, target, *, db_name, engine, lock_key, statements):
     return [
         StatementResult(
             index=i, status="applied", error=None, execution_ms=1,
@@ -145,8 +149,17 @@ def _fake_exec_ok(self, target, *, db_name, engine, managed_db_id, statements):
     ]
 
 
-def _token(admin_client, comparison_id, tgt_id, engine, mode, selected_ids=None):
-    """Reproduce el algoritmo documentado del confirm_token sobre los ítems reales."""
+def _token(admin_client, comparison_id, engine, mode, selected_ids=None):
+    """
+    Reproduce el algoritmo documentado del confirm_token sobre los ítems reales.
+
+    El primer componente del token es ahora ``f"{target_server_id}:{target_database_name}"``
+    (siempre poblado, gestionada o cruda) — se lee del resumen de la comparación.
+    """
+    summary = admin_client.get(
+        f"/api/v1/schema-comparisons/{comparison_id}"
+    ).json()["data"]
+    ref = f"{summary['target_server_id']}:{summary['target_database_name']}"
     items = admin_client.get(
         f"/api/v1/schema-comparisons/{comparison_id}/items?size=50"
     ).json()["data"]
@@ -163,7 +176,7 @@ def _token(admin_client, comparison_id, tgt_id, engine, mode, selected_ids=None)
         idset = set(selected_ids or [])
         chosen = [i for i in items if i["id"] in idset]
     resolved = [{"sql": i["sql"], "risk": i["risk_flags"]} for i in chosen]
-    token = SchemaComparisonController.execution_token(tgt_id, engine, resolved)
+    token = SchemaComparisonController.execution_token(ref, engine, resolved)
     return token, [i["id"] for i in chosen]
 
 
@@ -391,7 +404,7 @@ def test_preview_matches_manual_token_and_is_accepted_by_execute(admin_client, m
     cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
     monkeypatch.setattr(MigrationRunner, "execute_adhoc", _fake_exec_ok)
 
-    manual_token, manual_ids = _token(admin_client, cid, tgt_id, "mysql", "all")
+    manual_token, manual_ids = _token(admin_client, cid, "mysql", "all")
 
     r = _preview(admin_client, cid, "all")
     assert r.status_code == 200, r.text
@@ -445,7 +458,7 @@ def test_execute_mode_all(admin_client, monkeypatch):
     cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
     monkeypatch.setattr(MigrationRunner, "execute_adhoc", _fake_exec_ok)
 
-    token, ids = _token(admin_client, cid, tgt_id, "mysql", "all")
+    token, ids = _token(admin_client, cid, "mysql", "all")
     assert len(ids) == 2  # new_t + old_t (excluye la rutina que requiere revisión)
     r = admin_client.post(
         f"/api/v1/schema-comparisons/{cid}/execute",
@@ -473,7 +486,7 @@ def test_execute_mode_all_except_destructive(admin_client, monkeypatch):
     cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
     monkeypatch.setattr(MigrationRunner, "execute_adhoc", _fake_exec_ok)
 
-    token, ids = _token(admin_client, cid, tgt_id, "mysql", "all_except_destructive")
+    token, ids = _token(admin_client, cid, "mysql", "all_except_destructive")
     assert len(ids) == 1  # solo new_t (excluye destructivo y revisión-individual)
     r = admin_client.post(
         f"/api/v1/schema-comparisons/{cid}/execute",
@@ -495,7 +508,7 @@ def test_execute_mode_custom_requires_ids(admin_client, monkeypatch):
     monkeypatch.setattr(MigrationRunner, "execute_adhoc", _fake_exec_ok)
 
     # Sin selected_item_ids → 422.
-    token, _ = _token(admin_client, cid, tgt_id, "mysql", "all")
+    token, _ = _token(admin_client, cid, "mysql", "all")
     r = admin_client.post(
         f"/api/v1/schema-comparisons/{cid}/execute",
         json={"mode": "custom", "confirm_target_name": "tgt_db", "confirm_token": token},
@@ -505,7 +518,7 @@ def test_execute_mode_custom_requires_ids(admin_client, monkeypatch):
     # Con la rutina explícitamente seleccionada (solo posible vía custom).
     items = admin_client.get(f"/api/v1/schema-comparisons/{cid}/items").json()["data"]
     sp = next(i for i in items if i["object_name"] == "PROCEDURE:sp_x")
-    token, ids = _token(admin_client, cid, tgt_id, "mysql", "custom", [sp["id"]])
+    token, ids = _token(admin_client, cid, "mysql", "custom", [sp["id"]])
     r = admin_client.post(
         f"/api/v1/schema-comparisons/{cid}/execute",
         json={
@@ -523,7 +536,7 @@ def test_execute_stops_on_first_failure(admin_client, monkeypatch):
     src_id, tgt_id, _, _ = _setup(admin_client, monkeypatch, port=3526)
     cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
 
-    def _fail_first(self, target, *, db_name, engine, managed_db_id, statements):
+    def _fail_first(self, target, *, db_name, engine, lock_key, statements):
         # Falla la primera; la segunda no llega a ejecutarse (corte en el primer fallo).
         return [
             StatementResult(
@@ -533,7 +546,7 @@ def test_execute_stops_on_first_failure(admin_client, monkeypatch):
         ]
 
     monkeypatch.setattr(MigrationRunner, "execute_adhoc", _fail_first)
-    token, _ = _token(admin_client, cid, tgt_id, "mysql", "all")
+    token, _ = _token(admin_client, cid, "mysql", "all")
     r = admin_client.post(
         f"/api/v1/schema-comparisons/{cid}/execute",
         json={"mode": "all", "confirm_target_name": "tgt_db", "confirm_token": token},
@@ -551,7 +564,7 @@ def test_execute_anti_toctou_409(admin_client, monkeypatch):
     cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
     monkeypatch.setattr(MigrationRunner, "execute_adhoc", _fake_exec_ok)
 
-    token, _ = _token(admin_client, cid, tgt_id, "mysql", "all")
+    token, _ = _token(admin_client, cid, "mysql", "all")
     # El esquema del target cambia DESPUÉS de calcular la comparación → fingerprint distinto.
     fake.snaps["tgt_db"] = _snap(db="tgt_db", marker="drifted")
 
@@ -561,3 +574,197 @@ def test_execute_anti_toctou_409(admin_client, monkeypatch):
     )
     assert r.status_code == 409, r.text
     assert "cambió" in r.text.lower() or "recal" in r.text.lower()
+
+
+# =========================================================================== #
+# Extensión — comparar/ejecutar contra BDs CRUDAS (no registradas en inventario) #
+# =========================================================================== #
+def _setup_raw(admin_client, monkeypatch, *, port, raw_names=("raw_tgt",), rendered=None):
+    """
+    Servidor + una BD source GESTIONADA ('src_db') + N BDs CRUDAS no registradas cuyos
+    snapshots existen en el motor (via fake.list_databases). Devuelve (sid, src_id, fake).
+    """
+    sid = _server(admin_client, port)
+    oid = _owner(admin_client, sid)
+    src_id = _managed(admin_client, sid, oid, "src_db")
+    snaps = {"src_db": _snap(db="src_db", marker="src")}
+    for name in raw_names:
+        snaps[name] = _snap(db=name, marker=name)
+    fake = _FakeAdapter(snaps, rendered if rendered is not None else _rendered())
+    monkeypatch.setattr(scc, "get_adapter", lambda target: fake)
+    return sid, src_id, fake
+
+
+def _create_raw(admin_client, src_id, sid, name):
+    return admin_client.post(
+        "/api/v1/schema-comparisons",
+        json={
+            "source_database_id": src_id,
+            "target_server_id": sid,
+            "target_database_name": name,
+        },
+    )
+
+
+def _exec(admin_client, cid, mode, confirm_name, token, selected_item_ids=None):
+    body = {"mode": mode, "confirm_target_name": confirm_name, "confirm_token": token}
+    if selected_item_ids is not None:
+        body["selected_item_ids"] = selected_item_ids
+    return admin_client.post(f"/api/v1/schema-comparisons/{cid}/execute", json=body)
+
+
+def test_create_with_raw_target_not_in_inventory(admin_client, monkeypatch):
+    sid, src_id, _ = _setup_raw(admin_client, monkeypatch, port=3540)
+    r = _create_raw(admin_client, src_id, sid, "raw_tgt")
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    assert data["item_count"] == 3
+    # La BD física del target se persiste siempre (server + nombre)...
+    assert data["target_server_id"] == sid
+    assert data["target_database_name"] == "raw_tgt"
+    # ...pero al no estar en inventario, no hay managed_database_id (null → sin Opción A).
+    assert data["target_database_id"] is None
+    # El source (por id) SÍ está en inventario.
+    assert data["source_database_id"] == src_id
+    assert data["source_server_id"] == sid
+    assert data["source_database_name"] == "src_db"
+
+
+def test_create_raw_ref_autoresolves_to_managed(admin_client, monkeypatch):
+    """
+    Una referencia CRUDA (server_id + nombre) a una BD que YA está en el inventario debe
+    tratarse IDÉNTICO a pasar su managed_database_id: auto-resuelve el mismo id y aplica
+    el bloqueo por blueprint (que solo existe para targets gestionados con model_id).
+    """
+    src_id, tgt_id, _model_id, _ = _setup(
+        admin_client, monkeypatch, port=3541, target_has_model=True
+    )
+    # Referencia canónica por id (para descubrir el sid del servidor).
+    by_id = _create(admin_client, src_id, tgt_id).json()["data"]
+    sid = by_id["target_server_id"]
+    assert by_id["target_database_id"] == tgt_id
+
+    # Misma BD física, pero referida CRUDAMENTE por (server_id + nombre).
+    r = _create_raw(admin_client, src_id, sid, "tgt_db")
+    assert r.status_code == 201, r.text
+    by_raw = r.json()["data"]
+    # Auto-resuelta al MISMO managed_database_id → tratada como gestionada.
+    assert by_raw["target_database_id"] == tgt_id
+    assert by_raw["target_server_id"] == sid
+    assert by_raw["target_database_name"] == "tgt_db"
+
+    # Y execute queda BLOQUEADO por blueprint (comportamiento exclusivo de target gestionado).
+    blocked = admin_client.post(
+        f"/api/v1/schema-comparisons/{by_raw['id']}/execute",
+        json={"mode": "all", "confirm_target_name": "tgt_db", "confirm_token": "x"},
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert "adopt" in blocked.text.lower()
+
+
+def test_create_raw_target_missing_in_engine_404(admin_client, monkeypatch):
+    sid, src_id, _ = _setup_raw(admin_client, monkeypatch, port=3542)
+    # 'ghost_db' no está entre las BDs reales del motor (fake.list_databases).
+    r = _create_raw(admin_client, src_id, sid, "ghost_db")
+    assert r.status_code == 404, r.text
+    assert "no existe" in r.text.lower()
+
+
+def test_create_validator_rejects_both_representations(admin_client, monkeypatch):
+    sid, src_id, _ = _setup_raw(admin_client, monkeypatch, port=3543)
+    r = admin_client.post(
+        "/api/v1/schema-comparisons",
+        json={
+            "source_database_id": src_id,
+            "target_database_id": 999,
+            "target_server_id": sid,
+            "target_database_name": "raw_tgt",
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_create_validator_rejects_missing_representation(admin_client, monkeypatch):
+    sid, src_id, _ = _setup_raw(admin_client, monkeypatch, port=3544)
+    # source sin NINGUNA representación.
+    r = admin_client.post(
+        "/api/v1/schema-comparisons",
+        json={"target_server_id": sid, "target_database_name": "raw_tgt"},
+    )
+    assert r.status_code == 422, r.text
+    # raw PARCIAL: server_id sin database_name.
+    r2 = admin_client.post(
+        "/api/v1/schema-comparisons",
+        json={"source_database_id": src_id, "target_server_id": sid},
+    )
+    assert r2.status_code == 422, r2.text
+
+
+def test_execute_raw_target_end_to_end_all_modes(admin_client, monkeypatch):
+    sid, src_id, _ = _setup_raw(admin_client, monkeypatch, port=3545)
+    monkeypatch.setattr(MigrationRunner, "execute_adhoc", _fake_exec_ok)
+    cid = _create_raw(admin_client, src_id, sid, "raw_tgt").json()["data"]["id"]
+
+    # mode=all (flujo real: execute-preview → execute con el token devuelto).
+    prev = _preview(admin_client, cid, "all").json()["data"]
+    assert prev["target_database_id"] is None  # sin inventario
+    r = _exec(admin_client, cid, "all", "raw_tgt", prev["confirm_token"])
+    assert r.status_code == 200, r.text
+    d = r.json()["data"]
+    assert d["applied_count"] == 2  # new_t + old_t (excluye la rutina)
+    assert d["failed"] is False
+    assert d["target_database_id"] is None
+    assert {s["object_name"] for s in d["statements"]} == {"new_t", "old_t"}
+
+    # mode=all_except_destructive.
+    prev2 = _preview(admin_client, cid, "all_except_destructive").json()["data"]
+    r2 = _exec(admin_client, cid, "all_except_destructive", "raw_tgt", prev2["confirm_token"])
+    assert r2.status_code == 200, r2.text
+    assert [s["object_name"] for s in r2.json()["data"]["statements"]] == ["new_t"]
+
+    # mode=custom (la rutina, solo alcanzable por custom).
+    items = admin_client.get(f"/api/v1/schema-comparisons/{cid}/items").json()["data"]
+    sp = next(i for i in items if i["object_type"] == "routine")
+    prev3 = _preview(admin_client, cid, "custom", selected_item_ids=[sp["id"]]).json()["data"]
+    r3 = _exec(
+        admin_client, cid, "custom", "raw_tgt", prev3["confirm_token"],
+        selected_item_ids=[sp["id"]],
+    )
+    assert r3.status_code == 200, r3.text
+    assert [s["object_name"] for s in r3.json()["data"]["statements"]] == ["PROCEDURE:sp_x"]
+
+
+def test_execute_raw_target_token_parity_and_accepted(admin_client, monkeypatch):
+    """El confirm_token del preview coincide con el algoritmo documentado y /execute lo acepta."""
+    sid, src_id, _ = _setup_raw(admin_client, monkeypatch, port=3546)
+    monkeypatch.setattr(MigrationRunner, "execute_adhoc", _fake_exec_ok)
+    cid = _create_raw(admin_client, src_id, sid, "raw_tgt").json()["data"]["id"]
+
+    manual_token, manual_ids = _token(admin_client, cid, "mysql", "all")
+    prev = _preview(admin_client, cid, "all").json()["data"]
+    assert prev["confirm_token"] == manual_token
+
+    r = _exec(admin_client, cid, "all", "raw_tgt", prev["confirm_token"])
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["applied_count"] == len(manual_ids)
+
+
+def test_execute_raw_target_wrong_confirm_name_422(admin_client, monkeypatch):
+    sid, src_id, _ = _setup_raw(admin_client, monkeypatch, port=3547)
+    monkeypatch.setattr(MigrationRunner, "execute_adhoc", _fake_exec_ok)
+    cid = _create_raw(admin_client, src_id, sid, "raw_tgt").json()["data"]["id"]
+    r = _exec(admin_client, cid, "all", "WRONG", "whatever")
+    assert r.status_code == 422, r.text
+
+
+def test_adopt_raw_target_422_use_execute(admin_client, monkeypatch):
+    sid, src_id, _ = _setup_raw(admin_client, monkeypatch, port=3548)
+    cid = _create_raw(admin_client, src_id, sid, "raw_tgt").json()["data"]["id"]
+    items = admin_client.get(f"/api/v1/schema-comparisons/{cid}/items").json()["data"]
+    r = admin_client.post(
+        f"/api/v1/schema-comparisons/{cid}/adopt",
+        json={"selected_item_ids": [items[0]["id"]], "name": "v1"},
+    )
+    assert r.status_code == 422, r.text
+    body = r.text.lower()
+    assert "inventario" in body and "execute" in body
