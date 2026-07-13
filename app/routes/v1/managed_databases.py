@@ -13,7 +13,7 @@ from app.controllers.managed_database_controller import ManagedDatabaseControlle
 from app.controllers.managed_migration_controller import ManagedMigrationController
 from app.core.auth import AdminDep
 from app.core.limiter import limiter
-from app.models.enums import ProvisionStatus
+from app.models.enums import EngineType, ProvisionStatus
 from app.schemas.managed_database import (
     AdoptDatabaseIn,
     ManagedDatabaseCreate,
@@ -41,12 +41,16 @@ def list_databases(
     owner_id: int | None = Query(None, ge=1),
     model_id: int | None = Query(None, ge=1),
     status: ProvisionStatus | None = Query(None),
+    engine: EngineType | None = Query(
+        None, description="Filtra por motor del servidor (join a Server.engine)."
+    ),
 ):
     items, total = ManagedDatabaseController().list_databases(
         server_id=server_id,
         owner_id=owner_id,
         model_id=model_id,
         status=status,
+        engine=engine,
         limit=pagination.size,
         offset=pagination.offset,
     )

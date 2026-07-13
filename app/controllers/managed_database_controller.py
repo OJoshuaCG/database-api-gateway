@@ -21,9 +21,10 @@ from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.exceptions import AppHttpException
 from app.models.database_model import DatabaseModel
-from app.models.enums import ProvisionStatus
+from app.models.enums import EngineType, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
+from app.models.server import Server
 from app.models.server_user import ServerUser
 from app.services import audit
 from app.services.db_admin.factory import get_adapter
@@ -113,6 +114,7 @@ class ManagedDatabaseController:
         owner_id: int | None = None,
         model_id: int | None = None,
         status: str | None = None,
+        engine: EngineType | None = None,
         limit: int,
         offset: int,
     ) -> tuple[list[dict], int]:
@@ -127,6 +129,10 @@ class ManagedDatabaseController:
                 q = q.filter(ManagedDatabase.model_id == model_id)
             if status is not None:
                 q = q.filter(ManagedDatabase.status == status)
+            if engine is not None:
+                q = q.join(Server, Server.id == ManagedDatabase.server_id).filter(
+                    Server.engine == engine
+                )
             total = q.count()
             rows = q.order_by(ManagedDatabase.id.desc()).limit(limit).offset(offset).all()
             return [self._serialize(r) for r in rows], total

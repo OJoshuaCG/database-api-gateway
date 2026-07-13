@@ -103,6 +103,25 @@ def test_list_filters(admin_client):
     assert len(data) == 1 and data[0]["name"] == "f1"
 
 
+def test_list_filter_by_engine(admin_client):
+    pg_sid = _server(admin_client, 5449, engine="postgresql")
+    mysql_sid = _server(admin_client, 5450, engine="mysql")
+    pg_oid = _owner(admin_client, pg_sid, "pgowner")
+    mysql_oid = _owner(admin_client, mysql_sid, "myowner")
+    admin_client.post(
+        "/api/v1/managed-databases",
+        json={"server_id": pg_sid, "owner_id": pg_oid, "name": "pg_db"},
+    )
+    admin_client.post(
+        "/api/v1/managed-databases",
+        json={"server_id": mysql_sid, "owner_id": mysql_oid, "name": "mysql_db"},
+    )
+    data = admin_client.get("/api/v1/managed-databases?engine=mysql").json()["data"]
+    assert [d["name"] for d in data] == ["mysql_db"]
+    data = admin_client.get("/api/v1/managed-databases?engine=postgresql").json()["data"]
+    assert [d["name"] for d in data] == ["pg_db"]
+
+
 def test_update_and_delete(admin_client):
     sid = _server(admin_client, 5448)
     oid = _owner(admin_client, sid)
