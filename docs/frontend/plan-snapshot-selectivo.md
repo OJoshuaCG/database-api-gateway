@@ -5,6 +5,10 @@
 > **qué** validar, **qué** estados manejar y **cómo** navegar. El contrato de API es
 > completo y se refleja tal cual lo entrega el backend (sobre `ApiResponse[T]` en éxito;
 > `{ "detail": { "msg", "type", "context"? } }` en error).
+>
+> **Documentación relacionada** (misma carpeta):
+> - [`snapshot-selectivo-escenarios.md`](snapshot-selectivo-escenarios.md) — escenarios explicados a nivel humano + técnico, glosario y manejo de errores.
+> - [`snapshot-selectivo-ejemplos-api.md`](snapshot-selectivo-ejemplos-api.md) — recetario con ejemplos de petición/respuesta por endpoint.
 
 ---
 
@@ -151,12 +155,14 @@ Entidad: TableStat
 
 ```
 Entidad: FromSnapshotIn
-- server_id:             number,  requerido
-- database:              string,  requerido
-- name:                  string,  requerido   (nombre visible del blueprint)
-- slug:                  string,  requerido    patrón: ^[a-z0-9]+(?:[-_][a-z0-9]+)*$
-- description:           string,  opcional
-- baseline_name:         string,  opcional, default: "Snapshot baseline"
+- server_id:             number,  requerido, ≥ 1
+- database:              string,  requerido, 1..64
+- name:                  string,  requerido, 1..100  (nombre visible del blueprint)
+- slug:                  string,  requerido, 1..120   patrón: ^[a-z0-9]+(?:[-_][a-z0-9]+)*$
+- description:           string,  opcional  (sin límite declarado)
+- baseline_name:         string,  opcional, 1..200, default: "Snapshot baseline"
+                         ⚠️ IGNORADO si layout="manual" (cada bucket usa su propio `name`;
+                         ver `[CORREGIDO H]`). Solo tiene efecto en single/by_class.
 - layout:                enum,    opcional, default: "single", valores: [single, by_class, manual]
 - include_object_types:  array<string>, opcional  (si se da, SOLO esos tipos)
 - exclude_object_types:  array<string>, opcional
@@ -428,8 +434,8 @@ Respuestas de error (forma real del backend):
 | `duplicate_assignment` | `also_in_version` | El objeto está en dos versiones (también en la vX). Déjalo en una sola. |
 | `unassigned_object` | — | Objeto seleccionado sin asignar a ninguna versión. Asígnalo. |
 | `unknown_object` | — | El objeto no existe en el snapshot. Quítalo. |
-| `unassigned_data_table` | — | Tabla de datos sin asignar a un bucket de datos. Asígnala. |
-| `unknown_data_table` | — | La tabla de datos no existe en el snapshot. Quítala. |
+| `unassigned_data_table` | — | Tabla de datos (extraída con éxito) sin asignar a un bucket de datos. Asígnala. |
+| `unknown_data_table` | — | El bucket referencia una tabla que **nunca se pidió** en `data_tables` (típicamente un error de tecleo). Corrígela o quita la referencia. **No** dispara si la tabla se pidió pero se omitió por un guardrail (vacía, sin PK, etc.) — eso solo se reporta en `skipped_tables`, sin bloquear la creación (ver `[CORREGIDO I]`). |
 | `dependency_in_later_version` | `depends_on`, `dependency_version` | Depende de un objeto que está en una versión posterior (vX). Muévelo después. |
 | `prerequisite_after_a_table` | `must_be_at_most` | Un prerrequisito quedó después de una tabla. Muévelo a la versión ≤ X. |
 | `must_be_after_all_tables` | `must_be_at_least` | Debe ir después de todas las tablas (versión ≥ X). |
@@ -608,6 +614,8 @@ Propósito: componer buckets ordenados (esquema XOR datos) y validar en cliente 
   - Un bucket no puede mezclar esquema y datos.               (mixed_schema_and_data)
   - Ningún bucket vacío.                                      (empty_bucket)
   - Todos los objetos seleccionados deben estar asignados.    (unassigned_object)
+  - Toda tabla de datos-semilla elegida en Vista 5b tiene su bucket de datos
+    correspondiente aquí (ver regla obligatoria abajo).       (unassigned_data_table)
   - Los buckets de datos van DESPUÉS de todos los de esquema. (schema_after_data)
   - La tabla de un bucket de datos debe tener su estructura incluida en algún bucket de esquema
     anterior.                                                 (data_table_structure_not_included / data_before_table_structure)
@@ -620,6 +628,20 @@ Propósito: componer buckets ordenados (esquema XOR datos) y validar en cliente 
 Componentes: dos paneles (origen / destino) con asignación (arrastrar-soltar o mover);
 reordenamiento de buckets; renombrado; panel de problemas de validación **en cliente**;
 resaltado de objetos sin asignar.
+
+> **Regla OBLIGATORIA (corregida tras un caso real de producción — ver `[CORREGIDO G]`):**
+> la relación entre esta vista y la Vista 5b **no es "aquí o allá"**: es secuencial y
+> automática. Al confirmar la selección de datos-semilla en la Vista 5b, el frontend
+> **debe generar automáticamente** un bucket de datos por cada tabla marcada —
+> `{ "name": "Datos: {tabla}", "data_tables": ["{tabla}"] }` — y añadirlo al **final** de
+> esta lista de buckets (el usuario puede después renombrarlo/reordenarlo aquí, pero nunca
+> debe faltar). **Un bucket de datos por tabla** (no agrupar varias tablas en un mismo
+> bucket): el backend siempre crea una versión por tabla de datos aunque se agrupen en un
+> mismo bucket, así que agrupar rompe la correspondencia 1:1 entre "posición del bucket" (lo
+> que reportan `violations[].version` y `hint`) y el número de versión final — mantener 1:1
+> evita mensajes de error confusos. Sin esta generación automática, el backend responde
+> **422** con `unassigned_data_table` por cada tabla huérfana — es exactamente el error que
+> motivó esta corrección.
 
 Estados de UI:
 - `error de validación (cliente)`: panel de problemas visible, [Continuar] bloqueado.
@@ -678,6 +700,12 @@ Estados de UI:
   "No hay tablas elegibles para datos-semilla" y opción de continuar sin datos.
 - `éxito`: selección válida → [Continuar]. (Si el usuario no quiere datos, `data_tables=[]`.)
 
+> **Solo si `layout="manual"`:** al pulsar [Continuar], el frontend sincroniza
+> `manual_layout` ANTES de avanzar — agrega un bucket de datos por cada tabla marcada aquí
+> que aún no tenga uno (ver regla obligatoria en Vista 5) y elimina los que ya no
+> correspondan a una tabla deseleccionada. Esta sincronización es automática y no requiere
+> que el usuario vuelva a la Vista 5, aunque puede hacerlo para reordenar/renombrar.
+
 ---
 
 ### Vista 6 — Resumen y confirmación (submit)
@@ -691,6 +719,10 @@ Propósito: identidad del blueprint y revisión final antes de crear.
         (validar en cliente; sugerir slug a partir del nombre; avisar si tiene mayúsculas/espacios)
   Campo: Descripción (description)            — opcional
   Campo: Nombre del baseline (baseline_name)  — default "Snapshot baseline"
+        Mostrar SOLO si layout ∈ {single, by_class}. Con layout="manual" OCULTAR este
+        campo (o mostrarlo deshabilitado con nota "No aplica: cada versión usa el nombre
+        de su bucket, definido en Vista 5") — se ignora silenciosamente en el backend, y
+        enviarlo sugiere al usuario un efecto que nunca ocurre. Ver `[CORREGIDO H]`.
 
 [Resumen de lo que se creará (recap de pasos 3–5b)]
   Origen: servidor {id} · BD {database} · motor {source_engine}
@@ -772,9 +804,16 @@ Vista 1: Origen (servidor + BD)
                     → [¿Incluir datos?] Sí → Vista 5b: Datos-semilla → Vista 6: Resumen
                                         No → Vista 6: Resumen
               → (layout=manual)
-                    → Vista 5: Constructor manual (buckets esquema)
-                          → (los datos se definen como buckets de datos aquí, o en Vista 5b)
-                          → [Continuar] → Vista 6: Resumen
+                    → Vista 5: Constructor manual (buckets de esquema)
+                          → [¿Incluir datos?] Sí → Vista 5b: Datos-semilla
+                                                        → [Continuar] genera automáticamente
+                                                          un bucket de datos por tabla en
+                                                          manual_layout (regla obligatoria,
+                                                          ver Vista 5) → Vista 6: Resumen
+                                                        (el usuario puede volver a Vista 5 a
+                                                         reordenar/renombrar esos buckets)
+                                              No → Vista 6: Resumen
+                          → [Continuar] (sin datos) → Vista 6: Resumen
       → [Cambiar origen]                 → Vista 1
 
 Vista 6: Resumen
@@ -890,18 +929,58 @@ que ya conoce servidor + BD y puede prellenar la Vista 1.
   decisión puntual (¿siembro esta tabla?), no una tendencia; un número con badge de advertencia
   en la tabla de la Vista 5b comunica mejor que un gráfico.
 
+### Correcciones aplicadas (detectadas en una solicitud real de producción, 2026-07-08)
+
+Un payload real con `layout="manual"` + `data_tables` llegó al backend sin los buckets de
+datos correspondientes → 422 (`unassigned_data_table`), y además incluía un `baseline_name`
+que el backend ignora en modo manual. Ambos son síntomas de que este plan tenía puntos
+ambiguos/incompletos; se corrigieron aquí (Vista 5, Vista 5b, Vista 6, spec de campos):
+
+- `[CORREGIDO G]` La versión anterior de este plan decía que los datos se definían "aquí
+  [Vista 5], o en Vista 5b" — ambiguo y sin mecanismo de conexión. Ahora es una regla
+  obligatoria y determinista: la Vista 5b, al confirmar, **genera automáticamente** un
+  bucket de datos por tabla en `manual_layout` (uno por tabla, nunca agrupados — ver el
+  porqué en la nota de Vista 5). Se agregó también la validación en cliente
+  `unassigned_data_table` a la lista de la Vista 5.
+- `[CORREGIDO H]` `baseline_name` se **ignora silenciosamente** cuando `layout="manual"`
+  (verificado en `app/services/db_admin/snapshot_layout.py`: `build_versions` no lo pasa a
+  `_build_manual`; cada bucket usa su propio `name`). La Vista 6 y el spec de campos ahora
+  indican que el campo debe **ocultarse/deshabilitarse** con ese layout.
+- `[CORREGIDO I]` Siguiendo la recomendación de la corrección G ("un bucket por tabla de
+  datos"), una tabla vacía (u omitida por cualquier otro guardrail) en su propio bucket
+  **bloqueaba TODO el blueprint con 422** (`unknown_data_table`), en vez de omitirse en
+  silencio como ya hacían `single`/`by_class`. Corregido en el backend: `unknown_data_table`
+  ahora solo dispara si el bucket referencia una tabla que **nunca** se pidió en
+  `data_tables` (típicamente un typo); una tabla pedida pero omitida por un guardrail ya no
+  bloquea nada — solo aparece en `skipped_tables[]` de la respuesta 201. **No requiere ningún
+  cambio en el frontend**: es un cambio de backend estrictamente menos restrictivo
+  (retrocompatible). Ver detalle completo en
+  [`snapshot-selectivo-correcciones.md`](snapshot-selectivo-correcciones.md#5-tabla-de-datos-vacía-en-layout-manual-ya-no-interrumpe-la-creación).
+
 ### Supuestos (recopilación)
-- `[SUPUESTO A]` `detail.context` (incl. `violations`) solo llega en desarrollo; en producción
-  la UI se apoya en validación en cliente + `detail.msg` + `X-Request-ID`. Justificación:
-  confirmado en los handlers del backend (`APP_ENV=="development"`).
-- `[SUPUESTO B]` La lista de servidores y de BDs para la Vista 1 proviene de endpoints
-  existentes (`GET /servers`, `/servers/{id}/databases` o `reconcile`), no de este contrato.
+
+> Nota: varios supuestos fueron **VERIFICADOS contra el backend** (2026-07-08) y dejan de ser
+> suposiciones. Se conservan marcados para trazabilidad.
+
+- `[VERIFICADO A]` `detail.context` (incl. `violations`) solo llega en desarrollo; en producción
+  la UI se apoya en validación en cliente + `detail.msg` + `X-Request-ID`. Confirmado en el
+  handler (`APP_ENV=="development"` en `app/exceptions/HandlerExceptions.py`) y el header
+  `X-Request-ID` en `app/middleware/ContextMiddleware.py`.
+- `[VERIFICADO B]` La lista de servidores y de BDs para la Vista 1 proviene de endpoints
+  existentes: `GET /servers` (paginado) y `GET /servers/{id}/reconcile` (clasifica
+  `managed`/`unmanaged`/`orphan`); las candidatas a fotografiar son las `unmanaged`.
 - `[SUPUESTO C]` La previsualización de versiones para `single`/`by_class` se calcula en cliente
   y se marca como "estimada"; la numeración final (que oculta clases vacías) la fija el backend.
+  Nota: **no existe** un endpoint de "preview de versiones" sin crear (no hay dry-run de
+  `from-snapshot`); el desglose real solo llega en `versions[]` de la respuesta 201.
 - `[SUPUESTO D]` Puntos de entrada al asistente: listado de blueprints y/o pantalla de
   reconciliación (Plan 09), que puede prellenar servidor + BD.
-- `[SUPUESTO E]` Existe una vista/endpoint de Plan 02 que expone el SQL de cada versión para el
-  gate `reviewed`; esta feature solo enlaza a ella.
-- `[SUPUESTO F]` `name` y `baseline_name` no tienen límites de longitud declarados en el
-  contrato; se asume validación mínima (no vacío) en cliente hasta confirmar límites del backend.
+- `[VERIFICADO E]` El SQL de cada versión se consulta con
+  `GET /database-models/{id}/migrations/{version}` (Plan 02), que expone `up_sql`, `down_sql` y
+  `down_sql_suggested`; esta feature solo enlaza a esa vista para el gate `reviewed`.
+- `[VERIFICADO F]` `name`, `slug` y `baseline_name` **SÍ tienen límites** (aplícalos como
+  `maxlength` en los inputs para evitar 422): `name` ≤ 100, `slug` ≤ 120 con patrón
+  `^[a-z0-9]+(?:[-_][a-z0-9]+)*$`, `baseline_name` ≤ 200, `description` sin límite declarado.
+  En layout manual: nombre de bucket ≤ 200; `object_type`/`name` de objetos y `table` de datos
+  ≤ 64 (patrón de identificador legado `^[A-Za-z0-9_$][A-Za-z0-9_$.\-]{0,63}$`).
 ```
