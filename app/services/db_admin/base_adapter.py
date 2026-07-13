@@ -26,20 +26,37 @@ from app.core.remote_engine import (
 from app.exceptions import AppHttpException
 from app.services.db_admin import snapshot_data
 from app.services.db_admin.dtos import (
+    CheckConstraintInfo,
     ColumnInfo,
+    ComputedInfo,
     ConnectionInfo,
     EngineUserInfo,
+    EnumTypeInfo,
+    EventInfo,
+    ExtensionInfo,
     ForeignKeyInfo,
     GrantInfo,
     GrantLevel,
+    IdentityInfo,
     IndexInfo,
     ObjectRef,
+    RoutineInfo,
+    SchemaSnapshot,
     SeedResult,
+    SequenceInfo,
     StructureDump,
     TableSchema,
     TableStat,
+    TriggerInfo,
+    UniqueConstraintInfo,
+    ViewInfo,
 )
-from app.services.db_admin.identifiers import validate_identifier
+from app.services.db_admin.identifiers import quote_identifier, validate_identifier
+from app.services.db_admin.schema_diff import (
+    DiffItem,
+    RenderedStatement,
+    SchemaDiff,
+)
 
 
 class ServerAdapter(ABC):
@@ -275,21 +292,13 @@ class ServerAdapter(ABC):
             with database_connection(self.target, database) as conn:
                 insp = inspect(conn)
                 try:
-                    columns_raw = insp.get_columns(table, schema=schema)
+                    return self._build_table_schema(insp, conn, database, table, schema)
                 except NoSuchTableError:
                     raise AppHttpException(
                         message="La tabla no existe en la base de datos indicada.",
                         status_code=404,
                         context={"database": database, "table": table},
                     )
-                pk_cols = (
-                    insp.get_pk_constraint(table, schema=schema).get(
-                        "constrained_columns"
-                    )
-                    or []
-                )
-                fks_raw = insp.get_foreign_keys(table, schema=schema)
-                idx_raw = insp.get_indexes(table, schema=schema)
         except SQLAlchemyError as exc:
             raise map_driver_error(
                 exc,
@@ -298,44 +307,553 @@ class ServerAdapter(ABC):
                 extra={"database": database, "table": table},
             )
 
+    # ------------------------------------------------------------------ #
+    # Construcción de TableSchema extendido (compartido; usa el Inspector) #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _index_from_raw(ix: dict) -> IndexInfo:
+        """Traduce un índice del Inspector a IndexInfo, sin descartar dialect_options."""
+        dialect_opts = ix.get("dialect_options") or {}
+        method = None
+        predicate = None
+        include_columns: list[str] = []
+        for key, val in dialect_opts.items():
+            if key.endswith("_using") and val:
+                method = str(val)
+            elif key.endswith("_where") and val:
+                predicate = str(val)
+            elif key.endswith("_include") and val:
+                include_columns = list(val)
+        # column_sorting: {col: ('desc', 'nulls_first')} solo cuando no es el default.
+        column_sort: dict[str, list[str]] = {}
+        for col, opts in (ix.get("column_sorting") or {}).items():
+            if opts:
+                column_sort[col] = list(opts)
+        # expressions (índice funcional): SQLAlchemy las expone en 'expressions' cuando
+        # alguna posición de column_names es None (es una expresión, no una columna).
+        raw_names = ix.get("column_names") or []
+        expressions = []
+        if None in raw_names:
+            expressions = [str(e) for e in (ix.get("expressions") or []) if e is not None]
+        cols = [c for c in raw_names if c is not None]
+        return IndexInfo(
+            name=ix.get("name"),
+            columns=cols,
+            unique=bool(ix.get("unique")),
+            method=method,
+            predicate=predicate,
+            expressions=expressions,
+            column_sort=column_sort,
+            include_columns=include_columns,
+        )
+
+    def _build_table_schema(
+        self, insp, conn, database: str, table: str, schema: str
+    ) -> TableSchema:
+        """
+        Construye un ``TableSchema`` COMPLETO reutilizando lo que el Inspector ya expone
+        (columnas + computed/identity, FKs + options, índices + dialect_options, checks,
+        uniques, comment) más los hooks por adapter (collation/charset/on_update de
+        columna y storage_options de tabla) para lo que el Inspector no expone fiable.
+        """
+        columns_raw = insp.get_columns(table, schema=schema)
+        pk = insp.get_pk_constraint(table, schema=schema)
+        pk_cols = pk.get("constrained_columns") or []
+        pk_name = pk.get("name")
+        fks_raw = insp.get_foreign_keys(table, schema=schema)
+        idx_raw = insp.get_indexes(table, schema=schema)
+        try:
+            checks_raw = insp.get_check_constraints(table, schema=schema)
+        except (NotImplementedError, SQLAlchemyError):
+            checks_raw = []
+        try:
+            uniques_raw = insp.get_unique_constraints(table, schema=schema)
+        except (NotImplementedError, SQLAlchemyError):
+            uniques_raw = []
+        try:
+            comment = (insp.get_table_comment(table, schema=schema) or {}).get("text")
+        except (NotImplementedError, SQLAlchemyError):
+            comment = None
+
+        extras = self._column_extras(conn, database, table, schema)
+        storage = self._table_storage_options(conn, database, table, schema)
+
         pk_set = set(pk_cols)
-        columns = [
-            ColumnInfo(
-                name=c["name"],
-                type=str(c["type"]),
-                nullable=bool(c.get("nullable", True)),
-                default=None if c.get("default") is None else str(c.get("default")),
-                primary_key=c["name"] in pk_set,
-                autoincrement=c.get("autoincrement") in (True, "auto"),
-                comment=c.get("comment"),
+        columns: list[ColumnInfo] = []
+        for c in columns_raw:
+            ex = extras.get(c["name"], {})
+            computed = None
+            comp_raw = c.get("computed")
+            if comp_raw:
+                computed = ComputedInfo(
+                    sqltext=str(comp_raw.get("sqltext") or ""),
+                    persisted=bool(comp_raw.get("persisted")),
+                )
+            identity = None
+            id_raw = c.get("identity")
+            if id_raw:
+                identity = IdentityInfo(
+                    always=bool(id_raw.get("always")),
+                    start=id_raw.get("start"),
+                    increment=id_raw.get("increment"),
+                )
+            columns.append(
+                ColumnInfo(
+                    name=c["name"],
+                    type=str(c["type"]),
+                    nullable=bool(c.get("nullable", True)),
+                    default=None if c.get("default") is None else str(c.get("default")),
+                    primary_key=c["name"] in pk_set,
+                    autoincrement=c.get("autoincrement") in (True, "auto"),
+                    comment=c.get("comment"),
+                    collation=ex.get("collation"),
+                    charset=ex.get("charset"),
+                    computed=computed,
+                    identity=identity,
+                    on_update=ex.get("on_update"),
+                )
             )
-            for c in columns_raw
-        ]
         foreign_keys = [
             ForeignKeyInfo(
                 name=fk.get("name"),
                 columns=fk.get("constrained_columns") or [],
                 referred_table=fk.get("referred_table") or "",
                 referred_columns=fk.get("referred_columns") or [],
+                referred_schema=fk.get("referred_schema"),
+                on_delete=(fk.get("options") or {}).get("ondelete"),
+                on_update=(fk.get("options") or {}).get("onupdate"),
+                deferrable=(fk.get("options") or {}).get("deferrable"),
+                initially=(fk.get("options") or {}).get("initially"),
             )
             for fk in fks_raw
         ]
-        indexes = [
-            IndexInfo(
-                name=ix.get("name"),
-                columns=ix.get("column_names") or [],
-                unique=bool(ix.get("unique")),
+        indexes = [self._index_from_raw(ix) for ix in idx_raw]
+        check_constraints = [
+            CheckConstraintInfo(name=ck.get("name"), sqltext=str(ck.get("sqltext") or ""))
+            for ck in checks_raw
+            if ck.get("sqltext")
+        ]
+        unique_constraints = [
+            UniqueConstraintInfo(
+                name=uc.get("name"), columns=uc.get("column_names") or []
             )
-            for ix in idx_raw
+            for uc in uniques_raw
         ]
         return TableSchema(
             database=database,
             table=table,
             columns=columns,
             primary_key=list(pk_cols),
+            primary_key_name=pk_name,
             foreign_keys=foreign_keys,
             indexes=indexes,
+            check_constraints=check_constraints,
+            unique_constraints=unique_constraints,
+            comment=comment,
+            storage_options=storage,
         )
+
+    # ------------------------------------------------------------------ #
+    # Snapshot estructural CANÓNICO (Plan diff) — SchemaSnapshot           #
+    # ------------------------------------------------------------------ #
+    def structural_snapshot(self, database: str) -> SchemaSnapshot:
+        """
+        Snapshot estructural canónico y COMPLETO de la BD (entrada del motor de diff).
+
+        Reutiliza el Inspector para tablas y los hooks por adapter para vistas/rutinas/
+        triggers/secuencias/tipos/extensiones/events. Solo estructura, jamás filas.
+        PostgreSQL cubre solo el schema ``public`` (limitación conocida del sistema).
+        """
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        schema = self._inspect_schema(database)
+        try:
+            with database_connection(self.target, database) as conn:
+                insp = inspect(conn)
+                tables = [
+                    self._build_table_schema(insp, conn, database, t, schema)
+                    for t in sorted(insp.get_table_names(schema=schema))
+                ]
+                views = self._snapshot_views(conn, database, schema)
+                routines = self._snapshot_routines(conn, database, schema)
+                triggers = self._snapshot_triggers(conn, database, schema)
+                sequences = self._snapshot_sequences(conn, database, schema)
+                enum_types = self._snapshot_enum_types(conn, database, schema)
+                extensions = self._snapshot_extensions(conn, database, schema)
+                events = self._snapshot_events(conn, database, schema)
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="structural_snapshot", target=self.target,
+                extra={"database": database},
+            )
+        return SchemaSnapshot(
+            database=database,
+            source_engine=self.dialect,
+            tables=tables,
+            views=views,
+            routines=routines,
+            triggers=triggers,
+            sequences=sequences,
+            enum_types=enum_types,
+            extensions=extensions,
+            events=events,
+        )
+
+    # ---- Hooks del snapshot (default vacío; cada adapter sobreescribe) --- #
+    def _column_extras(self, conn, database: str, table: str, schema: str) -> dict[str, dict]:
+        """{col: {collation, charset, on_update}} — lo que el Inspector no expone fiable."""
+        return {}
+
+    def _table_storage_options(self, conn, database: str, table: str, schema: str) -> dict[str, str]:
+        """engine/charset/collation por tabla + db_charset/db_collation (herencia)."""
+        return {}
+
+    def _snapshot_views(self, conn, database: str, schema: str) -> list[ViewInfo]:
+        return []
+
+    def _snapshot_routines(self, conn, database: str, schema: str) -> list[RoutineInfo]:
+        return []
+
+    def _snapshot_triggers(self, conn, database: str, schema: str) -> list[TriggerInfo]:
+        return []
+
+    def _snapshot_sequences(self, conn, database: str, schema: str) -> list[SequenceInfo]:
+        return []
+
+    def _snapshot_enum_types(self, conn, database: str, schema: str) -> list[EnumTypeInfo]:
+        return []
+
+    def _snapshot_extensions(self, conn, database: str, schema: str) -> list[ExtensionInfo]:
+        return []
+
+    def _snapshot_events(self, conn, database: str, schema: str) -> list[EventInfo]:
+        return []
+
+    # ------------------------------------------------------------------ #
+    # Generación de DDL desde un SchemaDiff (Plan diff — Fase 3)           #
+    # ------------------------------------------------------------------ #
+    # El diff YA viene ordenado por fase (1..9). Cada RenderedStatement lleva los
+    # flags de riesgo calculados por el motor de diff (Fase 2). Los identificadores
+    # derivados del motor origen se revalidan (validate_identifier, allow_existing) y
+    # se re-emiten con quote_identifier: nunca se interpola texto crudo.
+    def render_diff(self, diff: SchemaDiff) -> list[RenderedStatement]:
+        """Traduce un ``SchemaDiff`` a sentencias DDL para el motor de este adapter."""
+        out: list[RenderedStatement] = []
+        for item in diff.items:
+            out.extend(self._render_item(item))
+        return out
+
+    def _q(self, name: str, kind: str = "objeto") -> str:
+        return quote_identifier(
+            validate_identifier(name, self.dialect, kind, allow_existing=True), self.dialect
+        )
+
+    def _stmt(
+        self, item: DiffItem, sql: str, *, down_sql: str | None = None,
+        down_confirmed: bool = False,
+    ) -> RenderedStatement:
+        return RenderedStatement(
+            sql=sql,
+            object_type=item.object_type,
+            object_name=item.object_name,
+            change_type=item.change_type,
+            phase=item.phase,
+            risk=item.risk,
+            down_sql=down_sql,
+            down_confirmed=down_confirmed,
+        )
+
+    def _render_item(self, item: DiffItem) -> list[RenderedStatement]:
+        ot, ct = item.object_type, item.change_type
+        handler = {
+            ("table", "new"): self._ri_table_new,
+            ("table", "dropped"): self._ri_table_dropped,
+            ("column", "new"): self._ri_column_new,
+            ("column", "dropped"): self._ri_column_dropped,
+            ("column", "modified"): self._ri_column_modified,
+            ("primary_key", "modified"): self._ri_pk_modified,
+            ("foreign_key", "new"): self._ri_fk_new,
+            ("foreign_key", "modified"): self._ri_fk_modified,
+            ("foreign_key", "dropped"): self._ri_fk_dropped,
+            ("unique_constraint", "new"): self._ri_unique_new,
+            ("unique_constraint", "dropped"): self._ri_unique_dropped,
+            ("check_constraint", "new"): self._ri_check_new,
+            ("check_constraint", "dropped"): self._ri_check_dropped,
+            ("index", "new"): self._ri_index_new,
+            ("index", "dropped"): self._ri_index_dropped,
+            ("view", "new"): self._ri_view_upsert,
+            ("view", "modified"): self._ri_view_upsert,
+            ("view", "dropped"): self._ri_view_dropped,
+            ("materialized_view", "new"): self._ri_view_upsert,
+            ("materialized_view", "modified"): self._ri_view_upsert,
+            ("materialized_view", "dropped"): self._ri_view_dropped,
+            ("routine", "new"): self._ri_routine_upsert,
+            ("routine", "modified"): self._ri_routine_upsert,
+            ("routine", "dropped"): self._ri_routine_dropped,
+            ("trigger", "new"): self._ri_trigger_upsert,
+            ("trigger", "modified"): self._ri_trigger_upsert,
+            ("trigger", "dropped"): self._ri_trigger_dropped,
+            ("event", "new"): self._ri_event_upsert,
+            ("event", "modified"): self._ri_event_upsert,
+            ("event", "dropped"): self._ri_event_dropped,
+            ("sequence", "new"): self._ri_sequence_new,
+            ("sequence", "modified"): self._ri_sequence_modified,
+            ("sequence", "dropped"): self._ri_sequence_dropped,
+            ("enum_type", "new"): self._ri_enum_new,
+            ("enum_type", "modified"): self._ri_enum_modified,
+            ("enum_type", "dropped"): self._ri_enum_dropped,
+            ("extension", "new"): self._ri_extension_new,
+            ("extension", "dropped"): self._ri_extension_dropped,
+        }.get((ot, ct))
+        if handler is None:
+            return []  # tipo/cambio no soportado en v1: se omite (nunca se inventa DDL)
+        return handler(item)
+
+    # ---- Portables (mismo SQL en ambos motores, solo cambia el quoting) ---- #
+    def _ri_table_new(self, item: DiffItem) -> list[RenderedStatement]:
+        tbl = item.source_payload
+        sql = self._render_create_table(tbl)
+        return [self._stmt(item, sql, down_sql=f"DROP TABLE {self._q(tbl.table, 'tabla')}",
+                           down_confirmed=True)]
+
+    def _ri_table_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, f"DROP TABLE {self._q(item.object_name, 'tabla')}")]
+
+    def _ri_column_new(self, item: DiffItem) -> list[RenderedStatement]:
+        table, col = item.parent_table, item.source_payload
+        coldef = self._render_column_def(col)
+        sql = f"ALTER TABLE {self._q(table, 'tabla')} ADD COLUMN {coldef}"
+        down = f"ALTER TABLE {self._q(table, 'tabla')} DROP COLUMN {self._q(col.name, 'columna')}"
+        return [self._stmt(item, sql, down_sql=down, down_confirmed=True)]
+
+    def _ri_column_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        table, col = item.parent_table, item.target_payload
+        sql = f"ALTER TABLE {self._q(table, 'tabla')} DROP COLUMN {self._q(col.name, 'columna')}"
+        # Reverso SUGERIDO (no confirmado): recrea la columna, pero los datos ya se perdieron.
+        down = f"ALTER TABLE {self._q(table, 'tabla')} ADD COLUMN {self._render_column_def(col)}"
+        return [self._stmt(item, sql, down_sql=down, down_confirmed=False)]
+
+    def _ri_fk_new(self, item: DiffItem) -> list[RenderedStatement]:
+        table, fk = item.parent_table, item.source_payload
+        return [self._stmt(item, self._render_add_fk(table, fk),
+                           down_sql=self._render_drop_fk(table, fk), down_confirmed=True)]
+
+    def _ri_fk_modified(self, item: DiffItem) -> list[RenderedStatement]:
+        table = item.parent_table
+        drop = self._render_drop_fk(table, item.target_payload)
+        add = self._render_add_fk(table, item.source_payload)
+        return [
+            self._stmt(item, drop),
+            self._stmt(item, add,
+                       down_sql=self._render_add_fk(table, item.target_payload)),
+        ]
+
+    def _ri_fk_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        table, fk = item.parent_table, item.target_payload
+        return [self._stmt(item, self._render_drop_fk(table, fk),
+                           down_sql=self._render_add_fk(table, fk), down_confirmed=False)]
+
+    def _ri_unique_new(self, item: DiffItem) -> list[RenderedStatement]:
+        table, uc = item.parent_table, item.source_payload
+        cols = ", ".join(self._q(c, "columna") for c in uc.columns)
+        name = self._q(uc.name, "constraint") if uc.name else None
+        clause = f"ADD CONSTRAINT {name} UNIQUE" if name else "ADD UNIQUE"
+        sql = f"ALTER TABLE {self._q(table, 'tabla')} {clause} ({cols})"
+        return [self._stmt(item, sql, down_sql=self._render_drop_unique(table, uc),
+                           down_confirmed=True)]
+
+    def _ri_unique_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, self._render_drop_unique(item.parent_table, item.target_payload))]
+
+    def _ri_check_new(self, item: DiffItem) -> list[RenderedStatement]:
+        table, ck = item.parent_table, item.source_payload
+        name = self._q(ck.name, "constraint") if ck.name else None
+        clause = f"ADD CONSTRAINT {name} CHECK" if name else "ADD CHECK"
+        sql = f"ALTER TABLE {self._q(table, 'tabla')} {clause} ({ck.sqltext})"
+        return [self._stmt(item, sql, down_sql=self._render_drop_check(table, ck),
+                           down_confirmed=True)]
+
+    def _ri_check_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, self._render_drop_check(item.parent_table, item.target_payload))]
+
+    def _ri_index_new(self, item: DiffItem) -> list[RenderedStatement]:
+        table, ix = item.parent_table, item.source_payload
+        return [self._stmt(item, self._render_create_index(table, ix),
+                           down_sql=self._render_drop_index(table, ix), down_confirmed=True)]
+
+    def _ri_index_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        table, ix = item.parent_table, item.target_payload
+        return [self._stmt(item, self._render_drop_index(table, ix),
+                           down_sql=self._render_create_index(table, ix), down_confirmed=False)]
+
+    def _ri_column_modified(self, item: DiffItem) -> list[RenderedStatement]:
+        table = item.parent_table
+        fwd = self._render_modify_column(table, item.source_payload, item.target_payload,
+                                         item.changed_attributes)
+        rev = self._render_modify_column(table, item.target_payload, item.source_payload,
+                                         item.changed_attributes)
+        rev_sql = ";\n".join(rev) if rev else None
+        return [self._stmt(item, s, down_sql=rev_sql, down_confirmed=False) for s in fwd]
+
+    def _ri_pk_modified(self, item: DiffItem) -> list[RenderedStatement]:
+        table = item.parent_table
+        return [self._stmt(item, s) for s in self._render_alter_pk(table, item.source_payload, item.target_payload)]
+
+    def _ri_view_upsert(self, item: DiffItem) -> list[RenderedStatement]:
+        replace = item.change_type == "modified"
+        return [self._stmt(item, s) for s in self._render_view(item.source_payload, replace)]
+
+    def _ri_view_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, self._render_drop_view(item.target_payload))]
+
+    def _ri_routine_upsert(self, item: DiffItem) -> list[RenderedStatement]:
+        replace = item.change_type == "modified"
+        return [self._stmt(item, s) for s in self._render_routine(item.source_payload, replace)]
+
+    def _ri_routine_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, self._render_drop_routine(item.target_payload))]
+
+    def _ri_trigger_upsert(self, item: DiffItem) -> list[RenderedStatement]:
+        replace = item.change_type == "modified"
+        return [self._stmt(item, s) for s in self._render_trigger(item.source_payload, replace)]
+
+    def _ri_trigger_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, self._render_drop_trigger(item.target_payload))]
+
+    def _ri_event_upsert(self, item: DiffItem) -> list[RenderedStatement]:
+        replace = item.change_type == "modified"
+        return [self._stmt(item, s) for s in self._render_event(item.source_payload, replace)]
+
+    def _ri_event_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, self._render_drop_event(item.target_payload))]
+
+    def _ri_sequence_new(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, s) for s in self._render_sequence(item.source_payload, alter=False)]
+
+    def _ri_sequence_modified(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, s) for s in self._render_sequence(item.source_payload, alter=True)]
+
+    def _ri_sequence_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, self._render_drop_sequence(item.target_payload))]
+
+    def _ri_enum_new(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, s) for s in self._render_enum(item.source_payload, item.target_payload)]
+
+    def _ri_enum_modified(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, s) for s in self._render_enum(item.source_payload, item.target_payload)]
+
+    def _ri_enum_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, self._render_drop_enum(item.target_payload))]
+
+    def _ri_extension_new(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, self._render_extension(item.source_payload))]
+
+    def _ri_extension_dropped(self, item: DiffItem) -> list[RenderedStatement]:
+        return [self._stmt(item, self._render_drop_extension(item.target_payload))]
+
+    # ---- Renderer portable de FK (ambos motores comparten esta sintaxis) ---- #
+    def _render_add_fk(self, table: str, fk) -> str:
+        cols = ", ".join(self._q(c, "columna") for c in fk.columns)
+        ref_cols = ", ".join(self._q(c, "columna") for c in fk.referred_columns)
+        ref = self._q(fk.referred_table, "tabla")
+        name = f"CONSTRAINT {self._q(fk.name, 'constraint')} " if fk.name else ""
+        sql = (
+            f"ALTER TABLE {self._q(table, 'tabla')} ADD {name}"
+            f"FOREIGN KEY ({cols}) REFERENCES {ref} ({ref_cols})"
+        )
+        if fk.on_delete:
+            sql += f" ON DELETE {self._sanitize_referential_action(fk.on_delete)}"
+        if fk.on_update:
+            sql += f" ON UPDATE {self._sanitize_referential_action(fk.on_update)}"
+        return sql
+
+    @staticmethod
+    def _sanitize_referential_action(action: str) -> str:
+        """Whitelist de acciones referenciales (nunca interpola texto crudo del motor)."""
+        allowed = {"CASCADE", "SET NULL", "RESTRICT", "NO ACTION", "SET DEFAULT"}
+        norm = (action or "").strip().upper()
+        if norm not in allowed:
+            raise AppHttpException(
+                message="Acción referencial de FK no reconocida.",
+                status_code=422, context={"action": norm},
+            )
+        return norm
+
+    # ------------------------------------------------------------------ #
+    # Hooks de rendering específicos de dialecto                           #
+    # ------------------------------------------------------------------ #
+    # NO son @abstractmethod a propósito: un ServerAdapter puede existir solo para
+    # introspección (p.ej. dobles de test) sin capacidad de rendering. Los adapters
+    # reales (MySQL/MariaDB/PostgreSQL) los implementan todos; llamar a uno no
+    # implementado falla ruidosamente (nunca genera DDL silenciosamente incorrecto).
+    def _render_column_def(self, col) -> str:
+        raise NotImplementedError(f"{self.dialect}: _render_column_def")
+
+    def _render_create_table(self, tbl) -> str:
+        raise NotImplementedError(f"{self.dialect}: _render_create_table")
+
+    def _render_modify_column(self, table, src_col, tgt_col, changed: list[str]) -> list[str]:
+        raise NotImplementedError(f"{self.dialect}: _render_modify_column")
+
+    def _render_drop_fk(self, table: str, fk) -> str:
+        raise NotImplementedError(f"{self.dialect}: _render_drop_fk")
+
+    def _render_drop_unique(self, table: str, uc) -> str:
+        raise NotImplementedError(f"{self.dialect}: _render_drop_unique")
+
+    def _render_drop_check(self, table: str, ck) -> str:
+        raise NotImplementedError(f"{self.dialect}: _render_drop_check")
+
+    def _render_create_index(self, table: str, ix) -> str:
+        raise NotImplementedError(f"{self.dialect}: _render_create_index")
+
+    def _render_drop_index(self, table: str, ix) -> str:
+        raise NotImplementedError(f"{self.dialect}: _render_drop_index")
+
+    def _render_alter_pk(self, table: str, src_tbl, tgt_tbl) -> list[str]:
+        raise NotImplementedError(f"{self.dialect}: _render_alter_pk")
+
+    def _render_view(self, view, replace: bool) -> list[str]:
+        raise NotImplementedError(f"{self.dialect}: _render_view")
+
+    def _render_drop_view(self, view) -> str:
+        raise NotImplementedError(f"{self.dialect}: _render_drop_view")
+
+    def _render_routine(self, routine, replace: bool) -> list[str]:
+        raise NotImplementedError(f"{self.dialect}: _render_routine")
+
+    def _render_drop_routine(self, routine) -> str:
+        raise NotImplementedError(f"{self.dialect}: _render_drop_routine")
+
+    def _render_trigger(self, trigger, replace: bool) -> list[str]:
+        raise NotImplementedError(f"{self.dialect}: _render_trigger")
+
+    def _render_drop_trigger(self, trigger) -> str:
+        raise NotImplementedError(f"{self.dialect}: _render_drop_trigger")
+
+    # Los siguientes solo aplican a un motor; el default degrada a no-op para el otro.
+    def _render_event(self, event, replace: bool) -> list[str]:
+        return []
+
+    def _render_drop_event(self, event) -> str:
+        return f"DROP EVENT {self._q(event.name, 'event')}"
+
+    def _render_sequence(self, seq, *, alter: bool) -> list[str]:
+        return []
+
+    def _render_drop_sequence(self, seq) -> str:
+        return f"DROP SEQUENCE {self._q(seq.name, 'secuencia')}"
+
+    def _render_enum(self, src_enum, tgt_enum) -> list[str]:
+        return []
+
+    def _render_drop_enum(self, enum) -> str:
+        return f"DROP TYPE {self._q(enum.name, 'tipo')}"
+
+    def _render_extension(self, ext) -> str:
+        return f"CREATE EXTENSION IF NOT EXISTS {self._q(ext.name, 'extension')}"
+
+    def _render_drop_extension(self, ext) -> str:
+        return f"DROP EXTENSION {self._q(ext.name, 'extension')}"
 
     # ------------------------------------------------------------------ #
     # Datos-semilla (snapshot selectivo) — read-only, cross-dialect       #

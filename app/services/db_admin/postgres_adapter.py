@@ -22,10 +22,16 @@ from app.services.db_admin.base_adapter import ServerAdapter
 from app.services.db_admin.dtos import (
     DumpStatement,
     EngineUserInfo,
+    EnumTypeInfo,
+    ExtensionInfo,
     GrantInfo,
     GrantLevel,
     ObjectRef,
+    RoutineInfo,
+    SequenceInfo,
     StructureDump,
+    TriggerInfo,
+    ViewInfo,
 )
 from app.services.db_admin.identifiers import (
     quote_identifier,
@@ -569,3 +575,317 @@ class PostgresAdapter(ServerAdapter):
             {"t": table, "s": schema},
         ).scalar()
         return int(row) if row is not None and row >= 0 else 0
+
+    # ------------------------- snapshot canónico (hooks) ---------------------- #
+    @staticmethod
+    def _safe_fetch(conn, sql, params=None):
+        """Consulta de catálogo OPCIONAL: [] si la feature no existe en esta versión."""
+        try:
+            return conn.execute(text(sql), params or {}).fetchall()
+        except SQLAlchemyError:
+            return []
+
+    def _column_extras(self, conn, database, table, schema) -> dict[str, dict]:
+        # PG: solo collation por columna. information_schema.columns.collation_name es
+        # NULL cuando la columna usa la collation por defecto (regla de herencia gratis).
+        out: dict[str, dict] = {}
+        for name, coll in self._safe_fetch(
+            conn,
+            "SELECT column_name, collation_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = :t",
+            {"t": table},
+        ):
+            out[name] = {"collation": coll, "charset": None, "on_update": None}
+        return out
+
+    def _snapshot_views(self, conn, database, schema) -> list[ViewInfo]:
+        out: list[ViewInfo] = []
+        for vname, vdef, check_option in self._safe_fetch(
+            conn,
+            "SELECT table_name, view_definition, check_option FROM information_schema.views "
+            "WHERE table_schema = 'public' ORDER BY table_name",
+        ):
+            cols = [
+                r[0]
+                for r in self._safe_fetch(
+                    conn,
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = :t ORDER BY ordinal_position",
+                    {"t": vname},
+                )
+            ]
+            out.append(
+                ViewInfo(
+                    name=vname, is_materialized=False, definition=str(vdef or ""),
+                    columns=cols,
+                    check_option=None if not check_option or str(check_option) == "NONE" else str(check_option),
+                )
+            )
+        for mname, mdef in self._safe_fetch(
+            conn,
+            "SELECT matviewname, definition FROM pg_matviews "
+            "WHERE schemaname = 'public' ORDER BY matviewname",
+        ):
+            out.append(ViewInfo(name=mname, is_materialized=True, definition=str(mdef or "")))
+        return out
+
+    def _snapshot_routines(self, conn, database, schema) -> list[RoutineInfo]:
+        out: list[RoutineInfo] = []
+        _vol = {"i": "IMMUTABLE", "s": "STABLE", "v": "VOLATILE"}
+        for proname, prokind, fdef, lang, ret, volatile, secdef in self._safe_fetch(
+            conn,
+            "SELECT p.proname, p.prokind, pg_get_functiondef(p.oid), l.lanname, "
+            "pg_get_function_result(p.oid), p.provolatile, p.prosecdef "
+            "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "JOIN pg_language l ON l.oid = p.prolang "
+            "WHERE n.nspname = 'public' AND p.prokind IN ('f', 'p') ORDER BY p.proname",
+        ):
+            out.append(
+                RoutineInfo(
+                    name=proname or "",
+                    kind="PROCEDURE" if prokind == "p" else "FUNCTION",
+                    return_type=str(ret) if ret else None,
+                    language=str(lang) if lang else None,
+                    volatility=_vol.get(str(volatile), None),
+                    security_definer=bool(secdef),
+                    body=str(fdef or ""),
+                )
+            )
+        return out
+
+    def _snapshot_triggers(self, conn, database, schema) -> list[TriggerInfo]:
+        # La identidad estructural del trigger vive en pg_get_triggerdef (captura timing/
+        # eventos/nivel/condición): timing/events/level se dejan None y el diff compara
+        # el cuerpo normalizado.
+        out: list[TriggerInfo] = []
+        for tgname, relname, tgdef in self._safe_fetch(
+            conn,
+            "SELECT t.tgname, c.relname, pg_get_triggerdef(t.oid) FROM pg_trigger t "
+            "JOIN pg_class c ON c.oid = t.tgrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' AND NOT t.tgisinternal ORDER BY t.tgname",
+        ):
+            out.append(TriggerInfo(name=tgname, table=relname or "", action=str(tgdef or "")))
+        return out
+
+    def _snapshot_sequences(self, conn, database, schema) -> list[SequenceInfo]:
+        out: list[SequenceInfo] = []
+        for name, dtype, incr, mn, mx, start, cycle in self._safe_fetch(
+            conn,
+            "SELECT c.relname, s.seqtypid::regtype::text, s.seqincrement, s.seqmin, "
+            "s.seqmax, s.seqstart, s.seqcycle FROM pg_sequence s "
+            "JOIN pg_class c ON c.oid = s.seqrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' AND NOT EXISTS "
+            "(SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'a') "
+            "ORDER BY c.relname",
+        ):
+            out.append(
+                SequenceInfo(
+                    name=name, data_type=str(dtype) if dtype else None,
+                    increment=incr, min_value=mn, max_value=mx, start_value=start,
+                    cycle=bool(cycle),
+                )
+            )
+        return out
+
+    def _snapshot_enum_types(self, conn, database, schema) -> list[EnumTypeInfo]:
+        out: list[EnumTypeInfo] = []
+        for typname, labels in self._safe_fetch(
+            conn,
+            "SELECT t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) "
+            "FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid "
+            "JOIN pg_namespace n ON n.oid = t.typnamespace "
+            "WHERE n.nspname = 'public' GROUP BY t.typname ORDER BY t.typname",
+        ):
+            out.append(EnumTypeInfo(name=typname, values=[str(v) for v in (labels or [])]))
+        return out
+
+    def _snapshot_extensions(self, conn, database, schema) -> list[ExtensionInfo]:
+        out: list[ExtensionInfo] = []
+        for extname, extversion in self._safe_fetch(
+            conn,
+            "SELECT extname, extversion FROM pg_extension WHERE extname <> 'plpgsql' "
+            "ORDER BY extname",
+        ):
+            out.append(ExtensionInfo(name=extname, version=str(extversion) if extversion else None))
+        return out
+
+    # ------------------------- generación de DDL (Fase 3) --------------------- #
+    # Todo NOMBRE de objeto pasa por validate_identifier + quote_identifier (self._q).
+    # Los cuerpos de vistas/rutinas/triggers se re-emiten tal cual (pg_get_*def, sin
+    # DEFINER) — requieren revisión individual (requires_individual_review).
+    def _render_column_def(self, col) -> str:
+        parts = [self._q(col.name, "columna"), col.type]
+        if col.collation:
+            parts.append(f"COLLATE {self._q(col.collation, 'collation')}")
+        if col.identity is not None:
+            mode = "ALWAYS" if col.identity.always else "BY DEFAULT"
+            parts.append(f"GENERATED {mode} AS IDENTITY")
+        elif col.computed is not None:
+            parts.append(f"GENERATED ALWAYS AS ({col.computed.sqltext}) STORED")
+        elif col.default is not None:
+            parts.append(f"DEFAULT {col.default}")
+        if not col.nullable:
+            parts.append("NOT NULL")
+        return " ".join(parts)
+
+    def _render_create_table(self, tbl) -> str:
+        lines = [self._render_column_def(c) for c in tbl.columns]
+        if tbl.primary_key:
+            pk = ", ".join(self._q(c, "columna") for c in tbl.primary_key)
+            lines.append(f"PRIMARY KEY ({pk})")
+        for uc in tbl.unique_constraints:
+            cols = ", ".join(self._q(c, "columna") for c in uc.columns)
+            name = f"CONSTRAINT {self._q(uc.name, 'constraint')} " if uc.name else ""
+            lines.append(f"{name}UNIQUE ({cols})")
+        for ck in tbl.check_constraints:
+            name = f"CONSTRAINT {self._q(ck.name, 'constraint')} " if ck.name else ""
+            lines.append(f"{name}CHECK ({ck.sqltext})")
+        body = ",\n  ".join(lines)
+        return f"CREATE TABLE {self._q(tbl.table, 'tabla')} (\n  {body}\n)"
+
+    def _render_modify_column(self, table, src_col, tgt_col, changed) -> list[str]:
+        # PostgreSQL no redefine en una sentencia: una por atributo que cambió.
+        t = self._q(table, "tabla")
+        c = self._q(src_col.name, "columna")
+        stmts: list[str] = []
+        if "type" in changed:
+            # USING best-effort (conversión no binaria-coercible). El motor de diff ya
+            # marcó needs_review para este ítem.
+            stmts.append(
+                f"ALTER TABLE {t} ALTER COLUMN {c} TYPE {src_col.type} USING {c}::{src_col.type}"
+            )
+        if "collation" in changed:
+            coll = self._q(src_col.collation, "collation") if src_col.collation else '"default"'
+            stmts.append(f"ALTER TABLE {t} ALTER COLUMN {c} TYPE {src_col.type} COLLATE {coll}")
+        if "nullable" in changed:
+            action = "DROP NOT NULL" if src_col.nullable else "SET NOT NULL"
+            stmts.append(f"ALTER TABLE {t} ALTER COLUMN {c} {action}")
+        if "default" in changed:
+            if src_col.default is None:
+                stmts.append(f"ALTER TABLE {t} ALTER COLUMN {c} DROP DEFAULT")
+            else:
+                stmts.append(f"ALTER TABLE {t} ALTER COLUMN {c} SET DEFAULT {src_col.default}")
+        if "comment" in changed:
+            cmt = quote_string_literal(src_col.comment, self.dialect) if src_col.comment else "NULL"
+            stmts.append(f"COMMENT ON COLUMN {t}.{c} IS {cmt}")
+        return stmts
+
+    def _drop_constraint(self, table: str, name: str | None) -> str:
+        if not name:
+            raise AppHttpException(
+                message="No se puede DROP de una constraint sin nombre en PostgreSQL.",
+                status_code=422,
+            )
+        return f"ALTER TABLE {self._q(table, 'tabla')} DROP CONSTRAINT {self._q(name, 'constraint')}"
+
+    def _render_drop_fk(self, table, fk) -> str:
+        return self._drop_constraint(table, fk.name)
+
+    def _render_drop_unique(self, table, uc) -> str:
+        return self._drop_constraint(table, uc.name)
+
+    def _render_drop_check(self, table, ck) -> str:
+        return self._drop_constraint(table, ck.name)
+
+    def _render_create_index(self, table, ix) -> str:
+        unique = "UNIQUE " if ix.unique else ""
+        name = (
+            self._q(ix.name, "indice") if ix.name
+            else self._q(f"ix_{table}_{'_'.join(ix.columns)}"[:63], "indice")
+        )
+        method = ""
+        if ix.method:
+            method = f" USING {validate_identifier(ix.method, self.dialect, 'metodo', allow_existing=True)}"
+        cols = ", ".join(self._q(c, "columna") for c in ix.columns)
+        sql = f"CREATE {unique}INDEX {name} ON {self._q(table, 'tabla')}{method} ({cols})"
+        if ix.include_columns:
+            sql += " INCLUDE (" + ", ".join(self._q(c, "columna") for c in ix.include_columns) + ")"
+        if ix.predicate:
+            sql += f" WHERE {ix.predicate}"
+        return sql
+
+    def _render_drop_index(self, table, ix) -> str:
+        if not ix.name:
+            raise AppHttpException(message="No se puede DROP de un índice sin nombre.", status_code=422)
+        return f"DROP INDEX {self._q(ix.name, 'indice')}"
+
+    def _render_alter_pk(self, table, src_tbl, tgt_tbl) -> list[str]:
+        stmts: list[str] = []
+        if tgt_tbl.primary_key:
+            pkname = tgt_tbl.primary_key_name or f"{table}_pkey"
+            stmts.append(self._drop_constraint(table, pkname))
+        if src_tbl.primary_key:
+            cols = ", ".join(self._q(c, "columna") for c in src_tbl.primary_key)
+            stmts.append(f"ALTER TABLE {self._q(table, 'tabla')} ADD PRIMARY KEY ({cols})")
+        return stmts
+
+    def _render_view(self, view, replace) -> list[str]:
+        if view.is_materialized:
+            stmts: list[str] = []
+            if replace:  # matview no soporta OR REPLACE
+                stmts.append(f"DROP MATERIALIZED VIEW IF EXISTS {self._q(view.name, 'vista')}")
+            stmts.append(f"CREATE MATERIALIZED VIEW {self._q(view.name, 'vista')} AS {view.definition}")
+            return stmts
+        cols = ""
+        if view.columns:
+            cols = " (" + ", ".join(self._q(c, "columna") for c in view.columns) + ")"
+        sql = f"CREATE OR REPLACE VIEW {self._q(view.name, 'vista')}{cols} AS {view.definition}"
+        if view.check_option:
+            sql += f" WITH {view.check_option} CHECK OPTION"
+        return [sql]
+
+    def _render_drop_view(self, view) -> str:
+        kind = "MATERIALIZED VIEW" if view.is_materialized else "VIEW"
+        return f"DROP {kind} {self._q(view.name, 'vista')}"
+
+    def _render_routine(self, routine, replace) -> list[str]:
+        # pg_get_functiondef ya emite CREATE OR REPLACE FUNCTION/PROCEDURE.
+        return [routine.body]
+
+    def _render_drop_routine(self, routine) -> str:
+        kind = "PROCEDURE" if routine.kind.upper() == "PROCEDURE" else "FUNCTION"
+        # best-effort: sin firma de argumentos (falla ante overloads; se documenta).
+        return f"DROP {kind} IF EXISTS {self._q(routine.name, 'rutina')}"
+
+    def _render_trigger(self, trigger, replace) -> list[str]:
+        stmts: list[str] = []
+        if replace:  # PG <14 no tiene CREATE OR REPLACE TRIGGER -> DROP + CREATE
+            stmts.append(
+                f"DROP TRIGGER IF EXISTS {self._q(trigger.name, 'trigger')} "
+                f"ON {self._q(trigger.table, 'tabla')}"
+            )
+        stmts.append(trigger.action)
+        return stmts
+
+    def _render_drop_trigger(self, trigger) -> str:
+        return (
+            f"DROP TRIGGER {self._q(trigger.name, 'trigger')} "
+            f"ON {self._q(trigger.table, 'tabla')}"
+        )
+
+    def _render_sequence(self, seq, *, alter) -> list[str]:
+        verb = "ALTER" if alter else "CREATE"
+        sql = f"{verb} SEQUENCE {self._q(seq.name, 'secuencia')}"
+        if seq.increment is not None:
+            sql += f" INCREMENT BY {int(seq.increment)}"
+        if seq.min_value is not None:
+            sql += f" MINVALUE {int(seq.min_value)}"
+        if seq.max_value is not None:
+            sql += f" MAXVALUE {int(seq.max_value)}"
+        sql += " CYCLE" if seq.cycle else " NO CYCLE"
+        return [sql]
+
+    def _render_enum(self, src_enum, tgt_enum) -> list[str]:
+        q = self._q(src_enum.name, "tipo")
+        if tgt_enum is None:
+            vals = ", ".join(quote_string_literal(v, self.dialect) for v in src_enum.values)
+            return [f"CREATE TYPE {q} AS ENUM ({vals})"]
+        # modified: solo la parte ADITIVA (ADD VALUE). Quitar/reordenar valores exige
+        # recrear el tipo y las columnas dependientes -> queda a revisión del operador.
+        existing = set(tgt_enum.values)
+        return [
+            f"ALTER TYPE {q} ADD VALUE {quote_string_literal(v, self.dialect)}"
+            for v in src_enum.values if v not in existing
+        ]

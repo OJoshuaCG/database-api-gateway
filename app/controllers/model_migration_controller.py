@@ -234,8 +234,27 @@ class ModelMigrationController:
             up_mysql = data.get("up_sql_mysql")
             up_pg = data.get("up_sql_postgresql")
             down_sql = data.get("down_sql")
-            # Sugerir rollback solo si el admin no proporcionó uno explícito.
-            suggested = self._rollback.generate(up_sql)
+            # Sugerir rollback solo si el admin no proporcionó uno explícito. Un llamador
+            # interno (p. ej. adopción de un diff) puede pasar un ``down_sql_suggested`` de
+            # mejor calidad (derivado del estado "antes" exacto): se respeta si viene.
+            suggested_override = data.get("down_sql_suggested")
+            suggested = (
+                suggested_override
+                if suggested_override is not None
+                else self._rollback.generate(up_sql)
+            )
+            # Parámetros OPCIONALES nuevos: preservan el comportamiento actual con sus
+            # defaults (una migración escrita a mano nace portable, schema, revisada). Se
+            # leen del ``data`` para no romper los call-sites existentes (la ruta pasa el
+            # ``model_dump()`` del schema, que no incluye estas claves). ``is_baseline`` se
+            # incluye además de los del plan porque el gate R1 (que protege el apply de DDL
+            # capturado sin revisar) se activa por ``is_baseline=True``.
+            source_engine = data.get("source_engine")
+            has_non_portable = bool(data.get("has_non_portable", False))
+            kind = data.get("kind") or "schema"
+            reviewed = data.get("reviewed")
+            reviewed = True if reviewed is None else bool(reviewed)
+            is_baseline = bool(data.get("is_baseline", False))
 
             # Versión: explícita si el admin la pasó; si no, autoasignada (secuencial).
             explicit_version = data.get("version")
@@ -255,6 +274,11 @@ class ModelMigrationController:
                     down_sql_suggested=suggested,
                     # El checksum cubre la versión: se recalcula en cada intento.
                     checksum=compute_checksum(up_sql, up_mysql, up_pg, down_sql, version),
+                    kind=kind,
+                    source_engine=source_engine,
+                    is_baseline=is_baseline,
+                    has_non_portable=has_non_portable,
+                    reviewed=reviewed,
                 )
                 session.add(migration)
                 try:
