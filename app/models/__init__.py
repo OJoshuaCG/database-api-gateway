@@ -30,6 +30,8 @@ from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.models.permission_profile import PermissionProfile, PermissionProfileItem
 from app.models.privilege import Privilege
+from app.models.schema_comparison import SchemaComparison
+from app.models.schema_comparison_item import SchemaComparisonItem
 from app.models.server import Server
 from app.models.server_user import ServerUser
 from app.models.user import User
@@ -49,6 +51,8 @@ __all__ = [
     "Privilege",
     "PermissionProfile",
     "PermissionProfileItem",
+    "SchemaComparison",
+    "SchemaComparisonItem",
     "EngineType",
     "ServerStatus",
     "ProvisionStatus",

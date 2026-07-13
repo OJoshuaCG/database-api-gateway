@@ -88,6 +88,17 @@ class MigrationResult:
     applied_at: datetime
 
 
+@dataclass(frozen=True)
+class StatementResult:
+    """Resultado de ejecutar UNA sentencia ad-hoc (Opción B del diff estructural)."""
+
+    index: int
+    status: str  # "applied" | "failed"
+    error: str | None
+    execution_ms: int
+    executed_at: datetime
+
+
 def version_table_name(slug: str) -> str:
     """
     Nombre de la tabla de versión Alembic en la BD destino: ``_gw_v_{slug}``.
@@ -483,6 +494,79 @@ class MigrationRunner:
         ) as (_conn, cfg, _vt):
             with _ALEMBIC_LOCK:
                 command.stamp(cfg, version)
+
+    # ------------------------------------------------------------------ #
+    # Ejecución AD-HOC (Opción B del diff estructural)                    #
+    # ------------------------------------------------------------------ #
+    def execute_adhoc(
+        self,
+        target: ServerTarget,
+        *,
+        db_name: str,
+        engine: EngineType,
+        managed_db_id: int,
+        statements: list[str],
+    ) -> list[StatementResult]:
+        """
+        Ejecuta ``statements`` DDL directamente sobre la BD destino, UNA por una,
+        deteniéndose en el primer fallo (igual que ``_apply_one``).
+
+        Reutiliza las primitivas ya probadas del runner: conexión en AUTOCOMMIT
+        (``database_connection``), advisory lock por BD (``_acquire_lock``/
+        ``_release_lock``) para evitar dos ejecuciones concurrentes sobre la misma
+        BD, y ``map_driver_error``/``_clean_error`` para no filtrar secretos.
+
+        DIFERENCIA con ``apply``: NO usa Alembic, NO genera archivos de revisión, NO
+        toca la tabla de versión ``_gw_v_{slug}`` ni ``database_migration_history``.
+        Es DDL derivado de un diff estructural sobre una BD SIN blueprint; ensuciar
+        esas estructuras (cuya FK apunta NOT NULL a ``model_migrations``) sería
+        incorrecto. El resultado por sentencia lo persiste el controller en
+        ``schema_comparison_items``.
+
+        Usa ``exec_driver_sql`` (no ``text()``): el DDL renderizado puede contener
+        ``::`` (casts de PostgreSQL) que ``text()`` interpretaría como bind params.
+        """
+        results: list[StatementResult] = []
+        try:
+            with database_connection(target, db_name) as conn:
+                conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+                self._acquire_lock(conn, engine, managed_db_id)
+                try:
+                    for i, stmt in enumerate(statements):
+                        t0 = time.monotonic()
+                        try:
+                            conn.exec_driver_sql(stmt)
+                            ms = int((time.monotonic() - t0) * 1000)
+                            results.append(
+                                StatementResult(
+                                    index=i, status="applied", error=None,
+                                    execution_ms=ms, executed_at=datetime.now(timezone.utc),
+                                )
+                            )
+                        except Exception as exc:  # noqa: BLE001 — registrar y detener
+                            ms = int((time.monotonic() - t0) * 1000)
+                            logger.warning(
+                                "execute_adhoc: la sentencia %d falló: %s", i, exc,
+                                exc_info=True,
+                            )
+                            results.append(
+                                StatementResult(
+                                    index=i, status="failed", error=_clean_error(exc),
+                                    execution_ms=ms, executed_at=datetime.now(timezone.utc),
+                                )
+                            )
+                            break  # no continuar tras un fallo (posible estado parcial)
+                finally:
+                    self._release_lock(conn, engine, managed_db_id)
+        except AppHttpException:
+            raise
+        except SQLAlchemyError as exc:
+            # Fallo ANTES de ejecutar ninguna sentencia (conexión/lock).
+            raise map_driver_error(
+                exc, op="schema_execute_adhoc", target=target,
+                extra={"database": db_name},
+            )
+        return results
 
     # ------------------------------------------------------------------ #
     # Helpers                                                             #

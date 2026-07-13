@@ -107,6 +107,18 @@ SNAPSHOT_MAX_SQL_PER_VERSION = int(
     os.getenv("SNAPSHOT_MAX_SQL_PER_VERSION", str(4 * 1024 * 1024))  # 4 MB
 )
 
+# ======= Diff estructural entre BDs (schema comparisons) ======= #
+# Vida útil (horas) de una comparación persistida. Tras expirar, adopt/execute exigen
+# recalcular: una comparación vieja describe un estado del motor que ya no existe.
+SCHEMA_COMPARISON_TTL_HOURS = int(os.getenv("SCHEMA_COMPARISON_TTL_HOURS", "24"))
+# Tope de sentencias por comparación. Un diff con miles de ítems suele indicar dos BDs
+# no comparables (o drift masivo); se rechaza (422) para no materializar payloads enormes.
+SCHEMA_COMPARISON_MAX_ITEMS = int(os.getenv("SCHEMA_COMPARISON_MAX_ITEMS", "2000"))
+# Tope de bytes del DDL total renderizado de una comparación (protege memoria/BD del gateway).
+SCHEMA_COMPARISON_MAX_SQL_BYTES = int(
+    os.getenv("SCHEMA_COMPARISON_MAX_SQL_BYTES", str(8 * 1024 * 1024))  # 8 MB
+)
+
 # ======= Anti-SSRF (validación de host destino) ======= #
 # Si True (default), al registrar/editar un Server se rechazan destinos peligrosos
 # (loopback, link-local/metadata 169.254.169.254, multicast, reservados). Los rangos

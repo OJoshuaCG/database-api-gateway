@@ -8,6 +8,7 @@ from app.routes.v1 import (
     model_migrations,
     permission_profiles,
     privileges,
+    schema_comparisons,
     server_users,
     servers,
     test,
@@ -21,6 +22,7 @@ router.include_router(server_users.router)
 router.include_router(database_models.router)
 router.include_router(model_migrations.router)
 router.include_router(managed_databases.router)
+router.include_router(schema_comparisons.router)
 router.include_router(privileges.router)
 router.include_router(permission_profiles.router)
 router.include_router(crypto.router)
