@@ -34,22 +34,62 @@ y 3 requieren motores reales (ver [Verificación](#verificación)).
 
 ## Decisiones de producto
 
-1. **Dirección explícita, nunca inferida.** Toda comparación exige `source_database_id`
-   (estado deseado/referencia) y `target_database_id` (la que se modificaría). Todo el DDL
-   generado es "qué correr sobre TARGET para que quede como SOURCE".
-2. **Adoptar como blueprint (Opción A) solo si el TARGET tiene `model_id`.** La nueva
-   versión se agrega a ESE blueprint.
-3. **Ejecución directa (Opción B) queda BLOQUEADA (409) si el target tiene blueprint
+1. **Dirección explícita, nunca inferida.** Toda comparación exige una referencia de
+   `source` (estado deseado/referencia) y una de `target` (la que se modificaría). Todo el
+   DDL generado es "qué correr sobre TARGET para que quede como SOURCE".
+2. **Cualquier BD de un servidor dado de alta es comparable, esté o no en el inventario
+   del gateway.** Cada lado (`source`/`target`) se especifica de forma independiente con
+   una de dos representaciones — ver [Referencias crudas](#referencias-crudas-bds-sin-adoptar).
+3. **Adoptar como blueprint (Opción A) exige DOS cosas del TARGET**: que esté registrado
+   en el inventario (`ManagedDatabase`) Y que tenga `model_id` asignado. Si falta
+   cualquiera de las dos, `422` con el motivo exacto. La nueva versión se agrega a ESE
+   blueprint.
+4. **Ejecución directa (Opción B) queda BLOQUEADA (409) si el target tiene blueprint
    asignado** — evita que el target quede desincronizado de su propio blueprint sin que el
-   sistema se entere. Sin blueprint, Opción B está disponible sin restricciones.
-4. **El modo automático `all_except_destructive` excluye TODO lo potencialmente
+   sistema se entere. Si el target NO está en el inventario, no puede tener blueprint por
+   definición, así que Opción B siempre está disponible sin restricción de blueprint.
+5. **El modo automático `all_except_destructive` excluye TODO lo potencialmente
    destructivo**, no solo `DROP` literal: también achicar un tipo, quitar valores de un
    ENUM, cambiar collation/charset, `DROP DEFAULT`/`DROP CONSTRAINT`, objetos con
    `possible_rename_of`, etc. — ver [clasificación destructiva](#clasificación-destructiva).
-5. **Se permite comparar MySQL↔MariaDB** (misma familia SQL); PostgreSQL solo consigo
+6. **Se permite comparar MySQL↔MariaDB** (misma familia SQL); PostgreSQL solo consigo
    mismo. La comparación cruzada marca `cross_flavor_warning=true` en cada ítem afectado
    (ruido esperable: JSON como LONGTEXT en MariaDB, `utf8mb4_0900_ai_ci` solo en MySQL 8,
    `CREATE SEQUENCE` nativo de MariaDB, etc.).
+
+## Referencias crudas (BDs sin adoptar)
+
+Cada lado (`source`/`target`) de una comparación se especifica de forma independiente con
+**una de dos** representaciones:
+
+- **Por inventario**: `{source|target}_database_id` — el id de una `ManagedDatabase` ya
+  registrada (adoptada o provisionada). Comportamiento de siempre.
+- **Cruda**: `{source|target}_server_id` + `{source|target}_database_name` — cualquier BD
+  que exista de verdad en el motor de ese servidor, **sin necesidad de haberla dado de
+  alta en el inventario**. Se valida que exista en vivo (`404` si no) antes de snapshotear.
+
+Mandar ambas representaciones para un mismo lado, o ninguna, da `422`.
+
+**Auto-resolución transparente**: si la referencia cruda (`server_id`+`database_name`)
+coincide con una `ManagedDatabase` YA registrada, se trata **exactamente igual** que si se
+hubiera pasado su id — mismo lock de concurrencia, misma cuarentena, Opción A disponible
+si tiene blueprint. Esto es importante para la seguridad del sistema: un id real y una
+referencia cruda a la MISMA BD física nunca quedan sin lock compartido entre sí, y nunca
+hay ambigüedad sobre "cuál es la fuente de verdad" para esa BD.
+
+**Para una BD genuinamente sin registrar** (no auto-resuelta):
+- Opción A (adoptar) da `422` explícito: "El target no está en el inventario del gateway
+  ... Usa /execute (Opción B)."
+- Opción B (ejecutar) funciona igual que con una BD gestionada, con dos diferencias: no
+  hay concepto de cuarentena (no existe una fila de estado que auditar — nunca se
+  bloquea por esa razón) y el lock de concurrencia usa una clave sintética
+  **determinística y siempre negativa**, derivada de `(server_id, database_name)` — nunca
+  colisiona con un `managed_database_id` real (siempre positivo), y dos ejecuciones
+  concurrentes sobre la MISMA BD física sin gestionar sí se serializan entre sí.
+- La respuesta (`GET .../{id}`) siempre expone `source_server_id`/`source_database_name`/
+  `target_server_id`/`target_database_name` (poblados en ambos modos) y
+  `source_database_id`/`target_database_id` como `int | null` (`null` = sin inventario;
+  úsalo para decidir si mostrar la Opción A).
 
 ## Matching por definición, no por nombre (garantía central)
 
@@ -103,8 +143,12 @@ exacto antes de confirmarlo.
 La comparación se **persiste** (no es efímera por token del cliente): el servidor sigue
 siendo la única fuente de verdad del SQL a ejecutar.
 
-- `SchemaComparison` (`app/models/schema_comparison.py`): `source_database_id`,
-  `target_database_id`, `source_engine`/`target_engine`, `source_fingerprint`/
+- `SchemaComparison` (`app/models/schema_comparison.py`): `source_server_id`/
+  `target_server_id` (FK a `servers`, siempre poblados) + `source_database_name`/
+  `target_database_name` (siempre poblados) identifican la BD física de cada lado;
+  `source_database_id`/`target_database_id` (`int | None`) son el `managed_database_id`
+  **solo si** esa BD está en el inventario (`NULL` si es una referencia cruda sin
+  adoptar). Además: `source_engine`/`target_engine`, `source_fingerprint`/
   `target_fingerprint` (hash del snapshot normalizado), `cross_flavor_warning`,
   `scope_note`, `expires_at` (TTL).
 - `SchemaComparisonItem` (`app/models/schema_comparison_item.py`): `object_type`,
@@ -124,10 +168,10 @@ cuarentena, que sí lo tiene).
 
 | Método | Ruta | Qué hace |
 |---|---|---|
-| `POST` | `/api/v1/schema-comparisons` 🔌 | Body `{source_database_id, target_database_id}`. Valida motor compatible, snapshotea ambas BDs, corre el diff puro, renderiza el DDL para el motor del TARGET y persiste cabecera + ítems + fingerprints. Rate limit 10/min. |
+| `POST` | `/api/v1/schema-comparisons` 🔌 | Body: para cada lado, `{source\|target}_database_id` **o** `{source\|target}_server_id` + `{source\|target}_database_name` (ver [Referencias crudas](#referencias-crudas-bds-sin-adoptar)). Valida motor compatible, snapshotea ambas BDs, corre el diff puro, renderiza el DDL para el motor del TARGET y persiste cabecera + ítems + fingerprints. Rate limit 10/min. |
 | `GET` | `/api/v1/schema-comparisons/{id}` | Resumen: `counts` (object_type → change_type → nº de objetos), `has_destructive`, `cross_flavor_warning`, `scope_note`, `expired`. |
 | `GET` | `/api/v1/schema-comparisons/{id}/items` | Detalle paginado con el **DDL exacto** (dry-run/preview obligatorio — nunca se ejecuta sin haberlo mostrado). Filtra por `object_type`/`change_type`. |
-| `POST` | `/api/v1/schema-comparisons/{id}/adopt` 🔌 | **Opción A.** Body `{selected_item_ids, name, description?, execute_immediately}`. `422` si el target no tiene `model_id`. Reusa `ModelMigrationController.create_migration` (checksum, autoversión). `execute_immediately=true` aplica por el camino normal (`ManagedMigrationController.apply`, con todos sus guards). Rate limit 3/min. |
+| `POST` | `/api/v1/schema-comparisons/{id}/adopt` 🔌 | **Opción A.** Body `{selected_item_ids, name, description?, execute_immediately}`. `422` si el target no está en el inventario, o si lo está pero no tiene `model_id` (dos motivos distintos, mismo código). Reusa `ModelMigrationController.create_migration` (checksum, autoversión). `execute_immediately=true` aplica por el camino normal (`ManagedMigrationController.apply`, con todos sus guards). Rate limit 3/min. |
 | `POST` | `/api/v1/schema-comparisons/{id}/execute-preview` | Resuelve un `mode`/selección de Opción B **sin ejecutar nada**: devuelve las sentencias exactas + el `confirm_token` a reenviar. Solo lectura (no toca el motor). Ver [El `confirm_token`](#el-confirm_token-opción-b). |
 | `POST` | `/api/v1/schema-comparisons/{id}/execute` 🔌 | **Opción B.** Body `{mode: all\|all_except_destructive\|custom, selected_item_ids?, confirm_target_name, confirm_token}` + query `force` (cuarentena). `409` si el target TIENE `model_id` (usar `adopt`). Ejecuta con `MigrationRunner.execute_adhoc` (sin Alembic, sin tabla de versión). Rate limit 3/min. |
 
@@ -277,6 +321,16 @@ bloquea un caso de uso legítimo — quedó verificado y documentado, no oculto.
   no se tocaron porque ya pueden estar aplicadas en otros entornos y corregirlas es un
   esfuerzo aparte, fuera del alcance de esta feature — vale la pena una auditoría dedicada
   del downgrade de todas las migraciones contra MySQL/MariaDB real en algún momento.
+- **Migración de seguimiento** (`f7a8b9c0d1e2`, referencias crudas): agrega
+  `source_server_id`/`target_server_id`/`source_database_name`/`target_database_name`
+  (NOT NULL, backfilleadas desde `managed_databases` para filas preexistentes) y relaja
+  `source_database_id`/`target_database_id` a nullable. Verificada de forma independiente
+  contra **MariaDB 11 real**: ciclo `upgrade head` → `downgrade -1` → `upgrade head` desde
+  cero, backfill confirmado con datos reales, y el **downgrade lossy** (borra las
+  comparaciones de BDs crudas antes de restaurar `NOT NULL`) probado explícitamente —
+  una fila gestionada sobrevive, una cruda se elimina, tal como está documentado en el
+  docstring de la migración. También aplica la lección de la migración anterior: la FK
+  se suelta antes que el índice que respalda, no al revés.
 
 ---
 

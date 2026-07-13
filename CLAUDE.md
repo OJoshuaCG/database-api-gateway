@@ -586,15 +586,27 @@ directo** ad-hoc (Opción B). Guía de uso: `docs/features/schema-comparison.md`
   ítem); (3) `ServerAdapter.render_diff(diff) -> list[RenderedStatement]` (DDL por dialecto).
 - **Endpoints** (`app/routes/v1/schema_comparisons.py`): `POST /schema-comparisons` (snapshotea
   ambas BDs, diffea, persiste), `GET /schema-comparisons/{id}` (resumen), `GET .../items`
-  (DDL paginado, dry-run obligatorio), `POST .../adopt` (Opción A, requiere `model_id` en el
-  target, reusa `ModelMigrationController.create_migration`), `POST .../execute` (Opción B,
-  409 si el target TIENE `model_id`; `mode: all|all_except_destructive|custom` +
+  (DDL paginado, dry-run obligatorio), `POST .../execute-preview` (resuelve modo/selección
+  de Opción B SIN ejecutar, devuelve el `confirm_token`), `POST .../adopt` (Opción A,
+  requiere que el target esté en el inventario Y tenga `model_id`, reusa
+  `ModelMigrationController.create_migration`), `POST .../execute` (Opción B, 409 si el
+  target TIENE `model_id`; `mode: all|all_except_destructive|custom` +
   `confirm_target_name` + `confirm_token` verificable con
   `SchemaComparisonController.execution_token(...)`; usa `MigrationRunner.execute_adhoc`, sin
   Alembic ni `_gw_v_{slug}`).
+- **BDs sin adoptar**: cada lado (`source`/`target`) acepta `{lado}_database_id` (BD en
+  inventario) O `{lado}_server_id`+`{lado}_database_name` (BD cruda de cualquier servidor
+  dado de alta, sin necesidad de registrarla) — validado que exista en vivo. Una referencia
+  cruda que coincide con una `ManagedDatabase` ya existente se **auto-resuelve** a esa BD
+  (mismo lock/cuarentena/Opción A que si se hubiera pasado el id). Opción B sobre una BD
+  genuinamente sin registrar usa una clave de lock sintética (negativa, determinística por
+  `server_id`+nombre — nunca colisiona con un `managed_database_id` real) y no tiene
+  concepto de cuarentena. Opción A da 422 si el target no está en el inventario.
 - **Modelos**: `SchemaComparison`/`SchemaComparisonItem` (persistidos, con `source_fingerprint`/
   `target_fingerprint` — anti-TOCTOU: re-snapshotear y recomparar antes de adoptar/ejecutar, 409
-  sin `force` si difiere).
+  sin `force` si difiere). `SchemaComparison` guarda siempre `{lado}_server_id`/
+  `{lado}_database_name` (identidad física) y `{lado}_database_id` (`int | None`, solo si
+  está en inventario).
 - **Gotchas**: dirección `source`(deseado)/`target`(a modificar) siempre explícita, nunca
   inferida; el modo automático `all_except_destructive` excluye TODO lo no-demostrablemente-
   aditivo (no solo `DROP`: narrowing de tipo, cambio de collation/charset, `possible_rename_of`);
