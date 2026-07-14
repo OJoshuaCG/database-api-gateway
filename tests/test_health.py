@@ -33,3 +33,18 @@ def test_readiness_503_when_db_unreachable(client, monkeypatch):
     r = client.get("/health/ready")
     assert r.status_code == 503
     assert r.json()["status"] == "unavailable"
+
+
+def test_health_endpoints_send_cors_header(client):
+    """
+    /health y /health/ready viven en el app principal, NO en una sub-app versionada, así
+    que necesitan su propio CORSMiddleware (regresión: sin él, el navegador bloquea la
+    lectura de la respuesta para un frontend en otro origen, p. ej. localhost:5173 en dev,
+    aunque la respuesta llegue con 200).
+    """
+    origin = "http://localhost:5173"
+    r = client.get("/health", headers={"Origin": origin})
+    assert r.headers.get("access-control-allow-origin") == origin
+
+    r = client.get("/health/ready", headers={"Origin": origin})
+    assert r.headers.get("access-control-allow-origin") == origin

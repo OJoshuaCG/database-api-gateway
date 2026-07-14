@@ -1,10 +1,12 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.core import remote_engine
 from app.core.auth import bootstrap_admin
-from app.core.versioned_app import create_versioned_app
+from app.core.environments import CORS_ORIGINS
+from app.core.versioned_app import cors_allow_credentials, create_versioned_app
 from app.routes.health import router as health_router
 from app.routes.v1.routes import router as v1_router
 from app.services.privilege_catalog import seed_privileges
@@ -25,14 +27,29 @@ async def lifespan(app: FastAPI):
 
 
 # === Main app
-# Solo gestiona rutas no versionadas (/health).
-# No tiene docs propios ni middlewares; cada sub-app versionada
-# es autocontenida con su propia configuración.
+# Solo gestiona rutas no versionadas (/health). No tiene docs propios ni el resto de los
+# middlewares (rate limiting, sesión, tamaño de request); cada sub-app versionada es
+# autocontenida con su propia configuración.
+#
+# CORS es la EXCEPCIÓN: /health no está montado bajo ninguna sub-app versionada, así que
+# sin su propio CORSMiddleware queda fuera de cualquier configuración de CORS y el
+# navegador bloquea la lectura de la respuesta desde un origen distinto (p. ej. el
+# frontend en dev, http://localhost:5173) aunque la respuesta SÍ llegue. /health no usa
+# cookies de sesión (no hay SessionMiddleware en este app), así que reusar CORS_ORIGINS
+# aquí es seguro: no hay credencial que proteger en esta ruta.
 app = FastAPI(
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=cors_allow_credentials(CORS_ORIGINS),
+    allow_methods=["GET"],
+    allow_headers=["*"],
 )
 
 app.include_router(health_router)

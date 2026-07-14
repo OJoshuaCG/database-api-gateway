@@ -47,17 +47,29 @@ CORS es el segundo middleware en ejecutarse (después de `RequestSizeMiddleware`
 
 ## CORS en `/health`
 
-El endpoint `/health` está en el app principal, **no** en la sub-app versionada, por lo que no tiene `CORSMiddleware`. Si necesitas llamar `/health` desde un browser con CORS, agrega el middleware al app principal en `main.py`:
+El endpoint `/health` (y `/health/ready`) está en el app principal, **no** en la sub-app
+versionada. Sin su propio `CORSMiddleware`, el navegador bloquea la LECTURA de la
+respuesta desde un origen distinto (p. ej. el frontend en dev, `localhost:5173`), aunque
+la respuesta llegue con 200 — síntoma típico: "CORS Missing Allow Origin" en devtools con
+el body visible en la pestaña Network.
+
+**Ya está resuelto** (`main.py`, aplicado al app principal junto con `app.include_router`):
 
 ```python
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.environments import CORS_ORIGINS
+from app.core.versioned_app import cors_allow_credentials
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
+    # cors_allow_credentials (no True fijo): con CORS_ORIGINS="*" da False, evitando la
+    # combinación que los browsers rechazan (ver advertencia arriba). /health no usa
+    # cookies de sesión de todos modos (no hay SessionMiddleware en el app principal).
+    allow_credentials=cors_allow_credentials(CORS_ORIGINS),
     allow_methods=["GET"],
     allow_headers=["*"],
 )
 ```
+
+Test de regresión: `tests/test_health.py::test_health_endpoints_send_cors_header`.
