@@ -46,6 +46,44 @@ def cors_allow_credentials(origins: list[str]) -> bool:
     return bool(origins) and "*" not in origins
 
 
+class PathScopedCORSMiddleware:
+    """
+    Aplica ``CORSMiddleware`` SOLO a paths que empiecen con ``path_prefix``; para
+    cualquier otro path, pasa la request sin tocar (passthrough total, ni siquiera mira
+    el ``Origin``).
+
+    Existe porque el app PRINCIPAL monta las sub-apps versionadas
+    (``app.mount("/api/v1", v1_app)``), y un middleware agregado con
+    ``app.add_middleware()`` en el app principal envuelve TAMBIÉN esas sub-apps montadas
+    (el middleware del ASGI externo siempre corre antes que el routing interno que
+    resuelve el mount). Un ``CORSMiddleware`` "global" ahí interceptaría el preflight de
+    *cualquier* ruta de ``/api/v1/*`` ANTES de que llegue al ``CORSMiddleware`` propio de
+    esa sub-app (que tiene su propia config de ``allow_methods``/``allow_headers``/
+    ``allow_credentials``) — y si la config del principal es más restrictiva (p. ej.
+    ``allow_methods=["GET"]``, pensada solo para ``/health``), el preflight de un POST a
+    ``/api/v1/auth/login`` se rechaza con ``400 Disallowed CORS method`` aunque la
+    sub-app v1 sí lo permita. Bug real detectado por el frontend (login roto en CORS)
+    tras agregar CORS al app principal para /health sin acotarlo por path.
+
+    Con este wrapper, el CORS del app principal queda estrictamente acotado a sus
+    propias rutas no versionadas (``/health``) y nunca interfiere con las sub-apps
+    montadas, que se resuelven con SU PROPIO stack de middlewares intacto — coherente
+    con que cada sub-app versionada es autocontenida (ver docstring de
+    ``create_versioned_app``).
+    """
+
+    def __init__(self, app, path_prefix: str, **cors_kwargs) -> None:
+        self._plain_app = app
+        self._cors_app = CORSMiddleware(app, **cors_kwargs)
+        self._path_prefix = path_prefix
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and scope["path"].startswith(self._path_prefix):
+            await self._cors_app(scope, receive, send)
+        else:
+            await self._plain_app(scope, receive, send)
+
+
 def _verify_docs_credentials(credentials: HTTPBasicCredentials = Depends(_http_basic)):
     """Verifica usuario y contraseña para acceder a la documentación."""
     valid_user = secrets.compare_digest(credentials.username.encode(), DOCS_USER.encode())

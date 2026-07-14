@@ -1,12 +1,15 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
 from app.core import remote_engine
 from app.core.auth import bootstrap_admin
 from app.core.environments import CORS_ORIGINS
-from app.core.versioned_app import cors_allow_credentials, create_versioned_app
+from app.core.versioned_app import (
+    PathScopedCORSMiddleware,
+    cors_allow_credentials,
+    create_versioned_app,
+)
 from app.routes.health import router as health_router
 from app.routes.v1.routes import router as v1_router
 from app.services.privilege_catalog import seed_privileges
@@ -32,11 +35,18 @@ async def lifespan(app: FastAPI):
 # autocontenida con su propia configuración.
 #
 # CORS es la EXCEPCIÓN: /health no está montado bajo ninguna sub-app versionada, así que
-# sin su propio CORSMiddleware queda fuera de cualquier configuración de CORS y el
-# navegador bloquea la lectura de la respuesta desde un origen distinto (p. ej. el
-# frontend en dev, http://localhost:5173) aunque la respuesta SÍ llegue. /health no usa
-# cookies de sesión (no hay SessionMiddleware en este app), así que reusar CORS_ORIGINS
-# aquí es seguro: no hay credencial que proteger en esta ruta.
+# sin su propio CORS queda fuera de cualquier configuración y el navegador bloquea la
+# lectura de la respuesta desde un origen distinto (p. ej. el frontend en dev,
+# http://localhost:5173) aunque la respuesta SÍ llegue. /health no usa cookies de sesión
+# (no hay SessionMiddleware en este app), así que reusar CORS_ORIGINS aquí es seguro: no
+# hay credencial que proteger en esta ruta.
+#
+# OJO: se usa PathScopedCORSMiddleware, NO CORSMiddleware directo. Un middleware del app
+# principal envuelve TAMBIÉN las sub-apps montadas (/api/v1 más abajo) — un CORS "global"
+# aquí, con allow_methods=["GET"] (pensado solo para /health), interceptaría el preflight
+# de cualquier POST/PUT/DELETE de /api/v1/* ANTES de llegar al CORSMiddleware propio de
+# esa sub-app y lo rechazaría (bug real ya detectado: login roto en CORS). Acotarlo a
+# "/health" evita interferir con las sub-apps versionadas por completo.
 app = FastAPI(
     docs_url=None,
     redoc_url=None,
@@ -45,7 +55,8 @@ app = FastAPI(
 )
 
 app.add_middleware(
-    CORSMiddleware,
+    PathScopedCORSMiddleware,
+    path_prefix="/health",
     allow_origins=CORS_ORIGINS,
     allow_credentials=cors_allow_credentials(CORS_ORIGINS),
     allow_methods=["GET"],

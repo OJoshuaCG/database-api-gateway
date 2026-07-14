@@ -56,12 +56,12 @@ el body visible en la pestaña Network.
 **Ya está resuelto** (`main.py`, aplicado al app principal junto con `app.include_router`):
 
 ```python
-from fastapi.middleware.cors import CORSMiddleware
 from app.core.environments import CORS_ORIGINS
-from app.core.versioned_app import cors_allow_credentials
+from app.core.versioned_app import PathScopedCORSMiddleware, cors_allow_credentials
 
 app.add_middleware(
-    CORSMiddleware,
+    PathScopedCORSMiddleware,
+    path_prefix="/health",
     allow_origins=CORS_ORIGINS,
     # cors_allow_credentials (no True fijo): con CORS_ORIGINS="*" da False, evitando la
     # combinación que los browsers rechazan (ver advertencia arriba). /health no usa
@@ -73,3 +73,27 @@ app.add_middleware(
 ```
 
 Test de regresión: `tests/test_health.py::test_health_endpoints_send_cors_header`.
+
+### ⚠️ GOTCHA: NO usar `CORSMiddleware` directo en el app principal
+
+Un intento inicial de este fix usó `app.add_middleware(CORSMiddleware, ...)` directo en el
+app principal, con `allow_methods=["GET"]` (suficiente para `/health`, que solo tiene
+rutas `GET`). Esto **rompió el preflight de TODA la API `/api/v1`**: el middleware del
+app principal envuelve también las sub-apps montadas (`app.mount("/api/v1", v1_app)`),
+así que interceptaba el preflight de cualquier `POST`/`PUT`/`DELETE` de `/api/v1/*`
+**antes** de que llegara al `CORSMiddleware` propio de esa sub-app — y como
+`allow_methods=["GET"]` no incluye `POST`, el navegador recibía
+`400 Disallowed CORS method` al intentar loguearse (`Access-Control-Request-Method: POST`
+a `/api/v1/auth/login`), pese a que la sub-app v1 sí lo permite. Bug real reportado por
+el equipo de frontend, detectado en devtools como "CORS Preflight Did Not Succeed".
+
+Por eso se usa `PathScopedCORSMiddleware` (`app/core/versioned_app.py`): envuelve
+`CORSMiddleware` pero solo lo activa para paths que empiecen con `path_prefix`
+(`"/health"`); para cualquier otro path (incluido todo `/api/v1/*` y futuras
+`/api/v2/*`), pasa la request sin tocar, dejando que la sub-app versionada resuelva su
+propio CORS sin interferencia. **Nunca agregar un `CORSMiddleware` sin acotar por path al
+app principal** mientras existan sub-apps montadas debajo — cualquier middleware ahí
+envuelve también a esas sub-apps.
+
+Test de regresión:
+`tests/test_health.py::test_v1_cors_preflight_not_blocked_by_main_app_cors`.
