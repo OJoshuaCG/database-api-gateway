@@ -119,6 +119,16 @@ SCHEMA_COMPARISON_MAX_SQL_BYTES = int(
     os.getenv("SCHEMA_COMPARISON_MAX_SQL_BYTES", str(8 * 1024 * 1024))  # 8 MB
 )
 
+# ======= Clonado de bases de datos (database clones) ======= #
+# Vida útil (horas) de un plan de clonación. Tras expirar, execute exige replanear.
+CLONE_TTL_HOURS = int(os.getenv("CLONE_TTL_HOURS", "24"))
+# Workers del pool in-process que ejecutan los jobs de clonación en segundo plano.
+# NO es una cola durable: si el proceso se reinicia, los jobs en curso quedan
+# 'interrupted' (barrido en el lifespan) y se reintentan a mano.
+CLONE_MAX_WORKERS = int(os.getenv("CLONE_MAX_WORKERS", "2"))
+# Filas por lote en la copia de datos por streaming (lectura yield_per + escritura executemany).
+CLONE_DATA_BATCH_ROWS = int(os.getenv("CLONE_DATA_BATCH_ROWS", "1000"))
+
 # ======= Anti-SSRF (validación de host destino) ======= #
 # Si True (default), al registrar/editar un Server se rechazan destinos peligrosos
 # (loopback, link-local/metadata 169.254.169.254, multicast, reservados). Los rangos
