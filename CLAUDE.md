@@ -639,6 +639,41 @@ directo** ad-hoc (Opción B). Guía de uso: `docs/features/schema-comparison.md`
   rechaza) — mismo patrón presente en migraciones anteriores del repo, no corregidas (fuera
   de alcance; pendiente de auditoría propia).
 
+## Módulo de Clonado de Bases de Datos
+
+Clona estructura (y opcionalmente TODOS los datos) de una BD origen a una BD destino en
+cualquier servidor — mismo u otro, mismo motor o distinto, origen/destino adoptados o crudos,
+destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
+
+- **Flujo** (mismo patrón seguro que schema-comparisons): `POST /database-clones` (crea plan,
+  snapshotea origen, persiste `CloneJob` + fingerprint + TTL) → `GET .../objects` (inventario +
+  portabilidad + grafo de dependencias) → `POST .../resolve-selection` (cierre de dependencias,
+  auto-select de la UI) → `POST .../preview` (plan final + `confirm_token`, sin ejecutar) →
+  `POST .../execute` (valida token/nombre/fingerprint + `record_intent` fail-closed, ENCOLA el
+  job async) → `GET .../{id}` (polling de estado) / `GET .../items` / `POST .../cancel`.
+- **Archivos**: `app/controllers/clone_controller.py` (orquestador: `create_plan`/`preview`/
+  `execute_clone`/`run_job` pipeline); `app/services/clone_runner.py` (worker in-process
+  `ThreadPoolExecutor` + barrido `interrupted` en el `lifespan`); `app/services/db_admin/
+  data_copy.py` (copia de datos por streaming, `executemany` parametrizado, FK-checks-off);
+  `app/services/db_admin/clone_dependencies.py` (resolver puro FK+trigger firme + advisory);
+  `app/models/clone_job.py` (`CloneJob`/`CloneJobItem`); `app/schemas/clone.py`;
+  `app/routes/v1/database_clones.py`. Migración `b1c2d3e4f5a6`.
+- **Reúso**: estructura = `diff_snapshots(origen_filtrado vs vacío)` + `adapter_destino.render_diff`
+  (DDL nativo en el dialecto destino); limpieza objeto-por-objeto = `diff(vacío vs destino)` →
+  DROPs; DDL/limpieza se ejecutan con `MigrationRunner.execute_adhoc` (advisory lock + AUTOCOMMIT,
+  clave sintética negativa para BDs crudas — `_synthetic_lock_key`); adopt reusa
+  `ManagedDatabaseController.adopt_database` + stamp.
+- **Decisiones/gotchas**: datos por **streaming async** (no el seed capado, que sigue siendo
+  "catálogo, no ETL"); `INSERT` parametrizado (NUNCA literales); datos NUNCA se traducen
+  cross-engine (valores adaptados por driver; tipos riesgosos fallan por tabla y se reportan);
+  cross-engine = clonar lo portable + reportar `skipped` (rutinas/triggers/events no portables;
+  estructura cross-family fiable solo MySQL→PostgreSQL); `clean_mode` objects preserva la BD y
+  su config, `drop_database` es reset total; auto-adopt SOLO en clon completo con origen
+  gestionado con blueprint (requiere `adopt_owner_id` del servidor destino). **Durabilidad**:
+  worker in-process, los jobs NO sobreviven un reinicio (quedan `interrupted`; cola durable =
+  futuro). Verificación: 45 tests unit/API (FakeAdapter + runner síncrono);
+  `scripts/verify_clone_e2e.py` (requiere Docker) pendiente de corrida contra motores reales.
+
 ## Documentación
 
 - `docs/` — documentación completa por feature (ver `docs/features/model-migrations.md`
