@@ -678,6 +678,8 @@ destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
 
 - `docs/` — documentación completa por feature (ver `docs/features/model-migrations.md`
   para migraciones de blueprints)
+- `docs/docker-deployment.md` — despliegue Docker en VPS plano (`docker-compose.yml`, nginx + Certbot propios)
+- `docs/dokploy-deployment.md` — despliegue en Dokploy (`docker-compose.dokploy.yml`, sin nginx: usa el Traefik propio de Dokploy)
 - `README_MIGRATIONS.md` — migraciones Alembic de la **BD del gateway** (distinto del módulo de blueprints)
 - `readme.md` — instalación y uso general
 - FastAPI genera Swagger en `/api/v1/docs` y ReDoc en `/api/v1/redoc`
