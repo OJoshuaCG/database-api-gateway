@@ -17,6 +17,7 @@ Ejemplo:
 
 from app.models.audit_log import AuditLog
 from app.models.base import Base, TimestampMixin
+from app.models.clone_job import CloneJob, CloneJobItem
 from app.models.crypto_key import CryptoKey
 from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
@@ -53,6 +54,8 @@ __all__ = [
     "PermissionProfileItem",
     "SchemaComparison",
     "SchemaComparisonItem",
+    "CloneJob",
+    "CloneJobItem",
     "EngineType",
     "ServerStatus",
     "ProvisionStatus",
