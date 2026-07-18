@@ -41,6 +41,7 @@ uv-cache/
 !.env.example
 !.env.template
 !.env.docker.example
+!.env.dokploy.example
 
 # === Testing & Coverage ===
 .coverage

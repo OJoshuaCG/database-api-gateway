@@ -1,0 +1,72 @@
+services:
+
+  # ── MariaDB (BD de metadatos del gateway) ────────────────────────────────────
+  db:
+    image: mariadb:11
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASS:?DB_ROOT_PASS es requerido en el entorno}
+      MARIADB_DATABASE:      ${DB_NAME:?DB_NAME es requerido en el entorno}
+      MARIADB_USER:          ${DB_USER:?DB_USER es requerido en el entorno}
+      MARIADB_PASSWORD:      ${DB_PASS:?DB_PASS es requerido en el entorno}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--su-mysql", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── Valkey ────────────────────────────────────────────────────────────────────
+  # Backend del rate limiting (SlowAPI) compartido entre workers/réplicas. Valkey es
+  # el fork OSI (BSD-3) de Redis, wire-compatible: el cliente `redis` y el esquema
+  # `redis://` funcionan sin cambios de código. Solo contadores efímeros: sin
+  # persistencia (save off, appendonly no).
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── FastAPI ──────────────────────────────────────────────────────────────────
+  # Sin `ports:` publicados: Dokploy enruta tráfico externo vía su propio Traefik
+  # directo al puerto interno 8000 (configurado desde la pestaña "Domains" del
+  # panel). No hay nginx/Certbot en este archivo: Dokploy ya ocupa 80/443 del host
+  # y gestiona TLS (Let's Encrypt) por su cuenta — ver docs/dokploy-deployment.md.
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    # Carga variables del archivo .env si existe (no falla si no existe). En Dokploy
+    # las variables se definen en la pestaña "Environment" del proyecto, que Dokploy
+    # inyecta al entorno del contenedor sin necesidad de este archivo.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Estas variables se sobrescriben siempre, independiente del entorno externo,
+      # para garantizar que la app use los servicios de este mismo compose.
+      DB_ENGINE: mysql+pymysql
+      DB_HOST: db
+      RATE_LIMIT_REDIS_ENABLED: "True"
+      RATE_LIMIT_REDIS_URL: redis://valkey:6379
+    volumes:
+      - uploads_data:/app/uploads
+    expose:
+      - "8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+
+volumes:
+  mariadb_data:   # Datos persistentes de la BD de metadatos (MariaDB)
+  uploads_data:   # Archivos subidos por la aplicación
