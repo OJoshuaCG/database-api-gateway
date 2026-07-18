@@ -613,7 +613,20 @@ directo** ad-hoc (Opción B). Guía de uso: `docs/features/schema-comparison.md`
   objetos procedurales (vistas/rutinas/triggers/events) llevan `requires_individual_review` y
   **nunca** entran en `all`/`all_except_destructive`, solo `custom`; PostgreSQL cubre solo el
   schema `public` (`scope_note` en la respuesta); v1 **no** autogenera `RENAME` (DROP+CREATE +
-  heurística `possible_rename_of` advisory). **Límite conocido confirmado contra motor real**:
+  heurística `possible_rename_of` advisory).
+- **Clasificación new/modified/dropped (fix)**: `primary_key` ya NO es siempre `modified`
+  — agregar un PK donde no existía es `new`, eliminarlo por completo es `dropped`, solo un
+  PK que cambió existiendo en ambos lados es `modified`. `index`/`unique_constraint`/
+  `check_constraint`/`foreign_key` que se redefinen (mismo `name`, firma distinta) ahora se
+  emparejan como un solo ítem `modified` en `_diff_collection` (`pair_by_name=True`) en vez
+  de un par suelto `new`+`dropped` sin relación visible — sigue ejecutándose como DROP+CREATE
+  por debajo, solo cambia clasificación/conteo (ver detalle y el gotcha de ejecución que
+  cierra este fix en `docs/features/schema-comparison.md`). Emparejamiento fail-closed: nombre
+  ambiguo (>1 candidato del mismo lado) no se fusiona. Pendiente: re-correr
+  `scripts/verify_schema_diff_e2e.py` contra motores reales para estos nuevos renderers
+  (`_ri_index_modified`/`_ri_unique_modified`/`_ri_check_modified`/`_ri_pk_changed`) — solo
+  verificados con tests unitarios/SQLite hasta ahora.
+  **Límite conocido confirmado contra motor real**:
   adoptar (Opción A) una rutina/trigger MySQL/MariaDB con cuerpo `BEGIN...END` puede fallar
   porque `sql_dialect.py::split_sql_statements` (Plan 02) no reconoce ese bloque (solo
   dollar-quoting de PG) — Opción B no tiene este problema (no vuelve a partir el SQL ya

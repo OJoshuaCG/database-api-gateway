@@ -99,6 +99,31 @@ instancias estructuralmente idénticas. El diff los empareja por **firma de defi
 pero nombres de constraint distintos dan **cero ítems de diff**. Verificado empíricamente
 contra los 3 motores (ver [Verificación](#verificación)).
 
+## Redefiniciones (mismo nombre, firma distinta) -> un solo ítem `modified`
+
+Cuando un índice/`unique_constraint`/`check_constraint`/FK cambia de definición pero
+mantiene el mismo `name` en ambos lados, el motor lo empareja como **un solo ítem
+`modified`** (antes: un par suelto `new`+`dropped`, sin relación visible entre ambos).
+Bajo el capó sigue ejecutándose como DROP + CREATE/ADD (ningún dialecto soportado ofrece
+un `ALTER` atómico para los tres a la vez), pero se reporta como una única modificación:
+evita que `counts` infle "nuevos"/"eliminados" con lo que en realidad es una sola
+redefinición, y cierra un riesgo de ejecución real — antes, en modo automático
+`all_except_destructive`, el lado `new` (no destructivo) podía aplicarse **sin** el
+`dropped` correspondiente (sí destructivo), dejando el objeto viejo huérfano.
+
+Distinto del **rename** de tabla/columna (arriba): ahí el nombre CAMBIA y la heurística es
+por similitud de firma, advisory, nunca se fusiona en `modified`. Acá el nombre se
+**mantiene igual** y solo cambia la definición — señal inequívoca de redefinición, no una
+suposición. Si por coincidencia dos objetos *no relacionados* comparten nombre, el motor
+los fusiona igual (caso raro, y la ejecución sigue siendo correcta — DROP luego CREATE —
+solo cambia la etiqueta mostrada). El emparejamiento es fail-closed: si hay más de un
+candidato del mismo lado con ese nombre (ambiguo), NO se fusiona y se deja como
+`new`+`dropped` suelto, tal como antes.
+
+**Llave primaria:** análogamente, agregar un PK donde antes no existía se reporta como
+`new` (no `modified`); eliminarlo por completo se reporta como `dropped`; solo un PK que
+existía en ambos lados y cambió se reporta como `modified`.
+
 ## Normalización anti-falsos-positivos
 
 - **Tipos**: canonicalizados vía `sqlglot` por dialecto (`int(11)` == `int` en MySQL 8+).
