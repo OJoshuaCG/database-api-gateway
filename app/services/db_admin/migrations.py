@@ -39,7 +39,12 @@ from alembic.runtime.migration import MigrationContext
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.logger import get_logger
-from app.core.remote_engine import ServerTarget, database_connection, map_driver_error
+from app.core.remote_engine import (
+    ServerTarget,
+    database_connection,
+    map_driver_error,
+    server_connection,
+)
 from app.exceptions import AppHttpException
 from app.models.enums import EngineType
 from app.services.db_admin.migration_integrity import validate_version, version_sort_key
@@ -500,6 +505,28 @@ class MigrationRunner:
     # ------------------------------------------------------------------ #
     # Ejecución AD-HOC (Opción B del diff estructural)                    #
     # ------------------------------------------------------------------ #
+    @contextmanager
+    def advisory_lock(self, target: ServerTarget, *, engine: EngineType, lock_key: int):
+        """
+        Sostiene el advisory lock por BD durante TODO un bloque (no por sentencia). Se usa
+        para operaciones multi-fase que deben ser atómicas frente a otras (p. ej. el
+        pipeline de clonación: limpiar → estructura → datos → adopt), donde llamar a
+        ``execute_adhoc`` por fase soltaría el lock entre fases.
+
+        Abre una conexión a NIVEL SERVIDOR (no requiere que la BD destino exista todavía:
+        ``GET_LOCK``/``pg_advisory_lock`` son globales a la instancia, independientes de la
+        BD conectada), adquiere el lock y lo libera al salir. Dentro del bloque, pasar
+        ``already_locked=True`` a ``execute_adhoc`` para que NO intente re-adquirir la misma
+        clave en su propia sesión (se auto-bloquearía hasta el timeout).
+        """
+        with server_connection(target) as conn:
+            conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+            self._acquire_lock(conn, engine, lock_key)
+            try:
+                yield
+            finally:
+                self._release_lock(conn, engine, lock_key)
+
     def execute_adhoc(
         self,
         target: ServerTarget,
@@ -508,6 +535,7 @@ class MigrationRunner:
         engine: EngineType,
         lock_key: int,
         statements: list[str],
+        already_locked: bool = False,
     ) -> list[StatementResult]:
         """
         Ejecuta ``statements`` DDL directamente sobre la BD destino, UNA por una,
@@ -539,7 +567,8 @@ class MigrationRunner:
         try:
             with database_connection(target, db_name) as conn:
                 conn = conn.execution_options(isolation_level="AUTOCOMMIT")
-                self._acquire_lock(conn, engine, lock_key)
+                if not already_locked:
+                    self._acquire_lock(conn, engine, lock_key)
                 try:
                     for i, stmt in enumerate(statements):
                         t0 = time.monotonic()
@@ -566,7 +595,8 @@ class MigrationRunner:
                             )
                             break  # no continuar tras un fallo (posible estado parcial)
                 finally:
-                    self._release_lock(conn, engine, lock_key)
+                    if not already_locked:
+                        self._release_lock(conn, engine, lock_key)
         except AppHttpException:
             raise
         except SQLAlchemyError as exc:
