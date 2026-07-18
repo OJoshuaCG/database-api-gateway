@@ -570,15 +570,20 @@ class ServerAdapter(ABC):
             ("column", "new"): self._ri_column_new,
             ("column", "dropped"): self._ri_column_dropped,
             ("column", "modified"): self._ri_column_modified,
-            ("primary_key", "modified"): self._ri_pk_modified,
+            ("primary_key", "new"): self._ri_pk_changed,
+            ("primary_key", "modified"): self._ri_pk_changed,
+            ("primary_key", "dropped"): self._ri_pk_changed,
             ("foreign_key", "new"): self._ri_fk_new,
             ("foreign_key", "modified"): self._ri_fk_modified,
             ("foreign_key", "dropped"): self._ri_fk_dropped,
             ("unique_constraint", "new"): self._ri_unique_new,
+            ("unique_constraint", "modified"): self._ri_unique_modified,
             ("unique_constraint", "dropped"): self._ri_unique_dropped,
             ("check_constraint", "new"): self._ri_check_new,
+            ("check_constraint", "modified"): self._ri_check_modified,
             ("check_constraint", "dropped"): self._ri_check_dropped,
             ("index", "new"): self._ri_index_new,
+            ("index", "modified"): self._ri_index_modified,
             ("index", "dropped"): self._ri_index_dropped,
             ("view", "new"): self._ri_view_upsert,
             ("view", "modified"): self._ri_view_upsert,
@@ -652,25 +657,49 @@ class ServerAdapter(ABC):
         return [self._stmt(item, self._render_drop_fk(table, fk),
                            down_sql=self._render_add_fk(table, fk), down_confirmed=False)]
 
-    def _ri_unique_new(self, item: DiffItem) -> list[RenderedStatement]:
-        table, uc = item.parent_table, item.source_payload
+    def _render_add_unique(self, table: str, uc) -> str:
         cols = ", ".join(self._q(c, "columna") for c in uc.columns)
         name = self._q(uc.name, "constraint") if uc.name else None
         clause = f"ADD CONSTRAINT {name} UNIQUE" if name else "ADD UNIQUE"
-        sql = f"ALTER TABLE {self._q(table, 'tabla')} {clause} ({cols})"
-        return [self._stmt(item, sql, down_sql=self._render_drop_unique(table, uc),
-                           down_confirmed=True)]
+        return f"ALTER TABLE {self._q(table, 'tabla')} {clause} ({cols})"
+
+    def _ri_unique_new(self, item: DiffItem) -> list[RenderedStatement]:
+        table, uc = item.parent_table, item.source_payload
+        return [self._stmt(item, self._render_add_unique(table, uc),
+                           down_sql=self._render_drop_unique(table, uc), down_confirmed=True)]
+
+    def _ri_unique_modified(self, item: DiffItem) -> list[RenderedStatement]:
+        table = item.parent_table
+        drop = self._render_drop_unique(table, item.target_payload)
+        add = self._render_add_unique(table, item.source_payload)
+        return [
+            self._stmt(item, drop),
+            self._stmt(item, add,
+                       down_sql=self._render_add_unique(table, item.target_payload)),
+        ]
 
     def _ri_unique_dropped(self, item: DiffItem) -> list[RenderedStatement]:
         return [self._stmt(item, self._render_drop_unique(item.parent_table, item.target_payload))]
 
-    def _ri_check_new(self, item: DiffItem) -> list[RenderedStatement]:
-        table, ck = item.parent_table, item.source_payload
+    def _render_add_check(self, table: str, ck) -> str:
         name = self._q(ck.name, "constraint") if ck.name else None
         clause = f"ADD CONSTRAINT {name} CHECK" if name else "ADD CHECK"
-        sql = f"ALTER TABLE {self._q(table, 'tabla')} {clause} ({ck.sqltext})"
-        return [self._stmt(item, sql, down_sql=self._render_drop_check(table, ck),
-                           down_confirmed=True)]
+        return f"ALTER TABLE {self._q(table, 'tabla')} {clause} ({ck.sqltext})"
+
+    def _ri_check_new(self, item: DiffItem) -> list[RenderedStatement]:
+        table, ck = item.parent_table, item.source_payload
+        return [self._stmt(item, self._render_add_check(table, ck),
+                           down_sql=self._render_drop_check(table, ck), down_confirmed=True)]
+
+    def _ri_check_modified(self, item: DiffItem) -> list[RenderedStatement]:
+        table = item.parent_table
+        drop = self._render_drop_check(table, item.target_payload)
+        add = self._render_add_check(table, item.source_payload)
+        return [
+            self._stmt(item, drop),
+            self._stmt(item, add,
+                       down_sql=self._render_add_check(table, item.target_payload)),
+        ]
 
     def _ri_check_dropped(self, item: DiffItem) -> list[RenderedStatement]:
         return [self._stmt(item, self._render_drop_check(item.parent_table, item.target_payload))]
@@ -679,6 +708,16 @@ class ServerAdapter(ABC):
         table, ix = item.parent_table, item.source_payload
         return [self._stmt(item, self._render_create_index(table, ix),
                            down_sql=self._render_drop_index(table, ix), down_confirmed=True)]
+
+    def _ri_index_modified(self, item: DiffItem) -> list[RenderedStatement]:
+        table = item.parent_table
+        drop = self._render_drop_index(table, item.target_payload)
+        create = self._render_create_index(table, item.source_payload)
+        return [
+            self._stmt(item, drop),
+            self._stmt(item, create,
+                       down_sql=self._render_create_index(table, item.target_payload)),
+        ]
 
     def _ri_index_dropped(self, item: DiffItem) -> list[RenderedStatement]:
         table, ix = item.parent_table, item.target_payload
@@ -694,7 +733,8 @@ class ServerAdapter(ABC):
         rev_sql = ";\n".join(rev) if rev else None
         return [self._stmt(item, s, down_sql=rev_sql, down_confirmed=False) for s in fwd]
 
-    def _ri_pk_modified(self, item: DiffItem) -> list[RenderedStatement]:
+    def _ri_pk_changed(self, item: DiffItem) -> list[RenderedStatement]:
+        # Cubre new/modified/dropped: _render_alter_pk decide DROP/ADD/ambos según payloads.
         table = item.parent_table
         return [self._stmt(item, s) for s in self._render_alter_pk(table, item.source_payload, item.target_payload)]
 

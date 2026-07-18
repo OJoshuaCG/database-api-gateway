@@ -149,17 +149,6 @@ class SchemaDiff(BaseModel):
     items: list[DiffItem] = Field(default_factory=list)
 
     @property
-    def counts(self) -> dict[str, dict[str, int]]:
-        """Conteos por (object_type -> change_type -> n)."""
-        out: dict[str, dict[str, int]] = {}
-        for it in self.items:
-            out.setdefault(it.object_type, {})
-            out[it.object_type][it.change_type] = (
-                out[it.object_type].get(it.change_type, 0) + 1
-            )
-        return out
-
-    @property
     def has_destructive(self) -> bool:
         return any(i.risk.destructive for i in self.items)
 
@@ -720,14 +709,21 @@ def _diff_one_table(src: TableSchema, tgt: TableSchema, engine: str) -> list[Dif
     # --- primary key -------------------------------------------------------- #
     if list(src.primary_key) != list(tgt.primary_key):
         risk = RiskFlags(lock_heavy=True)
-        if tgt.primary_key:  # había PK -> hay que droppearla: destructivo
+        if tgt.primary_key and src.primary_key:
+            change_type = "modified"  # PK existía en ambos lados, cambió
+            risk = risk.merge(destructive=True)
+        elif tgt.primary_key:
+            change_type = "dropped"  # había PK, ahora no -> se elimina
             risk = risk.merge(destructive=True)
         else:
+            change_type = "new"  # no había PK -> se agrega
             risk = risk.merge(needs_review=True)  # ADD PK valida datos existentes
         items.append(
             DiffItem(
-                object_type="primary_key", object_name=f"{table}.PRIMARY", change_type="modified",
+                object_type="primary_key", object_name=f"{table}.PRIMARY", change_type=change_type,
                 phase=PHASE_ALTER_MODIFY, parent_table=table,
+                # Ambos DTOs siempre poblados (aun en new/dropped): el renderer necesita ver
+                # las dos tablas completas para decidir DROP/ADD (a diferencia de otras entidades).
                 source_payload=src, target_payload=tgt, risk=risk,
                 changed_attributes=["columns"],
             )
@@ -742,6 +738,7 @@ def _diff_one_table(src: TableSchema, tgt: TableSchema, engine: str) -> list[Dif
         new_risk=RiskFlags(lock_heavy=True),
         drop_risk=RiskFlags(destructive=True),
         modify_risk=RiskFlags(destructive=True, lock_heavy=True),  # drop+add
+        pair_by_name=True,  # mismo nombre, firma distinta (p.ej. cambia la tabla referida)
     )
 
     # --- unique constraints ------------------------------------------------- #
@@ -751,6 +748,9 @@ def _diff_one_table(src: TableSchema, tgt: TableSchema, engine: str) -> list[Dif
         new_phase=PHASE_ALTER_ADDITIVE, drop_phase=PHASE_ALTER_DESTRUCTIVE,
         new_risk=RiskFlags(lock_heavy=True),
         drop_risk=RiskFlags(destructive=True),
+        modify_phase=PHASE_ALTER_MODIFY,
+        modify_risk=RiskFlags(destructive=True, lock_heavy=True),  # drop+add
+        pair_by_name=True,
     )
 
     # --- check constraints -------------------------------------------------- #
@@ -760,6 +760,9 @@ def _diff_one_table(src: TableSchema, tgt: TableSchema, engine: str) -> list[Dif
         new_phase=PHASE_ALTER_ADDITIVE, drop_phase=PHASE_ALTER_DESTRUCTIVE,
         new_risk=RiskFlags(lock_heavy=True),
         drop_risk=RiskFlags(destructive=True),
+        modify_phase=PHASE_ALTER_MODIFY,
+        modify_risk=RiskFlags(destructive=True, lock_heavy=True),  # drop+add
+        pair_by_name=True,
     )
 
     # --- índices (no PK/unique-constraint; match por firma) ----------------- #
@@ -769,6 +772,9 @@ def _diff_one_table(src: TableSchema, tgt: TableSchema, engine: str) -> list[Dif
         new_phase=PHASE_ALTER_ADDITIVE, drop_phase=PHASE_ALTER_DESTRUCTIVE,
         new_risk=RiskFlags(lock_heavy=True),
         drop_risk=RiskFlags(destructive=True),
+        modify_phase=PHASE_ALTER_MODIFY,
+        modify_risk=RiskFlags(destructive=True, lock_heavy=True),  # drop+add
+        pair_by_name=True,
     )
     return items
 
@@ -800,28 +806,30 @@ def _diff_collection(
     opts=None,
     modify_phase: int | None = None,
     modify_risk: RiskFlags | None = None,
+    pair_by_name: bool = False,
 ) -> list[DiffItem]:
     """
     Diffea una colección de sub-objetos de tabla (FK/índice/unique/check) por FIRMA
     de definición. El nombre autogenerado NO es criterio de identidad (se anota como
     secundario). ``opts`` (si se da) compara atributos extra de un match (p.ej. las
     opciones referenciales de una FK) -> genera un ítem 'modified'.
+
+    ``pair_by_name`` (si True): entre los objetos que NO matchearon por firma (o sea,
+    los candidatos a 'new'/'dropped'), empareja los que comparten el mismo ``name`` en
+    ambos lados como UN SOLO ítem 'modified' (redefinición: mismo nombre, definición
+    distinta) en vez de un par suelto new+dropped. Fail-closed: si el nombre no es
+    único de cada lado, no empareja (queda como new+dropped, comportamiento actual).
     """
     items: list[DiffItem] = []
     src_map: dict[tuple, Any] = {sig(o): o for o in src_objs}
     tgt_map: dict[tuple, Any] = {sig(o): o for o in tgt_objs}
 
+    new_pending: dict[tuple, Any] = {}
+    dropped_pending: dict[tuple, Any] = {}
+
     for s, sobj in src_map.items():
         if s not in tgt_map:
-            name = getattr(sobj, "name", None)
-            items.append(
-                DiffItem(
-                    object_type=object_type,
-                    object_name=f"{table}.{name}" if name else f"{table}.<{object_type}>",
-                    change_type="new", phase=new_phase, parent_table=table,
-                    source_payload=sobj, risk=new_risk.model_copy(deep=True),
-                )
-            )
+            new_pending[s] = sobj
         elif opts is not None and modify_phase is not None:
             tobj = tgt_map[s]
             if opts(sobj) != opts(tobj):
@@ -843,15 +851,66 @@ def _diff_collection(
 
     for t, tobj in tgt_map.items():
         if t not in src_map:
-            name = getattr(tobj, "name", None)
+            dropped_pending[t] = tobj
+
+    paired_new_keys: set = set()
+    paired_dropped_keys: set = set()
+    if pair_by_name:
+        new_by_name: dict[str, list] = {}
+        for key, obj in new_pending.items():
+            name = getattr(obj, "name", None)
+            if name:
+                new_by_name.setdefault(name, []).append(key)
+        dropped_by_name: dict[str, list] = {}
+        for key, obj in dropped_pending.items():
+            name = getattr(obj, "name", None)
+            if name:
+                dropped_by_name.setdefault(name, []).append(key)
+        for name in sorted(set(new_by_name) & set(dropped_by_name)):
+            nkeys, dkeys = new_by_name[name], dropped_by_name[name]
+            if len(nkeys) != 1 or len(dkeys) != 1:
+                continue  # nombre ambiguo de algún lado: fail-closed, se deja new+dropped
+            nkey, dkey = nkeys[0], dkeys[0]
+            sobj, tobj = new_pending[nkey], dropped_pending[dkey]
+            phase = modify_phase if modify_phase is not None else new_phase
+            risk = (modify_risk or RiskFlags(destructive=True, lock_heavy=True)).model_copy(deep=True)
             items.append(
                 DiffItem(
                     object_type=object_type,
-                    object_name=f"{table}.{name}" if name else f"{table}.<{object_type}>",
-                    change_type="dropped", phase=drop_phase, parent_table=table,
-                    target_payload=tobj, risk=drop_risk.model_copy(deep=True),
+                    object_name=f"{table}.{name}",
+                    change_type="modified", phase=phase, parent_table=table,
+                    source_payload=sobj, target_payload=tobj, risk=risk,
+                    changed_attributes=["definition"],
+                    notes=["redefinición detectada por nombre igual, definición distinta"],
                 )
             )
+            paired_new_keys.add(nkey)
+            paired_dropped_keys.add(dkey)
+
+    for key, sobj in new_pending.items():
+        if key in paired_new_keys:
+            continue
+        name = getattr(sobj, "name", None)
+        items.append(
+            DiffItem(
+                object_type=object_type,
+                object_name=f"{table}.{name}" if name else f"{table}.<{object_type}>",
+                change_type="new", phase=new_phase, parent_table=table,
+                source_payload=sobj, risk=new_risk.model_copy(deep=True),
+            )
+        )
+    for key, tobj in dropped_pending.items():
+        if key in paired_dropped_keys:
+            continue
+        name = getattr(tobj, "name", None)
+        items.append(
+            DiffItem(
+                object_type=object_type,
+                object_name=f"{table}.{name}" if name else f"{table}.<{object_type}>",
+                change_type="dropped", phase=drop_phase, parent_table=table,
+                target_payload=tobj, risk=drop_risk.model_copy(deep=True),
+            )
+        )
     return items
 
 
