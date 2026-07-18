@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import URL, create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.core.environments import DB_ENGINE, DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
@@ -82,7 +82,18 @@ class Database:
         if engine_prefix == "sqlite":
             DB_URL = f"{db_engine}:///{db_name}"
         else:
-            DB_URL = f"{db_engine}://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
+            # URL.create() codifica usuario/contraseña correctamente (percent-encoding).
+            # Una f-string plana rompe con contraseñas que contienen %, @, :, /, ? u otros
+            # caracteres reservados de URL: create_engine() reparsea la cadena como URL y
+            # los decodifica, corrompiendo la contraseña antes de llegar al driver.
+            DB_URL = URL.create(
+                drivername=db_engine,
+                username=db_user,
+                password=db_pass,
+                host=db_host,
+                port=db_port,
+                database=db_name,
+            )
 
         engine_kwargs = _get_engine_kwargs(engine_prefix)
 

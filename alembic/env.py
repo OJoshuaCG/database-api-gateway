@@ -10,7 +10,7 @@ Integra Alembic con la configuración del proyecto FastAPI:
 
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import URL, engine_from_config, pool
 
 from alembic import context
 
@@ -56,12 +56,25 @@ def get_url() -> str:
     Respeta DB_ENGINE (mysql+pymysql, postgresql+psycopg, sqlite, ...) igual que
     app.core.database.Database, para que las migraciones funcionen con el mismo
     motor configurado para la aplicación.
+
+    Usa URL.create() (no un f-string plano): codifica usuario/contraseña con
+    percent-encoding, evitando que create_engine() reparse la cadena y corrompa
+    contraseñas con caracteres reservados de URL (%, @, :, /, ?, ...).
     """
     engine_prefix = DB_ENGINE.split("+")[0].lower()
     if engine_prefix == "sqlite":
         return f"{DB_ENGINE}:///{DB_NAME}"
-    suffix = "?charset=utf8mb4" if engine_prefix in ("mysql", "mariadb") else ""
-    return f"{DB_ENGINE}://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}{suffix}"
+    query = {"charset": "utf8mb4"} if engine_prefix in ("mysql", "mariadb") else {}
+    url = URL.create(
+        drivername=DB_ENGINE,
+        username=DB_USER,
+        password=DB_PASS,
+        host=DB_HOST,
+        port=DB_PORT,
+        database=DB_NAME,
+        query=query,
+    )
+    return url.render_as_string(hide_password=False)
 
 
 def _connect_args() -> dict:
