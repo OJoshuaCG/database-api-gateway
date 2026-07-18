@@ -208,6 +208,23 @@ def test_create_comparison_persists_items(admin_client, monkeypatch):
     assert items[2]["risk_flags"]["destructive"] is True
 
 
+def test_new_primary_key_counts_as_new_not_modified(admin_client, monkeypatch):
+    """Regresión: un PK agregado donde antes no existía debe contar como 'new' en el
+    summary de la API, no 'modified' (ver fix de schema_diff._diff_one_table)."""
+    rendered = [
+        RenderedStatement(
+            sql="ALTER TABLE `t` ADD PRIMARY KEY (`id`)",
+            object_type="primary_key", object_name="t.PRIMARY", change_type="new", phase=4,
+            risk=RiskFlags(needs_review=True), down_sql=None, down_confirmed=False,
+        ),
+    ]
+    src_id, tgt_id, _, _ = _setup(admin_client, monkeypatch, port=3502, rendered=rendered)
+    r = _create(admin_client, src_id, tgt_id)
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    assert data["counts"]["primary_key"] == {"new": 1}
+
+
 def test_create_same_database_422(admin_client, monkeypatch):
     src_id, _, _, _ = _setup(admin_client, monkeypatch, port=3501)
     r = admin_client.post(

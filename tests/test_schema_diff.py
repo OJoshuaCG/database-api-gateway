@@ -26,6 +26,7 @@ from app.services.db_admin.dtos import (
     SequenceInfo,
     TableSchema,
     TriggerInfo,
+    UniqueConstraintInfo,
     ViewInfo,
 )
 
@@ -361,6 +362,177 @@ def test_mysql_enum_column_remove_value_is_destructive():
 
 
 # =========================================================================== #
+# PRIMARY KEY — new/modified/dropped según existía antes o no                  #
+# =========================================================================== #
+def test_added_primary_key_where_none_existed_is_new_not_modified():
+    src = _tbl("t", [_col("id", "int", nullable=False)], pk=["id"])
+    tgt = _tbl("t", [_col("id", "int", nullable=False)])  # sin PK
+    diff = sd.diff_snapshots(_snap("mysql", tables=[src]), _snap("mysql", tables=[tgt]))
+    items = _items_by(diff, "primary_key")
+    assert len(items) == 1
+    assert items[0].change_type == "new"
+    assert items[0].risk.needs_review is True
+    assert items[0].risk.destructive is False
+
+
+def test_removed_primary_key_entirely_is_dropped_not_modified():
+    src = _tbl("t", [_col("id", "int", nullable=False)])  # sin PK
+    tgt = _tbl("t", [_col("id", "int", nullable=False)], pk=["id"])
+    diff = sd.diff_snapshots(_snap("mysql", tables=[src]), _snap("mysql", tables=[tgt]))
+    items = _items_by(diff, "primary_key")
+    assert len(items) == 1
+    assert items[0].change_type == "dropped"
+    assert items[0].risk.destructive is True
+
+
+def test_changed_primary_key_existing_in_both_is_modified():
+    src = _tbl("t", [_col("id", "int"), _col("tenant", "int")], pk=["id", "tenant"])
+    tgt = _tbl("t", [_col("id", "int"), _col("tenant", "int")], pk=["id"])
+    diff = sd.diff_snapshots(_snap("mysql", tables=[src]), _snap("mysql", tables=[tgt]))
+    items = _items_by(diff, "primary_key")
+    assert len(items) == 1
+    assert items[0].change_type == "modified"
+    assert items[0].risk.destructive is True
+
+
+# =========================================================================== #
+# REDEFINICIÓN POR NOMBRE (índice/unique/check/FK) -> un solo ítem "modified"  #
+# en vez de un par suelto new+dropped                                         #
+# =========================================================================== #
+def test_redefined_index_same_name_is_modified_not_new_plus_dropped():
+    ix_old = IndexInfo(name="ix_email", columns=["email"], unique=False)
+    ix_new = IndexInfo(name="ix_email", columns=["email", "created_at"], unique=False)
+    src = _tbl("t", [_col("email", "varchar(50)"), _col("created_at", "datetime")],
+               indexes=[ix_new])
+    tgt = _tbl("t", [_col("email", "varchar(50)"), _col("created_at", "datetime")],
+               indexes=[ix_old])
+    diff = sd.diff_snapshots(_snap("mysql", tables=[src]), _snap("mysql", tables=[tgt]))
+    mods = _items_by(diff, "index", "modified")
+    assert len(mods) == 1
+    assert mods[0].object_name == "t.ix_email"
+    assert mods[0].risk.destructive is True
+    assert _items_by(diff, "index", "new") == []
+    assert _items_by(diff, "index", "dropped") == []
+
+
+def test_unrelated_new_and_dropped_index_stay_separate():
+    ix_a = IndexInfo(name="ix_a", columns=["a"], unique=False)
+    ix_b = IndexInfo(name="ix_b", columns=["b"], unique=False)
+    src = _tbl("t", [_col("a", "int"), _col("b", "int")], indexes=[ix_a])
+    tgt = _tbl("t", [_col("a", "int"), _col("b", "int")], indexes=[ix_b])
+    diff = sd.diff_snapshots(_snap("mysql", tables=[src]), _snap("mysql", tables=[tgt]))
+    assert len(_items_by(diff, "index", "new")) == 1
+    assert len(_items_by(diff, "index", "dropped")) == 1
+    assert _items_by(diff, "index", "modified") == []
+
+
+def test_ambiguous_index_name_pairing_is_fail_closed():
+    # Dos candidatos "new" comparten nombre: no se debe adivinar cuál emparejar.
+    ix1 = IndexInfo(name="ix_dup", columns=["a"], unique=False)
+    ix2 = IndexInfo(name="ix_dup", columns=["b"], unique=False)
+    ix_old = IndexInfo(name="ix_dup", columns=["c"], unique=False)
+    src = _tbl("t", [_col("a", "int"), _col("b", "int"), _col("c", "int")], indexes=[ix1, ix2])
+    tgt = _tbl("t", [_col("a", "int"), _col("b", "int"), _col("c", "int")], indexes=[ix_old])
+    diff = sd.diff_snapshots(_snap("mysql", tables=[src]), _snap("mysql", tables=[tgt]))
+    assert _items_by(diff, "index", "modified") == []
+    assert len(_items_by(diff, "index", "new")) == 2
+    assert len(_items_by(diff, "index", "dropped")) == 1
+
+
+def test_redefined_unique_constraint_same_name_is_modified():
+    uc_old = UniqueConstraintInfo(name="uq_email", columns=["email"])
+    uc_new = UniqueConstraintInfo(name="uq_email", columns=["email", "tenant"])
+    src = _tbl("t", [_col("email", "varchar(50)"), _col("tenant", "int")], uniques=[uc_new])
+    tgt = _tbl("t", [_col("email", "varchar(50)"), _col("tenant", "int")], uniques=[uc_old])
+    diff = sd.diff_snapshots(_snap("mysql", tables=[src]), _snap("mysql", tables=[tgt]))
+    mods = _items_by(diff, "unique_constraint", "modified")
+    assert len(mods) == 1
+    assert _items_by(diff, "unique_constraint", "new") == []
+    assert _items_by(diff, "unique_constraint", "dropped") == []
+
+
+def test_redefined_check_constraint_same_name_is_modified():
+    ck_old = CheckConstraintInfo(name="ck1", sqltext="x > 0")
+    ck_new = CheckConstraintInfo(name="ck1", sqltext="x > 10")
+    src = _tbl("t", [_col("x", "int")], checks=[ck_new])
+    tgt = _tbl("t", [_col("x", "int")], checks=[ck_old])
+    diff = sd.diff_snapshots(_snap("mysql", tables=[src]), _snap("mysql", tables=[tgt]))
+    mods = _items_by(diff, "check_constraint", "modified")
+    assert len(mods) == 1
+    assert _items_by(diff, "check_constraint", "new") == []
+    assert _items_by(diff, "check_constraint", "dropped") == []
+
+
+def test_redefined_foreign_key_same_name_different_target_is_modified():
+    fk_old = ForeignKeyInfo(name="fk1", columns=["uid"], referred_table="users",
+                            referred_columns=["id"])
+    fk_new = ForeignKeyInfo(name="fk1", columns=["uid"], referred_table="accounts",
+                            referred_columns=["id"])
+    src = _tbl("orders", [_col("uid", "int")], fks=[fk_new])
+    tgt = _tbl("orders", [_col("uid", "int")], fks=[fk_old])
+    diff = sd.diff_snapshots(_snap("mysql", tables=[src]), _snap("mysql", tables=[tgt]))
+    mods = _items_by(diff, "foreign_key", "modified")
+    assert len(mods) == 1
+    assert _items_by(diff, "foreign_key", "new") == []
+    assert _items_by(diff, "foreign_key", "dropped") == []
+
+
+# =========================================================================== #
+# INVARIANTE GENERAL — ningún objeto en más de un change_type                  #
+# =========================================================================== #
+def test_no_object_double_classified_across_all_entity_types():
+    """Ningún (object_type, object_name) debe aparecer bajo más de un change_type,
+    en un diff que mezcla altas/bajas/modificaciones en TODOS los tipos de objeto."""
+    fk_old = ForeignKeyInfo(name="fk1", columns=["uid"], referred_table="users",
+                            referred_columns=["id"])
+    fk_new = ForeignKeyInfo(name="fk1", columns=["uid"], referred_table="accounts",
+                            referred_columns=["id"])
+    uc_old = UniqueConstraintInfo(name="uq1", columns=["email"])
+    uc_new = UniqueConstraintInfo(name="uq1", columns=["email", "tenant"])
+    ck_old = CheckConstraintInfo(name="ck1", sqltext="x > 0")
+    ck_new = CheckConstraintInfo(name="ck1", sqltext="x > 10")
+    ix_old = IndexInfo(name="ix1", columns=["email"], unique=False)
+    ix_new = IndexInfo(name="ix1", columns=["email", "tenant"], unique=False)
+
+    src_tbl = _tbl(
+        "t",
+        [_col("id", "int"), _col("uid", "int"), _col("email", "varchar(50)"),
+         _col("tenant", "int"), _col("x", "int"), _col("brand_new", "int", nullable=True)],
+        pk=["id"], fks=[fk_new], uniques=[uc_new], checks=[ck_new], indexes=[ix_new],
+    )
+    tgt_tbl = _tbl(
+        "t",
+        [_col("id", "int"), _col("uid", "int"), _col("email", "varchar(50)"),
+         _col("tenant", "int"), _col("x", "int"), _col("old_col", "int")],
+        pk=[], fks=[fk_old], uniques=[uc_old], checks=[ck_old], indexes=[ix_old],
+    )
+    src = _snap(
+        "mysql", tables=[src_tbl],
+        views=[ViewInfo(name="v", definition="select 2")],
+        routines=[RoutineInfo(name="f", kind="FUNCTION",
+                              body="CREATE FUNCTION f() RETURNS int RETURN 2")],
+    )
+    tgt = _snap(
+        "mysql", tables=[tgt_tbl],
+        views=[ViewInfo(name="v", definition="select 1")],
+        routines=[RoutineInfo(name="f", kind="FUNCTION",
+                              body="CREATE FUNCTION f() RETURNS int RETURN 1")],
+    )
+    diff = sd.diff_snapshots(src, tgt)
+
+    seen: dict[tuple[str, str], set[str]] = {}
+    for it in diff.items:
+        seen.setdefault((it.object_type, it.object_name), set()).add(it.change_type)
+    offenders = {k: v for k, v in seen.items() if len(v) > 1}
+    assert offenders == {}, f"objetos con más de un change_type: {offenders}"
+
+    # Sanity: el diff realmente tocó cada tipo de objeto relevante (si no, el test no prueba nada).
+    types_seen = {it.object_type for it in diff.items}
+    assert {"column", "primary_key", "foreign_key", "unique_constraint",
+            "check_constraint", "index", "view", "routine"} <= types_seen
+
+
+# =========================================================================== #
 # CROSS-FLAVOR MySQL <-> MariaDB                                               #
 # =========================================================================== #
 def test_cross_flavor_warning_flag_set():
@@ -590,6 +762,34 @@ def test_render_new_column_down_sql_is_confirmed_drop():
     col = [s for s in _render("mysql", src, tgt) if s.object_type == "column"][0]
     assert col.down_confirmed is True
     assert "DROP COLUMN `x`" in col.down_sql
+
+
+def test_render_new_primary_key_only_emits_add():
+    src = _snap("mysql", tables=[_tbl("t", [_col("id", "int", nullable=False)], pk=["id"])])
+    tgt = _snap("mysql", tables=[_tbl("t", [_col("id", "int", nullable=False)])])
+    stmts = [s.sql for s in _render("mysql", src, tgt)]
+    pk_stmts = [s for s in stmts if "PRIMARY KEY" in s]
+    assert pk_stmts == ["ALTER TABLE `t` ADD PRIMARY KEY (`id`)"]
+
+
+def test_render_dropped_primary_key_only_emits_drop():
+    src = _snap("mysql", tables=[_tbl("t", [_col("id", "int", nullable=False)])])
+    tgt = _snap("mysql", tables=[_tbl("t", [_col("id", "int", nullable=False)], pk=["id"])])
+    stmts = [s.sql for s in _render("mysql", src, tgt)]
+    pk_stmts = [s for s in stmts if "PRIMARY KEY" in s]
+    assert pk_stmts == ["ALTER TABLE `t` DROP PRIMARY KEY"]
+
+
+def test_render_redefined_index_is_drop_then_create():
+    ix_old = IndexInfo(name="ix_email", columns=["email"], unique=False)
+    ix_new = IndexInfo(name="ix_email", columns=["email", "created_at"], unique=False)
+    src = _snap("mysql", tables=[_tbl(
+        "t", [_col("email", "varchar(50)"), _col("created_at", "datetime")], indexes=[ix_new])])
+    tgt = _snap("mysql", tables=[_tbl(
+        "t", [_col("email", "varchar(50)"), _col("created_at", "datetime")], indexes=[ix_old])])
+    stmts = [s.sql for s in _render("mysql", src, tgt)]
+    assert any("DROP INDEX `ix_email`" in s for s in stmts)
+    assert any(s.startswith("CREATE INDEX `ix_email`") for s in stmts)
 
 
 def test_render_mariadb_drop_check_uses_drop_constraint():
