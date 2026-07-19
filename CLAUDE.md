@@ -674,6 +674,56 @@ destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
   futuro). Verificación: 45 tests unit/API (FakeAdapter + runner síncrono);
   `scripts/verify_clone_e2e.py` (requiere Docker) pendiente de corrida contra motores reales.
 
+## Módulo de Usuarios del Motor (vista agrupada + CRUD por identidad)
+
+Mejora la LECTURA y la GESTIÓN de los usuarios de un servidor. Guía de uso:
+`docs/features/engine-users-management.md`.
+
+- **Problema/asimetría por motor**: en MySQL/MariaDB `'user'@'hostA'` y `'user'@'hostB'`
+  son cuentas SEPARADAS (redundancia visual al listar por `user@host`); en PostgreSQL un
+  ROLE **no tiene host** (`supports_hosts=false`; el acceso por host vive en pg_hba.conf,
+  fuera del alcance SQL). El adapter expone `supports_hosts` (MySQL/MariaDB True, PG False).
+- **Vista agrupada** `GET /servers/{id}/users/grouped`: agrupa por username (una entrada +
+  sus hosts como identidades) y CRUZA con el inventario → cada host se marca
+  `adopted`/`unmanaged`/`orphan` (mismo cruce que `reconcile`). El frontend usa
+  `supports_hosts` para ocultar host/agregar-host en PG.
+- **CRUD por IDENTIDAD física** `(server_id, username, host)` — funciona con usuarios
+  ADOPTADOS y NO adoptados (patrón "por identidad", como schema-comparisons con refs crudas):
+  `POST /servers/{id}/users` (CREATE), `PATCH /servers/{id}/users/password` (ALTER),
+  `DELETE /servers/{id}/users?username=&host=&confirm_username=` (DROP), todos sobre el
+  motor. **Stateless por defecto** con `adopt` opcional (registra en `server_users` con la
+  contraseña cifrada); si ya hay fila de inventario, el cambio de contraseña SIEMPRE la
+  sincroniza.
+- **Revelar contraseña** `POST /servers/{id}/users/reveal-password`: SOLO posible si el
+  gateway fijó la contraseña (la guarda Fernet-reversible). El motor solo guarda un hash
+  irreversible → una contraseña que el gateway nunca conoció NO se revela: `404` si no está
+  en inventario, `409` si adoptado sin contraseña. Auditado (`server_user.password.reveal`).
+- **Agregar host** `POST /servers/{id}/users/add-host` (solo MySQL/MariaDB; `422` en PG):
+  clona `'user'@'source_host'` a `'user'@'new_host'`. `reuse_password=true` copia el HASH
+  vía `SHOW CREATE USER` (reescribe solo el grantee; sirve incluso para el binario de
+  `caching_sha2_password`); `false` exige `new_password`. `copy_grants=true` (opcional)
+  replica permisos vía `SHOW GRANTS` reescribiendo el grantee (best-effort → `grants_error`;
+  omite USAGE/PROXY/`IDENTIFIED BY`).
+- **Archivos**: métodos nuevos en `server_user_controller.py` (`list_users_grouped`,
+  `create_user_by_identity`, `set_password_by_identity`, `drop_user_by_identity`,
+  `add_host`, `reveal_password`); adapters `supports_hosts` + `add_user_host`/
+  `copy_user_grants` (base 422 → MySQL implementa, PG hereda 422); schemas en
+  `app/schemas/server_user.py`; rutas en `app/routes/v1/servers.py`. **NO** hay tabla nueva
+  (reusa `server_users`).
+- **Gotchas / seguridad**: **guard anti auto-lockout (B1)** — crear/rotar/dropear/agregar-host
+  sobre `Server.root_username` (la credencial pseudo-root, que NO es fila de `server_users`,
+  así que el guard de `grant_controller` no la cubría) devuelve 409; replica el patrón de
+  `grant_controller.py:206`. **Revelar contraseña audita fail-closed** (`record_intent`,
+  `touched_engine=False`) antes de descifrar. El rewrite de grantee asume identificadores
+  whitelisteados → coincide byte a byte con `SHOW CREATE USER`/`SHOW GRANTS`; `copy_grants`
+  reejecuta DCL del motor (mismo servidor pseudo-root, omite USAGE/PROXY pero **sí** propaga
+  globales/`WITH GRANT OPTION` — es "clonar cuenta"). Limitación: el CRUD por identidad usa
+  whitelist ESTRICTA (rechaza usernames legacy con dígito inicial/`.-$`). Revisado por
+  gateway-security: B1 (bloqueante) + R1 (reveal fail-closed) + R4 (no volcar str(exc))
+  resueltos; R2 (rate-limit reveal)/R3 (auditar cada grant copiado)/R5 (whitelist legacy) =
+  follow-up. Tests: `tests/test_api_engine_users.py` (adapter mockeado + `_rewrite_grant_line`
+  + guard root). **Pendiente**: verificación e2e contra motores reales (add-host/copy-grants).
+
 ## Documentación
 
 - `docs/` — documentación completa por feature (ver `docs/features/model-migrations.md`
