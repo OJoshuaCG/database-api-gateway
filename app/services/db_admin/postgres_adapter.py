@@ -42,6 +42,10 @@ from app.services.db_admin.identifiers import (
 
 class PostgresAdapter(ServerAdapter):
     dialect = "postgresql"
+    # Un ROLE de PostgreSQL no tiene host (el acceso por host se controla en
+    # pg_hba.conf, fuera del alcance SQL): no hay "agregar host" ni identidades
+    # múltiples por username. add_user_host/copy_user_grants heredan el 422 del base.
+    supports_hosts = False
 
     def _version_sql(self) -> str:
         return "SELECT version()"

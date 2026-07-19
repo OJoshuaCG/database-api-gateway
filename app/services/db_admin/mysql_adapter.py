@@ -330,6 +330,119 @@ class MySQLAdapter(ServerAdapter):
             extra={"username": username},
         )
 
+    def add_user_host(self, username, source_host, new_host, *, new_password=None) -> None:
+        """
+        Agrega un host a un usuario: crea ``'user'@'new_host'`` como cuenta nueva.
+
+        - ``new_password`` con valor ⇒ ``CREATE USER ... IDENTIFIED BY '<nueva>'``.
+        - ``new_password`` None ⇒ misma contraseña: se toma la sentencia que el propio
+          motor emite con ``SHOW CREATE USER`` para la cuenta origen (escapa el hash de
+          auth correctamente, incluso el binario de ``caching_sha2_password``) y solo se
+          reescribe el grantee (host). No se descubre la contraseña en claro.
+        """
+        validate_identifier(username, self.dialect, "usuario", allow_existing=True)
+        validate_host(source_host)
+        validate_host(new_host)
+        new_grantee = self._user_at_host(username, new_host)
+
+        if new_password is not None:
+            pwd = quote_string_literal(new_password, self.dialect)
+            self._execute_server(
+                [f"CREATE USER {new_grantee} IDENTIFIED BY {pwd}"],
+                op="add_user_host",
+                extra={"username": username, "host": new_host},
+            )
+            return
+
+        source_grantee = self._user_at_host(username, source_host)
+        try:
+            with server_connection(self.target) as conn:
+                row = conn.execute(text(f"SHOW CREATE USER {source_grantee}")).fetchone()
+                if row is None:
+                    raise AppHttpException(
+                        message="La cuenta origen no existe en el motor.",
+                        status_code=404,
+                        context={"username": username, "host": source_host},
+                    )
+                create_stmt = row[0]
+                prefix = f"CREATE USER {source_grantee}"
+                # Los identificadores están whitelisteados (sin comillas ni backslash), así
+                # que el grantee que emite el motor coincide byte a byte con el que armamos.
+                if not create_stmt.startswith(prefix):
+                    raise AppHttpException(
+                        message=(
+                            "No se pudo derivar la creación desde la cuenta origen; "
+                            "reintenta indicando una contraseña nueva (reuse_password=false)."
+                        ),
+                        status_code=422,
+                        context={"username": username},
+                    )
+                new_stmt = f"CREATE USER {new_grantee}" + create_stmt[len(prefix):]
+                conn.execute(text(new_stmt))
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="add_user_host", target=self.target,
+                extra={"username": username, "host": new_host},
+            )
+
+    def copy_user_grants(self, username, source_host, new_host) -> int:
+        """
+        Replica los GRANT de ``'user'@'source_host'`` a ``'user'@'new_host'``.
+
+        Lee ``SHOW GRANTS FOR`` la cuenta origen y reejecuta cada sentencia reescribiendo
+        únicamente el grantee. Es el MISMO servidor y motor que el gateway ya administra
+        con pseudo-root (no se cruza una frontera de confianza nueva). Fail-closed: omite
+        el ``USAGE`` base, los grants ``PROXY`` y cualquier sentencia con credencial
+        embebida (``IDENTIFIED BY`` de motores viejos), que nunca se replica.
+        """
+        validate_identifier(username, self.dialect, "usuario", allow_existing=True)
+        validate_host(source_host)
+        validate_host(new_host)
+        source_grantee = self._user_at_host(username, source_host)
+        new_grantee = self._user_at_host(username, new_host)
+        applied = 0
+        try:
+            with server_connection(self.target) as conn:
+                rows = conn.execute(text(f"SHOW GRANTS FOR {source_grantee}")).fetchall()
+                for r in rows:
+                    stmt = self._rewrite_grant_line(str(r[0]), new_grantee)
+                    if stmt is None:
+                        continue
+                    conn.execute(text(stmt))
+                    applied += 1
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="copy_user_grants", target=self.target,
+                extra={"username": username},
+            )
+        return applied
+
+    @staticmethod
+    def _rewrite_grant_line(line: str, new_grantee: str) -> str | None:
+        """
+        Reescribe una línea de ``SHOW GRANTS`` para apuntar al ``new_grantee``, o None si
+        no debe replicarse. El grantee es lo que sigue al último `` TO``; después puede
+        venir ``WITH GRANT OPTION``. Fail-closed: se omite el ``USAGE`` base (no confiere
+        privilegio), los grants ``PROXY`` (sintaxis especial) y cualquier línea con
+        credencial embebida (``IDENTIFIED BY`` de motores viejos), que nunca se replica.
+        """
+        idx = line.rfind(" TO ")
+        if idx == -1:
+            return None
+        head = line[:idx]
+        tail = line[idx + 4:]
+        head_u = head.strip().upper()
+        if head_u == "GRANT USAGE ON *.*" or head_u.startswith("GRANT PROXY ON"):
+            return None
+        if " IDENTIFIED BY " in line.upper():
+            return None
+        suffix = (
+            " WITH GRANT OPTION"
+            if tail.upper().rstrip().endswith("WITH GRANT OPTION")
+            else ""
+        )
+        return f"{head} TO {new_grantee}{suffix}"
+
     def grant_database(self, username, db_name, host="%", privileges="ALL PRIVILEGES") -> None:
         validate_identifier(username, self.dialect, "usuario")
         validate_identifier(db_name, self.dialect, "base de datos")

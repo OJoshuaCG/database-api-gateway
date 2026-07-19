@@ -62,6 +62,12 @@ from app.services.db_admin.schema_diff import (
 class ServerAdapter(ABC):
     dialect: str
 
+    # ¿El motor modela usuarios por par ``'user'@'host'`` (varios hosts por username)?
+    # MySQL/MariaDB: True. PostgreSQL: False (un rol no tiene host; el acceso por host se
+    # controla en pg_hba.conf, fuera del alcance SQL). Gobierna la vista agrupada y si se
+    # permite "agregar host".
+    supports_hosts: bool = True
+
     # Tipos de rutina admitidos en grants de EXECUTE/ALTER ROUTINE.
     _ROUTINE_KINDS = frozenset({"FUNCTION", "PROCEDURE"})
 
@@ -171,6 +177,41 @@ class ServerAdapter(ABC):
 
     @abstractmethod
     def change_password(self, username: str, new_password: str, host: str = "%") -> None: ...
+
+    def add_user_host(
+        self,
+        username: str,
+        source_host: str,
+        new_host: str,
+        *,
+        new_password: str | None = None,
+    ) -> None:
+        """
+        Clona una cuenta existente a un ``new_host`` (agregar host a un usuario).
+
+        Solo tiene sentido en motores con ``supports_hosts=True`` (MySQL/MariaDB): ahí
+        ``'user'@'hostA'`` y ``'user'@'hostB'`` son cuentas separadas. ``new_password``
+        None ⇒ se copia el hash de la cuenta origen (misma contraseña, sin conocerla en
+        claro); con valor ⇒ se fija esa contraseña nueva. El default rechaza (422); cada
+        motor que lo soporte sobreescribe.
+        """
+        raise AppHttpException(
+            message="Este motor no soporta múltiples hosts por usuario (no aplica 'agregar host').",
+            status_code=422,
+            context={"dialect": self.dialect},
+        )
+
+    def copy_user_grants(self, username: str, source_host: str, new_host: str) -> int:
+        """
+        Replica los permisos de ``'user'@'source_host'`` a ``'user'@'new_host'`` (mismo
+        servidor/motor). Best-effort: omite el USAGE base y privilegios no portables por
+        seguridad. Devuelve cuántas sentencias GRANT se aplicaron. Default: 422.
+        """
+        raise AppHttpException(
+            message="Este motor no soporta copiar grants entre hosts de un usuario.",
+            status_code=422,
+            context={"dialect": self.dialect},
+        )
 
     @abstractmethod
     def grant_database(

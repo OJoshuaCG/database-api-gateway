@@ -132,14 +132,17 @@ def record_intent(
     object_name: str | None = None,
     with_grant_option: bool | None = None,
     grantor: str | None = None,
+    touched_engine: bool = True,
 ) -> None:
     """
-    Registra la INTENCIÓN (``status="attempt"``) de una operación destructiva/GATE
-    ANTES de ejecutarla. **Fail-closed**: si no se puede persistir, lanza
-    ``AppHttpException(500)`` y la operación NO debe continuar.
+    Registra la INTENCIÓN (``status="attempt"``) de una operación sensible ANTES de
+    ejecutarla. **Fail-closed**: si no se puede persistir, lanza ``AppHttpException(500)``
+    y la operación NO debe continuar.
 
-    Garantiza un rastro durable incluso si la operación posterior corrompe el proceso
-    a mitad de camino.
+    Garantiza un rastro durable incluso si la operación posterior corrompe el proceso a
+    mitad de camino. ``touched_engine`` es True por defecto (operaciones destructivas/GATE
+    que ejecutan DDL/DCL); pásalo False para acciones sensibles que NO tocan el motor pero
+    exigen rastro garantizado igual (p.ej. revelar una contraseña).
     """
     try:
         session = Database().get_declarative_base_session()
@@ -152,7 +155,7 @@ def record_intent(
                     target_type=target_type,
                     target_id=target_id,
                     server_id=server_id,
-                    touched_engine=True,
+                    touched_engine=touched_engine,
                     detail=detail,
                     grantee=grantee,
                     privilege=privilege,
