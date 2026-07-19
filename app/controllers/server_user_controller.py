@@ -18,16 +18,26 @@ La credencial descifrada NUNCA se persiste en claro, se serializa ni se loguea.
 
 from sqlalchemy.exc import IntegrityError
 
-from app.controllers.common import build_target, get_server_or_404
-from app.core.crypto import CryptoConfigError, CryptoError, encrypt
+from app.controllers.common import build_target, engine_value, get_server_or_404
+from app.core.crypto import CryptoConfigError, CryptoError, decrypt, encrypt
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.exceptions import AppHttpException
 from app.models.managed_database import ManagedDatabase
 from app.models.server_user import ServerUser
-from app.schemas.server_user import GrantApplyResult, GrantOnCreate, ServerUserFullOut, ServerUserOut
+from app.schemas.server_user import (
+    AddHostOut,
+    EngineUserActionOut,
+    EngineUserIdentityOut,
+    GrantApplyResult,
+    GrantOnCreate,
+    GroupedEngineUserOut,
+    GroupedEngineUsersOut,
+    RevealedPasswordOut,
+    ServerUserFullOut,
+    ServerUserOut,
+)
 from app.services import audit
-from app.services.db_admin.dtos import EngineUserInfo
 from app.services.db_admin.factory import get_adapter
 
 
@@ -462,3 +472,514 @@ class ServerUserController:
             server_id=server_id,
             touched_engine=drop_remote,
         )
+
+    # ------------------------------------------------------------------ #
+    # Manejo por IDENTIDAD FÍSICA (server_id, username, host)             #
+    # Funciona tanto para usuarios ADOPTADOS como NO adoptados: se opera  #
+    # directo sobre el motor y, si existe fila de inventario, se sincroniza.#
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _decrypt(ciphertext: str) -> str:
+        try:
+            return decrypt(ciphertext)
+        except (CryptoError, CryptoConfigError) as exc:
+            raise AppHttpException(
+                message="No se pudo descifrar la credencial del usuario.",
+                status_code=500,
+            ) from exc
+
+    @staticmethod
+    def _guard_not_root(root_username: str | None, username: str) -> None:
+        """
+        Guard anti auto-lockout: prohíbe operar por identidad sobre la CREDENCIAL
+        pseudo-root del gateway (``Server.root_username``), que normalmente NO es una
+        fila de ``ServerUser`` — por eso el guard de grant_controller no la cubre y hay
+        que replicarlo aquí. Un DROP/ALTER sobre esa cuenta deja al gateway sin control
+        del servidor (irreversible desde el gateway).
+        """
+        if root_username and username.lower() == root_username.lower():
+            raise AppHttpException(
+                message=(
+                    "No se puede operar sobre la propia credencial pseudo-root del gateway "
+                    "(riesgo de auto-bloqueo). Para gestionar esa cuenta, hazlo fuera del gateway."
+                ),
+                status_code=409,
+                context={"username": username},
+            )
+
+    def _find_inventory_row(self, session, server_id: int, username: str, host: str, *, is_pg: bool):
+        """Fila de inventario que corresponde a la identidad, o None. En PG se ignora host."""
+        q = session.query(ServerUser).filter(
+            ServerUser.server_id == server_id, ServerUser.username == username
+        )
+        if not is_pg:
+            q = q.filter(ServerUser.host == host)
+        return q.first()
+
+    def list_users_grouped(self, server_id: int) -> GroupedEngineUsersOut:
+        """
+        Lista los usuarios del motor AGRUPADOS por username (una entrada por nombre, sus
+        hosts como identidades) y CRUZADOS con el inventario del gateway: cada identidad
+        se marca ``adopted`` (en inventario), ``unmanaged`` (solo en el motor) u
+        ``orphan`` (solo en el inventario, borrada por fuera). En PostgreSQL
+        ``supports_hosts=false`` y cada username tiene una sola identidad (host None).
+        """
+        session = self._session()
+        try:
+            server = get_server_or_404(session, server_id)
+            target = build_target(server)
+            inv = [
+                (u.id, u.username, u.host, bool(u.password_encrypted), u.is_active, u.notes)
+                for u in session.query(ServerUser)
+                .filter(ServerUser.server_id == server_id)
+                .all()
+            ]
+        finally:
+            session.close()
+
+        adapter = get_adapter(target)
+        is_pg = target.dialect == "postgresql"
+        supports_hosts = getattr(adapter, "supports_hosts", not is_pg)
+        live = adapter.list_users()
+
+        def key(username: str, host: str | None) -> tuple:
+            return (username,) if is_pg else (username, host or "%")
+
+        inv_by_key = {key(r[1], r[2]): r for r in inv}
+        groups: dict[str, list[EngineUserIdentityOut]] = {}
+        seen: set[tuple] = set()
+
+        for lu in sorted(live, key=lambda x: (x.username, x.host or "")):
+            k = key(lu.username, lu.host)
+            seen.add(k)
+            row = inv_by_key.get(k)
+            groups.setdefault(lu.username, []).append(
+                EngineUserIdentityOut(
+                    host=None if is_pg else (lu.host or "%"),
+                    status="adopted" if row else "unmanaged",
+                    server_user_id=row[0] if row else None,
+                    has_password=row[3] if row else False,
+                    is_active=row[4] if row else None,
+                    notes=row[5] if row else None,
+                )
+            )
+
+        for k, row in inv_by_key.items():
+            if k in seen:
+                continue
+            groups.setdefault(row[1], []).append(
+                EngineUserIdentityOut(
+                    host=None if is_pg else (row[2] or "%"),
+                    status="orphan",
+                    server_user_id=row[0],
+                    has_password=row[3],
+                    is_active=row[4],
+                    notes=row[5],
+                )
+            )
+
+        users = [
+            GroupedEngineUserOut(username=name, identity_count=len(ids), identities=ids)
+            for name, ids in sorted(groups.items())
+        ]
+        return GroupedEngineUsersOut(
+            dialect=target.dialect, supports_hosts=supports_hosts, users=users
+        )
+
+    def reveal_password(
+        self, server_id: int, username: str, host: str, *, admin: dict | None = None
+    ) -> RevealedPasswordOut:
+        """
+        Revela la contraseña de un usuario ADOPTADO/gestionado — solo posible cuando el
+        gateway la fijó y la guarda cifrada. El motor solo guarda un hash irreversible:
+        una contraseña que el gateway nunca conoció NO se puede revelar (409).
+        """
+        session = self._session()
+        try:
+            server = get_server_or_404(session, server_id)
+            is_pg = engine_value(server) == "postgresql"
+            h = host or "%"
+            row = self._find_inventory_row(session, server_id, username, h, is_pg=is_pg)
+            enc = row.password_encrypted if row else None
+            user_id = row.id if row else None
+        finally:
+            session.close()
+
+        if user_id is None:
+            raise AppHttpException(
+                message=(
+                    "El usuario no está en el inventario del gateway; no hay contraseña "
+                    "que revelar. Adóptalo y rota su contraseña por el gateway para gestionarla."
+                ),
+                status_code=404,
+                context={"username": username, "host": None if is_pg else h},
+            )
+        if not enc:
+            raise AppHttpException(
+                message=(
+                    "El gateway no conoce la contraseña de este usuario (fue adoptado sin "
+                    "contraseña o la fijó el motor). Solo se puede rotar, no revelar."
+                ),
+                status_code=409,
+                context={"username": username, "host": None if is_pg else h},
+            )
+
+        # Divulgación de un secreto en claro: el rastro debe ser DURABLE (fail-closed),
+        # no best-effort. Se audita la intención ANTES de descifrar/retornar; si no se
+        # persiste, aborta y el secreto nunca sale.
+        audit.record_intent(
+            "server_user.password.reveal",
+            admin=admin,
+            target_type="server_user",
+            target_id=user_id,
+            server_id=server_id,
+            touched_engine=False,
+            detail="INTENT revelar contraseña al admin",
+        )
+        plaintext = self._decrypt(enc)
+        audit.record(
+            "server_user.password.reveal",
+            admin=admin,
+            target_type="server_user",
+            target_id=user_id,
+            server_id=server_id,
+            touched_engine=False,
+            detail="contraseña revelada al admin",
+        )
+        return RevealedPasswordOut(
+            username=username, host=None if is_pg else h, password=plaintext
+        )
+
+    def create_user_by_identity(
+        self, server_id: int, data: dict, *, admin: dict | None = None
+    ) -> EngineUserActionOut:
+        username = data["username"]
+        host = data.get("host") or "%"
+        password = data["password"]
+        adopt = bool(data.get("adopt"))
+        notes = data.get("notes")
+
+        session = self._session()
+        try:
+            server = get_server_or_404(session, server_id)
+            self._guard_not_root(server.root_username, username)
+            target = build_target(server)
+            is_pg = engine_value(server) == "postgresql"
+        finally:
+            session.close()
+
+        try:
+            get_adapter(target).create_user(username, password, host)
+        except AppHttpException:
+            audit.record(
+                "server_user.create",
+                status="error",
+                admin=admin,
+                target_type="server_user",
+                server_id=server_id,
+                touched_engine=True,
+                detail="fallo al crear el usuario en el motor (por identidad)",
+            )
+            raise
+
+        server_user_id = None
+        if adopt:
+            server_user_id = self._insert_inventory_row(
+                server_id, username, host, self._encrypt(password), notes
+            )
+
+        audit.record(
+            "server_user.create",
+            admin=admin,
+            target_type="server_user",
+            target_id=server_user_id,
+            server_id=server_id,
+            touched_engine=True,
+            detail="usuario creado en el motor por identidad" + (" + adoptado" if adopt else ""),
+        )
+        return EngineUserActionOut(
+            username=username,
+            host=None if is_pg else host,
+            adopted=server_user_id is not None,
+            server_user_id=server_user_id,
+        )
+
+    def set_password_by_identity(
+        self, server_id: int, data: dict, *, admin: dict | None = None
+    ) -> EngineUserActionOut:
+        username = data["username"]
+        host = data.get("host") or "%"
+        new_password = data["new_password"]
+        adopt = bool(data.get("adopt"))
+
+        session = self._session()
+        try:
+            server = get_server_or_404(session, server_id)
+            self._guard_not_root(server.root_username, username)
+            target = build_target(server)
+            is_pg = engine_value(server) == "postgresql"
+            row = self._find_inventory_row(session, server_id, username, host, is_pg=is_pg)
+            existing_id = row.id if row else None
+        finally:
+            session.close()
+
+        # Motor PRIMERO (no adelantar el inventario al motor).
+        try:
+            get_adapter(target).change_password(username, new_password, host)
+        except AppHttpException:
+            audit.record(
+                "server_user.update",
+                status="error",
+                admin=admin,
+                target_type="server_user",
+                target_id=existing_id,
+                server_id=server_id,
+                touched_engine=True,
+                detail="fallo al cambiar la contraseña en el motor (por identidad)",
+            )
+            raise
+
+        server_user_id = existing_id
+        if existing_id is not None:
+            # Fila existente: sincronizar la contraseña cifrada (queda revelable).
+            self._update_row_password(existing_id, self._encrypt(new_password))
+        elif adopt:
+            server_user_id = self._insert_inventory_row(
+                server_id, username, host, self._encrypt(new_password), None
+            )
+
+        audit.record(
+            "server_user.update",
+            admin=admin,
+            target_type="server_user",
+            target_id=server_user_id,
+            server_id=server_id,
+            touched_engine=True,
+            detail="contraseña cambiada en el motor por identidad",
+        )
+        return EngineUserActionOut(
+            username=username,
+            host=None if is_pg else host,
+            adopted=server_user_id is not None,
+            server_user_id=server_user_id,
+        )
+
+    def drop_user_by_identity(
+        self,
+        server_id: int,
+        username: str,
+        host: str,
+        *,
+        confirm_username: str | None = None,
+        admin: dict | None = None,
+    ) -> EngineUserActionOut:
+        host = host or "%"
+        session = self._session()
+        try:
+            server = get_server_or_404(session, server_id)
+            self._guard_not_root(server.root_username, username)
+            target = build_target(server)
+            is_pg = engine_value(server) == "postgresql"
+            row = self._find_inventory_row(session, server_id, username, host, is_pg=is_pg)
+            row_id = row.id if row else None
+            owned = (
+                session.query(ManagedDatabase)
+                .filter(ManagedDatabase.owner_id == row_id)
+                .count()
+                if row_id is not None
+                else 0
+            )
+        finally:
+            session.close()
+
+        if owned:
+            raise AppHttpException(
+                message=(
+                    "No se puede eliminar: el usuario posee bases de datos gestionadas. "
+                    "Reasigna o elimina esas BDs primero."
+                ),
+                status_code=409,
+                context={"username": username, "owned_databases": owned},
+            )
+        if confirm_username != username:
+            raise AppHttpException(
+                message=(
+                    "Confirmación requerida: para ejecutar DROP USER en el motor, "
+                    "'confirm_username' debe coincidir exactamente con el username."
+                ),
+                status_code=422,
+                context={"required": "confirm_username == username"},
+            )
+
+        audit.record_intent(
+            "server_user.delete",
+            admin=admin,
+            target_type="server_user",
+            target_id=row_id,
+            server_id=server_id,
+            detail="DROP USER por identidad solicitado (confirmado)",
+        )
+        try:
+            get_adapter(target).drop_user(username, host)
+        except AppHttpException:
+            audit.record(
+                "server_user.delete",
+                status="error",
+                admin=admin,
+                target_type="server_user",
+                target_id=row_id,
+                server_id=server_id,
+                touched_engine=True,
+                detail="fallo al eliminar el usuario en el motor (por identidad)",
+            )
+            raise
+
+        if row_id is not None:
+            self._delete_row(row_id)
+
+        audit.record(
+            "server_user.delete",
+            admin=admin,
+            target_type="server_user",
+            target_id=row_id,
+            server_id=server_id,
+            touched_engine=True,
+            detail="usuario eliminado del motor por identidad",
+        )
+        return EngineUserActionOut(
+            username=username, host=None if is_pg else host, adopted=False, server_user_id=None
+        )
+
+    def add_host(
+        self, server_id: int, data: dict, *, admin: dict | None = None
+    ) -> AddHostOut:
+        username = data["username"]
+        source_host = data.get("source_host") or "%"
+        new_host = data["new_host"]
+        reuse_password = data.get("reuse_password", True)
+        new_password = data.get("new_password")
+        copy_grants = bool(data.get("copy_grants"))
+        adopt = bool(data.get("adopt"))
+        notes = data.get("notes")
+
+        session = self._session()
+        try:
+            server = get_server_or_404(session, server_id)
+            self._guard_not_root(server.root_username, username)
+            target = build_target(server)
+        finally:
+            session.close()
+
+        adapter = get_adapter(target)
+        if not getattr(adapter, "supports_hosts", True):
+            raise AppHttpException(
+                message=(
+                    "Este motor no usa host por usuario; 'agregar host' no aplica "
+                    "(en PostgreSQL el acceso por host se gestiona en pg_hba.conf)."
+                ),
+                status_code=422,
+                context={"dialect": adapter.dialect},
+            )
+
+        audit.record_intent(
+            "server_user.add_host",
+            admin=admin,
+            target_type="server_user",
+            server_id=server_id,
+            detail=f"CREATE USER {username}@{new_host} (clon de {username}@{source_host})",
+        )
+        try:
+            adapter.add_user_host(
+                username,
+                source_host,
+                new_host,
+                new_password=None if reuse_password else new_password,
+            )
+        except AppHttpException:
+            audit.record(
+                "server_user.add_host",
+                status="error",
+                admin=admin,
+                target_type="server_user",
+                server_id=server_id,
+                touched_engine=True,
+                detail=f"fallo al crear {username}@{new_host}",
+            )
+            raise
+
+        grants_copied = 0
+        grants_error = None
+        if copy_grants:
+            try:
+                grants_copied = adapter.copy_user_grants(username, source_host, new_host)
+            except AppHttpException as exc:  # best-effort: el host ya se creó
+                # exc.message ya viene redactado por map_driver_error (sin DSN/credenciales).
+                grants_error = exc.message
+            except Exception:  # noqa: BLE001 — nunca volcar detalle crudo del driver al cliente
+                grants_error = "No se pudieron copiar todos los grants al nuevo host."
+
+        server_user_id = None
+        if adopt:
+            pw_enc = self._encrypt(new_password) if (not reuse_password and new_password) else None
+            server_user_id = self._insert_inventory_row(
+                server_id, username, new_host, pw_enc, notes
+            )
+
+        audit.record(
+            "server_user.add_host",
+            admin=admin,
+            target_type="server_user",
+            target_id=server_user_id,
+            server_id=server_id,
+            touched_engine=True,
+            detail=(
+                f"host agregado: {username}@{new_host} "
+                f"({'hash reusado' if reuse_password else 'nueva contraseña'}, "
+                f"{grants_copied} grants)"
+            ),
+        )
+        return AddHostOut(
+            username=username,
+            new_host=new_host,
+            password_mode="reused" if reuse_password else "new",
+            grants_copied=grants_copied,
+            grants_error=grants_error,
+            adopted=server_user_id is not None,
+            server_user_id=server_user_id,
+        )
+
+    # ---- helpers de inventario para el flujo por identidad -------------------- #
+    def _insert_inventory_row(
+        self, server_id: int, username: str, host: str, password_encrypted: str | None, notes
+    ) -> int | None:
+        """Inserta la fila de inventario; None si ya existía (no es fatal: el motor ya se tocó)."""
+        session = self._session()
+        try:
+            u = ServerUser(
+                server_id=server_id,
+                username=username,
+                host=host or "%",
+                password_encrypted=password_encrypted,
+                notes=notes,
+                is_active=True,
+            )
+            session.add(u)
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                return None
+            session.refresh(u)
+            return u.id
+        finally:
+            session.close()
+
+    def _update_row_password(self, user_id: int, password_encrypted: str) -> None:
+        session = self._session()
+        try:
+            u = session.get(ServerUser, user_id)
+            if u:
+                u.password_encrypted = password_encrypted
+                session.commit()
+        finally:
+            session.close()

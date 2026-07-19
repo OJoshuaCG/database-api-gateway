@@ -7,7 +7,7 @@ Solo se informa ``has_password``.
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.services.db_admin.dtos import GrantLevel, ObjectRef
 
@@ -91,3 +91,130 @@ class ServerUserFullOut(BaseModel):
     user: ServerUserOut
     grants_applied: int
     grant_results: list[GrantApplyResult]
+
+
+# ─── Vista agrupada por username + CRUD por identidad física ────────────────── #
+# Estos schemas alimentan el manejo de usuarios "por identidad" (server_id +
+# username + host), que funciona tanto para usuarios adoptados como NO adoptados.
+# La agrupación por username elimina la redundancia de listar 'user'@'hostA',
+# 'user'@'hostB', ... como si fueran usuarios distintos (en MySQL/MariaDB lo son a
+# nivel motor, pero visualmente confunde). En PostgreSQL un rol no tiene host:
+# ``supports_hosts=false`` y cada username tiene exactamente una identidad.
+
+
+class EngineUserIdentityOut(BaseModel):
+    """Una identidad concreta de un username: en MySQL un ``'user'@'host'``."""
+
+    host: str | None = None  # None en PostgreSQL (el rol no tiene host)
+    status: str  # 'adopted' (en inventario) | 'unmanaged' (solo motor) | 'orphan' (solo inventario)
+    server_user_id: int | None = None
+    has_password: bool = False  # ¿el gateway conoce/guarda su contraseña?
+    is_active: bool | None = None
+    notes: str | None = None
+
+
+class GroupedEngineUserOut(BaseModel):
+    username: str
+    identity_count: int
+    identities: list[EngineUserIdentityOut]
+
+
+class GroupedEngineUsersOut(BaseModel):
+    dialect: str
+    supports_hosts: bool  # false en PostgreSQL → el frontend oculta host/agregar-host
+    users: list[GroupedEngineUserOut]
+
+
+class EngineUserCreateIn(BaseModel):
+    """Crea un usuario directamente en el motor (con adopción opcional al inventario)."""
+
+    username: str = Field(..., pattern=_USERNAME)
+    host: str = Field("%", pattern=_HOST, description="Solo MySQL/MariaDB; ignorado en PostgreSQL")
+    password: str = Field(..., min_length=1)
+    adopt: bool = Field(
+        False,
+        description="Si true, además registra el usuario en el inventario del gateway (guarda la contraseña cifrada, permitiendo revelarla luego).",
+    )
+    notes: str | None = None
+
+
+class EnginePasswordChangeIn(BaseModel):
+    """Cambia la contraseña de un usuario en el motor, esté o no adoptado."""
+
+    username: str = Field(..., pattern=_USERNAME)
+    host: str = Field("%", pattern=_HOST, description="Solo MySQL/MariaDB; ignorado en PostgreSQL")
+    new_password: str = Field(..., min_length=1)
+    adopt: bool = Field(
+        False,
+        description="Solo aplica si el usuario NO está en el inventario: si true, lo adopta guardando la nueva contraseña cifrada.",
+    )
+
+
+class EngineRevealPasswordIn(BaseModel):
+    username: str = Field(..., pattern=_USERNAME)
+    host: str = Field("%", pattern=_HOST, description="Solo MySQL/MariaDB; ignorado en PostgreSQL")
+
+
+class RevealedPasswordOut(BaseModel):
+    """
+    Contraseña en claro de un usuario. SOLO es posible cuando el gateway fijó esa
+    contraseña (create/rotación por el gateway) y la guarda cifrada. El motor solo
+    almacena un hash irreversible: una contraseña que el gateway nunca conoció NO se
+    puede revelar (409), únicamente rotar.
+    """
+
+    username: str
+    host: str | None = None
+    password: str
+
+
+class EngineUserActionOut(BaseModel):
+    """Resultado de una operación por identidad (create / cambio de contraseña / drop)."""
+
+    username: str
+    host: str | None = None
+    adopted: bool = False  # ¿quedó (o ya estaba) registrado en el inventario?
+    server_user_id: int | None = None
+
+
+class AddHostIn(BaseModel):
+    """
+    Agrega un HOST adicional a un usuario existente (clona la cuenta a un nuevo host).
+    Exclusivo de MySQL/MariaDB: en esos motores ``'user'@'hostA'`` y ``'user'@'hostB'``
+    son cuentas separadas. En PostgreSQL el rol no tiene host → 422.
+    """
+
+    username: str = Field(..., pattern=_USERNAME)
+    source_host: str = Field(
+        "%", pattern=_HOST, description="Host de la cuenta origen desde la que se clona."
+    )
+    new_host: str = Field(..., pattern=_HOST, description="Nuevo host para el que se crea la cuenta.")
+    reuse_password: bool = Field(
+        True,
+        description="True: copia el hash de la cuenta origen (misma contraseña, sin conocerla en claro). False: usa 'new_password'.",
+    )
+    new_password: str | None = Field(None, min_length=1)
+    copy_grants: bool = Field(
+        False,
+        description="Si true, replica los permisos de la cuenta origen al nuevo host (best-effort; omite privilegios globales/PROXY).",
+    )
+    adopt: bool = Field(
+        False, description="Si true, registra la nueva identidad en el inventario del gateway."
+    )
+    notes: str | None = None
+
+    @model_validator(mode="after")
+    def _require_new_password(self):
+        if not self.reuse_password and not self.new_password:
+            raise ValueError("Se requiere 'new_password' cuando reuse_password=false.")
+        return self
+
+
+class AddHostOut(BaseModel):
+    username: str
+    new_host: str
+    password_mode: str  # 'reused' (hash copiado) | 'new'
+    grants_copied: int = 0
+    grants_error: str | None = None
+    adopted: bool = False
+    server_user_id: int | None = None
