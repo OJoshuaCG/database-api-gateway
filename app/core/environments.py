@@ -152,6 +152,16 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 SESSION_SECRET = os.getenv("SESSION_SECRET") or SECRET_KEY or "insecure-dev-session-secret"
 # Duración de la sesión en segundos (default 8 horas).
 SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE", "28800"))
+# Flag `Secure` de la cookie de sesión. Por defecto sigue a APP_ENV=="production"
+# (comportamiento histórico). Se puede fijar explícitamente (True/False) para
+# desacoplarlo de APP_ENV, p. ej. mientras se termina de configurar TLS delante del
+# gateway: NO desactivar en un despliegue real, la cookie viajaría sin cifrar.
+_session_cookie_secure_raw = os.getenv("SESSION_COOKIE_SECURE", None)
+SESSION_COOKIE_SECURE = (
+    APP_ENV == "production"
+    if _session_cookie_secure_raw is None
+    else _session_cookie_secure_raw.lower() == "true"
+)
 
 # ======= Startup validation ======= #
 if not SECRET_KEY:
@@ -187,4 +197,12 @@ if APP_ENV == "production" and "*" in CORS_ORIGINS:
     raise ValueError(
         "CORS_ORIGINS no puede ser '*' en producción: la auth por cookie requiere una "
         "lista explícita de orígenes (p. ej. CORS_ORIGINS=https://panel.midominio.com)."
+    )
+
+if APP_ENV == "production" and not SESSION_COOKIE_SECURE:
+    import logging as _logging
+    _logging.warning(
+        "SESSION_COOKIE_SECURE=False en producción: la cookie de sesión viaja SIN el "
+        "flag Secure y el navegador la acepta por HTTP sin cifrar. Usar solo mientras "
+        "se termina de configurar TLS delante del gateway (ver docs/dokploy-deployment.md)."
     )

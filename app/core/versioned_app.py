@@ -10,7 +10,6 @@ from slowapi.middleware import SlowAPIMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.core.environments import (
-    APP_ENV,
     APP_NAME,
     CORS_ORIGINS,
     DOCS_ENABLED,
@@ -18,6 +17,7 @@ from app.core.environments import (
     DOCS_PASSWORD_ENABLED,
     DOCS_USER,
     LOGGER_MIDDLEWARE_ENABLED,
+    SESSION_COOKIE_SECURE,
     SESSION_MAX_AGE,
     SESSION_SECRET,
 )
@@ -186,7 +186,7 @@ def create_versioned_app(
         session_cookie="gw_session",
         max_age=SESSION_MAX_AGE,
         same_site="lax",
-        https_only=(APP_ENV == "production"),
+        https_only=SESSION_COOKIE_SECURE,
     )
 
     # === Rate limiter
