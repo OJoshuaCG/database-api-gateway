@@ -3,12 +3,16 @@ Manejo de usuarios del motor por IDENTIDAD (server_id, username, host):
 - vista agrupada por username (adopted / unmanaged / orphan; supports_hosts por motor),
 - CRUD sobre adoptados y NO adoptados,
 - revelar contraseña (solo si el gateway la conoce),
-- agregar host (clonar cuenta, misma o nueva contraseña, copiar grants) — MySQL/MariaDB.
+- agregar host (clonar cuenta, misma o nueva contraseña, copiar grants) — MySQL/MariaDB,
+- operaciones MASIVAS: adoptar todos los hosts de un username, definir contraseña
+  conocida (sin ALTER USER) y rotar contraseña (con ALTER USER) con alcance individual
+  o global (todos los hosts en vivo).
 
 Adapter mockeado (sin motor real), mismo patrón que test_api_server_users.py.
 """
 
 import app.controllers.server_user_controller as suc
+from app.exceptions import AppHttpException
 from app.services.db_admin.dtos import EngineUserInfo
 from app.services.db_admin.mysql_adapter import MySQLAdapter
 
@@ -323,3 +327,322 @@ def test_add_host_422_on_postgres(admin_client, monkeypatch):
         json={"username": "u", "new_host": "h"},
     )
     assert r.status_code == 422, r.text
+
+
+# --------------------- adopción masiva de hosts ---------------------------- #
+def test_adopt_all_hosts_adopts_every_live_host(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-aah1", port=3330)
+    live = [("bulk", "%"), ("bulk", "localhost"), ("bulk", "10.0.0.9")]
+    _patch(monkeypatch, _FakeAdapter(live))
+    r = admin_client.post(
+        f"/api/v1/servers/{sid}/users/adopt-all-hosts", json={"username": "bulk"}
+    )
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    assert data["total_hosts"] == 3
+    assert data["adopted"] == 3
+    assert {i["status"] for i in data["results"]} == {"adopted"}
+    inv = admin_client.get(f"/api/v1/server-users?server_id={sid}").json()["data"]
+    bulk_rows = [u for u in inv if u["username"] == "bulk"]
+    assert len(bulk_rows) == 3
+    assert all(not u["has_password"] for u in bulk_rows)
+
+
+def test_adopt_all_hosts_with_known_password_sets_has_password_without_engine_call(
+    admin_client, monkeypatch
+):
+    sid = _make_server(admin_client, name="eu-aah2", port=3331)
+    fake = _FakeAdapter([("bulkpw", "%"), ("bulkpw", "localhost")])
+    _patch(monkeypatch, fake)
+    r = admin_client.post(
+        f"/api/v1/servers/{sid}/users/adopt-all-hosts",
+        json={"username": "bulkpw", "known_password": "Secr3t!"},
+    )
+    assert r.status_code == 201, r.text
+    inv = admin_client.get(f"/api/v1/server-users?server_id={sid}").json()["data"]
+    rows = [u for u in inv if u["username"] == "bulkpw"]
+    assert len(rows) == 2
+    assert all(u["has_password"] for u in rows)
+    # Nunca se ejecuta ALTER/CREATE en el motor: "definir" no toca el motor.
+    assert fake.calls == []
+
+
+def test_adopt_all_hosts_partial_already_adopted(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-aah3", port=3332)
+    live = [("part", "%"), ("part", "localhost")]
+    _patch(monkeypatch, _FakeAdapter(live))
+    admin_client.post(
+        "/api/v1/server-users/adopt", json={"server_id": sid, "username": "part", "host": "%"}
+    )
+    r = admin_client.post(
+        f"/api/v1/servers/{sid}/users/adopt-all-hosts", json={"username": "part"}
+    )
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    by_host = {i["host"]: i["status"] for i in data["results"]}
+    assert by_host["%"] == "already_adopted"
+    assert by_host["localhost"] == "adopted"
+    assert data["adopted"] == 1
+
+
+def test_adopt_all_hosts_404_when_username_not_live(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-aah4", port=3333)
+    _patch(monkeypatch, _FakeAdapter())
+    r = admin_client.post(
+        f"/api/v1/servers/{sid}/users/adopt-all-hosts", json={"username": "ghost"}
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_adopt_all_hosts_guards_root(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-aah5", port=3334, root_username="gwroot")
+    fake = _FakeAdapter([("gwroot", "%")])
+    _patch(monkeypatch, fake)
+    r = admin_client.post(
+        f"/api/v1/servers/{sid}/users/adopt-all-hosts", json={"username": "gwroot"}
+    )
+    assert r.status_code == 409, r.text
+    assert fake.calls == []
+
+
+def test_adopt_all_hosts_postgres_single_identity(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-aah6", port=5434, engine="postgresql")
+    _patch(monkeypatch, _FakeAdapter([("app", None)], supports_hosts=False))
+    r = admin_client.post(
+        f"/api/v1/servers/{sid}/users/adopt-all-hosts", json={"username": "app"}
+    )
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    assert data["total_hosts"] == 1
+    assert data["results"][0]["host"] is None
+
+
+# --------------------- definir contraseña conocida ------------------------- #
+def test_define_password_host_scope_updates_only_that_host(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-dp1", port=3335)
+    live = [("alice", "%"), ("alice", "localhost")]
+    fake = _FakeAdapter(live)
+    _patch(monkeypatch, fake)
+    admin_client.post(
+        f"/api/v1/servers/{sid}/users/adopt-all-hosts", json={"username": "alice"}
+    )
+    r = admin_client.post(
+        f"/api/v1/servers/{sid}/users/define-password",
+        json={"username": "alice", "scope": "host", "host": "%", "known_password": "Secr3t!"},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["updated"] == 1
+    inv = admin_client.get(f"/api/v1/server-users?server_id={sid}").json()["data"]
+    by_host = {u["host"]: u["has_password"] for u in inv if u["username"] == "alice"}
+    assert by_host["%"] is True
+    assert by_host["localhost"] is False
+    # Nunca toca el motor.
+    assert fake.calls == []
+
+
+def test_define_password_all_hosts_scope_updates_every_adopted_row(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-dp2", port=3336)
+    live = [("bob", "%"), ("bob", "localhost")]
+    _patch(monkeypatch, _FakeAdapter(live))
+    admin_client.post(
+        f"/api/v1/servers/{sid}/users/adopt-all-hosts", json={"username": "bob"}
+    )
+    r = admin_client.post(
+        f"/api/v1/servers/{sid}/users/define-password",
+        json={"username": "bob", "scope": "all_hosts", "known_password": "Secr3t!"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["updated"] == 2
+    inv = admin_client.get(f"/api/v1/server-users?server_id={sid}").json()["data"]
+    assert all(u["has_password"] for u in inv if u["username"] == "bob")
+
+
+def test_define_password_all_hosts_adopt_if_missing(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-dp3", port=3337)
+    live = [("carol", "%"), ("carol", "localhost")]
+    _patch(monkeypatch, _FakeAdapter(live))
+    # Solo se adopta un host; el otro queda "unmanaged".
+    admin_client.post(
+        "/api/v1/server-users/adopt", json={"server_id": sid, "username": "carol", "host": "%"}
+    )
+    # Sin la flag: el host no adoptado se omite.
+    r = admin_client.post(
+        f"/api/v1/servers/{sid}/users/define-password",
+        json={"username": "carol", "scope": "all_hosts", "known_password": "Secr3t!"},
+    )
+    by_host = {i["host"]: i["status"] for i in r.json()["data"]["results"]}
+    assert by_host["localhost"] == "skipped_not_found"
+    # Con la flag: se adopta y se define la contraseña.
+    r2 = admin_client.post(
+        f"/api/v1/servers/{sid}/users/define-password",
+        json={
+            "username": "carol",
+            "scope": "all_hosts",
+            "known_password": "Secr3t!",
+            "adopt_if_missing": True,
+        },
+    )
+    by_host2 = {i["host"]: i["status"] for i in r2.json()["data"]["results"]}
+    assert by_host2["localhost"] == "adopted"
+    inv = admin_client.get(f"/api/v1/server-users?server_id={sid}").json()["data"]
+    assert any(
+        u["username"] == "carol" and u["host"] == "localhost" and u["has_password"]
+        for u in inv
+    )
+
+
+def test_define_password_overwrite_required_to_replace_existing(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-dp4", port=3338)
+    _patch(monkeypatch, _FakeAdapter([("dana", "%")]))
+    admin_client.post(
+        f"/api/v1/servers/{sid}/users/adopt-all-hosts",
+        json={"username": "dana", "known_password": "Original1!"},
+    )
+    # Sin overwrite=true → se rechaza esa identidad, no se sobreescribe.
+    r = admin_client.post(
+        f"/api/v1/servers/{sid}/users/define-password",
+        json={"username": "dana", "scope": "host", "host": "%", "known_password": "Nuevo2!"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["results"][0]["status"] == "conflict_needs_overwrite"
+    reveal = admin_client.post(
+        f"/api/v1/servers/{sid}/users/reveal-password", json={"username": "dana"}
+    )
+    assert reveal.json()["data"]["password"] == "Original1!"
+    # Con overwrite=true → sí reemplaza.
+    r2 = admin_client.post(
+        f"/api/v1/servers/{sid}/users/define-password",
+        json={
+            "username": "dana",
+            "scope": "host",
+            "host": "%",
+            "known_password": "Nuevo2!",
+            "overwrite": True,
+        },
+    )
+    assert r2.json()["data"]["results"][0]["status"] == "updated"
+    reveal2 = admin_client.post(
+        f"/api/v1/servers/{sid}/users/reveal-password", json={"username": "dana"}
+    )
+    assert reveal2.json()["data"]["password"] == "Nuevo2!"
+
+
+def test_define_password_guards_root(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-dp5", port=3339, root_username="gwroot")
+    fake = _FakeAdapter([("gwroot", "%")])
+    _patch(monkeypatch, fake)
+    r = admin_client.post(
+        f"/api/v1/servers/{sid}/users/define-password",
+        json={"username": "gwroot", "known_password": "whatever1"},
+    )
+    assert r.status_code == 409, r.text
+    assert fake.calls == []
+
+
+# --------------------- rotar contraseña en todos los hosts ----------------- #
+def test_rotate_password_all_hosts_calls_change_password_per_host(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-rp1", port=3340)
+    live = [("rot", "%"), ("rot", "localhost")]
+    fake = _FakeAdapter(live)
+    _patch(monkeypatch, fake)
+    admin_client.post(
+        f"/api/v1/servers/{sid}/users/adopt-all-hosts", json={"username": "rot"}
+    )
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}/users/password-all-hosts",
+        json={"username": "rot", "new_password": "brandnew1", "confirm_username": "rot"},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["updated"] == 2
+    assert ("change_password", "rot", "%") in fake.calls
+    assert ("change_password", "rot", "localhost") in fake.calls
+    inv = admin_client.get(f"/api/v1/server-users?server_id={sid}").json()["data"]
+    assert all(u["has_password"] for u in inv if u["username"] == "rot")
+
+
+def test_rotate_password_all_hosts_requires_confirm_username(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-rp2", port=3341)
+    fake = _FakeAdapter([("rot2", "%")])
+    _patch(monkeypatch, fake)
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}/users/password-all-hosts",
+        json={"username": "rot2", "new_password": "brandnew1", "confirm_username": "otro"},
+    )
+    assert r.status_code == 422, r.text
+    assert fake.calls == []
+
+
+def test_rotate_password_all_hosts_partial_failure_reports_per_item(admin_client, monkeypatch):
+    class _PartialFailAdapter(_FakeAdapter):
+        def change_password(self, username, new_password, host):
+            if host == "localhost":
+                raise AppHttpException(message="motor caído", status_code=502)
+            super().change_password(username, new_password, host)
+
+    sid = _make_server(admin_client, name="eu-rp3", port=3342)
+    live = [("flaky", "%"), ("flaky", "localhost")]
+    fake = _PartialFailAdapter(live)
+    _patch(monkeypatch, fake)
+    admin_client.post(
+        f"/api/v1/servers/{sid}/users/adopt-all-hosts",
+        json={"username": "flaky", "known_password": "Original1!"},
+    )
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}/users/password-all-hosts",
+        json={"username": "flaky", "new_password": "brandnew1", "confirm_username": "flaky"},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    by_host = {i["host"]: i for i in data["results"]}
+    assert by_host["%"]["status"] == "rotated"
+    assert by_host["localhost"]["status"] == "error"
+    assert data["updated"] == 1
+    # El host fallido conserva la contraseña anterior (nunca se sobreescribió).
+    reveal = admin_client.post(
+        f"/api/v1/servers/{sid}/users/reveal-password",
+        json={"username": "flaky", "host": "localhost"},
+    )
+    assert reveal.json()["data"]["password"] == "Original1!"
+
+
+def test_rotate_password_all_hosts_404_when_username_not_live(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-rp4", port=3343)
+    _patch(monkeypatch, _FakeAdapter())
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}/users/password-all-hosts",
+        json={"username": "ghost", "new_password": "brandnew1", "confirm_username": "ghost"},
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_rotate_password_all_hosts_guards_root(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-rp5", port=3344, root_username="gwroot")
+    fake = _FakeAdapter([("gwroot", "%")])
+    _patch(monkeypatch, fake)
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}/users/password-all-hosts",
+        json={"username": "gwroot", "new_password": "brandnew1", "confirm_username": "gwroot"},
+    )
+    assert r.status_code == 409, r.text
+    assert fake.calls == []
+
+
+def test_rotate_password_all_hosts_adopt_if_missing(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-rp6", port=3345)
+    fake = _FakeAdapter([("newbie", "%")])
+    _patch(monkeypatch, fake)
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}/users/password-all-hosts",
+        json={
+            "username": "newbie",
+            "new_password": "brandnew1",
+            "confirm_username": "newbie",
+            "adopt_if_missing": True,
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["results"][0]["adopted"] is True
+    inv = admin_client.get(f"/api/v1/server-users?server_id={sid}").json()["data"]
+    assert any(u["username"] == "newbie" and u["has_password"] for u in inv)
