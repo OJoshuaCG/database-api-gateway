@@ -76,9 +76,12 @@ que el usuario esté adoptado. Si existe fila de inventario que coincide, se sin
 | Verbo | Ruta | Cuerpo / query | Efecto en motor |
 |---|---|---|---|
 | POST | `/servers/{id}/users` | `EngineUserCreateIn` | `CREATE USER` |
-| PATCH | `/servers/{id}/users/password` | `EnginePasswordChangeIn` | `ALTER USER/ROLE` |
+| PATCH | `/servers/{id}/users/password` | `EnginePasswordChangeIn` | `ALTER USER/ROLE` (1 host) |
+| PATCH | `/servers/{id}/users/password-all-hosts` | `EnginePasswordChangeAllHostsIn` | `ALTER USER/ROLE` (todos los hosts en vivo) |
 | DELETE | `/servers/{id}/users` | `?username=&host=&confirm_username=` | `DROP USER/ROLE` |
 | POST | `/servers/{id}/users/add-host` | `AddHostIn` | `CREATE USER` (clon) |
+| POST | `/servers/{id}/users/adopt-all-hosts` | `AdoptAllHostsIn` | — (solo inventario) |
+| POST | `/servers/{id}/users/define-password` | `DefineKnownPasswordIn` | — (solo inventario) |
 | POST | `/servers/{id}/users/reveal-password` | `EngineRevealPasswordIn` | — (solo lectura) |
 
 ### Adopción opcional (`adopt`)
@@ -145,6 +148,99 @@ POST /servers/{server_id}/users/add-host
   cualquier línea con credencial embebida (`IDENTIFIED BY` de motores viejos).
 - **PostgreSQL** → `422` (el rol no tiene host).
 
+## Adopción masiva de hosts
+
+```
+POST /servers/{server_id}/users/adopt-all-hosts
+```
+```jsonc
+{
+  "username": "alice",
+  "known_password": null,   // opcional: ver "Definir vs. rotar" más abajo
+  "notes": null
+}
+```
+
+Adopta de una sola vez **todas las identidades en vivo** de un username (en vez de
+llamar `POST /server-users/adopt` una vez por host). Verifica primero contra el motor
+(`adapter.list_users()`) qué hosts existen realmente → `404` si el username no existe
+en absoluto. Nunca ejecuta `CREATE USER`. Es **fail-tolerant por host**: un host ya
+adoptado se reporta `already_adopted` sin abortar el resto del lote.
+
+```jsonc
+{
+  "username": "alice",
+  "dialect": "mysql",
+  "total_hosts": 3,
+  "adopted": 2,
+  "results": [
+    { "host": "localhost", "status": "adopted",         "server_user_id": 41 },
+    { "host": "%",         "status": "already_adopted", "server_user_id": 12 },
+    { "host": "10.0.0.5",  "status": "adopted",          "server_user_id": 42 }
+  ]
+}
+```
+
+No reemplaza al `POST /server-users/adopt` singular (Plan 09), que sigue existiendo
+para adoptar una sola identidad puntual.
+
+## Definir vs. rotar contraseña (individual o todos los hosts)
+
+Son dos operaciones **deliberadamente distintas** y no deben confundirse:
+
+| | Toca el motor | Uso típico | Endpoint(s) |
+|---|---|---|---|
+| **Definir** (`define-password`) | ❌ Nunca (solo cifra y guarda) | El admin humano YA sabe cuál es la contraseña real vigente y solo quiere que el gateway la recuerde, para poder revelarla después | `POST /servers/{id}/users/define-password` |
+| **Rotar/cambiar** (`password[-all-hosts]`) | ✅ Sí (`ALTER USER/ROLE` real) | Se quiere cambiar la contraseña de verdad, o no se conoce la actual | `PATCH /servers/{id}/users/password`, `PATCH /servers/{id}/users/password-all-hosts` |
+
+Ambas admiten alcance **individual** (un host específico) o **global** (todos los
+hosts en vivo del username). El alcance se controla con un campo explícito — **nunca**
+sobrecargando `host`, porque `"%"` ya es un host real de MySQL, no un significado de
+"todos".
+
+### Definir contraseña conocida
+
+```jsonc
+// scope="host": solo esa identidad
+{ "username": "alice", "scope": "host", "host": "localhost", "known_password": "Secr3t!", "overwrite": false }
+
+// scope="all_hosts": todas las identidades en vivo del username
+{ "username": "alice", "scope": "all_hosts", "known_password": "Secr3t!", "adopt_if_missing": true }
+```
+
+- Nunca ejecuta `ALTER USER`: **es responsabilidad del admin** que el valor coincida
+  con la contraseña real del motor. Si se equivoca, `reveal-password` devolverá un
+  valor incorrecto sin que el gateway pueda detectarlo (no hay forma de verificarlo sin
+  tocar el motor).
+- `adopt_if_missing=true` registra en el inventario los hosts en vivo sin fila previa.
+  Sin la flag, esos hosts se reportan `skipped_not_found`.
+- **`overwrite=true` es obligatorio** para sobrescribir una identidad que YA tenía una
+  contraseña guardada por el gateway; sin el flag, esa identidad se reporta
+  `conflict_needs_overwrite` y no se toca (evita reemplazos accidentales de un valor
+  que ya era revelable correctamente). Sobrescribir SÍ audita fail-closed
+  (`record_intent`) antes de escribir, misma clase de riesgo que `reveal-password`.
+
+### Rotar contraseña en todos los hosts
+
+```jsonc
+{
+  "username": "alice",
+  "new_password": "N3wP4ss!",
+  "confirm_username": "alice",
+  "adopt_if_missing": false
+}
+```
+
+- `confirm_username` debe repetir exactamente el `username` (doble intención, mismo
+  patrón que `DROP USER`) porque esta operación ejecuta `ALTER USER` real e
+  irreversible sobre N cuentas de una sola vez.
+- **Fail-tolerant por host**: un fallo en un host no aborta la rotación de los demás;
+  la respuesta reporta `status="error"` con el detalle para el host que falló, dejando
+  claro que ese host quedó con la contraseña anterior mientras los demás ya rotaron
+  (estado real divergente en el motor, no solo en el inventario — revisar `results`).
+- El endpoint individual `PATCH /servers/{id}/users/password` no cambia: sigue
+  operando sobre un solo host, sin `confirm_username`.
+
 ## Seguridad
 
 - Todos los endpoints requieren admin autenticado.
@@ -165,6 +261,14 @@ POST /servers/{server_id}/users/add-host
   omite el `USAGE` base y los grants `PROXY`. **Advertencia**: replica fielmente privilegios
   **globales** (`ALL ON *.*`, `SUPER`, …) y `WITH GRANT OPTION` de la cuenta origen — es la
   semántica esperada de "clonar la cuenta", pero úsalo con criterio (over-provisioning).
+- **Operaciones masivas** (`adopt-all-hosts`, `define-password`, `password-all-hosts`):
+  el guard anti auto-lockout se evalúa **una sola vez sobre el username**, antes de
+  iterar hosts (no repetido por ítem). `password-all-hosts` exige `confirm_username`
+  por el mismo motivo que `DROP USER` (ALTER real e irreversible sobre N cuentas).
+  `define-password` audita con una acción (`server_user.password.define`)
+  inequívocamente distinta de la rotación real (`server_user.password.rotate_batch` /
+  `server_user.update`), para que un análisis de auditoría pueda filtrar sin ambigüedad
+  qué fue una rotación real en el motor vs. qué fue solo el gateway memorizando un dato.
 
 ## Limitaciones conocidas
 
@@ -175,15 +279,30 @@ POST /servers/{server_id}/users/add-host
 - **`reveal-password` no tiene rate-limit dedicado** (sí gating admin + auditoría fail-closed).
   Follow-up sugerido: `@limiter.limit(...)` conservador y exclusión explícita de logging de
   body.
+- **`define-password` no verifica el valor contra el motor**: al no ejecutar ALTER USER,
+  no hay forma de confirmar que `known_password` coincida con la contraseña real vigente.
+  Si el admin se equivoca, `reveal-password` devolverá ese valor incorrecto sin que el
+  gateway pueda detectarlo — es una limitación aceptada por diseño (sin 2FA/verificación
+  adicional por ahora).
+- **Rotación batch puede quedar parcial**: si `password-all-hosts` falla en un host, ese
+  host conserva la contraseña anterior mientras los demás ya rotaron — un estado real
+  divergente en el motor, no solo en el inventario. Revisar siempre `results` por host.
+- **Sin tope de hosts por request** en las operaciones masivas todavía (análogo al
+  `max_databases` de `apply-all` de migraciones). Follow-up sugerido si un username
+  acumula muchos hosts históricos por drift.
 
 ## Verificación
 
 - **Tests**: `tests/test_api_engine_users.py` (adapter mockeado): vista agrupada
   (adopted/unmanaged/orphan, supports_hosts por motor), CRUD por identidad, adopción
   opcional, revelar contraseña (200/409/404), agregar host (hash/nueva contraseña, copy
-  grants, 422 en PG) + test unitario puro de `_rewrite_grant_line`.
+  grants, 422 en PG), adopción masiva de hosts, definir contraseña conocida
+  (individual/global, overwrite), rotación de contraseña en todos los hosts
+  (confirm_username, fail-tolerante por host) + test unitario puro de `_rewrite_grant_line`.
 - **Pendiente**: verificación e2e contra motores reales (`add_user_host` /
   `copy_user_grants` con `SHOW CREATE USER` / `SHOW GRANTS` reales en MySQL 8 —
   `caching_sha2_password` — MariaDB y el 422 de PostgreSQL). El rewrite de grantee asume
   identificadores whitelisteados (sin comillas/backslash), por lo que el grantee que emite
-  el motor coincide byte a byte con el construido.
+  el motor coincide byte a byte con el construido. Las tres operaciones masivas nuevas
+  (adopt-all-hosts/define-password/password-all-hosts) también quedan pendientes de
+  verificación e2e contra motores reales.
