@@ -16,11 +16,17 @@ from app.schemas.server import ReconcileResult, ServerCreate, ServerOut, ServerU
 from app.schemas.server_user import (
     AddHostIn,
     AddHostOut,
+    AdoptAllHostsIn,
+    BatchAdoptOut,
+    DefineKnownPasswordIn,
+    EnginePasswordChangeAllHostsIn,
     EnginePasswordChangeIn,
     EngineRevealPasswordIn,
     EngineUserActionOut,
     EngineUserCreateIn,
     GroupedEngineUsersOut,
+    KnownPasswordSetOut,
+    PasswordChangeBatchOut,
     RevealedPasswordOut,
 )
 from app.services.db_admin.dtos import (
@@ -101,6 +107,25 @@ def list_users_grouped(admin: AdminDep, server_id: int):
 
 
 @router.post(
+    "/{server_id}/users/adopt-all-hosts",
+    response_model=ApiResponse[BatchAdoptOut],
+    status_code=201,
+)
+def adopt_engine_user_all_hosts(admin: AdminDep, server_id: int, payload: AdoptAllHostsIn):
+    """
+    Adopta TODAS las identidades en vivo de un username en una sola operación (nunca
+    ejecuta CREATE USER). Con ``known_password`` opcional, la guarda cifrada en todas
+    las filas adoptadas para habilitar reveal-password (tampoco ejecuta ALTER USER).
+    """
+    result = ServerUserController().adopt_user_all_hosts(
+        server_id, payload.model_dump(), admin=admin
+    )
+    return success(
+        data=result, message=f"{result.adopted}/{result.total_hosts} hosts adoptados."
+    )
+
+
+@router.post(
     "/{server_id}/users",
     response_model=ApiResponse[EngineUserActionOut],
     status_code=201,
@@ -126,6 +151,27 @@ def change_engine_user_password(
     return success(data=updated, message="Contraseña actualizada en el motor.")
 
 
+@router.patch(
+    "/{server_id}/users/password-all-hosts",
+    response_model=ApiResponse[PasswordChangeBatchOut],
+)
+def change_engine_user_password_all_hosts(
+    admin: AdminDep, server_id: int, payload: EnginePasswordChangeAllHostsIn
+):
+    """
+    Rota la contraseña REAL (ALTER USER/ROLE) en TODOS los hosts en vivo de un
+    username. Irreversible sobre N cuentas a la vez: exige ``confirm_username`` igual
+    al username (doble intención, mismo patrón que DROP USER). Fail-tolerant por host:
+    un fallo en uno no aborta el resto (ver ``results`` para el detalle por host).
+    """
+    result = ServerUserController().set_password_by_identity_all_hosts(
+        server_id, payload.model_dump(), admin=admin
+    )
+    return success(
+        data=result, message=f"{result.updated}/{result.total_hosts} hosts rotados."
+    )
+
+
 @router.post(
     "/{server_id}/users/reveal-password",
     response_model=ApiResponse[RevealedPasswordOut],
@@ -142,6 +188,28 @@ def reveal_engine_user_password(
         server_id, payload.username, payload.host, admin=admin
     )
     return success(data=revealed)
+
+
+@router.post(
+    "/{server_id}/users/define-password",
+    response_model=ApiResponse[KnownPasswordSetOut],
+)
+def define_engine_user_known_password(
+    admin: AdminDep, server_id: int, payload: DefineKnownPasswordIn
+):
+    """
+    Registra una contraseña YA conocida por el admin humano SIN ejecutar ALTER USER —
+    solo la cifra y guarda para habilitar reveal-password después. Distinto de
+    ``PATCH /users/password[-all-hosts]``, que sí ejecutan ALTER USER/ROLE real en el
+    motor. ``scope='all_hosts'`` aplica a todos los hosts en vivo del username;
+    ``overwrite=true`` es obligatorio para reemplazar una contraseña ya conocida.
+    """
+    result = ServerUserController().set_known_password(
+        server_id, payload.model_dump(), admin=admin
+    )
+    return success(
+        data=result, message=f"Contraseña definida en {result.updated} identidad(es)."
+    )
 
 
 @router.post(

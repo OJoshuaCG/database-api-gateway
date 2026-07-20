@@ -6,6 +6,7 @@ Solo se informa ``has_password``.
 """
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -218,3 +219,125 @@ class AddHostOut(BaseModel):
     grants_error: str | None = None
     adopted: bool = False
     server_user_id: int | None = None
+
+
+# ─── Adopción masiva de hosts + contraseña con alcance individual/global ────── #
+# Estos schemas alimentan tres operaciones que orquestan sobre TODOS los hosts en
+# vivo de un username (no una tabla nueva: server_users sigue siendo una fila por
+# identidad física; ver docs/features/engine-users-management.md).
+
+
+class AdoptAllHostsIn(BaseModel):
+    """Adopta TODOS los hosts en vivo de un username en una sola operación."""
+
+    username: str = Field(..., pattern=_USERNAME)
+    known_password: str | None = Field(
+        None,
+        min_length=1,
+        description=(
+            "Si se provee, se guarda cifrada en TODAS las identidades adoptadas. "
+            "NUNCA ejecuta ALTER USER (no confirma que sea la contraseña real del motor)."
+        ),
+    )
+    notes: str | None = None
+
+
+class AdoptAllHostsItemOut(BaseModel):
+    host: str | None = None  # None en PostgreSQL
+    status: str  # 'adopted' | 'already_adopted'
+    server_user_id: int | None = None
+
+
+class BatchAdoptOut(BaseModel):
+    username: str
+    dialect: str
+    total_hosts: int
+    adopted: int
+    results: list[AdoptAllHostsItemOut]
+
+
+class DefineKnownPasswordIn(BaseModel):
+    """
+    Registra una contraseña YA CONOCIDA por el admin humano (coincide con la real del
+    motor, fijada fuera del gateway o de otra forma) SIN ejecutar ALTER USER/ROLE. Solo
+    cifra y guarda, para habilitar reveal-password. Distinto de
+    EnginePasswordChangeIn/EnginePasswordChangeAllHostsIn, que sí rotan en el motor.
+    """
+
+    username: str = Field(..., pattern=_USERNAME)
+    scope: Literal["host", "all_hosts"] = Field(
+        "host",
+        description=(
+            "'host': aplica solo a 'host'. 'all_hosts': aplica a TODOS los hosts en "
+            "vivo del username (se ignora 'host')."
+        ),
+    )
+    host: str = Field(
+        "%", pattern=_HOST, description="Solo si scope='host'; ignorado si scope='all_hosts'."
+    )
+    known_password: str = Field(..., min_length=1)
+    adopt_if_missing: bool = Field(
+        False,
+        description="Si true, crea la fila de inventario para hosts en vivo sin fila previa.",
+    )
+    overwrite: bool = Field(
+        False,
+        description=(
+            "Obligatorio en true para sobrescribir una identidad que YA tiene una "
+            "contraseña guardada por el gateway (evita reemplazos accidentales de un "
+            "valor que ya era revelable correctamente)."
+        ),
+    )
+
+
+class KnownPasswordSetItemOut(BaseModel):
+    host: str | None = None
+    status: str  # 'updated' | 'adopted' | 'skipped_not_found' | 'conflict_needs_overwrite'
+    server_user_id: int | None = None
+
+
+class KnownPasswordSetOut(BaseModel):
+    username: str
+    scope: str
+    total_hosts: int
+    updated: int
+    results: list[KnownPasswordSetItemOut]
+
+
+class EnginePasswordChangeAllHostsIn(BaseModel):
+    """
+    Rota la contraseña REAL (ALTER USER/ROLE) en TODOS los hosts en vivo de un
+    username. Irreversible sobre N cuentas reales a la vez: exige 'confirm_username'
+    (mismo patrón de doble intención que DROP USER).
+    """
+
+    username: str = Field(..., pattern=_USERNAME)
+    new_password: str = Field(..., min_length=1)
+    confirm_username: str = Field(
+        ..., description="Debe coincidir exactamente con 'username' para confirmar la rotación masiva."
+    )
+    adopt_if_missing: bool = Field(
+        False,
+        description="Si true, registra en el inventario los hosts sin fila previa tras rotarlos.",
+    )
+
+    @model_validator(mode="after")
+    def _require_confirmation(self):
+        if self.confirm_username != self.username:
+            raise ValueError("'confirm_username' debe coincidir exactamente con 'username'.")
+        return self
+
+
+class PasswordChangeItemOut(BaseModel):
+    host: str | None = None
+    status: str  # 'rotated' | 'error'
+    server_user_id: int | None = None
+    adopted: bool = False
+    error: str | None = None
+
+
+class PasswordChangeBatchOut(BaseModel):
+    username: str
+    total_hosts: int
+    updated: int
+    results: list[PasswordChangeItemOut]

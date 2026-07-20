@@ -27,12 +27,18 @@ from app.models.managed_database import ManagedDatabase
 from app.models.server_user import ServerUser
 from app.schemas.server_user import (
     AddHostOut,
+    AdoptAllHostsItemOut,
+    BatchAdoptOut,
     EngineUserActionOut,
     EngineUserIdentityOut,
     GrantApplyResult,
     GrantOnCreate,
     GroupedEngineUserOut,
     GroupedEngineUsersOut,
+    KnownPasswordSetItemOut,
+    KnownPasswordSetOut,
+    PasswordChangeItemOut,
+    PasswordChangeBatchOut,
     RevealedPasswordOut,
     ServerUserFullOut,
     ServerUserOut,
@@ -946,6 +952,322 @@ class ServerUserController:
             grants_error=grants_error,
             adopted=server_user_id is not None,
             server_user_id=server_user_id,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Operaciones MASIVAS: todos los hosts en vivo de un username.        #
+    # No hay tabla "usuario lógico": se orquesta iterando adapter.list_users() #
+    # (plano real del motor) + las filas físicas de ServerUser existentes. #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _live_hosts_for_username(adapter, username: str, *, is_pg: bool) -> list[str | None]:
+        """Hosts en vivo (motor) de un username. En PG: [None] si existe, [] si no."""
+        live = adapter.list_users()
+        if is_pg:
+            return [None] if any(u.username == username for u in live) else []
+        return [u.host or "%" for u in live if u.username == username]
+
+    def adopt_user_all_hosts(
+        self, server_id: int, data: dict, *, admin: dict | None = None
+    ) -> BatchAdoptOut:
+        """
+        Adopta TODAS las identidades en vivo de un username en una sola operación
+        (nunca ejecuta CREATE USER). Con ``known_password`` opcional, la guarda cifrada
+        en todas las filas adoptadas (nunca ejecuta ALTER USER: es responsabilidad del
+        admin que el valor coincida con la contraseña real del motor).
+        """
+        username = data["username"]
+        known_password = data.get("known_password")
+        notes = data.get("notes")
+
+        session = self._session()
+        try:
+            server = get_server_or_404(session, server_id)
+            self._guard_not_root(server.root_username, username)
+            target = build_target(server)
+            is_pg = target.dialect == "postgresql"
+        finally:
+            session.close()
+
+        adapter = get_adapter(target)
+        hosts = self._live_hosts_for_username(adapter, username, is_pg=is_pg)
+        if not hosts:
+            raise AppHttpException(
+                message="El usuario no existe en el motor; no hay nada que adoptar.",
+                status_code=404,
+                context={"username": username},
+            )
+
+        password_encrypted = self._encrypt(known_password) if known_password else None
+
+        results: list[AdoptAllHostsItemOut] = []
+        adopted_count = 0
+        for host in hosts:
+            h = host or "%"
+            server_user_id = self._insert_inventory_row(
+                server_id, username, h, password_encrypted, notes
+            )
+            if server_user_id is not None:
+                adopted_count += 1
+                results.append(
+                    AdoptAllHostsItemOut(
+                        host=None if is_pg else h, status="adopted", server_user_id=server_user_id
+                    )
+                )
+                continue
+
+            # Ya existía: recuperar su id para reportarlo (no es fatal, el motor no se tocó).
+            session = self._session()
+            try:
+                row = self._find_inventory_row(session, server_id, username, h, is_pg=is_pg)
+                existing_id = row.id if row else None
+            finally:
+                session.close()
+            results.append(
+                AdoptAllHostsItemOut(
+                    host=None if is_pg else h, status="already_adopted", server_user_id=existing_id
+                )
+            )
+
+        audit.record(
+            "server_user.adopt_batch",
+            admin=admin,
+            target_type="server_user",
+            server_id=server_id,
+            touched_engine=False,
+            detail=(
+                f"{adopted_count}/{len(hosts)} hosts adoptados para '{username}'"
+                + (" + contraseña definida (sin ALTER USER)" if known_password else "")
+            ),
+        )
+        return BatchAdoptOut(
+            username=username,
+            dialect=target.dialect,
+            total_hosts=len(hosts),
+            adopted=adopted_count,
+            results=results,
+        )
+
+    def set_known_password(
+        self, server_id: int, data: dict, *, admin: dict | None = None
+    ) -> KnownPasswordSetOut:
+        """
+        Registra una contraseña YA conocida por el admin humano SIN ejecutar ALTER
+        USER/ROLE — solo cifra y guarda, para habilitar reveal-password. Nunca toca el
+        motor. Distinto de set_password_by_identity/_all_hosts, que sí rotan de verdad.
+        """
+        username = data["username"]
+        scope = data.get("scope", "host")
+        known_password = data["known_password"]
+        adopt_if_missing = bool(data.get("adopt_if_missing"))
+        overwrite = bool(data.get("overwrite"))
+
+        session = self._session()
+        try:
+            server = get_server_or_404(session, server_id)
+            self._guard_not_root(server.root_username, username)
+            target = build_target(server)
+            is_pg = target.dialect == "postgresql"
+        finally:
+            session.close()
+
+        adapter = get_adapter(target)
+        live_hosts = self._live_hosts_for_username(adapter, username, is_pg=is_pg)
+        if scope == "all_hosts":
+            if not live_hosts:
+                raise AppHttpException(
+                    message=(
+                        "El usuario no existe en el motor; no hay hosts sobre los que "
+                        "definir la contraseña."
+                    ),
+                    status_code=404,
+                    context={"username": username},
+                )
+            hosts = live_hosts
+        else:
+            hosts = [None] if is_pg else [data.get("host") or "%"]
+
+        live_set = {h or "%" for h in live_hosts}
+        password_encrypted = self._encrypt(known_password)
+
+        results: list[KnownPasswordSetItemOut] = []
+        updated_count = 0
+        for host in hosts:
+            h = host or "%"
+            session = self._session()
+            try:
+                row = self._find_inventory_row(session, server_id, username, h, is_pg=is_pg)
+                row_id = row.id if row else None
+                has_existing_password = bool(row and row.password_encrypted)
+            finally:
+                session.close()
+
+            if row_id is not None:
+                if has_existing_password and not overwrite:
+                    results.append(
+                        KnownPasswordSetItemOut(
+                            host=None if is_pg else h,
+                            status="conflict_needs_overwrite",
+                            server_user_id=row_id,
+                        )
+                    )
+                    continue
+                if has_existing_password:
+                    # Sobrescribe un valor que ya era revelable: auditar fail-closed
+                    # ANTES de escribir (misma clase de riesgo que reveal_password).
+                    audit.record_intent(
+                        "server_user.password.define",
+                        admin=admin,
+                        target_type="server_user",
+                        target_id=row_id,
+                        server_id=server_id,
+                        touched_engine=False,
+                        detail=f"INTENT sobrescribir contraseña conocida de '{username}'@'{h}'",
+                    )
+                self._update_row_password(row_id, password_encrypted)
+                updated_count += 1
+                results.append(
+                    KnownPasswordSetItemOut(
+                        host=None if is_pg else h, status="updated", server_user_id=row_id
+                    )
+                )
+            elif adopt_if_missing and h in live_set:
+                new_id = self._insert_inventory_row(
+                    server_id, username, h, password_encrypted, None
+                )
+                if new_id is not None:
+                    updated_count += 1
+                    results.append(
+                        KnownPasswordSetItemOut(
+                            host=None if is_pg else h, status="adopted", server_user_id=new_id
+                        )
+                    )
+                else:
+                    results.append(
+                        KnownPasswordSetItemOut(
+                            host=None if is_pg else h, status="skipped_not_found", server_user_id=None
+                        )
+                    )
+            else:
+                results.append(
+                    KnownPasswordSetItemOut(
+                        host=None if is_pg else h, status="skipped_not_found", server_user_id=None
+                    )
+                )
+
+        audit.record(
+            "server_user.password.define",
+            admin=admin,
+            target_type="server_user",
+            server_id=server_id,
+            touched_engine=False,
+            detail=(
+                f"contraseña definida en {updated_count}/{len(hosts)} identidad(es) de "
+                f"'{username}' (scope={scope}, sin ALTER USER)"
+            ),
+        )
+        return KnownPasswordSetOut(
+            username=username,
+            scope=scope,
+            total_hosts=len(hosts),
+            updated=updated_count,
+            results=results,
+        )
+
+    def set_password_by_identity_all_hosts(
+        self, server_id: int, data: dict, *, admin: dict | None = None
+    ) -> PasswordChangeBatchOut:
+        """
+        Rota la contraseña REAL (ALTER USER/ROLE) en TODOS los hosts en vivo de un
+        username. ``confirm_username`` ya fue validado por el schema (debe coincidir
+        con ``username``). Fail-tolerant por host: un fallo en uno no aborta el resto.
+        """
+        username = data["username"]
+        new_password = data["new_password"]
+        adopt_if_missing = bool(data.get("adopt_if_missing"))
+
+        session = self._session()
+        try:
+            server = get_server_or_404(session, server_id)
+            self._guard_not_root(server.root_username, username)
+            target = build_target(server)
+            is_pg = target.dialect == "postgresql"
+        finally:
+            session.close()
+
+        adapter = get_adapter(target)
+        hosts = self._live_hosts_for_username(adapter, username, is_pg=is_pg)
+        if not hosts:
+            raise AppHttpException(
+                message=(
+                    "El usuario no existe en el motor; no hay hosts sobre los que "
+                    "rotar la contraseña."
+                ),
+                status_code=404,
+                context={"username": username},
+            )
+
+        # Auditar la INTENCIÓN del lote completo, fail-closed, ANTES de iterar: es un
+        # ALTER USER real sobre N cuentas de una sola vez.
+        audit.record_intent(
+            "server_user.password.rotate_batch",
+            admin=admin,
+            target_type="server_user",
+            server_id=server_id,
+            touched_engine=True,
+            detail=f"INTENT rotar contraseña en {len(hosts)} host(s) de '{username}' (confirmado)",
+        )
+
+        password_encrypted = self._encrypt(new_password)
+        results: list[PasswordChangeItemOut] = []
+        updated_count = 0
+        for host in hosts:
+            h = host or "%"
+            try:
+                adapter.change_password(username, new_password, h)
+            except AppHttpException as exc:
+                results.append(
+                    PasswordChangeItemOut(host=None if is_pg else h, status="error", error=exc.message)
+                )
+                continue
+
+            session = self._session()
+            try:
+                row = self._find_inventory_row(session, server_id, username, h, is_pg=is_pg)
+                row_id = row.id if row else None
+            finally:
+                session.close()
+
+            server_user_id = row_id
+            adopted_now = False
+            if row_id is not None:
+                self._update_row_password(row_id, password_encrypted)
+            elif adopt_if_missing:
+                server_user_id = self._insert_inventory_row(
+                    server_id, username, h, password_encrypted, None
+                )
+                adopted_now = server_user_id is not None
+
+            updated_count += 1
+            results.append(
+                PasswordChangeItemOut(
+                    host=None if is_pg else h,
+                    status="rotated",
+                    server_user_id=server_user_id,
+                    adopted=adopted_now,
+                )
+            )
+
+        audit.record(
+            "server_user.password.rotate_batch",
+            admin=admin,
+            target_type="server_user",
+            server_id=server_id,
+            touched_engine=True,
+            detail=f"{updated_count}/{len(hosts)} hosts rotados para '{username}'",
+        )
+        return PasswordChangeBatchOut(
+            username=username, total_hosts=len(hosts), updated=updated_count, results=results
         )
 
     # ---- helpers de inventario para el flujo por identidad -------------------- #
