@@ -80,9 +80,28 @@ ADMIN_USERNAME=admin
 ADMIN_PASSWORD=              # OBLIGATORIO en producción (sin él, no se siembra admin)
 SESSION_SECRET=             # firma de la cookie; si vacío, se deriva de SECRET_KEY
 SESSION_MAX_AGE=28800       # duración de la sesión en segundos (8h)
+SESSION_COOKIE_SECURE=      # vacío = sigue a APP_ENV=="production"; True/False la desacopla
 ```
 
-La cookie es `httpOnly`, `same_site=lax` y `https_only` cuando `APP_ENV=production`.
+La cookie es `httpOnly`, `same_site=lax` y `https_only` según `SESSION_COOKIE_SECURE`
+(por defecto, igual a `APP_ENV=="production"`).
+
+### `SESSION_COOKIE_SECURE`
+
+Controla el flag `Secure` de la cookie de forma independiente de `APP_ENV`. Por defecto
+seguir a `APP_ENV` es correcto: en producción, un navegador rechaza silenciosamente una
+cookie `Secure` si el sitio se sirve por HTTP plano (login "exitoso" pero cualquier otro
+endpoint devuelve 401, porque la cookie nunca se guardó/reenvió — ver
+[troubleshooting en dokploy-deployment.md](../dokploy-deployment.md)).
+
+Fijar `SESSION_COOKIE_SECURE=False` con `APP_ENV=production` permite operar sin TLS
+delante del gateway (todas las demás validaciones de producción — `SECRET_KEY`,
+`SESSION_SECRET` independiente, `CORS_ORIGINS` sin `*` — se mantienen intactas). Es un
+downgrade de seguridad real: la cookie de sesión del admin (acceso completo a la
+administración de credenciales pseudo-root de los servidores destino) viajaría sin
+cifrar, exponible a cualquiera en la misma red. El arranque loguea un `WARNING`
+explícito cuando esta combinación está activa. Usar solo como diagnóstico temporal
+mientras se termina de configurar HTTPS, nunca como configuración final.
 
 ## Seguridad
 

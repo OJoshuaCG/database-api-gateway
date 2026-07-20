@@ -85,13 +85,28 @@ primer deploy o uno posterior.
 
 ## 4. Configurar el dominio (Traefik + TLS de Dokploy)
 
+**Este paso es obligatorio, no opcional**: la autenticación es por cookie de sesión
+(`SessionMiddleware`) y en producción esa cookie se marca `Secure` — un navegador la
+descarta si el sitio se sirve por HTTP plano. Sin este paso, el login "funciona" (200)
+pero cualquier otro endpoint da 401 (ver [troubleshooting](#troubleshooting) más abajo).
+
 En la pestaña **Domains** del servicio Compose:
 
 1. **Service Name**: `api` (el servicio del compose que debe recibir tráfico).
 2. **Container Port**: `8000`.
-3. **Host**: tu dominio (ej. `gateway.tudominio.com`).
-4. Habilitar **HTTPS** — Dokploy solicita y renueva el certificado Let's Encrypt automáticamente
-   vía su Traefik interno.
+3. **Host**: tu dominio (ej. `gateway.tudominio.com`) — el registro DNS `A` de ese
+   dominio debe apuntar a la IP pública del servidor Dokploy (prerrequisito de más
+   arriba); si el DNS todavía no propagó, la emisión del certificado falla.
+4. Habilitar **HTTPS**. Al guardar, Dokploy:
+   - Solicita el certificado a Let's Encrypt vía su Traefik interno (desafío HTTP-01,
+     usa el puerto 80 que Traefik ya tiene abierto).
+   - Lo renueva automáticamente antes de que expire — no requiere ningún cron ni
+     acción manual del lado del proyecto.
+5. Esperar unos segundos/minutos a que el certificado quede emitido (la propia UI de
+   Dokploy suele mostrar el estado). Hasta que esté emitido, `https://` puede fallar o
+   caer a un certificado autofirmado.
+6. Acceder **siempre** por `https://gateway.tudominio.com/api/v1/docs` — nunca por la
+   IP del servidor ni por `http://`, aunque el puerto responda.
 
 > Dokploy actualiza esta UI con frecuencia; si los nombres de campo difieren de los descritos
 > aquí, el punto fijo es: el servicio a exponer es `api` y el puerto de contenedor es `8000`.
@@ -109,6 +124,33 @@ curl https://gateway.tudominio.com/health/ready
 Ambos deben responder `200` con `{"status": "ok" | "ready", ...}`. Revisa los logs del servicio
 `api` desde el panel de Dokploy si alguno falla (Dokploy muestra el stdout del contenedor —
 la app loguea todo a consola, sin archivos de log).
+
+## Troubleshooting
+
+### `POST /auth/login` responde 200, pero cualquier otro endpoint da 401 "No autenticado"
+
+**Causa**: se está accediendo por HTTP directo o por IP:puerto en vez del dominio con
+HTTPS. La autenticación es por cookie de sesión (`gw_session`, ver
+[docs/features/authentication.md](features/authentication.md)); en producción esa
+cookie se marca `Secure`, y el navegador la descarta sin avisar en la respuesta —
+el login parece exitoso porque el `200` sí llega, pero la cookie nunca queda guardada,
+así que ninguna petición posterior la reenvía.
+
+**Confirmarlo**: abrir las DevTools del navegador (pestaña Console) al ejecutar el
+login. El mensaje es explícito, algo como: *"La cookie 'gw_session' ha sido rechazada
+porque una cookie no-HTTPS no se puede establecer como 'segura'."*
+
+**Solución**: completar el [paso 4](#4-configurar-el-dominio-traefik--tls-de-dokploy)
+(dominio + HTTPS habilitado en la pestaña Domains) y acceder siempre por
+`https://tu-dominio.com`, nunca por IP ni por `http://`.
+
+**Si todavía no hay dominio/DNS disponible** y solo se necesita probar el flujo de
+autenticación de forma temporal, se puede fijar `SESSION_COOKIE_SECURE=False` en las
+variables de entorno de Dokploy sin bajar `APP_ENV` (mantiene el resto de validaciones
+de producción intactas). Es un downgrade de seguridad real — la cookie de sesión del
+admin viaja sin cifrar — y el arranque lo deja explícito con un `WARNING` en los logs.
+No dejarlo así en un despliegue real; ver detalle en
+[docs/features/authentication.md](features/authentication.md#session_cookie_secure).
 
 ## 6. Ejecutar comandos manuales (Alembic, shell)
 
@@ -170,5 +212,7 @@ Si necesitas levantar el gateway en un VPS sin Dokploy (o con nginx/Certbot manu
 - [ ] `DOCS_ENABLED=False` (o protegido con `DOCS_PASSWORD_ENABLED`)
 - [ ] Deploy completado, `db`/`valkey` healthy, `api` corriendo
 - [ ] Dominio configurado en la pestaña Domains (`api`, puerto `8000`, HTTPS habilitado)
+- [ ] Se accede siempre por `https://tu-dominio.com` (nunca por IP ni `http://` — la
+      cookie de sesión requiere HTTPS en producción, ver [Troubleshooting](#troubleshooting))
 - [ ] `GET /health` y `GET /health/ready` responden `200`
 - [ ] Backup de `mariadb_data` configurado (nativo de Dokploy o script manual)
