@@ -34,6 +34,7 @@ from app.services.db_admin.dtos import (
     EnumTypeInfo,
     EventInfo,
     ExtensionInfo,
+    ExternalFkDependent,
     ForeignKeyInfo,
     GrantInfo,
     GrantLevel,
@@ -139,6 +140,21 @@ class ServerAdapter(ABC):
     @abstractmethod
     def list_users(self) -> list[EngineUserInfo]:
         """Lista usuarios/roles del motor, excluyendo los internos."""
+
+    def external_fk_dependents(self, database: str) -> list[ExternalFkDependent]:
+        """
+        FKs desde una tabla de OTRA base de datos del MISMO servidor hacia una tabla de
+        ``database``. El snapshot estructural (``structural_snapshot``) es de una sola BD
+        y nunca puede ver esto — usado para advertir ANTES de limpiar/dropear ``database``
+        (el clon: ``clean_mode=objects``/``drop_database``), ya que esas referencias
+        externas pueden bloquear un ``DROP TABLE``/``DROP DATABASE`` con
+        ``(1451, 'Cannot delete or update a parent row...')`` sin que el orden topológico
+        de los DROP (que solo ve tablas DENTRO de ``database``) tenga forma de evitarlo.
+
+        Default: lista vacía (PostgreSQL no soporta FKs cross-database por arquitectura —
+        una BD no puede referenciar tablas de otra). MySQL/MariaDB lo sobreescriben.
+        """
+        return []
 
     @abstractmethod
     def dump_structure(self, database: str) -> "StructureDump":

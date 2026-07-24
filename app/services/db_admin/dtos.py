@@ -39,6 +39,21 @@ class EngineUserInfo(BaseModel):
     host: str | None = None  # solo MySQL/MariaDB
 
 
+class ExternalFkDependent(BaseModel):
+    """
+    FK desde una tabla de OTRA base de datos del mismo servidor hacia una tabla de la BD
+    consultada. Solo aplica a motores con FKs cross-database (MySQL/MariaDB) — PostgreSQL
+    no las soporta por arquitectura (una BD no puede referenciar tablas de otra BD).
+    """
+
+    schema_name: str  # BD de la tabla que tiene la FK (NO la BD consultada)
+    table: str
+    column: str
+    constraint: str | None = None
+    referenced_table: str  # tabla de la BD consultada
+    referenced_column: str
+
+
 class RoutineRef(BaseModel):
     """Identidad de una rutina para grants de EXECUTE/ALTER ROUTINE."""
 

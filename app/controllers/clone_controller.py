@@ -644,8 +644,47 @@ class CloneController:
             skipped=skipped,
             will_adopt=job.adopt_target and selection is None and job.source_database_id is not None,
             table_order=[t.table for t in self._data_table_order(filtered)],
-            warnings=self._autoincrement_pk_warnings(filtered, tgt_engine),
+            warnings=(
+                self._autoincrement_pk_warnings(filtered, tgt_engine)
+                + self._external_fk_warnings(tgt_adapter, job)
+            ),
         )
+
+    @staticmethod
+    def _external_fk_warnings(tgt_adapter, job: CloneJob) -> list[str]:
+        """
+        Si la limpieza va a DROPear objetos del destino (``clean_mode='objects'`` o
+        ``'drop_database'`` sobre un destino EXISTENTE), consulta si alguna tabla de OTRA
+        base de datos del mismo servidor tiene una FK hacia el destino — invisible al
+        snapshot de una sola BD, y el candidato más probable ante un
+        ``(1451, 'Cannot delete or update a parent row...')`` en un DROP aislado (ver
+        ``execute_adhoc(disable_fk_checks=True)``, que resuelve el bloqueo pero no informa
+        la causa). Solo MySQL/MariaDB devuelven algo (PostgreSQL no soporta FKs
+        cross-database). Best-effort: si la consulta falla, no bloquea el preview.
+        """
+        if job.target_mode != CLONE_TARGET_EXISTING:
+            return []
+        if job.clean_mode not in (CLONE_CLEAN_OBJECTS, CLONE_CLEAN_DROP_DATABASE):
+            return []
+        try:
+            deps = tgt_adapter.external_fk_dependents(job.target_database_name)
+        except AppHttpException:
+            return []
+        if not deps:
+            return []
+        examples = ", ".join(
+            f"`{d.schema_name}`.`{d.table}`.`{d.column}` → `{d.referenced_table}`.`{d.referenced_column}`"
+            for d in deps[:5]
+        )
+        more = f" (+{len(deps) - 5} más)" if len(deps) > 5 else ""
+        return [
+            f"Hay {len(deps)} columna(s) en OTRA(S) base(s) de datos del servidor con una "
+            f"FK hacia `{job.target_database_name}` (invisible al snapshot de esta BD): "
+            f"{examples}{more}. La limpieza desactiva temporalmente el chequeo de FKs para "
+            "completarse igual, pero esas referencias externas pueden quedar apuntando a "
+            "datos ya reemplazados — revisar antes de continuar si es crítico para esas "
+            "otras bases."
+        ]
 
     @staticmethod
     def _autoincrement_pk_warnings(snap: SchemaSnapshot, tgt_engine: str) -> list[str]:

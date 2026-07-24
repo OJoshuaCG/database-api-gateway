@@ -23,6 +23,7 @@ from app.services.db_admin.dtos import (
     DumpStatement,
     EngineUserInfo,
     EventInfo,
+    ExternalFkDependent,
     GrantInfo,
     GrantLevel,
     ObjectRef,
@@ -91,6 +92,35 @@ class MySQLAdapter(ServerAdapter):
         except SQLAlchemyError as exc:
             raise map_driver_error(exc, op="list_users", target=self.target)
         return [EngineUserInfo(username=r.username, host=r.host) for r in rows]
+
+    def external_fk_dependents(self, database: str) -> list[ExternalFkDependent]:
+        # information_schema.KEY_COLUMN_USAGE es a nivel de SERVIDOR (no de una sola BD):
+        # detecta columnas en CUALQUIER otra BD del servidor cuya FK referencia una tabla
+        # de `database`. REFERENCED_TABLE_NAME IS NOT NULL filtra solo entradas de FK (no
+        # PK/UNIQUE, que también aparecen en esta vista sin referenced_table).
+        sql = (
+            "SELECT TABLE_SCHEMA AS schema_name, TABLE_NAME AS table_name, "
+            "COLUMN_NAME AS column_name, CONSTRAINT_NAME AS constraint_name, "
+            "REFERENCED_TABLE_NAME AS referenced_table, "
+            "REFERENCED_COLUMN_NAME AS referenced_column "
+            "FROM information_schema.KEY_COLUMN_USAGE "
+            "WHERE REFERENCED_TABLE_SCHEMA = :db AND TABLE_SCHEMA <> :db "
+            "AND REFERENCED_TABLE_NAME IS NOT NULL "
+            "ORDER BY TABLE_SCHEMA, TABLE_NAME"
+        )
+        try:
+            with server_connection(self.target) as conn:
+                rows = conn.execute(text(sql), {"db": database}).fetchall()
+        except SQLAlchemyError as exc:
+            raise map_driver_error(exc, op="external_fk_dependents", target=self.target)
+        return [
+            ExternalFkDependent(
+                schema_name=r.schema_name, table=r.table_name, column=r.column_name,
+                constraint=r.constraint_name, referenced_table=r.referenced_table,
+                referenced_column=r.referenced_column,
+            )
+            for r in rows
+        ]
 
     # ------------------------- snapshot estructural (Plan 09) ----------------- #
     @staticmethod
