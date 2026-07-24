@@ -266,6 +266,21 @@ orden padre-antes-que-hijo y FKs en fase aditiva separada. Best-effort: si el `S
 (motor sin soporte, o el pseudo-root de PostgreSQL sin el permiso), se ignora — el orden
 topológico sigue siendo la garantía primaria para el caso común.
 
+**Advertencia proactiva (visibilidad, no solo mitigación)**: desactivar los FK checks
+resuelve el bloqueo, pero no informa POR QUÉ hacía falta. `ServerAdapter.
+external_fk_dependents(database)` consulta `information_schema.KEY_COLUMN_USAGE` a nivel
+de **servidor** (no de una sola BD, vía `server_connection`) para detectar columnas de
+CUALQUIER otra base de datos del servidor cuya FK referencia una tabla de `database` —
+exactamente lo que el snapshot de una sola BD no puede ver. Solo MySQL/MariaDB lo
+implementan (`MySQLAdapter`, heredado por `MariaDBAdapter`); PostgreSQL no soporta FKs
+cross-database por arquitectura, así que hereda el default de `ServerAdapter` (`[]`).
+`CloneController._external_fk_warnings` lo consulta en el preview (`POST .../preview`)
+SOLO cuando el destino ya existe (`target_mode='existing'`) y el `clean_mode` implica
+DROPear algo (`objects` o `drop_database`) — un destino `new` no puede tener dependents
+todavía. Si encuentra columnas dependientes, las lista (hasta 5, con conteo del resto) en
+`warnings` para que el operador decida si es crítico revisarlas en esas otras bases ANTES
+de continuar, en vez de enterarse solo si el `DROP` llega a fallar.
+
 ## Dependencias (auto-selección inteligente)
 
 `app/services/db_admin/clone_dependencies.py` (módulo puro):

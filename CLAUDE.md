@@ -739,7 +739,14 @@ destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
   (mismo mecanismo que `data_copy.py::_set_fk_enforcement` para la fase de datos:
   `FOREIGN_KEY_CHECKS`/`session_replication_role`, best-effort). `CloneController` lo
   activa SOLO para `CLONE_ITEM_CLEAN`, no para estructura (que ya tiene su propio orden
-  padre-antes-que-hijo).
+  padre-antes-que-hijo). **Advertencia proactiva** (visibilidad, no solo mitigación):
+  `ServerAdapter.external_fk_dependents(database)` consulta
+  `information_schema.KEY_COLUMN_USAGE` a nivel de SERVIDOR (`server_connection`, no de
+  una sola BD) para detectar columnas de OTRA BD del servidor con FK hacia `database` —
+  solo MySQL/MariaDB (PostgreSQL no soporta FKs cross-database, hereda `[]` del default de
+  `ServerAdapter`). `CloneController._external_fk_warnings` la consulta en el preview SOLO
+  si `target_mode='existing'` y `clean_mode` implica DROP (`objects`/`drop_database`), y
+  lista las columnas dependientes en `warnings` (hasta 5 + conteo del resto).
 - Verificación: tests unit/API (FakeAdapter + runner síncrono) + `test_mysql_render.py` +
   `test_clone_body_objects.py`; **e2e contra MariaDB 11 real EJECUTADO** (tabla con `ON UPDATE`,
   vista, vista-sobre-vista en orden inverso, función, procedimiento, trigger, evento: todos
