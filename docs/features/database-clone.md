@@ -52,14 +52,75 @@ A diferencia del [datos-semilla del snapshot selectivo](adoption-reconcile-snaps
 capado a propósito como "seed de catálogo, no ETL" — el clon usa un **copiador por streaming**
 (`app/services/db_admin/data_copy.py`) sin tope práctico de filas:
 
-- Lee del origen con `stream_results=True` + `yield_per` (memoria acotada) y escribe al destino
-  con `INSERT` **parametrizado** por lotes (`executemany`) — nunca literales (a prueba de
-  inyección). `CLONE_DATA_BATCH_ROWS` (1000) controla el lote.
+- Lee del origen con `stream_results=True` + `yield_per` (memoria acotada); es el ÚNICO punto
+  que consume el cursor origen (`_iter_source_rows`), reusado por los tres writers de escritura.
 - Orden **topológico** entre tablas (padre antes que hijo) y **FK checks desactivados** durante
   la fase de datos (`SET FOREIGN_KEY_CHECKS=0` / `session_replication_role='replica'`,
   restaurados en `finally`) para tolerar ciclos.
-- Tablas **sin PK**: `INSERT` plano (sin upsert). Con PK y destino preservado: **upsert**
-  (`ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO UPDATE`).
+- Tablas **sin PK**: carga plana (sin upsert, sin staging). Con PK y destino preservado:
+  **upsert** (`ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO UPDATE`).
+
+### Escritura al destino: protocolo bulk nativo por motor (no `INSERT` genérico)
+
+La escritura NO usa `INSERT` parametrizado por lotes como camino principal — usa el protocolo
+de ingestión masiva que cada motor expone nativamente, vía los drivers ya instalados (sin
+dependencias ni binarios nuevos). El writer se elige por el **dialecto REAL de la conexión SQLAlchemy
+ya abierta** (`dest_conn.dialect.name`), no por el string de negocio `dest_engine` — así un test con
+SQLite que pasa `dest_engine="postgresql"` (para ejercer el mismo quoting que Postgres) cae
+naturalmente en la vía legacy sin necesidad de mockear nada especial:
+
+- **PostgreSQL** (`dest_conn.dialect.name == "postgresql"`) → `_copy_writer_postgres`:
+  `COPY ... FROM STDIN` vía `psycopg3` (`cursor.copy().write_row(tupla)`), con los MISMOS
+  dumpers de tipo que un `execute` parametrizado normal — no hace falta pre-serializar nada más
+  allá de `_adapt_value`. Atómico: un fallo a mitad del `COPY` aborta el statement completo (0
+  filas commiteadas en AUTOCOMMIT), igual que el `INSERT` legacy.
+- **MySQL/MariaDB** (`dest_conn.dialect.name == "mysql"`, mismo driver `pymysql` para ambos) →
+  `_copy_writer_mysql`: `LOAD DATA LOCAL INFILE` alimentado por un **FIFO en tmpfs** (`/dev/shm`,
+  no toca disco), con un hilo escritor que formatea/escapa cada fila a TSV (`FIELDS TERMINATED
+  BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n'`, `NULL` → `\N`) mientras el hilo principal
+  dispara el `LOAD DATA` (coordinación por bloqueo de apertura del FIFO, no hay archivo real de
+  por medio). Requiere `local_infile=True` en la conexión (agregado a `_connect_args` en
+  `remote_engine.py`, **solo** para conexiones `bulk=True` — el resto de conexiones no lo
+  habilita) Y `local_infile=ON` en el SERVIDOR destino (variable global del motor, fuera del
+  control del gateway). **Capability probe**: antes de copiar la primera tabla del job,
+  `SHOW VARIABLES LIKE 'local_infile'` decide de una vez para todo el job si se usa `LOAD DATA` o
+  se degrada a la vía legacy (`_copy_writer_insert`) con un `logger.warning` — es una comprobación
+  de capacidad determinística, no un fallback oportunista ante fallos de datos.
+  **Gotcha de integridad (por qué SIEMPRE hay staging con PK, no solo con upsert)**: la
+  documentación oficial de MySQL confirma que `LOAD DATA LOCAL INFILE` **siempre** se comporta
+  como `INSERT IGNORE` ante una clave duplicada ("the LOCAL modifier has the same effect as
+  IGNORE" — no hay sintaxis que lo haga abortar como un `INSERT` plano, porque el servidor no
+  puede cortar la transmisión del archivo a mitad). Cargar directo a la tabla final rompería el
+  modelo fail-closed (una fila en conflicto se saltearía en silencio en vez de marcar la tabla
+  `failed`). Por eso, con PK (haya o no upsert), el `LOAD DATA` carga siempre a una tabla
+  *staging* vacía —ahí nunca hay conflicto, porque las filas del origen ya son únicas entre sí— y
+  el conflicto real contra el destino se resuelve en UN SOLO statement server-side final
+  (`INSERT INTO final SELECT FROM staging`, plano o con `ON DUPLICATE KEY UPDATE` según
+  corresponda). PostgreSQL no tiene este problema (`COPY` directo a la final ya aborta
+  atómicamente ante conflicto), así que ahí la staging solo se usa cuando hay upsert.
+- **Cualquier otro dialecto** (SQLite en tests, motor no cubierto) → `_copy_writer_insert`: la vía
+  legacy (`INSERT` parametrizado por lotes, `executemany`), conservada tal cual como
+  compatibilidad y como respaldo.
+- **Kill switch** `CLONE_BULK_COPY_ENABLED` (default `True`): en `False`, fuerza la vía legacy
+  para TODO el job sin necesidad de re-desplegar código, por si el protocolo bulk da problemas en
+  un destino puntual en producción.
+- **Staging temporal por motor** (cuando aplica): `CREATE TEMP TABLE (LIKE final)` **plana** en
+  PostgreSQL (sin `ON COMMIT DROP`/`DELETE ROWS` — en AUTOCOMMIT cada statement es su propia
+  transacción y la destruiría/vaciaría de inmediato tras el `CREATE`) / `CREATE TEMPORARY TABLE
+  ... LIKE final` en MySQL/MariaDB (session-scoped). Nombre con sufijo aleatorio
+  (`_gw_stg_<uuid12>`, validado por la misma whitelist de identificadores que cualquier objeto),
+  dropeada explícitamente en `finally` de cada tabla (la conexión de destino se reusa para todas
+  las tablas del job).
+- **Limitación preexistente, no una regresión de este cambio**: `_adapt_value` convierte
+  `list`/`dict` Python a texto JSON antes de escribir — una columna PostgreSQL de tipo ARRAY
+  nativo (`int[]`/`text[]`) alimentada con un `list` no queda bien representada. Afecta por igual
+  al `INSERT` legacy y al `COPY` (ambos reciben el mismo valor ya adaptado); no se resolvió aquí.
+- **Pendiente de verificación e2e contra motores reales** (no hay Docker disponible en el entorno
+  donde se implementó este cambio): coordinación del hilo escritor del FIFO bajo carga real,
+  escaping de BLOB/JSON/timestamptz con datos reales, que el `INSERT ... SELECT` desde staging
+  efectivamente aborte con `ER_DUP_ENTRY`/`23505` ante conflicto real, y el comportamiento del
+  probe de `local_infile` contra un servidor con la variable en `OFF`. Extender
+  `scripts/verify_clone_e2e.py` con estos casos antes de confiar en el camino bulk en producción.
 - **Fidelidad del tipo (MySQL/MariaDB)**: el tipo de columna se captura de
   `information_schema.COLUMN_TYPE`, NO de `str(reflected_type)` — que pierde detalle crítico
   (`ENUM`/`SET` **sin su lista de valores** → CREATE TABLE inválido; `UNSIGNED` → rango corrupto;
