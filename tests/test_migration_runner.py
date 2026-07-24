@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from alembic import command
 from sqlalchemy import create_engine, inspect
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.models.enums import EngineType
 from app.services.db_admin.migrations import (
@@ -91,6 +92,43 @@ def test_escape_percent_breaks_postgres_placeholder_parser_if_not_escaped():
             _query2pg(raw.encode(), "utf-8")
         escaped = MigrationRunner._escape_percent(raw)
         _query2pg(escaped.encode(), "utf-8")  # no debe lanzar
+
+
+class _RecordingConn:
+    """Conexión falsa que registra cada ``exec_driver_sql`` (sin motor real)."""
+
+    def __init__(self, *, fail_on: str | None = None):
+        self.executed: list[str] = []
+        self.fail_on = fail_on
+
+    def exec_driver_sql(self, sql):
+        self.executed.append(sql)
+        if self.fail_on and self.fail_on in sql:
+            raise SQLAlchemyError("boom")
+
+
+def test_toggle_fk_checks_mysql_family():
+    conn = _RecordingConn()
+    MigrationRunner._toggle_fk_checks(conn, EngineType.mysql, enabled=False)
+    MigrationRunner._toggle_fk_checks(conn, EngineType.mariadb, enabled=True)
+    assert conn.executed == ["SET FOREIGN_KEY_CHECKS=0", "SET FOREIGN_KEY_CHECKS=1"]
+
+
+def test_toggle_fk_checks_postgresql():
+    conn = _RecordingConn()
+    MigrationRunner._toggle_fk_checks(conn, EngineType.postgresql, enabled=False)
+    MigrationRunner._toggle_fk_checks(conn, EngineType.postgresql, enabled=True)
+    assert conn.executed == [
+        "SET session_replication_role = 'replica'",
+        "SET session_replication_role = 'origin'",
+    ]
+
+
+def test_toggle_fk_checks_is_best_effort():
+    """Si el SET falla (motor sin soporte, o el pseudo-root sin permiso), se ignora."""
+    conn = _RecordingConn(fail_on="FOREIGN_KEY_CHECKS")
+    MigrationRunner._toggle_fk_checks(conn, EngineType.mysql, enabled=False)  # no debe lanzar
+    assert conn.executed == ["SET FOREIGN_KEY_CHECKS=0"]
 
 
 def test_compute_pending():

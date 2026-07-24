@@ -117,7 +117,7 @@ class _FakeRunner:
         yield  # no-op en test (sin motor real que lockear)
 
     def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
-                      already_locked=False, stop_on_error=True):
+                      already_locked=False, stop_on_error=True, disable_fk_checks=False):
         return [
             StatementResult(index=i, status="applied", error=None, execution_ms=1,
                             executed_at=datetime.now(timezone.utc))
@@ -237,6 +237,58 @@ def test_new_target_already_exists_422(admin_client, monkeypatch):
     assert r.status_code == 422, r.text
 
 
+def test_clean_mode_objects_disables_fk_checks_only_during_cleanup(admin_client, monkeypatch):
+    """
+    Regresión: un DROP TABLE en la fase de limpieza puede fallar con
+    (1451, 'Cannot delete or update a parent row...') si el orden topológico inverso no
+    alcanza a cubrir el caso (p. ej. FK desde OTRA base de datos del mismo servidor,
+    invisible al snapshot de una sola BD, o un ciclo de FKs). La fase de limpieza debe
+    pedir ``disable_fk_checks=True``; la fase de estructura (CREATE) NO debe pedirlo (ya
+    tiene su propio orden padre-antes-que-hijo).
+    """
+    source_db, target_db = "src_db", "dst_db"
+    # El destino ya existe con las MISMAS tablas que el origen (parent/child con FK) para
+    # que la limpieza objeto-por-objeto tenga algo real que DROPear.
+    snaps = {source_db: _source_snapshot(db=source_db), target_db: _source_snapshot(db=target_db)}
+    fake = _FakeAdapter(snaps, {source_db, target_db})
+    monkeypatch.setattr(cc, "get_adapter", lambda target: fake)
+
+    calls: list[tuple[str, bool]] = []
+
+    class _RecordingRunner(_FakeRunner):
+        def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
+                          already_locked=False, stop_on_error=True, disable_fk_checks=False):
+            calls.append(("clean" if disable_fk_checks else "other", disable_fk_checks))
+            return super().execute_adhoc(
+                target, db_name=db_name, engine=engine, lock_key=lock_key,
+                statements=statements, already_locked=already_locked,
+                stop_on_error=stop_on_error,
+            )
+
+    monkeypatch.setattr(cc, "MigrationRunner", _RecordingRunner)
+    monkeypatch.setattr(cc, "copy_tables", _fake_copy_tables)
+    monkeypatch.setattr(clone_runner, "enqueue", lambda job_id: cc.CloneController().run_job(job_id))
+
+    sid = _server(admin_client, 3699)
+    oid = _owner(admin_client, sid)
+    src_id = _managed(admin_client, sid, oid, source_db)
+    r = admin_client.post("/api/v1/database-clones", json={
+        "source_database_id": src_id,
+        "target_server_id": sid, "target_database_name": target_db,
+        "target_mode": "existing", "clean_mode": "objects", "include_data": False,
+    })
+    assert r.status_code == 201, r.text
+    job_id = r.json()["data"]["id"]
+    _pr, ex = _preview_and_execute(admin_client, job_id, target_db=target_db)
+    assert ex.status_code == 200, ex.text
+    summary = admin_client.get(f"/api/v1/database-clones/{job_id}").json()["data"]
+    assert summary["status"] == "succeeded", summary
+
+    disable_flags = {v for _, v in calls}
+    assert True in disable_flags, "la fase de limpieza no pidió disable_fk_checks=True"
+    assert False in disable_flags, "la fase de estructura pidió disable_fk_checks (no debería)"
+
+
 def test_execute_wrong_token_422(admin_client, monkeypatch):
     _install(monkeypatch)
     sid = _server(admin_client, 3604)
@@ -318,7 +370,7 @@ def test_structure_failure_marks_job_failed(admin_client, monkeypatch):
 
     class _FailingRunner(_FakeRunner):
         def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
-                          already_locked=False, stop_on_error=True):
+                          already_locked=False, stop_on_error=True, disable_fk_checks=False):
             return [StatementResult(index=0, status="failed", error="boom",
                                     execution_ms=1, executed_at=datetime.now(timezone.utc))]
 
