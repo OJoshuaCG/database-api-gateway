@@ -11,6 +11,7 @@ ejecutando el mismo ``env.py`` y ``command.*`` que usa el runner, sobre SQLite.
 import tempfile
 from pathlib import Path
 
+import pytest
 from alembic import command
 from sqlalchemy import create_engine, inspect
 
@@ -60,24 +61,36 @@ def test_select_down_sql_none_when_absent():
     assert r.select_down_sql(s, EngineType.postgresql) is None
 
 
-def test_escape_percent_doubles_literal_percent_for_mysql_family():
+def test_escape_percent_doubles_literal_percent():
     """
-    pymysql SIEMPRE hace ``query % args`` en ``cursor.execute`` cuando ``args`` no es
-    ``None`` (y SQLAlchemy distila ``None`` a ``()`` antes de llegar al DBAPI) — un ``%``
+    Los 3 motores (pymysql y psycopg, ambos paramstyle pyformat/format) parsean la
+    sentencia buscando placeholders ``%s``/``%(name)s`` en cuanto ``cursor.execute``
+    recibe params no ``None`` — y SQLAlchemy distila un ``parameters`` ausente a ``()``
+    (no ``None``) antes de llegar al DBAPI, así que SIEMPRE entra a ese parseo. Un ``%``
     literal en el DDL (columna GENERATED con módulo, LIKE '%...%', DATE_FORMAT con
-    '%Y-%m-%d', etc.) revienta con ``unsupported format character`` al ejecutarse via
-    ``exec_driver_sql``. Debe escaparse a ``%%`` para MySQL/MariaDB.
+    '%Y-%m-%d', etc.) revienta al ejecutarse via ``exec_driver_sql`` en CUALQUIERA de los
+    3 motores — debe escaparse a ``%%`` incondicionalmente.
     """
     stmt = "ALTER TABLE t ADD COLUMN r int GENERATED ALWAYS AS (id % 10) STORED"
-    escaped = MigrationRunner._escape_percent(stmt, EngineType.mysql)
-    assert escaped == stmt.replace("%", "%%")
-    assert MigrationRunner._escape_percent(stmt, EngineType.mariadb) == escaped
+    assert MigrationRunner._escape_percent(stmt) == stmt.replace("%", "%%")
 
 
-def test_escape_percent_untouched_for_postgresql():
-    """PostgreSQL (psycopg2) no tiene el problema — no debe tocarse el DDL."""
-    stmt = "ALTER TABLE t ADD COLUMN r int GENERATED ALWAYS AS (id % 10) STORED"
-    assert MigrationRunner._escape_percent(stmt, EngineType.postgresql) == stmt
+def test_escape_percent_breaks_postgres_placeholder_parser_if_not_escaped():
+    """
+    Prueba de regresión contra el parser REAL de psycopg (no un mock): confirma que un
+    ``%`` sin escapar efectivamente revienta (LIKE '%...%' y el operador módulo), y que
+    escaparlo con ``_escape_percent`` lo vuelve inofensivo para ``cursor.execute``.
+    """
+    from psycopg._queries import _query2pg
+
+    for raw in [
+        "CHECK (id % 10 = 0)",
+        "CHECK (name NOT LIKE '%bad%')",
+    ]:
+        with pytest.raises(Exception):
+            _query2pg(raw.encode(), "utf-8")
+        escaped = MigrationRunner._escape_percent(raw)
+        _query2pg(escaped.encode(), "utf-8")  # no debe lanzar
 
 
 def test_compute_pending():
