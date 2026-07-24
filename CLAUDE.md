@@ -676,8 +676,36 @@ destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
   su config, `drop_database` es reset total; auto-adopt SOLO en clon completo con origen
   gestionado con blueprint (requiere `adopt_owner_id` del servidor destino). **Durabilidad**:
   worker in-process, los jobs NO sobreviven un reinicio (quedan `interrupted`; cola durable =
-  futuro). Verificación: 45 tests unit/API (FakeAdapter + runner síncrono);
-  `scripts/verify_clone_e2e.py` (requiere Docker) pendiente de corrida contra motores reales.
+  futuro).
+- **Tablas grandes (copia de datos)**: la copia usa `database_connection(..., bulk=True)` con
+  `REMOTE_BULK_STATEMENT_TIMEOUT_MS` (default 1h; `0`=sin límite) en lugar del interactivo de 15s
+  (`REMOTE_STATEMENT_TIMEOUT_MS`) que cancelaría lotes grandes dejando datos parciales — se cachea
+  un engine aparte por el flag `bulk`. Sesión de lectura en `READ COMMITTED` (evita inflar
+  undo/history del origen; consistencia cross-tabla ya no garantizada). Progreso throttleado a
+  ~3s (no un UPDATE por lote). Commit por lote en AUTOCOMMIT (sin transacción gigante) → un fallo
+  a mitad NO es reanudable (reintentar = `drop_database`/dropear y recopiar). Lote por FILAS
+  (`CLONE_DATA_BATCH_ROWS`), no por bytes → en tablas MUY anchas con BLOB/TEXT bajar el batch si
+  aparece `max_allowed_packet`. Batching adaptativo por bytes + reanudación = futuro.
+- **Objetos con cuerpo (vistas/rutinas/funciones/triggers/eventos)**: SÍ se clonan (no solo
+  tablas); en el preview van al FINAL de `structure_statements` (fase 5, tras tablas/FKs). Se
+  ejecutan como una sola sentencia (`exec_driver_sql`, no re-parte `;` → `BEGIN…END` no se rompe).
+  Dos cuidados (`CloneController`): (1) **re-calificación de esquema** `_requalify_body` — MySQL/
+  MariaDB inyectan el esquema ORIGEN en el cuerpo (p.ej. `VIEW_DEFINITION` trae `` `origen`.`t` ``);
+  sin reescribir origen→destino, el clon leería de la BD ORIGEN (fuga cross-db); (2) **reintento
+  diferido** `_run_body_statements` — resuelve dependencias vista→vista en cualquier orden (pasadas
+  hasta sin progreso). `execute_adhoc` ganó `stop_on_error=False` para esto. Fix del ON UPDATE
+  duplicado en `MySQLAdapter._render_column_def` (MariaDB pega `ON UPDATE` dentro del default).
+- **Fidelidad de TIPOS (MySQL/MariaDB)**: el tipo de columna se captura de
+  `information_schema.COLUMN_TYPE` (hook `_column_extras` → `ex["column_type"]`, usado por
+  `base_adapter` en vez de `str(reflected_type)`). `str(type)` PIERDE detalle crítico: `ENUM`/`SET`
+  **sin lista de valores** → CREATE TABLE inválido (1064); `UNSIGNED` → rango corrupto; display
+  width. Con el fix el DDL reproduce `enum('a','b')`/`bigint(20) unsigned`/`tinyint(1)` exactos
+  (también mejora la exactitud del diff: dos ENUM con valores distintos ya no comparan iguales).
+- Verificación: tests unit/API (FakeAdapter + runner síncrono) + `test_mysql_render.py` +
+  `test_clone_body_objects.py`; **e2e contra MariaDB 11 real EJECUTADO** (tabla con `ON UPDATE`,
+  vista, vista-sobre-vista en orden inverso, función, procedimiento, trigger, evento: todos
+  clonados y re-calificados al destino). `scripts/verify_clone_e2e.py` cubre tablas/datos;
+  cross-engine MySQL→PostgreSQL pendiente de corrida.
 
 ## Módulo de Usuarios del Motor (vista agrupada + CRUD por identidad)
 

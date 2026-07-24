@@ -60,9 +60,35 @@ capado a propósito como "seed de catálogo, no ETL" — el clon usa un **copiad
   restaurados en `finally`) para tolerar ciclos.
 - Tablas **sin PK**: `INSERT` plano (sin upsert). Con PK y destino preservado: **upsert**
   (`ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO UPDATE`).
+- **Fidelidad del tipo (MySQL/MariaDB)**: el tipo de columna se captura de
+  `information_schema.COLUMN_TYPE`, NO de `str(reflected_type)` — que pierde detalle crítico
+  (`ENUM`/`SET` **sin su lista de valores** → CREATE TABLE inválido; `UNSIGNED` → rango corrupto;
+  display width). Así el DDL del clon reproduce `enum('a','b')`, `bigint(20) unsigned`,
+  `tinyint(1)`, etc. exactamente.
 - **Los datos NUNCA se traducen cross-engine** por sintaxis, pero los valores escalares se
   adaptan por driver; tipos riesgosos (arrays/enums/JSON/geometría) pueden fallar por tabla y
   se reportan (best-effort por tabla, el resto continúa).
+
+### Tablas grandes (consideraciones)
+
+- **Timeout de volcado (bulk)**: la copia NO usa el timeout interactivo de 15s
+  (`REMOTE_STATEMENT_TIMEOUT_MS`) que cancelaría lotes de tablas grandes y dejaría datos
+  parciales. Usa un timeout separado `REMOTE_BULK_STATEMENT_TIMEOUT_MS` (default **1 hora**;
+  `0` = sin límite). Aplica a la conexión de lectura (origen) y de escritura (destino); en PG
+  es `statement_timeout`, en MySQL/MariaDB los `read/write_timeout` de socket.
+- **Commit por lote (AUTOCOMMIT)**: cada lote se confirma solo → no se acumula una transacción
+  gigante (que reventaría undo/redo). El reverso: un fallo a mitad de una tabla grande deja los
+  lotes ya confirmados; **no hay reanudación** todavía — reintentar exige `clean_mode=drop_database`
+  o dropear el destino y recopiar desde cero.
+- **Aislamiento de lectura**: la sesión de origen baja a `READ COMMITTED` para que una lectura
+  larga no pinnee un read-view e infle el undo/history del ORIGEN (la consistencia point-in-time
+  cross-tabla ya no está garantizada de todas formas — se copia tabla por tabla, con FKs off).
+- **Progreso throttleado**: el avance por filas se persiste a la BD del gateway a lo sumo cada
+  ~3s (no un `UPDATE` por lote), para no martillar la metadata en tablas de millones de filas.
+- **Límites conocidos**: el lote es por **filas** (`CLONE_DATA_BATCH_ROWS`, default 1000), no por
+  bytes — en tablas MUY anchas con `TEXT`/`BLOB`/JSON grandes puede acercarse a
+  `max_allowed_packet` (MySQL); si aparece "packet too large", bajar `CLONE_DATA_BATCH_ROWS`. Sin
+  paralelismo entre tablas (secuencial). Batching adaptativo por bytes y reanudación = futuro.
 
 ## Cross-engine (portabilidad)
 
@@ -76,6 +102,28 @@ se **reporta lo omitido** (`skipped` en el preview). Reglas (`CloneController._p
   extensions/materialized_views** sin equivalente directo. La traducción nativa de estructura
   es fiable en la dirección MySQL→PostgreSQL; para otras direcciones cross-family solo lo
   trivial es portable.
+
+## Objetos con cuerpo (vistas, rutinas, funciones, triggers, eventos)
+
+El clon **sí** replica vistas, procedimientos, funciones, triggers y eventos (no solo tablas):
+se capturan en el snapshot, se rinden con `render_diff` y se ejecutan como una sola sentencia
+(`exec_driver_sql`, sin re-partir por `;`, por lo que los cuerpos `BEGIN…END` no se rompen). En
+el preview aparecen en `structure_statements` **después** de todas las tablas/FKs/índices
+(fase 5 del pipeline de diff) — si la UI trunca la respuesta, quedan al final.
+
+Dos cuidados propios de estos objetos (`CloneController`):
+
+- **Re-calificación de esquema** (`_requalify_body`): MySQL/MariaDB inyectan el esquema **origen**
+  en las referencias del cuerpo (p. ej. `VIEW_DEFINITION` siempre trae `` from `origen`.`tabla` ``).
+  Sin corregirlo, el objeto clonado seguiría leyendo de la **BD origen** (fuga cross-database; clon
+  roto si el origen cambia/desaparece). Se reescribe **solo** el calificador del esquema origen →
+  destino (`` `origen`. `` → `` `destino`. ``), preservando referencias intencionales a otras bases.
+  Solo aplica a la familia MySQL/MariaDB (PostgreSQL usa el schema `public`, igual en ambos lados).
+- **Reintento diferido** (`_run_body_statements`): estos objetos pueden depender entre sí en
+  cualquier orden (vista→vista, rutina→vista). Se ejecutan en pasadas: los que fallan por una
+  dependencia aún no creada se reintentan en la siguiente. Un objeto se marca **fallido** solo
+  cuando una pasada completa no crea ninguno de los pendientes (sin progreso = fallo real, no de
+  orden). Las tablas/FKs/índices siguen con orden determinista de una sola pasada.
 
 ## Dependencias (auto-selección inteligente)
 
