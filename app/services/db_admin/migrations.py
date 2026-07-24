@@ -527,6 +527,22 @@ class MigrationRunner:
             finally:
                 self._release_lock(conn, engine, lock_key)
 
+    @staticmethod
+    def _escape_percent(stmt: str, engine: EngineType) -> str:
+        """
+        MySQL/MariaDB (pymysql, paramstyle ``format``): ``cursor.execute(query, args)``
+        SIEMPRE hace ``query % args`` cuando ``args`` no es ``None`` — y SQLAlchemy, aun
+        sin bind params, distila ``None`` a una tupla vacía (``()``) antes de llegar al
+        DBAPI. Cualquier ``%`` LITERAL en el DDL (``GENERATED ... AS (id % 10)``, un
+        ``CHECK``/``DEFAULT``/cuerpo de vista con ``LIKE '%...%'`` o ``DATE_FORMAT(...,
+        '%Y-%m-%d')``) revienta con ``unsupported format character`` al ejecutarse via
+        ``exec_driver_sql``. Se escapa a ``%%`` SOLO para esta familia — PostgreSQL
+        (psycopg2) no tiene este problema y no necesita el escape.
+        """
+        if engine in (EngineType.mysql, EngineType.mariadb):
+            return stmt.replace("%", "%%")
+        return stmt
+
     def execute_adhoc(
         self,
         target: ServerTarget,
@@ -581,7 +597,7 @@ class MigrationRunner:
                     for i, stmt in enumerate(statements):
                         t0 = time.monotonic()
                         try:
-                            conn.exec_driver_sql(stmt)
+                            conn.exec_driver_sql(self._escape_percent(stmt, engine))
                             ms = int((time.monotonic() - t0) * 1000)
                             results.append(
                                 StatementResult(
