@@ -883,6 +883,21 @@ class MySQLAdapter(ServerAdapter):
         for ck in tbl.check_constraints:
             name = f"CONSTRAINT {self._q(ck.name, 'constraint')} " if ck.name else ""
             lines.append(f"{name}CHECK ({ck.sqltext})")
+        # MySQL/MariaDB (InnoDB): la columna AUTO_INCREMENT debe ser la primera
+        # columna de ALGUNA clave definida en esta MISMA sentencia (un índice
+        # creado en una sentencia posterior no sirve para esta validación de
+        # motor). Si la PK/UNIQUE inline no la cubre —origen con PK compuesta
+        # heredada donde el autoincrement no encabeza la clave— agregamos una
+        # KEY de apoyo: no cambia la PK ni ningún otro objeto, solo satisface
+        # el requisito del motor.
+        auto_col = next((c.name for c in tbl.columns if c.autoincrement), None)
+        if auto_col:
+            leads_pk = bool(tbl.primary_key) and tbl.primary_key[0] == auto_col
+            leads_unique = any(
+                uc.columns and uc.columns[0] == auto_col for uc in tbl.unique_constraints
+            )
+            if not leads_pk and not leads_unique:
+                lines.append(f"KEY ({self._q(auto_col, 'columna')})")
         body = ",\n  ".join(lines)
         sql = f"CREATE TABLE {self._q(tbl.table, 'tabla')} (\n  {body}\n)"
         opts = tbl.storage_options

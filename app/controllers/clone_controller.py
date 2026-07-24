@@ -99,6 +99,7 @@ class _ExecutionPlan:
     skipped: list[dict]
     will_adopt: bool
     table_order: list[str]
+    warnings: list[str]
 
 _MYSQL_FAMILY = frozenset({"mysql", "mariadb"})
 # Tipos con cuerpo procedural: no portables cross-engine (atados al motor de origen).
@@ -643,7 +644,38 @@ class CloneController:
             skipped=skipped,
             will_adopt=job.adopt_target and selection is None and job.source_database_id is not None,
             table_order=[t.table for t in self._data_table_order(filtered)],
+            warnings=self._autoincrement_pk_warnings(filtered, tgt_engine),
         )
+
+    @staticmethod
+    def _autoincrement_pk_warnings(snap: SchemaSnapshot, tgt_engine: str) -> list[str]:
+        """
+        MySQL/MariaDB (InnoDB) exige que la columna AUTO_INCREMENT sea la primera
+        columna de alguna clave definida en la MISMA sentencia CREATE TABLE. Si el
+        origen trae una PK compuesta heredada donde el autoincrement no la encabeza,
+        el renderer agrega automáticamente una KEY de apoyo (ver
+        ``MySQLAdapter._render_create_table``) — se avisa aquí para que el operador
+        lo vea en el preview, no solo leyendo el DDL en ``GET .../items``.
+        """
+        if tgt_engine not in _MYSQL_FAMILY:
+            return []
+        warnings: list[str] = []
+        for t in snap.tables:
+            auto_col = next((c.name for c in t.columns if c.autoincrement), None)
+            if not auto_col:
+                continue
+            leads_pk = bool(t.primary_key) and t.primary_key[0] == auto_col
+            leads_unique = any(
+                uc.columns and uc.columns[0] == auto_col for uc in t.unique_constraints
+            )
+            if not leads_pk and not leads_unique:
+                warnings.append(
+                    f"La tabla `{t.table}` tiene una columna AUTO_INCREMENT (`{auto_col}`) "
+                    "que no es la primera columna de la PRIMARY KEY de origen; se agregará "
+                    f"automáticamente un índice de apoyo (KEY (`{auto_col}`)) en el destino "
+                    "para que MySQL/MariaDB acepte la creación."
+                )
+        return warnings
 
     @staticmethod
     def _requalify_body(sql: str, source_db: str, target_db: str, tgt_engine: str) -> str:
@@ -756,7 +788,7 @@ class CloneController:
             ],
             "skipped": plan.skipped,
             "will_adopt": plan.will_adopt,
-            "warnings": [],
+            "warnings": plan.warnings,
             "confirm_token": token,
         }
 
