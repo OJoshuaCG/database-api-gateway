@@ -710,16 +710,21 @@ destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
   reordena la PK ni cambia ningún objeto) + aviso en `warnings` del preview
   (`ClonePreviewOut`/`_ExecutionPlan.warnings`, `clone_controller.py::_autoincrement_pk_warnings`).
   Mismo `render_diff` usado por schema-comparisons, así que también lo cubre.
-- **`%` literal en el DDL ejecutado (MySQL/MariaDB)**: `MigrationRunner.execute_adhoc` usa
+- **`%` literal en el DDL ejecutado (los 3 motores)**: `MigrationRunner.execute_adhoc` usa
   `conn.exec_driver_sql(stmt)` sin bind params (deliberado: `text()` rompería `::` de
-  PostgreSQL). Pero pymysql hace `query % args` SIEMPRE que `args` no sea `None`, y
-  SQLAlchemy distila un `parameters` ausente a `()` antes de llegar al DBAPI → `args` nunca
-  es `None` en este camino. Un `%` LITERAL en el DDL (columna `GENERATED ... AS (id % 10)`,
-  `LIKE '%...%'`, `DATE_FORMAT(..., '%Y-%m-%d')`) revienta con `unsupported format
-  character` aunque el DDL sea válido. Fix: `MigrationRunner._escape_percent` duplica
-  `%`→`%%` solo para MySQL/MariaDB justo antes de `exec_driver_sql` (PostgreSQL no lo
-  necesita); el DDL guardado en preview/historial conserva el texto sin escapar. Mismo
-  punto usado por clone y por la ejecución ad-hoc de schema-comparisons.
+  PostgreSQL). Pero SQLAlchemy distila un `parameters` ausente a `()` (nunca a `None`)
+  antes de llegar al DBAPI, y pymysql/psycopg (los 3 `EngineType`, paramstyle
+  `pyformat`/`format`) parsean placeholders `%s`/`%(name)s` en cuanto reciben params
+  no-`None` → un `%` LITERAL en el DDL (columna `GENERATED ... AS (id % 10)`,
+  `LIKE '%...%'`, `DATE_FORMAT(..., '%Y-%m-%d')`) revienta en CUALQUIERA de los 3 motores
+  (pymysql: `unsupported format character`; psycopg: `incomplete placeholder` / `only
+  '%s', '%b', '%t' are allowed as placeholders`) aunque el DDL sea válido. Verificado
+  invocando el parser real de ambos drivers — la primera versión de este fix asumía
+  incorrectamente que PostgreSQL no lo necesitaba y solo escapaba para MySQL/MariaDB.
+  Fix (corregido): `MigrationRunner._escape_percent` duplica `%`→`%%`
+  INCONDICIONALMENTE (sin distinguir `engine`) justo antes de `exec_driver_sql`; el DDL
+  guardado en preview/historial conserva el texto sin escapar. Mismo punto usado por
+  clone y por la ejecución ad-hoc de schema-comparisons.
 - Verificación: tests unit/API (FakeAdapter + runner síncrono) + `test_mysql_render.py` +
   `test_clone_body_objects.py`; **e2e contra MariaDB 11 real EJECUTADO** (tabla con `ON UPDATE`,
   vista, vista-sobre-vista en orden inverso, función, procedimiento, trigger, evento: todos

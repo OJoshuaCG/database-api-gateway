@@ -150,18 +150,23 @@ ya trae un índice "real" sobre esa columna, puede quedar una redundancia inofen
 `MigrationRunner.execute_adhoc` (usado por el clon y por la ejecución ad-hoc de
 schema-comparisons) ejecuta cada sentencia con `conn.exec_driver_sql(stmt)`, sin bind
 params — deliberado para no romper `::` de PostgreSQL (`text()` lo malinterpretaría como
-bind param). Pero **pymysql** (paramstyle `format`) hace `cursor.execute(query, args)` →
-`query % args` **siempre** que `args` no sea `None`, y SQLAlchemy distila un `parameters`
-ausente a una tupla vacía `()` antes de llegar al DBAPI — es decir, `args` NUNCA es `None`
-en este camino. Cualquier `%` **literal** en el DDL (una columna `GENERATED ALWAYS AS
+bind param). Pero SQLAlchemy distila un `parameters` ausente a una tupla vacía `()` (nunca
+a `None`) antes de llegar al DBAPI, y **los 3 motores soportados usan un DBAPI con
+paramstyle `pyformat`/`format`** (pymysql para MySQL/MariaDB, psycopg para PostgreSQL):
+ambos parsean la sentencia buscando placeholders `%s`/`%(name)s` en cuanto reciben params
+no-`None`, así que cualquier `%` **literal** en el DDL (una columna `GENERATED ALWAYS AS
 (id % 10)`, un `CHECK`/`DEFAULT` o el cuerpo de una vista/rutina con `LIKE '%...%'` o
-`DATE_FORMAT(..., '%Y-%m-%d')`) revienta con `ValueError: unsupported format character`
-al ejecutarse, aunque el DDL sea perfectamente válido para el motor.
+`DATE_FORMAT(..., '%Y-%m-%d')`) revienta al ejecutarse — pymysql con `ValueError:
+unsupported format character`, psycopg con `ProgrammingError: incomplete placeholder` /
+`only '%s', '%b', '%t' are allowed as placeholders`. Verificado invocando el parser real
+de ambos drivers (no solo por lectura de código): un `LIKE '%bad%'` revienta igual en
+PostgreSQL, algo que se asumió incorrectamente descartado en la primera versión de este
+fix (el escape solo cubría MySQL/MariaDB).
 
-Fix: `MigrationRunner._escape_percent` duplica cada `%` → `%%` **solo** para
-`EngineType.mysql`/`mariadb` justo antes de pasar la sentencia a `exec_driver_sql`
-(PostgreSQL/psycopg2 no tiene este problema, no se toca). El escape es solo para la
-ejecución — el DDL guardado en el preview/historial conserva el texto original sin escapar.
+Fix: `MigrationRunner._escape_percent` duplica cada `%` → `%%` **incondicionalmente**
+(sin distinguir por `engine` — es seguro para los 3 motores) justo antes de pasar la
+sentencia a `exec_driver_sql`. El escape es solo para la ejecución — el DDL guardado en el
+preview/historial conserva el texto original sin escapar.
 
 ## Dependencias (auto-selección inteligente)
 
