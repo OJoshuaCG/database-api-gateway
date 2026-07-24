@@ -98,6 +98,9 @@ class _FakeAdapter:
         self.existing.discard(db_name)
         self.dropped.append(db_name)
 
+    def external_fk_dependents(self, database):
+        return []
+
     def render_diff(self, diff):
         # Una sentencia por ítem del diff, con SQL determinista.
         return [
