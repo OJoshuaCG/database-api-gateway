@@ -127,6 +127,22 @@ class MigrationResultOut(BaseModel):
     status: str  # applied | failed
     error: str | None = None
     execution_ms: int
+    resumed: bool = Field(
+        False, description="True si este intento retomó desde un checkpoint parcial previo"
+    )
+    resumed_from_statement: int | None = Field(
+        None, description="Sentencia (1-based) desde la que se retomó, si resumed=true"
+    )
+    statement_total: int | None = Field(
+        None, description="Cantidad total de sentencias de esta migración/dirección"
+    )
+    failed_at_statement_index: int | None = Field(
+        None,
+        description=(
+            "Sentencia (1-based) en la que falló, si status=failed. Null si no se pudo "
+            "determinar (migración no resumible) o si status=applied."
+        ),
+    )
 
 
 class MigrationApplyOut(BaseModel):

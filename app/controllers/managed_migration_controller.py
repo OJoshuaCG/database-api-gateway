@@ -27,6 +27,7 @@ from app.models.enums import EngineType, MigrationStatus, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.services import audit
+from app.services.db_admin import migration_progress
 from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
 from app.services.db_admin.migrations import (
     MigrationResult,
@@ -91,6 +92,7 @@ class ManagedMigrationController:
                 down_sql=r.down_sql,
                 checksum=r.checksum,
                 kind=r.kind,
+                has_non_portable=r.has_non_portable,
             )
             for r in rows
         ]
@@ -511,7 +513,9 @@ class ManagedMigrationController:
             "results": [self._result_dict(r) for r in results],
         }
 
-    def stamp(self, db_id: int, version: str, *, admin: dict | None = None) -> dict:
+    def stamp(
+        self, db_id: int, version: str, *, force: bool = False, admin: dict | None = None
+    ) -> dict:
         session = self._session()
         try:
             md, server, model = self._load_context(session, db_id)
@@ -523,6 +527,8 @@ class ManagedMigrationController:
         finally:
             session.close()
 
+        self._guard_partial_checkpoint(db_id, force)
+
         self.runner.stamp(
             target, db_name=db_name, slug=slug, engine=engine,
             managed_db_id=db_id, specs=specs, version=version,
@@ -533,12 +539,52 @@ class ManagedMigrationController:
         # previo la dejó en 'error' (p. ej. reintentar CREATE TABLE de una tabla ya
         # existente tras adoptarla). No ejecuta SQL, solo marca la versión.
         self._set_quarantine(db_id, failed=False, results=[])
+        if force:
+            # El admin afirma haber reconciliado el estado físico a mano: cualquier
+            # checkpoint de sentencia (de CUALQUIER versión) que quedara pendiente para
+            # esta BD ya no es confiable — el stamp reescribe la narrativa de versión
+            # por completo, así que el checkpoint quedaría hablando de un estado que el
+            # admin acaba de invalidar.
+            migration_progress.clear_progress_for_database(db_id, direction="up")
         audit.record(
             "migration.stamp", admin=admin, target_type="managed_database",
             target_id=db_id, server_id=server_id, touched_engine=True,
-            detail=f"stamp {version}",
+            detail=f"stamp {version}" + (" (force: checkpoint parcial descartado)" if force else ""),
         )
         return self.status(db_id)
+
+    @staticmethod
+    def _guard_partial_checkpoint(db_id: int, force: bool) -> None:
+        """
+        ``stamp`` afirma "esta BD está en la versión X" SIN ejecutar SQL. Si hay una
+        aplicación PARCIAL detectada (checkpoint de sentencia incompleto: algunas
+        sentencias de alguna migración ya commitearon, pero no todas) para esta BD, un
+        stamp ciego la enmascararía: un rollback posterior ejecutaría el ``down_sql``
+        completo de esa versión contra una BD que solo tiene una FRACCIÓN de los cambios
+        físicos — pudiendo fallar a mitad también, o "funcionar" solo por casualidad.
+
+        Bloquea por defecto; ``force=true`` es la vía explícita para "ya reconcilié el
+        estado físico a mano, proceda" (descarta el checkpoint, auditado). Sin este
+        override, un fallo NO resumible (sentencia rota / DDL no atómico — ver
+        ``migration_progress.py``) dejaría al admin sin ninguna salida.
+        """
+        incomplete = migration_progress.incomplete_progress_for_database(db_id, direction="up")
+        if incomplete and not force:
+            detail = ", ".join(
+                f"migración {row['model_migration_id']} "
+                f"({row['last_statement_index']}/{row['total_statements']} sentencias)"
+                for row in incomplete
+            )
+            raise AppHttpException(
+                message=(
+                    f"No se puede stampear: hay una aplicación PARCIAL detectada ({detail}). "
+                    "Reintente 'apply' (retoma automáticamente desde la última sentencia "
+                    "exitosa) o, si ya reconcilió el estado físico manualmente, repita el "
+                    "stamp con force=true."
+                ),
+                status_code=409,
+                context={"managed_database_id": db_id, "incomplete_progress": incomplete},
+            )
 
     def apply_all(
         self,
@@ -772,4 +818,10 @@ class ManagedMigrationController:
             "status": r.status,
             "error": r.error,
             "execution_ms": r.execution_ms,
+            # Checkpoint por sentencia: para que el frontend distinga un resume de un
+            # intento desde cero, y sepa en qué sentencia murió (sin exponer SQL crudo).
+            "resumed": r.resumed,
+            "resumed_from_statement": r.resumed_from_statement,
+            "statement_total": r.statement_total,
+            "failed_at_statement_index": r.failed_at_statement_index,
         }

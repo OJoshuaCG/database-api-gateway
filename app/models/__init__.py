@@ -28,6 +28,7 @@ from app.models.enums import (
     ServerStatus,
 )
 from app.models.managed_database import ManagedDatabase
+from app.models.migration_statement_progress import MigrationStatementProgress
 from app.models.model_migration import ModelMigration
 from app.models.permission_profile import PermissionProfile, PermissionProfileItem
 from app.models.privilege import Privilege
@@ -47,6 +48,7 @@ __all__ = [
     "ManagedDatabase",
     "ModelMigration",
     "DatabaseMigrationHistory",
+    "MigrationStatementProgress",
     "AuditLog",
     "CryptoKey",
     "Privilege",

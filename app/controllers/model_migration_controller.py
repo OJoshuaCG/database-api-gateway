@@ -33,6 +33,7 @@ from app.models.database_model import DatabaseModel
 from app.models.enums import EngineType, MigrationStatus
 from app.models.model_migration import ModelMigration
 from app.services import audit
+from app.services.db_admin import migration_progress
 from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
 from app.services.db_admin.sql_dialect import RollbackGenerator, SqlTranslator
 
@@ -640,6 +641,37 @@ class ModelMigrationController:
                     status_code=409,
                     context={"model_id": model_id, "version": version},
                 )
+
+            # Una aplicación PARCIAL (checkpoint de sentencia incompleto: algunas
+            # sentencias del up_sql ACTUAL ya commitearon en alguna BD, pero no todas)
+            # tampoco es segura de editar, aunque `_has_successful_application` diga
+            # False (solo mira aplicaciones EXITOSAS). Si se permitiera, un resume
+            # posterior interpretaría los índices del checkpoint contra un SQL distinto
+            # del que efectivamente corrió — corrupción silenciosa de esquema.
+            if sql_fields_changing:
+                incomplete = migration_progress.incomplete_progress_for_migration(
+                    m.id, direction="up"
+                )
+                if incomplete:
+                    detail = ", ".join(
+                        f"BD {row['managed_database_id']} "
+                        f"({row['last_statement_index']}/{row['total_statements']} sentencias)"
+                        for row in incomplete
+                    )
+                    raise AppHttpException(
+                        message=(
+                            "No se puede modificar el SQL: hay una aplicación PARCIAL en "
+                            f"curso ({detail}). Reintente 'apply' sobre esa BD (retoma "
+                            "automáticamente) hasta que complete, o límpielo con "
+                            "'stamp?force=true' antes de editar."
+                        ),
+                        status_code=409,
+                        context={
+                            "model_id": model_id,
+                            "version": version,
+                            "incomplete_progress": incomplete,
+                        },
+                    )
 
             if "name" in data and data["name"] is not None:
                 m.name = data["name"]

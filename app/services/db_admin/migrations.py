@@ -47,6 +47,7 @@ from app.core.remote_engine import (
 )
 from app.exceptions import AppHttpException
 from app.models.enums import EngineType
+from app.services.db_admin import migration_progress
 from app.services.db_admin.migration_integrity import validate_version, version_sort_key
 from app.services.db_admin.sql_dialect import (
     RollbackGenerator,
@@ -79,6 +80,7 @@ class MigrationSpec:
     down_sql: str | None
     checksum: str
     kind: str = "schema"  # 'schema' | 'data' (los datos no se traducen cross-engine)
+    has_non_portable: bool = False  # rutinas/triggers/events no traducibles cross-engine
 
 
 @dataclass(frozen=True)
@@ -91,6 +93,13 @@ class MigrationResult:
     error: str | None
     execution_ms: int
     applied_at: datetime
+    # Checkpoint por sentencia (ver migration_progress.py): permite reportar si este
+    # resultado fue un RESUME (no un intento desde cero) y, ante un fallo, en qué
+    # sentencia exacta murió — sin volcar el SQL crudo (puede tener secretos).
+    resumed: bool = False
+    resumed_from_statement: int | None = None
+    statement_total: int | None = None
+    failed_at_statement_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -164,9 +173,22 @@ class MigrationRunner:
     # Generación de archivos de revisión (temporales)                    #
     # ------------------------------------------------------------------ #
     def _write_revision_files(
-        self, versions_dir: Path, specs: list[MigrationSpec], engine: EngineType
+        self,
+        versions_dir: Path,
+        specs: list[MigrationSpec],
+        engine: EngineType,
+        managed_db_id: int,
     ) -> None:
-        """Escribe un .py de Alembic por migración, con el SQL ya por motor."""
+        """
+        Escribe un .py de Alembic por migración, con el SQL ya por motor.
+
+        Si existe un CHECKPOINT de sentencia válido (mismo ``checksum``) de un
+        apply/rollback previo que falló a mitad de camino, el archivo generado incluye
+        SOLO las sentencias restantes — un reintento retoma donde quedó en vez de
+        re-ejecutar lo que ya commiteó (DDL en AUTOCOMMIT). Ver
+        ``migration_progress.is_resumable`` para qué migraciones son elegibles
+        (fail-closed: cualquier duda, todo-o-nada, igual que hoy).
+        """
         prev: str | None = None
         # Orden NUMÉRICO (no lexicográfico): "9999" < "10000" debe respetarse.
         for spec in sorted(specs, key=lambda s: version_sort_key(s.version)):
@@ -175,42 +197,166 @@ class MigrationRunner:
             validate_version(spec.version)
             up = self.select_up_sql(spec, engine)
             down = self.select_down_sql(spec, engine)
+            up_statements = split_sql_statements(up)
+            down_statements = split_sql_statements(down) if down else []
+
+            up_resumable = migration_progress.is_resumable(
+                up, up_statements, kind=spec.kind, has_non_portable=spec.has_non_portable,
+            )
+            down_resumable = bool(down_statements) and migration_progress.is_resumable(
+                down, down_statements, kind=spec.kind, has_non_portable=spec.has_non_portable,
+            )
+            up_resume_from = self._resolve_resume_offset(
+                managed_db_id, spec, "up", up_resumable, len(up_statements)
+            )
+            down_resume_from = self._resolve_resume_offset(
+                managed_db_id, spec, "down", down_resumable, len(down_statements)
+            )
+
             (versions_dir / f"rev_{spec.version}.py").write_text(
-                self._render_revision(spec.version, prev, up, down),
+                self._render_revision(
+                    spec.version, prev, up_statements, down_statements,
+                    managed_db_id=managed_db_id,
+                    migration_id=spec.id,
+                    migration_checksum=spec.checksum,
+                    up_resumable=up_resumable, down_resumable=down_resumable,
+                    up_resume_from=up_resume_from, down_resume_from=down_resume_from,
+                ),
                 encoding="utf-8",
             )
             prev = spec.version
 
     @staticmethod
-    def _render_revision(
-        version: str, down_revision: str | None, up_sql: str, down_sql: str | None
-    ) -> str:
-        """Genera el cuerpo de un archivo de revisión Alembic con op.execute()."""
-        up_calls = "\n".join(
-            f"    op.execute({stmt!r})" for stmt in split_sql_statements(up_sql)
-        ) or "    pass"
+    def _resolve_resume_offset(
+        managed_db_id: int,
+        spec: MigrationSpec,
+        direction: str,
+        resumable: bool,
+        total: int,
+    ) -> int:
+        """
+        0 si no hay checkpoint útil (empezar desde la sentencia 1). Si hay un checkpoint
+        VÁLIDO (mismo checksum y mismo total de sentencias) y parcial, el índice (1-based)
+        de la última sentencia ya ejecutada con éxito.
 
-        if down_sql is None:
+        Fail-closed: si hay un checkpoint pero su checksum/total ya NO coincide con la
+        migración vigente (el SQL fue editado entre el fallo y el reintento — no debería
+        poder pasar, el guard de ``ModelMigrationController.update_migration`` lo bloquea,
+        pero es una segunda barrera barata), se aborta con 409 en vez de asumir a ciegas
+        a qué sentencia corresponde cada índice.
+        """
+        if not resumable or total == 0:
+            return 0
+        progress = migration_progress.get_progress(managed_db_id, spec.id, direction)
+        if progress is None:
+            return 0
+        if progress.migration_checksum != spec.checksum or progress.total_statements != total:
+            raise AppHttpException(
+                message=(
+                    f"La migración {spec.version} tiene un checkpoint de aplicación "
+                    "parcial que ya no coincide con su SQL actual (fue editado tras un "
+                    "fallo, o el checkpoint quedó de una versión anterior de este "
+                    "mecanismo). No se puede continuar automáticamente: reconcilie el "
+                    "estado físico de la BD manualmente y limpie el checkpoint "
+                    "(managed_migration_controller.stamp con force=true) antes de "
+                    "reintentar."
+                ),
+                status_code=409,
+                context={
+                    "managed_database_id": managed_db_id,
+                    "version": spec.version,
+                    "direction": direction,
+                },
+            )
+        if 0 < progress.last_statement_index < total:
+            return progress.last_statement_index
+        return 0
+
+    @staticmethod
+    def _render_revision(
+        version: str,
+        down_revision: str | None,
+        up_statements: list[str],
+        down_statements: list[str],
+        *,
+        managed_db_id: int,
+        migration_id: int,
+        migration_checksum: str,
+        up_resumable: bool,
+        down_resumable: bool,
+        up_resume_from: int,
+        down_resume_from: int,
+    ) -> str:
+        """Genera el cuerpo de un archivo de revisión Alembic con op.execute().
+
+        Cuando ``up_resumable``/``down_resumable``, cada sentencia registra su progreso
+        en la BD del gateway (``migration_progress.record_statement``) justo DESPUÉS de
+        ejecutarse con éxito — nunca antes: grabar antes haría que un resume saltee una
+        sentencia que nunca corrió (corrupción silenciosa), grabar después en el peor
+        caso hace que un resume re-intente UNA sentencia ya aplicada (ruidoso, no
+        silencioso). Los índices son ABSOLUTOS respecto al total original, aunque el
+        archivo generado solo incluya las sentencias posteriores a ``*_resume_from``.
+        """
+        up_body = MigrationRunner._render_statement_calls(
+            up_statements, managed_db_id, migration_id, "up", migration_checksum,
+            resumable=up_resumable, resume_from=up_resume_from,
+        )
+
+        if not down_statements:
             down_body = (
                 "    raise NotImplementedError("
                 f"'La migración {version} no tiene rollback (down_sql) confirmado.')"
             )
         else:
-            down_body = "\n".join(
-                f"    op.execute({stmt!r})" for stmt in split_sql_statements(down_sql)
-            ) or "    pass"
+            down_body = MigrationRunner._render_statement_calls(
+                down_statements, managed_db_id, migration_id, "down", migration_checksum,
+                resumable=down_resumable, resume_from=down_resume_from,
+            )
+
+        needs_progress_import = up_resumable or down_resumable
+        import_line = (
+            "from app.services.db_admin import migration_progress\n" if needs_progress_import else ""
+        )
 
         return (
-            "from alembic import op\n\n"
+            "from alembic import op\n"
+            f"{import_line}\n"
             f"revision = {version!r}\n"
             f"down_revision = {down_revision!r}\n"
             "branch_labels = None\n"
             "depends_on = None\n\n\n"
             "def upgrade():\n"
-            f"{up_calls}\n\n\n"
+            f"{up_body}\n\n\n"
             "def downgrade():\n"
             f"{down_body}\n"
         )
+
+    @staticmethod
+    def _render_statement_calls(
+        statements: list[str],
+        managed_db_id: int,
+        migration_id: int,
+        direction: str,
+        migration_checksum: str,
+        *,
+        resumable: bool,
+        resume_from: int,
+    ) -> str:
+        total = len(statements)
+        if total == 0:
+            return "    pass"
+        lines: list[str] = []
+        for i, stmt in enumerate(statements, start=1):
+            if i <= resume_from:
+                continue  # ya ejecutada en un intento previo (checkpoint confirmado)
+            lines.append(f"    op.execute({stmt!r})")
+            if resumable:
+                lines.append(
+                    "    migration_progress.record_statement("
+                    f"{managed_db_id!r}, {migration_id!r}, {direction!r}, {i!r}, "
+                    f"{total!r}, {migration_checksum!r})"
+                )
+        return "\n".join(lines) or "    pass"
 
     def _make_config(self, versions_dir: Path, connection, version_table: str) -> Config:
         cfg = Config()
@@ -350,7 +496,7 @@ class MigrationRunner:
         with tempfile.TemporaryDirectory(prefix="gw_mig_") as tmp:
             versions_dir = Path(tmp) / "versions"
             versions_dir.mkdir()
-            self._write_revision_files(versions_dir, specs, engine)
+            self._write_revision_files(versions_dir, specs, engine, managed_db_id)
             try:
                 with database_connection(target, db_name) as conn:
                     conn = conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -393,29 +539,60 @@ class MigrationRunner:
             current = self._read_current(conn, version_table)
             pending = self.compute_pending(current, specs, up_to_version)
             for spec in pending:
-                result = self._apply_one(cfg, spec)
+                up_total = len(split_sql_statements(self.select_up_sql(spec, engine)))
+                result = self._apply_one(
+                    cfg, spec, managed_db_id=managed_db_id, statement_total=up_total
+                )
                 results.append(result)
                 if result.status == "failed":
                     break  # no continuar tras un fallo
         return results
 
-    def _apply_one(self, cfg: Config, spec: MigrationSpec) -> MigrationResult:
+    def _apply_one(
+        self, cfg: Config, spec: MigrationSpec, *, managed_db_id: int, statement_total: int
+    ) -> MigrationResult:
+        """
+        Aplica UNA migración. Antes de ejecutar, consulta si hay un checkpoint de
+        sentencia (resume de un fallo parcial previo) para reportarlo en el resultado;
+        el archivo de revisión que realmente ejecuta ``command.upgrade`` ya fue generado
+        (en ``_write_revision_files``) solo con las sentencias restantes si corresponde.
+        """
         t0 = time.monotonic()
+        pre = migration_progress.get_progress(managed_db_id, spec.id, "up")
+        resumed_from = (
+            pre.last_statement_index
+            if pre
+            and pre.migration_checksum == spec.checksum
+            and 0 < pre.last_statement_index < statement_total
+            else None
+        )
         try:
             with _ALEMBIC_LOCK:
                 command.upgrade(cfg, spec.version)
             ms = int((time.monotonic() - t0) * 1000)
+            # Éxito total de la dirección: el checkpoint ya no hace falta.
+            migration_progress.clear_progress(managed_db_id, spec.id, "up")
             return MigrationResult(
                 migration_id=spec.id, version=spec.version, status="applied",
                 error=None, execution_ms=ms, applied_at=datetime.now(timezone.utc),
+                resumed=resumed_from is not None, resumed_from_statement=resumed_from,
+                statement_total=statement_total, failed_at_statement_index=None,
             )
         except Exception as exc:  # noqa: BLE001 — registrar fallo y detener cadena
             ms = int((time.monotonic() - t0) * 1000)
             logger.warning("Falló la migración %s: %s", spec.version, exc, exc_info=True)
+            post = migration_progress.get_progress(managed_db_id, spec.id, "up")
+            failed_at = (
+                post.last_statement_index + 1
+                if post and post.migration_checksum == spec.checksum
+                else None
+            )
             return MigrationResult(
                 migration_id=spec.id, version=spec.version, status="failed",
                 error=_clean_error(exc), execution_ms=ms,
                 applied_at=datetime.now(timezone.utc),
+                resumed=resumed_from is not None, resumed_from_statement=resumed_from,
+                statement_total=statement_total, failed_at_statement_index=failed_at,
             )
 
     def rollback_to(
@@ -452,6 +629,21 @@ class MigrationRunner:
             ):
                 spec = by_version.get(current)
                 mig_id = spec.id if spec else -1
+                down_total = (
+                    len(split_sql_statements(self.select_down_sql(spec, engine) or ""))
+                    if spec else 0
+                ) or None
+                pre = (
+                    migration_progress.get_progress(managed_db_id, mig_id, "down")
+                    if spec else None
+                )
+                resumed_from = (
+                    pre.last_statement_index
+                    if pre and spec
+                    and pre.migration_checksum == spec.checksum
+                    and down_total and 0 < pre.last_statement_index < down_total
+                    else None
+                )
                 t0 = time.monotonic()
                 try:
                     with _ALEMBIC_LOCK:
@@ -459,16 +651,31 @@ class MigrationRunner:
                 except Exception as exc:  # noqa: BLE001 — registrar fallo y detener
                     ms = int((time.monotonic() - t0) * 1000)
                     logger.warning("Falló el rollback de %s: %s", current, exc, exc_info=True)
+                    post = (
+                        migration_progress.get_progress(managed_db_id, mig_id, "down")
+                        if spec else None
+                    )
+                    failed_at = (
+                        post.last_statement_index + 1
+                        if post and spec and post.migration_checksum == spec.checksum
+                        else None
+                    )
                     results.append(MigrationResult(
                         migration_id=mig_id, version=current, status="failed",
                         error=_clean_error(exc), execution_ms=ms,
                         applied_at=datetime.now(timezone.utc),
+                        resumed=resumed_from is not None, resumed_from_statement=resumed_from,
+                        statement_total=down_total, failed_at_statement_index=failed_at,
                     ))
                     break
                 ms = int((time.monotonic() - t0) * 1000)
+                if spec:
+                    migration_progress.clear_progress(managed_db_id, mig_id, "down")
                 results.append(MigrationResult(
                     migration_id=mig_id, version=current, status="applied",
                     error=None, execution_ms=ms, applied_at=datetime.now(timezone.utc),
+                    resumed=resumed_from is not None, resumed_from_statement=resumed_from,
+                    statement_total=down_total, failed_at_statement_index=None,
                 ))
                 new_current = self._read_current(conn, version_table)
                 # Salvaguarda anti-bucle: si el puntero no se movió, detener.

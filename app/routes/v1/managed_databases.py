@@ -237,9 +237,18 @@ def stamp_migration(
     admin: AdminDep,
     db_id: int,
     version: str = Query(..., pattern=r"^\d{4,10}$", description="Versión a marcar"),
+    force: bool = Query(
+        False,
+        description=(
+            "Descarta cualquier checkpoint de aplicación parcial detectado para esta BD "
+            "(409 sin esto si existe uno). Úsalo solo tras reconciliar manualmente el "
+            "estado físico real del motor."
+        ),
+    ),
 ):
-    result = ManagedMigrationController().stamp(db_id, version, admin=admin)
-    return success(data=result, message="Versión marcada (stamp).")
+    result = ManagedMigrationController().stamp(db_id, version, force=force, admin=admin)
+    msg = "Versión marcada (stamp)." + (" Checkpoint parcial descartado." if force else "")
+    return success(data=result, message=msg)
 
 
 @router.get(
