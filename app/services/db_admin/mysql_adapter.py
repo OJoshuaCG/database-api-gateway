@@ -636,19 +636,24 @@ class MySQLAdapter(ServerAdapter):
     # ------------------------- snapshot canónico (hooks) ---------------------- #
     def _column_extras(self, conn, database, table, schema) -> dict[str, dict]:
         """
-        Collation/charset/on_update por columna desde ``information_schema.COLUMNS``:
-        el Inspector de SQLAlchemy no expone estos de forma fiable en MySQL/MariaDB.
+        Collation/charset/on_update/column_type por columna desde
+        ``information_schema.COLUMNS``: el Inspector de SQLAlchemy no expone estos de forma
+        fiable en MySQL/MariaDB. En particular ``str(reflected_type)`` PIERDE detalle crítico
+        del tipo (``ENUM``/``SET`` sin su lista de valores → DDL inválido; ``UNSIGNED`` →
+        rango corrupto; display width). ``COLUMN_TYPE`` es la fuente CANÓNICA del tipo exacto
+        (``enum('a','b')``, ``bigint(20) unsigned``, ``tinyint(1)``, …); ``base_adapter`` la
+        usa en vez de ``str(type)`` cuando está presente.
         """
         out: dict[str, dict] = {}
         rows = conn.execute(
             text(
-                "SELECT COLUMN_NAME, COLLATION_NAME, CHARACTER_SET_NAME, EXTRA "
+                "SELECT COLUMN_NAME, COLLATION_NAME, CHARACTER_SET_NAME, EXTRA, COLUMN_TYPE "
                 "FROM information_schema.COLUMNS "
                 "WHERE TABLE_SCHEMA = :db AND TABLE_NAME = :t"
             ),
             {"db": database, "t": table},
         ).fetchall()
-        for name, coll, cs, extra in rows:
+        for name, coll, cs, extra, column_type in rows:
             on_update = None
             if extra and "on update" in str(extra).lower():
                 on_update = "CURRENT_TIMESTAMP"
@@ -656,6 +661,7 @@ class MySQLAdapter(ServerAdapter):
                 "collation": coll,
                 "charset": cs,
                 "on_update": on_update,
+                "column_type": str(column_type) if column_type else None,
             }
         return out
 
@@ -845,9 +851,19 @@ class MySQLAdapter(ServerAdapter):
                 parts.append("NOT NULL")
         else:
             parts.append("NULL" if col.nullable else "NOT NULL")
+            inline_on_update = False
             if col.default is not None:
-                parts.append(f"DEFAULT {col.default}")
-            if col.on_update:
+                default = col.default
+                # MariaDB refleja la cláusula ``ON UPDATE …`` DENTRO del COLUMN_DEFAULT
+                # de columnas DATETIME/TIMESTAMP (SQLAlchemy la devuelve pegada al default).
+                # ``on_update`` se emite por separado más abajo → la quitamos del default
+                # para no duplicar la cláusula y generar un CREATE TABLE inválido.
+                idx = default.upper().find(" ON UPDATE ")
+                if idx != -1:
+                    default = default[:idx].rstrip()
+                    inline_on_update = True
+                parts.append(f"DEFAULT {default}")
+            if col.on_update or inline_on_update:
                 parts.append("ON UPDATE CURRENT_TIMESTAMP")
             if col.autoincrement:
                 parts.append("AUTO_INCREMENT")

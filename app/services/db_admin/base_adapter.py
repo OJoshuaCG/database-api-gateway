@@ -440,8 +440,11 @@ class ServerAdapter(ABC):
                 )
             columns.append(
                 ColumnInfo(
+                    # ``column_type`` (extra por-adapter, p.ej. MySQL ``COLUMN_TYPE``) es el
+                    # tipo CANÓNICO cuando el hook lo provee; ``str(reflected_type)`` pierde
+                    # detalle en MySQL (ENUM/SET sin valores, UNSIGNED, display width).
                     name=c["name"],
-                    type=str(c["type"]),
+                    type=ex.get("column_type") or str(c["type"]),
                     nullable=bool(c.get("nullable", True)),
                     default=None if c.get("default") is None else str(c.get("default")),
                     primary_key=c["name"] in pk_set,
