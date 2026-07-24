@@ -326,6 +326,50 @@ def _set_fk_enforcement(conn, engine_type: str, *, enabled: bool) -> None:
         pass  # best-effort
 
 
+def _relax_strict_mode(conn, engine_type: str) -> str | None:
+    """
+    Quita ``STRICT_TRANS_TABLES``/``STRICT_ALL_TABLES`` del ``sql_mode`` de la sesión de
+    ESCRITURA, solo durante la fase de datos del clon. Motivo (decisión de producto,
+    ver ``docs/features/database-clone.md``): el origen puede tener filas "grandfathered"
+    con un valor de ENUM fuera de su lista de valores permitidos — MySQL representa un
+    valor inválido, insertado alguna vez sin modo estricto, como el string vacío ``''``
+    (el "valor especial de error" del ENUM, documentado en "13.3.5 The ENUM Type").
+    Reinsertar ese mismo ``''`` en un destino con modo estricto activo (default en MySQL
+    8/MariaDB moderno) lo rechaza con error (1265) en vez de aceptarlo como hace el origen.
+
+    Relaja SOLO esos dos modos (preserva el resto: ``ONLY_FULL_GROUP_BY``, ``NO_ZERO_DATE``,
+    etc.) para reproducir fielmente el dato del origen — a costa de que CUALQUIER OTRO
+    truncamiento de datos en CUALQUIER tabla/columna de este mismo job también se coercione
+    en silencio en vez de fallar esa tabla (trade-off explícito, no accidental).
+
+    Solo aplica a MySQL/MariaDB: PostgreSQL no tiene ``sql_mode`` ni esta ambigüedad de
+    ENUM (sus enums son siempre estrictos). Best-effort: devuelve el ``sql_mode`` original
+    (para restaurarlo con ``_restore_sql_mode``) o ``None`` si no aplica o el SET falla —
+    en ese caso el comportamiento fail-closed actual se mantiene sin cambios.
+    """
+    if engine_type not in ("mysql", "mariadb"):
+        return None
+    try:
+        original = conn.exec_driver_sql("SELECT @@SESSION.sql_mode").scalar()
+        conn.exec_driver_sql(
+            "SET SESSION sql_mode = REPLACE(REPLACE(@@SESSION.sql_mode, "
+            "'STRICT_ALL_TABLES', ''), 'STRICT_TRANS_TABLES', '')"
+        )
+        return original
+    except SQLAlchemyError:
+        return None
+
+
+def _restore_sql_mode(conn, original: str | None) -> None:
+    """Contraparte de ``_relax_strict_mode``. No-op si no se relajó nada (``None``)."""
+    if original is None:
+        return
+    try:
+        conn.execute(text("SET SESSION sql_mode = :m"), {"m": original})
+    except SQLAlchemyError:
+        pass  # best-effort
+
+
 # --------------------------------------------------------------------------- #
 # Lectura del origen (único punto de lectura del cursor)                        #
 # --------------------------------------------------------------------------- #
@@ -841,6 +885,9 @@ def copy_tables(
         # conexión, no por tabla) y se pasa hacia abajo ya resuelto.
         writer = _resolve_writer(dest_conn)
         _set_fk_enforcement(dest_conn, dest_engine, enabled=False)
+        # Best-effort, solo MySQL/MariaDB: ver docstring de _relax_strict_mode. Devuelve
+        # None (no-op en _restore_sql_mode) si no aplica al motor o si el SET falla.
+        original_sql_mode = _relax_strict_mode(dest_conn, dest_engine)
         try:
             for idx, spec in enumerate(specs):
                 if cancel_cb is not None and cancel_cb():
@@ -873,6 +920,7 @@ def copy_tables(
                         )
                     break
         finally:
+            _restore_sql_mode(dest_conn, original_sql_mode)
             _set_fk_enforcement(dest_conn, dest_engine, enabled=True)
 
     return results
