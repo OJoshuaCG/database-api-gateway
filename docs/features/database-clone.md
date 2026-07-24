@@ -115,6 +115,23 @@ naturalmente en la vía legacy sin necesidad de mockear nada especial:
   `list`/`dict` Python a texto JSON antes de escribir — una columna PostgreSQL de tipo ARRAY
   nativo (`int[]`/`text[]`) alimentada con un `list` no queda bien representada. Afecta por igual
   al `INSERT` legacy y al `COPY` (ambos reciben el mismo valor ya adaptado); no se resolvió aquí.
+- **Columnas `GENERATED`/computadas**: se excluyen de la copia de datos (`c.computed is None`
+  al armar `_DataSpec.columns` en `CloneController`) — el motor las recalcula solo; escribirles
+  un valor explícito dispara el warning 1906 de MySQL, que en `sql_mode` estricto se promueve a
+  error y aborta la tabla completa.
+- **`ENUM` con valores "grandfathered" fuera de rango (MySQL/MariaDB, decisión de producto)**:
+  MySQL representa un valor de `ENUM` inválido, insertado alguna vez sin modo estricto, como el
+  string vacío `''` (el "valor especial de error" del ENUM — documentado en el manual, "13.3.5
+  The ENUM Type"). Si el origen tiene filas viejas con ese `''`, reinsertarlo en un destino con
+  `STRICT_TRANS_TABLES`/`STRICT_ALL_TABLES` activo (default en MySQL 8/MariaDB moderno) lo
+  rechaza (1265) en vez de aceptarlo como hace el origen. `copy_tables` relaja **solo esos dos
+  modos** (`_relax_strict_mode`/`_restore_sql_mode`, preserva el resto del `sql_mode`) en la
+  conexión de escritura, **solo durante la fase de datos** (no DDL), y los restaura al terminar
+  — best-effort, solo MySQL/MariaDB (PostgreSQL no tiene `sql_mode` ni esta ambigüedad, sus enums
+  son siempre estrictos). **Trade-off explícito**: cualquier OTRO truncamiento de datos en
+  cualquier tabla/columna del mismo job también se coerciona en silencio en vez de fallar esa
+  tabla — decisión de producto para priorizar fidelidad con el origen sobre fail-closed en este
+  caso puntual, no un descuido.
 - **Pendiente de verificación e2e contra motores reales** (no hay Docker disponible en el entorno
   donde se implementó este cambio): coordinación del hilo escritor del FIFO bajo carga real,
   escaping de BLOB/JSON/timestamptz con datos reales, que el `INSERT ... SELECT` desde staging
@@ -129,6 +146,36 @@ naturalmente en la vía legacy sin necesidad de mockear nada especial:
 - **Los datos NUNCA se traducen cross-engine** por sintaxis, pero los valores escalares se
   adaptan por driver; tipos riesgosos (arrays/enums/JSON/geometría) pueden fallar por tabla y
   se reportan (best-effort por tabla, el resto continúa).
+
+### Asimetrías MySQL/MariaDB ↔ PostgreSQL que el pipeline compensa explícitamente
+
+Dos comportamientos que MySQL/MariaDB resuelve solo (por su motor de almacenamiento) y que
+PostgreSQL requiere un paso explícito — sin este, el clon quedaría con datos/comportamiento
+incompleto en el destino, en silencio:
+
+- **Secuencias `IDENTITY`/`SERIAL` desincronizadas en destino PostgreSQL**: MySQL/InnoDB ajusta
+  `AUTO_INCREMENT` solo al insertar un valor explícito mayor al contador actual; PostgreSQL NO
+  hace eso — ni `INSERT ... OVERRIDING SYSTEM VALUE` ni `COPY` (que es como este módulo escribe
+  los datos; confirmado contra la documentación oficial que `COPY` sí puede escribir valores
+  explícitos en una columna `IDENTITY` sin fallar) avanzan la secuencia asociada. Sin corregirlo,
+  el primer `INSERT` real de la aplicación que dependa del default/identity generaría un ID que
+  ya existe en una fila clonada → choque de PK. `CloneController._resync_postgres_identity_sequences`
+  corre, tras copiar los datos, `SELECT setval(pg_get_serial_sequence(tabla, columna), MAX(columna), true)`
+  por cada columna `identity` de cada tabla copiada con éxito (solo si tuvo ≥1 fila) — solo
+  cuando el destino es PostgreSQL. Best-effort: un fallo aquí no revierte los datos ya copiados.
+- **`ON UPDATE CURRENT_TIMESTAMP` (columna MySQL/MariaDB) se pierde en silencio al clonar hacia
+  PostgreSQL**: PostgreSQL no tiene una cláusula de columna equivalente — se implementa con un
+  `TRIGGER`. `PostgresAdapter._render_on_update_trigger_statements` (que engancha en
+  `_ri_table_new`/`_ri_column_new`, compartidos con `render_diff` de
+  [schema-comparison](schema-comparison.md) — **el fix aplica a ambas features por igual**)
+  genera, para cada columna origen con `on_update`, una función `CREATE OR REPLACE FUNCTION` +
+  `DROP TRIGGER IF EXISTS`/`CREATE TRIGGER BEFORE UPDATE` que fija `CURRENT_TIMESTAMP` en esa
+  columna. Nombre determinista (hash de tabla+columna, no aleatorio) → idempotente entre
+  corridas, no acumula duplicados. Solo se activa cross-engine (MySQL/MariaDB → PostgreSQL);
+  PostgreSQL nunca setea `on_update` en su propia introspección.
+
+Ambos confirmados contra la documentación oficial de PostgreSQL 16 / MySQL 8.0 (sin verificación
+e2e contra motores reales en el entorno donde se implementaron — ver limitaciones más abajo).
 
 ### Tablas grandes (consideraciones)
 
