@@ -11,6 +11,8 @@ Particularidades frente a MySQL:
 - `CREATE/DROP DATABASE` exigen AUTOCOMMIT (ya garantizado por server_connection).
 """
 
+import hashlib
+
 from sqlalchemy import MetaData, Table, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.schema import CreateTable
@@ -748,6 +750,53 @@ class PostgresAdapter(ServerAdapter):
             lines.append(f"{name}CHECK ({ck.sqltext})")
         body = ",\n  ".join(lines)
         return f"CREATE TABLE {self._q(tbl.table, 'tabla')} (\n  {body}\n)"
+
+    # ------------------------- ON UPDATE CURRENT_TIMESTAMP (cross-engine) ----- #
+    # PostgreSQL no tiene una cláusula de columna equivalente a ``ON UPDATE
+    # CURRENT_TIMESTAMP`` de MySQL/MariaDB (``col.on_update``, ver
+    # ``MySQLAdapter._render_column_def``) — se implementa con un TRIGGER. Sin esto,
+    # una columna que en MySQL se autoactualiza en cada UPDATE deja de hacerlo en
+    # silencio al clonar/sincronizar MySQL/MariaDB → PostgreSQL. Postgres NUNCA setea
+    # ``on_update`` en su propia introspección (``_column_extras`` de este adapter
+    # siempre lo deja en ``None``), así que esto solo se activa en el sentido
+    # cross-engine correcto.
+    def _render_on_update_trigger_statements(self, item, table: str, col) -> list:
+        if not getattr(col, "on_update", None):
+            return []
+        # Nombre DETERMINISTA (hash de tabla+columna, no aleatorio): idempotente entre
+        # corridas — un re-clon/re-sync no acumula funciones/triggers duplicados.
+        suffix = hashlib.sha256(f"{table}.{col.name}".encode()).hexdigest()[:16]
+        fn_name = self._q(f"gw_ou_{suffix}", "función")
+        trg_name = self._q(f"gw_ou_{suffix}", "trigger")
+        table_q = self._q(table, "tabla")
+        col_q = self._q(col.name, "columna")
+        fn_sql = (
+            f"CREATE OR REPLACE FUNCTION {fn_name}() RETURNS TRIGGER "
+            f"LANGUAGE plpgsql AS $$ BEGIN NEW.{col_q} := CURRENT_TIMESTAMP; "
+            f"RETURN NEW; END; $$"
+        )
+        # DROP + CREATE (en vez de ``CREATE OR REPLACE TRIGGER``, solo disponible desde
+        # PostgreSQL 14) para no asumir una versión mínima del motor destino.
+        drop_trg_sql = f"DROP TRIGGER IF EXISTS {trg_name} ON {table_q}"
+        create_trg_sql = (
+            f"CREATE TRIGGER {trg_name} BEFORE UPDATE ON {table_q} "
+            f"FOR EACH ROW EXECUTE FUNCTION {fn_name}()"
+        )
+        return [self._stmt(item, fn_sql), self._stmt(item, drop_trg_sql), self._stmt(item, create_trg_sql)]
+
+    def _ri_table_new(self, item):
+        out = super()._ri_table_new(item)
+        tbl = item.source_payload
+        for col in tbl.columns:
+            out.extend(self._render_on_update_trigger_statements(item, tbl.table, col))
+        return out
+
+    def _ri_column_new(self, item):
+        out = super()._ri_column_new(item)
+        out.extend(
+            self._render_on_update_trigger_statements(item, item.parent_table, item.source_payload)
+        )
+        return out
 
     def _render_modify_column(self, table, src_col, tgt_col, changed) -> list[str]:
         # PostgreSQL no redefine en una sentencia: una por atributo que cambió.
