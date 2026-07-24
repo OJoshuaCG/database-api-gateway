@@ -238,6 +238,34 @@ Fix: `MigrationRunner._escape_percent` duplica cada `%` → `%%` **incondicional
 sentencia a `exec_driver_sql`. El escape es solo para la ejecución — el DDL guardado en el
 preview/historial conserva el texto original sin escapar.
 
+## FK checks durante la limpieza objeto-por-objeto (`clean_mode=objects`)
+
+Los `DROP TABLE` de la fase de limpieza ya se ordenan en **topológico inverso** (hija antes
+que padre) vía `schema_diff.py::order_diff_items`/`_table_dep_order` — la misma función que
+ordena los `INSERT` de la fase de datos, reutilizada en reversa. Eso cubre el caso normal,
+pero por construcción **no puede ver**:
+
+- Una FK desde una tabla de **OTRA base de datos del mismo servidor** hacia una tabla de la
+  BD que se está limpiando — el snapshot que arma el orden es de una sola BD, así que esa
+  tabla externa ni siquiera es un `DiffItem` (nunca recibe su propio `DROP TABLE`). Es el
+  candidato más probable ante `(1451, 'Cannot delete or update a parent row...')` en un
+  `DROP TABLE` aislado (p. ej. una BD de control tipo "servers"/"databases" con otras BDs
+  del mismo servidor apuntándole por FK).
+- Un **ciclo de FKs** dentro de la misma BD: el fallback de `_table_dep_order` para tablas
+  no resolubles topológicamente ("ciclo/dep externa") las deja al final con el mismo rango,
+  desempatadas por nombre — sin garantía de que ese orden sea drop-safe.
+
+Fix (defensa en profundidad, no reemplaza el orden topológico): `execute_adhoc` gana un
+parámetro `disable_fk_checks: bool = False`. `MigrationRunner._toggle_fk_checks` desactiva
+el chequeo de FKs de la sesión antes del lote y lo restaura al final (MySQL/MariaDB:
+`FOREIGN_KEY_CHECKS`; PostgreSQL: `session_replication_role`) — mismo mecanismo que
+`data_copy.py::_set_fk_enforcement` usa para la fase de **datos**, ahora también para la
+fase de **limpieza**. `CloneController` lo activa SOLO para la sentencia de limpieza
+(`CLONE_ITEM_CLEAN`); la fase de estructura (CREATE) no lo necesita — ya tiene su propio
+orden padre-antes-que-hijo y FKs en fase aditiva separada. Best-effort: si el `SET` falla
+(motor sin soporte, o el pseudo-root de PostgreSQL sin el permiso), se ignora — el orden
+topológico sigue siendo la garantía primaria para el caso común.
+
 ## Dependencias (auto-selección inteligente)
 
 `app/services/db_admin/clone_dependencies.py` (módulo puro):

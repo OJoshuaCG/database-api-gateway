@@ -729,6 +729,17 @@ destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
   INCONDICIONALMENTE (sin distinguir `engine`) justo antes de `exec_driver_sql`; el DDL
   guardado en preview/historial conserva el texto sin escapar. Mismo punto usado por
   clone y por la ejecución ad-hoc de schema-comparisons.
+- **FK checks durante la limpieza (`clean_mode=objects`)**: los `DROP TABLE` ya se ordenan
+  en topológico INVERSO (`schema_diff.py::order_diff_items`/`_table_dep_order`, misma
+  función que ordena los INSERT de datos, en reversa) — cubre el caso normal, pero no
+  puede ver una FK desde OTRA base de datos del mismo servidor (snapshot de una sola BD) ni
+  un ciclo de FKs intra-BD; ambos disparan `(1451, 'Cannot delete or update a parent
+  row...')` en un `DROP TABLE` aislado. Fix (defensa en profundidad):
+  `execute_adhoc(..., disable_fk_checks=True)` + `MigrationRunner._toggle_fk_checks`
+  (mismo mecanismo que `data_copy.py::_set_fk_enforcement` para la fase de datos:
+  `FOREIGN_KEY_CHECKS`/`session_replication_role`, best-effort). `CloneController` lo
+  activa SOLO para `CLONE_ITEM_CLEAN`, no para estructura (que ya tiene su propio orden
+  padre-antes-que-hijo).
 - Verificación: tests unit/API (FakeAdapter + runner síncrono) + `test_mysql_render.py` +
   `test_clone_body_objects.py`; **e2e contra MariaDB 11 real EJECUTADO** (tabla con `ON UPDATE`,
   vista, vista-sobre-vista en orden inverso, función, procedimiento, trigger, evento: todos
