@@ -65,7 +65,8 @@ class ServerTarget:
 # Cache de engines
 # ---------------------------------------------------------------------------
 
-_engines: dict[tuple[int, str], Engine] = {}
+# Clave: (server_id, BD efectiva, bulk, mysql_local_infile).
+_engines: dict[tuple[int, str, bool, bool], Engine] = {}
 _lock = threading.Lock()
 
 
@@ -94,7 +95,11 @@ _PG_SSLMODES = {"disable", "allow", "prefer", "require", "verify-ca", "verify-fu
 
 
 def _connect_args(
-    dialect: str, ssl_mode: str | None = None, *, bulk: bool = False
+    dialect: str,
+    ssl_mode: str | None = None,
+    *,
+    bulk: bool = False,
+    mysql_local_infile: bool = False,
 ) -> dict[str, Any]:
     mode = (ssl_mode or "").strip().lower()
     ssl_enabled = mode not in _SSL_DISABLED
@@ -110,6 +115,19 @@ def _connect_args(
             "connect_timeout": REMOTE_CONNECT_TIMEOUT,
             "charset": "utf8mb4",
         }
+        if mysql_local_infile:
+            # LOAD DATA LOCAL INFILE (vía FIFO) exige habilitar explícitamente el envío de
+            # archivos locales o pymysql lanza RuntimeError al recibir la solicitud del
+            # servidor. Es un flag DEDICADO (desacoplado de ``bulk``): SOLO la conexión de
+            # ESCRITURA del destino en la copia de datos lo pide. La de LECTURA del origen
+            # también es ``bulk=True`` pero solo hace SELECT y NO debe habilitarlo — con
+            # ``local_infile=True`` un servidor ORIGEN comprometido podría exigir el envío de
+            # un archivo local del gateway en respuesta a CUALQUIER query (ataque "rogue
+            # MySQL server"). Minimizar la superficie: el flag se activa en la MENOR cantidad
+            # de conexiones posible. Aun cuando está activo, el guard de
+            # ``data_copy._guarded_read_load_local_packet`` neutraliza el ataque restringiendo
+            # el archivo servible al FIFO esperado.
+            args["local_infile"] = True
         # 0 => sin read/write_timeout (socket sin límite de tiempo de operación).
         if stmt_timeout_ms > 0:
             stmt_timeout_s = max(1, stmt_timeout_ms // 1000)
@@ -140,7 +158,13 @@ def _connect_args(
     return args
 
 
-def _build_engine(target: ServerTarget, effective_db: str | None, *, bulk: bool = False) -> Engine:
+def _build_engine(
+    target: ServerTarget,
+    effective_db: str | None,
+    *,
+    bulk: bool = False,
+    mysql_local_infile: bool = False,
+) -> Engine:
     driver = _require_driver(target.dialect)
     url = URL.create(
         drivername=driver,
@@ -153,22 +177,35 @@ def _build_engine(target: ServerTarget, effective_db: str | None, *, bulk: bool 
     return create_engine(
         url,
         poolclass=NullPool,
-        connect_args=_connect_args(target.dialect, target.ssl_mode, bulk=bulk),
+        connect_args=_connect_args(
+            target.dialect, target.ssl_mode, bulk=bulk, mysql_local_infile=mysql_local_infile
+        ),
     )
 
 
-def get_engine(target: ServerTarget, database: str | None = None, *, bulk: bool = False) -> Engine:
+def get_engine(
+    target: ServerTarget,
+    database: str | None = None,
+    *,
+    bulk: bool = False,
+    mysql_local_infile: bool = False,
+) -> Engine:
     """
-    Devuelve un engine cacheado por (server_id, BD efectiva, bulk). `database=None`
-    => conexión a nivel servidor (admin). `bulk=True` => timeouts de volcado masivo
-    (copia de datos del clon); se cachea por separado para no mezclar timeouts.
+    Devuelve un engine cacheado por (server_id, BD efectiva, bulk, mysql_local_infile).
+    `database=None` => conexión a nivel servidor (admin). `bulk=True` => timeouts de
+    volcado masivo (copia de datos del clon). `mysql_local_infile=True` => habilita
+    LOAD DATA LOCAL INFILE en pymysql (solo la conexión de ESCRITURA del clon lo pide).
+    Ambos flags entran en la clave de cache para que un engine con ``local_infile``
+    habilitado NUNCA se reuse en una conexión que no lo pidió (ni viceversa).
     """
     effective_db = _effective_database(target.dialect, database)
-    key = (target.server_id, effective_db or "", bulk)
+    key = (target.server_id, effective_db or "", bulk, mysql_local_infile)
     with _lock:
         engine = _engines.get(key)
         if engine is None:
-            engine = _build_engine(target, effective_db, bulk=bulk)
+            engine = _build_engine(
+                target, effective_db, bulk=bulk, mysql_local_infile=mysql_local_infile
+            )
             _engines[key] = engine
         return engine
 
@@ -193,11 +230,19 @@ def server_connection(target: ServerTarget):
 
 
 @contextmanager
-def database_connection(target: ServerTarget, database: str, *, bulk: bool = False):
+def database_connection(
+    target: ServerTarget,
+    database: str,
+    *,
+    bulk: bool = False,
+    mysql_local_infile: bool = False,
+):
     """Conexión a una BD CONCRETA (introspección/migraciones). Revalida el host (anti-SSRF, R2).
-    ``bulk=True`` usa timeouts de volcado masivo (copia de datos del clon)."""
+    ``bulk=True`` usa timeouts de volcado masivo (copia de datos del clon).
+    ``mysql_local_infile=True`` habilita LOAD DATA LOCAL INFILE (solo la conexión de
+    ESCRITURA del clon lo pide; ver ``data_copy``)."""
     validate_remote_host(target.host)
-    engine = get_engine(target, database, bulk=bulk)
+    engine = get_engine(target, database, bulk=bulk, mysql_local_infile=mysql_local_infile)
     conn = engine.connect()
     try:
         yield conn

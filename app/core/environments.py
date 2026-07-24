@@ -133,6 +133,10 @@ CLONE_TTL_HOURS = int(os.getenv("CLONE_TTL_HOURS", "24"))
 CLONE_MAX_WORKERS = int(os.getenv("CLONE_MAX_WORKERS", "2"))
 # Filas por lote en la copia de datos por streaming (lectura yield_per + escritura executemany).
 CLONE_DATA_BATCH_ROWS = int(os.getenv("CLONE_DATA_BATCH_ROWS", "1000"))
+# Kill switch de la copia BULK NATIVA (COPY FROM STDIN en PostgreSQL, LOAD DATA LOCAL
+# INFILE en MySQL/MariaDB). True (default) usa el protocolo bulk del motor; False vuelve
+# al INSERT parametrizado por lotes (executemany) sin necesidad de re-desplegar código.
+CLONE_BULK_COPY_ENABLED = os.getenv("CLONE_BULK_COPY_ENABLED", "True").lower() == "true"
 
 # ======= Anti-SSRF (validación de host destino) ======= #
 # Si True (default), al registrar/editar un Server se rechazan destinos peligrosos
