@@ -528,20 +528,23 @@ class MigrationRunner:
                 self._release_lock(conn, engine, lock_key)
 
     @staticmethod
-    def _escape_percent(stmt: str, engine: EngineType) -> str:
+    def _escape_percent(stmt: str) -> str:
         """
-        MySQL/MariaDB (pymysql, paramstyle ``format``): ``cursor.execute(query, args)``
-        SIEMPRE hace ``query % args`` cuando ``args`` no es ``None`` — y SQLAlchemy, aun
-        sin bind params, distila ``None`` a una tupla vacía (``()``) antes de llegar al
-        DBAPI. Cualquier ``%`` LITERAL en el DDL (``GENERATED ... AS (id % 10)``, un
-        ``CHECK``/``DEFAULT``/cuerpo de vista con ``LIKE '%...%'`` o ``DATE_FORMAT(...,
-        '%Y-%m-%d')``) revienta con ``unsupported format character`` al ejecutarse via
-        ``exec_driver_sql``. Se escapa a ``%%`` SOLO para esta familia — PostgreSQL
-        (psycopg2) no tiene este problema y no necesita el escape.
+        Los 3 motores soportados (MySQL/MariaDB vía pymysql, PostgreSQL vía psycopg —
+        ambos paramstyle ``pyformat``/``format``) parsean la sentencia buscando
+        placeholders ``%s``/``%(name)s`` en cuanto ``cursor.execute`` recibe params NO
+        ``None`` — y SQLAlchemy, aun sin bind params, distila ``None`` a una tupla vacía
+        (``()``) antes de llegar al DBAPI, así que SIEMPRE entra a ese parseo. Cualquier
+        ``%`` LITERAL en el DDL (``GENERATED ... AS (id % 10)``, un ``CHECK``/``DEFAULT``/
+        cuerpo de vista con ``LIKE '%...%'`` o ``DATE_FORMAT(..., '%Y-%m-%d')``) revienta
+        al ejecutarse via ``exec_driver_sql``: pymysql con ``ValueError: unsupported
+        format character``, psycopg con ``ProgrammingError: incomplete placeholder`` /
+        ``only '%s', '%b', '%t' are allowed as placeholders`` (verificado invocando el
+        parser real de ambos drivers, no solo por lectura de código). Se escapa a ``%%``
+        incondicionalmente — es seguro para los 3 motores y no requiere distinguir por
+        ``engine``.
         """
-        if engine in (EngineType.mysql, EngineType.mariadb):
-            return stmt.replace("%", "%%")
-        return stmt
+        return stmt.replace("%", "%%")
 
     def execute_adhoc(
         self,
@@ -597,7 +600,7 @@ class MigrationRunner:
                     for i, stmt in enumerate(statements):
                         t0 = time.monotonic()
                         try:
-                            conn.exec_driver_sql(self._escape_percent(stmt, engine))
+                            conn.exec_driver_sql(self._escape_percent(stmt))
                             ms = int((time.monotonic() - t0) * 1000)
                             results.append(
                                 StatementResult(
