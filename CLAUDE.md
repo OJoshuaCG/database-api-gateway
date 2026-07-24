@@ -586,7 +586,12 @@ directo** ad-hoc (Opción B). Guía de uso: `docs/features/schema-comparison.md`
   ítem); (3) `ServerAdapter.render_diff(diff) -> list[RenderedStatement]` (DDL por dialecto).
 - **Endpoints** (`app/routes/v1/schema_comparisons.py`): `POST /schema-comparisons` (snapshotea
   ambas BDs, diffea, persiste), `GET /schema-comparisons/{id}` (resumen), `GET .../items`
-  (DDL paginado, dry-run obligatorio), `POST .../execute-preview` (resuelve modo/selección
+  (DDL paginado, dry-run obligatorio), `GET .../export` (descarga el diff como archivo
+  `.sql`: todas las entidades o solo `item_ids` seleccionados + filtros
+  `object_type`/`change_type` + `include_rollback`; NO usa `ApiResponse`, es file download;
+  solo lee ítems ya calculados → funciona igual para BDs adoptadas o crudas; envuelve
+  rutinas/triggers/events MySQL con `DELIMITER`; audita `schema_comparison.export`),
+  `POST .../execute-preview` (resuelve modo/selección
   de Opción B SIN ejecutar, devuelve el `confirm_token`), `POST .../adopt` (Opción A,
   requiere que el target esté en el inventario Y tenga `model_id`, reusa
   `ModelMigrationController.create_migration`), `POST .../execute` (Opción B, 409 si el

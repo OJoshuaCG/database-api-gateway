@@ -196,6 +196,7 @@ cuarentena, que sí lo tiene).
 | `POST` | `/api/v1/schema-comparisons` 🔌 | Body: para cada lado, `{source\|target}_database_id` **o** `{source\|target}_server_id` + `{source\|target}_database_name` (ver [Referencias crudas](#referencias-crudas-bds-sin-adoptar)). Valida motor compatible, snapshotea ambas BDs, corre el diff puro, renderiza el DDL para el motor del TARGET y persiste cabecera + ítems + fingerprints. Rate limit 10/min. |
 | `GET` | `/api/v1/schema-comparisons/{id}` | Resumen: `counts` (object_type → change_type → nº de objetos), `has_destructive`, `cross_flavor_warning`, `scope_note`, `expired`. |
 | `GET` | `/api/v1/schema-comparisons/{id}/items` | Detalle paginado con el **DDL exacto** (dry-run/preview obligatorio — nunca se ejecuta sin haberlo mostrado). Filtra por `object_type`/`change_type`. |
+| `GET` | `/api/v1/schema-comparisons/{id}/export` | **Descarga el diff como archivo `.sql`** (`Content-Disposition: attachment`, `application/sql`). Exporta TODAS las entidades por defecto, o solo las seleccionadas vía `item_ids` (repetible: `?item_ids=1&item_ids=2`), combinable con los filtros `object_type`/`change_type`. `include_rollback=true` anexa el `down_sql` sugerido (orden inverso) **comentado**. Solo lectura de los ítems ya calculados (no toca el motor ni valida fingerprint). Ver [Export a `.sql`](#export-a-sql). |
 | `POST` | `/api/v1/schema-comparisons/{id}/adopt` 🔌 | **Opción A.** Body `{selected_item_ids, name, description?, execute_immediately}`. `422` si el target no está en el inventario, o si lo está pero no tiene `model_id` (dos motivos distintos, mismo código). Reusa `ModelMigrationController.create_migration` (checksum, autoversión). `execute_immediately=true` aplica por el camino normal (`ManagedMigrationController.apply`, con todos sus guards). Rate limit 3/min. |
 | `POST` | `/api/v1/schema-comparisons/{id}/execute-preview` | Resuelve un `mode`/selección de Opción B **sin ejecutar nada**: devuelve las sentencias exactas + el `confirm_token` a reenviar. Solo lectura (no toca el motor). Ver [El `confirm_token`](#el-confirm_token-opción-b). |
 | `POST` | `/api/v1/schema-comparisons/{id}/execute` 🔌 | **Opción B.** Body `{mode: all\|all_except_destructive\|custom, selected_item_ids?, confirm_target_name, confirm_token}` + query `force` (cuarentena). `409` si el target TIENE `model_id` (usar `adopt`). Ejecuta con `MigrationRunner.execute_adhoc` (sin Alembic, sin tabla de versión). Rate limit 3/min. |
@@ -215,6 +216,32 @@ separadores) — ambos son detalles de implementación que pueden cambiar. Por e
 devuelve las sentencias resueltas + el `confirm_token` listo para reenviar tal cual en
 `POST .../execute`. Flujo esperado del cliente: `execute-preview` → mostrar
 confirmación al usuario → `execute` con el token recibido.
+
+## Export a `.sql`
+
+`GET /schema-comparisons/{id}/export` devuelve el DDL del diff como un archivo `.sql`
+descargable (`Content-Disposition: attachment`, `application/sql`, nombre
+`schema-diff-{id}-{target}.sql`). A diferencia del resto de endpoints **no** usa el
+envoltorio `ApiResponse` (es una descarga binaria/de archivo).
+
+- **Selección**: por defecto exporta **todas** las entidades del diff. Para exportar
+  solo algunas, `?item_ids=1&item_ids=2` (repetible). Combinable con los filtros
+  `object_type` y `change_type` (mismos que `/items`); el resultado son los ítems que
+  cumplen TODOS los filtros, ordenados por `seq` (orden de fase).
+- **Rollback**: `?include_rollback=true` anexa al final el `down_sql` sugerido (orden
+  inverso) **comentado** (nunca ejecutable por accidente) — pensado para revisión.
+- **Objetos con cuerpo** (rutinas/triggers/eventos) en MySQL/MariaDB se envuelven con
+  `DELIMITER $$ ... $$ DELIMITER ;` para que un cliente de línea de comandos no corte el
+  cuerpo en el primer `;` interno.
+- **Adoptadas o crudas, da igual**: solo LEE los ítems ya calculados (no toca el motor
+  ni valida fingerprint), así que funciona idéntico para una `ManagedDatabase` del
+  inventario o una BD cruda no registrada — el recurso ya está keyed por comparación.
+- **Auditoría**: registra `schema_comparison.export` (`touched_engine=False`), con el
+  nº de sentencias exportadas.
+- **Advertencia en la cabecera**: el archivo lleva un bloque de comentarios con los
+  metadatos (source/target/motores/snapshot) y una nota de que el DDL deriva de un
+  snapshot — hay que revisarlo antes de ejecutarlo (marca `[EXPIRADA]` si la comparación
+  ya venció).
 
 ## Flujo típico
 
