@@ -11,10 +11,13 @@ PostgreSQL (FK off real, tipos exóticos) queda para el script e2e.
 Convención de estilo: funciones pytest planas, sin clases (igual que test_schema_diff.py).
 """
 
+import os
+import re
 from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import create_engine
 
 from app.core.remote_engine import ServerTarget
@@ -24,7 +27,11 @@ from app.services.db_admin.data_copy import (
     TableCopySpec,
     _adapt_value,
     _build_insert,
+    _build_insert_from_staging,
     _build_select,
+    _escape_mysql_field,
+    _render_mysql_field,
+    _staging_name,
     copy_tables,
 )
 
@@ -183,7 +190,7 @@ def _setup_sqlite_env(monkeypatch, tmp_path, source_rows, *, create_dest_rows=No
     engines = {"srcdb": src_engine, "dstdb": dst_engine}
 
     @contextmanager
-    def fake_conn(target, database, *, bulk=False):
+    def fake_conn(target, database, *, bulk=False, mysql_local_infile=False):
         conn = engines[database].connect()
         try:
             yield conn
@@ -304,3 +311,512 @@ def test_no_pk_copies_without_order(monkeypatch, tmp_path):
     assert results[0].status == "applied"
     assert results[0].rows_copied == 2
     assert sorted(_dest_rows(engines)) == [(1, "a"), (2, "b")]
+
+
+# --------------------------------------------------------------------------- #
+# _resolve_writer (dispatch por dialecto real + capability-probe local_infile)#
+# --------------------------------------------------------------------------- #
+class _FakeDialect:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeShowVariablesResult:
+    def __init__(self, value):
+        self._value = value
+
+    def fetchone(self):
+        if self._value is None:
+            return None
+        return ("local_infile", self._value)
+
+
+class _FakeResolveConn:
+    """``dest_conn`` mínimo para ``_resolve_writer``: solo dialecto + probe de MySQL."""
+
+    def __init__(self, dialect_name, local_infile="ON"):
+        self.dialect = _FakeDialect(dialect_name)
+        self.local_infile = local_infile
+        self.exec_calls: list[str] = []
+
+    def exec_driver_sql(self, sql):
+        self.exec_calls.append(sql)
+        return _FakeShowVariablesResult(self.local_infile)
+
+
+def test_resolve_writer_postgres_dialect_uses_copy_writer():
+    conn = _FakeResolveConn("postgresql")
+    assert dc._resolve_writer(conn) is dc._copy_writer_postgres
+
+
+def test_resolve_writer_sqlite_dialect_falls_back_to_insert():
+    conn = _FakeResolveConn("sqlite")
+    assert dc._resolve_writer(conn) is dc._copy_writer_insert
+
+
+def test_resolve_writer_unmapped_dialect_falls_back_to_insert():
+    conn = _FakeResolveConn("oracle")
+    assert dc._resolve_writer(conn) is dc._copy_writer_insert
+
+
+def test_resolve_writer_mysql_local_infile_on_uses_load_data():
+    conn = _FakeResolveConn("mysql", local_infile="ON")
+    assert dc._resolve_writer(conn) is dc._copy_writer_mysql
+    assert any("local_infile" in c for c in conn.exec_calls)
+
+
+def test_resolve_writer_mysql_local_infile_off_falls_back_to_insert():
+    conn = _FakeResolveConn("mysql", local_infile="OFF")
+    assert dc._resolve_writer(conn) is dc._copy_writer_insert
+
+
+def test_resolve_writer_mysql_local_infile_fetchone_none_falls_back_to_insert():
+    # SHOW VARIABLES sin filas (motor/permiso raro): probe fail-closed -> legacy.
+    conn = _FakeResolveConn("mysql", local_infile=None)
+    assert dc._resolve_writer(conn) is dc._copy_writer_insert
+
+
+def test_resolve_writer_mysql_probe_error_falls_back_to_insert():
+    class _ErrorConn:
+        dialect = _FakeDialect("mysql")
+
+        def exec_driver_sql(self, sql):
+            from sqlalchemy.exc import SQLAlchemyError
+
+            raise SQLAlchemyError("boom")
+
+    assert dc._resolve_writer(_ErrorConn()) is dc._copy_writer_insert
+
+
+# --------------------------------------------------------------------------- #
+# Kill switch CLONE_BULK_COPY_ENABLED=False                                   #
+# --------------------------------------------------------------------------- #
+def test_kill_switch_disabled_skips_probe_and_forces_insert(monkeypatch):
+    monkeypatch.setattr(dc, "CLONE_BULK_COPY_ENABLED", False)
+
+    class _ExplodingConn:
+        dialect = _FakeDialect("mysql")
+
+        def exec_driver_sql(self, sql):
+            raise AssertionError("no debe probar local_infile con el kill switch off")
+
+    assert dc._resolve_writer(_ExplodingConn()) is dc._copy_writer_insert
+
+
+def test_kill_switch_disabled_forces_insert_for_postgres_too(monkeypatch):
+    monkeypatch.setattr(dc, "CLONE_BULK_COPY_ENABLED", False)
+    conn = _FakeResolveConn("postgresql")
+    assert dc._resolve_writer(conn) is dc._copy_writer_insert
+
+
+def test_kill_switch_enabled_by_default_uses_bulk_writer_for_postgres():
+    # Sanity: sin monkeypatch, el kill switch está en su default (True) y no interfiere.
+    assert dc.CLONE_BULK_COPY_ENABLED is True
+    conn = _FakeResolveConn("postgresql")
+    assert dc._resolve_writer(conn) is dc._copy_writer_postgres
+
+
+# --------------------------------------------------------------------------- #
+# _build_insert_from_staging (INSERT ... SELECT FROM staging, por dialecto)   #
+# --------------------------------------------------------------------------- #
+def test_staging_insert_plain_mysql():
+    sql = _build_insert_from_staging("mysql", _spec(upsert=False), "_gw_stg_abc123")
+    assert sql == "INSERT INTO `widget` (`id`, `name`) SELECT `id`, `name` FROM `_gw_stg_abc123`"
+
+
+def test_staging_insert_plain_postgres():
+    sql = _build_insert_from_staging("postgresql", _spec(upsert=False), "_gw_stg_abc123")
+    assert sql == (
+        'INSERT INTO "widget" ("id", "name") SELECT "id", "name" FROM "_gw_stg_abc123"'
+    )
+
+
+def test_staging_insert_upsert_mysql_on_duplicate_key():
+    sql = _build_insert_from_staging("mysql", _spec(upsert=True), "_gw_stg_abc123")
+    assert sql.startswith(
+        "INSERT INTO `widget` (`id`, `name`) SELECT `id`, `name` FROM `_gw_stg_abc123`"
+    )
+    assert sql.endswith("ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)")
+
+
+def test_staging_insert_upsert_mariadb_uses_backticks():
+    sql = _build_insert_from_staging("mariadb", _spec(upsert=True), "_gw_stg_abc123")
+    assert "`name` = VALUES(`name`)" in sql
+    assert sql.startswith("INSERT INTO `widget`")
+
+
+def test_staging_insert_upsert_postgres_on_conflict_do_update():
+    sql = _build_insert_from_staging("postgresql", _spec(upsert=True), "_gw_stg_abc123")
+    assert sql.endswith('ON CONFLICT ("id") DO UPDATE SET "name" = EXCLUDED."name"')
+
+
+def test_staging_insert_upsert_postgres_pk_only_do_nothing():
+    sql = _build_insert_from_staging(
+        "postgresql", _spec(columns=["id"], pk=["id"], upsert=True), "_gw_stg_abc123"
+    )
+    assert sql.endswith('ON CONFLICT ("id") DO NOTHING')
+
+
+def test_staging_insert_upsert_mysql_pk_only_insert_ignore():
+    sql = _build_insert_from_staging(
+        "mysql", _spec(columns=["id"], pk=["id"], upsert=True), "_gw_stg_abc123"
+    )
+    assert sql.startswith("INSERT IGNORE INTO `widget`")
+    assert "SELECT `id` FROM `_gw_stg_abc123`" in sql
+
+
+def test_staging_insert_without_pk_forces_plain_select():
+    for engine in ("mysql", "mariadb", "postgresql"):
+        sql = _build_insert_from_staging(engine, _spec(pk=[], upsert=True), "_gw_stg_abc123")
+        assert "ON CONFLICT" not in sql
+        assert "ON DUPLICATE KEY" not in sql
+        assert "IGNORE" not in sql
+        assert sql.startswith("INSERT INTO")
+        assert "SELECT" in sql
+
+
+def test_staging_insert_composite_pk_upsert_postgres():
+    sql = _build_insert_from_staging(
+        "postgresql", _spec(columns=["a", "b", "v"], pk=["a", "b"], upsert=True), "_gw_stg_xyz"
+    )
+    assert 'ON CONFLICT ("a", "b") DO UPDATE SET "v" = EXCLUDED."v"' in sql
+    assert 'SELECT "a", "b", "v" FROM "_gw_stg_xyz"' in sql
+
+
+# --------------------------------------------------------------------------- #
+# _render_mysql_field / _escape_mysql_field (serialización LOAD DATA)         #
+# --------------------------------------------------------------------------- #
+def test_render_mysql_field_none_is_literal_null():
+    assert _render_mysql_field(None) == b"\\N"
+
+
+def test_render_mysql_field_bool_as_0_or_1():
+    assert _render_mysql_field(True) == b"1"
+    assert _render_mysql_field(False) == b"0"
+
+
+def test_render_mysql_field_scalars_use_str_repr():
+    assert _render_mysql_field(42) == b"42"
+    assert _render_mysql_field(3.5) == b"3.5"
+
+
+def test_render_mysql_field_str_escapes_tab_newline_cr():
+    assert _render_mysql_field("a\tb\nc\rd") == b"a\\tb\\nc\\rd"
+
+
+def test_render_mysql_field_backslash_escaped_before_tab_no_double_escape():
+    # Un backslash Y un tab REALES en el mismo valor: cada uno se escapa una sola vez
+    # (si el orden fuera al revés, el tab ya escapado a "\t" literal se re-escaparía
+    # el backslash recién insertado, corrompiendo el campo).
+    assert _render_mysql_field("a\\b\tc") == b"a\\\\b\\tc"
+
+
+def test_render_mysql_field_literal_backslash_t_sequence_not_read_as_tab():
+    # La secuencia de 2 caracteres backslash+"t" (NO un tab real, value as-is) debe
+    # quedar como backslash-escapado + "t" literal, nunca colapsar a un solo "\t".
+    assert _render_mysql_field("\\t") == b"\\\\t"
+
+
+def test_render_mysql_field_bytes_raw_passthrough_when_no_special_chars():
+    assert _render_mysql_field(b"\x00\x01\x02") == b"\x00\x01\x02"
+
+
+def test_render_mysql_field_bytearray_and_memoryview_escaped():
+    assert _render_mysql_field(bytearray(b"a\tb")) == b"a\\tb"
+    assert _render_mysql_field(memoryview(b"a\nb")) == b"a\\nb"
+
+
+def test_escape_mysql_field_order_backslash_before_tab():
+    raw = b"\\" + b"\t"  # un backslash real seguido de un tab real
+    assert _escape_mysql_field(raw) == b"\\" + b"\\" + b"\\" + b"t"
+
+
+# --------------------------------------------------------------------------- #
+# _staging_name                                                               #
+# --------------------------------------------------------------------------- #
+def test_staging_name_passes_validate_identifier_mysql_and_postgres():
+    from app.services.db_admin.identifiers import validate_identifier
+
+    name = _staging_name()
+    validate_identifier(name, "mysql")
+    validate_identifier(name, "postgresql")
+
+
+def test_staging_name_generates_distinct_names():
+    assert _staging_name() != _staging_name()
+
+
+# --------------------------------------------------------------------------- #
+# LOAD DATA vía FIFO: coordinación real de hilos, SIN servidor MySQL           #
+# --------------------------------------------------------------------------- #
+# Nota de alcance: estos fakes simulan el LADO LECTOR del FIFO (lo que en producción
+# hace pymysql dentro de ``cur.execute(LOAD DATA ...)``) abriéndolo ellos mismos, para
+# ejercer la coordinación de hilos real de ``_load_data_via_fifo``/``_copy_writer_mysql``
+# (open bloqueante en escritura hasta que este lado abre en lectura). Se mantienen
+# SIMPLIFICADOS a propósito: los valores usados en estos tests no llevan
+# backslash/tab/newline, así que decodificar utf-8 directo alcanza para reconstruir las
+# filas (el unescape byte a byte completo ya está cubierto arriba por los tests puros de
+# ``_render_mysql_field``/``_escape_mysql_field``). NO se ejercita contra un motor MySQL
+# real (fuera del alcance de este entorno sin Docker) -- ver script e2e de clonado para
+# esa verificación.
+def test_load_data_via_fifo_transmits_rows_in_order_across_threads():
+    received: list[list[bytes]] = []
+
+    class _FifoReaderConn:
+        def exec_driver_sql(self, sql):
+            m = re.search(r"LOAD DATA LOCAL INFILE '([^']+)'", sql)
+            assert m, f"SQL inesperado: {sql}"
+            path = m.group(1)
+            with open(path, "rb") as fh:
+                for line in fh:
+                    received.append(line.rstrip(b"\n").split(b"\t"))
+            return None
+
+    rows = [(1, "a"), (2, "b"), (3, "c")]
+    dc._load_data_via_fifo(
+        dest_conn=_FifoReaderConn(),
+        load_target="`widget`",
+        cols_q="`id`, `name`",
+        table="widget",
+        rows_iter=iter(rows),
+        batch_rows=1000,
+        progress_cb=None,
+        cancel_cb=None,
+        counter=[0],
+    )
+
+    assert received == [[b"1", b"a"], [b"2", b"b"], [b"3", b"c"]]
+
+
+def test_load_data_via_fifo_engine_error_propagates_and_cleans_up_fifo(tmp_path):
+    class _FailingConn:
+        def exec_driver_sql(self, sql):
+            raise RuntimeError("1146: Table 'x.does_not_exist' doesn't exist")
+
+    with pytest.raises(RuntimeError, match="does_not_exist"):
+        dc._load_data_via_fifo(
+            dest_conn=_FailingConn(),
+            load_target="`does_not_exist`",
+            cols_q="`id`, `name`",
+            table="does_not_exist",
+            rows_iter=iter([(1, "a")]),
+            batch_rows=1000,
+            progress_cb=None,
+            cancel_cb=None,
+            counter=[0],
+        )
+    # El escritor bloqueado en open('wb') se desbloquea y el FIFO se limpia (no queda
+    # huérfano en /dev/shm ni en el tmpdir).
+    leftover = [p for p in os.listdir(dc._fifo_dir()) if p.startswith("gw_clone_")]
+    assert leftover == []
+
+
+# --------------------------------------------------------------------------- #
+# Regresión: staging con PK aunque upsert=False (conflicto detectado en FINAL) #
+# --------------------------------------------------------------------------- #
+class _FakeMySQLDestConn:
+    """
+    Fake mínimo que ejecuta ``_copy_writer_mysql`` completo (CREATE TEMPORARY TABLE,
+    LOAD DATA LOCAL INFILE vía FIFO -- incluyendo el lado lector, como pymysql --,
+    INSERT ... SELECT, DROP TEMPORARY TABLE) contra tablas en memoria. Simplificado
+    igual que los fakes de arriba: sin backslash/tab/newline en los valores de prueba.
+    """
+
+    def __init__(self, final_rows, *, pk_index=0):
+        self.tables: dict[str, list[tuple]] = {"widget": list(final_rows)}
+        self._pk_index = pk_index
+
+    def exec_driver_sql(self, sql):
+        m = re.match(r"CREATE TEMPORARY TABLE `([^`]+)` LIKE `([^`]+)`", sql)
+        if m:
+            self.tables[m.group(1)] = []
+            return None
+
+        m = re.match(r"DROP TEMPORARY TABLE IF EXISTS `([^`]+)`", sql)
+        if m:
+            self.tables.pop(m.group(1), None)
+            return None
+
+        m = re.match(
+            r"LOAD DATA LOCAL INFILE '([^']+)' INTO TABLE `([^`]+)` FIELDS.*\(([^)]+)\)$",
+            sql,
+        )
+        if m:
+            path, target = m.group(1), m.group(2)
+            self.tables.setdefault(target, [])
+            with open(path, "rb") as fh:
+                for line in fh:
+                    fields = line.rstrip(b"\n").split(b"\t")
+                    row = tuple(
+                        None if f == b"\\N" else f.decode("utf-8") for f in fields
+                    )
+                    self.tables[target].append(row)
+            return None
+
+        m = re.match(
+            r"^INSERT (?:IGNORE )?INTO `([^`]+)` \([^)]+\) SELECT [^)]+ FROM `([^`]+)`", sql
+        )
+        if m:
+            final, stg = m.group(1), m.group(2)
+            has_on_duplicate_update = "ON DUPLICATE KEY UPDATE" in sql
+            is_ignore = sql.startswith("INSERT IGNORE")
+            for row in self.tables.get(stg, []):
+                rows = self.tables[final]
+                conflict_idx = next(
+                    (i for i, r in enumerate(rows) if r[self._pk_index] == row[self._pk_index]),
+                    None,
+                )
+                if conflict_idx is None:
+                    rows.append(row)
+                elif has_on_duplicate_update:
+                    rows[conflict_idx] = row
+                elif is_ignore:
+                    pass  # INSERT IGNORE: conflicto silenciado, fila descartada
+                else:
+                    raise RuntimeError(
+                        f"1062: Duplicate entry '{row[self._pk_index]}' for key 'PRIMARY'"
+                    )
+            return None
+
+        raise AssertionError(f"SQL no reconocido por _FakeMySQLDestConn: {sql!r}")
+
+
+def test_mysql_writer_stages_with_pk_even_without_upsert_and_fails_on_final_conflict():
+    """
+    Regresión del fix ``use_staging = bool(spec.primary_key)`` (antes solo se activaba
+    con ``upsert=True``): con PK y upsert=False, una fila que colisiona en la tabla
+    FINAL (nunca en la staging, que siempre nace vacía) debe hacer fallar el
+    ``INSERT ... SELECT`` final. Antes del fix, cargar directo a la final con LOAD DATA
+    LOCAL habría hecho IGNORE silencioso del duplicado (comportamiento fijo de LOCAL en
+    MySQL, sin sintaxis para abortar a mitad de archivo) -- divergiendo del INSERT
+    legacy, que sí falla con ER_DUP_ENTRY.
+    """
+    conn = _FakeMySQLDestConn(final_rows=[("1", "orig")])
+    spec = _spec(upsert=False)  # primary_key=["id"], upsert=False
+
+    with pytest.raises(RuntimeError, match="Duplicate entry"):
+        dc._copy_writer_mysql(
+            conn, "mysql", spec, iter([("1", "new")]), 1000, None, None, [0]
+        )
+
+    # La final no cambió (el conflicto abortó el INSERT...SELECT) y la staging se
+    # limpió en el finally (no queda ninguna tabla temporal huérfana).
+    assert conn.tables["widget"] == [("1", "orig")]
+    assert not any(name.startswith("_gw_stg_") for name in conn.tables)
+
+
+def test_mysql_writer_staging_upsert_resolves_final_conflict():
+    # Mismo escenario que el anterior, pero con upsert=True: el ON DUPLICATE KEY UPDATE
+    # debe absorber el conflicto en la final (actualizar) en vez de fallar la tabla.
+    conn = _FakeMySQLDestConn(final_rows=[("1", "orig")])
+    spec = _spec(upsert=True)
+
+    dc._copy_writer_mysql(conn, "mysql", spec, iter([("1", "new")]), 1000, None, None, [0])
+
+    assert conn.tables["widget"] == [("1", "new")]
+    assert not any(name.startswith("_gw_stg_") for name in conn.tables)
+
+
+
+# --------------------------------------------------------------------------- #
+# B1 -- guard anti "rogue MySQL server" en LOAD DATA LOCAL INFILE             #
+# --------------------------------------------------------------------------- #
+# Añadido concurrentemente a este trabajo de QA (ver el guard nuevo en
+# ``data_copy.py``): pymysql, con ``local_infile=True``, abre y envía CUALQUIER archivo
+# que el SERVIDOR pida en respuesta al LOAD_LOCAL request -- no necesariamente el que el
+# gateway puso en su SQL. Un servidor MySQL comprometido podría pedir `.env`/la clave
+# Fernet. El guard parchea ``MySQLResult._read_load_local_packet`` para rechazar
+# cualquier filename que no coincida EXACTO con el FIFO esperado (thread-local, armado
+# solo durante la ventana del ``exec_driver_sql(LOAD DATA)``).
+#
+# El unit-test directo de ``_guarded_read_load_local_packet`` (rechazo sin ventana armada,
+# rechazo por filename distinto, aceptación con match exacto, verificación del parche
+# instalado en la clase) YA está cubierto en ``tests/test_load_local_guard.py`` -- no lo
+# duplicamos aquí. Lo que SÍ agregamos, porque no está en ese archivo: (1) que el mensaje
+# de error no filtra el path que pidió el "servidor" atacante, y (2) la integración real
+# con ``_load_data_via_fifo`` -- que el thread-local queda ARMADO solo durante la ventana
+# del ``exec_driver_sql`` y DESARMADO después, tanto en éxito como en fallo del motor.
+def test_guard_error_message_does_not_leak_requested_path():
+    from pymysql.err import OperationalError
+
+    class _FakeLoadLocalPacket:
+        def __init__(self, filename: bytes):
+            self._filename = filename
+
+        def is_load_local_packet(self):
+            return True
+
+        def get_all_data(self):
+            return b"\xfb" + self._filename
+
+    dc._expected_local_infile_path.path = "/dev/shm/gw_clone_expected.tsv"
+    try:
+        packet = _FakeLoadLocalPacket(b"/etc/shadow")
+        with pytest.raises(OperationalError) as exc_info:
+            dc._guarded_read_load_local_packet(None, packet)
+        assert "/etc/shadow" not in str(exc_info.value)
+    finally:
+        dc._expected_local_infile_path.path = None
+
+
+def test_load_data_via_fifo_arms_guard_only_during_engine_call():
+    captured = {}
+
+    class _CapturingConn:
+        def exec_driver_sql(self, sql):
+            captured["armed_path"] = getattr(dc._expected_local_infile_path, "path", None)
+            # Simula lo que hace pymysql: abre el FIFO para lectura y lo drena hasta EOF.
+            m = re.search(r"LOAD DATA LOCAL INFILE '([^']+)'", sql)
+            with open(m.group(1), "rb") as fh:
+                fh.read()
+            return None
+
+    dc._load_data_via_fifo(
+        dest_conn=_CapturingConn(),
+        load_target="`widget`",
+        cols_q="`id`, `name`",
+        table="widget",
+        rows_iter=iter([(1, "a")]),
+        batch_rows=1000,
+        progress_cb=None,
+        cancel_cb=None,
+        counter=[0],
+    )
+
+    assert captured["armed_path"] is not None
+    assert captured["armed_path"].startswith(dc._fifo_dir())
+    # Fail-closed: desarmado fuera de la ventana del exec_driver_sql.
+    assert getattr(dc._expected_local_infile_path, "path", None) is None
+
+
+def test_load_data_via_fifo_disarms_guard_even_on_engine_error():
+    class _FailingConn:
+        def exec_driver_sql(self, sql):
+            raise RuntimeError("1146: Table 'x.does_not_exist' doesn't exist")
+
+    with pytest.raises(RuntimeError):
+        dc._load_data_via_fifo(
+            dest_conn=_FailingConn(),
+            load_target="`widget`",
+            cols_q="`id`, `name`",
+            table="widget",
+            rows_iter=iter([(1, "a")]),
+            batch_rows=1000,
+            progress_cb=None,
+            cancel_cb=None,
+            counter=[0],
+        )
+    assert getattr(dc._expected_local_infile_path, "path", None) is None
+
+
+def test_mysql_writer_no_pk_skips_staging_entirely():
+    # Sin PK no hay concepto de conflicto: carga directo a la final, sin staging.
+    conn = _FakeMySQLDestConn(final_rows=[])
+    spec = _spec(pk=[], upsert=False)
+
+    dc._copy_writer_mysql(
+        conn, "mysql", spec, iter([("1", "a"), ("2", "b")]), 1000, None, None, [0]
+    )
+
+    assert sorted(conn.tables["widget"]) == [("1", "a"), ("2", "b")]
+    assert not any(name.startswith("_gw_stg_") for name in conn.tables)

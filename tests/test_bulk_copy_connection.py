@@ -47,11 +47,52 @@ def test_bulk_zero_means_unlimited(monkeypatch):
 def test_engine_cache_key_separates_bulk_from_interactive():
     # bulk y no-bulk deben cachearse por separado (distinto timeout).
     assert re.get_engine.__doc__ is not None  # sanity
-    # La clave incluye el flag bulk (3-tupla): construir ambas no colisiona.
-    # Verificado indirectamente por la firma; aquí solo garantizamos que acepta el kwarg.
+    # La clave incluye los flags bulk y mysql_local_infile (4-tupla): no colisionan.
     import inspect
     sig = inspect.signature(re.get_engine)
     assert "bulk" in sig.parameters
+    assert "mysql_local_infile" in sig.parameters
+
+
+# --------------------------------------------------------------------------- #
+# local_infile DESACOPLADO de bulk (B1): solo la conexión de ESCRITURA lo pide  #
+# --------------------------------------------------------------------------- #
+def test_bulk_alone_does_not_enable_local_infile():
+    # bulk=True SIN el flag dedicado NO debe habilitar local_infile (la lectura del origen
+    # del clon es bulk pero solo hace SELECT: no debe exponer la superficie LOAD LOCAL).
+    assert "local_infile" not in re._connect_args("mysql", "disable", bulk=True)
+    assert "local_infile" not in re._connect_args("mariadb", "disable", bulk=True)
+
+
+def test_interactive_never_enables_local_infile():
+    assert "local_infile" not in re._connect_args("mysql", "disable")
+    assert "local_infile" not in re._connect_args("mysql", "disable", mysql_local_infile=False)
+
+
+def test_mysql_local_infile_flag_enables_it():
+    args = re._connect_args("mysql", "disable", bulk=True, mysql_local_infile=True)
+    assert args["local_infile"] is True
+    # Sin bulk también puede pedirse (independientes), aunque el clon lo usa junto a bulk.
+    assert re._connect_args("mariadb", "disable", mysql_local_infile=True)["local_infile"] is True
+
+
+def test_postgres_ignores_local_infile_flag():
+    # El flag es específico de la rama mysql/mariadb; en PG no debe romper ni aparecer.
+    args = re._connect_args("postgresql", "disable", bulk=True, mysql_local_infile=True)
+    assert "local_infile" not in args
+
+
+def test_engine_cache_key_separates_local_infile():
+    t = re.ServerTarget(
+        server_id=999, dialect="mysql", host="10.0.0.9", port=3306,
+        admin_user="root", admin_password="x",
+    )
+    # Nota: no conecta (NullPool difiere la conexión); solo verifica el cacheo por clave.
+    e_plain = re.get_engine(t, "db", bulk=True)
+    e_infile = re.get_engine(t, "db", bulk=True, mysql_local_infile=True)
+    assert e_plain is not e_infile  # distinto flag => engine distinto
+    assert re.get_engine(t, "db", bulk=True, mysql_local_infile=True) is e_infile  # se cachea
+    re.invalidate_server(999)
 
 
 class _FakeConn:
