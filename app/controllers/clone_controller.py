@@ -23,6 +23,9 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.controllers.schema_comparison_controller import _synthetic_lock_key
 from app.core.database import Database
@@ -36,7 +39,7 @@ from app.core.environments import (
     DB_USER,
 )
 from app.core.logger import get_logger
-from app.core.remote_engine import ServerTarget
+from app.core.remote_engine import ServerTarget, database_connection
 from app.exceptions import AppHttpException
 from app.models.clone_job import (
     CLONE_CLEAN_DROP_DATABASE,
@@ -68,6 +71,7 @@ from app.services.db_admin import clone_dependencies as cdeps
 from app.services.db_admin.data_copy import TableCopySpec, copy_tables
 from app.services.db_admin.dtos import SchemaSnapshot
 from app.services.db_admin.factory import get_adapter
+from app.services.db_admin.identifiers import quote_identifier, validate_identifier
 from app.services.db_admin.migrations import MigrationRunner
 from app.services.db_admin.schema_diff import diff_snapshots
 
@@ -720,6 +724,69 @@ class CloneController:
         return warnings
 
     @staticmethod
+    def _resync_postgres_identity_sequences(
+        tgt_target: ServerTarget,
+        target_db: str,
+        source_snap: SchemaSnapshot,
+        results: list,
+    ) -> None:
+        """
+        MySQL/InnoDB ajusta AUTO_INCREMENT solo al insertar un valor explícito mayor al
+        contador actual (no requiere ningún paso nuestro). PostgreSQL NO hace eso: ni un
+        ``INSERT ... OVERRIDING SYSTEM VALUE`` ni un ``COPY`` (que es como este módulo
+        escribe los datos) avanzan la secuencia asociada a una columna
+        ``GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY`` — queda en su valor inicial. El
+        primer ``INSERT`` real de la aplicación que dependa del default/identity para
+        generar un ID coincidiría con una fila ya clonada → choque de PK. Confirmado
+        contra la documentación oficial de PostgreSQL (``pg_get_serial_sequence`` funciona
+        también para columnas IDENTITY, no solo ``serial``).
+
+        Se apoya en el snapshot del ORIGEN (mismo criterio que ``_autoincrement_pk_warnings``)
+        para saber qué columnas son identity — asume que el destino las espeja (cierto en
+        ``target_mode=new``; aproximación razonable en ``target_mode=existing``).
+
+        Best-effort por tabla/columna: un fallo aquí NO revierte los datos ya copiados
+        (que son correctos) ni marca el job como fallido — solo se loguea. Solo corre para
+        tablas con ``status='applied'`` y al menos una fila copiada (una tabla vacía no
+        mueve la secuencia, y ``MAX(col)`` sobre 0 filas sería ``NULL``).
+        """
+        tables_by_name = {t.table: t for t in source_snap.tables}
+        applied_tables = {r.table for r in results if r.status == "applied" and r.rows_copied > 0}
+        if not applied_tables:
+            return
+        with database_connection(tgt_target, target_db) as conn:
+            conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+            for table_name in applied_tables:
+                table = tables_by_name.get(table_name)
+                if table is None:
+                    continue
+                for col in table.columns:
+                    if col.identity is None:
+                        continue
+                    col_q = quote_identifier(
+                        validate_identifier(col.name, "postgresql", "columna", allow_existing=True),
+                        "postgresql",
+                    )
+                    table_q = quote_identifier(
+                        validate_identifier(table.table, "postgresql", "tabla", allow_existing=True),
+                        "postgresql",
+                    )
+                    try:
+                        conn.execute(
+                            text(
+                                "SELECT setval(pg_get_serial_sequence(:t, :c), "
+                                f"(SELECT MAX({col_q}) FROM {table_q}), true)"
+                            ),
+                            {"t": table.table, "c": col.name},
+                        )
+                    except SQLAlchemyError:
+                        logger.warning(
+                            "Clon: no se pudo resincronizar la secuencia de %s.%s "
+                            "(los datos ya copiados no se ven afectados).",
+                            table_name, col.name,
+                        )
+
+    @staticmethod
     def _requalify_body(sql: str, source_db: str, target_db: str, tgt_engine: str) -> str:
         """
         Re-califica el esquema en el cuerpo de un objeto (vista/rutina/trigger/evento).
@@ -1248,6 +1315,10 @@ class CloneController:
             if any(r.status == "canceled" for r in results):
                 self._set_status(job_id, CLONE_STATUS_CANCELED, phase="data", finished=True)
                 return
+            if ctx["target_engine"] == "postgresql":
+                self._resync_postgres_identity_sequences(
+                    tgt_target, ctx["target_db"], source_snap, results,
+                )
 
         # --- Fase: adopt ------------------------------------------------------------- #
         if not had_failure and plan.will_adopt:
