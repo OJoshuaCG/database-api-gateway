@@ -510,6 +510,25 @@ uv remove <paquete>
 uv sync
 ```
 
+## Ejecución de tests (pytest) — NO por defecto
+
+**Nunca ejecutes `pytest`** (ni acotado a un archivo/módulo, ni la suite completa) como parte
+de tu propio flujo de verificación — ni el agente principal ni ningún subagente delegado. La
+suite completa (`tests/`, ~690 tests) tarda varios minutos en este entorno (I/O lento de WSL2
+sobre `/mnt/`) y correrla como "chequeo automático" tras cada cambio genera carga real en la
+máquina del usuario sin que se haya pedido.
+
+- Corré `pytest` **únicamente** si el usuario lo pide explícitamente en su mensaje (p. ej.
+  "corré los tests", "verificá con pytest", "correr la suite", "confirmá que no rompiste
+  nada con los tests").
+- Si delegás una tarea a un subagente, **no le indiques que corra tests** salvo que el
+  usuario lo haya pedido para esa tarea puntual — no lo agregues "por las dudas" ni como
+  buena práctica genérica.
+- En su lugar, verificá un cambio por otros medios: lectura cuidadosa del diff,
+  `python -c "import ast; ast.parse(...)"` o compilación cuando aplique, revisión manual de
+  la lógica. Sé explícito en tu respuesta sobre qué quedó **sin verificar** por esta razón,
+  para que el usuario decida si quiere correr los tests él mismo o pedírtelo.
+
 ## Módulo de Migraciones de Blueprints (Plan 02)
 
 Sistema de **migraciones versionadas de blueprints** (`DatabaseModel`): el admin sube
@@ -848,4 +867,4 @@ limiter = Limiter(
 
 ---
 
-**Nota para Agentes**: Mantén consistencia con la arquitectura existente. Todo endpoint debe usar `ApiResponse[T]`. Todo error controlado debe usar `AppHttpException`. Consulta `docs/` para detalles de cada feature.
+**Nota para Agentes**: Mantén consistencia con la arquitectura existente. Todo endpoint debe usar `ApiResponse[T]`. Todo error controlado debe usar `AppHttpException`. Consulta `docs/` para detalles de cada feature. **No ejecutes `pytest` salvo pedido explícito del usuario** (ver "Ejecución de tests (pytest) — NO por defecto" más arriba).
