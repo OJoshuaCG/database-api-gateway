@@ -546,6 +546,41 @@ class MigrationRunner:
         """
         return stmt.replace("%", "%%")
 
+    @staticmethod
+    def _toggle_fk_checks(conn, engine: EngineType, *, enabled: bool) -> None:
+        """
+        Activa/desactiva el chequeo de FKs para la SESIÓN de destino. MySQL/MariaDB usan
+        ``FOREIGN_KEY_CHECKS``; PostgreSQL ``session_replication_role`` ('replica' apaga
+        triggers/FKs, requiere pseudo-root). Mismo mecanismo que
+        ``data_copy.py::_set_fk_enforcement`` para la fase de DATOS del clon — aquí se usa
+        para la fase de LIMPIEZA (DROP objeto por objeto, ``clean_mode=objects``).
+
+        El orden topológico inverso de los DROP (``schema_diff.py::order_diff_items``,
+        ``_table_dep_order``) ya cubre el caso normal (tabla hija con FK antes que la
+        tabla padre), pero por construcción NO puede ver: (1) una FK desde una tabla de
+        OTRA base de datos del mismo servidor hacia una tabla de la BD que se limpia (el
+        snapshot es de una sola BD) — el candidato más probable dado
+        ``(1451, 'Cannot delete or update a parent row...')`` en un DROP TABLE aislado; ni
+        (2) un ciclo de FKs dentro de la misma BD (el fallback de ``_table_dep_order`` no
+        garantiza orden drop-safe). Desactivar los checks durante la limpieza cubre ambos
+        casos sin necesitar ver el resto del servidor. Best-effort: si el SET falla (motor
+        sin soporte, o el pseudo-root de PostgreSQL sin permiso), se ignora — el orden
+        topológico sigue siendo la garantía primaria para el caso común.
+        """
+        if engine in (EngineType.mysql, EngineType.mariadb):
+            sql = "SET FOREIGN_KEY_CHECKS=1" if enabled else "SET FOREIGN_KEY_CHECKS=0"
+        elif engine == EngineType.postgresql:
+            sql = (
+                "SET session_replication_role = 'origin'" if enabled
+                else "SET session_replication_role = 'replica'"
+            )
+        else:
+            return
+        try:
+            conn.exec_driver_sql(sql)
+        except SQLAlchemyError:
+            pass
+
     def execute_adhoc(
         self,
         target: ServerTarget,
@@ -556,6 +591,7 @@ class MigrationRunner:
         statements: list[str],
         already_locked: bool = False,
         stop_on_error: bool = True,
+        disable_fk_checks: bool = False,
     ) -> list[StatementResult]:
         """
         Ejecuta ``statements`` DDL directamente sobre la BD destino, UNA por una,
@@ -567,6 +603,12 @@ class MigrationRunner:
         reintento diferido: los que fallan por una dependencia aún no creada se reintentan
         en la pasada siguiente. Cada sentencia es autónoma (AUTOCOMMIT), así que un fallo
         no deja una transacción a medias.
+
+        ``disable_fk_checks=True``: desactiva el chequeo de FKs de la sesión antes de
+        ejecutar y lo restaura al final (ver ``_toggle_fk_checks``). Lo usa el clon para
+        la fase de limpieza (``clean_mode=objects``): el orden topológico inverso de los
+        DROP ya cubre el caso normal, esto es defensa en profundidad para FKs
+        cross-database o ciclos que el snapshot de una sola BD no puede ver.
 
         ``lock_key`` es la clave del advisory lock por BD: para una BD gestionada es su
         ``managed_database_id`` (positivo, comparte lock con ``apply``/``rollback`` de esa
@@ -596,6 +638,8 @@ class MigrationRunner:
                 conn = conn.execution_options(isolation_level="AUTOCOMMIT")
                 if not already_locked:
                     self._acquire_lock(conn, engine, lock_key)
+                if disable_fk_checks:
+                    self._toggle_fk_checks(conn, engine, enabled=False)
                 try:
                     for i, stmt in enumerate(statements):
                         t0 = time.monotonic()
@@ -633,6 +677,8 @@ class MigrationRunner:
                             if stop_on_error:
                                 break  # no continuar tras un fallo (posible estado parcial)
                 finally:
+                    if disable_fk_checks:
+                        self._toggle_fk_checks(conn, engine, enabled=True)
                     if not already_locked:
                         self._release_lock(conn, engine, lock_key)
         except AppHttpException:

@@ -1123,9 +1123,12 @@ class CloneController:
                                              executed_at=_utcnow())])
             seq += 1
         elif ctx["clean_mode"] == CLONE_CLEAN_OBJECTS and plan.clean_statements:
+            # disable_fk_checks: el orden topológico inverso de los DROP (schema_diff.py)
+            # cubre el caso normal, pero no puede ver una FK desde OTRA base de datos del
+            # mismo servidor (fuera del snapshot) ni un ciclo de FKs — defensa en profundidad.
             seq, failed = self._run_statements(
                 job_id, runner, tgt_target, ctx["target_db"], engine, lock_key,
-                plan.clean_statements, CLONE_ITEM_CLEAN, seq,
+                plan.clean_statements, CLONE_ITEM_CLEAN, seq, disable_fk_checks=True,
             )
             had_failure = had_failure or failed
 
@@ -1255,13 +1258,14 @@ class CloneController:
             session.close()
 
     def _run_statements(self, job_id, runner, tgt_target, db_name, engine, lock_key,
-                        statements: list, kind: str, seq: int) -> tuple[int, bool]:
+                        statements: list, kind: str, seq: int,
+                        *, disable_fk_checks: bool = False) -> tuple[int, bool]:
         """Ejecuta una lista de _StructStmt vía execute_adhoc y registra el resultado por ítem.
         ``already_locked=True``: el pipeline ya sostiene el advisory lock (no re-adquirir)."""
         sqls = [s.sql for s in statements]
         results = runner.execute_adhoc(
             tgt_target, db_name=db_name, engine=engine, lock_key=lock_key, statements=sqls,
-            already_locked=True,
+            already_locked=True, disable_fk_checks=disable_fk_checks,
         )
         by_index = {r.index: r for r in results}
         rows = []
