@@ -889,7 +889,12 @@ class MySQLAdapter(ServerAdapter):
         # motor). Si la PK/UNIQUE inline no la cubre —origen con PK compuesta
         # heredada donde el autoincrement no encabeza la clave— agregamos una
         # KEY de apoyo: no cambia la PK ni ningún otro objeto, solo satisface
-        # el requisito del motor.
+        # el requisito del motor. Nombre EXPLÍCITO con prefijo ``_gw_`` (mismo
+        # patrón que ``_gw_v_``/``_gw_stg_`` en otros módulos): sin nombre,
+        # MySQL/MariaDB la auto-nombra igual que la columna (``id``) — si el
+        # origen YA tiene un índice real sobre esa columna (con ese mismo
+        # nombre auto-asignado), la sentencia posterior que lo recrea en el
+        # destino choca con ``1061 Duplicate key name``.
         auto_col = next((c.name for c in tbl.columns if c.autoincrement), None)
         if auto_col:
             leads_pk = bool(tbl.primary_key) and tbl.primary_key[0] == auto_col
@@ -897,7 +902,8 @@ class MySQLAdapter(ServerAdapter):
                 uc.columns and uc.columns[0] == auto_col for uc in tbl.unique_constraints
             )
             if not leads_pk and not leads_unique:
-                lines.append(f"KEY ({self._q(auto_col, 'columna')})")
+                key_name = self._q(f"_gw_autoinc_{auto_col}"[:64], "indice")
+                lines.append(f"KEY {key_name} ({self._q(auto_col, 'columna')})")
         body = ",\n  ".join(lines)
         sql = f"CREATE TABLE {self._q(tbl.table, 'tabla')} (\n  {body}\n)"
         opts = tbl.storage_options
