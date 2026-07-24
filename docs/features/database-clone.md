@@ -145,6 +145,24 @@ el operador lo vea antes de ejecutar, no solo leyendo el DDL en `GET .../items`.
 ya trae un índice "real" sobre esa columna, puede quedar una redundancia inofensiva (dos
 índices sobre la misma columna) — preferible a que el clon completo falle.
 
+## `%` literal en el DDL ejecutado (MySQL/MariaDB)
+
+`MigrationRunner.execute_adhoc` (usado por el clon y por la ejecución ad-hoc de
+schema-comparisons) ejecuta cada sentencia con `conn.exec_driver_sql(stmt)`, sin bind
+params — deliberado para no romper `::` de PostgreSQL (`text()` lo malinterpretaría como
+bind param). Pero **pymysql** (paramstyle `format`) hace `cursor.execute(query, args)` →
+`query % args` **siempre** que `args` no sea `None`, y SQLAlchemy distila un `parameters`
+ausente a una tupla vacía `()` antes de llegar al DBAPI — es decir, `args` NUNCA es `None`
+en este camino. Cualquier `%` **literal** en el DDL (una columna `GENERATED ALWAYS AS
+(id % 10)`, un `CHECK`/`DEFAULT` o el cuerpo de una vista/rutina con `LIKE '%...%'` o
+`DATE_FORMAT(..., '%Y-%m-%d')`) revienta con `ValueError: unsupported format character`
+al ejecutarse, aunque el DDL sea perfectamente válido para el motor.
+
+Fix: `MigrationRunner._escape_percent` duplica cada `%` → `%%` **solo** para
+`EngineType.mysql`/`mariadb` justo antes de pasar la sentencia a `exec_driver_sql`
+(PostgreSQL/psycopg2 no tiene este problema, no se toca). El escape es solo para la
+ejecución — el DDL guardado en el preview/historial conserva el texto original sin escapar.
+
 ## Dependencias (auto-selección inteligente)
 
 `app/services/db_admin/clone_dependencies.py` (módulo puro):

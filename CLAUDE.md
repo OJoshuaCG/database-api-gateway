@@ -710,6 +710,16 @@ destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
   reordena la PK ni cambia ningún objeto) + aviso en `warnings` del preview
   (`ClonePreviewOut`/`_ExecutionPlan.warnings`, `clone_controller.py::_autoincrement_pk_warnings`).
   Mismo `render_diff` usado por schema-comparisons, así que también lo cubre.
+- **`%` literal en el DDL ejecutado (MySQL/MariaDB)**: `MigrationRunner.execute_adhoc` usa
+  `conn.exec_driver_sql(stmt)` sin bind params (deliberado: `text()` rompería `::` de
+  PostgreSQL). Pero pymysql hace `query % args` SIEMPRE que `args` no sea `None`, y
+  SQLAlchemy distila un `parameters` ausente a `()` antes de llegar al DBAPI → `args` nunca
+  es `None` en este camino. Un `%` LITERAL en el DDL (columna `GENERATED ... AS (id % 10)`,
+  `LIKE '%...%'`, `DATE_FORMAT(..., '%Y-%m-%d')`) revienta con `unsupported format
+  character` aunque el DDL sea válido. Fix: `MigrationRunner._escape_percent` duplica
+  `%`→`%%` solo para MySQL/MariaDB justo antes de `exec_driver_sql` (PostgreSQL no lo
+  necesita); el DDL guardado en preview/historial conserva el texto sin escapar. Mismo
+  punto usado por clone y por la ejecución ad-hoc de schema-comparisons.
 - Verificación: tests unit/API (FakeAdapter + runner síncrono) + `test_mysql_render.py` +
   `test_clone_body_objects.py`; **e2e contra MariaDB 11 real EJECUTADO** (tabla con `ON UPDATE`,
   vista, vista-sobre-vista en orden inverso, función, procedimiento, trigger, evento: todos
