@@ -263,6 +263,105 @@ def test_items_filter_by_change_type(admin_client, monkeypatch):
 
 
 # =========================================================================== #
+# Export — descarga del diff como archivo .sql                                 #
+# =========================================================================== #
+def test_export_all_entities_as_sql_file(admin_client, monkeypatch):
+    src_id, tgt_id, _, _ = _setup(admin_client, monkeypatch, port=3560)
+    cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
+
+    r = admin_client.get(f"/api/v1/schema-comparisons/{cid}/export")
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("application/sql")
+    assert 'filename="schema-diff-' in r.headers["content-disposition"]
+    assert r.headers["content-disposition"].endswith('tgt_db.sql"')
+    body = r.text
+    # Todas las entidades del diff están presentes.
+    assert "CREATE TABLE new_t" in body
+    assert "DROP TABLE `old_t`" in body
+    # La rutina (cuerpo procedural, MySQL) va envuelta en DELIMITER para ser ejecutable.
+    assert "DELIMITER $$" in body
+    assert "CREATE PROCEDURE sp_x" in body
+    # Cabecera con metadatos + marca de lo destructivo.
+    assert "Schema diff export" in body
+    assert "[DESTRUCTIVO]" in body
+
+
+def test_export_selected_item_ids_only(admin_client, monkeypatch):
+    src_id, tgt_id, _, _ = _setup(admin_client, monkeypatch, port=3561)
+    cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
+    items = admin_client.get(f"/api/v1/schema-comparisons/{cid}/items").json()["data"]
+    new_t = next(i for i in items if i["object_name"] == "new_t")
+
+    r = admin_client.get(
+        f"/api/v1/schema-comparisons/{cid}/export", params={"item_ids": [new_t["id"]]}
+    )
+    assert r.status_code == 200, r.text
+    body = r.text
+    assert "CREATE TABLE new_t" in body
+    # Las demás entidades NO están.
+    assert "DROP TABLE `old_t`" not in body
+    assert "CREATE PROCEDURE sp_x" not in body
+    assert "1 de 3" in body  # contador en la cabecera
+
+
+def test_export_filter_by_change_type(admin_client, monkeypatch):
+    src_id, tgt_id, _, _ = _setup(admin_client, monkeypatch, port=3562)
+    cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
+
+    r = admin_client.get(
+        f"/api/v1/schema-comparisons/{cid}/export", params={"change_type": "dropped"}
+    )
+    assert r.status_code == 200, r.text
+    body = r.text
+    assert "DROP TABLE `old_t`" in body
+    assert "CREATE TABLE new_t" not in body
+
+
+def test_export_with_rollback_section(admin_client, monkeypatch):
+    src_id, tgt_id, _, _ = _setup(admin_client, monkeypatch, port=3563)
+    cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
+    items = admin_client.get(f"/api/v1/schema-comparisons/{cid}/items").json()["data"]
+    new_t = next(i for i in items if i["object_name"] == "new_t")
+
+    r = admin_client.get(
+        f"/api/v1/schema-comparisons/{cid}/export",
+        params={"item_ids": [new_t["id"]], "include_rollback": True},
+    )
+    assert r.status_code == 200, r.text
+    body = r.text
+    assert "ROLLBACK sugerido" in body
+    # El down_sql va comentado (new_t.down_sql = "DROP TABLE `new_t`").
+    assert "-- DROP TABLE `new_t`" in body
+
+
+def test_export_unknown_item_id_422(admin_client, monkeypatch):
+    src_id, tgt_id, _, _ = _setup(admin_client, monkeypatch, port=3564)
+    cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
+    r = admin_client.get(
+        f"/api/v1/schema-comparisons/{cid}/export", params={"item_ids": [999999]}
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_export_unknown_comparison_404(admin_client):
+    assert admin_client.get("/api/v1/schema-comparisons/999999/export").status_code == 404
+
+
+def test_export_requires_auth(client):
+    assert client.get("/api/v1/schema-comparisons/1/export").status_code == 401
+
+
+def test_export_raw_target_not_in_inventory(admin_client, monkeypatch):
+    """La descarga funciona igual para una BD cruda no registrada en el inventario."""
+    sid, src_id, _ = _setup_raw(admin_client, monkeypatch, port=3565)
+    cid = _create_raw(admin_client, src_id, sid, "raw_tgt").json()["data"]["id"]
+    r = admin_client.get(f"/api/v1/schema-comparisons/{cid}/export")
+    assert r.status_code == 200, r.text
+    assert r.headers["content-disposition"].endswith('raw_tgt.sql"')
+    assert "CREATE TABLE new_t" in r.text
+
+
+# =========================================================================== #
 # Fase 5 — adopt (Opción A)                                                    #
 # =========================================================================== #
 def test_adopt_requires_target_blueprint_422(admin_client, monkeypatch):
