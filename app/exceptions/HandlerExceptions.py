@@ -25,6 +25,9 @@ async def app_exception_handler(request: Request, exc: AppHttpException):
         "type": exc.__class__.__name__,
     }
 
+    if getattr(exc, "public_context", None):
+        detail_error["public_context"] = exc.public_context
+
     if LOGGER_EXCEPTIONS_ENABLED:
         logger_warning_exception = [
             current_http_identifier.get(),

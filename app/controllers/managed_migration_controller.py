@@ -464,6 +464,9 @@ class ManagedMigrationController:
                 ),
                 status_code=409,
                 context={"managed_database_id": db_id, "missing_down_sql": missing},
+                # El frontend necesita esta lista para guiar al admin (PATCH por versión),
+                # no es solo debug info: viaja siempre, no solo en development.
+                public_context={"missing_down_sql": missing},
             )
 
         audit.record(

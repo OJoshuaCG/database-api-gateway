@@ -13,11 +13,16 @@ class AppHttpException(HTTPException):
         message: str = "Error interno del servidor",
         status_code: int = 500,
         context: str | list | dict | None = None,
+        public_context: dict | None = None,
         **extra,
     ):
         self.message = message
         self.status_code = status_code
         self.context = context
+        # A diferencia de `context` (solo visible en development, es debug info interna),
+        # `public_context` es dato ESTRUCTURADO que el cliente necesita para operar (p.ej.
+        # qué versiones bloquean un rollback) y viaja SIEMPRE, en cualquier entorno.
+        self.public_context = public_context
         self.loc = self.__get_caller_info()
 
         super().__init__(
@@ -25,6 +30,7 @@ class AppHttpException(HTTPException):
             detail={
                 "msg": self.message,
                 "context": self.context,
+                "public_context": self.public_context,
                 "loc": self.loc,
                 "extra": extra,
             },
