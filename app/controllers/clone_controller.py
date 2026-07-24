@@ -107,6 +107,10 @@ _PROCEDURAL_TYPES = frozenset({"routine", "trigger", "event"})
 _ENGINE_SPECIFIC_TYPES = frozenset(
     {"sequence", "enum_type", "extension", "materialized_view"}
 )
+# Tipos cuyo DDL lleva un CUERPO que puede referenciar OTROS objetos por nombre
+# (vistas/rutinas/triggers/eventos). Requieren: (1) re-calificar el esquema origen→destino
+# y (2) ejecución con reintento diferido, porque pueden depender entre sí en cualquier orden.
+_BODY_TYPES = frozenset({"view", "materialized_view", "routine", "trigger", "event"})
 
 
 def _utcnow() -> datetime:
@@ -585,7 +589,12 @@ class CloneController:
         for r in rendered:
             portable, reason = self._portability(r.object_type, source_snap.source_engine, tgt_engine)
             if portable:
-                structure.append(_StructStmt("structure", r.object_type, r.object_name, r.sql))
+                sql = r.sql
+                if r.object_type in _BODY_TYPES:
+                    sql = self._requalify_body(
+                        sql, source_snap.database, job.target_database_name, tgt_engine
+                    )
+                structure.append(_StructStmt("structure", r.object_type, r.object_name, sql))
             elif r.object_name not in skipped_names:
                 skipped_names.add(r.object_name)
                 skipped.append({
@@ -633,6 +642,24 @@ class CloneController:
             will_adopt=job.adopt_target and selection is None and job.source_database_id is not None,
             table_order=[t.table for t in self._data_table_order(filtered)],
         )
+
+    @staticmethod
+    def _requalify_body(sql: str, source_db: str, target_db: str, tgt_engine: str) -> str:
+        """
+        Re-califica el esquema en el cuerpo de un objeto (vista/rutina/trigger/evento).
+
+        MySQL/MariaDB inyectan el esquema ORIGEN en las referencias del cuerpo (p. ej.
+        ``VIEW_DEFINITION`` siempre trae ``from `origen`.`tabla` ``). Si se clona tal cual,
+        el objeto en la BD DESTINO seguiría leyendo de la BD ORIGEN (fuga cross-database y
+        clon roto si el origen cambia/desaparece). Reescribimos SOLO el calificador del
+        esquema origen → destino (``` `origen`. ``` → ``` `destino`. ```), preservando
+        referencias intencionales a OTRAS bases. El backtick de cierre delimita el nombre
+        completo, así que no hay coincidencias por prefijo. Solo aplica a la familia
+        MySQL/MariaDB (PostgreSQL califica por schema ``public``, igual en origen y destino).
+        """
+        if source_db == target_db or tgt_engine not in _MYSQL_FAMILY:
+            return sql
+        return sql.replace(f"`{source_db}`.", f"`{target_db}`.")
 
     @staticmethod
     def _data_table_order(snap: SchemaSnapshot):
@@ -1074,11 +1101,23 @@ class CloneController:
             if cancel():
                 self._set_status(job_id, CLONE_STATUS_CANCELED, finished=True)
                 return
-            seq, failed = self._run_statements(
-                job_id, runner, tgt_target, ctx["target_db"], engine, lock_key,
-                plan.structure_statements, CLONE_ITEM_STRUCTURE, seq,
-            )
-            had_failure = had_failure or failed
+            # Objetos "duros" (tablas/columnas/FKs/índices): orden determinista ya correcto
+            # (topológico + FKs en fase aditiva) → una pasada, corta al primer fallo.
+            # Objetos con CUERPO (vistas/rutinas/triggers/eventos): pueden depender entre sí
+            # en cualquier orden → reintento diferido.
+            hard = [s for s in plan.structure_statements if s.object_type not in _BODY_TYPES]
+            body = [s for s in plan.structure_statements if s.object_type in _BODY_TYPES]
+            if hard:
+                seq, failed = self._run_statements(
+                    job_id, runner, tgt_target, ctx["target_db"], engine, lock_key,
+                    hard, CLONE_ITEM_STRUCTURE, seq,
+                )
+                had_failure = had_failure or failed
+            if not had_failure and body:
+                seq, failed = self._run_body_statements(
+                    job_id, runner, tgt_target, ctx["target_db"], engine, lock_key, body, seq,
+                )
+                had_failure = had_failure or failed
 
         # --- Fase: datos ------------------------------------------------------------- #
         if not had_failure and ctx["include_data"] and plan.data_specs:
@@ -1196,6 +1235,54 @@ class CloneController:
             rows.append(dict(seq=seq, kind=kind, object_type=st.object_type, object_name=st.object_name,
                              sql=st.sql, status=status, error=error, execution_ms=ms,
                              executed_at=_utcnow() if r is not None else None))
+            seq += 1
+        self._record_items(job_id, rows)
+        return seq, failed
+
+    def _run_body_statements(self, job_id, runner, tgt_target, db_name, engine, lock_key,
+                             statements: list, seq: int) -> tuple[int, bool]:
+        """Ejecuta objetos con cuerpo (vistas/rutinas/triggers/eventos) con REINTENTO
+        DIFERIDO: los que fallan por una dependencia aún no creada se reintentan en la
+        pasada siguiente. Un objeto solo se marca fallido cuando una pasada COMPLETA no
+        crea NINGUNO de los pendientes (sin progreso = fallo real, no de orden). Esto
+        resuelve dependencias vista→vista / rutina→vista en cualquier orden sin parsear
+        los cuerpos. Cada sentencia es autónoma (AUTOCOMMIT): un fallo no deja estado
+        parcial, y los ya aplicados NO se reintentan (no hay 'already exists')."""
+        # (índice original, sentencia) — para registrar los ítems en su orden original.
+        results: dict[int, tuple[str, str | None, int | None]] = {}
+        remaining = list(enumerate(statements))
+        while remaining:
+            res = runner.execute_adhoc(
+                tgt_target, db_name=db_name, engine=engine, lock_key=lock_key,
+                statements=[st.sql for _, st in remaining],
+                already_locked=True, stop_on_error=False,
+            )
+            by_pos = {r.index: r for r in res}
+            still: list = []
+            progressed = False
+            for pos, (orig_i, st) in enumerate(remaining):
+                r = by_pos.get(pos)
+                if r is not None and r.status == "applied":
+                    results[orig_i] = ("applied", None, r.execution_ms)
+                    progressed = True
+                else:
+                    results[orig_i] = ("failed", r.error if r else None,
+                                       r.execution_ms if r else None)
+                    still.append((orig_i, st))
+            remaining = still
+            if not progressed:
+                break  # ninguna dependencia se resolvió: lo que queda es fallo real
+
+        rows = []
+        failed = False
+        for orig_i, st in enumerate(statements):
+            status_key, error, ms = results[orig_i]
+            status = CLONE_ITEM_APPLIED if status_key == "applied" else CLONE_ITEM_FAILED
+            if status_key == "failed":
+                failed = True
+            rows.append(dict(seq=seq, kind=CLONE_ITEM_STRUCTURE, object_type=st.object_type,
+                             object_name=st.object_name, sql=st.sql, status=status,
+                             error=error, execution_ms=ms, executed_at=_utcnow()))
             seq += 1
         self._record_items(job_id, rows)
         return seq, failed

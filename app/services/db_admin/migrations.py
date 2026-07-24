@@ -536,10 +536,18 @@ class MigrationRunner:
         lock_key: int,
         statements: list[str],
         already_locked: bool = False,
+        stop_on_error: bool = True,
     ) -> list[StatementResult]:
         """
         Ejecuta ``statements`` DDL directamente sobre la BD destino, UNA por una,
         deteniéndose en el primer fallo (igual que ``_apply_one``).
+
+        ``stop_on_error=False`` INTENTA todas las sentencias y devuelve un resultado por
+        cada una (aplicada/fallida) sin cortar en el primer fallo. Lo usa el clon para
+        ejecutar objetos con cuerpo (vistas/rutinas/triggers/eventos) en pasadas con
+        reintento diferido: los que fallan por una dependencia aún no creada se reintentan
+        en la pasada siguiente. Cada sentencia es autónoma (AUTOCOMMIT), así que un fallo
+        no deja una transacción a medias.
 
         ``lock_key`` es la clave del advisory lock por BD: para una BD gestionada es su
         ``managed_database_id`` (positivo, comparte lock con ``apply``/``rollback`` de esa
@@ -583,17 +591,28 @@ class MigrationRunner:
                             )
                         except Exception as exc:  # noqa: BLE001 — registrar y detener
                             ms = int((time.monotonic() - t0) * 1000)
-                            logger.warning(
-                                "execute_adhoc: la sentencia %d falló: %s", i, exc,
-                                exc_info=True,
-                            )
+                            # Con reintento diferido (stop_on_error=False) un fallo puede ser
+                            # de ORDEN (dependencia aún no creada) y resolverse en otra pasada:
+                            # log a debug SIN traceback para no alarmar. Con corte al primer
+                            # fallo el error es definitivo → warning con traceback.
+                            if stop_on_error:
+                                logger.warning(
+                                    "execute_adhoc: la sentencia %d falló: %s", i, exc,
+                                    exc_info=True,
+                                )
+                            else:
+                                logger.debug(
+                                    "execute_adhoc: la sentencia %d falló (reintentable): %s",
+                                    i, exc,
+                                )
                             results.append(
                                 StatementResult(
                                     index=i, status="failed", error=_clean_error(exc),
                                     execution_ms=ms, executed_at=datetime.now(timezone.utc),
                                 )
                             )
-                            break  # no continuar tras un fallo (posible estado parcial)
+                            if stop_on_error:
+                                break  # no continuar tras un fallo (posible estado parcial)
                 finally:
                     if not already_locked:
                         self._release_lock(conn, engine, lock_key)
