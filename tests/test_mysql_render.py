@@ -7,7 +7,7 @@ Si no se limpia, el CREATE TABLE sale con ``ON UPDATE`` duplicado → SQL invál
 clon/aplicación falla. Ver regresión en clone_controller (fase estructura).
 """
 
-from app.services.db_admin.dtos import ColumnInfo
+from app.services.db_admin.dtos import ColumnInfo, TableSchema, UniqueConstraintInfo
 from app.services.db_admin.mysql_adapter import MySQLAdapter
 
 
@@ -73,3 +73,51 @@ def test_inline_on_update_emitted_even_if_extra_flag_missing():
     ddl = _adapter()._render_column_def(col)
     assert ddl.upper().count("ON UPDATE") == 1
     assert ddl.endswith("DEFAULT current_timestamp() ON UPDATE CURRENT_TIMESTAMP")
+
+
+def _products_table(pk_order):
+    return TableSchema(
+        database="db",
+        table="products",
+        columns=[
+            ColumnInfo(name="id", type="int(11)", nullable=False, autoincrement=True),
+            ColumnInfo(name="id_product", type="int(11)", nullable=False),
+            ColumnInfo(name="name", type="varchar(50)", nullable=True),
+        ],
+        primary_key=pk_order,
+        foreign_keys=[],
+        indexes=[],
+    )
+
+
+def test_trailing_autoincrement_in_composite_pk_gets_supporting_key():
+    """
+    MySQL/MariaDB (InnoDB) exige que AUTO_INCREMENT sea la primera columna de
+    alguna clave de la MISMA sentencia CREATE TABLE. Si la PK de origen trae el
+    autoincrement al final (patrón heredado, p. ej. tabla migrada de MyISAM a
+    InnoDB sin corregir el orden), el render debe agregar una KEY de apoyo o el
+    CREATE TABLE dispara el error 1075 al ejecutarse contra un motor real.
+    """
+    tbl = _products_table(pk_order=["id_product", "id"])
+    ddl = _adapter()._render_create_table(tbl)
+    assert "PRIMARY KEY (`id_product`, `id`)" in ddl
+    assert "KEY (`id`)" in ddl
+
+
+def test_leading_autoincrement_in_pk_does_not_get_redundant_key():
+    """Si el autoincrement ya encabeza la PK, no hace falta ninguna KEY extra."""
+    tbl = _products_table(pk_order=["id", "id_product"])
+    ddl = _adapter()._render_create_table(tbl)
+    assert "PRIMARY KEY (`id`, `id_product`)" in ddl
+    assert "KEY (`id`)" not in ddl
+
+
+def test_autoincrement_covered_by_leading_unique_does_not_get_redundant_key():
+    """Si un UNIQUE inline ya encabeza con el autoincrement, tampoco hace falta la KEY extra."""
+    tbl = _products_table(pk_order=["id_product"])
+    tbl = tbl.model_copy(
+        update={"unique_constraints": [UniqueConstraintInfo(name="uq_id", columns=["id"])]}
+    )
+    ddl = _adapter()._render_create_table(tbl)
+    assert "UNIQUE (`id`)" in ddl
+    assert "KEY (`id`)" not in ddl
