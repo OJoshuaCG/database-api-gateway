@@ -116,7 +116,8 @@ class _FakeRunner:
     def advisory_lock(self, target, *, engine, lock_key):
         yield  # no-op en test (sin motor real que lockear)
 
-    def execute_adhoc(self, target, *, db_name, engine, lock_key, statements, already_locked=False):
+    def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
+                      already_locked=False, stop_on_error=True):
         return [
             StatementResult(index=i, status="applied", error=None, execution_ms=1,
                             executed_at=datetime.now(timezone.utc))
@@ -316,7 +317,8 @@ def test_structure_failure_marks_job_failed(admin_client, monkeypatch):
     _install(monkeypatch, target_exists=False)
 
     class _FailingRunner(_FakeRunner):
-        def execute_adhoc(self, target, *, db_name, engine, lock_key, statements, already_locked=False):
+        def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
+                          already_locked=False, stop_on_error=True):
             return [StatementResult(index=0, status="failed", error="boom",
                                     execution_ms=1, executed_at=datetime.now(timezone.utc))]
 

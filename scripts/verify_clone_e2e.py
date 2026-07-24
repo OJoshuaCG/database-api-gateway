@@ -178,11 +178,91 @@ def scenario_partial_selection(client, engine_key):
     check(_count(engine_key, "clone_dst2", "parent") == 2, "parent clonada por dependencia")
 
 
+def scenario_procedural_objects(client, engine_key):
+    """Clona vistas/rutinas/funciones/triggers/eventos + tabla con ON UPDATE, y verifica
+    que las vistas queden RE-CALIFICADAS al destino (no apuntando al origen). Solo MySQL/
+    MariaDB (los cuerpos procedurales no son portables cross-engine)."""
+    if engine_key not in ("mysql", "mariadb"):
+        return
+    print(f"\n[{engine_key}] Clon de objetos con cuerpo (vista/rutina/función/trigger/evento)")
+    eng = _root_engine(engine_key)
+    with eng.connect() as conn:
+        conn.execute(text("DROP DATABASE IF EXISTS clone_proc_src"))
+        conn.execute(text("DROP DATABASE IF EXISTS clone_proc_dst"))
+        conn.execute(text("CREATE DATABASE clone_proc_src"))
+    url = str(eng.url).rsplit("/", 1)[0] + "/clone_proc_src"
+    dbeng = create_engine(url, isolation_level="AUTOCOMMIT")
+    with dbeng.connect() as conn:
+        conn.execute(text("CREATE TABLE audit_log (id INT PRIMARY KEY AUTO_INCREMENT, "
+                          "created_at DATETIME NOT NULL DEFAULT current_timestamp(), "
+                          "updated_at DATETIME NOT NULL DEFAULT current_timestamp() "
+                          "ON UPDATE current_timestamp())"))
+        # Tipos que str(reflected_type) pierde y COLUMN_TYPE preserva: ENUM/SET (sin lista
+        # de valores = DDL inválido), UNSIGNED (rango), display width.
+        conn.execute(text("CREATE TABLE parent (id INT PRIMARY KEY, name VARCHAR(50), "
+                          "status ENUM('a','b','c') NULL, flags SET('x','y') NULL, "
+                          "big_u BIGINT UNSIGNED NULL, flag TINYINT(1) NULL)"))
+        conn.execute(text("INSERT INTO parent (id, name, status, flags, big_u, flag) "
+                          "VALUES (1,'a','b','x,y',9999999999,1),(2,'b','c','y',1,0)"))
+        # v_z base; v_a depende de v_z (orden alfabético INVERSO → prueba el reintento)
+        conn.execute(text("CREATE VIEW v_z AS SELECT id FROM parent"))
+        conn.execute(text("CREATE VIEW v_a AS SELECT id FROM v_z"))
+        conn.execute(text("CREATE FUNCTION fn_double(x INT) RETURNS INT DETERMINISTIC RETURN x*2"))
+        conn.execute(text("CREATE PROCEDURE sp_count(OUT n INT) BEGIN "
+                          "SELECT COUNT(*) INTO n FROM parent; END"))
+        conn.execute(text("CREATE TRIGGER trg_bi BEFORE INSERT ON parent "
+                          "FOR EACH ROW BEGIN SET NEW.id = NEW.id; END"))
+        conn.execute(text("CREATE EVENT ev_x ON SCHEDULE EVERY 1 DAY "
+                          "DO DELETE FROM audit_log WHERE id < 0"))
+    sid = _register_server(client, engine_key)
+    job_id = client.post("/api/v1/database-clones", json={
+        "source_server_id": sid, "source_database_name": "clone_proc_src",
+        "target_server_id": sid, "target_database_name": "clone_proc_dst",
+        "target_mode": "new", "include_data": True,
+    }).json()["data"]["id"]
+    pr = client.post(f"/api/v1/database-clones/{job_id}/preview", json={}).json()["data"]
+    types = {s["object_type"] for s in pr["structure_statements"]}
+    for t in ("view", "routine", "trigger", "event"):
+        check(t in types, f"el plan incluye '{t}'")
+    client.post(f"/api/v1/database-clones/{job_id}/execute",
+                json={"confirm_target_name": "clone_proc_dst", "confirm_token": pr["confirm_token"]})
+    final = _poll(client, job_id)
+    check(final["status"] == "succeeded", f"status final = succeeded ({final['status']})")
+    # Verificar objetos + re-calificación de las vistas al destino.
+    dst_url = str(_root_engine(engine_key).url).rsplit("/", 1)[0] + "/clone_proc_dst"
+    with create_engine(dst_url).connect() as conn:
+        views = {r[0]: r[1] for r in conn.execute(text(
+            "SELECT TABLE_NAME, VIEW_DEFINITION FROM information_schema.VIEWS "
+            "WHERE TABLE_SCHEMA='clone_proc_dst'"))}
+        routines = {r[0] for r in conn.execute(text(
+            "SELECT ROUTINE_NAME FROM information_schema.ROUTINES "
+            "WHERE ROUTINE_SCHEMA='clone_proc_dst'"))}
+        triggers = {r[0] for r in conn.execute(text(
+            "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
+            "WHERE TRIGGER_SCHEMA='clone_proc_dst'"))}
+        events = {r[0] for r in conn.execute(text(
+            "SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA='clone_proc_dst'"))}
+        dst_types = {r[0]: r[1] for r in conn.execute(text(
+            "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA='clone_proc_dst' AND TABLE_NAME='parent'"))}
+    # Tipos exactos preservados (ENUM/SET con valores, UNSIGNED, display width).
+    check("enum('a','b','c')" in dst_types.get("status", ""), "ENUM clonado con su lista de valores")
+    check("set('x','y')" in dst_types.get("flags", ""), "SET clonado con su lista de valores")
+    check("unsigned" in dst_types.get("big_u", ""), "BIGINT UNSIGNED preservado")
+    check({"v_a", "v_z"} <= set(views), "vistas v_a/v_z clonadas (reintento resolvió el orden)")
+    check(all("clone_proc_src" not in (d or "") for d in views.values()),
+          "las vistas NO referencian la BD origen (re-calificadas al destino)")
+    check({"fn_double", "sp_count"} <= routines, "función y procedimiento clonados")
+    check("trg_bi" in triggers, "trigger clonado")
+    check("ev_x" in events, "evento clonado")
+
+
 def main_run(engine_keys):
     client = _admin_client()
     for ek in engine_keys:
         scenario_full_clone_same_engine(client, ek)
         scenario_partial_selection(client, ek)
+        scenario_procedural_objects(client, ek)
     print("\n" + ("=" * 60))
     if failures:
         print(f"FALLARON {len(failures)} checks:")

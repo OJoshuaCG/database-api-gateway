@@ -183,7 +183,7 @@ def _setup_sqlite_env(monkeypatch, tmp_path, source_rows, *, create_dest_rows=No
     engines = {"srcdb": src_engine, "dstdb": dst_engine}
 
     @contextmanager
-    def fake_conn(target, database):
+    def fake_conn(target, database, *, bulk=False):
         conn = engines[database].connect()
         try:
             yield conn
