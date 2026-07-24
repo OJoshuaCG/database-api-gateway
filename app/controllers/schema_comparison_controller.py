@@ -508,6 +508,214 @@ class SchemaComparisonController:
         finally:
             session.close()
 
+    # ------------------------------------------------------------------ #
+    # Export — descarga del diff como archivo .sql                        #
+    # ------------------------------------------------------------------ #
+    # Tipos de objeto con CUERPO procedural (``BEGIN...END``) cuyo SQL lleva ``;``
+    # internos: en MySQL/MariaDB hay que envolverlos con ``DELIMITER`` para que un
+    # cliente de línea de comandos no corte la sentencia en el primer ``;`` del cuerpo.
+    _BODY_TYPES = frozenset({"routine", "trigger", "event"})
+
+    @staticmethod
+    def _sanitize_filename(name: str) -> str:
+        """Deja solo alfanuméricos, ``.-_`` (resto → ``_``) para un filename seguro."""
+        safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in name)
+        return safe.strip("._") or "db"
+
+    def _render_statement_block(self, it: dict, engine: str) -> str:
+        """
+        Un bloque SQL por ítem: comentario de contexto + la sentencia terminada en ``;``.
+
+        Para objetos con cuerpo procedural en la familia MySQL, envuelve con
+        ``DELIMITER $$ ... $$ DELIMITER ;`` para que el cuerpo con ``;`` internos sea
+        ejecutable por un cliente estándar (el motor del gateway ejecuta por sentencia
+        única, así que este envoltorio es solo para el archivo que descarga el usuario).
+        """
+        destructive = " [DESTRUCTIVO]" if it["risk"].get("destructive") else ""
+        review = (
+            " [REQUIERE REVISIÓN INDIVIDUAL]"
+            if it["risk"].get("requires_individual_review")
+            else ""
+        )
+        header = (
+            f"-- [{it['seq']}] {it['object_type']} {it['object_name']} "
+            f"({it['change_type']}){destructive}{review}"
+        )
+        sql = it["sql"].rstrip().rstrip(";")
+        is_body = it["object_type"] in self._BODY_TYPES and engine in _MYSQL_FAMILY
+        if is_body:
+            body = f"DELIMITER $$\n{sql}$$\nDELIMITER ;"
+        else:
+            body = f"{sql};"
+        return f"{header}\n{body}"
+
+    def export_sql(
+        self,
+        comparison_id: int,
+        *,
+        item_ids: list[int] | None = None,
+        object_type: str | None = None,
+        change_type: str | None = None,
+        include_rollback: bool = False,
+        admin: dict | None = None,
+    ) -> tuple[str, str]:
+        """
+        Ensambla el DDL del diff como un único texto ``.sql`` descargable y devuelve
+        ``(filename, content)``.
+
+        Selección (todas combinables; el resultado son los ítems que cumplen TODOS los
+        filtros, ordenados por ``seq``):
+        - ``item_ids``: exactamente estos ítems (validando pertenencia); ``None`` = todos.
+        - ``object_type`` / ``change_type``: filtros como en ``list_items``.
+
+        Solo LEE ítems ya persistidos (no toca ningún motor, no valida fingerprint): es un
+        artefacto de revisión, no una ejecución. Funciona idéntico para BDs adoptadas y
+        crudas (el recurso ya está keyed por comparación). ``include_rollback`` anexa el
+        ``down_sql`` sugerido (orden inverso) COMENTADO al final.
+        """
+        session = self._session()
+        try:
+            comp = self._comparison_or_404(session, comparison_id)
+            q = session.query(SchemaComparisonItem).filter(
+                SchemaComparisonItem.comparison_id == comparison_id
+            )
+            if object_type is not None:
+                q = q.filter(SchemaComparisonItem.object_type == object_type)
+            if change_type is not None:
+                q = q.filter(SchemaComparisonItem.change_type == change_type)
+            total_in_comparison = (
+                session.query(SchemaComparisonItem)
+                .filter(SchemaComparisonItem.comparison_id == comparison_id)
+                .count()
+            )
+            rows = q.order_by(SchemaComparisonItem.seq.asc()).all()
+            if item_ids is not None:
+                idset = set(item_ids)
+                found = {r.id for r in rows}
+                missing = [i for i in item_ids if i not in found]
+                if missing:
+                    raise AppHttpException(
+                        message=(
+                            "Algunos ítems seleccionados no pertenecen a esta comparación "
+                            "(o no pasan los filtros indicados)."
+                        ),
+                        status_code=422,
+                        context={
+                            "comparison_id": comparison_id,
+                            "missing_item_ids": missing,
+                        },
+                    )
+                rows = [r for r in rows if r.id in idset]
+            # Datos planos ANTES de cerrar la sesión.
+            selected = [
+                {
+                    "id": r.id,
+                    "seq": r.seq,
+                    "sql": r.sql,
+                    "down_sql": r.down_sql,
+                    "object_type": r.object_type,
+                    "object_name": r.object_name,
+                    "change_type": r.change_type,
+                    "risk": json.loads(r.risk_flags),
+                }
+                for r in rows
+            ]
+            meta = {
+                "id": comp.id,
+                "source_server_id": comp.source_server_id,
+                "source_database_name": comp.source_database_name,
+                "target_server_id": comp.target_server_id,
+                "target_database_name": comp.target_database_name,
+                "source_engine": comp.source_engine,
+                "target_engine": comp.target_engine,
+                "created_at": comp.created_at,
+                "expires_at": comp.expires_at,
+                "target_managed_id": comp.target_database_id,
+            }
+        finally:
+            session.close()
+
+        if not selected:
+            raise AppHttpException(
+                message="No hay sentencias para exportar con la selección/filtros indicados.",
+                status_code=422,
+                context={"comparison_id": comparison_id},
+            )
+
+        target_engine = meta["target_engine"]
+        expired = bool(meta["expires_at"] is not None and meta["expires_at"] < _utcnow())
+        expired_note = "  [EXPIRADA — puede no reflejar el estado actual]" if expired else ""
+        lines = [
+            "-- ==========================================================================",
+            f"-- Schema diff export — comparación #{meta['id']}",
+            f"-- Generado: {_utcnow().isoformat(timespec='seconds')} UTC",
+            f"-- Snapshot de la comparación: {meta['created_at']}{expired_note}",
+            (
+                f"-- Source (deseado): servidor {meta['source_server_id']} / "
+                f"{meta['source_database_name']} ({meta['source_engine']})"
+            ),
+            (
+                f"-- Target (a modificar): servidor {meta['target_server_id']} / "
+                f"{meta['target_database_name']} ({target_engine})"
+            ),
+            (
+                f"-- Sentencias exportadas: {len(selected)} de {total_in_comparison} "
+                "en la comparación"
+            ),
+            "-- ADVERTENCIA: DDL derivado de un snapshot; el gateway NO garantiza que el",
+            "--   esquema siga vigente. Revísalo antes de ejecutarlo contra el target.",
+            "-- ==========================================================================",
+            "",
+        ]
+        for it in selected:
+            lines.append(self._render_statement_block(it, target_engine))
+            lines.append("")
+
+        if include_rollback:
+            down_parts = [d for d in (it["down_sql"] for it in reversed(selected)) if d]
+            lines.append(
+                "-- ======================================================================"
+            )
+            if down_parts:
+                lines.append(
+                    "-- ROLLBACK sugerido (orden inverso) — COMENTADO. Revísalo antes de usar."
+                )
+                lines.append(
+                    "-- ===================================================================="
+                )
+                for part in down_parts:
+                    for ln in part.rstrip().rstrip(";").splitlines():
+                        lines.append(f"-- {ln}")
+                    lines.append("-- ;")
+            else:
+                lines.append(
+                    "-- ROLLBACK: no hay down_sql sugerido para los ítems exportados."
+                )
+                lines.append(
+                    "-- ===================================================================="
+                )
+            lines.append("")
+
+        content = "\n".join(lines)
+        filename = (
+            f"schema-diff-{meta['id']}-"
+            f"{self._sanitize_filename(meta['target_database_name'])}.sql"
+        )
+
+        audit.record(
+            "schema_comparison.export",
+            admin=admin,
+            **self._audit_target_kwargs(meta["target_managed_id"]),
+            server_id=meta["target_server_id"],
+            touched_engine=False,
+            detail=(
+                f"export .sql de la comparación {meta['id']}: {len(selected)} de "
+                f"{total_in_comparison} sentencia(s)"
+                + (" (con rollback)" if include_rollback else "")
+            ),
+        )
+        return filename, content
+
     def list_items(
         self,
         comparison_id: int,

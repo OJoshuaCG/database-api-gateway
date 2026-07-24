@@ -15,6 +15,7 @@ con apply-all).
 """
 
 from fastapi import APIRouter, Query, Request
+from fastapi.responses import Response
 
 from app.controllers.schema_comparison_controller import SchemaComparisonController
 from app.core.auth import AdminDep
@@ -77,6 +78,50 @@ def list_comparison_items(
         offset=pagination.offset,
     )
     return paginated(items, total=total, pagination=pagination)
+
+
+@router.get("/{comparison_id}/export")
+def export_comparison_sql(
+    admin: AdminDep,
+    comparison_id: int,
+    item_ids: list[int] | None = Query(
+        None,
+        description=(
+            "IDs de los ítems a incluir (repetible: ?item_ids=1&item_ids=2). "
+            "Omitido = todas las entidades del diff."
+        ),
+    ),
+    object_type: str | None = Query(None, description="Filtra por tipo de objeto."),
+    change_type: str | None = Query(
+        None, pattern=r"^(new|modified|dropped)$", description="Filtra por tipo de cambio."
+    ),
+    include_rollback: bool = Query(
+        False, description="Anexa el rollback sugerido (down_sql) COMENTADO al final."
+    ),
+):
+    """
+    Descarga el DDL del diff como un archivo ``.sql`` (``Content-Disposition: attachment``).
+
+    Exporta TODAS las entidades por defecto, o solo las seleccionadas vía ``item_ids``
+    (combinable con los filtros ``object_type``/``change_type``). Es solo lectura de los
+    ítems ya calculados — no toca el motor ni valida fingerprint — y funciona igual para
+    BDs adoptadas o crudas no registradas en el inventario.
+
+    No usa el envoltorio ``ApiResponse`` a propósito: es una descarga de archivo.
+    """
+    filename, content = SchemaComparisonController().export_sql(
+        comparison_id,
+        item_ids=item_ids,
+        object_type=object_type,
+        change_type=change_type,
+        include_rollback=include_rollback,
+        admin=admin,
+    )
+    return Response(
+        content=content,
+        media_type="application/sql",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post(
