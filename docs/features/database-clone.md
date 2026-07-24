@@ -138,12 +138,21 @@ can be only one auto column and it must be defined as a key')` al primer `CREATE
 
 El clon **no reordena la PK** (se preserva fiel al origen): en cambio,
 `MySQLAdapter._render_create_table` detecta si el autoincrement queda cubierto por la PK o
-un `UNIQUE` inline y, si no, agrega automáticamente una `KEY (`id`)` de apoyo en la misma
+un `UNIQUE` inline y, si no, agrega automáticamente una `KEY` de apoyo en la misma
 sentencia — no cambia el conjunto de columnas de la PK ni ningún otro objeto, solo satisface
 el requisito del motor. Esto se avisa en `warnings` del preview (`POST .../preview`) para que
-el operador lo vea antes de ejecutar, no solo leyendo el DDL en `GET .../items`. Si el origen
-ya trae un índice "real" sobre esa columna, puede quedar una redundancia inofensiva (dos
-índices sobre la misma columna) — preferible a que el clon completo falle.
+el operador lo vea antes de ejecutar, no solo leyendo el DDL en `GET .../items`.
+
+**Nombre EXPLÍCITO de la KEY de apoyo (`` `_gw_autoinc_{columna}` ``, mismo patrón que
+`_gw_v_`/`_gw_stg_` en otros módulos) — no dejarla sin nombre.** Regresión real encontrada:
+si la KEY de apoyo se crea SIN nombre, MySQL/MariaDB la auto-nombra igual que su columna
+(`id`). Cuando el origen YA tiene un índice real sobre esa columna (frecuente: es común que
+una tabla con este patrón de PK tenga además un índice suelto sobre el autoincrement,
+también auto-nombrado `id`), la sentencia posterior que recrea ESE índice capturado del
+origen choca con `(1061, "Duplicate key name 'id'")` — el nombre ya está tomado por la KEY
+de apoyo. El resultado final SÍ queda con dos índices sobre la misma columna (uno sintético,
+uno real) — redundancia inofensiva, preferible a que el clon completo falle — pero deben
+tener nombres DISTINTOS para coexistir.
 
 ## `%` literal en el DDL ejecutado (MySQL/MariaDB)
 

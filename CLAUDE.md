@@ -709,7 +709,11 @@ destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
   PK/UNIQUE inline no cubre al autoincrement, se agrega automáticamente una `KEY` de apoyo (no
   reordena la PK ni cambia ningún objeto) + aviso en `warnings` del preview
   (`ClonePreviewOut`/`_ExecutionPlan.warnings`, `clone_controller.py::_autoincrement_pk_warnings`).
-  Mismo `render_diff` usado por schema-comparisons, así que también lo cubre.
+  Mismo `render_diff` usado por schema-comparisons, así que también lo cubre. **Nombre EXPLÍCITO
+  de la KEY** (`` `_gw_autoinc_{columna}` ``, patrón `_gw_`): sin nombre, MySQL/MariaDB la
+  auto-nombra igual que la columna (`id`) — si el origen YA tiene un índice real sobre esa
+  columna (también auto-nombrado `id`), la sentencia posterior que lo recrea choca con
+  `(1061, "Duplicate key name 'id'")`. Regresión real encontrada tras desplegar el fix anterior.
 - **`%` literal en el DDL ejecutado (los 3 motores)**: `MigrationRunner.execute_adhoc` usa
   `conn.exec_driver_sql(stmt)` sin bind params (deliberado: `text()` rompería `::` de
   PostgreSQL). Pero SQLAlchemy distila un `parameters` ausente a `()` (nunca a `None`)
