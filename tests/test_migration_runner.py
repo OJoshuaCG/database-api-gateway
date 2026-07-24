@@ -60,6 +60,26 @@ def test_select_down_sql_none_when_absent():
     assert r.select_down_sql(s, EngineType.postgresql) is None
 
 
+def test_escape_percent_doubles_literal_percent_for_mysql_family():
+    """
+    pymysql SIEMPRE hace ``query % args`` en ``cursor.execute`` cuando ``args`` no es
+    ``None`` (y SQLAlchemy distila ``None`` a ``()`` antes de llegar al DBAPI) — un ``%``
+    literal en el DDL (columna GENERATED con módulo, LIKE '%...%', DATE_FORMAT con
+    '%Y-%m-%d', etc.) revienta con ``unsupported format character`` al ejecutarse via
+    ``exec_driver_sql``. Debe escaparse a ``%%`` para MySQL/MariaDB.
+    """
+    stmt = "ALTER TABLE t ADD COLUMN r int GENERATED ALWAYS AS (id % 10) STORED"
+    escaped = MigrationRunner._escape_percent(stmt, EngineType.mysql)
+    assert escaped == stmt.replace("%", "%%")
+    assert MigrationRunner._escape_percent(stmt, EngineType.mariadb) == escaped
+
+
+def test_escape_percent_untouched_for_postgresql():
+    """PostgreSQL (psycopg2) no tiene el problema — no debe tocarse el DDL."""
+    stmt = "ALTER TABLE t ADD COLUMN r int GENERATED ALWAYS AS (id % 10) STORED"
+    assert MigrationRunner._escape_percent(stmt, EngineType.postgresql) == stmt
+
+
 def test_compute_pending():
     r = MigrationRunner()
     specs = [_spec("0001", "x"), _spec("0002", "y"), _spec("0003", "z")]
