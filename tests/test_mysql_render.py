@@ -101,7 +101,19 @@ def test_trailing_autoincrement_in_composite_pk_gets_supporting_key():
     tbl = _products_table(pk_order=["id_product", "id"])
     ddl = _adapter()._render_create_table(tbl)
     assert "PRIMARY KEY (`id_product`, `id`)" in ddl
-    assert "KEY (`id`)" in ddl
+    assert "KEY `_gw_autoinc_id` (`id`)" in ddl
+
+
+def test_supporting_key_has_explicit_name_to_avoid_collision_with_real_index():
+    """
+    Regresión: sin nombre explícito, MySQL/MariaDB auto-nombra un KEY sin nombre igual
+    que su columna (`id`). Si el origen YA tiene un índice real sobre esa columna (con
+    ese mismo nombre auto-asignado), la sentencia posterior que lo recrea en el destino
+    choca con 1061 Duplicate key name. El nombre `_gw_autoinc_id` evita la colisión.
+    """
+    tbl = _products_table(pk_order=["id_product", "id"])
+    ddl = _adapter()._render_create_table(tbl)
+    assert "KEY (`id`)" not in ddl  # sin nombre, colisionaría con el índice real del origen
 
 
 def test_leading_autoincrement_in_pk_does_not_get_redundant_key():
@@ -109,7 +121,7 @@ def test_leading_autoincrement_in_pk_does_not_get_redundant_key():
     tbl = _products_table(pk_order=["id", "id_product"])
     ddl = _adapter()._render_create_table(tbl)
     assert "PRIMARY KEY (`id`, `id_product`)" in ddl
-    assert "KEY (`id`)" not in ddl
+    assert "_gw_autoinc_id" not in ddl
 
 
 def test_autoincrement_covered_by_leading_unique_does_not_get_redundant_key():
@@ -120,4 +132,4 @@ def test_autoincrement_covered_by_leading_unique_does_not_get_redundant_key():
     )
     ddl = _adapter()._render_create_table(tbl)
     assert "UNIQUE (`id`)" in ddl
-    assert "KEY (`id`)" not in ddl
+    assert "_gw_autoinc_id" not in ddl
