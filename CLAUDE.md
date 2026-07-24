@@ -569,6 +569,35 @@ regenera `down_sql_suggested`. `DELETE` solo borra la **última** versión (la p
 Verificación e2e contra motores reales (`scripts/verify_migrations_e2e.py`, requiere Docker):
 **ejecutada — 153 checks / 0 fallos** (cubre Plan 02 + Plan 09 + UX).
 
+**Checkpoint de sentencia (resume automático tras fallo parcial)**: como el DDL no es
+transaccional en MySQL/MariaDB (AUTOCOMMIT), una migración de N sentencias que falla a
+mitad (p. ej. 3 de 50) dejaba antes solo dos salidas: reintentar desde cero (choca "ya
+existe" en lo que sí se creó) o `stamp` a ciegas (riesgo real: un `rollback` posterior
+ejecutaría el `down_sql` completo contra una BD con solo una fracción de los cambios
+físicos). Fix: `app/services/db_admin/migration_progress.py` +
+`migration_statement_progress` (tabla nueva, efímera — una fila solo mientras hay
+progreso incompleto) graban qué sentencia fue la última exitosa; el próximo
+`apply`/`rollback` retoma ahí (`migrations.py::_write_revision_files`/`_apply_one`/
+`rollback_to`), sin re-ejecutar lo ya commiteado. **Fail-closed por diseño** (revisado
+con `gateway-senior-python`/`gateway-db-dialects` antes de implementar, no solo
+código): el checkpoint se **deshabilita** (todo-o-nada, como antes) si la migración es
+`kind='data'`, tiene `has_non_portable=True`, o contiene sentencias de **estado de
+sesión** (`SET`, `PREPARE`, `LOCK TABLES`, `USE`, transacciones explícitas) — el
+splitter no entiende `BEGIN...END` de MySQL/MariaDB y una conexión nueva en el resume
+pierde ese estado (`SET FOREIGN_KEY_CHECKS=0` de la sentencia 1 no sobrevive a un
+resume que arranca en la 4). El checkpoint queda ligado al `checksum` de la migración:
+editar `up_sql` con un checkpoint incompleto → **409** (tanto en `PATCH` de la
+migración como en `stamp`, salvo `force=true`, que descarta el checkpoint y audita).
+**Límite irreducible** (no lo resuelve ningún diseño de checkpoint): si la sentencia
+que falló está genuinamente rota, o un `ALTER` multi-cláusula quedó parcialmente
+aplicado por el motor, el resume solo evita re-tropezar con las sentencias previas —
+la rota vuelve a fallar y sigue requiriendo fix-forward o reconciliación manual.
+**No verificado contra motor real** (sin Docker/MySQL disponibles al implementarlo) ni
+con `pytest` — solo `ast.parse`/compilación del codegen y ejecución directa de las
+funciones puras. Pendiente antes de confiar en producción: ciclo apply-parcial→retoma
+contra los 3 motores reales, y la migración Alembic nueva
+(`d1e2f3a4b5c6_add_migration_statement_progress`) contra la BD del gateway real.
+
 ## Módulo de Adopción, Reconciliación y Snapshot (Plan 09)
 
 Puente entre el **plano en vivo** (motor real) y el **inventario** del gateway. Guía de uso:

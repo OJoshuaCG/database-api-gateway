@@ -181,6 +181,12 @@ de marcar la versión, **saca la BD de cuarentena** (`status=error → active`) 
 previo la dejó ahí. Es la vía correcta para reconciliar una BD adoptada cuyo esquema ya
 coincide con el baseline (evita reintentar un `CREATE TABLE` de algo que ya existe).
 
+**`stamp` bloquea (409) si detecta un checkpoint de aplicación PARCIAL** para esa BD (ver
+"Checkpoint de sentencia" más abajo): stampear a ciegas por encima de un fallo a mitad de
+camino dejaría un `rollback` posterior ejecutando el `down_sql` completo contra una BD que
+solo tiene una fracción de los cambios físicos. `?force=true` es la vía explícita para
+"ya reconcilié el estado físico a mano" — descarta el checkpoint y procede.
+
 ## Matriz de equivalencia DDL
 
 El gateway auto-traduce `up_sql` (MySQL → PostgreSQL) para DDL común. **Escribe un
@@ -217,6 +223,37 @@ fiable:
   estado parcial. El gateway marca la BD con `status=error` + nota; el siguiente `apply`
   responde **409** hasta que inspecciones y reintentes con **`?force=true`**. Un `apply`
   exitoso —o un `stamp`— limpia la cuarentena.
+- **Checkpoint de sentencia (resume automático)**: cuando una migración de N sentencias
+  falla a mitad (p. ej. 3 de 50 ya commitearon), el gateway graba un checkpoint por
+  sentencia en su propia BD de metadatos (`migration_statement_progress`, tabla
+  **efímera**: una fila existe solo mientras hay progreso incompleto). El próximo
+  `apply` sobre esa BD **retoma automáticamente desde la sentencia 4**, sin re-ejecutar
+  las 3 que ya corrieron ni requerir inspección manual — esto es lo que reemplaza el
+  flujo manual anterior de "inspeccionar y stampear a mano".
+  - **Fail-closed por diseño** (`app/services/db_admin/migration_progress.py`): el
+    checkpoint solo se activa (`is_resumable`) para SQL de esquema "plano". Se
+    **deshabilita** (todo-o-nada, como antes) si la migración es `kind='data'`, incluye
+    objetos no portables (`has_non_portable`), o contiene sentencias que dependen de
+    **estado de sesión** (`SET`, `PREPARE`, `LOCK TABLES`, `USE`, transacciones
+    explícitas) — un reintento abre una conexión NUEVA y ese estado (p. ej.
+    `SET FOREIGN_KEY_CHECKS=0` de la sentencia 1) no sobrevive.
+  - El checkpoint queda **ligado al `checksum`** de la migración: si el admin edita el
+    `up_sql` mientras hay un checkpoint incompleto, el `PATCH` responde **409** (no se
+    permite editar con un resume en curso — el índice del checkpoint dejaría de
+    corresponder al SQL nuevo).
+  - **Límite irreducible, no resuelto por el checkpoint**: si la sentencia que falló
+    está genuinamente rota (error de sintaxis, tipo, o un `ALTER` multi-cláusula que
+    MySQL/MariaDB aplica parcialmente — p. ej. `ADD COLUMN a, ADD COLUMN b` donde `a`
+    commitea y `b` falla), el resume solo evita re-tropezar con las sentencias previas
+    ya aplicadas; la sentencia rota vuelve a fallar igual y requiere corrección manual
+    (nueva migración fix-forward o reconciliación directa). El checkpoint reduce
+    drásticamente la intervención manual, no la elimina.
+  - **Ventana de doble escritura**: el commit del DDL (BD destino) y el commit del
+    checkpoint (BD del gateway) son dos datastores independientes sin transacción
+    compartida. Si el proceso muere justo entre ambos, el checkpoint puede quedar un
+    statement atrasado — el resume re-ejecuta a lo sumo UNA sentencia ya aplicada
+    (falla ruidosa tipo "ya existe"), nunca salta una sentencia que no corrió (el
+    checkpoint se graba SIEMPRE después del `op.execute`, nunca antes).
 - **Recomendación**: escribe migraciones **idempotentes** (`CREATE TABLE IF NOT EXISTS`,
   `ADD COLUMN IF NOT EXISTS`) para que un reintento sea seguro.
 
@@ -241,6 +278,16 @@ fiable:
   (2026-06-29), cubre apply/rollback secuencial, gate `reviewed`, autoasignación de versión y los
   flujos de [adopción/snapshot](adoption-reconcile-snapshot.md) (Plan 09). Pendiente: integrarlo en
   CI con testcontainers (Plan 08).
+- **Checkpoint de sentencia (resume automático) — pendiente de verificación e2e**: revisado
+  en diseño con los agentes `gateway-senior-python`/`gateway-db-dialects` (ventana de doble
+  escritura, binding por checksum, exclusión de `BEGIN...END`/estado de sesión), verificado
+  con `ast.parse`/compilación del codegen y ejecución directa de las funciones puras
+  (`is_resumable`, generación del archivo de revisión) — **no** verificado contra un motor
+  real (sin Docker/MySQL disponibles en el entorno donde se implementó) ni con la suite
+  `pytest`. Antes de confiar en producción: correr el ciclo apply parcial → reintento
+  contra MySQL/MariaDB/PostgreSQL reales, y la migración Alembic
+  (`d1e2f3a4b5c6_add_migration_statement_progress`) con upgrade/downgrade/upgrade contra la
+  BD del gateway real.
 
 ---
 
