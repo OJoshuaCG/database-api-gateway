@@ -629,9 +629,12 @@ class CloneController:
                 portable, _ = self._portability("table", source_snap.source_engine, tgt_engine)
                 if not portable:
                     continue
+                # Columnas GENERATED (STORED/VIRTUAL) se excluyen: el motor las recalcula
+                # solo. Escribirles un valor explicito da un warning (MySQL 1906) que en
+                # sql_mode estricto se promueve a error y aborta la tabla completa.
                 data_specs.append(_DataSpec(
                     table=t.table,
-                    columns=[c.name for c in t.columns],
+                    columns=[c.name for c in t.columns if c.computed is None],
                     primary_key=list(t.primary_key),
                     upsert=upsert,
                     row_estimate=None,
