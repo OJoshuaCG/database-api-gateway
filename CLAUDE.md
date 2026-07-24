@@ -701,6 +701,15 @@ destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
   **sin lista de valores** → CREATE TABLE inválido (1064); `UNSIGNED` → rango corrupto; display
   width. Con el fix el DDL reproduce `enum('a','b')`/`bigint(20) unsigned`/`tinyint(1)` exactos
   (también mejora la exactitud del diff: dos ENUM con valores distintos ya no comparan iguales).
+- **AUTO_INCREMENT que no encabeza la PK (MySQL/MariaDB)**: InnoDB exige que la columna
+  AUTO_INCREMENT sea la primera columna de alguna clave de la MISMA sentencia `CREATE TABLE`
+  (un índice creado después no cuenta). Tablas origen heredadas (p.ej. migradas de MyISAM, que sí
+  lo tolera) pueden traer una PK compuesta con el autoincrement al final → reproducirla tal cual
+  dispara `(1075, ...)` al primer `CREATE TABLE`. Fix en `MySQLAdapter._render_create_table`: si la
+  PK/UNIQUE inline no cubre al autoincrement, se agrega automáticamente una `KEY` de apoyo (no
+  reordena la PK ni cambia ningún objeto) + aviso en `warnings` del preview
+  (`ClonePreviewOut`/`_ExecutionPlan.warnings`, `clone_controller.py::_autoincrement_pk_warnings`).
+  Mismo `render_diff` usado por schema-comparisons, así que también lo cubre.
 - Verificación: tests unit/API (FakeAdapter + runner síncrono) + `test_mysql_render.py` +
   `test_clone_body_objects.py`; **e2e contra MariaDB 11 real EJECUTADO** (tabla con `ON UPDATE`,
   vista, vista-sobre-vista en orden inverso, función, procedimiento, trigger, evento: todos

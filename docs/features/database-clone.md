@@ -125,6 +125,26 @@ Dos cuidados propios de estos objetos (`CloneController`):
   cuando una pasada completa no crea ninguno de los pendientes (sin progreso = fallo real, no de
   orden). Las tablas/FKs/índices siguen con orden determinista de una sola pasada.
 
+## AUTO_INCREMENT que no encabeza la PRIMARY KEY (MySQL/MariaDB)
+
+MySQL/MariaDB (InnoDB) exige que una columna `AUTO_INCREMENT` sea la **primera columna de
+alguna clave** definida en la **misma sentencia** `CREATE TABLE` (un índice creado en una
+sentencia posterior no cuenta para esta validación). Algunas tablas origen "heredadas"
+(p. ej. migradas de MyISAM a InnoDB sin corregir el orden, o restauradas desde un backup
+antiguo) tienen una PK compuesta donde el autoincrement quedó al final
+(`PRIMARY KEY (col_a, col_b, id)` con `id` AUTO_INCREMENT) — MyISAM lo tolera, InnoDB no.
+Reproducir esa PK tal cual en el destino dispara `(1075, 'Incorrect table definition; there
+can be only one auto column and it must be defined as a key')` al primer `CREATE TABLE`.
+
+El clon **no reordena la PK** (se preserva fiel al origen): en cambio,
+`MySQLAdapter._render_create_table` detecta si el autoincrement queda cubierto por la PK o
+un `UNIQUE` inline y, si no, agrega automáticamente una `KEY (`id`)` de apoyo en la misma
+sentencia — no cambia el conjunto de columnas de la PK ni ningún otro objeto, solo satisface
+el requisito del motor. Esto se avisa en `warnings` del preview (`POST .../preview`) para que
+el operador lo vea antes de ejecutar, no solo leyendo el DDL en `GET .../items`. Si el origen
+ya trae un índice "real" sobre esa columna, puede quedar una redundancia inofensiva (dos
+índices sobre la misma columna) — preferible a que el clon completo falle.
+
 ## Dependencias (auto-selección inteligente)
 
 `app/services/db_admin/clone_dependencies.py` (módulo puro):
