@@ -82,6 +82,11 @@ CRYPTO_KEY_SALT = os.getenv("CRYPTO_KEY_SALT", "db-gateway-static-salt")
 REMOTE_CONNECT_TIMEOUT = int(os.getenv("REMOTE_CONNECT_TIMEOUT", "10"))
 # Timeout (milisegundos) de ejecución de una sentencia remota (DDL/DCL/introspección).
 REMOTE_STATEMENT_TIMEOUT_MS = int(os.getenv("REMOTE_STATEMENT_TIMEOUT_MS", "15000"))
+# Timeout (milisegundos) para operaciones de VOLCADO MASIVO (copia de datos del clon):
+# el timeout interactivo de 15s es demasiado corto para insertar/leer lotes de tablas
+# grandes → las cancelaría y dejaría datos parciales. Default 1 hora. ``0`` = sin límite
+# (útil para tablas enormes, pero un clon colgado nunca se autocancela).
+REMOTE_BULK_STATEMENT_TIMEOUT_MS = int(os.getenv("REMOTE_BULK_STATEMENT_TIMEOUT_MS", "3600000"))
 # Política TLS hacia los motores DESTINO (la credencial pseudo-root viaja por aquí).
 # Vacío/None/"disable" => sin TLS (comportamiento histórico). Recomendado en producción:
 #   - PostgreSQL: "require" | "verify-ca" | "verify-full" (psycopg lo aplica nativamente).

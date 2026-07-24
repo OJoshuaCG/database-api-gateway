@@ -136,6 +136,26 @@ def _build_insert(engine_type: str, spec: TableCopySpec) -> str:
 # --------------------------------------------------------------------------- #
 # Desactivación / restauración de FKs (nivel sesión, best-effort)              #
 # --------------------------------------------------------------------------- #
+def _set_read_committed(conn, engine_type: str) -> None:
+    """
+    Baja el aislamiento de la sesión de LECTURA a READ COMMITTED (best-effort). Una copia
+    larga en REPEATABLE READ (default de MySQL/InnoDB y de PostgreSQL en una tx) mantiene
+    un read-view/snapshot que impide el purge del undo → crece el history list del ORIGEN
+    si tiene carga de escritura. No afecta la corrección: ya copiamos tabla por tabla, sin
+    consistencia point-in-time cross-tabla. Si el SET falla, se ignora.
+    """
+    if engine_type in ("mysql", "mariadb"):
+        sql = "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    elif engine_type == "postgresql":
+        sql = "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    else:
+        return
+    try:
+        conn.exec_driver_sql(sql)
+    except SQLAlchemyError:
+        pass  # best-effort
+
+
 def _set_fk_enforcement(conn, engine_type: str, *, enabled: bool) -> None:
     """
     Activa/desactiva el chequeo de FKs para la SESIÓN de destino. MySQL/MariaDB usan
@@ -195,7 +215,12 @@ def _copy_one_table(
 
     try:
         # Conexión de ORIGEN por tabla: aísla el cursor en streaming ante un fallo.
-        with database_connection(source_target, source_db) as src:
+        # ``bulk=True``: timeout de volcado (leer una tabla grande supera los 15s
+        # interactivos). ``READ COMMITTED``: una lectura larga en REPEATABLE READ pinnea
+        # un read-view e infla el undo/history del ORIGEN si tiene carga de escritura; la
+        # consistencia cross-tabla ya no está garantizada (FKs off, tabla por tabla).
+        with database_connection(source_target, source_db, bulk=True) as src:
+            _set_read_committed(src, source_engine)
             result = src.execution_options(
                 stream_results=True, yield_per=batch_rows
             ).execute(text(select_sql))
@@ -259,7 +284,8 @@ def copy_tables(
     results: list[TableCopyResult] = []
 
     # UNA conexión de destino para toda la fase, en AUTOCOMMIT, con FKs desactivadas.
-    with database_connection(dest_target, dest_db) as dest_conn:
+    # ``bulk=True``: timeout de volcado (un executemany de lote grande supera los 15s).
+    with database_connection(dest_target, dest_db, bulk=True) as dest_conn:
         dest_conn = dest_conn.execution_options(isolation_level="AUTOCOMMIT")
         _set_fk_enforcement(dest_conn, dest_engine, enabled=False)
         try:

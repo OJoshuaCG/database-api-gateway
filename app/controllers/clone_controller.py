@@ -111,6 +111,8 @@ _ENGINE_SPECIFIC_TYPES = frozenset(
 # (vistas/rutinas/triggers/eventos). Requieren: (1) re-calificar el esquema origen→destino
 # y (2) ejecución con reintento diferido, porque pueden depender entre sí en cualquier orden.
 _BODY_TYPES = frozenset({"view", "materialized_view", "routine", "trigger", "event"})
+# Intervalo mínimo entre persistencias del progreso de datos a la BD del gateway (throttle).
+_CLONE_PROGRESS_PERSIST_SECONDS = 3.0
 
 
 def _utcnow() -> datetime:
@@ -1124,9 +1126,18 @@ class CloneController:
             self._set_status(job_id, CLONE_STATUS_RUNNING, phase="data")
             progress["phase"] = "data"
 
-            def progress_cb(table, rows_so_far, _p=progress, _jid=job_id):
+            # Throttle temporal: persistir el progreso a la BD del gateway a lo sumo cada
+            # ~3s. Sin esto, una tabla grande dispara un UPDATE por lote (p. ej. 50M filas /
+            # 1000 = 50k updates), martillando la BD de metadatos. El estado final siempre se
+            # persiste al cierre del pipeline (_set_progress más abajo).
+            _last_persist = [0.0]
+
+            def progress_cb(table, rows_so_far, _p=progress, _jid=job_id, _lp=_last_persist):
                 _p["tables"][table] = rows_so_far
-                self._set_progress(_jid, _p)
+                now = time.monotonic()
+                if now - _lp[0] >= _CLONE_PROGRESS_PERSIST_SECONDS:
+                    _lp[0] = now
+                    self._set_progress(_jid, _p)
 
             specs = [
                 TableCopySpec(table=d.table, columns=d.columns, primary_key=d.primary_key, upsert=d.upsert)

@@ -25,7 +25,11 @@ from sqlalchemy import URL, Engine, create_engine
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
 
-from app.core.environments import REMOTE_CONNECT_TIMEOUT, REMOTE_STATEMENT_TIMEOUT_MS
+from app.core.environments import (
+    REMOTE_BULK_STATEMENT_TIMEOUT_MS,
+    REMOTE_CONNECT_TIMEOUT,
+    REMOTE_STATEMENT_TIMEOUT_MS,
+)
 from app.core.net_guard import validate_remote_host
 from app.exceptions import AppHttpException
 
@@ -89,19 +93,28 @@ _SSL_DISABLED = {"", "disable", "disabled", "off", "false", "0", "none"}
 _PG_SSLMODES = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
 
 
-def _connect_args(dialect: str, ssl_mode: str | None = None) -> dict[str, Any]:
+def _connect_args(
+    dialect: str, ssl_mode: str | None = None, *, bulk: bool = False
+) -> dict[str, Any]:
     mode = (ssl_mode or "").strip().lower()
     ssl_enabled = mode not in _SSL_DISABLED
+    # ``bulk=True`` (copia de datos del clon): usa un timeout mucho mayor que el
+    # interactivo (15s cancelaría lotes de tablas grandes). ``0`` = sin límite.
+    stmt_timeout_ms = (
+        REMOTE_BULK_STATEMENT_TIMEOUT_MS if bulk else REMOTE_STATEMENT_TIMEOUT_MS
+    )
 
     if dialect in ("mysql", "mariadb"):
         # pymysql: timeouts a nivel de socket cubren conexión y ejecución.
-        stmt_timeout_s = max(1, REMOTE_STATEMENT_TIMEOUT_MS // 1000)
         args: dict[str, Any] = {
             "connect_timeout": REMOTE_CONNECT_TIMEOUT,
-            "read_timeout": stmt_timeout_s,
-            "write_timeout": stmt_timeout_s,
             "charset": "utf8mb4",
         }
+        # 0 => sin read/write_timeout (socket sin límite de tiempo de operación).
+        if stmt_timeout_ms > 0:
+            stmt_timeout_s = max(1, stmt_timeout_ms // 1000)
+            args["read_timeout"] = stmt_timeout_s
+            args["write_timeout"] = stmt_timeout_s
         if ssl_enabled:
             # Un dict ``ssl`` no vacío fuerza TLS en pymysql. Sin material de CA en el
             # inventario, ciframos el transporte sin verificar el certificado
@@ -111,12 +124,13 @@ def _connect_args(dialect: str, ssl_mode: str | None = None) -> dict[str, Any]:
         return args
 
     # postgresql (psycopg v3): connect_timeout + statement/lock timeout por sesión.
+    # statement_timeout=0 => sin límite (lo usa el modo bulk para tablas grandes).
     args = {
         "connect_timeout": REMOTE_CONNECT_TIMEOUT,
         "options": (
-            f"-c statement_timeout={REMOTE_STATEMENT_TIMEOUT_MS} "
+            f"-c statement_timeout={stmt_timeout_ms} "
             "-c lock_timeout=5000 "
-            f"-c idle_in_transaction_session_timeout={REMOTE_STATEMENT_TIMEOUT_MS}"
+            f"-c idle_in_transaction_session_timeout={stmt_timeout_ms}"
         ),
     }
     if ssl_enabled:
@@ -126,7 +140,7 @@ def _connect_args(dialect: str, ssl_mode: str | None = None) -> dict[str, Any]:
     return args
 
 
-def _build_engine(target: ServerTarget, effective_db: str | None) -> Engine:
+def _build_engine(target: ServerTarget, effective_db: str | None, *, bulk: bool = False) -> Engine:
     driver = _require_driver(target.dialect)
     url = URL.create(
         drivername=driver,
@@ -139,21 +153,22 @@ def _build_engine(target: ServerTarget, effective_db: str | None) -> Engine:
     return create_engine(
         url,
         poolclass=NullPool,
-        connect_args=_connect_args(target.dialect, target.ssl_mode),
+        connect_args=_connect_args(target.dialect, target.ssl_mode, bulk=bulk),
     )
 
 
-def get_engine(target: ServerTarget, database: str | None = None) -> Engine:
+def get_engine(target: ServerTarget, database: str | None = None, *, bulk: bool = False) -> Engine:
     """
-    Devuelve un engine cacheado por (server_id, BD efectiva). `database=None`
-    => conexión a nivel servidor (admin). Construye on-demand con NullPool.
+    Devuelve un engine cacheado por (server_id, BD efectiva, bulk). `database=None`
+    => conexión a nivel servidor (admin). `bulk=True` => timeouts de volcado masivo
+    (copia de datos del clon); se cachea por separado para no mezclar timeouts.
     """
     effective_db = _effective_database(target.dialect, database)
-    key = (target.server_id, effective_db or "")
+    key = (target.server_id, effective_db or "", bulk)
     with _lock:
         engine = _engines.get(key)
         if engine is None:
-            engine = _build_engine(target, effective_db)
+            engine = _build_engine(target, effective_db, bulk=bulk)
             _engines[key] = engine
         return engine
 
@@ -178,10 +193,11 @@ def server_connection(target: ServerTarget):
 
 
 @contextmanager
-def database_connection(target: ServerTarget, database: str):
-    """Conexión a una BD CONCRETA (introspección/migraciones). Revalida el host (anti-SSRF, R2)."""
+def database_connection(target: ServerTarget, database: str, *, bulk: bool = False):
+    """Conexión a una BD CONCRETA (introspección/migraciones). Revalida el host (anti-SSRF, R2).
+    ``bulk=True`` usa timeouts de volcado masivo (copia de datos del clon)."""
     validate_remote_host(target.host)
-    engine = get_engine(target, database)
+    engine = get_engine(target, database, bulk=bulk)
     conn = engine.connect()
     try:
         yield conn
