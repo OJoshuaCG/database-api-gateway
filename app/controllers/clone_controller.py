@@ -116,6 +116,12 @@ _ENGINE_SPECIFIC_TYPES = frozenset(
 # (vistas/rutinas/triggers/eventos). Requieren: (1) re-calificar el esquema origen→destino
 # y (2) ejecución con reintento diferido, porque pueden depender entre sí en cualquier orden.
 _BODY_TYPES = frozenset({"view", "materialized_view", "routine", "trigger", "event"})
+# Objetos con cuerpo que tienen EFECTOS SECUNDARIOS ante un INSERT: un trigger de origen
+# puede poblar OTRA tabla, y un evento puede mutar datos. Se crean DESPUÉS de la fase de
+# datos (ver _run_phases) para que no se disparen durante la copia y dupliquen/alteren filas
+# (MySQL/MariaDB NO desactivan triggers con FOREIGN_KEY_CHECKS=0; PostgreSQL sí con
+# session_replication_role='replica', pero diferirlos es la defensa portable para ambos).
+_POST_DATA_BODY_TYPES = frozenset({"trigger", "event"})
 # Intervalo mínimo entre persistencias del progreso de datos a la BD del gateway (throttle).
 _CLONE_PROGRESS_PERSIST_SECONDS = 3.0
 
@@ -1241,6 +1247,12 @@ class CloneController:
             )
             had_failure = had_failure or failed
 
+        # Triggers/eventos se difieren a DESPUÉS de la fase de datos (ver el bloque de más
+        # abajo): si el origen tiene un trigger de INSERT que puebla otra tabla, crearlo ANTES
+        # de copiar los datos lo dispararía durante la copia y duplicaría filas en la tabla
+        # que puebla (ER_DUP_ENTRY 1062 en una pivote poblada por trigger, p. ej.).
+        body_post = [s for s in plan.structure_statements if s.object_type in _POST_DATA_BODY_TYPES]
+
         # --- Fase: estructura -------------------------------------------------------- #
         if not had_failure and plan.structure_statements:
             self._set_status(job_id, CLONE_STATUS_RUNNING, phase="structure")
@@ -1249,19 +1261,22 @@ class CloneController:
                 return
             # Objetos "duros" (tablas/columnas/FKs/índices): orden determinista ya correcto
             # (topológico + FKs en fase aditiva) → una pasada, corta al primer fallo.
-            # Objetos con CUERPO (vistas/rutinas/triggers/eventos): pueden depender entre sí
-            # en cualquier orden → reintento diferido.
+            # Objetos con CUERPO SIN efectos en INSERT (vistas/rutinas): pueden depender entre
+            # sí en cualquier orden → reintento diferido. Triggers/eventos NO van acá (body_post).
             hard = [s for s in plan.structure_statements if s.object_type not in _BODY_TYPES]
-            body = [s for s in plan.structure_statements if s.object_type in _BODY_TYPES]
+            body_pre = [
+                s for s in plan.structure_statements
+                if s.object_type in _BODY_TYPES and s.object_type not in _POST_DATA_BODY_TYPES
+            ]
             if hard:
                 seq, failed = self._run_statements(
                     job_id, runner, tgt_target, ctx["target_db"], engine, lock_key,
                     hard, CLONE_ITEM_STRUCTURE, seq,
                 )
                 had_failure = had_failure or failed
-            if not had_failure and body:
+            if not had_failure and body_pre:
                 seq, failed = self._run_body_statements(
-                    job_id, runner, tgt_target, ctx["target_db"], engine, lock_key, body, seq,
+                    job_id, runner, tgt_target, ctx["target_db"], engine, lock_key, body_pre, seq,
                 )
                 had_failure = had_failure or failed
 
@@ -1319,6 +1334,26 @@ class CloneController:
                 self._resync_postgres_identity_sequences(
                     tgt_target, ctx["target_db"], source_snap, results,
                 )
+
+        # --- Fase: triggers y eventos (DESPUÉS de los datos) -------------------------- #
+        # Diferidos a propósito: crearlos recién ahora, con los datos ya cargados, evita que
+        # un trigger de INSERT del origen se dispare durante la copia y duplique/altere filas
+        # de la tabla que puebla (síntoma real: ER_DUP_ENTRY 1062 en una tabla pivote como
+        # users_modules_permissions). MySQL/MariaDB NO desactivan triggers con
+        # FOREIGN_KEY_CHECKS=0, así que la única defensa portable es el orden (igual que
+        # mysqldump, que recrea los triggers al final, tras cargar los datos). Reintento
+        # diferido para dependencias entre ellos; las tablas/rutinas de las que dependen ya
+        # existen (fase de estructura). Corre aunque include_data=False (sin datos que copiar,
+        # simplemente se crean acá en vez de en la fase de estructura).
+        if not had_failure and body_post:
+            self._set_status(job_id, CLONE_STATUS_RUNNING, phase="structure")
+            if cancel():
+                self._set_status(job_id, CLONE_STATUS_CANCELED, finished=True)
+                return
+            seq, failed = self._run_body_statements(
+                job_id, runner, tgt_target, ctx["target_db"], engine, lock_key, body_post, seq,
+            )
+            had_failure = had_failure or failed
 
         # --- Fase: adopt ------------------------------------------------------------- #
         if not had_failure and plan.will_adopt:
