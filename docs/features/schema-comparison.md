@@ -143,6 +143,41 @@ existía en ambos lados y cambió se reporta como `modified`.
   columna). El diff naive los ve como DROP+CREATE; se agrega una heurística *advisory* —
   si un objeto eliminado tiene firma muy similar a uno recién creado, se marca
   `possible_rename_of: <nombre>` para que el operador lo note antes de aplicar el DROP.
+- **`UNIQUE KEY` de MySQL/MariaDB reflejada por duplicado**: en esos motores una unique
+  constraint **es** un índice, y SQLAlchemy la refleja en *ambas* colecciones a la vez
+  (`get_indexes()` con `unique=True` y `get_unique_constraints()`, que la marca con
+  `duplicates_index`). Se descarta la copia redundante del lado de los índices — en el lado
+  `source` **y** en el `target` — para no emitir dos sentencias que crean (o eliminan) la
+  misma clave. Ver ["`ADD CONSTRAINT … UNIQUE` duplicado"](#add-constraint--unique-duplicado-1061)
+  más abajo.
+
+## `ADD CONSTRAINT … UNIQUE` duplicado (1061)
+
+Síntoma: una versión de blueprint adoptada desde un diff falla al aplicarse con
+
+```
+(1061, "Duplicate key name 'uk_...'")
+[SQL: ALTER TABLE `...` ADD CONSTRAINT `uk_...` UNIQUE (...)]
+```
+
+Causa: el diff emitía **dos** ítems para la **misma** UNIQUE KEY física — un
+`unique_constraint` *new* (`ALTER TABLE … ADD CONSTRAINT … UNIQUE`) y un `index` *new*
+(`CREATE UNIQUE INDEX …`) — porque el snapshot guardaba las dos copias que devuelve la
+reflexión de MySQL/MariaDB. La primera sentencia crea la clave y la **segunda choca con ella**,
+abortando la migración a mitad (el DDL no es transaccional en MySQL, así que lo anterior queda
+aplicado). El caso simétrico daba dos `DROP` y el segundo fallaba con 1091.
+
+Corregido en `schema_diff.py` (`_index_backs_unique_constraint`, aplicado a tablas nuevas y
+existentes). El dedup es **por nombre**, no por "el índice es único": en PostgreSQL un índice
+único **parcial** (`CREATE UNIQUE INDEX … WHERE …`) es un objeto autónomo sin constraint detrás
+y debe preservarse.
+
+**Versiones ya adoptadas antes del fix** conservan el `up_sql` malformado: hay que corregirlas
+a mano con `PATCH /database-models/{model_id}/migrations/{version}` quitando la sentencia
+redundante. El `PATCH` está permitido mientras la versión no haya tenido una aplicación
+**exitosa** (un intento fallido no congela el SQL). Si el fallo dejó un checkpoint de sentencia
+parcial, el `PATCH` responde 409 y hay que resolverlo con `force=true` tras verificar el estado
+físico real de la BD (ver `docs/features/model-migrations.md`).
 
 ## Clasificación destructiva (fail-closed, por ítem)
 

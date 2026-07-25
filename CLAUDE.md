@@ -667,6 +667,26 @@ directo** ad-hoc (Opción B). Guía de uso: `docs/features/schema-comparison.md`
   **nunca** entran en `all`/`all_except_destructive`, solo `custom`; PostgreSQL cubre solo el
   schema `public` (`scope_note` en la respuesta); v1 **no** autogenera `RENAME` (DROP+CREATE +
   heurística `possible_rename_of` advisory).
+- **UNIQUE KEY reflejada DUPLICADA en MySQL/MariaDB (fix)**: SQLAlchemy refleja una misma
+  `UNIQUE KEY` de MySQL/MariaDB en **dos** colecciones — `get_indexes()` (con `unique=True`)
+  y `get_unique_constraints()` (que la marca con `duplicates_index`) — porque en esos motores
+  una unique constraint *es* un índice. El snapshot guardaba ambas copias, así que el diff
+  emitía **DOS** sentencias que crean la MISMA clave (`ALTER TABLE … ADD CONSTRAINT x UNIQUE`
+  + `CREATE UNIQUE INDEX x`) y la segunda abortaba la migración con
+  `(1061, "Duplicate key name 'x'")`. El camino de tabla NUEVA ya lo evitaba
+  (`_new_table_child_items` saltaba `ix.unique`), pero el de tabla EXISTENTE no filtraba nada
+  (el comentario "no PK/unique-constraint" documentaba una intención no implementada). Fix:
+  `schema_diff.py::_index_backs_unique_constraint` + filtrado de `src.indexes`/`tgt.indexes`
+  en `_diff_one_table` (**ambos** lados: si no, una unique key que sobra en el destino daba
+  dos DROP y el segundo fallaba con 1091). El match es por **NOMBRE**, no por `ix.unique` a
+  secas: en PostgreSQL un índice único puede ser autónomo sin constraint detrás (índice único
+  **parcial** con `WHERE`) y descartarlo lo perdería en silencio — el fix también corrige esa
+  pérdida latente en el camino de tabla nueva (afectaba al clon). Solo MySQL y Oracle marcan
+  `duplicates_index`; PostgreSQL no duplica. Afecta a schema-comparisons (diff/adopt/execute)
+  y al clon, que comparten `diff_snapshots`+`render_diff`. Tests en `tests/test_schema_diff.py`.
+  **Nota operativa**: una versión de blueprint YA adoptada antes de este fix conserva el
+  `up_sql` con la sentencia redundante — hay que corregirla con `PATCH` (permitido mientras no
+  haya una aplicación EXITOSA; un intento fallido no congela el SQL).
 - **Clasificación new/modified/dropped (fix)**: `primary_key` ya NO es siempre `modified`
   — agregar un PK donde no existía es `new`, eliminarlo por completo es `dropped`, solo un
   PK que cambió existiendo en ambos lados es `modified`. `index`/`unique_constraint`/
