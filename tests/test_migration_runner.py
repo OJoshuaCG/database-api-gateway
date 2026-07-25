@@ -9,7 +9,9 @@ ejecutando el mismo ``env.py`` y ``command.*`` que usa el runner, sobre SQLite.
 """
 
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from alembic import command
@@ -17,6 +19,7 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.models.enums import EngineType
+from app.services.db_admin import migration_progress
 from app.services.db_admin.migrations import (
     MigrationRunner,
     MigrationSpec,
@@ -29,6 +32,30 @@ def _spec(version, up_sql, *, mysql=None, pg=None, down=None):
         id=int(version), version=version, name=f"m{version}", up_sql=up_sql,
         up_sql_mysql=mysql, up_sql_postgresql=pg, down_sql=down, checksum="x",
     )
+
+
+# ``_write_revision_files`` recibe el id de la BD gestionada para consultar el checkpoint
+# de sentencia (``migration_progress``). Estos tests solo verifican el CODEGEN de los
+# archivos de revisión y el ciclo Alembic contra SQLite, así que se pasa un id inexistente.
+_NO_MANAGED_DB = -1
+
+
+@contextmanager
+def _no_checkpoint():
+    """
+    Neutraliza el checkpoint de sentencia, que vive en la BD de METADATOS del gateway.
+
+    Sin esto, estos tests —que no tocan ningún motor remoto y corren contra SQLite— exigen
+    una conexión viva a la BD del gateway: ``_write_revision_files`` consulta el checkpoint
+    (``get_progress``) y el código generado llama a ``record_statement`` en cada sentencia.
+    Se stubean ambos: ``get_progress`` a None (no hay aplicación parcial previa, el codegen
+    sale completo) y ``record_statement`` a un no-op.
+    """
+    with (
+        mock.patch.object(migration_progress, "get_progress", return_value=None),
+        mock.patch.object(migration_progress, "record_statement", lambda *a, **k: None),
+    ):
+        yield
 
 
 # --------------------------------------------------------------------------- #
@@ -153,6 +180,7 @@ def test_compute_pending_numeric_not_lexicographic():
     assert [s.version for s in r.compute_pending(None, mixed)] == ["0099", "00100"]
 
 
+@_no_checkpoint()
 def test_write_revision_files_chains_down_revision():
     r = MigrationRunner()
     specs = [_spec("0001", "CREATE TABLE a (id INT)"),
@@ -160,7 +188,7 @@ def test_write_revision_files_chains_down_revision():
     with tempfile.TemporaryDirectory() as tmp:
         vdir = Path(tmp) / "versions"
         vdir.mkdir()
-        r._write_revision_files(vdir, specs, EngineType.mysql)
+        r._write_revision_files(vdir, specs, EngineType.mysql, _NO_MANAGED_DB)
         rev1 = (vdir / "rev_0001.py").read_text()
         rev2 = (vdir / "rev_0002.py").read_text()
         assert "down_revision = None" in rev1
@@ -173,6 +201,7 @@ def test_write_revision_files_chains_down_revision():
 # --------------------------------------------------------------------------- #
 # Ciclo Alembic real contra SQLite (env.py compartido + command.*)            #
 # --------------------------------------------------------------------------- #
+@_no_checkpoint()
 def test_full_upgrade_downgrade_stamp_cycle_sqlite():
     r = MigrationRunner()
     specs = [
@@ -188,7 +217,7 @@ def test_full_upgrade_downgrade_stamp_cycle_sqlite():
     with tempfile.TemporaryDirectory() as tmp:
         vdir = Path(tmp) / "versions"
         vdir.mkdir()
-        r._write_revision_files(vdir, specs, EngineType.mysql)
+        r._write_revision_files(vdir, specs, EngineType.mysql, _NO_MANAGED_DB)
 
         with engine.connect() as conn:
             cfg = r._make_config(vdir, conn, vt)
@@ -210,13 +239,14 @@ def test_full_upgrade_downgrade_stamp_cycle_sqlite():
     with tempfile.TemporaryDirectory() as tmp:
         vdir = Path(tmp) / "versions"
         vdir.mkdir()
-        r._write_revision_files(vdir, specs, EngineType.mysql)
+        r._write_revision_files(vdir, specs, EngineType.mysql, _NO_MANAGED_DB)
         with engine.connect() as conn:
             cfg = r._make_config(vdir, conn, vt)
             command.stamp(cfg, "0002")
             assert r._read_current(conn, vt) == "0002"
 
 
+@_no_checkpoint()
 def test_sequential_downgrade_to_target_version_sqlite():
     """
     Mecánica del rollback secuencial: estando en 0004, bajar a 0001 en pasos
@@ -237,7 +267,7 @@ def test_sequential_downgrade_to_target_version_sqlite():
     with tempfile.TemporaryDirectory() as tmp:
         vdir = Path(tmp) / "versions"
         vdir.mkdir()
-        r._write_revision_files(vdir, specs, EngineType.mysql)
+        r._write_revision_files(vdir, specs, EngineType.mysql, _NO_MANAGED_DB)
         with engine.connect() as conn:
             cfg = r._make_config(vdir, conn, vt)
             command.upgrade(cfg, "0004")
