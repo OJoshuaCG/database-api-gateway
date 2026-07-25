@@ -809,6 +809,94 @@ def test_render_mysql_drop_check_uses_drop_check():
 
 
 # =========================================================================== #
+# UNIQUE KEY reflejada DUPLICADA por MySQL (regresión: 1061 Duplicate key name) #
+# =========================================================================== #
+# MySQL/MariaDB no distinguen constraint de índice: SQLAlchemy refleja una misma
+# ``UNIQUE KEY`` en get_indexes() (unique=True) Y en get_unique_constraints(). Sin
+# deduplicar, el diff emitía DOS sentencias que crean la MISMA clave (ADD CONSTRAINT +
+# CREATE UNIQUE INDEX) y la segunda fallaba con (1061, "Duplicate key name").
+def _uk_both_sides(name="uk_ab", cols=("a", "b")):
+    """Una UNIQUE KEY tal como la refleja MySQL: en índices Y en unique constraints."""
+    return (
+        [IndexInfo(name=name, columns=list(cols), unique=True)],
+        [UniqueConstraintInfo(name=name, columns=list(cols))],
+    )
+
+
+def test_mysql_unique_key_reflected_twice_emits_one_add_statement():
+    ixs, ucs = _uk_both_sides()
+    cols = [_col("a", "int"), _col("b", "int")]
+    src = _snap("mysql", tables=[_tbl("t", cols, indexes=ixs, uniques=ucs)])
+    tgt = _snap("mysql", tables=[_tbl("t", cols)])
+    stmts = [s.sql for s in _render("mysql", src, tgt)]
+    assert len(stmts) == 1, f"la unique key se emitió duplicada: {stmts}"
+    assert "ADD CONSTRAINT `uk_ab` UNIQUE" in stmts[0]
+    assert not any("CREATE UNIQUE INDEX" in s for s in stmts)
+
+
+def test_mysql_unique_key_reflected_twice_emits_one_drop_statement():
+    """Simétrico: la clave sobra en el destino → un solo DROP (el 2º fallaría con 1091)."""
+    ixs, ucs = _uk_both_sides()
+    cols = [_col("a", "int"), _col("b", "int")]
+    src = _snap("mysql", tables=[_tbl("t", cols)])
+    tgt = _snap("mysql", tables=[_tbl("t", cols, indexes=ixs, uniques=ucs)])
+    stmts = [s.sql for s in _render("mysql", src, tgt)]
+    assert len(stmts) == 1, f"el DROP de la unique key se emitió duplicado: {stmts}"
+
+
+def test_two_distinct_unique_keys_still_emit_two_statements():
+    """El dedup es por NOMBRE: dos unique keys distintas no se fusionan."""
+    cols = [_col("a", "int"), _col("b", "int")]
+    ixs = [IndexInfo(name="uk_a", columns=["a"], unique=True),
+           IndexInfo(name="uk_b", columns=["b"], unique=True)]
+    ucs = [UniqueConstraintInfo(name="uk_a", columns=["a"]),
+           UniqueConstraintInfo(name="uk_b", columns=["b"])]
+    src = _snap("mysql", tables=[_tbl("t", cols, indexes=ixs, uniques=ucs)])
+    tgt = _snap("mysql", tables=[_tbl("t", cols)])
+    assert len(_render("mysql", src, tgt)) == 2
+
+
+def test_non_unique_index_is_never_deduplicated():
+    cols = [_col("a", "int")]
+    ixs = [IndexInfo(name="ix_a", columns=["a"], unique=False)]
+    src = _snap("mysql", tables=[_tbl("t", cols, indexes=ixs)])
+    tgt = _snap("mysql", tables=[_tbl("t", cols)])
+    stmts = [s.sql for s in _render("mysql", src, tgt)]
+    assert len(stmts) == 1 and "CREATE INDEX `ix_a`" in stmts[0]
+
+
+def test_pg_partial_unique_index_without_constraint_is_preserved():
+    """
+    En PostgreSQL un índice único PARCIAL es un objeto autónomo sin unique constraint
+    detrás: deduplicar por ``ix.unique`` a secas lo perdería del diff en silencio.
+    """
+    cols = [_col("a", "int"), _col("deleted_at", "timestamp")]
+    ixs = [IndexInfo(name="uix_live", columns=["a"], unique=True,
+                     predicate="deleted_at IS NULL")]
+    src = _snap("postgresql", tables=[_tbl("t", cols, indexes=ixs)])
+    tgt = _snap("postgresql", tables=[_tbl("t", cols)])
+    stmts = [s.sql for s in _render("postgresql", src, tgt)]
+    assert len(stmts) == 1 and "UNIQUE INDEX" in stmts[0].upper()
+    assert "WHERE deleted_at IS NULL" in stmts[0]
+
+
+def test_new_table_keeps_partial_unique_index_but_not_backing_index():
+    """
+    Tabla NUEVA (camino del clon): la unique constraint va inline en el CREATE TABLE y su
+    índice de respaldo NO se recrea aparte; un índice único parcial sí se emite aparte.
+    """
+    cols = [_col("a", "int"), _col("deleted_at", "timestamp")]
+    ixs, ucs = _uk_both_sides(name="uk_a", cols=("a",))
+    ixs = ixs + [IndexInfo(name="uix_live", columns=["a"], unique=True,
+                           predicate="deleted_at IS NULL")]
+    src = _snap("postgresql", tables=[_tbl("t", cols, indexes=ixs, uniques=ucs)])
+    rendered = _render("postgresql", src, _snap("postgresql"))
+    index_stmts = [s.sql for s in rendered if s.object_type == "index"]
+    assert len(index_stmts) == 1, f"esperaba solo el parcial, hubo: {index_stmts}"
+    assert "uix_live" in index_stmts[0]
+
+
+# =========================================================================== #
 # Helper de aserción de "cero diff"                                            #
 # =========================================================================== #
 def diff_items(src, tgt):
