@@ -604,6 +604,44 @@ def _diff_tables(source: SchemaSnapshot, target: SchemaSnapshot, engine: str) ->
     return items
 
 
+def _index_backs_unique_constraint(
+    ix: IndexInfo, uniques: list[UniqueConstraintInfo]
+) -> bool:
+    """
+    ¿Este índice ÚNICO es el MISMO objeto físico que una unique constraint de la tabla?
+
+    MySQL/MariaDB no distinguen ambos conceptos: una ``UNIQUE KEY`` es a la vez constraint
+    e índice, y SQLAlchemy la refleja **DUPLICADA** — aparece en ``get_indexes()`` (con
+    ``unique=True``) *y* en ``get_unique_constraints()`` (que además la marca con
+    ``duplicates_index`` = el mismo nombre). Verificado en
+    ``sqlalchemy/dialects/mysql/base.py`` (solo MySQL y Oracle marcan ``duplicates_index``;
+    PostgreSQL no duplica).
+
+    Sin descartar la copia redundante, el diff emite **DOS** sentencias que crean la MISMA
+    clave — ``ALTER TABLE … ADD CONSTRAINT x UNIQUE (…)`` y
+    ``CREATE UNIQUE INDEX x ON …`` — y la segunda falla con
+    ``(1061, "Duplicate key name 'x'")``, abortando la migración a mitad.
+
+    El match es por **NOMBRE** (no por el simple hecho de que el índice sea único): en
+    PostgreSQL un índice único puede ser un objeto autónomo SIN constraint detrás — el caso
+    típico es un índice único **parcial** (``CREATE UNIQUE INDEX … WHERE deleted_at IS
+    NULL``) — y descartarlo lo perdería del diff en silencio. Solo se compara por conjunto
+    de columnas cuando a alguno de los dos lados le falta el nombre.
+    """
+    if not ix.unique:
+        return False
+    if ix.predicate or ix.expressions:
+        # Un índice parcial/funcional NUNCA puede ser el respaldo de una unique constraint.
+        return False
+    for uc in uniques:
+        if uc.name and ix.name:
+            if uc.name == ix.name:
+                return True
+        elif list(uc.columns) == list(ix.columns):
+            return True
+    return False
+
+
 def _new_table_child_items(tbl: TableSchema) -> list[DiffItem]:
     """FKs (todas) e índices no-únicos de una tabla NUEVA, como ítems de fase 3."""
     items: list[DiffItem] = []
@@ -615,8 +653,8 @@ def _new_table_child_items(tbl: TableSchema) -> list[DiffItem]:
             source_payload=fk, risk=RiskFlags(lock_heavy=True),
         ))
     for ix in tbl.indexes:
-        if ix.unique:
-            continue  # las UNIQUE van inline en el CREATE TABLE
+        if _index_backs_unique_constraint(ix, tbl.unique_constraints):
+            continue  # ya va inline (CONSTRAINT … UNIQUE) en el CREATE TABLE
         items.append(DiffItem(
             object_type="index",
             object_name=f"{tbl.table}.{ix.name}" if ix.name else f"{tbl.table}.<index>",
@@ -766,8 +804,22 @@ def _diff_one_table(src: TableSchema, tgt: TableSchema, engine: str) -> list[Dif
     )
 
     # --- índices (no PK/unique-constraint; match por firma) ----------------- #
+    # Se descartan, en AMBOS lados, los índices únicos que son el mismo objeto físico que
+    # una unique constraint ya diffeada arriba (MySQL/MariaDB los reflejan duplicados; ver
+    # ``_index_backs_unique_constraint``). Filtrar el lado TARGET también es necesario: si
+    # no, una unique key que sobra en el destino se reportaría dos veces (un
+    # ``unique_constraint`` dropped + un ``index`` dropped) y el segundo DROP fallaría
+    # porque el primero ya eliminó la clave.
+    src_indexes = [
+        ix for ix in src.indexes
+        if not _index_backs_unique_constraint(ix, src.unique_constraints)
+    ]
+    tgt_indexes = [
+        ix for ix in tgt.indexes
+        if not _index_backs_unique_constraint(ix, tgt.unique_constraints)
+    ]
     items += _diff_collection(
-        table, "index", src.indexes, tgt.indexes,
+        table, "index", src_indexes, tgt_indexes,
         sig=_index_signature,
         new_phase=PHASE_ALTER_ADDITIVE, drop_phase=PHASE_ALTER_DESTRUCTIVE,
         new_risk=RiskFlags(lock_heavy=True),
