@@ -118,10 +118,11 @@ _PROCEDURAL_TYPES = frozenset({"routine", "trigger", "event"})
 _ENGINE_SPECIFIC_TYPES = frozenset(
     {"sequence", "enum_type", "extension", "materialized_view"}
 )
-# Tipos cuyo DDL lleva un CUERPO que puede referenciar OTROS objetos por nombre
-# (vistas/rutinas/triggers/eventos). Requieren: (1) re-calificar el esquema origen→destino
-# y (2) ejecución con reintento diferido, porque pueden depender entre sí en cualquier orden.
-_BODY_TYPES = frozenset({"view", "materialized_view", "routine", "trigger", "event"})
+# ``_BODY_TYPES`` se importa como alias de ``BODY_OBJECT_TYPES`` (``sql_dialect``, fuente
+# única de verdad compartida con schema-comparison): tipos cuyo DDL lleva un CUERPO que puede
+# referenciar OTROS objetos por nombre (vistas/rutinas/triggers/eventos). Requieren: (1)
+# re-calificar el esquema origen→destino y (2) ejecución con reintento diferido, porque
+# pueden depender entre sí en cualquier orden.
 # Objetos con cuerpo que tienen EFECTOS SECUNDARIOS ante un INSERT: un trigger de origen
 # puede poblar OTRA tabla, y un evento puede mutar datos. Se crean DESPUÉS de la fase de
 # datos (ver _run_phases) para que no se disparen durante la copia y dupliquen/alteren filas

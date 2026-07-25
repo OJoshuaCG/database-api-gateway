@@ -362,33 +362,6 @@ MySQL/MariaDB real ni con `pytest`. Re-correr `scripts/verify_schema_diff_e2e.py
 cubrir el ciclo comparación→adopción→aplicación de una vista con esquema calificado entre
 BDs de nombre distinto.
 
-### Detalle del hallazgo: `split_sql_statements` y rutinas MySQL/MariaDB
-
-`app/services/db_admin/sql_dialect.py::split_sql_statements` (infraestructura de
-[Plan 02](model-migrations.md), reusada por Opción A al generar la revisión de Alembic)
-respeta el dollar-quoting de PostgreSQL (`$$...$$`) pero **no reconoce los bloques
-`BEGIN...END` de MySQL/MariaDB** — cualquier `;` interno se trata como fin de sentencia.
-Confirmado con un caso mínimo:
-
-```pycon
->>> split_sql_statements("CREATE PROCEDURE sp_x() BEGIN UPDATE t SET x=x; END")
-['CREATE PROCEDURE sp_x() BEGIN UPDATE t SET x=x', 'END']
-```
-
-Esto ya estaba **documentado como limitación aceptada** en el docstring del módulo desde
-el Plan 02 ("deben subirse con cuidado, una por migración"), pero no se había verificado
-contra un motor real hasta esta fase. El impacto concreto para este plan: **Opción A**
-(que concatena el `up_sql` y lo pasa por Alembic → `split_sql_statements`) falla al
-aplicar cualquier rutina/trigger MySQL/MariaDB con cuerpo multi-sentencia; **Opción B**
-(`execute_adhoc`) NO tiene este problema porque ejecuta cada ítem ya renderizado como
-sentencia completa, sin volver a partirlo. No se modificó `sql_dialect.py` en este plan
-(el fix genérico — parsear anidamiento `BEGIN...END` con sus terminadores `END IF`/
-`END CASE`/`END LOOP`/`END WHILE`/`END REPEAT` — es una pieza de infraestructura
-compartida por TODAS las migraciones de blueprint, no solo por esta feature; tocarla
-está fuera del alcance de esta fase y merece su propio plan + batería de tests dedicada).
-El comportamiento observado es seguro (falla limpio, sin corrupción: la sentencia
-partida es sintácticamente inválida y el motor la rechaza antes de crear nada), pero
-bloquea un caso de uso legítimo — quedó verificado y documentado, no oculto.
 ### `split_sql_statements` y rutinas MySQL/MariaDB (corregido)
 
 **Síntoma histórico.** Adoptar (Opción A) una rutina/trigger/evento de MySQL/MariaDB con
