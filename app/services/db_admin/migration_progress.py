@@ -10,9 +10,13 @@ riesgo de CORRUPCIÓN SILENCIOSA detectado en esa revisión, no es arbitraria:
 
 - ``kind='data'``: la sintaxis upsert (``ON DUPLICATE KEY UPDATE`` / ``ON CONFLICT``) y
   el ``down_sql`` (DELETE por PK) no valen el riesgo de indexar mal.
-- ``has_non_portable`` (rutinas/triggers/events MySQL/MariaDB): ``split_sql_statements``
-  NO reconoce bloques ``BEGIN...END`` (solo dollar-quoting de PostgreSQL) — el índice de
-  sentencia sería basura sobre un cuerpo mal partido.
+- ``has_non_portable`` (rutinas/triggers/events MySQL/MariaDB): se mantiene excluido por
+  CONSERVADURISMO, no por una limitación del splitter. ``split_sql_statements`` **sí**
+  entiende hoy los bloques ``BEGIN...END`` (además del dollar-quoting de PostgreSQL y de
+  la directiva ``DELIMITER``), así que el índice de sentencia ya no sería basura; pero un
+  cuerpo procedural sigue siendo el caso donde un resume mal indexado costaría más caro,
+  y no hay demanda de reanudarlo. Si alguna vez se relaja, hace falta verificarlo contra
+  motor real antes.
 - Sentencias que dependen de ESTADO DE SESIÓN (``SET``, ``PREPARE``, ``CREATE TEMPORARY``,
   ``LOCK TABLES``, ``USE``, transacciones explícitas): un reintento abre una conexión
   NUEVA (``database_connection`` en ``_prepared``) — ese estado se pierde. Un resume que
@@ -49,8 +53,8 @@ _SESSION_STATEMENT_PREFIXES = (
     "declare ", "commit", "rollback",
 )
 
-# Indicios de bloque procedural que split_sql_statements puede partir mal en
-# MySQL/MariaDB (no reconoce BEGIN...END, a diferencia del dollar-quoting de PG).
+# Indicios de bloque procedural. El splitter ya los parte bien (ver arriba); esto excluye
+# la migración del checkpoint por prudencia, no porque el split sea incorrecto.
 _PROCEDURAL_HINT = re.compile(
     r"\b(create|alter)\s+(procedure|function|trigger|event)\b", re.IGNORECASE
 )

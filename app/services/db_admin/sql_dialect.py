@@ -16,13 +16,15 @@ Tres piezas, todas sin estado y sin tocar ningún motor:
   (CREATE TABLE/INDEX/VIEW, ADD COLUMN). Devuelve ``None`` si alguna sentencia es
   destructiva o no invertible — nunca adivina un rollback que pueda perder datos.
 
-LIMITACIÓN documentada: el splitter no interpreta bloques ``BEGIN…END`` de rutinas
-MySQL con ``;`` internos (esas deben subirse con cuidado, una por migración). El
-dollar-quoting de PostgreSQL (``$$…$$``) sí se respeta, por lo que las funciones PG
-se separan correctamente.
+El splitter entiende los cuerpos procedurales con ``;`` internos por dos vías
+independientes: la directiva ``DELIMITER`` (explícita, gana siempre) y el seguimiento de
+bloques ``BEGIN…END`` dentro de una definición de rutina (implícita). Ver
+``split_sql_statements``.
 """
 
 from __future__ import annotations
+
+import re
 
 import sqlglot
 from sqlglot import exp
@@ -39,6 +41,75 @@ _SQLGLOT_DIALECT = {
 # El ``up_sql`` base se escribe en estilo MySQL (dialecto de referencia).
 _REFERENCE_DIALECT = "mysql"
 
+# --------------------------------------------------------------------------- #
+# Detección de cuerpos procedurales (para no cortarlos en su primer ``;``)      #
+# --------------------------------------------------------------------------- #
+# Una sentencia que ABRE una definición de rutina: su cuerpo puede ser un bloque
+# compuesto ``BEGIN…END`` con ``;`` internos. Solo dentro de una de estas sentencias se
+# activa el seguimiento de bloques — fuera, un ``BEGIN`` es el inicio de una TRANSACCIÓN
+# y contarlo como apertura dejaría el resto del script pegado en una sola sentencia.
+# NOTA: sin ``^``. Se usa con ``.match(sql, i)``, que YA ancla en ``i``; un ``^`` solo
+# casaría en el inicio real del string y la detección nunca dispararía a media entrada.
+_ROUTINE_START_RE = re.compile(
+    r"""CREATE\s+
+        (?:OR\s+REPLACE\s+)?
+        (?:DEFINER\s*=\s*(?:\S+|`[^`]*`(?:@`[^`]*`)?|'[^']*'(?:@'[^']*')?)\s+)?
+        (?:AGGREGATE\s+)?
+        (?:PROCEDURE|FUNCTION|TRIGGER|EVENT)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Directiva de cliente ``DELIMITER <tok>``: no se envía al motor, cambia el terminador.
+# Igual que ``_ROUTINE_START_RE``: sin ``^``, se ancla con el ``pos`` de ``.match``.
+_DELIMITER_RE = re.compile(r"[ \t]*DELIMITER[ \t]+(\S+)[ \t]*(?:\r?\n|$)", re.IGNORECASE)
+
+# Palabras que ABREN un bloque y se cierran con un ``END`` **sin sufijo o con ``CASE``**:
+#
+# - ``BEGIN … END``            (bloque compuesto de la rutina)
+# - ``CASE … END CASE``        (CASE *statement*)
+# - ``CASE … END``             (CASE *expresión*, p.ej. ``SELECT CASE WHEN … END AS x``)
+#
+# Deliberadamente NO se cuentan ``IF``/``WHILE``/``LOOP``/``REPEAT``: sus cierres llevan
+# sufijo obligatorio (``END IF``, ``END WHILE``, …) y se neutralizan abajo, mientras que
+# contarlos como aperturas sería ambiguo — ``IF (c) THEN`` y ``WHILE (c) DO`` son
+# statements aunque lleven paréntesis, pero ``IF(a,b,c)`` y ``REPEAT('x',3)`` son
+# FUNCIONES, y no hay forma barata de distinguirlos sin parsear la expresión.
+_BLOCK_OPENERS = frozenset({"BEGIN", "CASE"})
+
+# ``END <sufijo>`` que cierra un constructo NO contado como apertura => profundidad igual.
+_NEUTRAL_END_SUFFIXES = frozenset({"IF", "LOOP", "WHILE", "REPEAT"})
+
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+
+
+def _word_at(sql: str, i: int) -> str | None:
+    """Palabra que empieza EXACTAMENTE en ``i`` (o None si ahí no arranca una)."""
+    if i > 0 and (sql[i - 1].isalnum() or sql[i - 1] in "_$"):
+        return None  # estamos a mitad de un identificador (p.ej. ELSEIF, my_end)
+    m = _WORD_RE.match(sql, i)
+    return m.group(0) if m else None
+
+
+def _next_word(sql: str, i: int) -> tuple[str | None, int]:
+    """Siguiente palabra desde ``i`` saltando espacios/comentarios; devuelve (palabra, pos)."""
+    n = len(sql)
+    while i < n:
+        if sql[i].isspace():
+            i += 1
+            continue
+        if sql.startswith("--", i) or sql[i] == "#":
+            j = sql.find("\n", i)
+            i = n if j == -1 else j + 1
+            continue
+        if sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+            continue
+        break
+    m = _WORD_RE.match(sql, i)
+    return (m.group(0), m.start()) if m else (None, i)
+
 
 def split_sql_statements(sql: str) -> list[str]:
     """
@@ -47,14 +118,62 @@ def split_sql_statements(sql: str) -> list[str]:
     Respeta: literales ``'…'`` y ``"…"``, identificadores ``` `…` ```, dollar-quoting
     ``$tag$…$tag$`` (PostgreSQL), comentarios de línea ``--`` y ``#`` y de bloque
     ``/* … */``. Descarta sentencias vacías.
+
+    **Cuerpos procedurales con ``;`` internos.** Un ``CREATE PROCEDURE/FUNCTION/TRIGGER/
+    EVENT`` cuyo cuerpo es un bloque ``BEGIN … END`` contiene ``;`` que NO terminan la
+    sentencia. Cortar ahí produce SQL truncado que el motor rechaza — el síntoma típico es
+    un ``CREATE PROCEDURE`` que muere en su primer ``DECLARE`` con
+    ``(1064, "…syntax… near '' at line N")``. Se maneja por dos vías independientes:
+
+    1. **``DELIMITER <tok>``** (explícita, la de cualquier dump de ``mysqldump``): cambia el
+       terminador de sentencia. Es una directiva de CLIENTE: se consume acá y nunca se
+       envía al motor.
+    2. **Bloques ``BEGIN…END``** (implícita): dentro de una sentencia que abre una rutina
+       (``_ROUTINE_START_RE``) se lleva la cuenta de bloques abiertos y un ``;`` solo
+       termina la sentencia con la cuenta en cero. Se cuentan como aperturas ``BEGIN``,
+       ``CASE``, ``IF``, ``LOOP``, ``WHILE`` y ``REPEAT``, y ``END`` consume el sufijo que
+       le corresponda (``END IF``, ``END CASE``, …) — así se equilibran tanto el ``CASE``
+       *statement* (``END CASE``) como el ``CASE`` *expresión* de un ``SELECT``
+       (``… END``), que de otro modo cerraría el bloque de más.
+
+    El seguimiento se activa **solo** dentro de una definición de rutina: fuera, un
+    ``BEGIN`` es el arranque de una transacción y tratarlo como apertura dejaría todo el
+    resto del script pegado en una sola sentencia.
+
+    PostgreSQL ya venía cubierto por el dollar-quoting (``$$…$$``, ``$body$…$body$``) de
+    sus funciones ``plpgsql``; la vía 2 le agrega los cuerpos ``BEGIN ATOMIC`` de SQL/PSM
+    (PostgreSQL 14+), que **no** llevan dollar-quoting y antes también se partían.
     """
     statements: list[str] = []
     buf: list[str] = []
     i = 0
     n = len(sql)
+    delimiter = ";"
+    # Profundidad de bloques del cuerpo procedural en curso; None = no estamos dentro de
+    # una definición de rutina (no se cuentan bloques).
+    depth: int | None = None
+
+    def _at_statement_start() -> bool:
+        return not "".join(buf).strip()
+
     while i < n:
         ch = sql[i]
         nxt = sql[i + 1] if i + 1 < n else ""
+
+        # Directiva de cliente DELIMITER: solo al principio de una sentencia (si no,
+        # ``DELIMITER`` podría ser una palabra dentro de un literal o un identificador).
+        if (ch in ("D", "d")) and _at_statement_start():
+            m = _DELIMITER_RE.match(sql, i)
+            if m:
+                delimiter = m.group(1)
+                i = m.end()
+                buf = []  # la directiva NO se emite: es del cliente, no del motor
+                continue
+
+        # ¿Esta sentencia abre una definición de rutina? Solo ahí se cuentan bloques.
+        if depth is None and _at_statement_start() and (ch in ("C", "c")):
+            if _ROUTINE_START_RE.match(sql, i):
+                depth = 0
 
         # Comentario de línea: -- ... \n  o  # ... \n
         if (ch == "-" and nxt == "-") or ch == "#":
@@ -109,13 +228,46 @@ def split_sql_statements(sql: str) -> list[str]:
                         i = close + len(tag)
                         continue
 
-        # Fin de sentencia.
-        if ch == ";":
+        # Conteo de bloques BEGIN…END / CASE…END dentro de una definición de rutina.
+        if depth is not None and (ch.isalpha() or ch == "_"):
+            word = _word_at(sql, i)
+            if word is not None:
+                upper = word.upper()
+                if upper == "END":
+                    nxt_word, nxt_pos = _next_word(sql, i + len(word))
+                    suffix = nxt_word.upper() if nxt_word else ""
+                    if suffix in _NEUTRAL_END_SUFFIXES:
+                        # ``END IF`` / ``END WHILE`` / … : cierra un constructo que no
+                        # contamos como apertura. Se consume el sufijo (para no leerlo
+                        # como palabra suelta) sin tocar la profundidad.
+                        buf.append(sql[i : nxt_pos + len(nxt_word)])
+                        i = nxt_pos + len(nxt_word)
+                    elif suffix == "CASE":
+                        # ``END CASE`` cierra el CASE *statement* que sí contamos.
+                        buf.append(sql[i : nxt_pos + len(nxt_word)])
+                        i = nxt_pos + len(nxt_word)
+                        depth = max(0, depth - 1)
+                    else:
+                        # ``END`` a secas: cierra el BEGIN del cuerpo o un CASE expresión.
+                        buf.append(word)
+                        i += len(word)
+                        depth = max(0, depth - 1)
+                    continue
+                if upper in _BLOCK_OPENERS:
+                    depth += 1
+                    buf.append(word)
+                    i += len(word)
+                    continue
+
+        # Fin de sentencia (terminador actual; ``;`` salvo que DELIMITER lo haya cambiado).
+        # Con un cuerpo procedural abierto (depth > 0) el ``;`` es interno: no termina nada.
+        if sql.startswith(delimiter, i) and not depth:
             stmt = "".join(buf).strip()
             if stmt:
                 statements.append(stmt)
             buf = []
-            i += 1
+            depth = None  # la próxima sentencia se re-evalúa desde cero
+            i += len(delimiter)
             continue
 
         buf.append(ch)
