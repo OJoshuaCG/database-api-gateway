@@ -232,6 +232,22 @@ Dos cuidados propios de estos objetos (`CloneController`):
   dependencia aún no creada se reintentan en la siguiente. Un objeto se marca **fallido** solo
   cuando una pasada completa no crea ninguno de los pendientes (sin progreso = fallo real, no de
   orden). Las tablas/FKs/índices siguen con orden determinista de una sola pasada.
+- **Triggers y eventos se crean DESPUÉS de la fase de datos** (no en la fase de estructura,
+  como vistas y rutinas). Motivo: un trigger del origen con efectos secundarios de escritura
+  (p. ej. `AFTER INSERT ON users` que hace `INSERT INTO users_modules_permissions ...` para
+  sembrar permisos por defecto) se **dispararía durante la copia de datos** — las tablas se
+  copian en orden padre→hijo, así que al copiar el padre el trigger puebla la tabla hija, y
+  cuando la copia llega a esa tabla hija choca con lo ya insertado:
+  `(1062, "Duplicate entry '…' for key 'PRIMARY'")`. Esto se manifiesta cuando la copia usa
+  `INSERT` plano (`upsert=False`, i.e. destino **nuevo o limpiado**); con `upsert=True`
+  (destino existente + `clean_mode=none`) el `ON DUPLICATE KEY UPDATE` lo enmascararía pero
+  igual dejaría filas espurias. **Clave**: `SET FOREIGN_KEY_CHECKS=0` de la fase de datos
+  **no** desactiva triggers en MySQL/MariaDB (PostgreSQL sí los apaga con
+  `session_replication_role='replica'`, por lo que el bug era MySQL-específico). La defensa
+  portable es el **orden de creación** — se difieren hasta que los datos ya están cargados,
+  igual que hace `mysqldump` al recrear los triggers al final del dump. Los eventos se difieren
+  junto con los triggers por el mismo motivo (pueden mutar datos). Corren aunque
+  `include_data=false` (sin datos que copiar, simplemente se crean en esta fase final).
 
 ## AUTO_INCREMENT que no encabeza la PRIMARY KEY (MySQL/MariaDB)
 

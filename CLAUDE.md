@@ -743,6 +743,14 @@ destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
   diferido** `_run_body_statements` — resuelve dependencias vista→vista en cualquier orden (pasadas
   hasta sin progreso). `execute_adhoc` ganó `stop_on_error=False` para esto. Fix del ON UPDATE
   duplicado en `MySQLAdapter._render_column_def` (MariaDB pega `ON UPDATE` dentro del default).
+  **Triggers/eventos se crean DESPUÉS de la fase de datos** (`_POST_DATA_BODY_TYPES` en
+  `_run_phases`), no en la fase de estructura como vistas/rutinas: un trigger `AFTER INSERT`
+  del origen que puebla OTRA tabla (p.ej. una pivote `users_modules_permissions`) se
+  dispararía durante la copia de datos y duplicaría filas → `ER_DUP_ENTRY 1062` cuando la
+  copia llega a esa tabla (con `upsert=False`, i.e. destino nuevo/limpiado). `FOREIGN_KEY_CHECKS=0`
+  NO desactiva triggers en MySQL/MariaDB (PostgreSQL sí con `session_replication_role='replica'`),
+  así que la única defensa portable es el ORDEN — mismo criterio que `mysqldump` (recrea triggers
+  tras cargar datos). Los eventos van con los triggers por prudencia (efectos secundarios).
 - **Fidelidad de TIPOS (MySQL/MariaDB)**: el tipo de columna se captura de
   `information_schema.COLUMN_TYPE` (hook `_column_extras` → `ex["column_type"]`, usado por
   `base_adapter` en vez de `str(reflected_type)`). `str(type)` PIERDE detalle crítico: `ENUM`/`SET`
