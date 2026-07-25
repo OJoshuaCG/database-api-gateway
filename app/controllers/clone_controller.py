@@ -74,6 +74,12 @@ from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import quote_identifier, validate_identifier
 from app.services.db_admin.migrations import MigrationRunner
 from app.services.db_admin.schema_diff import diff_snapshots
+from app.services.db_admin.sql_dialect import (
+    BODY_OBJECT_TYPES as _BODY_TYPES,
+)
+from app.services.db_admin.sql_dialect import (
+    requalify_body_schema,
+)
 
 logger = get_logger(__name__)
 
@@ -797,18 +803,12 @@ class CloneController:
         """
         Re-califica el esquema en el cuerpo de un objeto (vista/rutina/trigger/evento).
 
-        MySQL/MariaDB inyectan el esquema ORIGEN en las referencias del cuerpo (p. ej.
-        ``VIEW_DEFINITION`` siempre trae ``from `origen`.`tabla` ``). Si se clona tal cual,
-        el objeto en la BD DESTINO seguiría leyendo de la BD ORIGEN (fuga cross-database y
-        clon roto si el origen cambia/desaparece). Reescribimos SOLO el calificador del
-        esquema origen → destino (``` `origen`. ``` → ``` `destino`. ```), preservando
-        referencias intencionales a OTRAS bases. El backtick de cierre delimita el nombre
-        completo, así que no hay coincidencias por prefijo. Solo aplica a la familia
-        MySQL/MariaDB (PostgreSQL califica por schema ``public``, igual en origen y destino).
+        Delega en ``sql_dialect.requalify_body_schema`` (fuente única de verdad, compartida
+        con schema-comparison). MySQL/MariaDB inyectan el esquema ORIGEN en las referencias
+        del cuerpo; sin reescribir origen→destino el objeto seguiría leyendo de la BD ORIGEN
+        (fuga cross-database / clon roto). Solo aplica a la familia MySQL/MariaDB.
         """
-        if source_db == target_db or tgt_engine not in _MYSQL_FAMILY:
-            return sql
-        return sql.replace(f"`{source_db}`.", f"`{target_db}`.")
+        return requalify_body_schema(sql, source_db, target_db, tgt_engine)
 
     @staticmethod
     def _data_table_order(snap: SchemaSnapshot):
@@ -1484,7 +1484,9 @@ class CloneController:
 
     def _adopt_target(self, job_id, ctx) -> None:
         """Adopta el destino y le stampa el blueprint+versión del origen (clon completo)."""
-        from app.controllers.managed_database_controller import ManagedDatabaseController
+        from app.controllers.managed_database_controller import (
+            ManagedDatabaseController,
+        )
 
         session = self._session()
         try:

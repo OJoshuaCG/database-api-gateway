@@ -41,6 +41,34 @@ _SQLGLOT_DIALECT = {
 # El ``up_sql`` base se escribe en estilo MySQL (dialecto de referencia).
 _REFERENCE_DIALECT = "mysql"
 
+# Motores cuyos cuerpos procedurales pueden traer el esquema ORIGEN calificado.
+_MYSQL_FAMILY_NAMES = frozenset({"mysql", "mariadb"})
+
+# Tipos de objeto cuyo CUERPO puede referenciar tablas calificadas por esquema (MySQL/
+# MariaDB inyectan el esquema ORIGEN en las referencias del cuerpo de vistas/rutinas/
+# triggers/eventos). Fuente única de verdad para clone y schema-comparison.
+BODY_OBJECT_TYPES = frozenset({"view", "materialized_view", "routine", "trigger", "event"})
+
+
+def requalify_body_schema(sql: str, source_db: str, target_db: str, engine: str) -> str:
+    """
+    Re-califica el esquema ORIGEN → DESTINO en el cuerpo de un objeto con cuerpo
+    (vista/rutina/trigger/evento).
+
+    MySQL/MariaDB inyectan el esquema ORIGEN en las referencias del cuerpo (p. ej.
+    ``information_schema.VIEWS.VIEW_DEFINITION`` siempre trae ``from `origen`.`tabla` ``).
+    Emitido tal cual contra otra BD (adopción como versión de blueprint, ejecución ad-hoc
+    o clonado), el objeto seguiría leyendo de la BD ORIGEN: fuga cross-database, o sentencia
+    rota si el origen no es visible / la tabla no existe con ese esquema en el destino.
+    Reescribe SOLO el calificador del esquema origen (``` `origen`. ``` → ``` `destino`. ```),
+    preservando referencias intencionales a OTRAS bases (el backtick de cierre delimita el
+    nombre completo → no hay match por prefijo). Solo aplica a la familia MySQL/MariaDB
+    (PostgreSQL no soporta referencias cross-database y comparte el schema ``public``).
+    """
+    if not sql or source_db == target_db or engine not in _MYSQL_FAMILY_NAMES:
+        return sql
+    return sql.replace(f"`{source_db}`.", f"`{target_db}`.")
+
 # --------------------------------------------------------------------------- #
 # Detección de cuerpos procedurales (para no cortarlos en su primer ``;``)      #
 # --------------------------------------------------------------------------- #

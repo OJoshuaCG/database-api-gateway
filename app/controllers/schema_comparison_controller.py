@@ -52,6 +52,10 @@ from app.services import audit
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.migrations import MigrationRunner
 from app.services.db_admin.schema_diff import diff_snapshots
+from app.services.db_admin.sql_dialect import (
+    BODY_OBJECT_TYPES,
+    requalify_body_schema,
+)
 
 # Motores de la misma familia SQL (comparables entre sí). PostgreSQL solo consigo mismo.
 _MYSQL_FAMILY = frozenset({"mysql", "mariadb"})
@@ -405,6 +409,26 @@ class SchemaComparisonController:
         target_snap = get_adapter(tgt.target).structural_snapshot(tgt.database_name)
         diff = diff_snapshots(source_snap, target_snap)
         rendered = get_adapter(tgt.target).render_diff(diff)
+
+        # Re-calificación de esquema en cuerpos (vistas/rutinas/triggers/eventos): MySQL/
+        # MariaDB persisten el esquema ORIGEN calificado DENTRO del cuerpo (una vista trae
+        # ``from `origen`.`tabla` ``). Sin reescribir origen→destino, el SQL renderizado
+        # referenciaría la BD ORIGEN cuando luego se adopta como versión de blueprint, se
+        # ejecuta ad-hoc (Opción B) o se exporta → tabla inexistente en el destino o fuga
+        # cross-database. Se hace ACÁ, una sola vez, porque todos los consumidores
+        # (adopt/execute/export) leen el ``sql`` ya persistido. Mismo tratamiento que el
+        # clonado (``CloneController._requalify_body``). No-op si ambos lados comparten
+        # nombre de BD o el motor no es de la familia MySQL.
+        if src.database_name != tgt.database_name and tgt.engine in _MYSQL_FAMILY:
+            for r in rendered:
+                if r.object_type in BODY_OBJECT_TYPES:
+                    r.sql = requalify_body_schema(
+                        r.sql, src.database_name, tgt.database_name, tgt.engine
+                    )
+                    if r.down_sql:
+                        r.down_sql = requalify_body_schema(
+                            r.down_sql, src.database_name, tgt.database_name, tgt.engine
+                        )
 
         # 3) Guardrails de tamaño (fail temprano; no materializar payloads enormes).
         if len(rendered) > SCHEMA_COMPARISON_MAX_ITEMS:

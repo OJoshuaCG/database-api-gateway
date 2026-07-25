@@ -327,6 +327,68 @@ envoltorio `ApiResponse` (es una descarga binaria/de archivo).
 - **`DROP FUNCTION`/`DROP ROUTINE` sin firma** (best-effort): puede fallar ante
   sobrecarga de funciones (overloads) con el mismo nombre y distinta firma.
 
+### Re-calificación de esquema en cuerpos (vistas/rutinas/triggers/eventos) — FIX
+
+**Problema (bug real, encontrado en producción):** MySQL/MariaDB persisten el nombre de la
+BD ORIGEN calificado DENTRO del cuerpo de vistas/rutinas/triggers/eventos.
+`information_schema.VIEWS.VIEW_DEFINITION` siempre devuelve `` from `origen`.`tabla` `` con
+el esquema calificado. `_snapshot_views` guarda ese cuerpo tal cual y `_render_view` lo
+re-emite verbatim. Si la BD ORIGEN y la DESTINO tienen **nombres distintos** (comparar
+`DB_B` como source vs `DB_A` como target y luego adoptar el diff como versión de blueprint
+de `DB_A`), la sentencia `CREATE OR REPLACE VIEW` referenciaba las tablas de la BD ORIGEN:
+al aplicar la migración contra el destino → `(1146, "Table 'origen.tabla' doesn't exist")`
+(o, si el origen es visible desde el destino, **fuga cross-database** silenciosa: la vista
+del destino leería del origen).
+
+**Fix:** `create_comparison` re-califica origen→destino en el `sql`/`down_sql` de los ítems
+con cuerpo (`BODY_OBJECT_TYPES`) justo después de `render_diff`, con
+`sql_dialect.requalify_body_schema` (fuente única de verdad, compartida con el clonado —
+antes `CloneController._requalify_body`). Se hace UNA sola vez porque todos los consumidores
+(adopt Opción A, execute Opción B, export) leen el `sql` ya persistido. Es no-op si ambos
+lados comparten nombre de BD o el target no es de la familia MySQL. Reescribe SOLO
+`` `origen`. `` → `` `destino`. `` (el backtick de cierre delimita el nombre completo →
+no hay match por prefijo), preservando referencias intencionales a OTRAS bases.
+
+> **Recuperación de una comparación ya adoptada con el bug:** el `up_sql` de la versión ya
+> creada quedó con el esquema origen calificado. Re-correr la comparación (genera ítems
+> corregidos) y **corregir la versión rota**: `PATCH` de su `up_sql` (permitido si no hubo
+> aplicación EXITOSA — un apply fallido no congela el SQL) o borrarla y re-adoptar. Si el
+> apply fallido dejó tablas ya creadas en el destino (fase 2 corrió antes de fallar en la
+> vista de fase 5), reconciliar ese estado parcial antes de re-aplicar.
+
+**Pendiente de verificación:** el fix se validó con `ast.parse`, la función pura
+(`requalify_body_schema`) y la resolución de imports/delegación; **no** contra un motor
+MySQL/MariaDB real ni con `pytest`. Re-correr `scripts/verify_schema_diff_e2e.py` para
+cubrir el ciclo comparación→adopción→aplicación de una vista con esquema calificado entre
+BDs de nombre distinto.
+
+### Detalle del hallazgo: `split_sql_statements` y rutinas MySQL/MariaDB
+
+`app/services/db_admin/sql_dialect.py::split_sql_statements` (infraestructura de
+[Plan 02](model-migrations.md), reusada por Opción A al generar la revisión de Alembic)
+respeta el dollar-quoting de PostgreSQL (`$$...$$`) pero **no reconoce los bloques
+`BEGIN...END` de MySQL/MariaDB** — cualquier `;` interno se trata como fin de sentencia.
+Confirmado con un caso mínimo:
+
+```pycon
+>>> split_sql_statements("CREATE PROCEDURE sp_x() BEGIN UPDATE t SET x=x; END")
+['CREATE PROCEDURE sp_x() BEGIN UPDATE t SET x=x', 'END']
+```
+
+Esto ya estaba **documentado como limitación aceptada** en el docstring del módulo desde
+el Plan 02 ("deben subirse con cuidado, una por migración"), pero no se había verificado
+contra un motor real hasta esta fase. El impacto concreto para este plan: **Opción A**
+(que concatena el `up_sql` y lo pasa por Alembic → `split_sql_statements`) falla al
+aplicar cualquier rutina/trigger MySQL/MariaDB con cuerpo multi-sentencia; **Opción B**
+(`execute_adhoc`) NO tiene este problema porque ejecuta cada ítem ya renderizado como
+sentencia completa, sin volver a partirlo. No se modificó `sql_dialect.py` en este plan
+(el fix genérico — parsear anidamiento `BEGIN...END` con sus terminadores `END IF`/
+`END CASE`/`END LOOP`/`END WHILE`/`END REPEAT` — es una pieza de infraestructura
+compartida por TODAS las migraciones de blueprint, no solo por esta feature; tocarla
+está fuera del alcance de esta fase y merece su propio plan + batería de tests dedicada).
+El comportamiento observado es seguro (falla limpio, sin corrupción: la sentencia
+partida es sintácticamente inválida y el motor la rechaza antes de crear nada), pero
+bloquea un caso de uso legítimo — quedó verificado y documentado, no oculto.
 ### `split_sql_statements` y rutinas MySQL/MariaDB (corregido)
 
 **Síntoma histórico.** Adoptar (Opción A) una rutina/trigger/evento de MySQL/MariaDB con
