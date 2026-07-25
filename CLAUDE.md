@@ -542,7 +542,7 @@ Archivos del módulo:
   - `migrations.py` — `MigrationRunner` (Alembic embebido, advisory lock por BD,
     conexión en AUTOCOMMIT, archivos de revisión en tempdir, dry-run, cuarentena).
   - `sql_dialect.py` — `SqlTranslator` (MySQL→PostgreSQL con sqlglot), `RollbackGenerator`,
-    `split_sql_statements`.
+    `split_sql_statements` (ver "Cuerpos procedurales" abajo).
   - `migration_integrity.py` — `compute_checksum`, `validate_version` (anti path-traversal),
     `version_sort_key` (orden NUMÉRICO, no lexicográfico).
 - **Modelos**: `app/models/model_migration.py` (`ModelMigration`),
@@ -552,6 +552,29 @@ Archivos del módulo:
   el motor).
 - **Rutas**: `app/routes/v1/model_migrations.py` + endpoints `/migrations/*` en
   `app/routes/v1/managed_databases.py`.
+
+**Cuerpos procedurales en `split_sql_statements`** (fix): el `up_sql` de una migración se
+vuelve a PARTIR por `;` para generar un `op.execute` por sentencia. Un
+`CREATE PROCEDURE/FUNCTION/TRIGGER/EVENT` con cuerpo `BEGIN…END` se cortaba en su primer
+`;` interno (normalmente el `DECLARE`) → el motor recibía SQL truncado y respondía
+`(1064, "…syntax… near '' at line N")`. Golpeaba sobre todo a la Opción A de
+schema-comparisons (concatena los ítems con `;`); la Opción B nunca lo tuvo (no re-parte lo
+ya renderizado). Ahora se reconocen dos vías: (1) la directiva **`DELIMITER <tok>`** (la de
+`mysqldump` y la que ya emitía el `export`), consumida como directiva de CLIENTE y jamás
+enviada al motor; (2) **conteo de bloques `BEGIN…END`**, activo **solo** dentro de una
+sentencia que abre una rutina (`_ROUTINE_START_RE`, acepta `DEFINER=` con backticks o
+comillas) — fuera de ahí un `BEGIN` es una TRANSACCIÓN y contarlo pegaría todo el script.
+Sutileza del conteo: aperturas **solo** `BEGIN` y `CASE`; los cierres con sufijo
+(`END IF`/`END WHILE`/`END LOOP`/`END REPEAT`) se neutralizan y `END CASE` + el `END` a
+secas cierran. Así se equilibran tanto el `CASE` *statement* como el `CASE` *expresión* de
+un `SELECT` (`… END`, que cerraría un bloque de más), y se esquiva `IF`/`REPEAT`, que son
+**funciones** (`IF(a,b,c)`, `REPEAT('x',3)`) además de statements — por eso NO se cuentan.
+**No era exclusivo de MySQL**: PostgreSQL estaba a salvo en sus funciones `plpgsql` por el
+dollar-quoting, pero los cuerpos `BEGIN ATOMIC` de SQL/PSM (PG 14+) no lo llevan y también
+se partían; ahora los cubre la vía 2. Un cambio de split invalida los checkpoints viejos,
+pero eso ya estaba cubierto: `_resolve_resume_offset` compara `total_statements` y responde
+409 en vez de reanudar a ciegas. `migration_progress.is_resumable` sigue excluyendo las
+migraciones con rutinas — ahora por prudencia, no porque el split sea incorrecto.
 
 Gotchas clave: el runner corre en **AUTOCOMMIT** (el advisory lock de sesión sobrevive y
 no deja una transacción sin commitear); las versiones se comparan/ordenan **numéricamente**.
@@ -699,11 +722,12 @@ directo** ad-hoc (Opción B). Guía de uso: `docs/features/schema-comparison.md`
   `scripts/verify_schema_diff_e2e.py` contra motores reales para estos nuevos renderers
   (`_ri_index_modified`/`_ri_unique_modified`/`_ri_check_modified`/`_ri_pk_changed`) — solo
   verificados con tests unitarios/SQLite hasta ahora.
-  **Límite conocido confirmado contra motor real**:
-  adoptar (Opción A) una rutina/trigger MySQL/MariaDB con cuerpo `BEGIN...END` puede fallar
-  porque `sql_dialect.py::split_sql_statements` (Plan 02) no reconoce ese bloque (solo
-  dollar-quoting de PG) — Opción B no tiene este problema (no vuelve a partir el SQL ya
-  renderizado); ver detalle en la guía de la feature.
+  **Límite histórico YA CORREGIDO** (se deja anotado porque explica el síntoma): adoptar
+  (Opción A) una rutina/trigger MySQL/MariaDB con cuerpo `BEGIN...END` fallaba porque
+  `sql_dialect.py::split_sql_statements` cortaba el cuerpo en su primer `;` interno
+  (normalmente el `DECLARE`) → `1064 ... near '' at line N` con el SQL truncado. Opción B
+  nunca lo tuvo (no vuelve a partir el SQL ya renderizado). Ver
+  "Cuerpos procedurales en `split_sql_statements`" en la sección de Plan 02.
   Verificación e2e contra motores reales (`scripts/verify_schema_diff_e2e.py`, requiere Docker):
   **ejecutada — 219 checks / 0 fallos** en MySQL/MariaDB/PostgreSQL. Migración Alembic
   (`schema_comparisons`/`schema_comparison_items`) verificada con ciclo completo

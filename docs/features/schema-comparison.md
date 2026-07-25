@@ -316,11 +316,10 @@ envoltorio `ApiResponse` (es una descarga binaria/de archivo).
   `possible_rename_of` como advertencia heurística no autoritativa).
 - **Cuerpos procedurales**: el diff es "cambió/no cambió", nunca diff semántico de
   lógica interna.
-- **Adoptar (Opción A) una rutina/trigger de MySQL/MariaDB con cuerpo `BEGIN...END`
-  puede FALLAR al aplicarse** — hallazgo confirmado empíricamente en la verificación
-  e2e (Fase 7), **no arreglado en este plan** (ver detalle abajo). **Workaround:**
-  adoptar esos objetos vía Opción B (`/execute`, `mode=custom`), que no tiene este
-  problema, o editar manualmente el `up_sql` de la versión ya creada antes de aplicarla.
+- ~~**Adoptar (Opción A) una rutina/trigger de MySQL/MariaDB con cuerpo `BEGIN...END`
+  puede FALLAR al aplicarse**~~ — **CORREGIDO**: `split_sql_statements` ya entiende los
+  cuerpos procedurales (ver detalle abajo). Se mantiene el detalle histórico porque
+  explica el síntoma por si reaparece en una forma no cubierta.
 - **`ALTER TYPE ... ADD VALUE` (PostgreSQL, enums)** no es siempre transaccional según
   la versión — el valor agregado no puede usarse en la misma transacción en la que se
   agregó; no es un problema aquí porque cada sentencia de Opción B corre en su propia
@@ -328,33 +327,57 @@ envoltorio `ApiResponse` (es una descarga binaria/de archivo).
 - **`DROP FUNCTION`/`DROP ROUTINE` sin firma** (best-effort): puede fallar ante
   sobrecarga de funciones (overloads) con el mismo nombre y distinta firma.
 
-### Detalle del hallazgo: `split_sql_statements` y rutinas MySQL/MariaDB
+### `split_sql_statements` y rutinas MySQL/MariaDB (corregido)
 
-`app/services/db_admin/sql_dialect.py::split_sql_statements` (infraestructura de
-[Plan 02](model-migrations.md), reusada por Opción A al generar la revisión de Alembic)
-respeta el dollar-quoting de PostgreSQL (`$$...$$`) pero **no reconoce los bloques
-`BEGIN...END` de MySQL/MariaDB** — cualquier `;` interno se trata como fin de sentencia.
-Confirmado con un caso mínimo:
+**Síntoma histórico.** Adoptar (Opción A) una rutina/trigger/evento de MySQL/MariaDB con
+cuerpo `BEGIN...END` fallaba al aplicar la versión, con el cuerpo **truncado** en su primer
+`;` interno (normalmente el `DECLARE`):
 
-```pycon
->>> split_sql_statements("CREATE PROCEDURE sp_x() BEGIN UPDATE t SET x=x; END")
-['CREATE PROCEDURE sp_x() BEGIN UPDATE t SET x=x', 'END']
+```
+(1064, "You have an error in your SQL syntax; ... near '' at line 53")
+[SQL: CREATE PROCEDURE `sp_endpoint_entity_access`( ... BEGIN
+  ...
+  DECLARE v_module_id INT DEFAULT NULL]      <-- cortado acá
 ```
 
-Esto ya estaba **documentado como limitación aceptada** en el docstring del módulo desde
-el Plan 02 ("deben subirse con cuidado, una por migración"), pero no se había verificado
-contra un motor real hasta esta fase. El impacto concreto para este plan: **Opción A**
-(que concatena el `up_sql` y lo pasa por Alembic → `split_sql_statements`) falla al
-aplicar cualquier rutina/trigger MySQL/MariaDB con cuerpo multi-sentencia; **Opción B**
-(`execute_adhoc`) NO tiene este problema porque ejecuta cada ítem ya renderizado como
-sentencia completa, sin volver a partirlo. No se modificó `sql_dialect.py` en este plan
-(el fix genérico — parsear anidamiento `BEGIN...END` con sus terminadores `END IF`/
-`END CASE`/`END LOOP`/`END WHILE`/`END REPEAT` — es una pieza de infraestructura
-compartida por TODAS las migraciones de blueprint, no solo por esta feature; tocarla
-está fuera del alcance de esta fase y merece su propio plan + batería de tests dedicada).
-El comportamiento observado es seguro (falla limpio, sin corrupción: la sentencia
-partida es sintácticamente inválida y el motor la rechaza antes de crear nada), pero
-bloquea un caso de uso legítimo — quedó verificado y documentado, no oculto.
+**Causa.** `app/services/db_admin/sql_dialect.py::split_sql_statements` (infraestructura de
+[Plan 02](model-migrations.md)) partía por `;` respetando comillas, comentarios y el
+dollar-quoting de PostgreSQL, pero **no** los bloques `BEGIN...END` de MySQL/MariaDB. La
+Opción A concatena los ítems en `up_sql` con `;` y el runner los vuelve a partir para
+generar la revisión de Alembic (una sentencia por `op.execute`), así que el cuerpo se
+fragmentaba. La Opción B (`execute_adhoc`) nunca tuvo el problema: ejecuta cada ítem ya
+renderizado sin re-partirlo.
+
+**Corrección.** El splitter ahora reconoce cuerpos procedurales por dos vías independientes:
+
+1. **`DELIMITER <tok>`** — la directiva de cualquier dump de `mysqldump` (y la que ya emitía
+   el `export` de esta feature). Es de CLIENTE: se consume y nunca se envía al motor.
+2. **Bloques `BEGIN...END`** — dentro de una sentencia que abre una rutina
+   (`CREATE [DEFINER=…] PROCEDURE|FUNCTION|TRIGGER|EVENT`) se cuentan los bloques abiertos y
+   un `;` solo termina la sentencia con la cuenta en cero.
+
+El conteo trata como aperturas **solo** `BEGIN` y `CASE`, y neutraliza los cierres con
+sufijo (`END IF`/`END WHILE`/`END LOOP`/`END REPEAT`), mientras `END CASE` y el `END` a
+secas sí cierran. Ese reparto no es cosmético: cubre a la vez el `CASE` *statement*
+(`END CASE`) y el `CASE` *expresión* de un `SELECT` (`… END`, que de otro modo cerraría un
+bloque de más), y evita el caso ambiguo de `IF`/`REPEAT`, que son **funciones**
+(`IF(a,b,c)`, `REPEAT('x',3)`) además de statements.
+
+El seguimiento se activa **solo** dentro de una definición de rutina: fuera, un `BEGIN` es
+el arranque de una transacción, y contarlo pegaría el resto del script en una sola
+sentencia.
+
+**PostgreSQL.** Ya estaba cubierto para funciones `plpgsql` por el dollar-quoting
+(`$$…$$`, `$body$…$body$`). La vía 2 le agregó los cuerpos `BEGIN ATOMIC` de SQL/PSM
+(PostgreSQL 14+), que **no** llevan dollar-quoting y antes también se partían — o sea que
+el problema **no era exclusivo de MySQL**, solo mucho más frecuente ahí.
+
+Cobertura en `tests/test_sql_dialect.py`: procedure/function/trigger/event, `DEFINER` con
+backticks y con comillas, `WHILE`/`LOOP`/`REPEAT` anidados, `IF()`/`REPEAT()` como
+funciones, `BEGIN…END` anidados, trigger sin bloque, `;` en strings y comentarios, CRLF,
+`DELIMITER $$` y `//`, dollar-quoting con y sin tag, `BEGIN ATOMIC`, `DO $$`, y las
+regresiones que NO deben cambiar (`BEGIN` transaccional y `CASE` expresión fuera de
+rutina).
 
 ## Seguridad
 
