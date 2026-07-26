@@ -6,6 +6,8 @@ Endpoints de comparaciones estructurales entre dos BDs gestionadas (Plan diff).
 - GET  /schema-comparisons/{id}/items         — detalle paginado del DDL (dry-run/preview).
 - POST /schema-comparisons/{id}/execute-preview — resuelve modo/selección de Opción B
   SIN ejecutar (devuelve las sentencias exactas + el ``confirm_token`` a reenviar).
+- POST /schema-comparisons/{id}/resolve-selection — cierra una selección parcial sobre su
+  grafo de dependencias (sin adoptar ni ejecutar).
 - POST /schema-comparisons/{id}/adopt         — Opción A: nueva versión de blueprint.
 - POST /schema-comparisons/{id}/execute       — Opción B: ejecución directa ad-hoc.
 
@@ -27,6 +29,8 @@ from app.schemas.schema_comparison import (
     ExecuteComparisonOut,
     ExecutePreviewIn,
     ExecutePreviewOut,
+    ResolveSelectionIn,
+    ResolveSelectionOut,
     SchemaComparisonCreate,
     SchemaComparisonItemOut,
     SchemaComparisonSummaryOut,
@@ -137,11 +141,42 @@ def adopt_comparison(
         name=payload.name,
         description=payload.description,
         execute_immediately=payload.execute_immediately,
+        auto_resolve_dependencies=payload.auto_resolve_dependencies,
         admin=admin,
     )
     msg = f"Versión {result['version']} creada desde la comparación."
+    if result.get("added_item_ids"):
+        msg += (
+            f" Se agregaron {len(result['added_item_ids'])} sentencia(s) para cerrar "
+            "dependencias."
+        )
     if result["executed"]:
         msg += " Aplicada al target."
+    return success(data=result, message=msg)
+
+
+@router.post(
+    "/{comparison_id}/resolve-selection", response_model=ApiResponse[ResolveSelectionOut]
+)
+def resolve_selection(admin: AdminDep, comparison_id: int, payload: ResolveSelectionIn):
+    """
+    Expande una selección a su CIERRE de dependencias, sin adoptar ni ejecutar nada.
+
+    Adoptar o ejecutar un subconjunto incoherente falla contra el motor a mitad de camino:
+    una vista sin la tabla que lee, un ``ADD`` de índice sin el ``DROP`` que lo precede, un
+    ``CREATE INDEX`` sobre una tabla que quedó fuera. Este endpoint devuelve el conjunto
+    realmente ejecutable —en ORDEN DE EJECUCIÓN— y el detalle de qué hubo que agregar,
+    para que el frontend lo muestre antes de pedir confirmación.
+    """
+    result = SchemaComparisonController().resolve_selection(
+        comparison_id, payload.selected_item_ids
+    )
+    n = len(result["added_item_ids"])
+    msg = (
+        f"Selección completada: se agregaron {n} sentencia(s) por dependencia."
+        if n
+        else "La selección ya estaba completa."
+    )
     return success(data=result, message=msg)
 
 

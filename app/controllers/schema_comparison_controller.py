@@ -51,6 +51,14 @@ from app.models.schema_comparison_item import SchemaComparisonItem
 from app.services import audit
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.migrations import MigrationRunner
+from app.services.db_admin.plan_integrity import (
+    PlanItem,
+    blocking,
+    check_closure,
+    expand_selection,
+    prune_unsatisfied,
+    validate_statement_plan,
+)
 from app.services.db_admin.schema_diff import diff_snapshots
 from app.services.db_admin.sql_dialect import (
     BODY_OBJECT_TYPES,
@@ -339,6 +347,12 @@ class SchemaComparisonController:
             "risk_flags": json.loads(it.risk_flags),
             "down_sql": it.down_sql,
             "down_confirmed": it.down_confirmed,
+            # Atomicidad + dependencias: el frontend los necesita para no dejar marcar
+            # media redefinición ni una vista sin su tabla (y para explicar el porqué).
+            "op_group": it.op_group,
+            "depends_on": (
+                json.loads(it.depends_on) if it.depends_on else []
+            ),
             "execution_status": it.execution_status,
             "execution_error": it.execution_error,
             "executed_at": it.executed_at,
@@ -489,6 +503,12 @@ class SchemaComparisonController:
                         risk_flags=json.dumps(r.risk.model_dump(), sort_keys=True),
                         down_sql=r.down_sql,
                         down_confirmed=r.down_confirmed,
+                        # Grupo atómico + grafo de dependencias: se persisten con el ítem
+                        # porque adopt/execute validan la selección MUCHO después, sin los
+                        # snapshots en memoria (recalcularlos exigiría re-snapshotear ambas
+                        # BDs y volver a diffear).
+                        op_group=r.op_group or None,
+                        depends_on=json.dumps(r.depends_on) if r.depends_on else None,
                     )
                 )
             session.commit()
@@ -771,6 +791,165 @@ class SchemaComparisonController:
             session.close()
 
     # ------------------------------------------------------------------ #
+    # Integridad del plan: grupos atómicos y cierre de dependencias        #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _plan_items(rows: list) -> list[PlanItem]:
+        """
+        Adapta filas de ``schema_comparison_items`` a los DTOs puros de
+        ``plan_integrity``. Las comparaciones creadas ANTES de que existieran
+        ``op_group``/``depends_on`` tienen ambos en NULL: se degrada a un grupo por
+        sentencia y sin dependencias (comportamiento anterior), nunca se inventa un
+        grafo que no se calculó.
+        """
+        out: list[PlanItem] = []
+        for r in rows:
+            try:
+                deps = tuple(json.loads(r.depends_on)) if r.depends_on else ()
+            except (TypeError, ValueError):
+                deps = ()
+            try:
+                risk = json.loads(r.risk_flags) if r.risk_flags else {}
+            except (TypeError, ValueError):
+                risk = {}
+            out.append(
+                PlanItem(
+                    id=r.id,
+                    seq=r.seq,
+                    op_group=r.op_group or f"{r.object_type}|{r.object_name}|{r.change_type}|{r.id}",
+                    depends_on=deps,
+                    object_type=r.object_type,
+                    object_name=r.object_name,
+                    change_type=r.change_type,
+                    has_down_sql=bool(r.down_sql),
+                    destructive=bool(risk.get("destructive")),
+                )
+            )
+        return out
+
+    def _assert_selection_closed(
+        self, plan: list[PlanItem], selected_item_ids: list[int], *, operation: str
+    ) -> None:
+        """
+        Rechaza (422) una selección EXPLÍCITA a la que le faltan dependencias o que parte
+        un grupo atómico.
+
+        Es el guard que faltaba y que explica una clase entera de fallos en producción: el
+        gateway aceptaba cualquier subconjunto de ítems y armaba el ``up_sql`` con él, así
+        que "adoptar la vista pero no la tabla que lee" o "adoptar el ``ADD`` de un índice
+        redefinido sin su ``DROP``" solo se descubría cuando el motor abortaba la
+        migración a mitad de camino. La respuesta incluye los ids que faltan para que el
+        frontend pueda ofrecer "agregarlos" (o llamar a ``/resolve-selection``).
+        """
+        missing = check_closure(plan, selected_item_ids)
+        if not missing:
+            return
+        closure = expand_selection(plan, selected_item_ids)
+        raise AppHttpException(
+            message=(
+                f"La selección no es ejecutable: {len(missing)} cambio(s) dependen de "
+                "otros que no fueron seleccionados (o quedó partido un cambio que se "
+                "ejecuta como DROP+CREATE). Agregue los ítems faltantes o use "
+                "/resolve-selection para completarlos automáticamente."
+            ),
+            status_code=422,
+            context={"operation": operation, "missing_dependencies": missing},
+            public_context={
+                # El frontend NECESITA esto para guiar al admin, no es solo debug.
+                "missing_dependencies": missing,
+                "suggested_item_ids": list(closure.item_ids),
+                "would_add_item_ids": list(closure.added_item_ids),
+            },
+        )
+
+    def _assert_plan_sane(
+        self, plan: list[PlanItem], selected_item_ids: list[int], *, operation: str
+    ) -> list:
+        """
+        Corre el linter sobre el plan YA cerrado y aborta (422) ante cualquier hallazgo
+        bloqueante. Devuelve los hallazgos informativos (avisos) para exponerlos.
+
+        Barrera de último recurso: verifica el INVARIANTE de que toda dependencia se
+        ejecuta antes que su dependiente. Si el ordenador de ``schema_diff`` regresara,
+        esto falla acá —en el gateway, sin tocar el motor— en vez de escribir una versión
+        de blueprint que reventará en cada BD donde se aplique.
+        """
+        chosen = set(selected_item_ids)
+        findings = validate_statement_plan([p for p in plan if p.id in chosen])
+        hard = blocking(findings)
+        if hard:
+            raise AppHttpException(
+                message=(
+                    "El plan de sentencias no pasó la validación de integridad: "
+                    + "; ".join(f.message for f in hard[:3])
+                ),
+                status_code=422,
+                context={"operation": operation},
+                public_context={
+                    "plan_errors": [
+                        {"code": f.code, "message": f.message, "op_group": f.op_group}
+                        for f in hard
+                    ]
+                },
+            )
+        return [
+            {"code": f.code, "message": f.message, "op_group": f.op_group}
+            for f in findings
+        ]
+
+    def resolve_selection(self, comparison_id: int, selected_item_ids: list[int]) -> dict:
+        """
+        Expande una selección a su CIERRE de dependencias sin ejecutar ni adoptar nada.
+
+        Mismo patrón que ``POST /database-clones/{id}/resolve-selection`` del clonado: el
+        frontend manda lo que el usuario marcó y recibe el conjunto realmente ejecutable,
+        con el detalle de qué se agregó y por qué. Evita el ciclo "intento → 422 → agrego
+        → reintento".
+        """
+        session = self._session()
+        try:
+            self._comparison_or_404(session, comparison_id)
+            rows = (
+                session.query(SchemaComparisonItem)
+                .filter(SchemaComparisonItem.comparison_id == comparison_id)
+                .order_by(SchemaComparisonItem.seq.asc())
+                .all()
+            )
+            plan = self._plan_items(rows)
+            by_id = {r.id: r for r in rows}
+        finally:
+            session.close()
+
+        ids = list(dict.fromkeys(selected_item_ids))
+        unknown = [i for i in ids if i not in by_id]
+        if unknown:
+            raise AppHttpException(
+                message="Algunos ítems seleccionados no pertenecen a esta comparación.",
+                status_code=422,
+                context={"comparison_id": comparison_id, "missing_item_ids": unknown},
+            )
+        closure = expand_selection(plan, ids)
+        reasons = check_closure(plan, ids)
+        return {
+            "comparison_id": comparison_id,
+            "requested_item_ids": ids,
+            "resolved_item_ids": list(closure.item_ids),
+            "added_item_ids": list(closure.added_item_ids),
+            "added_reasons": reasons,
+            "added": [
+                {
+                    "item_id": by_id[i].id,
+                    "object_type": by_id[i].object_type,
+                    "object_name": by_id[i].object_name,
+                    "change_type": by_id[i].change_type,
+                    "sql": by_id[i].sql,
+                }
+                for i in closure.added_item_ids
+            ],
+            "total": len(closure.item_ids),
+        }
+
+    # ------------------------------------------------------------------ #
     # Anti-TOCTOU                                                         #
     # ------------------------------------------------------------------ #
     def _assert_fingerprint(
@@ -824,6 +1003,7 @@ class SchemaComparisonController:
         name: str,
         description: str | None = None,
         execute_immediately: bool = False,
+        auto_resolve_dependencies: bool = False,
         admin: dict | None = None,
     ) -> dict:
         session = self._session()
@@ -869,15 +1049,46 @@ class SchemaComparisonController:
             target_db_name = tgt_md.name
             target_engine = comp.target_engine
             target_fp = comp.target_fingerprint
+            # TODOS los ítems: hacen falta para validar el cierre de dependencias de la
+            # selección (una dependencia no seleccionada igual tiene que ser conocida).
+            all_rows = (
+                session.query(SchemaComparisonItem)
+                .filter(SchemaComparisonItem.comparison_id == comparison_id)
+                .order_by(SchemaComparisonItem.seq.asc())
+                .all()
+            )
             # Extraer los ítems seleccionados YA como datos planos (la sesión se cierra).
             selected = self._load_selected(session, comparison_id, selected_item_ids)
+            # DTOs puros (no filas ORM): la sesión se cierra a continuación.
+            plan = self._plan_items(all_rows)
         finally:
             session.close()
+
+        # --- Integridad de la selección ANTES de crear la versión ------------- #
+        # Cerrar (o rechazar) la selección: adoptar un subconjunto incoherente escribe una
+        # versión de blueprint que fallará en TODAS las BDs del modelo, no solo en esta.
+        effective_ids = [d["id"] for d in selected]
+        added_ids: list[int] = []
+        if auto_resolve_dependencies:
+            closure = expand_selection(plan, effective_ids)
+            added_ids = list(closure.added_item_ids)
+            if added_ids:
+                effective_ids = list(closure.item_ids)
+                session = self._session()
+                try:
+                    selected = self._load_selected(session, comparison_id, effective_ids)
+                finally:
+                    session.close()
+        # El cierre se re-verifica SIEMPRE, incluso después de expandirlo: si la expansión
+        # tuviera un hueco, el linter no lo detectaría (ignora dependencias ausentes del
+        # subconjunto, porque para entonces ya se asume cerrado).
+        self._assert_selection_closed(plan, effective_ids, operation="adopt")
+        plan_warnings = self._assert_plan_sane(plan, effective_ids, operation="adopt")
 
         # Anti-TOCTOU antes de derivar/aplicar nada.
         self._assert_fingerprint(target_server_id, target_db_name, target_fp, label="target")
 
-        # Ensamblar up_sql (orden de fase) y down_sql (orden inverso).
+        # Ensamblar up_sql (orden de EJECUCIÓN) y down_sql (orden inverso).
         selected.sort(key=lambda d: d["seq"])
         up_sql = ";\n".join(d["sql"] for d in selected)
         down_parts = [d["down_sql"] for d in reversed(selected) if d["down_sql"]]
@@ -932,6 +1143,22 @@ class SchemaComparisonController:
                 "kind": "schema",
                 "is_baseline": True,
                 "reviewed": execute_immediately,
+                # MANIFIESTO de sentencias: una fila por sentencia con su reverso
+                # EMPAREJADO y su ``seq`` alineado al índice del checkpoint. Es lo que
+                # habilita reconciliar una aplicación parcial (deshacer exactamente las
+                # sentencias que commitearon) en vez de quedar con la BD a mitad de camino.
+                "statements": [
+                    {
+                        "up_sql": d["sql"],
+                        "down_sql": d["down_sql"],
+                        "down_confirmed": d["down_confirmed"],
+                        "object_type": d["object_type"],
+                        "object_name": d["object_name"],
+                        "op_group": d["op_group"],
+                        "destructive": bool(d["risk"].get("destructive")),
+                    }
+                    for d in selected
+                ],
             },
             admin=admin,
         )
@@ -973,6 +1200,10 @@ class SchemaComparisonController:
             "executed": execute_immediately,
             "migration": migration,
             "apply_result": apply_result,
+            # Ítems que hubo que agregar para cerrar dependencias (solo con
+            # auto_resolve_dependencies=true) y avisos NO bloqueantes del linter de plan.
+            "added_item_ids": added_ids,
+            "plan_warnings": plan_warnings,
         }
 
     @staticmethod
@@ -1006,6 +1237,9 @@ class SchemaComparisonController:
                 "down_confirmed": r.down_confirmed,
                 "object_type": r.object_type,
                 "object_name": r.object_name,
+                "change_type": r.change_type,
+                "op_group": r.op_group
+                or f"{r.object_type}|{r.object_name}|{r.change_type}|{r.id}",
                 "risk": json.loads(r.risk_flags),
             }
             for r in rows
@@ -1037,16 +1271,26 @@ class SchemaComparisonController:
         blob = "\x1f".join(parts)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
-    @staticmethod
-    def _resolve_mode(all_items: list, mode: str, selected_item_ids: list[int] | None) -> list[dict]:
+    def _resolve_mode(
+        self, all_items: list, mode: str, selected_item_ids: list[int] | None
+    ) -> tuple[list[dict], list[str], list[dict]]:
         """
-        Resuelve el conjunto de sentencias a ejecutar según el modo (ya ordenadas por seq).
+        Resuelve el conjunto de sentencias a ejecutar según el modo (ya ordenadas por seq)
+        y lo VALIDA. Devuelve ``(sentencias, grupos_excluidos_por_dependencia, avisos)``.
 
         - ``all``: todo lo aditivo/seguro y destructivo, EXCEPTO objetos procedurales
           con cuerpo no revisable (``requires_individual_review``: solo vía custom).
         - ``all_except_destructive``: excluye además cualquier ítem ``destructive``.
-        - ``custom``: exactamente los ``selected_item_ids`` (el admin los eligió a mano;
-          sin exclusiones automáticas).
+        - ``custom``: exactamente los ``selected_item_ids`` (el admin los eligió a mano),
+          pero se VALIDA que la selección cierre sobre sus dependencias.
+
+        **Los modos automáticos se PODAN, no fallan.** El filtro por riesgo es por
+        sentencia y puede dejar fuera una dependencia sin sacar a sus dependientes. Caso
+        real: una tabla nueva que la heurística marcó ``possible_rename_of`` es
+        ``destructive`` y queda fuera de ``all_except_destructive``, pero sus índices y
+        FKs (no destructivos) NO — y un ``CREATE INDEX`` sobre una tabla que no existe
+        aborta la ejecución. Se descartan transitivamente los cambios que quedaron sin
+        base y se reporta cuáles (el admin ve exactamente qué NO se va a ejecutar).
         """
         def to_dict(it) -> dict:
             return {
@@ -1058,17 +1302,20 @@ class SchemaComparisonController:
                 "risk": json.loads(it.risk_flags),
             }
 
+        plan = self._plan_items(all_items)
         dicts = [to_dict(it) for it in all_items]  # ya vienen ordenados por seq
-        if mode == "all":
-            return [d for d in dicts if not d["risk"].get("requires_individual_review")]
-        if mode == "all_except_destructive":
-            return [
-                d
+        by_id = {d["id"]: d for d in dicts}
+
+        if mode in ("all", "all_except_destructive"):
+            keep = [
+                d["id"]
                 for d in dicts
-                if not d["risk"].get("destructive")
-                and not d["risk"].get("requires_individual_review")
+                if not d["risk"].get("requires_individual_review")
+                and not (mode == "all_except_destructive" and d["risk"].get("destructive"))
             ]
-        if mode == "custom":
+            kept_ids, pruned = prune_unsatisfied(plan, keep)
+            resolved = [by_id[i] for i in kept_ids]
+        elif mode == "custom":
             if not selected_item_ids:
                 raise AppHttpException(
                     message="mode=custom requiere 'selected_item_ids'.",
@@ -1076,20 +1323,28 @@ class SchemaComparisonController:
                     context={"mode": mode},
                 )
             idset = set(selected_item_ids)
-            chosen = [d for d in dicts if d["id"] in idset]
-            missing = idset - {d["id"] for d in chosen}
+            missing = idset - set(by_id)
             if missing:
                 raise AppHttpException(
                     message="Algunos 'selected_item_ids' no pertenecen a esta comparación.",
                     status_code=422,
                     context={"missing_item_ids": sorted(missing)},
                 )
-            return chosen
-        raise AppHttpException(
-            message="Modo de ejecución inválido.",
-            status_code=422,
-            context={"mode": mode},
+            self._assert_selection_closed(plan, sorted(idset), operation="execute")
+            resolved, pruned = [d for d in dicts if d["id"] in idset], []
+        else:
+            raise AppHttpException(
+                message="Modo de ejecución inválido.",
+                status_code=422,
+                context={"mode": mode},
+            )
+
+        # Linter de plan: última barrera antes de tocar el motor. Un plan cuyo orden viole
+        # una dependencia no se ejecuta (fallaría a mitad, dejando la BD inconsistente).
+        warnings = self._assert_plan_sane(
+            plan, [d["id"] for d in resolved], operation=f"execute:{mode}"
         )
+        return resolved, pruned, warnings
 
     def preview_execution(
         self,
@@ -1124,7 +1379,7 @@ class SchemaComparisonController:
                 .order_by(SchemaComparisonItem.seq.asc())
                 .all()
             )
-            resolved = self._resolve_mode(all_items, mode, selected_item_ids)
+            resolved, pruned, plan_warnings = self._resolve_mode(all_items, mode, selected_item_ids)
         finally:
             session.close()
 
@@ -1150,6 +1405,11 @@ class SchemaComparisonController:
                 }
                 for d in resolved
             ],
+            # Cambios descartados porque su dependencia quedó fuera del modo automático
+            # (p. ej. un índice de una tabla excluida por destructiva). Visible en el
+            # preview para que el admin no descubra la ausencia después de ejecutar.
+            "excluded_by_dependency": pruned,
+            "plan_warnings": plan_warnings,
             "confirm_token": token,
         }
 
@@ -1228,7 +1488,7 @@ class SchemaComparisonController:
                 .order_by(SchemaComparisonItem.seq.asc())
                 .all()
             )
-            resolved = self._resolve_mode(all_items, mode, selected_item_ids)
+            resolved, pruned, plan_warnings = self._resolve_mode(all_items, mode, selected_item_ids)
         finally:
             session.close()
 
@@ -1314,6 +1574,8 @@ class SchemaComparisonController:
             "applied_count": applied_count,
             "failed": failed,
             "statements": self._result_items(resolved, results),
+            "excluded_by_dependency": pruned,
+            "plan_warnings": plan_warnings,
         }
 
     @staticmethod
