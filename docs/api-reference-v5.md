@@ -143,6 +143,11 @@ ahora se **rechaza con 422** (antes fallaba contra el motor).
 - Como alternativa más simple a construir esa UI, ver la sección 3: el backend lo resuelve por
   vos.
 
+⚠️ **`op_group` puede venir `null`** en ítems de comparaciones creadas ANTES de esta versión
+(no se recalcula retroactivamente sobre datos ya persistidos). Tratalo como "ítem suelto, sin
+grupo atómico ni dependencias conocidas" — seleccionable individualmente, sin agrupar con
+nada. No asumas que `null` es un error de datos.
+
 ---
 
 ## 3. Cerrar una selección: `POST .../resolve-selection`
@@ -180,6 +185,12 @@ el usuario entienda el porqué, no solo el qué) → usar `resolved_item_ids` (y
 el `selected_item_ids` real que se manda a `adopt`/`execute`.
 
 Esto reemplaza el ciclo anterior de "intento → 422 → leo el error → agrego a mano → reintento".
+
+⚠️ **`resolve-selection` no valida si la comparación expiró** (a diferencia de `adopt` y
+`execute`, que sí lo hacen). Un resultado de este endpoint sobre una comparación vieja puede
+parecer válido y aun así fallar al confirmar con `adopt`/`execute` por expiración — no lo
+uses como sustituto de refrescar la comparación si pasó mucho tiempo entre que se creó y que
+el usuario confirma.
 
 ---
 
@@ -325,6 +336,21 @@ Si `reconciliation.fully_reconciled: false` (algunas sentencias no tenían rever
 mostrar `unconfirmed_reverses`/`unreversible_statements` y dirigir a
 `/migrations/reconcile-partial` con `force=true` (§10) o a corrección manual.
 
+⚠️ **`reconciliation: null` con `failed: true` NO significa "no pasó nada".** Puede ser
+cualquiera de tres casos distintos, y la UI no debe asumir que todo está bien solo porque no
+hay objeto de reconciliación:
+1. La migración falló en su **primera** sentencia — no había nada aplicado, no hay nada que
+   reconciliar (el caso más benigno).
+2. Se llamó con `on_failure=leave` explícito — la auto-reconciliación ni se intentó a
+   propósito.
+3. `on_failure=auto` (el default) pero había sentencias sin reverso seguro — el sistema
+   **deliberadamente no intentó** una reconciliación parcial (a diferencia de `reconcile`,
+   que sí la intenta salteando lo irreversible) y dejó la BD en cuarentena tal cual.
+
+**La única forma confiable de saber cuál es** es consultar `GET .../migrations/status`
+después: si `has_partial_application: true`, es el caso 2 o 3 (hay algo pendiente de
+resolver); si `false`, es el caso 1 (nada que hacer, solo corregir la migración).
+
 ---
 
 ## 9. Ver si una BD quedó a medias: `GET .../migrations/status`
@@ -348,10 +374,21 @@ Dos campos nuevos:
 }
 ```
 
-**Esto solo puede pasar si alguien usó `on_failure=leave` (o la versión previa a esta, que no
-tenía otra opción).** Con el default `auto`, un `apply` fallido ya se auto-resuelve en la
-misma llamada (§8) y este estado no debería acumularse. Aun así, la UI del panel de
-migraciones debe:
+**Esto persiste solo si el `apply` que falló usó `on_failure=leave`, o si `auto`/`reconcile`
+no pudieron reconciliar del todo** (sentencias sin reverso, con `reconcile` sin `force`, o
+`auto` que directamente no lo intentó — ver el ⚠️ de la sección 8). Con el default `auto` y
+sin sentencias irreversibles, un `apply` fallido ya se auto-resuelve en la misma llamada y
+este estado no debería acumularse.
+
+⚠️ **Puede haber MÁS de una entrada en `partial_application[]`** (migraciones distintas que
+quedaron a medias en momentos distintos, sin reconciliar entre sí). `reconcile-partial` solo
+resuelve **la de versión más alta** en cada llamada (es la última que se intentó aplicar) —
+si hay varias, hace falta llamar al endpoint varias veces, una por versión, de la más alta a
+la más baja. La UI debería iterar mostrando "Reconciliar 0009" primero y no ofrecer "0008"
+hasta que la de arriba esté resuelta (el backend además lo exige: `confirm_version` debe
+coincidir con la versión que reconciliaría esa llamada, que siempre es la más alta pendiente).
+
+La UI del panel de migraciones debe:
 - Mostrar un banner **persistente** (no un toast que desaparece) si `has_partial_application:
   true` — es más urgente que "hay pendientes".
 - Por cada entrada de `partial_application`, si `reconcilable: true`, ofrecer el botón
@@ -374,8 +411,18 @@ Rate limit: **10/minute**. Query params:
 | Param | Requerido | Descripción |
 |---|---|---|
 | `confirm_version` | sí | Debe ser la versión que aparece en `partial_application[].version` (doble intención). |
-| `dry_run` | no | `true` devuelve los reversos exactos SIN ejecutar nada. **Recomendado llamarlo primero siempre.** |
+| `dry_run` | no | `true` devuelve los reversos exactos SIN ejecutar nada. **Recomendado llamarlo primero siempre.** ⚠️ Ver la nota de abajo: no siempre alcanza para previsualizar. |
 | `force` | no | Procede aunque haya sentencias sin reverso — las saltea y reporta (409 sin esto). |
+
+⚠️ **`dry_run=true` NO garantiza una previsualización si hay sentencias sin reverso.** El
+backend valida `force` ANTES de mirar `dry_run`: si el plan tiene sentencias sin `down_sql`
+(`unreversible_statements` no vacío) y no se pasó `force=true`, la llamada responde **409
+incluso en modo dry-run** — no hay forma de "solo mirar" ese caso sin comprometerse de
+antemano a saltear lo irreversible. Para la UI: si el primer intento con `dry_run=true` da
+409 con `public_context.unreversible_statements`, el siguiente intento debe repetirse con
+`dry_run=true&force=true` para ver el plan completo antes de decidir si se ejecuta de
+verdad. No asumas que un dry-run exitoso implica ausencia de sentencias irreversibles —
+puede ser que ya viniste con `force=true` desde el paso anterior.
 
 Respuesta con `dry_run=true` (`data: MigrationReconcilePartialOut`):
 ```jsonc
