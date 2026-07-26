@@ -231,3 +231,180 @@ def test_reconcile_plan_flags_reverses_that_are_not_demonstrably_safe():
     assert plan["reconcilable"] is True  # ambas tienen reverso
     assert [u["seq"] for u in plan["unconfirmed"]] == [2]
     assert plan["unconfirmed"][0]["destructive"] is True
+
+
+# --------------------------------------------------------------------------- #
+# DDL transaccional (PostgreSQL): el estado parcial deja de existir            #
+# --------------------------------------------------------------------------- #
+def test_postgresql_uses_transactional_ddl():
+    """
+    Diferencia de motor más importante del módulo: PostgreSQL ejecuta DDL transaccional,
+    así que una migración que falla a mitad se deshace SOLA y nunca hay estado parcial.
+    """
+    assert MigrationRunner().use_transactional_ddl(EngineType.postgresql, [_spec()]) is True
+
+
+def test_mysql_family_never_uses_transactional_ddl():
+    """MySQL/MariaDB hacen COMMIT IMPLÍCITO en cada DDL: la atomicidad es imposible."""
+    runner = MigrationRunner()
+    assert runner.use_transactional_ddl(EngineType.mysql, [_spec()]) is False
+    assert runner.use_transactional_ddl(EngineType.mariadb, [_spec()]) is False
+
+
+def test_statements_postgresql_cannot_run_in_a_transaction_disable_the_mode():
+    """
+    Fail-safe: si el SQL trae algo que PostgreSQL no admite en una transacción, se cae al
+    modo AUTOCOMMIT histórico en vez de abortar con "cannot run inside a transaction block".
+    """
+    runner = MigrationRunner()
+    for sql in (
+        "CREATE INDEX CONCURRENTLY ix ON t (a)",
+        "DROP INDEX CONCURRENTLY ix",
+        "VACUUM FULL t",
+        "ALTER SYSTEM SET work_mem = '8MB'",
+        # PostgreSQL 12+ lo permite en una transacción, pero el valor nuevo no se puede
+        # USAR ahí mismo: se excluye por prudencia.
+        "ALTER TYPE mi_enum ADD VALUE 'z'",
+    ):
+        spec = _spec(up_sql=sql, up_sql_mysql=sql, up_sql_postgresql=sql, manifest=())
+        assert runner.use_transactional_ddl(EngineType.postgresql, [spec]) is False, sql
+
+
+def test_one_bad_statement_in_any_migration_disables_the_mode():
+    """Conservador: la decisión es por operación, no por migración."""
+    bad = "CREATE INDEX CONCURRENTLY ix ON a (id)"
+    specs = [
+        _spec(),
+        _spec(up_sql=bad, up_sql_mysql=bad, up_sql_postgresql=bad, manifest=(), version="0004"),
+    ]
+    assert MigrationRunner().use_transactional_ddl(EngineType.postgresql, specs) is False
+
+
+def test_transactional_mode_disables_the_statement_checkpoint(tmp_path):
+    """
+    NO es una optimización, es CORRECCIÓN: el checkpoint se graba en la BD del gateway
+    (otra conexión, otro commit). Si la transacción de la migración se deshace en el motor
+    destino, un checkpoint sobreviviente afirmaría "10 sentencias aplicadas" sobre una BD
+    virgen y el resume arrancaría en la 11.
+    """
+    runner = MigrationRunner()
+    versions = tmp_path / "versions"
+    versions.mkdir()
+    # Spec PINNEADO a PostgreSQL: con source_engine='mysql' el manifiesto se descarta
+    # (correcto) y el SQL se transpila, así que el conteo de sentencias no sería el del
+    # manifiesto sino el del splitter sobre el texto traducido.
+    up = ";\n".join(up for up, _ in _STATEMENTS)
+    pg = _spec(source_engine="postgresql", up_sql_postgresql=up)
+    runner._write_revision_files(
+        versions, [pg], EngineType.postgresql, 999, transactional=True
+    )
+    body = (versions / "rev_0003.py").read_text(encoding="utf-8")
+    # Ni una sola llamada al checkpoint: es lo que se está verificando.
+    assert "migration_progress" not in body
+    # Una sentencia del manifiesto = un op.execute en upgrade() (el downgrade tiene los
+    # suyos, así que se cuenta solo en la parte de upgrade).
+    upgrade_body = body.split("def downgrade():")[0]
+    assert upgrade_body.count("op.execute(") == 4, upgrade_body
+
+
+# --------------------------------------------------------------------------- #
+# Traducción MySQL -> PostgreSQL: DDL que sqlglot dejaba inválido              #
+# --------------------------------------------------------------------------- #
+def test_mysql_only_ddl_is_rewritten_to_valid_postgresql():
+    """
+    sqlglot transpila expresiones y tipos, pero emitía VERBATIM el DDL de MySQL al escribir
+    PostgreSQL: ``DROP INDEX i ON t`` (PG no acepta ON) y ``DROP FOREIGN KEY``/``INDEX``/
+    ``CHECK`` (PG usa ``DROP CONSTRAINT``). El resultado solo fallaba contra el motor.
+    """
+    from app.services.db_admin.sql_dialect import SqlTranslator
+
+    t = SqlTranslator()
+    assert t.translate("DROP INDEX `ix` ON `c`", EngineType.postgresql) == 'DROP INDEX "ix"'
+    assert (
+        t.translate("ALTER TABLE `t` DROP FOREIGN KEY `fk`", EngineType.postgresql)
+        == 'ALTER TABLE "t" DROP CONSTRAINT "fk"'
+    )
+    assert (
+        t.translate("ALTER TABLE `t` DROP INDEX `uq`", EngineType.postgresql)
+        == 'ALTER TABLE "t" DROP CONSTRAINT "uq"'
+    )
+    # DROP CHECK cae en el parser opaco de sqlglot y dejaba los backticks intactos.
+    assert (
+        t.translate("ALTER TABLE `t` DROP CHECK `ck`", EngineType.postgresql)
+        == 'ALTER TABLE "t" DROP CONSTRAINT "ck"'
+    )
+
+
+def test_rewrites_do_not_cascade_between_statements():
+    """
+    Regresión: aplicar las reglas sobre el script COMPLETO hacía que la segunda pisara el
+    resultado de la primera (``DROP INDEX i ON t`` terminaba como ``DROP CONSTRAINT i``).
+    Se aplican por sentencia y con contexto de ``ALTER TABLE``.
+    """
+    from app.services.db_admin.sql_dialect import SqlTranslator
+
+    out = SqlTranslator().translate(
+        "DROP INDEX `ix` ON `t`;\nALTER TABLE `t` DROP FOREIGN KEY `fk`",
+        EngineType.postgresql,
+    )
+    assert out == 'DROP INDEX "ix";\nALTER TABLE "t" DROP CONSTRAINT "fk"'
+
+
+def test_untranslatable_mysql_ddl_is_reported_as_blocking():
+    """
+    Lo que NO tiene traducción exacta se REPORTA en vez de emitirse roto: ``MODIFY COLUMN``
+    hay que partirlo semánticamente y ``DROP PRIMARY KEY`` necesita el nombre del
+    constraint. Devolver None no alcanzaba: el llamador caía al ``up_sql`` en dialecto
+    MySQL crudo, igual de inválido contra PostgreSQL.
+    """
+    from app.services.db_admin.sql_dialect import SqlTranslator
+
+    t = SqlTranslator()
+    assert t.translation_blockers(
+        "ALTER TABLE `t` MODIFY COLUMN `a` INT NOT NULL", EngineType.postgresql
+    )
+    assert t.translation_blockers("ALTER TABLE `t` DROP PRIMARY KEY", EngineType.postgresql)
+    assert t.translation_blockers(
+        "CREATE TABLE `t` (`id` INT) ENGINE=InnoDB", EngineType.postgresql
+    )
+    # Lo traducible NO se bloquea.
+    assert not t.translation_blockers("DROP INDEX `ix` ON `c`", EngineType.postgresql)
+    assert not t.translation_blockers(
+        "ALTER TABLE `t` ADD COLUMN `a` INT NOT NULL DEFAULT 0", EngineType.postgresql
+    )
+    # Con MySQL/MariaDB como destino nunca hay nada que traducir ni bloquear.
+    assert not t.translation_blockers(
+        "ALTER TABLE `t` MODIFY COLUMN `a` INT", EngineType.mysql
+    )
+
+
+def test_postgresql_serial_columns_are_rendered_as_serial():
+    """
+    Una columna ``serial`` tiene su secuencia POSEÍDA (``pg_depend.deptype='a'``), que el
+    snapshot excluye a propósito. Emitir ``DEFAULT nextval('t_id_seq')`` referenciaba una
+    secuencia que nunca se crea -> ``relation "t_id_seq" does not exist`` en el primer
+    CREATE TABLE. Rompía el clon PG->PG de cualquier tabla con ``id serial primary key``.
+    """
+    from app.services.db_admin.dtos import ColumnInfo
+    from app.services.db_admin.postgres_adapter import PostgresAdapter
+
+    class _T:
+        host, port, username, password, engine = "h", 1, "u", "p", "postgresql"
+
+    ad = PostgresAdapter(_T())
+    nextval = "nextval('t_id_seq'::regclass)"
+    assert ad._render_column_def(
+        ColumnInfo(name="id", type="integer", nullable=False, default=nextval)
+    ) == '"id" SERIAL'
+    assert ad._render_column_def(
+        ColumnInfo(name="id", type="bigint", nullable=False, default=nextval)
+    ) == '"id" BIGSERIAL'
+    # Un default normal no se toca.
+    assert ad._render_column_def(
+        ColumnInfo(name="n", type="integer", nullable=False, default="0")
+    ) == '"n" integer DEFAULT 0 NOT NULL'
+    # Límite conocido: NULLABLE con nextval no se convierte (SERIAL implica NOT NULL y
+    # cambiar la nullabilidad en silencio sería peor).
+    assert "SERIAL" not in ad._render_column_def(
+        ColumnInfo(name="id", type="integer", nullable=True, default=nextval)
+    )

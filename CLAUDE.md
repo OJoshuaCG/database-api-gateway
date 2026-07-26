@@ -597,6 +597,67 @@ regenera `down_sql_suggested`. `DELETE` solo borra la **última** versión (la p
 Verificación e2e contra motores reales (`scripts/verify_migrations_e2e.py`, requiere Docker):
 **ejecutada — 153 checks / 0 fallos** (cubre Plan 02 + Plan 09 + UX).
 
+**PostgreSQL: DDL TRANSACCIONAL — el estado parcial no existe** (`MigrationRunner.use_transactional_ddl`):
+diferencia de motor más importante del módulo. PG ejecuta DDL transaccional, así que una
+migración que falla en la sentencia 10 de 50 **se deshace sola** y el ledger nunca divergió del
+plano físico. El `env.py` compartido SIEMPRE pidió `transaction_per_migration=True`, pero el
+runner forzaba AUTOCOMMIT y lo anulaba — PG sufría un problema que no le corresponde. Ahora:
+PG → conexión transaccional + advisory lock en **otra sesión** (`advisory_lock`; los locks de
+SESIÓN sobreviven COMMIT/ROLLBACK, los de transacción serían `pg_advisory_xact_lock`) +
+**checkpoint DESACTIVADO** (no es optimización sino CORRECCIÓN: el checkpoint se graba en la BD
+del gateway con su propio commit; si la tx del destino se revierte, afirmaría "10 aplicadas"
+sobre una BD virgen). MySQL/MariaDB → AUTOCOMMIT (commit implícito en cada DDL, atomicidad
+imposible) + checkpoint. Se cae a AUTOCOMMIT si ALGUNA migración trae algo que PG no admite en
+tx (`CREATE/DROP INDEX CONCURRENTLY`, `VACUUM`, `ALTER SYSTEM`, `CREATE/DROP DATABASE`,
+`ALTER TYPE … ADD VALUE` — este último aunque PG12+ lo permita: el valor nuevo no se puede USAR
+en la misma tx). `_read_current` commitea la tx implícita del SELECT (si no, Alembic no puede
+abrir la suya). Verificado con SQLite hecho transaccional a propósito (el driver pysqlite NO
+emite BEGIN para DDL por default → SQLite normal NO sirve como proxy de PG).
+
+**Auto-protección ante un fallo** (`apply?on_failure=auto|reconcile|leave`, default `auto`):
+solo aplica a MySQL/MariaDB. `auto` deshace lo aplicado SOLO si puede deshacerlo todo → la BD
+vuelve limpia a su versión anterior y **NO queda en cuarentena**. La respuesta trae
+`reconciliation`. **ANTI-PATRÓN que esto elimina**: `stamp --force` a la versión que falló +
+`rollback`. El stamp AFIRMA que las 50 sentencias corrieron, así que el rollback ejecuta 50
+reversos contra 10 cambios reales → los 40 restantes fallan (`doesn't exist`) y queda un TERCER
+estado inconsistente; encima `force` descarta el checkpoint. El 409 de
+`_guard_partial_checkpoint` ahora lo explica y ordena las vías correctas.
+
+**Traducción MySQL→PostgreSQL (fix)**: sqlglot transpila bien expresiones/tipos pero emitía
+VERBATIM el DDL de MySQL al escribir PG. Verificado invocando el transpilador real:
+`DROP INDEX i ON t` → `DROP INDEX "i" ON "t"` (PG no acepta `ON`); `DROP FOREIGN KEY`/
+`DROP INDEX`/`DROP CHECK` → se quedaban así (PG usa `DROP CONSTRAINT`), y `DROP CHECK` incluso
+dejaba los **backticks**. Las 4 tienen reescritura exacta (`_rewrite_pg_statement`, aplicada
+**por sentencia y con contexto de `ALTER TABLE`** — al script completo la 2ª pisaba a la 1ª).
+`MODIFY COLUMN`/`CHANGE COLUMN`/`DROP PRIMARY KEY`/`ENGINE=`/`AUTO_INCREMENT=` NO son
+traducibles → `_guard_untranslatable_sql` responde **422 antes de tocar el motor** pidiendo
+`up_sql_postgresql`. Que `translate` devolviera `None` NO era defensa: `select_up_sql` caía al
+`up_sql` base en MySQL crudo, igual de inválido. Transpilado **memoizado** (`lru_cache`, 80ms →
+0.02ms) + pre-filtro regex sobre el SQL crudo en el guard. `apply_all` ahora SÍ corre
+`_guard_cross_engine` y este guard (antes no corría ninguno: lote heterogéneo sin validar).
+
+**`serial` de PostgreSQL (fix)**: la secuencia que respalda un `serial` está POSEÍDA por la
+columna (`pg_depend.deptype='a'`) y el snapshot la excluye A PROPÓSITO, pero
+`_render_column_def` emitía `DEFAULT nextval('t_id_seq'::regclass)` → `relation "t_id_seq"
+does not exist` en el primer CREATE TABLE. **Rompía el clon PG→PG de cualquier tabla con
+`id serial primary key`.** Fix: `PostgresAdapter._serial_type` rendea `SERIAL`/`BIGSERIAL`/
+`SMALLSERIAL` (crea la secuencia, la asocia y fija el default en un paso). Solo para columnas
+NOT NULL: `serial` implica NOT NULL, y una columna nullable con `nextval` (creada a mano, muy
+inusual) queda con el default crudo — límite conocido y acotado.
+
+**`snapshot_layout` — el OTRO camino de creación de versiones (fix)**: `order_statements`
+ordenaba las clases no-tabla **ALFABÉTICAMENTE**, así que una `v_alpha` que lee de `v_zeta`
+salía primero y el baseline fallaba con 1146/42P01 — el mismo bug que en el diff, en el otro
+camino. Ahora los objetos con cuerpo se ordenan por dependencia real
+(`_order_by_body_references`, reusa `_referenced_identifiers` de `schema_diff` + el
+`depends_on` firme del dump). Además se reordenó `_CLASS_ORDER`: `routine` ANTES de
+`view`/`matview` (una vista puede llamar una función y PG la valida al crearla) e `index`
+DESPUÉS de `materialized_view` (en PG `pg_indexes` incluye los índices de las MATVIEWS y el
+dump los emite como `object_type='index'` → `CREATE INDEX … ON mi_matview` antes de la
+matview). Pendiente en este camino: `_persist_snapshot_versions` no escribe manifiesto (un
+baseline que falla a mitad no es reconciliable) y `filter_statements` no valida cierre
+(excluir `type` deja un baseline inaplicable en silencio).
+
 **Manifiesto de sentencias + reconciliación de una aplicación PARCIAL** (`model_migration_statements`,
 tabla nueva; migración `e2f3a4b5c6d7`): cierra el agujero más grave del rollback. Alembic
 escribe la versión en `_gw_v_{slug}` recién al TERMINAR el `upgrade()`, así que un `apply` que

@@ -471,3 +471,94 @@ def test_unrelated_fk_drop_is_not_hoisted():
     diff = diff_snapshots(snap([parent, source_child]), snap([parent, target_child]))
     # 'nota' cambia de tipo pero la FK es sobre 'pid': el DROP queda en su paso destructivo.
     assert_before(diff, ("column", "child.nota"), ("foreign_key", "child.fk_pid"))
+
+
+# --------------------------------------------------------------------------- #
+# El OTRO camino de creación de versiones: baseline de snapshot                #
+# --------------------------------------------------------------------------- #
+def test_snapshot_layout_orders_bodies_by_dependency_not_alphabetically():
+    """
+    ``snapshot_layout.order_statements`` ordenaba vistas/matviews/rutinas por NOMBRE.
+    Una ``v_alpha`` que lee de ``v_zeta`` salía primero y el baseline fallaba con
+    ``1146``/``42P01``. Es el mismo bug que en el diff, en el otro camino.
+    """
+    from app.services.db_admin.dtos import DumpStatement
+    from app.services.db_admin.snapshot_layout import order_statements
+
+    ordered = order_statements([
+        DumpStatement(object_type="view", name="v_alpha",
+                      ddl="CREATE VIEW v_alpha AS SELECT * FROM v_zeta"),
+        DumpStatement(object_type="view", name="v_zeta",
+                      ddl="CREATE VIEW v_zeta AS SELECT * FROM t"),
+        DumpStatement(object_type="table", name="t", ddl="CREATE TABLE t (id int)"),
+    ])
+    names = [s.name for s in ordered]
+    assert names.index("t") < names.index("v_zeta") < names.index("v_alpha"), names
+
+
+def test_snapshot_layout_puts_routines_before_views_and_indexes_after_matviews():
+    """
+    Dos reordenamientos de clase: una vista puede llamar a una función (PostgreSQL la valida
+    al crear la vista) y ``pg_indexes`` incluye los índices de las MATVIEWS, que antes se
+    emitían antes de la matview misma.
+    """
+    from app.services.db_admin.dtos import DumpStatement
+    from app.services.db_admin.snapshot_layout import order_statements
+
+    ordered = order_statements([
+        DumpStatement(object_type="index", name="ix_mv",
+                      ddl="CREATE INDEX ix_mv ON mv_agg (x)"),
+        DumpStatement(object_type="materialized_view", name="mv_agg",
+                      ddl="CREATE MATERIALIZED VIEW mv_agg AS SELECT 1"),
+        DumpStatement(object_type="view", name="v", ddl="CREATE VIEW v AS SELECT fn_x()"),
+        DumpStatement(object_type="routine", name="fn_x", ddl="CREATE FUNCTION fn_x() ..."),
+    ])
+    names = [s.name for s in ordered]
+    assert names.index("fn_x") < names.index("v"), names
+    assert names.index("mv_agg") < names.index("ix_mv"), names
+
+
+def test_snapshot_layout_survives_a_view_cycle():
+    """Un ciclo de vistas no debe abortar el layout: queda al final, determinista."""
+    from app.services.db_admin.dtos import DumpStatement
+    from app.services.db_admin.snapshot_layout import order_statements
+
+    ordered = order_statements([
+        DumpStatement(object_type="view", name="a", ddl="CREATE VIEW a AS SELECT * FROM b"),
+        DumpStatement(object_type="view", name="b", ddl="CREATE VIEW b AS SELECT * FROM a"),
+    ])
+    assert {s.name for s in ordered} == {"a", "b"}
+
+
+# --------------------------------------------------------------------------- #
+# Dependencias de PostgreSQL: tipos ENUM y secuencias                          #
+# --------------------------------------------------------------------------- #
+def test_new_table_depends_on_the_enum_type_its_column_uses():
+    """Elegir la tabla sin su ENUM daba "type does not exist" al ejecutar."""
+    from app.services.db_admin.dtos import EnumTypeInfo
+
+    src = SchemaSnapshot(
+        database="d", source_engine="postgresql",
+        tables=[tbl("t", [col("id"), col("estado", "mi_estado")], pk=["id"])],
+        enum_types=[EnumTypeInfo(name="mi_estado", values=["a", "b"])],
+    )
+    diff = diff_snapshots(src, snap([], engine="postgresql"))
+    graph = build_dependency_graph(diff.items)
+    assert "enum_type|mi_estado|new" in graph["table|t|new"]
+    assert_before(diff, ("enum_type", "mi_estado"), ("table", "t"))
+
+
+def test_new_column_depends_on_the_sequence_in_its_default():
+    from app.services.db_admin.dtos import SequenceInfo
+
+    base = tbl("t", [col("id")], pk=["id"])
+    src = SchemaSnapshot(
+        database="d", source_engine="postgresql",
+        tables=[tbl("t", [col("id"),
+                          col("n", "integer", default="nextval('mi_seq'::regclass)")],
+                    pk=["id"])],
+        sequences=[SequenceInfo(name="mi_seq")],
+    )
+    diff = diff_snapshots(src, snap([base], engine="postgresql"))
+    graph = build_dependency_graph(diff.items)
+    assert "sequence|mi_seq|new" in graph["column|t.n|new"]

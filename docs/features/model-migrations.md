@@ -257,6 +257,102 @@ fiable:
 - **Recomendación**: escribe migraciones **idempotentes** (`CREATE TABLE IF NOT EXISTS`,
   `ADD COLUMN IF NOT EXISTS`) para que un reintento sea seguro.
 
+## PostgreSQL: el estado parcial no existe
+
+Es la diferencia de motor más importante de todo el módulo. **PostgreSQL ejecuta DDL
+transaccional**: una migración de 50 sentencias que falla en la 10 se deshace **sola**, el
+ledger de Alembic y el plano físico nunca divergen, y el `rollback` posterior opera sobre un
+estado conocido. MySQL/MariaDB hacen **COMMIT IMPLÍCITO** en cada DDL: ahí la atomicidad es
+imposible y el checkpoint por sentencia es la única defensa.
+
+El `env.py` compartido siempre pidió `transaction_per_migration=True`, pero el runner
+forzaba la conexión a AUTOCOMMIT y lo anulaba — así que PostgreSQL sufría un problema que
+no le corresponde. Ahora `MigrationRunner.use_transactional_ddl` decide por motor:
+
+| | PostgreSQL | MySQL / MariaDB |
+|---|---|---|
+| Conexión | transaccional | AUTOCOMMIT |
+| Advisory lock | en **otra sesión** (`advisory_lock`) | en la misma conexión |
+| Fallo a mitad | **el motor revierte todo** | quedan k sentencias aplicadas |
+| Checkpoint por sentencia | **desactivado** | activo |
+| Reconciliación | no hace falta | `reconcile-partial` |
+
+Dos detalles que no son opcionales:
+
+- **El lock va en su propia sesión.** Los advisory locks de *sesión* de PostgreSQL
+  sobreviven a COMMIT y a ROLLBACK (los de transacción son `pg_advisory_xact_lock`, que no
+  se usan), pero tenerlo en la misma conexión metería la adquisición dentro de la
+  transacción de la migración. Con una sesión aparte, la transacción queda limpia.
+- **El checkpoint se desactiva.** No es una optimización: el checkpoint se graba en la BD
+  del *gateway*, otra conexión con su propio commit. Si la transacción de la migración se
+  revierte en el destino, un checkpoint sobreviviente afirmaría "10 sentencias aplicadas"
+  sobre una BD virgen y el resume arrancaría en la 11.
+
+**Excepciones.** Si alguna migración del blueprint contiene una sentencia que PostgreSQL no
+admite en una transacción (`CREATE INDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY`,
+`VACUUM`, `ALTER SYSTEM`, `CREATE/DROP DATABASE`, `ALTER TYPE … ADD VALUE`) se cae al modo
+AUTOCOMMIT para toda la operación y se registra en el log qué versión lo desactivó. Es
+conservador a propósito: se evalúan todas las migraciones, no solo las pendientes, porque la
+decisión se toma antes de saber cuáles van a correr. `ALTER TYPE … ADD VALUE` se excluye
+aunque PostgreSQL 12+ lo permita: el valor nuevo no se puede *usar* en la misma transacción.
+
+## Qué hace el sistema cuando un apply falla
+
+`POST .../migrations/apply?on_failure=` — solo relevante en MySQL/MariaDB (en PostgreSQL el
+motor ya deshizo todo):
+
+| Modo | Comportamiento |
+|---|---|
+| `auto` (default) | Deshace lo aplicado **solo si puede deshacerlo todo**. Si lo logra, la BD vuelve limpia a su versión anterior y **no queda en cuarentena**: solo hay que corregir la migración. |
+| `reconcile` | Deshace igual, salteando y reportando las sentencias sin reverso. |
+| `leave` | No toca nada (cuarentena + checkpoint). Comportamiento anterior. |
+
+La respuesta trae `reconciliation` con qué se deshizo, si quedó completo y qué reversos no
+son demostrablemente seguros. Con `auto` el flujo del admin pasa a ser: apply falla →
+la BD ya está limpia → corregir el SQL → reintentar. Sin pasos manuales.
+
+### ⚠️ El anti-patrón: `stamp --force` + `rollback`
+
+La reacción intuitiva ante un apply que falla a mitad es stampear la versión que falló y
+después revertirla. **Eso empeora el problema:**
+
+1. `stamp 8` **afirma** que las 50 sentencias de la versión 8 se aplicaron.
+2. `rollback` ejecuta los **50 reversos** contra una BD que solo tiene 10 cambios físicos.
+3. Los 40 reversos de lo que nunca corrió fallan (`doesn't exist`) y el rollback muere a
+   mitad, dejando un **tercer** estado inconsistente.
+4. Encima, `force=true` descarta el checkpoint — la única prueba de dónde había quedado.
+
+Las vías correctas, en orden: `on_failure=auto` (automático), `reconcile-partial`
+(explícito), o reintentar `apply` (retoma desde el checkpoint). `stamp --force` es solo para
+"ya reconcilié el estado físico a mano"; su 409 lo explica.
+
+## Traducción MySQL → PostgreSQL: lo que sqlglot dejaba roto
+
+Una migración sin `up_sql_postgresql` se auto-traduce con sqlglot. Transpila bien
+expresiones y tipos, pero emitía **verbatim** varias formas de DDL de MySQL:
+
+| Entrada (MySQL) | Salía | Debe ser |
+|---|---|---|
+| `DROP INDEX i ON t` | `DROP INDEX "i" ON "t"` ❌ | `DROP INDEX "i"` |
+| `ALTER TABLE t DROP FOREIGN KEY f` | `… DROP FOREIGN KEY "f"` ❌ | `… DROP CONSTRAINT "f"` |
+| `ALTER TABLE t DROP INDEX u` | `… DROP INDEX "u"` ❌ | `… DROP CONSTRAINT "u"` |
+| `ALTER TABLE t DROP CHECK c` | ``… DROP CHECK `c` `` ❌ (¡backticks!) | `… DROP CONSTRAINT "c"` |
+
+Las cuatro tienen reescritura exacta y ahora se aplican **por sentencia y con contexto**
+(aplicarlas al script completo hacía que la segunda pisara el resultado de la primera).
+
+`MODIFY COLUMN`, `CHANGE COLUMN`, `DROP PRIMARY KEY`, `ENGINE=` y `AUTO_INCREMENT=` **no**
+tienen traducción exacta (la primera hay que partirla semánticamente; la tercera necesita el
+nombre del constraint, que en PostgreSQL es convencionalmente `<tabla>_pkey` pero no está
+garantizado). Antes se emitían roto; ahora `apply` responde **422** antes de tocar el motor
+pidiendo un `up_sql_postgresql` explícito. Devolver `None` no alcanzaba como defensa:
+`select_up_sql` caía al `up_sql` base, en dialecto MySQL crudo, igual de inválido.
+
+**Rendimiento**: el transpilado está memoizado (`lru_cache`, 256 entradas) — el `up_sql` de
+una versión es inmutable, así que cachear por (sql, dialectos) es seguro. Medido: 80 ms la
+primera vez, 0,02 ms las siguientes. El guard usa además un pre-filtro por regex sobre el
+SQL crudo, así que solo paga el transpilado si hay algo sospechoso.
+
 ## Aplicación parcial: el rollback ya no opera a ciegas
 
 ### El problema
