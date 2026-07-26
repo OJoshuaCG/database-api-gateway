@@ -24,6 +24,7 @@ from app.schemas.managed_database import (
 from app.schemas.model_migration import (
     MigrationApplyOut,
     MigrationHistoryOut,
+    MigrationReconcilePartialOut,
     MigrationRollbackOut,
     MigrationStatusOut,
 )
@@ -228,6 +229,78 @@ def _rollback_message(result: dict) -> str:
             "Revisa la cuarentena."
         )
     return f"Revertidas {n} migración(es): {frm} → {to or 'base'}."
+
+
+@router.post(
+    "/{db_id}/migrations/reconcile-partial",
+    response_model=ApiResponse[MigrationReconcilePartialOut],
+)
+@limiter.limit("10/minute")
+def reconcile_partial_migration(
+    request: Request,
+    admin: AdminDep,
+    db_id: int,
+    confirm_version: str = Query(
+        ...,
+        pattern=r"^\d{4,10}$",
+        description=(
+            "Confirmación obligatoria: repetir la versión PARCIALMENTE aplicada (la que "
+            "informa 'partial_application' en /migrations/status)."
+        ),
+    ),
+    dry_run: bool = Query(
+        False,
+        description=(
+            "Devuelve los reversos EXACTOS que se ejecutarían, sin tocar el motor. "
+            "Recomendado antes de reconciliar."
+        ),
+    ),
+    force: bool = Query(
+        False,
+        description=(
+            "Procede aunque alguna sentencia ya aplicada no tenga reverso: la saltea y la "
+            "reporta (409 sin esto). Esos cambios quedan en la BD y hay que resolverlos a "
+            "mano."
+        ),
+    ),
+):
+    """
+    Deshace las sentencias que SÍ se aplicaron de una migración que falló a mitad.
+
+    Cuando un ``apply`` muere en la sentencia k de N, Alembic nunca registró la versión
+    (el stamp va al final del ``upgrade()``), así que la BD queda con k sentencias
+    aplicadas mientras el ledger sigue en la versión anterior. Este endpoint ejecuta el
+    reverso EXACTO de esas k sentencias, en orden inverso, hasta que el plano físico
+    vuelve a coincidir con el ledger. NO toca la tabla de versión: la versión parcial
+    nunca existió para Alembic.
+
+    Requiere que la versión tenga MANIFIESTO de sentencias (lo tienen las versiones
+    generadas por adopción de un diff estructural). Sin él, el emparejamiento
+    sentencia↔reverso es inferible y se responde 409 con el motivo.
+    """
+    result = ManagedMigrationController().reconcile_partial(
+        db_id,
+        confirm_version=confirm_version,
+        dry_run=dry_run,
+        force=force,
+        admin=admin,
+    )
+    if result.get("dry_run"):
+        msg = (
+            f"Dry-run: se desharían {result['statements_to_undo']} sentencia(s) de la "
+            f"aplicación parcial de {result['version']}."
+        )
+    elif result.get("fully_reconciled"):
+        msg = (
+            f"Estado reconciliado: deshechas {result['undone_count']} sentencia(s). "
+            "La BD volvió a coincidir con su versión registrada."
+        )
+    else:
+        msg = (
+            f"Reconciliación incompleta: deshechas {result['undone_count']}, quedan "
+            f"{result['remaining_applied_statements']} sentencia(s) aplicadas. Revisa el error."
+        )
+    return success(data=result, message=msg)
 
 
 @router.post("/{db_id}/migrations/stamp", response_model=ApiResponse[MigrationStatusOut])

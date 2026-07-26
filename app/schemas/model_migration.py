@@ -107,6 +107,28 @@ class ModelMigrationOut(BaseModel):
     updated_at: datetime
 
 
+class PartialApplicationOut(BaseModel):
+    """Una migración que quedó APLICADA A MEDIAS en esta BD."""
+
+    version: str | None = None
+    model_migration_id: int
+    applied_statements: int = Field(
+        0, description="Sentencias que ya commitearon con éxito (el DDL va en AUTOCOMMIT)."
+    )
+    total_statements: int = Field(0, description="Sentencias totales de la migración.")
+    reconcilable: bool = Field(
+        False,
+        description=(
+            "True si el gateway puede deshacer automáticamente lo aplicado "
+            "(POST /migrations/reconcile-partial). Requiere manifiesto de sentencias."
+        ),
+    )
+    reason: str | None = Field(
+        None, description="Por qué NO es reconciliable automáticamente, si aplica."
+    )
+    statements_to_undo: int = Field(0, description="Reversos que se ejecutarían.")
+
+
 class MigrationStatusOut(BaseModel):
     """Estado de una BD gestionada frente a las migraciones de su blueprint."""
 
@@ -117,6 +139,67 @@ class MigrationStatusOut(BaseModel):
     latest_available: str | None = None
     pending_count: int
     pending_versions: list[str]
+    has_partial_application: bool = Field(
+        False,
+        description=(
+            "True si alguna migración quedó aplicada a medias. OJO: 'current_version' NO "
+            "lo refleja — Alembic solo registra la versión cuando el upgrade TERMINA, así "
+            "que el estado se lee como sano aunque la BD tenga cambios físicos de una "
+            "versión que el ledger no conoce. Con esto en true, 'rollback' responde 409."
+        ),
+    )
+    partial_application: list[PartialApplicationOut] = Field(default_factory=list)
+
+
+class MigrationReconcileStatementOut(BaseModel):
+    seq: int
+    status: str | None = None  # applied | failed (ausente en dry_run)
+    sql: str | None = None  # solo en dry_run
+    error: str | None = None
+    execution_ms: int | None = None
+
+
+class MigrationReconcilePartialOut(BaseModel):
+    """
+    Resultado de reconciliar una aplicación PARCIAL: deshacer las sentencias que sí
+    corrieron de una migración que falló a mitad.
+
+    NO toca la tabla de versión de Alembic: la versión parcial nunca se registró, así que
+    esto no es un ``downgrade`` sino una compensación que devuelve el plano físico al
+    estado que el ledger ya afirma.
+    """
+
+    managed_database_id: int
+    database_name: str
+    server_id: int
+    version: str
+    applied_statements: int
+    total_statements: int
+    statements_to_undo: int
+    unreversible_statements: list[dict] = Field(
+        default_factory=list,
+        description="Sentencias aplicadas SIN reverso: quedan en la BD (solo con force=true).",
+    )
+    unconfirmed_reverses: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "Reversos que existen pero NO son demostrablemente seguros: pueden fallar (una "
+            "UNIQUE/CHECK/FK que se re-crea valida los datos actuales) o no restaurar los "
+            "datos (recrear una tabla borrada devuelve la estructura, no las filas). "
+            "Revisalos en el dry-run: no bloquean, son el mejor reverso disponible."
+        ),
+    )
+    dry_run: bool = False
+    undone_count: int = 0
+    failed: bool = False
+    fully_reconciled: bool = Field(
+        False, description="True si la BD volvió a coincidir con su versión registrada."
+    )
+    remaining_applied_statements: int = Field(
+        0, description="Sentencias que siguen aplicadas si la reconciliación no terminó."
+    )
+    statements: list[MigrationReconcileStatementOut] = Field(default_factory=list)
+    results: list[MigrationReconcileStatementOut] = Field(default_factory=list)
 
 
 class MigrationResultOut(BaseModel):

@@ -26,14 +26,17 @@ from app.models.database_model import DatabaseModel
 from app.models.enums import EngineType, MigrationStatus, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
+from app.models.model_migration_statement import ModelMigrationStatement
 from app.services import audit
 from app.services.db_admin import migration_progress
 from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
 from app.services.db_admin.migrations import (
+    ManifestStatement,
     MigrationResult,
     MigrationRunner,
     MigrationSpec,
 )
+from app.services.db_admin.sql_dialect import split_sql_statements
 
 logger = get_logger(__name__)
 
@@ -81,6 +84,20 @@ class ManagedMigrationController:
             .filter(ModelMigration.model_id == model_id)
             .all()
         )
+        # MANIFIESTO de sentencias por migración (una sola consulta para todas). Es
+        # OPCIONAL: las migraciones escritas a mano no lo tienen y siguen funcionando por
+        # el camino del splitter.
+        manifests: dict[int, list[ModelMigrationStatement]] = {}
+        if rows:
+            for st in (
+                session.query(ModelMigrationStatement)
+                .filter(
+                    ModelMigrationStatement.model_migration_id.in_([r.id for r in rows])
+                )
+                .order_by(ModelMigrationStatement.seq.asc())
+                .all()
+            ):
+                manifests.setdefault(st.model_migration_id, []).append(st)
         specs = [
             MigrationSpec(
                 id=r.id,
@@ -93,6 +110,19 @@ class ManagedMigrationController:
                 checksum=r.checksum,
                 kind=r.kind,
                 has_non_portable=r.has_non_portable,
+                source_engine=r.source_engine,
+                manifest=tuple(
+                    ManifestStatement(
+                        seq=st.seq,
+                        up_sql=st.up_sql,
+                        down_sql=st.down_sql,
+                        down_confirmed=st.down_confirmed,
+                        object_type=st.object_type,
+                        object_name=st.object_name,
+                        destructive=st.destructive,
+                    )
+                    for st in manifests.get(r.id, [])
+                ),
             )
             for r in rows
         ]
@@ -127,6 +157,7 @@ class ManagedMigrationController:
             specs = self._load_specs(session, model.id)
             slug = model.slug
             db_name, model_id = md.name, model.id
+            engine = EngineType(engine_value(server))
             target = build_target(server)
         finally:
             session.close()
@@ -134,6 +165,11 @@ class ManagedMigrationController:
         current = self.runner.get_current_version(target, db_name, slug)
         latest = specs[-1].version if specs else None
         pending = self.runner.compute_pending(current, specs)
+        # Aplicación PARCIAL pendiente: ``current_version`` NO la refleja (Alembic no
+        # alcanzó a registrarla), así que sin este campo el estado se lee como sano y el
+        # admin descubre el problema recién cuando el rollback se niega.
+        incomplete = migration_progress.incomplete_progress_for_database(db_id, direction="up")
+        by_id = {s.id: s for s in specs}
         return {
             "managed_database_id": db_id,
             "model_id": model_id,
@@ -142,6 +178,38 @@ class ManagedMigrationController:
             "latest_available": latest,
             "pending_count": len(pending),
             "pending_versions": [s.version for s in pending],
+            "has_partial_application": bool(incomplete),
+            "partial_application": [
+                self._partial_entry(by_id.get(row["model_migration_id"]), engine, row)
+                for row in incomplete
+            ],
+        }
+
+    @classmethod
+    def _partial_entry(cls, spec: MigrationSpec | None, engine: EngineType, row: dict) -> dict:
+        """
+        Una entrada de ``partial_application``, ya resuelta con si se puede reconciliar.
+
+        El frontend necesita saberlo ANTES de ofrecer el botón: sin manifiesto de
+        sentencias la reconciliación automática no es posible y la salida es
+        ``stamp?force=true`` tras reconciliar a mano.
+        """
+        plan = cls._reconcile_plan(spec, engine, row) if spec is not None else None
+        return {
+            "version": spec.version if spec is not None else None,
+            "model_migration_id": row["model_migration_id"],
+            "applied_statements": row["last_statement_index"],
+            "total_statements": row["total_statements"],
+            "reconcilable": bool(plan and plan["reconcilable"]),
+            "reason": (
+                None
+                if plan and plan["reconcilable"]
+                else (
+                    plan["reason"] if plan
+                    else "la migración ya no existe en el blueprint"
+                )
+            ),
+            "statements_to_undo": plan["count"] if plan else 0,
         }
 
     # ------------------------------------------------------------------ #
@@ -394,6 +462,11 @@ class ManagedMigrationController:
         finally:
             session.close()
 
+        # ROB2 — una aplicación PARCIAL bloquea el rollback. Ver el docstring del guard:
+        # revertir N-1 mientras la BD tiene media versión N aplicada es el escenario de
+        # corrupción que este módulo existe para evitar.
+        self._guard_partial_before_rollback(db_id, specs)
+
         current = self.runner.get_current_version(target, db_name, slug)
         if current is None:
             raise AppHttpException(
@@ -554,6 +627,49 @@ class ManagedMigrationController:
         return self.status(db_id)
 
     @staticmethod
+    def _guard_partial_before_rollback(db_id: int, specs: list[MigrationSpec]) -> None:
+        """
+        ROB2: bloquea (409) el ``rollback`` mientras haya una aplicación PARCIAL pendiente.
+
+        Es el agujero más grave que tenía el flujo de rollback. Cuando el ``apply`` de la
+        versión N falla a mitad, Alembic NO alcanzó a escribir N en ``_gw_v_{slug}`` (el
+        stamp va al final del ``upgrade()``), así que el ledger sigue en N-1 mientras la BD
+        tiene, físicamente, las primeras sentencias de N ya commiteadas (AUTOCOMMIT: el DDL
+        de MySQL/MariaDB no es transaccional).
+
+        En ese estado, ``rollback`` NO veía nada raro: leía "current = N-1" y se ponía a
+        ejecutar el ``down_sql`` de N-1 contra una BD contaminada con parte de N. O falla a
+        mitad —dejando un tercer estado inconsistente— o "funciona" por casualidad y deja
+        objetos huérfanos de N que el gateway ya no sabe que existen.
+
+        La salida no es forzar: es RECONCILIAR primero (``/migrations/reconcile-partial``,
+        que deshace exactamente las sentencias que sí se aplicaron) o reintentar el
+        ``apply`` para completar N. Recién entonces el rollback opera sobre un estado
+        conocido.
+        """
+        incomplete = migration_progress.incomplete_progress_for_database(db_id, direction="up")
+        if not incomplete:
+            return
+        by_id = {s.id: s.version for s in specs}
+        detail = ", ".join(
+            f"versión {by_id.get(row['model_migration_id'], row['model_migration_id'])} "
+            f"({row['last_statement_index']}/{row['total_statements']} sentencias)"
+            for row in incomplete
+        )
+        raise AppHttpException(
+            message=(
+                f"No se puede revertir: hay una aplicación PARCIAL sin resolver ({detail}). "
+                "La versión no quedó registrada en la BD, así que el rollback operaría "
+                "sobre un estado desconocido. Primero: reintente 'apply' para completarla, "
+                "o use 'migrations/reconcile-partial' para deshacer exactamente lo que sí "
+                "se aplicó."
+            ),
+            status_code=409,
+            context={"managed_database_id": db_id, "incomplete_progress": incomplete},
+            public_context={"incomplete_progress": incomplete},
+        )
+
+    @staticmethod
     def _guard_partial_checkpoint(db_id: int, force: bool) -> None:
         """
         ``stamp`` afirma "esta BD está en la versión X" SIN ejecutar SQL. Si hay una
@@ -585,6 +701,257 @@ class ManagedMigrationController:
                 status_code=409,
                 context={"managed_database_id": db_id, "incomplete_progress": incomplete},
             )
+
+    # ------------------------------------------------------------------ #
+    # Reconciliación de una aplicación PARCIAL                            #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _reconcile_plan(spec: MigrationSpec, engine: EngineType, progress_row: dict) -> dict:
+        """
+        Plan de reconciliación de UNA migración parcial: qué reversos hay que ejecutar.
+
+        Requiere el MANIFIESTO (``model_migration_statements``): con solo los blobs
+        ``up_sql``/``down_sql`` es imposible saber qué reverso corresponde a la sentencia
+        ``k`` — el ``down_sql`` es una secuencia INDEPENDIENTE, con otra cantidad de
+        sentencias (los cambios sin reverso simplemente no aparecen). Sin manifiesto se
+        devuelve ``reconcilable=False`` con el motivo, en vez de adivinar.
+        """
+        runner = MigrationRunner()
+        manifest = runner.usable_manifest(spec, engine)
+        applied = int(progress_row["last_statement_index"])
+        total = int(progress_row["total_statements"])
+        if not manifest:
+            return {
+                "reconcilable": False,
+                "reason": (
+                    "esta versión no tiene manifiesto de sentencias para el motor destino "
+                    "(migración escrita a mano o SQL editado): no se puede saber qué "
+                    "reverso corresponde a cada sentencia aplicada"
+                ),
+                "count": 0, "unreversible": [], "inverses": [],
+            }
+        if len(manifest) != total:
+            return {
+                "reconcilable": False,
+                "reason": (
+                    f"el checkpoint habla de {total} sentencias y el manifiesto tiene "
+                    f"{len(manifest)}: no coinciden, no se reconcilia a ciegas"
+                ),
+                "count": 0, "unreversible": [], "inverses": [],
+            }
+        # Sentencias efectivamente aplicadas (1..applied), en orden INVERSO.
+        pending = [m for m in manifest if m.seq <= applied]
+        pending.sort(key=lambda m: m.seq, reverse=True)
+        unreversible = [
+            {"seq": m.seq, "object_type": m.object_type, "object_name": m.object_name}
+            for m in pending if not m.down_sql
+        ]
+        # Reversos que NO son demostrablemente seguros: existen, pero pueden fallar (una
+        # UNIQUE/CHECK/FK que se re-crea VALIDA los datos actuales) o no restaurar los datos
+        # (recrear una tabla borrada devuelve la estructura, no las filas). No bloquean —
+        # son el mejor reverso disponible — pero el admin tiene que verlos en el dry-run.
+        unconfirmed = [
+            {
+                "seq": m.seq,
+                "object_type": m.object_type,
+                "object_name": m.object_name,
+                "destructive": m.destructive,
+            }
+            for m in pending if m.down_sql and not m.down_confirmed
+        ]
+        inverses: list[tuple[int, str]] = []
+        for m in pending:
+            if not m.down_sql:
+                continue
+            # Un reverso puede ser multi-sentencia (DROP nuevo; CREATE viejo): se parte,
+            # porque cada exec_driver_sql admite una sola sentencia.
+            for sql in split_sql_statements(m.down_sql):
+                inverses.append((m.seq, sql))
+        return {
+            "reconcilable": not unreversible,
+            "reason": None,
+            "count": len(inverses),
+            "unreversible": unreversible,
+            "unconfirmed": unconfirmed,
+            "inverses": inverses,
+        }
+
+    def reconcile_partial(
+        self,
+        db_id: int,
+        *,
+        confirm_version: str,
+        dry_run: bool = False,
+        force: bool = False,
+        admin: dict | None = None,
+    ) -> dict:
+        """
+        Deshace las sentencias que SÍ se aplicaron de una migración que falló a mitad.
+
+        Deja la BD igual a lo que el ledger de Alembic ya afirma (la versión parcial nunca
+        se registró), así que NO toca la tabla de versión: es una compensación, no un
+        ``downgrade``. Después de esto la BD queda en un estado conocido y el ``rollback``
+        normal vuelve a estar disponible.
+
+        Doble intención: ``confirm_version`` debe ser la versión parcialmente aplicada (el
+        admin tiene que haber mirado el estado antes). ``force=true`` procede aunque haya
+        sentencias SIN reverso — las saltea y las reporta: sin eso, una sola sentencia
+        irreversible dejaría al admin sin salida automática.
+        """
+        session = self._session()
+        try:
+            md, server, model = self._load_context(session, db_id)
+            specs = self._load_specs(session, model.id)
+            self._verify_integrity(specs)  # se va a ejecutar DDL destructivo
+            engine = EngineType(engine_value(server))
+            db_name, server_id = md.name, md.server_id
+            target = build_target(server)
+        finally:
+            session.close()
+
+        incomplete = migration_progress.incomplete_progress_for_database(db_id, direction="up")
+        if not incomplete:
+            raise AppHttpException(
+                message="Esta BD no tiene ninguna aplicación parcial que reconciliar.",
+                status_code=409,
+                context={"managed_database_id": db_id},
+            )
+        by_id = {s.id: s for s in specs}
+        # La versión MÁS ALTA primero: es la última que se intentó aplicar.
+        rows = sorted(
+            incomplete,
+            key=lambda r: version_sort_key(
+                by_id[r["model_migration_id"]].version
+                if r["model_migration_id"] in by_id else "0"
+            ),
+            reverse=True,
+        )
+        row = rows[0]
+        spec = by_id.get(row["model_migration_id"])
+        if spec is None:
+            raise AppHttpException(
+                message=(
+                    "La migración parcialmente aplicada ya no existe en el blueprint: no "
+                    "hay reversos que ejecutar. Reconcilie el estado a mano y use "
+                    "'stamp?force=true'."
+                ),
+                status_code=409,
+                context={"model_migration_id": row["model_migration_id"]},
+            )
+        if confirm_version != spec.version:
+            raise AppHttpException(
+                message=(
+                    "Confirmación requerida: 'confirm_version' debe coincidir con la "
+                    f"versión parcialmente aplicada ({spec.version})."
+                ),
+                status_code=422,
+                context={
+                    "managed_database_id": db_id,
+                    "partial_version": spec.version,
+                    "required": "confirm_version == partial_version",
+                },
+            )
+
+        plan = self._reconcile_plan(spec, engine, row)
+        if not plan["inverses"] and not plan["reconcilable"]:
+            raise AppHttpException(
+                message=f"No se puede reconciliar automáticamente: {plan['reason']}.",
+                status_code=409,
+                context={"managed_database_id": db_id, "version": spec.version},
+                public_context={"reason": plan["reason"]},
+            )
+        if plan["unreversible"] and not force:
+            raise AppHttpException(
+                message=(
+                    f"{len(plan['unreversible'])} de las sentencias ya aplicadas no tienen "
+                    "reverso: reconciliar dejaría esos cambios en la BD. Revíselos y "
+                    "reintente con force=true para deshacer el resto, o reconcilie a mano."
+                ),
+                status_code=409,
+                context={"managed_database_id": db_id, "version": spec.version},
+                public_context={"unreversible_statements": plan["unreversible"]},
+            )
+
+        base = {
+            "managed_database_id": db_id,
+            "database_name": db_name,
+            "server_id": server_id,
+            "version": spec.version,
+            "applied_statements": row["last_statement_index"],
+            "total_statements": row["total_statements"],
+            "statements_to_undo": len(plan["inverses"]),
+            "unreversible_statements": plan["unreversible"],
+            "unconfirmed_reverses": plan["unconfirmed"],
+        }
+        if dry_run:
+            return {
+                **base,
+                "dry_run": True,
+                "statements": [{"seq": seq, "sql": sql} for seq, sql in plan["inverses"]],
+            }
+
+        # Auditoría fail-closed ANTES de tocar el motor.
+        audit.record_intent(
+            "migration.reconcile_partial",
+            admin=admin,
+            target_type="managed_database",
+            target_id=db_id,
+            server_id=server_id,
+            detail=(
+                f"reconciliar aplicación parcial de {spec.version}: deshacer "
+                f"{len(plan['inverses'])} sentencia(s) de las "
+                f"{row['last_statement_index']} aplicadas"
+            ),
+        )
+        results = self.runner.reconcile_partial(
+            target,
+            db_name=db_name,
+            engine=engine,
+            managed_db_id=db_id,
+            spec=spec,
+            inverses=plan["inverses"],
+            total_statements=row["total_statements"],
+        )
+        failed = any(r.status == "failed" for r in results)
+        remaining = migration_progress.get_progress(db_id, spec.id, "up")
+        fully_reconciled = not failed and remaining is None
+        if fully_reconciled:
+            # El plano físico volvió a coincidir con el ledger: la BD sale de cuarentena.
+            self._set_quarantine(db_id, failed=False, results=[])
+        audit.record(
+            "migration.reconcile_partial",
+            status="error" if failed else "success",
+            admin=admin,
+            target_type="managed_database",
+            target_id=db_id,
+            server_id=server_id,
+            touched_engine=True,
+            detail=(
+                f"{sum(1 for r in results if r.status == 'applied')}/"
+                f"{len(plan['inverses'])} reverso(s) ejecutado(s) de {spec.version}"
+                + (" (con fallo)" if failed else "")
+                + (" — estado reconciliado" if fully_reconciled else "")
+            ),
+        )
+        return {
+            **base,
+            "dry_run": False,
+            "undone_count": sum(1 for r in results if r.status == "applied"),
+            "failed": failed,
+            "fully_reconciled": fully_reconciled,
+            "remaining_applied_statements": (
+                remaining.last_statement_index if remaining else 0
+            ),
+            "results": [
+                {
+                    "seq": r.index,
+                    "status": r.status,
+                    "error": r.error,
+                    "execution_ms": r.execution_ms,
+                }
+                for r in results
+            ],
+        }
 
     def apply_all(
         self,
