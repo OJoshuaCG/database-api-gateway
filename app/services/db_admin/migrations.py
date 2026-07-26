@@ -25,6 +25,7 @@ Diseño:
 
 from __future__ import annotations
 
+import re
 import tempfile
 import threading
 import time
@@ -210,6 +211,60 @@ class MigrationRunner:
     # manifiesto: exacto y SIN pasar por el splitter.
     _MANIFEST_JOIN = ";\n"
 
+    # Sentencias que PostgreSQL NO admite dentro de un bloque de transacción. Si alguna
+    # aparece, el modo transaccional se desactiva para TODA la operación (fail-safe): es
+    # mejor caer al comportamiento histórico (AUTOCOMMIT + checkpoint) que abortar con
+    # "cannot run inside a transaction block".
+    #
+    # ``ALTER TYPE … ADD VALUE`` se incluye a propósito aunque PostgreSQL 12+ lo permita
+    # en una transacción: el valor nuevo NO se puede USAR en la misma transacción, así que
+    # una migración que lo agrega y luego lo referencia fallaría. Conservador por diseño.
+    _PG_NON_TRANSACTIONAL_RE = re.compile(
+        r"\b(?:"
+        r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY"
+        r"|DROP\s+INDEX\s+CONCURRENTLY"
+        r"|REINDEX\s+\w+\s+CONCURRENTLY"
+        r"|VACUUM"
+        r"|CREATE\s+DATABASE|DROP\s+DATABASE"
+        r"|ALTER\s+SYSTEM"
+        r"|CREATE\s+TABLESPACE|DROP\s+TABLESPACE"
+        r"|ALTER\s+TYPE\s+[^;]*?\bADD\s+VALUE"
+        r")\b",
+        re.IGNORECASE,
+    )
+
+    def use_transactional_ddl(
+        self, engine: EngineType, specs: list[MigrationSpec]
+    ) -> bool:
+        """
+        ¿Se puede aplicar cada migración dentro de UNA transacción (atómica)?
+
+        **Solo PostgreSQL.** Es la diferencia de motor más importante de todo este módulo:
+        PostgreSQL ejecuta DDL transaccional, así que una migración de 50 sentencias que
+        falla en la 10 **se deshace sola** — no queda estado parcial, el ledger y el plano
+        físico nunca divergen, y el ``rollback`` posterior opera sobre un estado conocido.
+        MySQL/MariaDB hacen COMMIT IMPLÍCITO en cada DDL: ahí la atomicidad es imposible y
+        el checkpoint por sentencia (con su reconciliación) es la única defensa.
+
+        Se desactiva si CUALQUIER migración del blueprint contiene una sentencia que
+        PostgreSQL no admite en una transacción (``CREATE INDEX CONCURRENTLY``, ``VACUUM``,
+        ``ALTER TYPE … ADD VALUE``, …). Es conservador: se evalúan TODAS las migraciones,
+        no solo las pendientes, porque la decisión se toma antes de saber cuáles se van a
+        aplicar. Se registra en el log qué versión lo desactivó para que no sea un misterio.
+        """
+        if engine != EngineType.postgresql:
+            return False
+        for spec in specs:
+            for sql in (self.select_up_sql(spec, engine), self.select_down_sql(spec, engine)):
+                if sql and self._PG_NON_TRANSACTIONAL_RE.search(sql):
+                    logger.info(
+                        "DDL transaccional desactivado: la migración %s tiene una sentencia "
+                        "que PostgreSQL no admite dentro de una transacción.",
+                        spec.version,
+                    )
+                    return False
+        return True
+
     def usable_manifest(
         self, spec: MigrationSpec, engine: EngineType
     ) -> tuple[ManifestStatement, ...]:
@@ -283,6 +338,8 @@ class MigrationRunner:
         specs: list[MigrationSpec],
         engine: EngineType,
         managed_db_id: int,
+        *,
+        transactional: bool = False,
     ) -> None:
         """
         Escribe un .py de Alembic por migración, con el SQL ya por motor.
@@ -293,6 +350,14 @@ class MigrationRunner:
         re-ejecutar lo que ya commiteó (DDL en AUTOCOMMIT). Ver
         ``migration_progress.is_resumable`` para qué migraciones son elegibles
         (fail-closed: cualquier duda, todo-o-nada, igual que hoy).
+
+        ``transactional=True`` (PostgreSQL) **desactiva el checkpoint por completo**, y no
+        es una optimización: es CORRECCIÓN. El checkpoint se graba en la BD del gateway,
+        que es otra conexión con su propio commit; si la transacción de la migración se
+        deshace en el motor destino, el checkpoint quedaría afirmando "10 sentencias
+        aplicadas" cuando en realidad no quedó ninguna. Un resume posterior arrancaría en
+        la 11 sobre una BD virgen. Con DDL transaccional no hay estado parcial que
+        rastrear, así que no hay nada que grabar.
         """
         prev: str | None = None
         # Orden NUMÉRICO (no lexicográfico): "9999" < "10000" debe respetarse.
@@ -304,13 +369,17 @@ class MigrationRunner:
             down = self.select_down_sql(spec, engine)
             up_statements, down_statements, pinned = self.statement_lists(spec, engine)
 
-            up_resumable = migration_progress.is_resumable(
+            up_resumable = not transactional and migration_progress.is_resumable(
                 up, up_statements, kind=spec.kind, has_non_portable=spec.has_non_portable,
                 manifest_pinned=pinned,
             )
-            down_resumable = bool(down_statements) and migration_progress.is_resumable(
-                down or "", down_statements, kind=spec.kind,
-                has_non_portable=spec.has_non_portable, manifest_pinned=pinned,
+            down_resumable = (
+                not transactional
+                and bool(down_statements)
+                and migration_progress.is_resumable(
+                    down or "", down_statements, kind=spec.kind,
+                    has_non_portable=spec.has_non_portable, manifest_pinned=pinned,
+                )
             )
             up_resume_from = self._resolve_resume_offset(
                 managed_db_id, spec, "up", up_resumable, len(up_statements)
@@ -588,30 +657,49 @@ class MigrationRunner:
     ):
         """
         Context manager que centraliza el preámbulo de toda operación del runner:
-        genera los archivos de revisión en un tempdir, abre la conexión a la BD destino
-        en AUTOCOMMIT, adquiere el advisory lock por BD y arma la ``Config``. Cede
+        genera los archivos de revisión en un tempdir, abre la conexión a la BD destino,
+        adquiere el advisory lock por BD y arma la ``Config``. Cede
         ``(conn, cfg, version_table)`` y, al salir, libera el lock y limpia el tempdir.
 
-        AUTOCOMMIT: cada sentencia (DDL, escritura de la tabla de versión, advisory
-        lock) commitea al instante en MySQL y PostgreSQL — evita que el SELECT del lock
-        abra una transacción que Alembic no commitea y se perdería al cerrar.
+        **Dos modos según el motor** (ver ``use_transactional_ddl``):
+
+        - **PostgreSQL — TRANSACCIONAL.** El DDL es transaccional, así que cada migración
+          corre dentro de su propia transacción (``transaction_per_migration=True`` en el
+          ``env.py`` compartido) junto con la escritura de la tabla de versión: si falla en
+          la sentencia 10 de 50, PostgreSQL **deshace las 10** y el ledger nunca divergió
+          del plano físico. Aquí el advisory lock vive en su **propia sesión** (otra
+          conexión): así la transacción de la migración queda limpia y un ROLLBACK no lo
+          afecta — los advisory locks de SESIÓN de PostgreSQL sobreviven a COMMIT y a
+          ROLLBACK (los de transacción son ``pg_advisory_xact_lock``, que NO se usan).
+        - **MySQL/MariaDB — AUTOCOMMIT.** El DDL hace COMMIT IMPLÍCITO: la atomicidad es
+          imposible, así que se mantiene el comportamiento histórico (lock en la misma
+          conexión) y la defensa es el checkpoint por sentencia + la reconciliación.
 
         Mapea errores de driver a AppHttpException con el ``op`` correspondiente.
         """
         version_table = version_table_name(slug)
+        transactional = self.use_transactional_ddl(engine, specs)
         with tempfile.TemporaryDirectory(prefix="gw_mig_") as tmp:
             versions_dir = Path(tmp) / "versions"
             versions_dir.mkdir()
-            self._write_revision_files(versions_dir, specs, engine, managed_db_id)
+            self._write_revision_files(
+                versions_dir, specs, engine, managed_db_id, transactional=transactional
+            )
             try:
-                with database_connection(target, db_name) as conn:
-                    conn = conn.execution_options(isolation_level="AUTOCOMMIT")
-                    self._acquire_lock(conn, engine, managed_db_id)
-                    try:
-                        cfg = self._make_config(versions_dir, conn, version_table)
-                        yield conn, cfg, version_table
-                    finally:
-                        self._release_lock(conn, engine, managed_db_id)
+                if transactional:
+                    with self.advisory_lock(target, engine=engine, lock_key=managed_db_id):
+                        with database_connection(target, db_name) as conn:
+                            cfg = self._make_config(versions_dir, conn, version_table)
+                            yield conn, cfg, version_table
+                else:
+                    with database_connection(target, db_name) as conn:
+                        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+                        self._acquire_lock(conn, engine, managed_db_id)
+                        try:
+                            cfg = self._make_config(versions_dir, conn, version_table)
+                            yield conn, cfg, version_table
+                        finally:
+                            self._release_lock(conn, engine, managed_db_id)
             except AppHttpException:
                 raise
             except SQLAlchemyError as exc:
@@ -653,8 +741,25 @@ class MigrationRunner:
                 )
                 results.append(result)
                 if result.status == "failed":
+                    self._discard_failed_transaction(conn)
                     break  # no continuar tras un fallo
         return results
+
+    @staticmethod
+    def _discard_failed_transaction(conn) -> None:
+        """
+        Deja la conexión utilizable después de un fallo (modo transaccional).
+
+        Alembic ya revierte su propia transacción al propagar la excepción; esto es una
+        segunda barrera: si quedara una transacción abortada, PostgreSQL rechazaría
+        cualquier sentencia posterior con ``current transaction is aborted`` — incluido el
+        ``pg_advisory_unlock`` de la limpieza. En AUTOCOMMIT es un no-op.
+        """
+        try:
+            if conn.in_transaction():
+                conn.rollback()
+        except SQLAlchemyError:
+            pass  # la conexión se cierra igual al salir de _prepared
 
     def _apply_one(
         self, cfg: Config, spec: MigrationSpec, *, managed_db_id: int, statement_total: int
@@ -774,6 +879,7 @@ class MigrationRunner:
                         resumed=resumed_from is not None, resumed_from_statement=resumed_from,
                         statement_total=down_total, failed_at_statement_index=failed_at,
                     ))
+                    self._discard_failed_transaction(conn)
                     break
                 ms = int((time.monotonic() - t0) * 1000)
                 if spec:
@@ -1094,8 +1200,20 @@ class MigrationRunner:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _read_current(conn, version_table: str) -> str | None:
+        """
+        Lee la versión actual y CIERRA la transacción implícita del SELECT.
+
+        En modo transaccional (PostgreSQL) la conexión no está en AUTOCOMMIT, así que este
+        SELECT abre una transacción por autobegin. Dejarla abierta le impediría a Alembic
+        abrir la suya para la migración —que es justamente lo que da la atomicidad— y en
+        ``rollback_to`` (que relee la versión entre downgrades) mantendría una transacción
+        viva durante todo el bucle. En AUTOCOMMIT el commit es un no-op inofensivo.
+        """
         ctx = MigrationContext.configure(conn, opts={"version_table": version_table})
-        return ctx.get_current_revision()
+        current = ctx.get_current_revision()
+        if conn.in_transaction():
+            conn.commit()
+        return current
 
 
 def _clean_error(exc: Exception) -> str:
