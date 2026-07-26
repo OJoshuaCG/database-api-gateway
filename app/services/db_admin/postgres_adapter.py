@@ -784,19 +784,72 @@ class PostgresAdapter(ServerAdapter):
         )
         return [self._stmt(item, fn_sql), self._stmt(item, drop_trg_sql), self._stmt(item, create_trg_sql)]
 
+    def _on_update_reverse(self, table: str, col) -> list[str]:
+        """Reverso de ``_render_on_update_trigger_statements``: suelta trigger y función.
+
+        Sin esto, revertir la columna/tabla dejaba la función ``gw_ou_*`` huérfana en la
+        BD (el ``DROP TABLE`` arrastra el trigger, pero nunca la función).
+        """
+        if not getattr(col, "on_update", None):
+            return []
+        suffix = hashlib.sha256(f"{table}.{col.name}".encode()).hexdigest()[:16]
+        return [
+            f"DROP TRIGGER IF EXISTS {self._q(f'gw_ou_{suffix}', 'trigger')} "
+            f"ON {self._q(table, 'tabla')}",
+            f"DROP FUNCTION IF EXISTS {self._q(f'gw_ou_{suffix}', 'función')}()",
+        ]
+
+    @staticmethod
+    def _move_reverse_to_last(out: list, extra_reverse_first: list[str]) -> list:
+        """
+        Reubica el ``down_sql`` del grupo en su ÚLTIMA sentencia, precedido por
+        ``extra_reverse_first``.
+
+        Los overrides de PostgreSQL AGREGAN sentencias después de las del renderer base
+        (que ya adjuntó su reverso a lo que entonces era la última). ``_stmts`` garantiza
+        que el reverso viva en la última sentencia del grupo: se restablece ese invariante.
+        """
+        if not out:
+            return out
+        carried = next((s.down_sql for s in out if s.down_sql), None)
+        confirmed = next((s.down_confirmed for s in out if s.down_sql), False)
+        for s in out:
+            s.down_sql, s.down_confirmed = None, False
+        parts = [p for p in [*extra_reverse_first, carried] if p]
+        if parts:
+            out[-1].down_sql = ";\n".join(parts)
+            out[-1].down_confirmed = confirmed and not extra_reverse_first
+        return out
+
     def _ri_table_new(self, item):
         out = super()._ri_table_new(item)
         tbl = item.source_payload
+        extra: list[str] = []
         for col in tbl.columns:
-            out.extend(self._render_on_update_trigger_statements(item, tbl.table, col))
+            stmts = self._render_on_update_trigger_statements(item, tbl.table, col)
+            if stmts:
+                out.extend(stmts)
+                # El DROP TABLE del reverso arrastra el trigger; la función hay que
+                # soltarla DESPUÉS de la tabla (mientras el trigger la use, no se puede).
+                extra.extend(self._on_update_reverse(tbl.table, col)[1:])
+        if not extra:
+            return out
+        carried = next((s.down_sql for s in out if s.down_sql), None)
+        for s in out:
+            s.down_sql, s.down_confirmed = None, False
+        out[-1].down_sql = ";\n".join([p for p in [carried, *extra] if p])
+        out[-1].down_confirmed = False
         return out
 
     def _ri_column_new(self, item):
         out = super()._ri_column_new(item)
-        out.extend(
-            self._render_on_update_trigger_statements(item, item.parent_table, item.source_payload)
+        stmts = self._render_on_update_trigger_statements(
+            item, item.parent_table, item.source_payload
         )
-        return out
+        out.extend(stmts)
+        return self._move_reverse_to_last(
+            out, self._on_update_reverse(item.parent_table, item.source_payload)
+        )
 
     def _render_modify_column(self, table, src_col, tgt_col, changed) -> list[str]:
         # PostgreSQL no redefine en una sentencia: una por atributo que cambió.

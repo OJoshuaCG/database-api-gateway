@@ -620,7 +620,45 @@ class ServerAdapter(ABC):
             risk=item.risk,
             down_sql=down_sql,
             down_confirmed=down_confirmed,
+            op_group=item.op_key(),
+            depends_on=list(item.depends_on),
         )
+
+    def _stmts(
+        self,
+        item: DiffItem,
+        forward: list[str],
+        reverse: list[str] | None = None,
+        *,
+        down_confirmed: bool = False,
+    ) -> list[RenderedStatement]:
+        """
+        Renderiza un ítem que produce VARIAS sentencias, con su reverso COMPLETO.
+
+        El reverso se adjunta a la ÚLTIMA sentencia del grupo (las demás quedan con
+        ``down_sql=None``) porque el ``down_sql`` de una versión se ensambla recorriendo
+        las sentencias en ORDEN INVERSO: así el reverso del ítem se ejecuta UNA sola vez,
+        completo y en el lugar correcto respecto de los otros ítems.
+
+        Esto corrige un fallo real de rollback: un índice/UNIQUE/CHECK/FK REDEFINIDO se
+        renderiza como ``DROP viejo`` + ``CREATE nuevo``, y antes solo la segunda
+        sentencia llevaba reverso (``CREATE viejo``) — sin borrar primero el nuevo. Al
+        revertir, el objeto nuevo seguía existiendo con el MISMO nombre (el emparejamiento
+        ``pair_by_name`` de ``_diff_collection`` es justamente por nombre) y el motor
+        respondía ``(1061, "Duplicate key name")`` / ``42P07 relation already exists``.
+        El reverso correcto del par es ``DROP nuevo`` + ``CREATE viejo``.
+        """
+        if not forward:
+            return []
+        out = [self._stmt(item, s) for s in forward[:-1]]
+        rev_sql = ";\n".join(s for s in (reverse or []) if s) or None
+        out.append(
+            self._stmt(
+                item, forward[-1], down_sql=rev_sql,
+                down_confirmed=bool(rev_sql) and down_confirmed,
+            )
+        )
+        return out
 
     def _render_item(self, item: DiffItem) -> list[RenderedStatement]:
         ot, ct = item.object_type, item.change_type
@@ -681,7 +719,14 @@ class ServerAdapter(ABC):
                            down_confirmed=True)]
 
     def _ri_table_dropped(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, f"DROP TABLE {self._q(item.object_name, 'tabla')}")]
+        tbl = item.target_payload
+        # Reverso SUGERIDO: recrea la ESTRUCTURA. Los datos ya se perdieron -> nunca
+        # confirmado (un rollback deja la tabla vacía, no como estaba).
+        reverse = [self._render_create_table(tbl)] if tbl is not None else []
+        return self._stmts(
+            item, [f"DROP TABLE {self._q(item.object_name, 'tabla')}"], reverse,
+            down_confirmed=False,
+        )
 
     def _ri_column_new(self, item: DiffItem) -> list[RenderedStatement]:
         table, col = item.parent_table, item.source_payload
@@ -704,13 +749,19 @@ class ServerAdapter(ABC):
 
     def _ri_fk_modified(self, item: DiffItem) -> list[RenderedStatement]:
         table = item.parent_table
-        drop = self._render_drop_fk(table, item.target_payload)
-        add = self._render_add_fk(table, item.source_payload)
-        return [
-            self._stmt(item, drop),
-            self._stmt(item, add,
-                       down_sql=self._render_add_fk(table, item.target_payload)),
-        ]
+        return self._stmts(
+            item,
+            [
+                self._render_drop_fk(table, item.target_payload),
+                self._render_add_fk(table, item.source_payload),
+            ],
+            [
+                self._render_drop_fk(table, item.source_payload),
+                self._render_add_fk(table, item.target_payload),
+            ],
+            # Re-crear la FK vieja VALIDA los datos actuales: puede fallar -> sugerido.
+            down_confirmed=False,
+        )
 
     def _ri_fk_dropped(self, item: DiffItem) -> list[RenderedStatement]:
         table, fk = item.parent_table, item.target_payload
@@ -730,16 +781,25 @@ class ServerAdapter(ABC):
 
     def _ri_unique_modified(self, item: DiffItem) -> list[RenderedStatement]:
         table = item.parent_table
-        drop = self._render_drop_unique(table, item.target_payload)
-        add = self._render_add_unique(table, item.source_payload)
-        return [
-            self._stmt(item, drop),
-            self._stmt(item, add,
-                       down_sql=self._render_add_unique(table, item.target_payload)),
-        ]
+        return self._stmts(
+            item,
+            [
+                self._render_drop_unique(table, item.target_payload),
+                self._render_add_unique(table, item.source_payload),
+            ],
+            [
+                self._render_drop_unique(table, item.source_payload),
+                self._render_add_unique(table, item.target_payload),
+            ],
+            down_confirmed=False,  # re-crear la UNIQUE valida los datos actuales
+        )
 
     def _ri_unique_dropped(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, self._render_drop_unique(item.parent_table, item.target_payload))]
+        table, uc = item.parent_table, item.target_payload
+        return self._stmts(
+            item, [self._render_drop_unique(table, uc)],
+            [self._render_add_unique(table, uc)], down_confirmed=False,
+        )
 
     def _render_add_check(self, table: str, ck) -> str:
         name = self._q(ck.name, "constraint") if ck.name else None
@@ -753,16 +813,25 @@ class ServerAdapter(ABC):
 
     def _ri_check_modified(self, item: DiffItem) -> list[RenderedStatement]:
         table = item.parent_table
-        drop = self._render_drop_check(table, item.target_payload)
-        add = self._render_add_check(table, item.source_payload)
-        return [
-            self._stmt(item, drop),
-            self._stmt(item, add,
-                       down_sql=self._render_add_check(table, item.target_payload)),
-        ]
+        return self._stmts(
+            item,
+            [
+                self._render_drop_check(table, item.target_payload),
+                self._render_add_check(table, item.source_payload),
+            ],
+            [
+                self._render_drop_check(table, item.source_payload),
+                self._render_add_check(table, item.target_payload),
+            ],
+            down_confirmed=False,  # re-crear el CHECK valida los datos actuales
+        )
 
     def _ri_check_dropped(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, self._render_drop_check(item.parent_table, item.target_payload))]
+        table, ck = item.parent_table, item.target_payload
+        return self._stmts(
+            item, [self._render_drop_check(table, ck)],
+            [self._render_add_check(table, ck)], down_confirmed=False,
+        )
 
     def _ri_index_new(self, item: DiffItem) -> list[RenderedStatement]:
         table, ix = item.parent_table, item.source_payload
@@ -771,13 +840,15 @@ class ServerAdapter(ABC):
 
     def _ri_index_modified(self, item: DiffItem) -> list[RenderedStatement]:
         table = item.parent_table
-        drop = self._render_drop_index(table, item.target_payload)
-        create = self._render_create_index(table, item.source_payload)
-        return [
-            self._stmt(item, drop),
-            self._stmt(item, create,
-                       down_sql=self._render_create_index(table, item.target_payload)),
-        ]
+        old, new = item.target_payload, item.source_payload
+        # Un índice NO único no valida datos al crearse -> el reverso es exacto y seguro.
+        confirmed = not (bool(getattr(old, "unique", False)) or bool(getattr(new, "unique", False)))
+        return self._stmts(
+            item,
+            [self._render_drop_index(table, old), self._render_create_index(table, new)],
+            [self._render_drop_index(table, new), self._render_create_index(table, old)],
+            down_confirmed=confirmed,
+        )
 
     def _ri_index_dropped(self, item: DiffItem) -> list[RenderedStatement]:
         table, ix = item.parent_table, item.target_payload
@@ -786,69 +857,154 @@ class ServerAdapter(ABC):
 
     def _ri_column_modified(self, item: DiffItem) -> list[RenderedStatement]:
         table = item.parent_table
-        fwd = self._render_modify_column(table, item.source_payload, item.target_payload,
-                                         item.changed_attributes)
-        rev = self._render_modify_column(table, item.target_payload, item.source_payload,
-                                         item.changed_attributes)
-        rev_sql = ";\n".join(rev) if rev else None
-        return [self._stmt(item, s, down_sql=rev_sql, down_confirmed=False) for s in fwd]
+        return self._stmts(
+            item,
+            self._render_modify_column(table, item.source_payload, item.target_payload,
+                                       item.changed_attributes),
+            # El reverso es la MISMA operación con los payloads invertidos. Antes se
+            # adjuntaba a CADA sentencia del grupo, así que un cambio que rendereaba N
+            # sentencias (PostgreSQL) revertía N veces lo mismo.
+            self._render_modify_column(table, item.target_payload, item.source_payload,
+                                       item.changed_attributes),
+            down_confirmed=False,  # una conversión de tipo puede no ser reversible
+        )
 
     def _ri_pk_changed(self, item: DiffItem) -> list[RenderedStatement]:
         # Cubre new/modified/dropped: _render_alter_pk decide DROP/ADD/ambos según payloads.
+        # El reverso es la misma llamada con las tablas invertidas (restaura la PK previa).
         table = item.parent_table
-        return [self._stmt(item, s) for s in self._render_alter_pk(table, item.source_payload, item.target_payload)]
+        return self._stmts(
+            item,
+            self._render_alter_pk(table, item.source_payload, item.target_payload),
+            self._render_alter_pk(table, item.target_payload, item.source_payload),
+            down_confirmed=False,  # ADD PRIMARY KEY valida unicidad/NOT NULL de los datos
+        )
 
     def _ri_view_upsert(self, item: DiffItem) -> list[RenderedStatement]:
         replace = item.change_type == "modified"
-        return [self._stmt(item, s) for s in self._render_view(item.source_payload, replace)]
+        view = item.source_payload
+        if replace and item.target_payload is not None:
+            reverse = self._render_view(item.target_payload, True)  # restaura la anterior
+        else:
+            reverse = [self._render_drop_view(view)]
+        # Una vista es pura definición: el reverso es exacto. Una MATVIEW guarda datos
+        # derivados -> recrearla los recalcula/pierde: nunca confirmado.
+        return self._stmts(
+            item, self._render_view(view, replace), reverse,
+            down_confirmed=not bool(getattr(view, "is_materialized", False)),
+        )
 
     def _ri_view_dropped(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, self._render_drop_view(item.target_payload))]
+        view = item.target_payload
+        return self._stmts(
+            item, [self._render_drop_view(view)], self._render_view(view, False),
+            down_confirmed=not bool(getattr(view, "is_materialized", False)),
+        )
 
     def _ri_routine_upsert(self, item: DiffItem) -> list[RenderedStatement]:
         replace = item.change_type == "modified"
-        return [self._stmt(item, s) for s in self._render_routine(item.source_payload, replace)]
+        routine = item.source_payload
+        if replace and item.target_payload is not None:
+            reverse = self._render_routine(item.target_payload, True)
+        else:
+            reverse = [self._render_drop_routine(routine)]
+        return self._stmts(
+            item, self._render_routine(routine, replace), reverse, down_confirmed=True,
+        )
 
     def _ri_routine_dropped(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, self._render_drop_routine(item.target_payload))]
+        routine = item.target_payload
+        return self._stmts(
+            item, [self._render_drop_routine(routine)],
+            self._render_routine(routine, False), down_confirmed=True,
+        )
 
     def _ri_trigger_upsert(self, item: DiffItem) -> list[RenderedStatement]:
         replace = item.change_type == "modified"
-        return [self._stmt(item, s) for s in self._render_trigger(item.source_payload, replace)]
+        trigger = item.source_payload
+        if replace and item.target_payload is not None:
+            reverse = self._render_trigger(item.target_payload, True)
+        else:
+            reverse = [self._render_drop_trigger(trigger)]
+        return self._stmts(
+            item, self._render_trigger(trigger, replace), reverse, down_confirmed=True,
+        )
 
     def _ri_trigger_dropped(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, self._render_drop_trigger(item.target_payload))]
+        trigger = item.target_payload
+        return self._stmts(
+            item, [self._render_drop_trigger(trigger)],
+            self._render_trigger(trigger, False), down_confirmed=True,
+        )
 
     def _ri_event_upsert(self, item: DiffItem) -> list[RenderedStatement]:
         replace = item.change_type == "modified"
-        return [self._stmt(item, s) for s in self._render_event(item.source_payload, replace)]
+        event = item.source_payload
+        if replace and item.target_payload is not None:
+            reverse = self._render_event(item.target_payload, True)
+        else:
+            reverse = [self._render_drop_event(event)]
+        return self._stmts(
+            item, self._render_event(event, replace), reverse, down_confirmed=True,
+        )
 
     def _ri_event_dropped(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, self._render_drop_event(item.target_payload))]
+        event = item.target_payload
+        return self._stmts(
+            item, [self._render_drop_event(event)],
+            self._render_event(event, False), down_confirmed=True,
+        )
 
     def _ri_sequence_new(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, s) for s in self._render_sequence(item.source_payload, alter=False)]
+        return self._stmts(
+            item, self._render_sequence(item.source_payload, alter=False),
+            [self._render_drop_sequence(item.source_payload)], down_confirmed=True,
+        )
 
     def _ri_sequence_modified(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, s) for s in self._render_sequence(item.source_payload, alter=True)]
+        return self._stmts(
+            item, self._render_sequence(item.source_payload, alter=True),
+            self._render_sequence(item.target_payload, alter=True), down_confirmed=True,
+        )
 
     def _ri_sequence_dropped(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, self._render_drop_sequence(item.target_payload))]
+        # Recrear la secuencia NO restaura su valor actual (last_value es estado, y el
+        # snapshot lo excluye a propósito) -> sugerido, nunca confirmado.
+        return self._stmts(
+            item, [self._render_drop_sequence(item.target_payload)],
+            self._render_sequence(item.target_payload, alter=False), down_confirmed=False,
+        )
 
     def _ri_enum_new(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, s) for s in self._render_enum(item.source_payload, item.target_payload)]
+        return self._stmts(
+            item, self._render_enum(item.source_payload, item.target_payload),
+            [self._render_drop_enum(item.source_payload)], down_confirmed=True,
+        )
 
     def _ri_enum_modified(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, s) for s in self._render_enum(item.source_payload, item.target_payload)]
+        # PostgreSQL no puede QUITAR un valor de un ENUM: el ADD VALUE es irreversible
+        # sin recrear el tipo y todas sus columnas -> sin reverso (nunca se inventa uno).
+        return self._stmts(
+            item, self._render_enum(item.source_payload, item.target_payload), None,
+        )
 
     def _ri_enum_dropped(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, self._render_drop_enum(item.target_payload))]
+        return self._stmts(
+            item, [self._render_drop_enum(item.target_payload)],
+            self._render_enum(item.target_payload, None), down_confirmed=False,
+        )
 
     def _ri_extension_new(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, self._render_extension(item.source_payload))]
+        return self._stmts(
+            item, [self._render_extension(item.source_payload)],
+            [self._render_drop_extension(item.source_payload)], down_confirmed=False,
+        )
 
     def _ri_extension_dropped(self, item: DiffItem) -> list[RenderedStatement]:
-        return [self._stmt(item, self._render_drop_extension(item.target_payload))]
+        return self._stmts(
+            item, [self._render_drop_extension(item.target_payload)],
+            [self._render_extension(item.target_payload)], down_confirmed=False,
+        )
 
     # ---- Renderer portable de FK (ambos motores comparten esta sintaxis) ---- #
     def _render_add_fk(self, table: str, fk) -> str:
