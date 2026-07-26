@@ -221,6 +221,152 @@ siendo la única fuente de verdad del SQL a ejecutar.
 "el esquema cambió; recalcula". No hay `force` para saltear esto (a diferencia de la
 cuarentena, que sí lo tiene).
 
+## Orden de ejecución: `seq` manda, `phase` es solo una etiqueta
+
+El diff sale **ordenado por dependencia real**, no por fase. `seq` es la única fuente de
+verdad del orden; `phase` (1..9) quedó como etiqueta gruesa para agrupar/filtrar en la UI.
+
+**Ordenar por `phase` produce un orden que el motor rechaza.** El orden anterior era
+`(phase, object_type, object_name)` — alfabético dentro de la fase — y eso bastaba para
+romper la migración a mitad de camino. Casos verificados, todos con error garantizado:
+
+| Qué pasaba | Por qué | Error del motor |
+|---|---|---|
+| `CREATE VIEW v_alpha` (lee de `v_zeta`) antes de `v_zeta` | alfabético entre vistas | `1146` / `42P01` |
+| `ADD CONSTRAINT ck CHECK (edad>=0)` antes de `ADD COLUMN edad` | `check_constraint` < `column` | `3813` / `42703` |
+| `ADD FOREIGN KEY … REFERENCES parent(code)` antes de la `UNIQUE` sobre `parent.code` | `foreign_key` < `unique_constraint` | errno `150` |
+| FK (fase 3) antes de la `PRIMARY KEY` que referencia (fase 4) | orden por fase | errno `150` |
+| `DROP COLUMN pid` antes del `DROP FOREIGN KEY` que la usa | `column` < `foreign_key` | `1828` |
+| `DROP INDEX` que respalda una FK viva | idem | `1553` |
+| `CREATE MATERIALIZED VIEW` antes de la vista de la que lee | `materialized_view` < `view` | `42P01` |
+| `DROP TABLE padre` antes de `DROP TABLE hija` | nivel topológico mal calculado (ver abajo) | `1451` / `2BP01` |
+| `MODIFY COLUMN` de una columna con FK viva que el diff también elimina | el DROP de la FK iba al final | `1832` / `3780` |
+
+Ahora el orden lo decide `schema_diff.order_diff_items` en dos niveles:
+
+1. **`_STEP`** — pasos finos que codifican el pipeline de un DBA y **cruzan fases** cuando
+   la dependencia lo exige:
+
+   ```
+   prerrequisitos (extension → enum → sequence)
+     → [DROP adelantado de cuerpos/FKs que bloquean un ALTER]
+     → CREATE TABLE  → columnas → PK → índices/UNIQUE/CHECK → FKs
+     → cuerpos (vistas → matviews → rutinas → triggers → events)
+     → DROP de cuerpos
+     → DROP de FKs → índices → UNIQUE → CHECK → columnas → tablas
+     → DROP de secuencias/tipos/extensiones
+   ```
+
+   Reglas que codifica: una FK va **siempre al final del bloque aditivo** (ya existen la
+   PK/UNIQUE de la tabla referida y el índice del lado referente); un CHECK/índice/UNIQUE
+   va **después** de las columnas nuevas que menciona; al borrar se recorre el camino
+   **inverso** (FKs primero, tablas al final).
+
+2. **Orden topológico dentro de cada paso**, con el grafo de
+   `schema_diff.build_dependency_graph`. Aristas que detecta:
+   tabla→tabla por FK; sub-objeto→su tabla nueva; columna nueva→el índice/UNIQUE/CHECK/FK
+   que la menciona; FK→la PK/UNIQUE/índice de la tabla referida; **cuerpo→los objetos que
+   menciona su cuerpo** (vista sobre vista, matview sobre vista, trigger sobre su tabla y
+   sobre la rutina que llama). Para los `dropped` la arista se **invierte** (el dependiente
+   cae primero, que es lo que exige PostgreSQL). Un ciclo no aborta el diff: queda al final,
+   en orden estable.
+
+**DROP adelantado (hoisting).** Dos casos donde el DROP no puede esperar a la fase
+destructiva:
+
+- **Cuerpos que bloquean un ALTER**: PostgreSQL rechaza `ALTER COLUMN TYPE`/`DROP COLUMN`/
+  `DROP TABLE` mientras una vista o matview dependa de ese objeto. Si el diff elimina esa
+  vista, se la suelta **antes** del ALTER (paso 20), con cierre sobre sus propios
+  dependientes.
+- **FKs que bloquean un cambio de tipo**: MySQL/MariaDB rechazan `MODIFY COLUMN` sobre una
+  columna que participa en una FK viva (`1832`), y también si el cambio rompe la
+  compatibilidad con el otro lado (`3780`). La FK se suelta antes del ALTER (paso 38). Es
+  quirúrgico: solo la FK que toca una columna cuyo **tipo** cambia.
+
+**Bug de `_table_dep_order` (corregido).** Agregaba a `placed` *dentro* de la pasada, así
+que una hija visitada después de su padre en la MISMA pasada heredaba su nivel (ambas en 0).
+Al crear no se notaba —el desempate alfabético dejaba al padre primero por casualidad— pero
+el DROP ordena por rango **invertido**: con ambas en 0 el nombre decidía y se borraba la
+tabla PADRE primero. Ahora el nivel se asigna por pasada completa. La función la comparten
+el clon (orden de copia de datos) y `clone_dependencies`, que también se benefician.
+
+## Grupos atómicos y cierre de dependencias de la selección
+
+Dos guards nuevos, ambos sobre la **selección parcial** que hace el admin (`adopt` y
+`execute` con `mode=custom`). Antes el gateway aceptaba cualquier subconjunto y armaba el
+`up_sql` con él: el error aparecía recién contra el motor, a mitad de la migración.
+
+**`op_group` — la unidad de selección es el CAMBIO, no la sentencia.** Un solo cambio
+lógico puede rendear varias sentencias: un índice/UNIQUE/CHECK/FK redefinido es
+`DROP viejo` + `CREATE nuevo`; un `PRIMARY KEY` cambiado es `DROP` + `ADD`. Todas comparten
+`op_group` (`object_type|object_name|change_type`). Marcar solo el `CREATE` daba
+`1061 Duplicate key name` (el emparejamiento `pair_by_name` es justamente por nombre, así
+que el objeto nuevo choca con el viejo); marcar solo el `ADD PRIMARY KEY` daba
+`1068 Multiple primary key defined`.
+
+**`depends_on` — cierre transitivo.** Cada ítem lista los `op_group` que deben ejecutarse
+**antes**. Solo incluye lo que hay que ejecutar *en esta comparación*: una dependencia que
+ya existe en el destino no aparece (no hace falta seleccionarla).
+
+Cómo se aplica según el modo:
+
+| Modo | Política | Por qué |
+|---|---|---|
+| `adopt`, `execute` con `mode=custom` | **422** con el detalle de lo que falta | La selección es explícita: recortarla en silencio sería peor que decírselo. La respuesta trae `missing_dependencies`, `suggested_item_ids` y `would_add_item_ids` en `public_context`. |
+| `execute` con `mode=all` / `all_except_destructive` | **poda transitiva** + reporte en `excluded_by_dependency` | El filtro por riesgo es por sentencia y puede dejar fuera una dependencia sin sacar a sus dependientes. Caso real: una tabla nueva marcada `possible_rename_of` es `destructive` y queda fuera de `all_except_destructive`, pero sus índices/FKs (aditivos) NO — y `CREATE INDEX` sobre una tabla inexistente aborta la ejecución. |
+
+**`POST /schema-comparisons/{id}/resolve-selection`** expande una selección a su cierre sin
+adoptar ni ejecutar (mismo patrón que el `resolve-selection` del clonado). Devuelve
+`resolved_item_ids` **en orden de ejecución**, `added_item_ids` y el detalle de cada
+agregado. `adopt` acepta además `auto_resolve_dependencies=true` para cerrar en la misma
+llamada (default `false`: fail-closed).
+
+## Linter de plan (`plan_integrity.py`)
+
+Última barrera antes de materializar una versión de blueprint o ejecutar ad-hoc. Verifica
+el **invariante de orden** del plan ya cerrado: toda dependencia aparece antes que su
+dependiente. Si el ordenador regresara alguna vez, la operación falla **en el gateway**
+(422, sin tocar el motor) en vez de escribir un `up_sql` que reventará en cada BD donde se
+aplique.
+
+| Código | Bloqueante | Qué detecta |
+|---|---|---|
+| `dependency_out_of_order` | ✅ | Una dependencia se ejecuta después de su dependiente. |
+| `atomic_group_not_contiguous` | ✅ | Las sentencias de una redefinición quedaron intercaladas con otras. |
+| `duplicate_creation` | ✅ | Dos ítems crean el mismo objeto (la segunda daría "ya existe"). |
+| `create_and_drop_same_object` | ❌ aviso | El mismo objeto se crea y se borra (casi siempre un rename detectado como par suelto). |
+| `destructive_without_rollback` | ❌ aviso | Cambios destructivos sin reverso: la versión no podrá revertirse automáticamente. |
+
+Los avisos no bloqueantes viajan en `plan_warnings` (en la respuesta de `adopt`,
+`execute-preview` y `execute`).
+
+## Reverso (`down_sql`) de las redefiniciones — FIX
+
+Una **redefinición** (índice/UNIQUE/CHECK/FK con el mismo nombre y firma distinta) se
+rendea como `DROP viejo` + `CREATE nuevo`, pero solo la **segunda** sentencia llevaba
+reverso, y ese reverso era `CREATE viejo` — **sin borrar antes el nuevo**. Al revertir, el
+objeto nuevo seguía existiendo con el MISMO nombre y el motor respondía
+`1061 Duplicate key name` / `42P07 relation already exists`. Es decir: el rollback de una
+redefinición **fallaba siempre**.
+
+Ahora el reverso completo se adjunta a la **última** sentencia del grupo (las demás quedan
+en `NULL`), porque el `down_sql` de una versión se ensambla recorriendo las sentencias en
+orden **inverso**: así el reverso del ítem se ejecuta una sola vez, completo y en la
+posición correcta respecto de los otros ítems. Para el par de arriba el reverso correcto es
+`DROP nuevo` + `CREATE viejo`.
+
+Además se agregaron reversos donde no había ninguno: vistas/matviews, rutinas, triggers,
+eventos (`new` → `DROP`; `modified` → restaurar la definición anterior), `PRIMARY KEY`
+(restaura la PK previa), `DROP TABLE` (recrea la estructura, **nunca confirmado**: los datos
+ya se perdieron), `UNIQUE`/`CHECK` eliminados, secuencias, tipos ENUM y extensiones. El
+`ALTER TYPE … ADD VALUE` de PostgreSQL sigue **sin** reverso a propósito (no se puede quitar
+un valor de un ENUM sin recrear el tipo y sus columnas).
+
+`down_confirmed` conserva su semántica estricta: solo `true` si el reverso es
+demostrablemente seguro. Un objeto que **valida datos** al recrearse (UNIQUE, CHECK, FK,
+`ADD PRIMARY KEY`) queda como sugerencia; una vista/rutina/trigger (pura definición) sí se
+confirma. Un índice **no único** redefinido se confirma; uno único no.
+
 ## Endpoints
 
 > Todos requieren sesión de administrador (`AdminDep`). 🔌 = tocan el motor destino
@@ -232,7 +378,8 @@ cuarentena, que sí lo tiene).
 | `GET` | `/api/v1/schema-comparisons/{id}` | Resumen: `counts` (object_type → change_type → nº de objetos), `has_destructive`, `cross_flavor_warning`, `scope_note`, `expired`. |
 | `GET` | `/api/v1/schema-comparisons/{id}/items` | Detalle paginado con el **DDL exacto** (dry-run/preview obligatorio — nunca se ejecuta sin haberlo mostrado). Filtra por `object_type`/`change_type`. |
 | `GET` | `/api/v1/schema-comparisons/{id}/export` | **Descarga el diff como archivo `.sql`** (`Content-Disposition: attachment`, `application/sql`). Exporta TODAS las entidades por defecto, o solo las seleccionadas vía `item_ids` (repetible: `?item_ids=1&item_ids=2`), combinable con los filtros `object_type`/`change_type`. `include_rollback=true` anexa el `down_sql` sugerido (orden inverso) **comentado**. Solo lectura de los ítems ya calculados (no toca el motor ni valida fingerprint). Ver [Export a `.sql`](#export-a-sql). |
-| `POST` | `/api/v1/schema-comparisons/{id}/adopt` 🔌 | **Opción A.** Body `{selected_item_ids, name, description?, execute_immediately}`. `422` si el target no está en el inventario, o si lo está pero no tiene `model_id` (dos motivos distintos, mismo código). Reusa `ModelMigrationController.create_migration` (checksum, autoversión). `execute_immediately=true` aplica por el camino normal (`ManagedMigrationController.apply`, con todos sus guards). Rate limit 3/min. |
+| `POST` | `/api/v1/schema-comparisons/{id}/resolve-selection` | Expande una selección a su **cierre de dependencias** sin adoptar ni ejecutar. Devuelve `resolved_item_ids` (en orden de ejecución), `added_item_ids` y el detalle de cada agregado. Solo lectura. |
+| `POST` | `/api/v1/schema-comparisons/{id}/adopt` 🔌 | **Opción A.** Body `{selected_item_ids, name, description?, execute_immediately, auto_resolve_dependencies}`. `422` si el target no está en el inventario, o si lo está pero no tiene `model_id` (dos motivos distintos, mismo código). **`422` también si la selección no cierra** sobre sus dependencias o parte un grupo atómico, salvo `auto_resolve_dependencies=true` (ver [Grupos atómicos](#grupos-atómicos-y-cierre-de-dependencias-de-la-selección)). Reusa `ModelMigrationController.create_migration` (checksum, autoversión) y persiste el **manifiesto de sentencias** de la versión. `execute_immediately=true` aplica por el camino normal (`ManagedMigrationController.apply`, con todos sus guards). Rate limit 3/min. |
 | `POST` | `/api/v1/schema-comparisons/{id}/execute-preview` | Resuelve un `mode`/selección de Opción B **sin ejecutar nada**: devuelve las sentencias exactas + el `confirm_token` a reenviar. Solo lectura (no toca el motor). Ver [El `confirm_token`](#el-confirm_token-opción-b). |
 | `POST` | `/api/v1/schema-comparisons/{id}/execute` 🔌 | **Opción B.** Body `{mode: all\|all_except_destructive\|custom, selected_item_ids?, confirm_target_name, confirm_token}` + query `force` (cuarentena). `409` si el target TIENE `model_id` (usar `adopt`). Ejecuta con `MigrationRunner.execute_adhoc` (sin Alembic, sin tabla de versión). Rate limit 3/min. |
 
@@ -284,11 +431,17 @@ envoltorio `ApiResponse` (es una descarga binaria/de archivo).
    `target_database_id` (a modificar).
 2. `GET /schema-comparisons/{id}` para el resumen (¿hay destructivos? ¿warning
    cross-flavor?).
-3. `GET /schema-comparisons/{id}/items` para el DDL exacto por ítem (paginado).
-4. Según si el target tiene blueprint:
-   - **Con blueprint** → `POST .../adopt` con los `selected_item_ids` elegidos
+3. `GET /schema-comparisons/{id}/items` para el DDL exacto por ítem (paginado, **ordenar
+   por `seq`**). Usar `op_group` para no dejar marcar media redefinición y `depends_on`
+   para mostrar por qué un ítem arrastra a otro.
+4. `POST .../resolve-selection` con lo que marcó el usuario → devuelve el conjunto
+   realmente ejecutable y qué hubo que agregar. Evita el ciclo "intento → 422 → agrego →
+   reintento".
+5. Según si el target tiene blueprint:
+   - **Con blueprint** → `POST .../adopt` con los `selected_item_ids` ya resueltos
      (`execute_immediately` opcional).
-   - **Sin blueprint** → `POST .../execute` con `mode` + confirmaciones.
+   - **Sin blueprint** → `POST .../execute` con `mode` + confirmaciones (revisar
+     `excluded_by_dependency` del `execute-preview` antes de confirmar).
 
 ## Reutilización de infraestructura existente
 

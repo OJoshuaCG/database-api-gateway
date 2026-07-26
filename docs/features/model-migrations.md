@@ -257,13 +257,98 @@ fiable:
 - **Recomendación**: escribe migraciones **idempotentes** (`CREATE TABLE IF NOT EXISTS`,
   `ADD COLUMN IF NOT EXISTS`) para que un reintento sea seguro.
 
+## Aplicación parcial: el rollback ya no opera a ciegas
+
+### El problema
+
+Cuando el `apply` de la versión N muere en la sentencia k de N, quedan **dos verdades en
+desacuerdo**:
+
+- Alembic escribe la versión en `_gw_v_{slug}` recién al **terminar** el `upgrade()`, así
+  que el ledger sigue diciendo *"estoy en N-1"*;
+- la BD tiene, físicamente, las primeras k sentencias de N **ya commiteadas** (AUTOCOMMIT:
+  el DDL de MySQL/MariaDB no es transaccional).
+
+`rollback` no veía nada raro: leía `current = N-1` y se ponía a ejecutar el `down_sql` de
+**N-1** contra una BD contaminada con parte de N. O falla a mitad —dejando un tercer estado
+inconsistente— o "funciona" por casualidad y deja objetos huérfanos de N que el gateway ya
+no sabe que existen. `current_version` tampoco delataba el problema: la versión parcial
+nunca se registró.
+
+Y con solo los blobs `up_sql`/`down_sql` era **imposible** arreglarlo: el `down_sql` es una
+secuencia independiente, con otra cantidad de sentencias (los cambios sin reverso
+simplemente no aparecen), así que "deshacé las k primeras del up" era ininferible.
+
+### La solución: manifiesto de sentencias + reconciliación
+
+**`model_migration_statements`** (tabla nueva, opcional) guarda **una fila por sentencia**
+de la versión, con su reverso **emparejado** y su `seq` coincidiendo exactamente con el
+índice del checkpoint (`migration_statement_progress.last_statement_index`). Ese acople es
+lo que hace posible saber qué se aplicó y qué hay que deshacer.
+
+Lo escribe el flujo que conoce el emparejamiento sentencia↔reverso: la **adopción de un
+diff estructural** (`POST /schema-comparisons/{id}/adopt`). Una migración escrita a mano no
+lo tiene y sigue funcionando como antes (todo-o-nada).
+
+Tres barreras fail-closed antes de confiar en un manifiesto:
+
+1. tiene que ser del **mismo motor** que la BD destino (el SQL traducido cross-engine puede
+   no partirse en la misma cantidad de sentencias);
+2. concatenar sus sentencias tiene que **reproducir exactamente** el `up_sql` vigente — es
+   la misma operación con la que se construyó, así que es una igualdad exacta y no depende
+   del splitter. Si no coincide, el SQL fue editado y el manifiesto NO se usa;
+3. el `PATCH` que cambia el SQL **borra** el manifiesto (barrera primaria).
+
+### Qué cambió en la práctica
+
+- **`rollback` responde 409** mientras haya una aplicación parcial sin resolver (guard
+  ROB2). El mensaje ofrece las dos salidas reales: completar con `apply` (que retoma desde
+  el checkpoint) o reconciliar.
+- **`GET /migrations/status`** informa `has_partial_application` y, por versión,
+  `applied_statements`/`total_statements`, si es `reconcilable` y `statements_to_undo`. El
+  frontend puede ofrecer el botón solo cuando sirve.
+- **`POST /managed-databases/{id}/migrations/reconcile-partial`** deshace las sentencias que
+  **sí** se aplicaron: ejecuta el reverso exacto de las k primeras, **en orden inverso**,
+  hasta que el plano físico vuelve a coincidir con el ledger.
+  - **No es un `downgrade` de Alembic**: la versión N nunca se aplicó, no hay nada que bajar
+    en el ledger — y por eso **no se toca** la tabla de versión. Es una compensación.
+  - `confirm_version` obligatorio (la versión parcialmente aplicada: el admin tiene que
+    haber mirado el estado antes).
+  - `dry_run=true` devuelve los reversos exactos sin tocar el motor. **Recomendado siempre.**
+  - El checkpoint se **decrementa** después de cada reverso exitoso, así que si la
+    reconciliación misma falla a mitad, el checkpoint sigue describiendo con exactitud qué
+    queda aplicado y un reintento retoma donde quedó. Se limpia al llegar a 0, y ahí la BD
+    sale de cuarentena.
+  - `force=true` procede aunque alguna sentencia aplicada **no tenga reverso**: la saltea y
+    la reporta en `unreversible_statements` (esos cambios quedan en la BD). Sin ese
+    override, una sola sentencia irreversible dejaría al admin sin salida automática.
+  - Sin manifiesto responde **409 con el motivo**, nunca reconcilia a ciegas. La salida ahí
+    sigue siendo reconciliar a mano + `stamp?force=true`.
+
+### Efecto secundario bueno: cuerpos procedurales resumibles
+
+El checkpoint excluía las migraciones con rutinas/triggers (`has_non_portable`, o cualquier
+`CREATE PROCEDURE/FUNCTION/TRIGGER/EVENT`) por prudencia: el riesgo era indexar mal por una
+duda del splitter. Con un manifiesto **no hay splitter** — el índice es dato persistido —
+así que esas migraciones ahora **sí** se pueden resumir (`is_resumable(..., manifest_pinned=True)`).
+Las exclusiones por **estado de sesión** (`SET`, `LOCK TABLES`, transacciones explícitas) y
+por `kind='data'` se mantienen siempre: no dependen de cómo se obtuvieron las sentencias
+sino de que un resume abre una conexión **nueva** que pierde ese estado.
+
+### Pendiente
+
+`create_from_snapshot` (baseline de Plan 09) **no** escribe manifiesto todavía: un baseline
+que falla a mitad sigue siendo todo-o-nada. Es viable (el `StructureDump` tiene
+`object_type` + `name`, así que el reverso `DROP <tipo> <nombre>` es derivable) y quedó como
+follow-up.
+
 ## Límites y consideraciones
 
 | Límite | Valor |
 |---|---|
 | Tamaño de cada campo SQL | 256 KB (422 si se excede) |
 | `apply-all` por request | `max_databases` ≤ 100 (síncrono) |
-| Rate limit `apply`/`rollback`/`stamp` | 10/min |
+| Rate limit `apply`/`rollback`/`stamp`/`reconcile-partial` | 10/min |
 | Rate limit `apply-all` | 3/min |
 | Concurrencia | advisory lock por BD; `command.*` serializado en el proceso (multiprocessing = Plan 06) |
 

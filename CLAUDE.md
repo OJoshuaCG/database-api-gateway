@@ -545,8 +545,13 @@ Archivos del módulo:
     `split_sql_statements` (ver "Cuerpos procedurales" abajo).
   - `migration_integrity.py` — `compute_checksum`, `validate_version` (anti path-traversal),
     `version_sort_key` (orden NUMÉRICO, no lexicográfico).
+  - `plan_integrity.py` — PURO: cierre de dependencias de una selección parcial
+    (`expand_selection`/`check_closure`/`prune_unsatisfied`) + linter de invariantes del plan
+    (`validate_statement_plan`). Lo consume schema-comparisons (adopt/execute).
 - **Modelos**: `app/models/model_migration.py` (`ModelMigration`),
-  `app/models/database_migration_history.py` (espejo de auditoría) + enum `MigrationStatus`.
+  `app/models/model_migration_statement.py` (`ModelMigrationStatement` — MANIFIESTO de
+  sentencias con reverso emparejado, ver abajo), `app/models/database_migration_history.py`
+  (espejo de auditoría) + enum `MigrationStatus`.
 - **Controllers**: `model_migration_controller.py` (CRUD del blueprint, NO toca el motor),
   `managed_migration_controller.py` (apply/rollback/stamp/status/history/apply-all, SÍ toca
   el motor).
@@ -591,6 +596,28 @@ regenera `down_sql_suggested`. `DELETE` solo borra la **última** versión (la p
 `rollback` es tipada (`MigrationApplyOut`/`MigrationRollbackOut`, con `from_version`→`to_version`).
 Verificación e2e contra motores reales (`scripts/verify_migrations_e2e.py`, requiere Docker):
 **ejecutada — 153 checks / 0 fallos** (cubre Plan 02 + Plan 09 + UX).
+
+**Manifiesto de sentencias + reconciliación de una aplicación PARCIAL** (`model_migration_statements`,
+tabla nueva; migración `e2f3a4b5c6d7`): cierra el agujero más grave del rollback. Alembic
+escribe la versión en `_gw_v_{slug}` recién al TERMINAR el `upgrade()`, así que un `apply` que
+muere en la sentencia k de N deja el ledger en N-1 y la BD con k sentencias de N ya commiteadas
+(AUTOCOMMIT). `rollback` no lo veía: leía `current=N-1` y ejecutaba el `down_sql` de N-1 contra
+una BD contaminada con parte de N. Con los blobs `up_sql`/`down_sql` era **ininferible** qué
+deshacer (el down es una secuencia INDEPENDIENTE, con otra cantidad de sentencias — los cambios
+sin reverso no aparecen). Ahora una fila por sentencia con su reverso EMPAREJADO y `seq` ==
+índice del checkpoint. Piezas: guard **ROB2** (`rollback` → 409 con aplicación parcial pendiente);
+`GET /migrations/status` informa `has_partial_application` + `reconcilable`;
+`POST /managed-databases/{id}/migrations/reconcile-partial` (`confirm_version` obligatorio,
+`dry_run`, `force`) ejecuta el reverso de las k sentencias en orden INVERSO. **NO es un
+`downgrade`**: la versión nunca se aplicó, así que NO se toca la tabla de versión — es una
+COMPENSACIÓN que devuelve el plano físico al estado que el ledger ya afirma. El checkpoint se
+DECREMENTA tras cada reverso (si la reconciliación falla a mitad, retoma). Tres barreras
+fail-closed sobre el manifiesto: mismo motor que el destino; concatenarlo debe reproducir
+EXACTO el `up_sql` (igualdad sin splitter); el `PATCH` que cambia el SQL lo BORRA. Solo lo
+escribe `adopt` de schema-comparisons; sin manifiesto → 409 con motivo, nunca a ciegas.
+Efecto secundario: con manifiesto NO hay splitter, así que `is_resumable(..., manifest_pinned=True)`
+habilita resumir cuerpos procedurales (las exclusiones por estado de sesión y `kind='data'`
+siguen SIEMPRE). Pendiente: `create_from_snapshot` no escribe manifiesto todavía.
 
 **Checkpoint de sentencia (resume automático tras fallo parcial)**: como el DDL no es
 transaccional en MySQL/MariaDB (AUTOCOMMIT), una migración de N sentencias que falla a
@@ -683,6 +710,55 @@ directo** ad-hoc (Opción B). Guía de uso: `docs/features/schema-comparison.md`
   sin `force` si difiere). `SchemaComparison` guarda siempre `{lado}_server_id`/
   `{lado}_database_name` (identidad física) y `{lado}_database_id` (`int | None`, solo si
   está en inventario).
+- **ORDEN DE EJECUCIÓN (fix mayor)**: `seq` es la ÚNICA fuente de verdad del orden; `phase`
+  (1..9) quedó como etiqueta INFORMATIVA — **ordenar por `phase` produce un orden que el motor
+  rechaza**. El orden viejo era `(phase, object_type, object_name)`, alfabético dentro de la
+  fase, y eso solo bastaba para romper la migración: vista antes que la vista que lee (1146);
+  `check_constraint` < `column` → CHECK antes de su columna (3813/42703); `foreign_key` <
+  `unique_constraint`/`index` → FK sin clave de respaldo (errno 150); FK de fase 3 antes de la
+  PK de fase 4 (errno 150); `column` < `foreign_key` → DROP COLUMN con FK viva (1828);
+  `materialized_view` < `view` en PG (42P01); DROP de tabla padre antes que la hija (1451).
+  Ahora `order_diff_items` ordena por **`_STEP`** (pasos finos que CRUZAN fases: prerrequisitos
+  → [DROP adelantado] → CREATE TABLE → columnas → PK → índices/UNIQUE/CHECK → **FKs al final
+  del bloque aditivo** → cuerpos → DROP de cuerpos → DROP de FKs → índices → UNIQUE → CHECK →
+  columnas → tablas → prerrequisitos) y, dentro de cada paso, **topológicamente** con
+  `build_dependency_graph` (tabla→tabla por FK; sub-objeto→su tabla nueva; columna nueva→el
+  índice/CHECK/FK que la menciona; FK→la PK/UNIQUE/índice de la tabla referida; **cuerpo→los
+  objetos que menciona su cuerpo** por escaneo de identificadores). Para los `dropped` la
+  arista se INVIERTE (el dependiente cae primero, que es lo que exige PG). **Hoisting**: se
+  ADELANTA el DROP de un cuerpo que bloquea un ALTER (PG rechaza `ALTER COLUMN TYPE` con una
+  vista dependiente) y el DROP de una FK que bloquea un cambio de TIPO de sus columnas
+  (MySQL 1832/3780). Bug PREEXISTENTE corregido en `_table_dep_order`: agregaba a `placed`
+  DENTRO de la pasada, así que una hija visitada tras su padre heredaba su nivel (ambas en 0);
+  invisible al crear (el desempate alfabético lo tapaba) pero fatal al borrar, que usa el rango
+  INVERTIDO. La comparten el clon y `clone_dependencies`.
+- **Grupos atómicos + cierre de dependencias de la selección** (`plan_integrity.py`, puro):
+  la unidad de selección es el CAMBIO (`op_group` = `object_type|object_name|change_type`), no
+  la sentencia — un índice/UNIQUE/CHECK/FK redefinido rendea `DROP viejo`+`CREATE nuevo` y un
+  PK cambiado `DROP`+`ADD`; marcar solo una daba 1061/1068. `depends_on` (persistido en
+  `schema_comparison_items`, JSON) lista los `op_group` que deben ir ANTES, solo de ítems de
+  ESTA comparación. Política: `adopt`/`execute custom` → **422** con `missing_dependencies` +
+  `suggested_item_ids` (selección explícita: no se recorta en silencio), salvo
+  `auto_resolve_dependencies=true`; `all`/`all_except_destructive` → **poda transitiva** +
+  `excluded_by_dependency` (el filtro por riesgo dejaba fuera una tabla `possible_rename_of`
+  pero NO sus índices → `CREATE INDEX` sobre tabla inexistente). Endpoint nuevo
+  `POST /schema-comparisons/{id}/resolve-selection`. **Linter de plan**
+  (`validate_statement_plan`) verifica el INVARIANTE de orden antes de materializar la versión:
+  `dependency_out_of_order`/`atomic_group_not_contiguous`/`duplicate_creation` son BLOQUEANTES
+  (422 en el gateway, sin tocar el motor); `create_and_drop_same_object`/
+  `destructive_without_rollback` son avisos (`plan_warnings`).
+- **`down_sql` de una REDEFINICIÓN (fix)**: solo la 2ª sentencia del par llevaba reverso y ese
+  reverso era `CREATE viejo` **sin borrar antes el nuevo** → el rollback de un índice/UNIQUE/
+  CHECK/FK redefinido **fallaba SIEMPRE** con 1061/42P07 (el emparejamiento `pair_by_name` es
+  por nombre, así que el objeto nuevo choca). Ahora `base_adapter._stmts(...)` adjunta el
+  reverso COMPLETO a la ÚLTIMA sentencia del grupo (las demás en NULL) porque el `down_sql` de
+  la versión se ensambla en orden INVERSO. Se agregaron reversos donde no había: vistas/
+  matviews/rutinas/triggers/eventos, PK, `DROP TABLE` (estructura, nunca confirmado),
+  UNIQUE/CHECK eliminados, secuencias, ENUM, extensiones. `ALTER TYPE … ADD VALUE` sigue SIN
+  reverso a propósito. `down_confirmed` estricto: lo que VALIDA datos al recrearse (UNIQUE/
+  CHECK/FK/`ADD PRIMARY KEY`) queda sugerido; pura definición (vista/rutina/trigger) se
+  confirma; índice no único sí, único no. También se corrigió `_ri_column_modified`, que
+  duplicaba el reverso en cada sentencia del grupo.
 - **Gotchas**: dirección `source`(deseado)/`target`(a modificar) siempre explícita, nunca
   inferida; el modo automático `all_except_destructive` excluye TODO lo no-demostrablemente-
   aditivo (no solo `DROP`: narrowing de tipo, cambio de collation/charset, `possible_rename_of`);
