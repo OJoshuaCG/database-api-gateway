@@ -928,41 +928,56 @@ class MigrationRunner:
         plano físico a coincidir con el ledger.
 
         ``inverses`` viene ya ordenado del ``seq`` más alto al más bajo, con el ``down_sql``
-        de cada sentencia. El checkpoint se DECREMENTA después de cada reverso exitoso
-        (``seq-1``), así que si esto mismo falla a mitad, el checkpoint sigue describiendo
-        con exactitud qué queda aplicado y un reintento retoma donde quedó. Se limpia solo
-        al llegar a 0.
+        de cada sentencia. El checkpoint se DECREMENTA recién cuando TODOS los reversos de
+        esa sentencia terminaron — un ``seq`` puede aportar VARIAS entradas (el reverso de
+        una redefinición es ``DROP nuevo; CREATE viejo``): decrementar tras la primera
+        afirmaría "la sentencia quedó deshecha" con el reverso a medias, y un reintento
+        posterior saltearía la mitad restante en silencio. Grabar tarde es seguro: en el
+        peor caso se re-intenta un reverso ya hecho (falla ruidosa tipo "no existe"), nunca
+        se omite uno pendiente. Se limpia solo al llegar a 0.
         """
         results: list[StatementResult] = []
+        # Agrupar los reversos por sentencia de ORIGEN preservando el orden (ya viene
+        # seq desc): la unidad de progreso es la SENTENCIA, no cada reverso individual.
+        grouped: list[tuple[int, list[str]]] = []
+        for seq, sql in inverses:
+            if grouped and grouped[-1][0] == seq:
+                grouped[-1][1].append(sql)
+            else:
+                grouped.append((seq, [sql]))
         try:
             with database_connection(target, db_name) as conn:
                 conn = conn.execution_options(isolation_level="AUTOCOMMIT")
                 self._acquire_lock(conn, engine, managed_db_id)
                 try:
-                    for seq, sql in inverses:
-                        t0 = time.monotonic()
-                        try:
-                            conn.exec_driver_sql(self._escape_percent(sql))
-                        except Exception as exc:  # noqa: BLE001 — registrar y detener
+                    aborted = False
+                    for seq, stmts in grouped:
+                        for sql in stmts:
+                            t0 = time.monotonic()
+                            try:
+                                conn.exec_driver_sql(self._escape_percent(sql))
+                            except Exception as exc:  # noqa: BLE001 — registrar y detener
+                                ms = int((time.monotonic() - t0) * 1000)
+                                logger.warning(
+                                    "Reconciliación parcial de %s: falló el reverso de la "
+                                    "sentencia %d: %s", spec.version, seq, exc, exc_info=True,
+                                )
+                                results.append(StatementResult(
+                                    index=seq, status="failed", error=_clean_error(exc),
+                                    execution_ms=ms, executed_at=datetime.now(timezone.utc),
+                                ))
+                                aborted = True
+                                break
                             ms = int((time.monotonic() - t0) * 1000)
-                            logger.warning(
-                                "Reconciliación parcial de %s: falló el reverso de la "
-                                "sentencia %d: %s", spec.version, seq, exc, exc_info=True,
-                            )
                             results.append(StatementResult(
-                                index=seq, status="failed", error=_clean_error(exc),
+                                index=seq, status="applied", error=None,
                                 execution_ms=ms, executed_at=datetime.now(timezone.utc),
                             ))
+                        if aborted:
                             break
-                        ms = int((time.monotonic() - t0) * 1000)
-                        results.append(StatementResult(
-                            index=seq, status="applied", error=None,
-                            execution_ms=ms, executed_at=datetime.now(timezone.utc),
-                        ))
-                        # El reverso de la sentencia `seq` ya commiteó: lo aplicado ahora
-                        # llega hasta `seq-1`. Se graba DESPUÉS (nunca antes): en el peor
-                        # caso se re-deshace una sentencia ya deshecha (ruidoso pero
-                        # visible), no se saltea una que sigue aplicada (silencioso).
+                        # TODOS los reversos de `seq` commitearon: lo aplicado llega ahora
+                        # hasta `seq-1`. Se graba DESPUÉS (nunca antes): re-deshacer es
+                        # ruidoso pero visible; saltear un reverso pendiente es silencioso.
                         if seq - 1 <= 0:
                             migration_progress.clear_progress(managed_db_id, spec.id, "up")
                         else:
