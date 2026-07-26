@@ -14,6 +14,8 @@ Integridad: antes de tocar el motor se re-valida el ``checksum`` de cada migraci
 (detecta alteración directa en la BD del gateway).
 """
 
+import re
+
 from sqlalchemy import or_ as sa_or
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
@@ -36,7 +38,7 @@ from app.services.db_admin.migrations import (
     MigrationRunner,
     MigrationSpec,
 )
-from app.services.db_admin.sql_dialect import split_sql_statements
+from app.services.db_admin.sql_dialect import SqlTranslator, split_sql_statements
 
 logger = get_logger(__name__)
 
@@ -222,6 +224,7 @@ class ManagedMigrationController:
         up_to_version: str | None = None,
         force: bool = False,
         dry_run: bool = False,
+        on_failure: str = "auto",
         admin: dict | None = None,
     ) -> dict:
         session = self._session()
@@ -232,6 +235,7 @@ class ManagedMigrationController:
             slug, engine = model.slug, EngineType(engine_value(server))
             self._guard_cross_engine(session, model.id, engine)
             self._guard_reviewed_baseline(session, model.id)
+            self._guard_untranslatable_sql(specs, engine)
             db_name, server_id = md.name, md.server_id
             quarantined = md.status == ProvisionStatus.error
             target = build_target(server)
@@ -266,10 +270,18 @@ class ManagedMigrationController:
         if dry_run:
             return self._dry_run_plan(db_id, db_name, server_id, target, slug, specs, up_to_version)
 
+        if on_failure not in self._ON_FAILURE_MODES:
+            raise AppHttpException(
+                message="'on_failure' invalido.",
+                status_code=422,
+                context={"on_failure": on_failure, "allowed": list(self._ON_FAILURE_MODES)},
+            )
+
         return self._run_apply(
             db_id, db_name=db_name, server_id=server_id, target=target,
             engine=engine, slug=slug, specs=specs,
             up_to_version=up_to_version, was_quarantined=quarantined, admin=admin,
+            on_failure=on_failure,
         )
 
     @staticmethod
@@ -310,6 +322,60 @@ class ManagedMigrationController:
                 ),
                 status_code=422,
                 context={"source_engine": row.source_engine, "target_engine": engine.value},
+            )
+
+    # Construcciones de MySQL que, en el SQL CRUDO, delatan que la traducción a PostgreSQL
+    # no va a ser confiable. Es un pre-filtro BARATO: solo si alguna aparece se paga el
+    # transpilado completo para confirmarlo (ver _guard_untranslatable_sql).
+    _MYSQLISM_RE = re.compile(
+        r"\b(?:MODIFY\s+COLUMN|CHANGE\s+COLUMN|DROP\s+PRIMARY\s+KEY"
+        r"|DROP\s+FOREIGN\s+KEY|DROP\s+CHECK|ENGINE\s*=|AUTO_INCREMENT\s*=)",
+        re.IGNORECASE,
+    )
+
+    def _guard_untranslatable_sql(self, specs: list[MigrationSpec], engine: EngineType) -> None:
+        """
+        Bloquea (422) aplicar a PostgreSQL una migración cuyo DDL de MySQL no se puede
+        traducir con certeza.
+
+        sqlglot transpila bien expresiones y tipos, pero deja VERBATIM varias formas de DDL
+        de MySQL al escribir PostgreSQL: ``MODIFY COLUMN``, ``DROP PRIMARY KEY``,
+        ``ENGINE=``… El resultado es SQL sintácticamente inválido que antes solo se
+        descubría cuando el motor lo rechazaba, a mitad de la migración. Peor: cuando
+        ``translate`` devuelve ``None``, ``select_up_sql`` cae al ``up_sql`` base, que en
+        dialecto MySQL crudo es igual de inválido contra PostgreSQL — o sea que "fallar
+        callado" no era una defensa. Ahora se detecta ANTES de tocar el motor y se le pide
+        al admin lo único que resuelve el caso: un ``up_sql_postgresql`` explícito.
+
+        Las reescrituras seguras (``DROP INDEX … ON``, ``DROP FOREIGN KEY``/``INDEX``/
+        ``CHECK`` → ``DROP CONSTRAINT``) las hace el traductor y NO bloquean.
+
+        Coste: el pre-filtro es una regex sobre el SQL crudo; el transpilado (caro) solo se
+        ejecuta si esa regex encuentra algo, y encima está memoizado.
+        """
+        if engine != EngineType.postgresql:
+            return
+        translator = SqlTranslator()
+        problems: dict[str, list[str]] = {}
+        for spec in specs:
+            if spec.up_sql_postgresql or spec.kind == "data":
+                continue  # override explícito, o ya cubierto por _guard_cross_engine
+            if not self._MYSQLISM_RE.search(spec.up_sql):
+                continue  # pre-filtro barato: nada sospechoso, no se paga el transpilado
+            blockers = translator.translation_blockers(spec.up_sql, engine)
+            if blockers:
+                problems[spec.version] = blockers
+        if problems:
+            detail = "; ".join(f"{v}: {', '.join(b)}" for v, b in sorted(problems.items()))
+            raise AppHttpException(
+                message=(
+                    "No se puede aplicar a PostgreSQL: hay migraciones con DDL específico "
+                    f"de MySQL que no se traduce de forma confiable ({detail}). Define un "
+                    "'up_sql_postgresql' explícito en esas versiones (PATCH) y reintenta."
+                ),
+                status_code=422,
+                context={"target_engine": engine.value, "untranslatable": problems},
+                public_context={"untranslatable": problems},
             )
 
     @staticmethod
@@ -374,9 +440,104 @@ class ManagedMigrationController:
             "pending_count": len(pending),
         }
 
+    # Política ante un fallo a mitad de una migración (solo aplica cuando el motor NO es
+    # transaccional — en PostgreSQL el propio motor deshace la migración y no hay nada que
+    # reconciliar).
+    #   'auto'      → reconcilia SOLO si puede deshacer TODO lo aplicado (default).
+    #   'reconcile' → reconcilia igual, salteando lo que no tiene reverso (equivale a force).
+    #   'leave'     → no toca nada: cuarentena + checkpoint, como antes.
+    _ON_FAILURE_MODES = ("auto", "reconcile", "leave")
+
+    def _auto_reconcile_after_failure(
+        self, db_id, *, db_name, target, engine, specs, results, mode, admin,
+    ) -> dict | None:
+        """
+        Deshace la aplicación parcial INMEDIATAMENTE después del fallo, en la misma llamada.
+
+        Es la "sobreprotección" que faltaba: sin esto, un `apply` que falla a mitad devolvía
+        200 con `failed=true` y dejaba al admin con una BD en estado desconocido, un
+        checkpoint que tenía que entender, y la tentación de `stamp --force` + `rollback`
+        (que es exactamente el camino que corrompe: stampear afirma que las 50 sentencias
+        corrieron, y el rollback ejecuta 50 reversos contra 10 cambios reales).
+
+        Devuelve el resultado de la reconciliación, o ``None`` si no había nada que hacer
+        (motor transaccional, sin checkpoint, o ``mode='leave'``).
+        """
+        if mode == "leave":
+            return None
+        failed = next((r for r in results if r.status == "failed"), None)
+        if failed is None:
+            return None
+        spec = next((s for s in specs if s.id == failed.migration_id), None)
+        if spec is None:
+            return None
+        row = next(
+            (
+                r
+                for r in migration_progress.incomplete_progress_for_database(db_id, "up")
+                if r["model_migration_id"] == spec.id
+            ),
+            None,
+        )
+        if row is None:
+            # Sin checkpoint incompleto no hay estado parcial que deshacer: o el motor es
+            # transaccional (PostgreSQL ya lo revirtió), o falló la PRIMERA sentencia, o la
+            # migración no era resumible y no se puede saber qué corrió.
+            return None
+        plan = self._reconcile_plan(spec, engine, row)
+        if not plan["inverses"]:
+            return None
+        if mode == "auto" and not plan["reconcilable"]:
+            # Hay sentencias aplicadas SIN reverso: deshacer solo una parte dejaría un
+            # estado igual de raro pero MENOS documentado. Se deja como está y el admin
+            # decide (reconcile-partial con force, o a mano).
+            logger.info(
+                "No se auto-reconcilia %s: %d sentencia(s) aplicada(s) sin reverso.",
+                spec.version, len(plan["unreversible"]),
+            )
+            return None
+        audit.record_intent(
+            "migration.auto_reconcile",
+            admin=admin, target_type="managed_database", target_id=db_id,
+            server_id=None,
+            detail=(
+                f"auto-reconciliación tras fallo de {spec.version}: deshacer "
+                f"{len(plan['inverses'])} sentencia(s)"
+            ),
+        )
+        undo = self.runner.reconcile_partial(
+            target, db_name=db_name, engine=engine, managed_db_id=db_id,
+            spec=spec, inverses=plan["inverses"],
+            total_statements=row["total_statements"],
+        )
+        undo_failed = any(r.status == "failed" for r in undo)
+        remaining = migration_progress.get_progress(db_id, spec.id, "up")
+        fully = not undo_failed and remaining is None
+        audit.record(
+            "migration.auto_reconcile",
+            status="error" if undo_failed else "success",
+            admin=admin, target_type="managed_database", target_id=db_id,
+            touched_engine=True,
+            detail=(
+                f"{sum(1 for r in undo if r.status == 'applied')}/{len(plan['inverses'])} "
+                f"reverso(s) de {spec.version}"
+                + (" — estado reconciliado" if fully else " — INCOMPLETO")
+            ),
+        )
+        return {
+            "version": spec.version,
+            "attempted": True,
+            "undone_count": sum(1 for r in undo if r.status == "applied"),
+            "statements_to_undo": len(plan["inverses"]),
+            "fully_reconciled": fully,
+            "unconfirmed_reverses": plan["unconfirmed"],
+            "unreversible_statements": plan["unreversible"],
+            "error": next((r.error for r in undo if r.status == "failed"), None),
+        }
+
     def _run_apply(
         self, db_id, *, db_name, server_id, target, engine, slug, specs,
-        up_to_version, was_quarantined, admin,
+        up_to_version, was_quarantined, admin, on_failure: str = "auto",
     ) -> dict:
         """Ejecuta el apply real sobre UNA BD ya cargada/validada (reutilizable por apply_all)."""
         # Versión ANTES de aplicar (read-only) para reportar el salto from→to.
@@ -403,13 +564,27 @@ class ManagedMigrationController:
             raise
 
         self._record_history(db_id, results)
+        failed = any(r.status == "failed" for r in results)
+
+        # Auto-protección: si quedó una aplicación PARCIAL (solo posible en MySQL/MariaDB,
+        # donde el DDL hace commit implícito), se deshace acá mismo. Va ANTES de sincronizar
+        # la versión y de marcar cuarentena para que ambos reflejen el estado YA reconciliado.
+        reconciliation = None
+        if failed:
+            reconciliation = self._auto_reconcile_after_failure(
+                db_id, db_name=db_name, target=target, engine=engine, specs=specs,
+                results=results, mode=on_failure, admin=admin,
+            )
+
         # model_version se SINCRONIZA releyendo la fuente de verdad (tabla de versión
         # que Alembic mantiene en la BD destino), no la contabilidad local.
         self._sync_model_version_from_engine(db_id, target, db_name, slug)
 
-        failed = any(r.status == "failed" for r in results)
-        # ROB1 — marcar/limpiar cuarentena según el desenlace.
-        self._set_quarantine(db_id, failed, results)
+        # ROB1 — marcar/limpiar cuarentena según el desenlace. Si la auto-reconciliación
+        # dejó la BD coincidiendo con su versión registrada, NO se pone en cuarentena: no
+        # hay estado parcial que inspeccionar, solo una migración que hay que corregir.
+        reconciled_clean = bool(reconciliation and reconciliation["fully_reconciled"])
+        self._set_quarantine(db_id, failed and not reconciled_clean, results)
 
         audit.record(
             "migration.apply", status="error" if failed else "success", admin=admin,
@@ -429,10 +604,12 @@ class ManagedMigrationController:
             "target_version": up_to_version,
             "applied_count": len(applied),
             "failed": failed,
-            "quarantined": failed,
+            "quarantined": failed and not reconciled_clean,
             "no_op": len(results) == 0 and not failed,
             "pending_versions": [r.version for r in results],
             "results": [self._result_dict(r) for r in results],
+            # Qué hizo el sistema por su cuenta ante el fallo (None si no hizo falta).
+            "reconciliation": reconciliation,
         }
 
     def rollback(
@@ -683,6 +860,16 @@ class ManagedMigrationController:
         estado físico a mano, proceda" (descarta el checkpoint, auditado). Sin este
         override, un fallo NO resumible (sentencia rota / DDL no atómico — ver
         ``migration_progress.py``) dejaría al admin sin ninguna salida.
+
+        **ADVERTENCIA sobre el anti-patrón más común.** La reacción intuitiva ante un apply
+        que falla a mitad es ``stamp --force`` a la versión que falló y después ``rollback``.
+        Eso EMPEORA el problema: el stamp AFIRMA que las N sentencias de esa versión se
+        aplicaron, así que el rollback ejecuta los N reversos contra una BD que solo tiene k
+        cambios físicos — los N-k reversos de lo que nunca corrió fallan ("no existe") y el
+        rollback muere a mitad, dejando un TERCER estado inconsistente. Además ``force``
+        descarta el checkpoint, que era la única prueba de dónde había quedado. La vía
+        correcta es ``/migrations/reconcile-partial`` (deshace exactamente las k que
+        corrieron) o reintentar ``apply``, que retoma desde el checkpoint.
         """
         incomplete = migration_progress.incomplete_progress_for_database(db_id, direction="up")
         if incomplete and not force:
@@ -694,12 +881,19 @@ class ManagedMigrationController:
             raise AppHttpException(
                 message=(
                     f"No se puede stampear: hay una aplicación PARCIAL detectada ({detail}). "
-                    "Reintente 'apply' (retoma automáticamente desde la última sentencia "
-                    "exitosa) o, si ya reconcilió el estado físico manualmente, repita el "
-                    "stamp con force=true."
+                    "Vías correctas, en orden de preferencia: (1) "
+                    "POST /migrations/reconcile-partial, que deshace EXACTAMENTE las "
+                    "sentencias que sí se aplicaron y deja la BD en su versión anterior; "
+                    "(2) reintentar 'apply', que retoma automáticamente desde la última "
+                    "sentencia exitosa. NO stampees esta versión para después revertirla: "
+                    "el stamp afirma que se aplicó COMPLETA, así que el rollback ejecutaría "
+                    "todos los reversos contra una BD que solo tiene una fracción de los "
+                    "cambios, y fallaría también. Si ya reconciliaste el estado físico a "
+                    "mano, repetí el stamp con force=true."
                 ),
                 status_code=409,
                 context={"managed_database_id": db_id, "incomplete_progress": incomplete},
+                public_context={"incomplete_progress": incomplete},
             )
 
     # ------------------------------------------------------------------ #
@@ -960,6 +1154,7 @@ class ManagedMigrationController:
         max_databases: int,
         force: bool = False,
         dry_run: bool = False,
+        on_failure: str = "auto",
         admin: dict | None = None,
     ) -> dict:
         """
@@ -1002,6 +1197,14 @@ class ManagedMigrationController:
             for sid in {d[2] for d in dbs}:
                 srv = get_server_or_404(session, sid)
                 targets[sid] = (build_target(srv), EngineType(engine_value(srv)))
+            # Guards por MOTOR presente en el lote. ``apply`` los corre para su única BD;
+            # acá el lote puede ser HETEROGÉNEO (el mismo blueprint en servidores de motores
+            # distintos), así que se validan una vez por motor distinto — antes se aplicaba
+            # sin revisarlos y un blueprint atado a un motor solo se detectaba por el fallo
+            # del propio motor, BD por BD.
+            for _target, eng in {(None, e) for _t, e in targets.values()}:
+                self._guard_cross_engine(session, model_id, eng)
+                self._guard_untranslatable_sql(specs, eng)
         finally:
             session.close()
 
@@ -1035,6 +1238,7 @@ class ManagedMigrationController:
                         db_id, db_name=name, server_id=server_id, target=target,
                         engine=engine, slug=slug, specs=specs, up_to_version=None,
                         was_quarantined=quarantined, admin=admin,
+                        on_failure=on_failure,
                     )
                     item["ok"] = not out["failed"]
                     item["applied"] = out["results"]

@@ -157,9 +157,23 @@ def apply_migrations(
     dry_run: bool = Query(
         False, description="No aplica: devuelve el plan (versión actual + pendientes)."
     ),
+    on_failure: str = Query(
+        "auto",
+        pattern="^(auto|reconcile|leave)$",
+        description=(
+            "Qué hacer si una migración falla A MITAD (solo posible en MySQL/MariaDB: en "
+            "PostgreSQL el motor deshace la migración por sí solo). "
+            "'auto' (default) deshace lo aplicado SOLO si puede deshacerlo todo; "
+            "'reconcile' deshace igual, salteando y reportando lo que no tiene reverso; "
+            "'leave' no toca nada (cuarentena + checkpoint, comportamiento anterior). "
+            "Con 'auto'/'reconcile' exitosos la BD NO queda en cuarentena: vuelve a su "
+            "versión anterior de forma limpia y solo hay que corregir la migración."
+        ),
+    ),
 ):
     result = ManagedMigrationController().apply(
-        db_id, up_to_version=version, force=force, dry_run=dry_run, admin=admin
+        db_id, up_to_version=version, force=force, dry_run=dry_run,
+        on_failure=on_failure, admin=admin,
     )
     msg = _apply_message(result, dry_run=dry_run)
     return success(data=result, message=msg)
@@ -181,8 +195,26 @@ def _apply_message(result: dict, *, dry_run: bool) -> str:
                 f"({frm}): no se aplica nada (usa /rollback para revertir)."
             )
         return f"La BD ya está en la versión más reciente ({frm or 'sin versión'}); nada que aplicar."
-    suffix = " (con fallo: revisa cuarentena)" if result.get("failed") else ""
-    return f"Aplicadas {result.get('applied_count', 0)} migración(es): {frm or '∅'} → {to}.{suffix}"
+    if result.get("failed"):
+        rec = result.get("reconciliation")
+        if rec and rec.get("fully_reconciled"):
+            return (
+                f"Falló la migración {rec['version']} y el sistema deshizo automáticamente "
+                f"las {rec['undone_count']} sentencia(s) que ya se habían aplicado: la BD "
+                f"quedó limpia en {to or '∅'}. Corregí la migración y reintentá."
+            )
+        if rec and rec.get("attempted"):
+            return (
+                f"Falló la migración {rec['version']} y la reconciliación automática quedó "
+                f"INCOMPLETA ({rec['undone_count']}/{rec['statements_to_undo']} reversos). "
+                "Revisa el estado y usa /migrations/reconcile-partial."
+            )
+        return (
+            f"Aplicadas {result.get('applied_count', 0)} migración(es) con FALLO: "
+            f"{frm or '∅'} → {to}. Revisa la cuarentena y /migrations/status "
+            "(¿aplicación parcial?)."
+        )
+    return f"Aplicadas {result.get('applied_count', 0)} migración(es): {frm or '∅'} → {to}."
 
 
 @router.post("/{db_id}/migrations/rollback", response_model=ApiResponse[MigrationRollbackOut])

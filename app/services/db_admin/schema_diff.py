@@ -1580,7 +1580,7 @@ def build_dependency_graph(items: list[DiffItem]) -> dict[str, set[str]]:
         if referred in new_tables:
             add(it.op_key(), f"table|{referred}|new")
 
-    # 6) tabla eliminada -> FKs ENTRANTES eliminadas (desde otras tablas). Sin borrar
+    # 5) tabla eliminada -> FKs ENTRANTES eliminadas (desde otras tablas). Sin borrar
     #    primero la FK que la referencia, el DROP TABLE falla (MySQL 1451/3730).
     for it in items:
         if it.object_type != "foreign_key" or it.change_type != "dropped":
@@ -1589,7 +1589,40 @@ def build_dependency_graph(items: list[DiffItem]) -> dict[str, set[str]]:
         if referred in dropped_tables:
             add(f"table|{referred}|dropped", it.op_key())
 
-    # 5) objetos con cuerpo: dependencias por nombre mencionado en el cuerpo.
+    # 6) tabla/columna nueva -> el TIPO ENUM o la SECUENCIA que usa.
+    #    Muy común en PostgreSQL: una columna declarada ``estado mi_estado`` o con default
+    #    ``nextval('mi_seq'::regclass)`` no se puede crear si el tipo/la secuencia no
+    #    existen. El orden ya lo garantizan los pasos (prerrequisitos antes que tablas);
+    #    la arista hace falta para el CIERRE de una selección parcial: elegir la tabla sin
+    #    su ENUM fallaba con "type does not exist".
+    prereq_by_name: dict[str, list[str]] = {}
+    for it in items:
+        if it.object_type in ("enum_type", "sequence") and it.change_type in ("new", "modified"):
+            prereq_by_name.setdefault(it.object_name.lower(), []).append(it.op_key())
+    if prereq_by_name:
+        for it in items:
+            if it.change_type == "dropped":
+                continue
+            if it.object_type == "table":
+                columns = getattr(it.source_payload, "columns", []) or []
+            elif it.object_type == "column":
+                columns = [it.source_payload] if it.source_payload is not None else []
+            else:
+                continue
+            mentioned: set[str] = set()
+            for c in columns:
+                # El TIPO y el DEFAULT son los dos lugares donde una columna nombra un
+                # tipo ENUM o una secuencia. También la expresión de una columna generada.
+                parts = [getattr(c, "type", ""), getattr(c, "default", "") or ""]
+                computed = getattr(c, "computed", None)
+                if computed is not None:
+                    parts.append(getattr(computed, "sqltext", "") or "")
+                mentioned |= _referenced_identifiers(" ".join(str(p) for p in parts))
+            for name in mentioned:
+                for provider in prereq_by_name.get(name, []):
+                    add(it.op_key(), provider)
+
+    # 7) objetos con cuerpo: dependencias por nombre mencionado en el cuerpo.
     body_items = [it for it in items if it.object_type in _BODY_TYPES]
     providers: dict[str, list[str]] = {}
     for it in items:

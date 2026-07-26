@@ -228,6 +228,33 @@ class MigrationResultOut(BaseModel):
     )
 
 
+class MigrationAutoReconcileOut(BaseModel):
+    """
+    Auto-reconciliación ejecutada por el sistema tras un fallo a mitad de una migración.
+
+    Existe para que un `apply` fallido no deje la BD en un estado que el admin tenga que
+    entender y desarmar a mano. Se deshacen EXACTAMENTE las sentencias que alcanzaron a
+    commitear, en orden inverso, y la BD vuelve a su versión anterior.
+    """
+
+    version: str = Field(..., description="Versión que falló y se deshizo")
+    attempted: bool = True
+    undone_count: int = 0
+    statements_to_undo: int = 0
+    fully_reconciled: bool = Field(
+        False, description="True si la BD volvió a coincidir con su versión registrada"
+    )
+    unconfirmed_reverses: list[dict] = Field(
+        default_factory=list,
+        description="Reversos ejecutados que NO son demostrablemente seguros (revisar)",
+    )
+    unreversible_statements: list[dict] = Field(
+        default_factory=list,
+        description="Sentencias aplicadas sin reverso: siguen en la BD",
+    )
+    error: str | None = None
+
+
 class MigrationApplyOut(BaseModel):
     """
     Resultado de `POST .../migrations/apply` (cubre apply real y dry-run).
@@ -252,6 +279,15 @@ class MigrationApplyOut(BaseModel):
     dry_run: bool = False
     pending_versions: list[str] = Field(default_factory=list)
     results: list[MigrationResultOut] = Field(default_factory=list)
+    reconciliation: MigrationAutoReconcileOut | None = Field(
+        None,
+        description=(
+            "Qué hizo el sistema por su cuenta si una migración falló A MITAD (solo puede "
+            "pasar en MySQL/MariaDB: en PostgreSQL el motor deshace la migración solo). "
+            "null = no hizo falta. Con 'fully_reconciled=true' la BD volvió limpia a su "
+            "versión anterior y NO queda en cuarentena: solo hay que corregir la migración."
+        ),
+    )
 
 
 class MigrationRollbackOut(BaseModel):
