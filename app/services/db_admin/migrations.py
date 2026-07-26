@@ -68,6 +68,26 @@ _ALEMBIC_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
+class ManifestStatement:
+    """
+    UNA sentencia del manifiesto de una migración, con su reverso EMPAREJADO.
+
+    Espejo plano de ``model_migration_statements`` (ver el docstring de ese modelo). El
+    ``seq`` es 1-based y coincide con el índice del checkpoint
+    (``migration_statement_progress.last_statement_index``): ese acople es justamente lo
+    que permite saber qué sentencias se aplicaron y cuáles hay que deshacer.
+    """
+
+    seq: int
+    up_sql: str
+    down_sql: str | None = None
+    down_confirmed: bool = False
+    object_type: str | None = None
+    object_name: str | None = None
+    destructive: bool = False
+
+
+@dataclass(frozen=True)
 class MigrationSpec:
     """Datos planos de una migración (desacoplados de la sesión ORM)."""
 
@@ -81,6 +101,19 @@ class MigrationSpec:
     checksum: str
     kind: str = "schema"  # 'schema' | 'data' (los datos no se traducen cross-engine)
     has_non_portable: bool = False  # rutinas/triggers/events no traducibles cross-engine
+    source_engine: str | None = None  # motor para el que está renderizado el SQL/manifiesto
+    # Manifiesto de sentencias (vacío = no hay; se degrada a partir el blob con el
+    # splitter, comportamiento histórico). Solo se usa si ``source_engine`` coincide con
+    # el motor destino: el SQL traducido cross-engine puede no partirse igual.
+    manifest: tuple[ManifestStatement, ...] = ()
+
+    def manifest_for(self, engine: EngineType) -> tuple[ManifestStatement, ...]:
+        """Manifiesto de este motor, o vacío si no hay o es de otro motor."""
+        if not self.manifest or not self.source_engine:
+            return ()
+        if self.source_engine != engine.value:
+            return ()
+        return self.manifest
 
 
 @dataclass(frozen=True)
@@ -170,6 +203,78 @@ class MigrationRunner:
         return translated if translated is not None else spec.down_sql
 
     # ------------------------------------------------------------------ #
+    # Manifiesto de sentencias (fuente ÚNICA de la lista de sentencias)    #
+    # ------------------------------------------------------------------ #
+    # El separador con el que ``SchemaComparisonController.adopt_comparison`` ensambla el
+    # ``up_sql`` a partir de las sentencias. Reproducirlo es el chequeo de integridad del
+    # manifiesto: exacto y SIN pasar por el splitter.
+    _MANIFEST_JOIN = ";\n"
+
+    def usable_manifest(
+        self, spec: MigrationSpec, engine: EngineType
+    ) -> tuple[ManifestStatement, ...]:
+        """
+        Manifiesto que se puede usar con CONFIANZA para este motor, o vacío.
+
+        Verificación de integridad: concatenar las sentencias del manifiesto tiene que
+        reproducir EXACTAMENTE el ``up_sql`` vigente para el motor. Es la misma operación
+        con la que se construyó (``";\\n".join(...)`` en la adopción), así que es una
+        igualdad exacta y —a diferencia de comparar cantidades— no depende del splitter.
+
+        Si no coincide, el ``up_sql`` fue editado sin regenerar el manifiesto (el ``PATCH``
+        ya lo borra, esto es la segunda barrera) y el manifiesto NO se usa: se vuelve al
+        camino histórico de partir el blob. Fail-closed: un manifiesto desalineado haría
+        que una reconciliación deshiciera la sentencia equivocada.
+        """
+        manifest = spec.manifest_for(engine)
+        if not manifest:
+            return ()
+        expected = self.select_up_sql(spec, engine)
+        if self._MANIFEST_JOIN.join(m.up_sql for m in manifest) != expected:
+            logger.warning(
+                "Manifiesto de la migración %s descartado: no reproduce el up_sql vigente "
+                "(¿SQL editado sin regenerarlo?). Se usa el splitter.",
+                spec.version,
+            )
+            return ()
+        return manifest
+
+    def statement_lists(
+        self, spec: MigrationSpec, engine: EngineType
+    ) -> tuple[list[str], list[str], bool]:
+        """
+        ``(sentencias_up, sentencias_down, pinned)`` para este motor — fuente ÚNICA de la
+        lista de sentencias de una migración.
+
+        Existe para que el codegen, el conteo del resultado y la resolución del offset de
+        resume vean EXACTAMENTE la misma lista. Cuando cada uno la calculaba por su cuenta,
+        una discrepancia de conteo entre manifiesto y splitter disparaba el 409 de
+        "checkpoint que ya no coincide" sin que nada hubiera cambiado.
+
+        Con manifiesto: una sentencia por fila (el ``seq`` del manifiesto ES el índice del
+        checkpoint, así que NUNCA se re-parte una fila del up). El reverso sí se parte: el
+        ``down_sql`` de una redefinición es multi-sentencia (``DROP nuevo; CREATE viejo``)
+        y cada ``op.execute`` admite una sola.
+        """
+        manifest = self.usable_manifest(spec, engine)
+        if manifest:
+            up_statements = [m.up_sql for m in manifest]
+            down_statements = [
+                s
+                for m in reversed(manifest)
+                if m.down_sql
+                for s in split_sql_statements(m.down_sql)
+            ]
+            return up_statements, down_statements, True
+        up = self.select_up_sql(spec, engine)
+        down = self.select_down_sql(spec, engine)
+        return (
+            split_sql_statements(up),
+            split_sql_statements(down) if down else [],
+            False,
+        )
+
+    # ------------------------------------------------------------------ #
     # Generación de archivos de revisión (temporales)                    #
     # ------------------------------------------------------------------ #
     def _write_revision_files(
@@ -197,14 +302,15 @@ class MigrationRunner:
             validate_version(spec.version)
             up = self.select_up_sql(spec, engine)
             down = self.select_down_sql(spec, engine)
-            up_statements = split_sql_statements(up)
-            down_statements = split_sql_statements(down) if down else []
+            up_statements, down_statements, pinned = self.statement_lists(spec, engine)
 
             up_resumable = migration_progress.is_resumable(
                 up, up_statements, kind=spec.kind, has_non_portable=spec.has_non_portable,
+                manifest_pinned=pinned,
             )
             down_resumable = bool(down_statements) and migration_progress.is_resumable(
-                down, down_statements, kind=spec.kind, has_non_portable=spec.has_non_portable,
+                down or "", down_statements, kind=spec.kind,
+                has_non_portable=spec.has_non_portable, manifest_pinned=pinned,
             )
             up_resume_from = self._resolve_resume_offset(
                 managed_db_id, spec, "up", up_resumable, len(up_statements)
@@ -539,7 +645,9 @@ class MigrationRunner:
             current = self._read_current(conn, version_table)
             pending = self.compute_pending(current, specs, up_to_version)
             for spec in pending:
-                up_total = len(split_sql_statements(self.select_up_sql(spec, engine)))
+                # MISMA lista que vio el codegen (ver statement_lists): si el conteo
+                # difiere, _resolve_resume_offset dispara un 409 espurio.
+                up_total = len(self.statement_lists(spec, engine)[0])
                 result = self._apply_one(
                     cfg, spec, managed_db_id=managed_db_id, statement_total=up_total
                 )
@@ -630,8 +738,7 @@ class MigrationRunner:
                 spec = by_version.get(current)
                 mig_id = spec.id if spec else -1
                 down_total = (
-                    len(split_sql_statements(self.select_down_sql(spec, engine) or ""))
-                    if spec else 0
+                    len(self.statement_lists(spec, engine)[1]) if spec else 0
                 ) or None
                 pre = (
                     migration_progress.get_progress(managed_db_id, mig_id, "down")
@@ -682,6 +789,90 @@ class MigrationRunner:
                 if new_current == current:
                     break
                 current = new_current
+        return results
+
+    # ------------------------------------------------------------------ #
+    # Reconciliación de una aplicación PARCIAL                            #
+    # ------------------------------------------------------------------ #
+    def reconcile_partial(
+        self,
+        target: ServerTarget,
+        *,
+        db_name: str,
+        engine: EngineType,
+        managed_db_id: int,
+        spec: MigrationSpec,
+        inverses: list[tuple[int, str]],
+        total_statements: int,
+    ) -> list[StatementResult]:
+        """
+        Deshace las sentencias que SÍ se aplicaron de una migración que falló a mitad,
+        dejando la BD igual a lo que el ledger de Alembic ya afirma.
+
+        **Por qué existe.** El DDL corre en AUTOCOMMIT (obligado en MySQL/MariaDB, donde no
+        es transaccional), y Alembic escribe la versión en ``_gw_v_{slug}`` recién al
+        terminar el ``upgrade()``. Si la migración N muere en la sentencia 3 de 50 queda un
+        estado partido: el ledger dice "estoy en N-1" y la BD tiene, físicamente, 3
+        sentencias de N. Un ``rollback`` en ese estado arranca en N-1 y ejecuta el
+        ``down_sql`` de N-1 contra una BD contaminada con parte de N.
+
+        Esto NO es un ``downgrade`` de Alembic: la versión N nunca se aplicó, no hay nada
+        que "bajar" en el ledger (y por eso tampoco se lo toca). Es una COMPENSACIÓN —
+        ejecutar el reverso exacto de las sentencias 1..k en orden inverso— que vuelve el
+        plano físico a coincidir con el ledger.
+
+        ``inverses`` viene ya ordenado del ``seq`` más alto al más bajo, con el ``down_sql``
+        de cada sentencia. El checkpoint se DECREMENTA después de cada reverso exitoso
+        (``seq-1``), así que si esto mismo falla a mitad, el checkpoint sigue describiendo
+        con exactitud qué queda aplicado y un reintento retoma donde quedó. Se limpia solo
+        al llegar a 0.
+        """
+        results: list[StatementResult] = []
+        try:
+            with database_connection(target, db_name) as conn:
+                conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+                self._acquire_lock(conn, engine, managed_db_id)
+                try:
+                    for seq, sql in inverses:
+                        t0 = time.monotonic()
+                        try:
+                            conn.exec_driver_sql(self._escape_percent(sql))
+                        except Exception as exc:  # noqa: BLE001 — registrar y detener
+                            ms = int((time.monotonic() - t0) * 1000)
+                            logger.warning(
+                                "Reconciliación parcial de %s: falló el reverso de la "
+                                "sentencia %d: %s", spec.version, seq, exc, exc_info=True,
+                            )
+                            results.append(StatementResult(
+                                index=seq, status="failed", error=_clean_error(exc),
+                                execution_ms=ms, executed_at=datetime.now(timezone.utc),
+                            ))
+                            break
+                        ms = int((time.monotonic() - t0) * 1000)
+                        results.append(StatementResult(
+                            index=seq, status="applied", error=None,
+                            execution_ms=ms, executed_at=datetime.now(timezone.utc),
+                        ))
+                        # El reverso de la sentencia `seq` ya commiteó: lo aplicado ahora
+                        # llega hasta `seq-1`. Se graba DESPUÉS (nunca antes): en el peor
+                        # caso se re-deshace una sentencia ya deshecha (ruidoso pero
+                        # visible), no se saltea una que sigue aplicada (silencioso).
+                        if seq - 1 <= 0:
+                            migration_progress.clear_progress(managed_db_id, spec.id, "up")
+                        else:
+                            migration_progress.record_statement(
+                                managed_db_id, spec.id, "up", seq - 1,
+                                total_statements, spec.checksum,
+                            )
+                finally:
+                    self._release_lock(conn, engine, managed_db_id)
+        except AppHttpException:
+            raise
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="migration_reconcile_partial", target=target,
+                extra={"database": db_name},
+            )
         return results
 
     def stamp(

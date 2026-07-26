@@ -32,6 +32,7 @@ from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
 from app.models.enums import EngineType, MigrationStatus
 from app.models.model_migration import ModelMigration
+from app.models.model_migration_statement import ModelMigrationStatement
 from app.services import audit
 from app.services.db_admin import migration_progress
 from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
@@ -286,6 +287,9 @@ class ModelMigrationController:
                     # flush hace visible la migración a _bump_model_version y detecta el
                     # conflicto de versión (UNIQUE) en la MISMA transacción.
                     session.flush()
+                    self._write_statement_manifest(
+                        session, migration.id, data.get("statements"), source_engine
+                    )
                     self._bump_model_version(session, model_id)
                     session.commit()  # inserción + current_version en un único commit
                     break
@@ -326,6 +330,41 @@ class ModelMigrationController:
             detail=f"migración {assigned_version} creada (id={migration_id})",
         )
         return result
+
+    @staticmethod
+    def _write_statement_manifest(
+        session, migration_id: int, statements: list[dict] | None, source_engine: str | None
+    ) -> None:
+        """
+        Persiste el MANIFIESTO de sentencias de la versión (una fila por sentencia, con su
+        reverso emparejado). Ver ``app/models/model_migration_statement.py``.
+
+        Se escribe en la MISMA transacción que la migración: o existen las dos cosas o
+        ninguna (un manifiesto huérfano describiría un ``up_sql`` que no se guardó).
+
+        Es OPCIONAL: solo lo provee el flujo que conoce el emparejamiento sentencia↔reverso
+        (la adopción de un diff estructural). Requiere ``source_engine``: el manifiesto está
+        renderizado para UN motor y el runner solo lo usa si coincide con el destino — sin
+        saber para cuál es, no sirve, así que se ignora en silencio en vez de guardar filas
+        que nunca se podrán validar.
+        """
+        if not statements or not source_engine:
+            return
+        for i, st in enumerate(statements, start=1):
+            session.add(
+                ModelMigrationStatement(
+                    model_migration_id=migration_id,
+                    seq=i,
+                    engine=source_engine,
+                    up_sql=st["up_sql"],
+                    down_sql=st.get("down_sql"),
+                    down_confirmed=bool(st.get("down_confirmed")),
+                    object_type=st.get("object_type"),
+                    object_name=(st.get("object_name") or "")[:512] or None,
+                    op_group=(st.get("op_group") or "")[:600] or None,
+                    destructive=bool(st.get("destructive")),
+                )
+            )
 
     # Motivos de omisión de datos-semilla que honran on_oversize="error".
     _OVERSIZE_REASONS = ("oversize_rows", "oversize_bytes")
@@ -711,6 +750,17 @@ class ModelMigrationController:
             if data.get("reviewed") is not None:
                 reviewed_approved = bool(data["reviewed"]) and not m.reviewed
                 m.reviewed = bool(data["reviewed"])
+
+            # El MANIFIESTO de sentencias (``model_migration_statements``) describe el
+            # ``up_sql`` que se guardó al crear la versión: si el SQL cambia, el
+            # emparejamiento sentencia↔reverso y los índices ``seq`` ya no corresponden.
+            # Se BORRA en vez de intentar re-derivarlo: un manifiesto desalineado haría
+            # que una reconciliación parcial deshiciera la sentencia equivocada
+            # (corrupción silenciosa). La migración vuelve al modo todo-o-nada.
+            if sql_fields_changing:
+                session.query(ModelMigrationStatement).filter(
+                    ModelMigrationStatement.model_migration_id == m.id
+                ).delete(synchronize_session=False)
 
             # Recalcular checksum si cambió alguna variante de SQL o el rollback.
             m.checksum = compute_checksum(

@@ -61,16 +61,33 @@ _PROCEDURAL_HINT = re.compile(
 
 
 def is_resumable(
-    raw_sql: str, statements: list[str], *, kind: str, has_non_portable: bool
+    raw_sql: str,
+    statements: list[str],
+    *,
+    kind: str,
+    has_non_portable: bool,
+    manifest_pinned: bool = False,
 ) -> bool:
     """
     Decide si una migración puede reanudarse sentencia-por-sentencia. Fail-closed: ante
     cualquier duda, False (todo-o-nada, comportamiento actual sin checkpoint).
+
+    ``manifest_pinned=True`` cuando las sentencias NO salen de partir un blob sino del
+    MANIFIESTO persistido (``model_migration_statements``, una fila por sentencia). Eso
+    elimina la única razón por la que se excluían los cuerpos procedurales y las
+    migraciones ``has_non_portable``: el riesgo era indexar mal por una duda del splitter,
+    y con el manifiesto no hay splitter — el índice ``seq`` es dato, no inferencia. Las
+    exclusiones por ESTADO DE SESIÓN se mantienen siempre: no dependen de cómo se
+    obtuvieron las sentencias sino de que un resume abre una conexión NUEVA que pierde
+    ese estado.
     """
-    if kind == "data" or has_non_portable or not statements:
+    if kind == "data" or not statements:
         return False
-    if _PROCEDURAL_HINT.search(raw_sql):
-        return False
+    if not manifest_pinned:
+        if has_non_portable:
+            return False
+        if _PROCEDURAL_HINT.search(raw_sql):
+            return False
     for stmt in statements:
         s = stmt.strip().lower()
         if s and s.startswith(_SESSION_STATEMENT_PREFIXES):
