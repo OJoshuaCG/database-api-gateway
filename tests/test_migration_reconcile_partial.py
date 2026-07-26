@@ -408,3 +408,168 @@ def test_postgresql_serial_columns_are_rendered_as_serial():
     assert "SERIAL" not in ad._render_column_def(
         ColumnInfo(name="id", type="integer", nullable=True, default=nextval)
     )
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoint por SENTENCIA completa en la reconciliación (reversos multi-parte) #
+# --------------------------------------------------------------------------- #
+def test_reconcile_checkpoint_decrements_only_after_the_whole_reverse_of_a_seq():
+    """
+    El reverso de una redefinición son DOS sentencias con el MISMO seq (DROP nuevo;
+    CREATE viejo). Decrementar el checkpoint tras la primera afirmaría "la sentencia
+    quedó deshecha" con el reverso a medias: si la segunda falla y se reintenta, la
+    mitad restante se saltearía en silencio. El checkpoint debe moverse recién cuando
+    TODO el grupo del seq terminó.
+    """
+    from unittest import mock
+
+    from app.services.db_admin import migrations as mig_mod
+
+    recorded: list[tuple] = []
+    cleared: list[tuple] = []
+
+    class _FakeConn:
+        def __init__(self):
+            self.executed: list[str] = []
+
+        def execution_options(self, **kw):
+            return self
+
+        def exec_driver_sql(self, sql):
+            # El lock (GET_LOCK / RELEASE_LOCK) responde 1; el 2º reverso del seq 4 falla.
+            if "GET_LOCK" in sql or "RELEASE_LOCK" in sql:
+                return mock.Mock(scalar=lambda: 1)
+            self.executed.append(sql)
+            if sql == "CREATE INDEX viejo":
+                raise RuntimeError("boom")
+            return mock.Mock()
+
+    fake_conn = _FakeConn()
+
+    class _Ctx:
+        def __enter__(self):
+            return fake_conn
+
+        def __exit__(self, *a):
+            return False
+
+    spec = _spec()
+    with mock.patch.object(mig_mod, "database_connection", lambda *a, **k: _Ctx()), \
+         mock.patch.object(mig_mod.migration_progress, "record_statement",
+                           side_effect=lambda *a: recorded.append(a)), \
+         mock.patch.object(mig_mod.migration_progress, "clear_progress",
+                           side_effect=lambda *a: cleared.append(a)):
+        results = MigrationRunner().reconcile_partial(
+            mock.Mock(),  # target (no se usa: database_connection está mockeada)
+            db_name="db", engine=EngineType.mysql, managed_db_id=9, spec=spec,
+            # seq 4 tiene reverso de DOS sentencias; la segunda REVIENTA.
+            inverses=[(4, "DROP INDEX nuevo"), (4, "CREATE INDEX viejo"),
+                      (3, "DROP TABLE `b`")],
+            total_statements=4,
+        )
+
+    # La primera mitad del seq 4 corrió, la segunda falló, el seq 3 nunca se intentó.
+    assert [r.status for r in results] == ["applied", "failed"]
+    # CRÍTICO: el checkpoint NO se movió (el seq 4 no terminó) — un reintento vuelve a
+    # deshacer el seq 4 completo en vez de saltearlo a medias.
+    assert recorded == [], recorded
+    assert cleared == [], cleared
+
+
+def test_reconcile_checkpoint_moves_once_per_seq_when_all_parts_succeed():
+    from unittest import mock
+
+    from app.services.db_admin import migrations as mig_mod
+
+    recorded: list[tuple] = []
+    cleared: list[tuple] = []
+
+    class _FakeConn:
+        def execution_options(self, **kw):
+            return self
+
+        def exec_driver_sql(self, sql):
+            return mock.Mock(scalar=lambda: 1)
+
+    class _Ctx:
+        def __enter__(self):
+            return _FakeConn()
+
+        def __exit__(self, *a):
+            return False
+
+    spec = _spec()
+    with mock.patch.object(mig_mod, "database_connection", lambda *a, **k: _Ctx()), \
+         mock.patch.object(mig_mod.migration_progress, "record_statement",
+                           side_effect=lambda *a: recorded.append(a)), \
+         mock.patch.object(mig_mod.migration_progress, "clear_progress",
+                           side_effect=lambda *a: cleared.append(a)):
+        results = MigrationRunner().reconcile_partial(
+            mock.Mock(), db_name="db", engine=EngineType.mysql, managed_db_id=9,
+            spec=spec,
+            inverses=[(2, "DROP X"), (2, "CREATE Y"), (1, "DROP Z")],
+            total_statements=4,
+        )
+
+    assert all(r.status == "applied" for r in results)
+    # UN movimiento de checkpoint por seq (no por sub-sentencia): 2→1, y al llegar a 0
+    # se limpia en vez de grabar.
+    assert [a[3] for a in recorded] == [1], recorded  # solo seq-1 = 1
+    assert len(cleared) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Guards de dirección CRUZADA (apply con rollback parcial, stamp con ambos)     #
+# --------------------------------------------------------------------------- #
+def test_apply_is_blocked_while_a_rollback_is_partially_executed():
+    """
+    Simétrico de ROB2: si el downgrade de N falló a mitad, el ledger sigue en N pero la BD
+    tiene ALGUNOS reversos ejecutados. Un apply ahí lee current=N y congela la versión a
+    medio deshacer para siempre. La salida es reintentar el rollback (retoma del checkpoint).
+    """
+    from unittest import mock
+
+    from app.controllers import managed_migration_controller as ctrl_mod
+    from app.exceptions import AppHttpException
+
+    row = {"model_migration_id": 7, "last_statement_index": 2, "total_statements": 4}
+
+    def fake_incomplete(db_id, direction="up"):
+        return [row] if direction == "down" else []
+
+    with mock.patch.object(
+        ctrl_mod.migration_progress, "incomplete_progress_for_database",
+        side_effect=fake_incomplete,
+    ):
+        try:
+            ctrl_mod.ManagedMigrationController._guard_partial_down_before_apply(
+                1, [_spec()]
+            )
+            raise AssertionError("debía bloquear con 409")
+        except AppHttpException as exc:
+            assert exc.status_code == 409
+            assert "ROLLBACK parcialmente ejecutado" in exc.message
+
+
+def test_stamp_guard_detects_partials_in_both_directions():
+    """El stamp enmascara igual un apply a medias que un rollback a medias."""
+    from unittest import mock
+
+    from app.controllers import managed_migration_controller as ctrl_mod
+    from app.exceptions import AppHttpException
+
+    row = {"model_migration_id": 7, "last_statement_index": 1, "total_statements": 3}
+
+    for partial_direction in ("up", "down"):
+        def fake_incomplete(db_id, direction="up", _pd=partial_direction):
+            return [dict(row)] if direction == _pd else []
+
+        with mock.patch.object(
+            ctrl_mod.migration_progress, "incomplete_progress_for_database",
+            side_effect=fake_incomplete,
+        ):
+            try:
+                ctrl_mod.ManagedMigrationController._guard_partial_checkpoint(1, force=False)
+                raise AssertionError(f"debía bloquear con 409 (partial {partial_direction})")
+            except AppHttpException as exc:
+                assert exc.status_code == 409

@@ -658,6 +658,24 @@ matview). Pendiente en este camino: `_persist_snapshot_versions` no escribe mani
 baseline que falla a mitad no es reconciliable) y `filter_statements` no valida cierre
 (excluir `type` deja un baseline inaplicable en silencio).
 
+**Endurecimiento de bordes de la reconciliación (2ª pasada, 2026-07-26)**: (1) el checkpoint
+de `reconcile_partial` se decrementa recién cuando TODOS los reversos de un `seq` terminaron —
+un reverso multi-sentencia (redefinición: `DROP nuevo; CREATE viejo`) aporta DOS entradas con
+el mismo `seq`, y decrementar tras la primera afirmaba "sentencia deshecha" a medias (un
+reintento saltearía la mitad restante en silencio). (2) Guards de dirección CRUZADA:
+`_guard_partial_down_before_apply` (409: `apply` con un ROLLBACK a medio ejecutar congelaría
+la versión N a medio deshacer — el ledger sigue en N y "no hay pendientes"; la salida es
+reintentar el rollback, que retoma del checkpoint `down`); el guard de `stamp` ahora mira
+AMBAS direcciones y `force` limpia ambas. (3) Rutinas invocadas por DDL de tabla
+(PostgreSQL: `DEFAULT next_id()`, `CHECK (fn(x))`, GENERATED con función IMMUTABLE — MySQL no
+lo permite): se ADELANTAN al paso 26 (`_STEP_ROUTINE_PREREQ` + `_table_ddl_routine_deps`, con
+arista para el cierre de selección) — antes el CREATE TABLE moría con 42883 porque las
+rutinas van en el paso 80. Exclusión de dependencia MUTUA fail-closed: si el cuerpo de la
+rutina consulta una tabla del diff, NO se adelanta (una función SQL-language que consulta la
+tabla se valida al crearse). Mismo hoist en `snapshot_layout._prereq_routines` para el
+baseline. Un falso positivo del escaneo es inocuo (crear antes una rutina que no toca tablas
+no rompe nada).
+
 **Manifiesto de sentencias + reconciliación de una aplicación PARCIAL** (`model_migration_statements`,
 tabla nueva; migración `e2f3a4b5c6d7`): cierra el agujero más grave del rollback. Alembic
 escribe la versión en `_gw_v_{slug}` recién al TERMINAR el `upgrade()`, así que un `apply` que

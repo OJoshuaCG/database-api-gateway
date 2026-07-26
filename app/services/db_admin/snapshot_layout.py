@@ -208,6 +208,33 @@ def _order_by_body_references(items: list[DumpStatement]) -> list[DumpStatement]
     return ordered
 
 
+def _prereq_routines(
+    tables: list[DumpStatement], routines: list[DumpStatement]
+) -> set[str]:
+    """
+    Nombres de rutinas que el DDL de alguna TABLA invoca y que hay que crear ANTES.
+
+    PostgreSQL valida al ejecutar el ``CREATE TABLE`` las funciones usadas en un
+    ``DEFAULT``, un ``CHECK`` o una columna ``GENERATED`` — con las rutinas después de
+    las tablas (el orden correcto para el caso común: funciones que consultan tablas),
+    ese baseline moría con ``42883``. Se adelantan SOLO las rutinas mencionadas por DDL
+    de tabla cuyo propio cuerpo no menciona ninguna tabla del dump (dependencia mutua →
+    fail-closed: se conserva el orden actual). Un falso positivo del escaneo es inocuo:
+    crear antes una rutina que no toca tablas nunca rompe nada.
+    """
+    if not tables or not routines:
+        return set()
+    table_refs = _referenced_identifiers(" ".join(t.ddl for t in tables))
+    table_names = {t.name.lower() for t in tables}
+    out: set[str] = set()
+    for r in routines:
+        if r.name.lower() in table_refs and not (
+            _referenced_identifiers(r.ddl) & table_names
+        ):
+            out.add(r.name)
+    return out
+
+
 def order_statements(statements: list[DumpStatement]) -> list[DumpStatement]:
     """
     Ordena por clase canónica; dentro de cada clase, por DEPENDENCIA real.
@@ -216,19 +243,31 @@ def order_statements(statements: list[DumpStatement]) -> list[DumpStatement]:
     - objetos con cuerpo (``view``/``materialized_view``/``routine``/``trigger``/``event``):
       topológico por las referencias de su DDL (vista sobre vista, trigger sobre la rutina
       que llama). Antes era alfabético, que es azar.
+    - rutinas invocadas por DDL de tabla (``DEFAULT``/``CHECK``/``GENERATED`` de
+      PostgreSQL): se ADELANTAN antes de las tablas (ver ``_prereq_routines``).
     - el resto: alfabético (no hay dependencias intra-clase que resolver).
     """
     by_class: dict[str, list[DumpStatement]] = {}
     for s in statements:
         by_class.setdefault(s.object_type, []).append(s)
 
+    prereq = _prereq_routines(by_class.get("table", []), by_class.get("routine", []))
+
     result: list[DumpStatement] = []
     for cls in _CLASS_ORDER:
         items = by_class.get(cls, [])
+        if cls == "table" and prereq:
+            # Las rutinas-prerrequisito van ANTES de las tablas, ordenadas entre sí.
+            hoisted = [r for r in by_class.get("routine", []) if r.name in prereq]
+            result.extend(_order_by_body_references(hoisted))
         if not items:
             continue
         if cls == "table":
             result.extend(_topo_sort_tables(items))
+        elif cls == "routine" and prereq:
+            result.extend(
+                _order_by_body_references([r for r in items if r.name not in prereq])
+            )
         elif cls in _BODY_CLASSES:
             result.extend(_order_by_body_references(items))
         else:

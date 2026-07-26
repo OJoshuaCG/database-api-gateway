@@ -1337,6 +1337,18 @@ _STEP_BODY_DROP_EARLY = 20
 # en la fase destructiva (paso 100), que va mucho después.
 _STEP_FK_DROP_EARLY = 38
 
+# Paso al que se ADELANTA una RUTINA que el DDL de una tabla referencia. PostgreSQL permite
+# funciones del usuario en un ``DEFAULT`` (``next_id()``), en un ``CHECK`` y en una columna
+# ``GENERATED`` (si es IMMUTABLE) — y las valida al ejecutar el ``CREATE TABLE``/``ALTER``.
+# Con las rutinas en el paso 80 (después de las tablas, que es lo correcto para el caso
+# común: funciones que CONSULTAN tablas), ese CREATE TABLE fallaba con ``function … does
+# not exist`` (42883). Solo se adelantan las rutinas efectivamente referenciadas por DDL de
+# tabla, y NUNCA si el cuerpo de la rutina menciona a su vez una tabla del diff (dependencia
+# mutua: una función SQL-language que consulta la tabla se valida al crearse — ahí gana el
+# orden normal y el caso queda como estaba, fail-closed). MySQL/MariaDB no admiten funciones
+# almacenadas en DEFAULT/CHECK/GENERATED, así que esto no los afecta.
+_STEP_ROUTINE_PREREQ = 26
+
 # Desempate por tipo cuando NO hay dependencia detectable entre dos objetos con cuerpo:
 # lo que suele ser dependencia de otros va primero. Solo se usa dentro del mismo nivel
 # topológico, así que nunca contradice una dependencia real.
@@ -1622,7 +1634,16 @@ def build_dependency_graph(items: list[DiffItem]) -> dict[str, set[str]]:
                 for provider in prereq_by_name.get(name, []):
                     add(it.op_key(), provider)
 
-    # 7) objetos con cuerpo: dependencias por nombre mencionado en el cuerpo.
+    # 7) tabla/columna/CHECK nueva -> la RUTINA que su DDL invoca (PostgreSQL).
+    #    ``DEFAULT next_id()``, ``CHECK (validar(x))`` o una columna GENERATED con función
+    #    inmutable se validan al ejecutar el CREATE/ALTER: la función tiene que existir
+    #    antes. La arista alimenta el cierre de selección; el ORDEN lo resuelve el hoist
+    #    de ``order_diff_items`` (las rutinas viven en el paso 80, después de las tablas).
+    for consumer_key, routine_keys in _table_ddl_routine_deps(items).items():
+        for rkey in routine_keys:
+            add(consumer_key, rkey)
+
+    # 8) objetos con cuerpo: dependencias por nombre mencionado en el cuerpo.
     body_items = [it for it in items if it.object_type in _BODY_TYPES]
     providers: dict[str, list[str]] = {}
     for it in items:
@@ -1755,6 +1776,78 @@ def _hoist_blocking_fk_drops(items: list[DiffItem]) -> set[str]:
     return hoisted
 
 
+def _table_ddl_routine_deps(items: list[DiffItem]) -> dict[str, set[str]]:
+    """
+    ``op_key`` de tabla/columna/CHECK -> rutinas del diff que su DDL invoca.
+
+    PostgreSQL valida al ejecutar el ``CREATE TABLE``/``ALTER`` cualquier función usada en
+    un ``DEFAULT``, un ``CHECK`` o una columna ``GENERATED`` — si la función se crea
+    después (paso 80, tras las tablas), el DDL muere con ``42883 function … does not
+    exist``. MySQL/MariaDB no admiten funciones almacenadas ahí, así que nunca aporta
+    aristas para ellos.
+
+    Exclusión de dependencia MUTUA (fail-closed): si el CUERPO de la rutina menciona a su
+    vez una tabla del diff, NO se registra la arista ni se adelanta — una función
+    SQL-language que consulta la tabla se valida al crearse, y adelantarla rompería ese
+    caso. Ahí se conserva el orden actual (tabla primero) y el caso patológico
+    (dependencia circular real) sigue requiriendo un override manual, como hasta ahora.
+    """
+    routines: dict[str, str] = {}  # nombre desnudo -> op_key
+    routine_bodies: dict[str, str] = {}
+    for it in items:
+        if it.object_type == "routine" and it.change_type in ("new", "modified"):
+            bare = _bare_object_name(it)
+            routines[bare] = it.op_key()
+            routine_bodies[bare] = _body_text(it)
+    if not routines:
+        return {}
+    table_names = {
+        it.object_name.lower()
+        for it in items
+        if it.object_type == "table" and it.change_type in ("new", "modified")
+    }
+
+    def _ddl_texts(it: DiffItem) -> list[str]:
+        if it.object_type == "table":
+            tbl = it.source_payload
+            cols = getattr(tbl, "columns", []) or []
+            checks = getattr(tbl, "check_constraints", []) or []
+        elif it.object_type == "column":
+            cols = [it.source_payload] if it.source_payload is not None else []
+            checks = []
+        elif it.object_type == "check_constraint":
+            cols, checks = [], [it.source_payload] if it.source_payload is not None else []
+        else:
+            return []
+        parts: list[str] = []
+        for c in cols:
+            parts.append(str(getattr(c, "default", "") or ""))
+            computed = getattr(c, "computed", None)
+            if computed is not None:
+                parts.append(str(getattr(computed, "sqltext", "") or ""))
+        for ck in checks:
+            parts.append(str(getattr(ck, "sqltext", "") or ""))
+        return parts
+
+    out: dict[str, set[str]] = {}
+    for it in items:
+        if it.change_type == "dropped":
+            continue
+        texts = _ddl_texts(it)
+        if not texts:
+            continue
+        mentioned = _referenced_identifiers(" ".join(texts))
+        for bare, rkey in routines.items():
+            if bare not in mentioned:
+                continue
+            # Dependencia mutua: el cuerpo de la rutina usa una tabla del diff -> no tocar.
+            body_refs = _referenced_identifiers(routine_bodies.get(bare, ""))
+            if body_refs & table_names:
+                continue
+            out.setdefault(it.op_key(), set()).add(rkey)
+    return out
+
+
 def order_diff_items(
     items: list[DiffItem], source: SchemaSnapshot, target: SchemaSnapshot
 ) -> list[DiffItem]:
@@ -1774,6 +1867,11 @@ def order_diff_items(
     deps = build_dependency_graph(items)
     hoisted = _hoist_blocking_body_drops(items, deps)
     hoisted_fks = _hoist_blocking_fk_drops(items)
+    # Rutinas que el DDL de una tabla invoca (DEFAULT/CHECK/GENERATED en PostgreSQL):
+    # se crean ANTES de las tablas o el CREATE TABLE muere con 42883.
+    hoisted_routines = {
+        rkey for rkeys in _table_ddl_routine_deps(items).values() for rkey in rkeys
+    }
 
     src_by_name = {t.table: t for t in source.tables}
     tgt_by_name = {t.table: t for t in target.tables}
@@ -1799,6 +1897,8 @@ def order_diff_items(
             base = _STEP_BODY_DROP_EARLY
         elif key in hoisted_fks:
             base = _STEP_FK_DROP_EARLY
+        elif key in hoisted_routines:
+            base = _STEP_ROUTINE_PREREQ
         step_of[key] = base
 
     # Nivel topológico DENTRO de cada paso (una dependencia de otro paso ya queda

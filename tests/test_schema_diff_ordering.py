@@ -562,3 +562,68 @@ def test_new_column_depends_on_the_sequence_in_its_default():
     diff = diff_snapshots(src, snap([base], engine="postgresql"))
     graph = build_dependency_graph(diff.items)
     assert "sequence|mi_seq|new" in graph["column|t.n|new"]
+
+
+# --------------------------------------------------------------------------- #
+# Rutinas invocadas por DDL de tabla (PostgreSQL: DEFAULT/CHECK/GENERATED)     #
+# --------------------------------------------------------------------------- #
+def test_routine_called_by_a_table_default_is_created_before_the_table():
+    """
+    PostgreSQL valida al CREATE TABLE las funciones de un DEFAULT (``next_id()``): con las
+    rutinas en el paso 80 (después de las tablas) el DDL moría con 42883. La rutina
+    referenciada se adelanta y la arista alimenta el cierre de selección.
+    """
+    from app.services.db_admin.dtos import RoutineInfo
+
+    src = SchemaSnapshot(
+        database="d", source_engine="postgresql",
+        tables=[tbl("t", [col("id", "bigint", nullable=False, default="next_id()")],
+                    pk=["id"])],
+        routines=[RoutineInfo(name="next_id", kind="FUNCTION",
+                              body="CREATE FUNCTION next_id() RETURNS bigint AS $$ "
+                                   "SELECT 1 $$ LANGUAGE sql")],
+    )
+    diff = diff_snapshots(src, snap([], engine="postgresql"))
+    assert_before(diff, ("routine", "FUNCTION:next_id"), ("table", "t"))
+    graph = build_dependency_graph(diff.items)
+    assert "routine|FUNCTION:next_id|new" in graph["table|t|new"]
+
+
+def test_routine_that_reads_a_diff_table_is_not_hoisted():
+    """
+    Dependencia MUTUA (la función consulta una tabla del diff): adelantarla rompería la
+    validación de una función SQL-language. Fail-closed: orden actual, sin arista.
+    """
+    from app.services.db_admin.dtos import RoutineInfo
+
+    src = SchemaSnapshot(
+        database="d", source_engine="postgresql",
+        tables=[tbl("contadores", [col("id"), col("n")], pk=["id"])],
+        routines=[RoutineInfo(name="next_id", kind="FUNCTION",
+                              body="CREATE FUNCTION next_id() RETURNS bigint AS $$ "
+                                   "UPDATE contadores SET n = n + 1 RETURNING n $$ "
+                                   "LANGUAGE sql")],
+    )
+    diff = diff_snapshots(src, snap([], engine="postgresql"))
+    # La tabla va primero (orden normal) y NO hay arista tabla->rutina.
+    assert_before(diff, ("table", "contadores"), ("routine", "FUNCTION:next_id"))
+    graph = build_dependency_graph(diff.items)
+    assert "routine|FUNCTION:next_id|new" not in graph.get("table|contadores|new", set())
+
+
+def test_snapshot_layout_hoists_routines_used_by_table_ddl():
+    """Mismo caso en el camino del snapshot: el DEFAULT next_id() exige la función antes."""
+    from app.services.db_admin.dtos import DumpStatement
+    from app.services.db_admin.snapshot_layout import order_statements
+
+    ordered = order_statements([
+        DumpStatement(object_type="table", name="t",
+                      ddl='CREATE TABLE t (id bigint DEFAULT next_id() NOT NULL)'),
+        DumpStatement(object_type="routine", name="next_id",
+                      ddl="CREATE FUNCTION next_id() RETURNS bigint ..."),
+        DumpStatement(object_type="routine", name="fn_reporte",
+                      ddl="CREATE FUNCTION fn_reporte() ... SELECT count(*) FROM t ..."),
+    ])
+    names = [s.name for s in ordered]
+    # next_id (prerrequisito) antes de la tabla; fn_reporte (consulta la tabla) después.
+    assert names.index("next_id") < names.index("t") < names.index("fn_reporte"), names
