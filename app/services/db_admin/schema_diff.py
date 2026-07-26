@@ -135,6 +135,26 @@ class DiffItem(BaseModel):
     changed_attributes: list[str] = Field(default_factory=list)
     risk: RiskFlags = Field(default_factory=RiskFlags)
     notes: list[str] = Field(default_factory=list)
+    # --- orden de ejecución y dependencias (calculados por order_diff_items) --- #
+    # ``depends_on`` = claves (``op_key``) de OTROS ítems de ESTE diff que deben
+    # ejecutarse ANTES que este. Es la base de dos cosas distintas:
+    #   1. el orden topológico de ejecución (``order_diff_items``);
+    #   2. la validación de CIERRE de una selección parcial (el admin no puede adoptar
+    #      "la vista" sin "la tabla que la vista lee", ni el ADD de un índice
+    #      redefinido sin su DROP previo).
+    # Solo lista dependencias que hay que CREAR/EJECUTAR acá: lo que ya existe en el
+    # target no aparece (no hace falta seleccionarlo).
+    depends_on: list[str] = Field(default_factory=list)
+    execution_step: int = 0  # paso fino de ejecución (ver _STEP); 0 hasta ordenar
+
+    def op_key(self) -> str:
+        """
+        Identidad ATÓMICA del cambio. Un ``DiffItem`` puede renderizar VARIAS
+        sentencias (un índice redefinido = ``DROP`` + ``CREATE``; un ``PRIMARY KEY``
+        cambiado = ``DROP`` + ``ADD``) y todas comparten esta clave: son
+        indivisibles, seleccionar una sin la otra rompe la ejecución.
+        """
+        return f"{self.object_type}|{self.object_name}|{self.change_type}"
 
 
 class SchemaDiff(BaseModel):
@@ -164,6 +184,13 @@ class RenderedStatement(BaseModel):
     risk: RiskFlags
     down_sql: str | None = None
     down_confirmed: bool = False  # True si el reverso es claramente seguro (aditivo)
+    # Grupo ATÓMICO: varias sentencias del MISMO ``DiffItem`` (DROP+CREATE de un índice
+    # redefinido, DROP+ADD de un PK) comparten ``op_group``. Seleccionar una sin las otras
+    # produce un error garantizado del motor (``Duplicate key name``, ``Multiple primary
+    # key defined``), así que la selección se valida por grupo, no por sentencia.
+    op_group: str = ""
+    # ``op_group`` de otros cambios que deben ejecutarse ANTES que este (ver DiffItem).
+    depends_on: list[str] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -1208,64 +1235,575 @@ def _diff_extensions(source: SchemaSnapshot, target: SchemaSnapshot) -> list[Dif
 
 
 # --------------------------------------------------------------------------- #
-# Orden de aplicación (pipeline de 9 fases)                                    #
+# Orden de aplicación                                                          #
 # --------------------------------------------------------------------------- #
+# Las 9 FASES (``PHASE_*``) son la etiqueta gruesa que se muestra en la API. NO
+# alcanzan para ordenar la ejecución: dentro de una fase el desempate alfabético por
+# ``object_type`` producía errores garantizados del motor, y entre fases el número no
+# siempre refleja la dependencia real. Casos verificados que fallaban:
+#
+#   - fase 3, ``check_constraint`` < ``column`` (alfabético): un CHECK sobre una columna
+#     NUEVA se creaba antes de la columna -> MySQL 3813 / PostgreSQL 42703.
+#   - fase 3, ``foreign_key`` < ``index``/``unique_constraint``: una FK se creaba antes
+#     del índice/UNIQUE que necesita en la tabla referida -> MySQL errno 150.
+#   - fase 3 (FK) ANTES de fase 4 (PK): una FK contra una tabla cuya PRIMARY KEY se
+#     agrega en el mismo diff -> MySQL errno 150.
+#   - fase 5, alfabético: ``event`` < ``materialized_view`` < ``routine`` < ``trigger``
+#     < ``view``. Una vista que lee de OTRA vista, o una matview de PostgreSQL sobre una
+#     vista, se creaba antes de su dependencia -> 1146 / 42P01.
+#   - fase 7, ``column`` < ``foreign_key``: se borraba una columna todavía usada por una
+#     FK que también se borra -> MySQL 1828.
+#
+# ``_STEP`` es el orden de ejecución REAL (grano fino, atravesando fases cuando la
+# dependencia lo exige). Cada valor es un peldaño del pipeline de un DBA:
+#
+#   prerrequisitos -> [drop de cuerpos que bloquean ALTERs] -> CREATE TABLE ->
+#   columnas -> PK -> índices/UNIQUE/CHECK -> FKs -> cuerpos (vistas/rutinas/...) ->
+#   drop de cuerpos -> FKs -> índices -> UNIQUE -> CHECK -> columnas -> tablas ->
+#   secuencias/tipos/extensiones
+#
+# Reglas de DBA que codifica (cada una es un error real que se evita):
+#   * una FK se agrega SIEMPRE al final del bloque aditivo: para entonces ya existen la
+#     PK/UNIQUE de la tabla referida y el índice de la columna referente;
+#   * un CHECK/índice/UNIQUE se agrega DESPUÉS de las columnas nuevas que menciona;
+#   * al borrar se recorre el camino INVERSO: primero las FKs (MySQL 1553/1828), después
+#     índices/UNIQUE/CHECK, después las columnas y al final las tablas;
+#   * los objetos con cuerpo se crean después de TODA la estructura y se ordenan entre sí
+#     por dependencia real (vista sobre vista, rutina llamada por un trigger).
+_STEP: dict[tuple[str, str], int] = {
+    # --- prerrequisitos ---------------------------------------------------- #
+    ("extension", "new"): 10,
+    ("enum_type", "new"): 12,
+    ("enum_type", "modified"): 13,
+    ("sequence", "new"): 14,
+    # --- estructura: creación ---------------------------------------------- #
+    ("table", "new"): 30,
+    ("column", "new"): 40,
+    ("column", "modified"): 42,
+    ("primary_key", "new"): 44,
+    ("primary_key", "modified"): 44,
+    ("primary_key", "dropped"): 44,
+    ("sequence", "modified"): 46,
+    ("index", "new"): 50,
+    ("unique_constraint", "new"): 52,
+    ("check_constraint", "new"): 54,
+    ("index", "modified"): 56,
+    ("unique_constraint", "modified"): 58,
+    ("check_constraint", "modified"): 60,
+    ("foreign_key", "new"): 70,
+    ("foreign_key", "modified"): 72,
+    # --- objetos con cuerpo: crear/reemplazar ------------------------------ #
+    ("view", "new"): 80,
+    ("view", "modified"): 80,
+    ("materialized_view", "new"): 80,
+    ("materialized_view", "modified"): 80,
+    ("routine", "new"): 80,
+    ("routine", "modified"): 80,
+    ("trigger", "new"): 80,
+    ("trigger", "modified"): 80,
+    ("event", "new"): 80,
+    ("event", "modified"): 80,
+    # --- objetos con cuerpo: borrar ---------------------------------------- #
+    ("view", "dropped"): 90,
+    ("materialized_view", "dropped"): 90,
+    ("routine", "dropped"): 90,
+    ("trigger", "dropped"): 90,
+    ("event", "dropped"): 90,
+    # --- estructura: destrucción (camino inverso) -------------------------- #
+    ("foreign_key", "dropped"): 100,
+    ("index", "dropped"): 102,
+    ("unique_constraint", "dropped"): 104,
+    ("check_constraint", "dropped"): 106,
+    ("column", "dropped"): 110,
+    ("table", "dropped"): 120,
+    ("sequence", "dropped"): 130,
+    ("enum_type", "dropped"): 132,
+    ("extension", "dropped"): 134,
+}
+
+# Paso al que se ADELANTA el DROP de un objeto con cuerpo que bloquea un ALTER/DROP de
+# columna del que depende. PostgreSQL rechaza ``ALTER TABLE … ALTER COLUMN TYPE`` y
+# ``DROP COLUMN`` si una vista/matview depende de esa columna ("cannot alter type of a
+# column used by a view or rule"), así que la vista tiene que caer ANTES del ALTER, no
+# después. MySQL/MariaDB no validan cuerpos de vista, pero adelantar el DROP es
+# igualmente correcto ahí (el objeto se borra en ambos casos).
+_STEP_BODY_DROP_EARLY = 20
+
+# Paso al que se ADELANTA el DROP de una FK que bloquea un cambio de TIPO de alguna de sus
+# columnas. MySQL/MariaDB rechazan ``MODIFY COLUMN`` sobre una columna que participa en una
+# FK viva (``1832 Cannot change column …: used in a foreign key constraint``), tanto del
+# lado referente como del referido (``3780``: los tipos tienen que seguir siendo
+# compatibles). Si el diff elimina esa FK igual, hay que soltarla ANTES del ALTER en vez de
+# en la fase destructiva (paso 100), que va mucho después.
+_STEP_FK_DROP_EARLY = 38
+
+# Desempate por tipo cuando NO hay dependencia detectable entre dos objetos con cuerpo:
+# lo que suele ser dependencia de otros va primero. Solo se usa dentro del mismo nivel
+# topológico, así que nunca contradice una dependencia real.
+_BODY_TYPE_ORDER = {
+    "routine": 0,        # una vista/trigger puede llamar a una función
+    "view": 1,
+    "materialized_view": 2,  # una matview suele leer de vistas
+    "trigger": 3,        # un trigger llama rutinas y vive sobre una tabla
+    "event": 4,          # un evento suele llamar rutinas
+}
+
+# Tipos cuyo cuerpo puede REFERENCIAR otros objetos por nombre.
+_BODY_TYPES = frozenset({"view", "materialized_view", "routine", "trigger", "event"})
+
+# Identificadores dentro de un cuerpo SQL: `backtick`, "doble comilla" o palabra suelta.
+_BODY_IDENT_RE = re.compile(r"`([^`]+)`|\"([^\"]+)\"|\b([A-Za-z_][A-Za-z_0-9$]*)\b")
+
+
 def _table_dep_order(names: list[str], tables_by_name: dict[str, TableSchema]) -> dict[str, int]:
-    """Rango topológico por FK (referida antes que referente); alfabético en empates."""
+    """
+    Rango topológico por FK (tabla referida antes que la referente); alfabético en
+    empates. Un ciclo (o cualquier resto no colocable) va al final, de forma estable.
+
+    Las FKs hacia tablas que NO están en ``names`` se ignoran: son dependencias FUERA
+    del conjunto que se ordena (p. ej. una tabla nueva con FK a una tabla que YA existe
+    en el destino). Contarlas hacía que esa tabla nunca se pudiera "colocar" y cayera al
+    bucket de ciclos junto a sus dependientes, destruyendo el orden topológico del resto
+    del lote. Para el clon —que pasa TODAS las tablas— el comportamiento es idéntico.
+
+    El rango es un NIVEL topológico real: todas las tablas colocables en una misma pasada
+    comparten nivel y ``placed`` se actualiza al TERMINAR la pasada, no en el medio. Antes
+    se agregaba a ``placed`` dentro del bucle, así que una hija visitada después de su
+    padre en la MISMA pasada heredaba su nivel (padre e hija ambas en 0). Eso no se notaba
+    al crear —el desempate alfabético dejaba al padre primero por casualidad— pero rompía
+    el DROP, que ordena por rango INVERTIDO: con ambas en 0, el desempate alfabético
+    borraba la tabla PADRE primero y el motor respondía
+    ``(1451, 'Cannot delete or update a parent row')``.
+    """
+    name_set = {n for n in names if n in tables_by_name}
     deps = {
-        n: {fk.referred_table for fk in tables_by_name[n].foreign_keys
-            if fk.referred_table in tables_by_name and fk.referred_table != n}
-        for n in names if n in tables_by_name
+        n: {
+            fk.referred_table
+            for fk in tables_by_name[n].foreign_keys
+            if fk.referred_table in name_set and fk.referred_table != n
+        }
+        for n in name_set
     }
     rank: dict[str, int] = {}
     placed: set[str] = set()
-    remaining = sorted(n for n in names if n in tables_by_name)
+    remaining = sorted(name_set)
     level = 0
-    progress = True
-    while remaining and progress:
-        progress = False
-        for n in list(remaining):
-            if deps[n] <= placed:
-                rank[n] = level
-                placed.add(n)
-                remaining.remove(n)
-                progress = True
+    while remaining:
+        ready = [n for n in remaining if deps[n] <= placed]
+        if not ready:
+            break
+        for n in ready:
+            rank[n] = level
+            remaining.remove(n)
+        placed.update(ready)
         level += 1
     for n in remaining:  # ciclo/dep externa: al final, estable
         rank[n] = level
     return rank
 
 
+def _referenced_identifiers(text: str | None) -> set[str]:
+    """Identificadores (en minúsculas) que aparecen en un cuerpo SQL."""
+    if not text:
+        return set()
+    out: set[str] = set()
+    for m in _BODY_IDENT_RE.finditer(text):
+        name = m.group(1) or m.group(2) or m.group(3)
+        if name:
+            out.add(name.lower())
+    return out
+
+
+def _body_text(item: DiffItem) -> str:
+    """Texto del cuerpo de un objeto procedural, del lado que corresponda al cambio."""
+    payload = item.target_payload if item.change_type == "dropped" else item.source_payload
+    if payload is None:
+        return ""
+    for attr in ("definition", "body", "action"):
+        value = getattr(payload, attr, None)
+        if value:
+            return str(value)
+    return ""
+
+
+def _bare_object_name(item: DiffItem) -> str:
+    """
+    Nombre "desnudo" del objeto, comparable contra los identificadores de un cuerpo.
+
+    Las rutinas se nombran ``KIND:nombre`` (``PROCEDURE:sp_x``) y los sub-objetos de
+    tabla ``tabla.objeto``; acá interesa el último segmento.
+    """
+    name = item.object_name
+    if item.object_type == "routine" and ":" in name:
+        name = name.split(":", 1)[1]
+    return name.lower()
+
+
+def _topological_levels(
+    keys: list[str], must_run_before: dict[str, set[str]]
+) -> dict[str, int]:
+    """
+    Nivel topológico de cada clave: 0 si no depende de nadie del lote, 1+max(niveles de
+    sus dependencias) si depende. Un CICLO no revienta: las claves involucradas quedan
+    todas en el último nivel (orden estable por nombre) — fail-closed, se ejecuta en un
+    orden arbitrario pero determinístico en vez de abortar el diff completo.
+    """
+    level: dict[str, int] = {}
+    pending = sorted(keys)
+    guard = 0
+    while pending and guard <= len(keys):
+        guard += 1
+        progressed = False
+        for k in list(pending):
+            deps = must_run_before.get(k, set()) & set(keys)
+            if all(d in level for d in deps if d != k):
+                level[k] = 1 + max((level[d] for d in deps if d != k and d in level), default=-1)
+                pending.remove(k)
+                progressed = True
+        if not progressed:
+            break
+    fallback = max(level.values(), default=-1) + 1
+    for k in pending:
+        level[k] = fallback
+    return level
+
+
+def build_dependency_graph(items: list[DiffItem]) -> dict[str, set[str]]:
+    """
+    Grafo ``op_key -> {op_keys que deben ejecutarse ANTES}`` sobre los ítems de ESTE
+    diff. Es la fuente de verdad tanto del orden topológico como de la validación de
+    cierre de una selección parcial (adopción / ejecución ad-hoc de un subconjunto).
+
+    Solo se registran aristas hacia ítems del MISMO diff: una dependencia que ya existe
+    en el destino no necesita crearse ni seleccionarse. Aristas que se detectan:
+
+    - **tabla nueva -> tabla nueva** por FK (la referida antes que la referente);
+    - **sub-objeto de tabla -> su tabla nueva** (índice/FK/columna/PK de una tabla que se
+      crea en este mismo diff);
+    - **columna nueva -> el índice/UNIQUE/CHECK/FK que la menciona** (la columna primero);
+    - **FK nueva -> PK/UNIQUE/índice de la tabla referida** creados acá (MySQL errno 150);
+    - **cuerpo -> tablas y otros cuerpos que menciona** (vista sobre vista, matview sobre
+      vista, trigger sobre su tabla, rutina llamada por un trigger/evento);
+    - **cuerpo eliminado -> cuerpo eliminado que lo referencia** (arista INVERTIDA: el
+      dependiente se borra primero, que es lo que exige PostgreSQL);
+    - **tabla eliminada -> sub-objetos y cuerpos eliminados que la usan**.
+    """
+    by_key = {it.op_key(): it for it in items}
+    deps: dict[str, set[str]] = {k: set() for k in by_key}
+
+    def add(key: str, before: str) -> None:
+        if before in by_key and before != key:
+            deps[key].add(before)
+
+    new_tables = {
+        it.object_name for it in items if it.object_type == "table" and it.change_type == "new"
+    }
+    dropped_tables = {
+        it.object_name for it in items if it.object_type == "table" and it.change_type == "dropped"
+    }
+
+    # 1) tabla nueva -> tabla nueva (FK). La tabla referida se crea primero.
+    for it in items:
+        if it.object_type == "table" and it.change_type == "new":
+            tbl = it.source_payload
+            for fk in getattr(tbl, "foreign_keys", []) or []:
+                if fk.referred_table in new_tables:
+                    add(it.op_key(), f"table|{fk.referred_table}|new")
+        # Al BORRAR la arista se invierte: la tabla HIJA cae primero, si no el motor
+        # rechaza el DROP de la padre (MySQL 1451 / PostgreSQL 2BP01).
+        elif it.object_type == "table" and it.change_type == "dropped":
+            tbl = it.target_payload
+            for fk in getattr(tbl, "foreign_keys", []) or []:
+                if fk.referred_table in dropped_tables:
+                    add(f"table|{fk.referred_table}|dropped", it.op_key())
+
+    # 2) sub-objetos de tabla: dependen de su tabla (nueva) o la tabla eliminada depende
+    #    de ellos (los sub-objetos se borran antes que la tabla).
+    for it in items:
+        parent = it.parent_table
+        if not parent:
+            continue
+        if it.change_type in ("new", "modified") and parent in new_tables:
+            add(it.op_key(), f"table|{parent}|new")
+        if it.change_type == "dropped" and parent in dropped_tables:
+            add(f"table|{parent}|dropped", it.op_key())
+
+    # 3) columnas nuevas -> constraints/índices que las mencionan.
+    new_cols_by_table: dict[str, dict[str, str]] = {}
+    for it in items:
+        if it.object_type == "column" and it.change_type == "new" and it.parent_table:
+            col = getattr(it.source_payload, "name", None)
+            if col:
+                new_cols_by_table.setdefault(it.parent_table, {})[col.lower()] = it.op_key()
+    for it in items:
+        if it.change_type == "dropped" or not it.parent_table:
+            continue
+        cols_here = new_cols_by_table.get(it.parent_table)
+        if not cols_here:
+            continue
+        if it.object_type in ("index", "unique_constraint", "foreign_key", "primary_key"):
+            used = _constraint_columns(it)
+            for c in used:
+                if c.lower() in cols_here:
+                    add(it.op_key(), cols_here[c.lower()])
+        elif it.object_type == "check_constraint":
+            # Un CHECK menciona columnas dentro de una expresión: se escanea el texto.
+            mentioned = _referenced_identifiers(
+                getattr(it.source_payload, "sqltext", None)
+            )
+            for cname, ckey in cols_here.items():
+                if cname in mentioned:
+                    add(it.op_key(), ckey)
+
+    # 4) FK nueva -> la clave (PK/UNIQUE/índice) de la tabla REFERIDA que se crea acá.
+    #    MySQL exige que la columna referida esté indexada al crear la FK (errno 150).
+    key_providers: dict[str, list[tuple[tuple[str, ...], str]]] = {}
+    for it in items:
+        if it.change_type == "dropped" or not it.parent_table:
+            continue
+        if it.object_type in ("primary_key", "unique_constraint", "index"):
+            cols = tuple(c.lower() for c in _constraint_columns(it))
+            if cols:
+                key_providers.setdefault(it.parent_table, []).append((cols, it.op_key()))
+    for it in items:
+        if it.object_type != "foreign_key" or it.change_type == "dropped":
+            continue
+        fk = it.source_payload
+        referred = getattr(fk, "referred_table", None)
+        ref_cols = tuple(c.lower() for c in (getattr(fk, "referred_columns", []) or []))
+        for cols, provider in key_providers.get(referred, []):
+            # La clave sirve de respaldo si EMPIEZA por las columnas referidas.
+            if cols[: len(ref_cols)] == ref_cols:
+                add(it.op_key(), provider)
+        # La tabla REFERIDA también es dependencia directa: sin ella la FK no se puede
+        # crear (y una selección parcial que la omita fallaría con errno 150 / 42P01).
+        if referred in new_tables:
+            add(it.op_key(), f"table|{referred}|new")
+
+    # 6) tabla eliminada -> FKs ENTRANTES eliminadas (desde otras tablas). Sin borrar
+    #    primero la FK que la referencia, el DROP TABLE falla (MySQL 1451/3730).
+    for it in items:
+        if it.object_type != "foreign_key" or it.change_type != "dropped":
+            continue
+        referred = getattr(it.target_payload, "referred_table", None)
+        if referred in dropped_tables:
+            add(f"table|{referred}|dropped", it.op_key())
+
+    # 5) objetos con cuerpo: dependencias por nombre mencionado en el cuerpo.
+    body_items = [it for it in items if it.object_type in _BODY_TYPES]
+    providers: dict[str, list[str]] = {}
+    for it in items:
+        if it.object_type == "table" or it.object_type in _BODY_TYPES:
+            providers.setdefault(_bare_object_name(it), []).append(it.op_key())
+    for it in body_items:
+        mentioned = _referenced_identifiers(_body_text(it))
+        own = _bare_object_name(it)
+        # Un trigger depende SIEMPRE de su tabla (dependencia firme, no textual).
+        if it.object_type == "trigger" and it.parent_table:
+            mentioned.add(it.parent_table.lower())
+        for name in mentioned:
+            if name == own:
+                continue
+            for cand_key in providers.get(name, []):
+                cand = by_key[cand_key]
+                if it.change_type == "dropped":
+                    # Al BORRAR la arista se invierte: el dependiente cae primero
+                    # (PostgreSQL rechaza borrar un objeto del que otro depende).
+                    if cand.change_type == "dropped":
+                        add(cand_key, it.op_key())
+                elif cand.change_type in ("new", "modified"):
+                    add(it.op_key(), cand_key)
+    return deps
+
+
+def _constraint_columns(item: DiffItem) -> list[str]:
+    """Columnas que un sub-objeto de tabla (índice/UNIQUE/FK/PK) toca del lado SOURCE."""
+    payload = item.source_payload
+    if payload is None:
+        return []
+    if item.object_type == "primary_key":
+        return list(getattr(payload, "primary_key", []) or [])
+    return list(getattr(payload, "columns", []) or [])
+
+
+def _hoist_blocking_body_drops(
+    items: list[DiffItem], deps: dict[str, set[str]]
+) -> set[str]:
+    """
+    ``op_key`` de los DROP de objetos con cuerpo que hay que ADELANTAR porque bloquean
+    un ALTER/DROP de columna, o el DROP de la tabla, de la que dependen.
+
+    PostgreSQL rechaza ``ALTER COLUMN TYPE``/``DROP COLUMN``/``DROP TABLE`` mientras una
+    vista o matview dependa de ese objeto ("cannot drop … because other objects depend on
+    it"). El orden natural (cuerpos al paso 90, después de los ALTER del 42/110) fallaría
+    siempre. Solo se adelantan los DROP cuyo cuerpo menciona una tabla realmente afectada
+    por un cambio de columna o por su propia eliminación — no todos, para no reordenar de
+    más.
+    """
+    touched_tables = {
+        it.parent_table
+        for it in items
+        if it.parent_table
+        and it.object_type == "column"
+        and it.change_type in ("modified", "dropped")
+    }
+    touched_tables |= {
+        it.object_name
+        for it in items
+        if it.object_type == "table" and it.change_type == "dropped"
+    }
+    if not touched_tables:
+        return set()
+    touched_lower = {t.lower() for t in touched_tables if t}
+    hoisted: set[str] = set()
+    for it in items:
+        if it.object_type not in _BODY_TYPES or it.change_type != "dropped":
+            continue
+        mentioned = _referenced_identifiers(_body_text(it))
+        if it.object_type == "trigger" and it.parent_table:
+            mentioned.add(it.parent_table.lower())
+        if mentioned & touched_lower:
+            hoisted.add(it.op_key())
+    # Cierre: si se adelanta un cuerpo, también los cuerpos que deben caer ANTES que él
+    # (sus dependientes), o quedarían huérfanos apuntando a un objeto ya borrado.
+    changed = True
+    while changed:
+        changed = False
+        for key in list(hoisted):
+            for dep in deps.get(key, set()):
+                if dep not in hoisted and _is_body_drop(dep):
+                    hoisted.add(dep)
+                    changed = True
+    return hoisted
+
+
+def _is_body_drop(op_key: str) -> bool:
+    parts = op_key.split("|")
+    return len(parts) == 3 and parts[0] in _BODY_TYPES and parts[2] == "dropped"
+
+
+def _hoist_blocking_fk_drops(items: list[DiffItem]) -> set[str]:
+    """
+    ``op_key`` de los DROP de FK que hay que ADELANTAR porque bloquean un cambio de TIPO
+    de alguna de sus columnas.
+
+    MySQL/MariaDB rechazan ``MODIFY COLUMN`` mientras una FK use esa columna
+    (``1832``), y también si el cambio rompe la compatibilidad de tipos con el otro lado
+    (``3780``). El caso típico: el origen cambió el tipo de la columna Y eliminó la FK — el
+    orden natural (columna en el paso 42, DROP de FK en el 100) falla siempre. Se adelanta
+    SOLO la FK que realmente toca una columna cuyo TIPO cambia: no todas, para no reordenar
+    de más ni perder la garantía de que los DROP van al final.
+    """
+    retyped: dict[str, set[str]] = {}
+    for it in items:
+        if (
+            it.object_type == "column"
+            and it.change_type == "modified"
+            and it.parent_table
+            and "type" in it.changed_attributes
+        ):
+            name = getattr(it.source_payload, "name", None)
+            if name:
+                retyped.setdefault(it.parent_table, set()).add(name.lower())
+    if not retyped:
+        return set()
+    hoisted: set[str] = set()
+    for it in items:
+        if it.object_type != "foreign_key" or it.change_type != "dropped":
+            continue
+        fk = it.target_payload
+        own = {c.lower() for c in (getattr(fk, "columns", []) or [])}
+        ref = {c.lower() for c in (getattr(fk, "referred_columns", []) or [])}
+        referred_table = getattr(fk, "referred_table", None)
+        if (it.parent_table and own & retyped.get(it.parent_table, set())) or (
+            referred_table and ref & retyped.get(referred_table, set())
+        ):
+            hoisted.add(it.op_key())
+    return hoisted
+
+
 def order_diff_items(
     items: list[DiffItem], source: SchemaSnapshot, target: SchemaSnapshot
 ) -> list[DiffItem]:
     """
-    Ordena por fase (1..9) y, dentro de cada fase, con orden estable útil:
-    - fase 2 (crear tablas): topológico por FK (padre antes que hijo);
-    - fase 8 (borrar tablas): topológico INVERSO (hijo antes que padre);
-    - resto: por (object_type, object_name).
+    Ordena los ítems por ORDEN DE EJECUCIÓN real (``_STEP``) y, dentro de cada paso, por
+    dependencia topológica. Además puebla ``depends_on``/``execution_step`` en cada ítem
+    (los consume la validación de cierre de selección y el renderer).
+
+    Dentro de cada paso:
+      - ``table new``: topológico por FK (padre antes que hijo);
+      - ``table dropped``: topológico INVERSO (hijo antes que padre);
+      - objetos con cuerpo: topológico por referencias del cuerpo (vista sobre vista,
+        matview sobre vista, trigger/evento sobre la rutina que llaman), invertido para
+        los DROP;
+      - resto: topológico por el grafo de dependencias y, en empate, alfabético estable.
     """
+    deps = build_dependency_graph(items)
+    hoisted = _hoist_blocking_body_drops(items, deps)
+    hoisted_fks = _hoist_blocking_fk_drops(items)
+
     src_by_name = {t.table: t for t in source.tables}
     tgt_by_name = {t.table: t for t in target.tables}
-    new_tbl_names = [i.object_name for i in items if i.object_type == "table" and i.change_type == "new"]
-    drop_tbl_names = [i.object_name for i in items if i.object_type == "table" and i.change_type == "dropped"]
+    new_tbl_names = [
+        i.object_name for i in items if i.object_type == "table" and i.change_type == "new"
+    ]
+    drop_tbl_names = [
+        i.object_name for i in items if i.object_type == "table" and i.change_type == "dropped"
+    ]
     new_rank = _table_dep_order(new_tbl_names, src_by_name)
     drop_rank = _table_dep_order(drop_tbl_names, tgt_by_name)
 
+    # Paso de ejecución de cada ítem (con el adelanto de los DROP bloqueantes aplicado).
+    step_of: dict[str, int] = {}
+    for it in items:
+        key = it.op_key()
+        base = _STEP.get((it.object_type, it.change_type))
+        if base is None:
+            # Combinación no prevista: se ejecuta con los cuerpos (paso 80), que es el
+            # punto más tardío de la fase de creación. Nunca se descarta un ítem.
+            base = 80
+        if key in hoisted:
+            base = _STEP_BODY_DROP_EARLY
+        elif key in hoisted_fks:
+            base = _STEP_FK_DROP_EARLY
+        step_of[key] = base
+
+    # Nivel topológico DENTRO de cada paso (una dependencia de otro paso ya queda
+    # ordenada por el paso; mezclar niveles entre pasos distintos no aporta).
+    levels: dict[str, int] = {}
+    by_step: dict[int, list[DiffItem]] = {}
+    for it in items:
+        by_step.setdefault(step_of[it.op_key()], []).append(it)
+    for group in by_step.values():
+        keys = [it.op_key() for it in group]
+        keyset = set(keys)
+        local = {k: (deps.get(k, set()) & keyset) for k in keys}
+        levels.update(_topological_levels(keys, local))
+
+    for it in items:
+        it.depends_on = sorted(deps.get(it.op_key(), set()))
+        it.execution_step = step_of[it.op_key()]
+
     def key(it: DiffItem):
-        if it.phase == PHASE_CREATE_TABLE and it.object_type == "table":
-            return (it.phase, new_rank.get(it.object_name, 0), it.object_name)
-        if it.phase == PHASE_DROP_TABLE and it.object_type == "table":
-            # inverso: mayor rango primero
-            return (it.phase, -drop_rank.get(it.object_name, 0), it.object_name)
-        return (it.phase, 0, f"{it.object_type}:{it.object_name}")
+        k = it.op_key()
+        step = step_of[k]
+        level = levels.get(k, 0)
+        if it.object_type == "table" and it.change_type == "new":
+            return (step, level, new_rank.get(it.object_name, 0), 0, it.object_name)
+        if it.object_type == "table" and it.change_type == "dropped":
+            # inverso: mayor rango primero (la hija antes que la padre)
+            return (step, level, -drop_rank.get(it.object_name, 0), 0, it.object_name)
+        type_order = _BODY_TYPE_ORDER.get(it.object_type, 0)
+        if it.change_type == "dropped" and it.object_type in _BODY_TYPES:
+            type_order = -type_order  # al borrar, el orden por tipo también se invierte
+        return (step, level, 0, type_order, f"{it.object_type}:{it.object_name}")
 
     return sorted(items, key=key)
 
 
 __all__ = [
     "RiskFlags", "DiffItem", "SchemaDiff", "RenderedStatement",
-    "diff_snapshots", "order_diff_items",
+    "build_dependency_graph", "diff_snapshots", "order_diff_items",
     "canonical_type", "normalize_default", "normalize_body",
     "effective_collation", "effective_charset", "is_narrowing",
     "PHASE_CREATE_PREREQ", "PHASE_CREATE_TABLE", "PHASE_ALTER_ADDITIVE",
