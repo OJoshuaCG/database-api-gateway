@@ -25,6 +25,7 @@ bloques ``BEGIN…END`` dentro de una definición de rutina (implícita). Ver
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 import sqlglot
 from sqlglot import exp
@@ -307,6 +308,103 @@ def split_sql_statements(sql: str) -> list[str]:
     return statements
 
 
+# --------------------------------------------------------------------------- #
+# DDL específico de MySQL que sqlglot NO traduce a PostgreSQL                   #
+# --------------------------------------------------------------------------- #
+# sqlglot transpila bien las expresiones y los tipos, pero varias formas de DDL de
+# MySQL las emite VERBATIM al escribir PostgreSQL — produciendo SQL sintácticamente
+# inválido que solo revienta al ejecutarse contra el motor. Verificado invocando
+# ``sqlglot.transpile(read='mysql', write='postgres')``:
+#
+#   'DROP INDEX `i` ON `t`'                 -> 'DROP INDEX "i" ON "t"'          (PG no acepta ON)
+#   'ALTER TABLE `t` DROP INDEX `u`'        -> 'ALTER TABLE "t" DROP INDEX "u"' (PG: DROP CONSTRAINT)
+#   'ALTER TABLE `t` DROP FOREIGN KEY `f`'  -> '… DROP FOREIGN KEY "f"'         (PG: DROP CONSTRAINT)
+#   'ALTER TABLE `t` DROP CHECK `c`'        -> '… DROP CHECK `c`'               (¡deja backticks!)
+#   'ALTER TABLE `t` MODIFY COLUMN …'       -> '… MODIFY COLUMN …'              (PG: ALTER COLUMN)
+#   'ALTER TABLE `t` DROP PRIMARY KEY'      -> '… DROP PRIMARY KEY'             (PG: DROP CONSTRAINT)
+#
+# Las cuatro primeras tienen una reescritura EXACTA y se aplican acá. Las dos últimas NO:
+# ``MODIFY COLUMN`` hay que partirlo en ``ALTER COLUMN … TYPE`` + ``SET/DROP NOT NULL`` +
+# ``SET/DROP DEFAULT`` (semántica, no textual) y ``DROP PRIMARY KEY`` necesita el NOMBRE del
+# constraint, que en PostgreSQL es convencionalmente ``<tabla>_pkey`` pero no está
+# garantizado. Adivinar cualquiera de las dos sería peor que fallar: se reportan como
+# BLOQUEANTES para que el admin provea un ``up_sql_postgresql`` explícito.
+# Un identificador SQL: `backtick`, "doble comilla" o desnudo.
+_IDENT = r'(?:`(?:[^`]|``)+`|"(?:[^"]|"")+"|[A-Za-z_][\w$]*)'
+
+# ``DROP INDEX x ON t`` (MySQL) -> ``DROP INDEX x`` (PostgreSQL). Solo cuando la sentencia
+# ARRANCA con DROP INDEX: dentro de un ALTER TABLE, ``DROP INDEX`` significa otra cosa
+# (soltar una constraint) y lo maneja la reescritura de abajo.
+_PG_DROP_INDEX_ON_RE = re.compile(
+    rf"^(\s*DROP\s+INDEX\s+(?:CONCURRENTLY\s+)?{_IDENT})\s+ON\s+{_IDENT}\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+# ``ALTER TABLE t DROP {FOREIGN KEY|INDEX|KEY|CHECK} x`` -> ``DROP CONSTRAINT x``.
+_PG_DROP_CONSTRAINT_RE = re.compile(
+    rf"\bDROP\s+(?:FOREIGN\s+KEY|INDEX|KEY|CHECK)\s+({_IDENT})", re.IGNORECASE
+)
+_ALTER_TABLE_RE = re.compile(r"^\s*ALTER\s+TABLE\b", re.IGNORECASE)
+
+
+def _pg_requote(ident: str) -> str:
+    """Normaliza un identificador a comillas dobles (PostgreSQL)."""
+    if ident.startswith("`") and ident.endswith("`"):
+        return '"' + ident[1:-1].replace("``", "`").replace('"', '""') + '"'
+    return ident
+
+
+def _rewrite_pg_statement(stmt: str) -> str:
+    """
+    Corrige, en UNA sentencia ya transpilada, el DDL que sqlglot dejó en sintaxis MySQL.
+
+    Se hace por sentencia y con contexto: aplicar las reglas sobre el script completo
+    hacía que la segunda pisara el resultado de la primera (``DROP INDEX i ON t`` quedaba
+    convertido en ``DROP CONSTRAINT i``, que no es lo mismo ni es válido suelto).
+    """
+    m = _PG_DROP_INDEX_ON_RE.match(stmt)
+    if m:
+        return m.group(1)
+    if _ALTER_TABLE_RE.match(stmt):
+        return _PG_DROP_CONSTRAINT_RE.sub(
+            lambda mm: f"DROP CONSTRAINT {_pg_requote(mm.group(1))}", stmt
+        )
+    return stmt
+
+# Construcciones que NO se pueden traducir con certeza: bloquean la aplicación.
+_PG_BLOCKERS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\bMODIFY\s+COLUMN\b", re.IGNORECASE),
+     "MODIFY COLUMN (PostgreSQL usa ALTER COLUMN … TYPE / SET NOT NULL / SET DEFAULT)"),
+    (re.compile(r"\bCHANGE\s+COLUMN\b", re.IGNORECASE),
+     "CHANGE COLUMN (PostgreSQL usa RENAME COLUMN + ALTER COLUMN)"),
+    (re.compile(r"\bDROP\s+PRIMARY\s+KEY\b", re.IGNORECASE),
+     "DROP PRIMARY KEY (PostgreSQL necesita el nombre del constraint: DROP CONSTRAINT …)"),
+    (re.compile(r"\bAUTO_INCREMENT\s*=", re.IGNORECASE),
+     "AUTO_INCREMENT = n (PostgreSQL usa ALTER SEQUENCE … RESTART)"),
+    (re.compile(r"\bENGINE\s*=", re.IGNORECASE),
+     "ENGINE = … (no existe en PostgreSQL)"),
+    (re.compile(r"`", re.IGNORECASE),
+     "identificadores entre backticks que la traducción no convirtió"),
+)
+
+
+@lru_cache(maxsize=256)
+def _transpile_cached(sql: str, read: str, write: str) -> tuple[str, ...] | None:
+    """
+    ``sqlglot.transpile`` memoizado. ``None`` si sqlglot no pudo parsear.
+
+    El transpilado es CARO (parsea y re-genera todo el script) y se pedía varias veces por
+    el mismo SQL en una sola operación: ``select_up_sql`` en el codegen, otra vez al contar
+    sentencias, otra en el guard de traducibilidad. El ``up_sql`` de una migración es
+    inmutable (cualquier cambio pasa por un ``PATCH`` que recalcula el checksum), así que
+    cachear por (sql, dialectos) es seguro. Acotado a 256 entradas para no crecer sin
+    límite con scripts grandes.
+    """
+    try:
+        return tuple(sqlglot.transpile(sql, read=read, write=write))
+    except sqlglot.errors.SqlglotError:
+        return None
+
+
 class SqlTranslator:
     """Auto-traduce el ``up_sql`` base (MySQL) al motor destino con sqlglot."""
 
@@ -316,19 +414,46 @@ class SqlTranslator:
 
         Para MySQL/MariaDB devuelve el SQL base sin tocar (es el dialecto de
         referencia): así se preserva exactamente lo que escribió el admin.
+
+        Para PostgreSQL, además de sqlglot se aplican las reescrituras de ``_PG_REWRITES``:
+        sin ellas, un ``DROP INDEX … ON …`` o un ``DROP FOREIGN KEY`` salían del transpilado
+        con sintaxis MySQL intacta y solo fallaban contra el motor.
         """
         if to_engine in (EngineType.mysql, EngineType.mariadb):
             return sql
         write = _SQLGLOT_DIALECT.get(to_engine)
         if write is None:
             return None
-        try:
-            parts = sqlglot.transpile(sql, read=_REFERENCE_DIALECT, write=write)
-        except sqlglot.errors.SqlglotError:
-            return None
+        parts = _transpile_cached(sql, _REFERENCE_DIALECT, write)
         if not parts:
             return None
-        return ";\n".join(p.strip() for p in parts if p.strip())
+        cleaned = [p.strip() for p in parts if p.strip()]
+        if to_engine == EngineType.postgresql:
+            cleaned = [_rewrite_pg_statement(p) for p in cleaned]
+        return ";\n".join(cleaned)
+
+    def translation_blockers(self, sql: str, to_engine: EngineType) -> list[str]:
+        """
+        Construcciones del SQL que NO se pueden traducir con certeza al motor destino.
+
+        Lista vacía = la traducción es confiable. Se evalúa sobre el resultado YA
+        traducido (y reescrito): lo que sobreviva ahí es genuinamente intraducible.
+
+        Existe porque ``translate`` devolviendo ``None`` no alcanza como defensa: el
+        llamador cae al SQL base, que en dialecto MySQL crudo es igual de inválido contra
+        PostgreSQL. Lo correcto es detectarlo ANTES de tocar el motor y exigir un override
+        explícito (``up_sql_postgresql``) — fail-closed, y accionable para el admin.
+        """
+        if to_engine != EngineType.postgresql:
+            return []
+        translated = self.translate(sql, to_engine)
+        if translated is None:
+            return ["sqlglot no pudo transpilar el SQL a PostgreSQL"]
+        found: list[str] = []
+        for pattern, label in _PG_BLOCKERS:
+            if pattern.search(translated) and label not in found:
+                found.append(label)
+        return found
 
     def translate_all(self, sql: str) -> dict[str, str]:
         """
