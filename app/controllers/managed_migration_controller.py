@@ -535,11 +535,49 @@ class ManagedMigrationController:
             "error": next((r.error for r in undo if r.status == "failed"), None),
         }
 
+    @staticmethod
+    def _guard_partial_down_before_apply(db_id: int, specs: list[MigrationSpec]) -> None:
+        """
+        Bloquea (409) el ``apply`` mientras haya un ROLLBACK parcialmente aplicado.
+
+        Simétrico de ROB2 (que bloquea el rollback con un apply parcial): si el
+        ``downgrade`` de la versión N falló a mitad, Alembic nunca movió el puntero — el
+        ledger sigue en N — pero la BD ya tiene ALGUNOS reversos de N ejecutados. Un
+        ``apply`` en ese estado lee "current=N", calcula pendientes desde ahí y deja la
+        versión N a medio deshacer para siempre (ninguna re-aplicación la repara, porque
+        para el ledger N "ya está aplicada"). La salida correcta es REINTENTAR el
+        rollback, que retoma desde el checkpoint de dirección ``down``.
+        """
+        incomplete = migration_progress.incomplete_progress_for_database(db_id, direction="down")
+        if not incomplete:
+            return
+        by_id = {s.id: s.version for s in specs}
+        detail = ", ".join(
+            f"versión {by_id.get(row['model_migration_id'], row['model_migration_id'])} "
+            f"({row['last_statement_index']}/{row['total_statements']} reversos)"
+            for row in incomplete
+        )
+        raise AppHttpException(
+            message=(
+                f"No se puede aplicar: hay un ROLLBACK parcialmente ejecutado ({detail}). "
+                "La versión sigue registrada pero sus cambios están a medio deshacer; "
+                "aplicar encima congelaría ese estado. Reintente el 'rollback' (retoma "
+                "automáticamente desde el último reverso exitoso) antes de aplicar."
+            ),
+            status_code=409,
+            context={"managed_database_id": db_id, "incomplete_progress": incomplete},
+            public_context={"incomplete_progress": incomplete},
+        )
+
     def _run_apply(
         self, db_id, *, db_name, server_id, target, engine, slug, specs,
         up_to_version, was_quarantined, admin, on_failure: str = "auto",
     ) -> dict:
         """Ejecuta el apply real sobre UNA BD ya cargada/validada (reutilizable por apply_all)."""
+        # Simétrico de ROB2: con un rollback a medio ejecutar, aplicar encima opera a
+        # ciegas. Va acá (no en apply()) para cubrir también apply_all, que captura la
+        # excepción por BD sin abortar el lote.
+        self._guard_partial_down_before_apply(db_id, specs)
         # Versión ANTES de aplicar (read-only) para reportar el salto from→to.
         from_version = self.runner.get_current_version(target, db_name, slug)
         audit.record(
@@ -791,11 +829,11 @@ class ManagedMigrationController:
         self._set_quarantine(db_id, failed=False, results=[])
         if force:
             # El admin afirma haber reconciliado el estado físico a mano: cualquier
-            # checkpoint de sentencia (de CUALQUIER versión) que quedara pendiente para
-            # esta BD ya no es confiable — el stamp reescribe la narrativa de versión
-            # por completo, así que el checkpoint quedaría hablando de un estado que el
-            # admin acaba de invalidar.
-            migration_progress.clear_progress_for_database(db_id, direction="up")
+            # checkpoint de sentencia (de CUALQUIER versión y en CUALQUIER dirección)
+            # que quedara pendiente para esta BD ya no es confiable — el stamp
+            # reescribe la narrativa de versión por completo, así que el checkpoint
+            # quedaría hablando de un estado que el admin acaba de invalidar.
+            migration_progress.clear_progress_for_database(db_id)
         audit.record(
             "migration.stamp", admin=admin, target_type="managed_database",
             target_id=db_id, server_id=server_id, touched_engine=True,
@@ -871,11 +909,19 @@ class ManagedMigrationController:
         correcta es ``/migrations/reconcile-partial`` (deshace exactamente las k que
         corrieron) o reintentar ``apply``, que retoma desde el checkpoint.
         """
+        # AMBAS direcciones: un rollback a medio ejecutar (checkpoint 'down') deja la BD
+        # tan desconocida como un apply a medias — stampear encima lo enmascara igual.
         incomplete = migration_progress.incomplete_progress_for_database(db_id, direction="up")
+        incomplete += [
+            {**row, "direction": "down"}
+            for row in migration_progress.incomplete_progress_for_database(db_id, direction="down")
+        ]
         if incomplete and not force:
             detail = ", ".join(
                 f"migración {row['model_migration_id']} "
-                f"({row['last_statement_index']}/{row['total_statements']} sentencias)"
+                f"({row['last_statement_index']}/{row['total_statements']} sentencias"
+                + (" del rollback" if row.get("direction") == "down" else "")
+                + ")"
                 for row in incomplete
             )
             raise AppHttpException(
