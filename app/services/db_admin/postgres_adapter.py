@@ -12,6 +12,7 @@ Particularidades frente a MySQL:
 """
 
 import hashlib
+import re
 
 from sqlalchemy import MetaData, Table, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -721,7 +722,39 @@ class PostgresAdapter(ServerAdapter):
     # Todo NOMBRE de objeto pasa por validate_identifier + quote_identifier (self._q).
     # Los cuerpos de vistas/rutinas/triggers se re-emiten tal cual (pg_get_*def, sin
     # DEFINER) — requieren revisión individual (requires_individual_review).
+    # ``DEFAULT nextval('x_seq'::regclass)`` = columna ``serial``. La secuencia que respalda
+    # un serial está POSEÍDA por la columna (``pg_depend.deptype='a'``) y el snapshot la
+    # excluye A PROPÓSITO (es un detalle de implementación del serial, no un objeto
+    # independiente). Pero emitir el default tal cual referencia una secuencia que NUNCA se
+    # crea -> ``relation "x_seq" does not exist`` en el primer CREATE TABLE. Reproducir la
+    # columna como ``SERIAL`` crea la secuencia, la asocia y fija el default en un solo
+    # paso: es exactamente lo que era en el origen.
+    _NEXTVAL_RE = re.compile(r"^\s*nextval\s*\(", re.IGNORECASE)
+    _SERIAL_BY_TYPE = {
+        "smallint": "SMALLSERIAL", "int2": "SMALLSERIAL",
+        "integer": "SERIAL", "int": "SERIAL", "int4": "SERIAL",
+        "bigint": "BIGSERIAL", "int8": "BIGSERIAL",
+    }
+
+    def _serial_type(self, col) -> str | None:
+        """``SERIAL``/``BIGSERIAL``/``SMALLSERIAL`` si la columna es un serial, o None.
+
+        Solo se aplica a columnas NOT NULL: ``serial`` de PostgreSQL implica NOT NULL por
+        definición, así que usarlo en una columna nullable cambiaría la nullabilidad en
+        silencio. Una columna NULLABLE con default ``nextval`` (creada a mano, muy inusual)
+        queda con el default crudo — limitación conocida y acotada.
+        """
+        if col.default is None or col.nullable or col.identity is not None:
+            return None
+        if not self._NEXTVAL_RE.match(str(col.default)):
+            return None
+        return self._SERIAL_BY_TYPE.get(str(col.type).strip().lower())
+
     def _render_column_def(self, col) -> str:
+        serial = self._serial_type(col)
+        if serial:
+            # SERIAL ya aporta tipo + NOT NULL + DEFAULT nextval + la secuencia asociada.
+            return f"{self._q(col.name, 'columna')} {serial}"
         parts = [self._q(col.name, "columna"), col.type]
         if col.collation:
             parts.append(f"COLLATE {self._q(col.collation, 'collation')}")
