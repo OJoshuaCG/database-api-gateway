@@ -55,7 +55,11 @@ class SchemaComparisonItem(Base, TimestampMixin):
     seq: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
-        comment="Orden GLOBAL de aplicación (render order, ya por fase 1..9)",
+        comment=(
+            "Orden GLOBAL de ejecución. Es la ÚNICA fuente de verdad del orden: lo calcula "
+            "el ordenador topológico de schema_diff, que cruza fases cuando la dependencia "
+            "lo exige (una FK se crea después de la PK que necesita, aunque sea fase 3 vs 4)"
+        ),
     )
 
     object_type: Mapped[str] = mapped_column(
@@ -75,7 +79,36 @@ class SchemaComparisonItem(Base, TimestampMixin):
     )
 
     phase: Mapped[int] = mapped_column(
-        Integer, nullable=False, comment="Fase del pipeline de aplicación (1..9)"
+        Integer,
+        nullable=False,
+        comment=(
+            "Etiqueta gruesa del pipeline (1..9), INFORMATIVA. NO ordena la ejecución: "
+            "para eso está 'seq'. Ordenar por 'phase' produce un orden que el motor "
+            "rechaza (una FK de fase 3 puede depender de una PK de fase 4)"
+        ),
+    )
+
+    # ---- Atomicidad y dependencias (calculadas por el motor de diff) ----------- #
+    op_group: Mapped[str | None] = mapped_column(
+        String(600),
+        nullable=True,
+        index=True,
+        comment=(
+            "Grupo ATÓMICO ('object_type|object_name|change_type'): las varias sentencias "
+            "de un mismo cambio lógico (DROP+CREATE de un índice redefinido, DROP+ADD de "
+            "un PK) lo comparten. La selección se valida por grupo, no por sentencia"
+        ),
+    )
+
+    depends_on: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment=(
+            "JSON: lista de op_group que deben ejecutarse ANTES que esta sentencia "
+            "(tabla antes que su vista, columna antes que su CHECK, UNIQUE antes que la "
+            "FK que la referencia). Base del cierre de dependencias de una selección "
+            "parcial y del linter de orden del plan"
+        ),
     )
 
     sql: Mapped[str] = mapped_column(

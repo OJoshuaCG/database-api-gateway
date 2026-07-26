@@ -30,6 +30,7 @@ from app.models.enums import (
 from app.models.managed_database import ManagedDatabase
 from app.models.migration_statement_progress import MigrationStatementProgress
 from app.models.model_migration import ModelMigration
+from app.models.model_migration_statement import ModelMigrationStatement
 from app.models.permission_profile import PermissionProfile, PermissionProfileItem
 from app.models.privilege import Privilege
 from app.models.schema_comparison import SchemaComparison
@@ -49,6 +50,7 @@ __all__ = [
     "ModelMigration",
     "DatabaseMigrationHistory",
     "MigrationStatementProgress",
+    "ModelMigrationStatement",
     "AuditLog",
     "CryptoKey",
     "Privilege",
