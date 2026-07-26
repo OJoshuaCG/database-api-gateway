@@ -28,18 +28,30 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from app.services.db_admin.dtos import DumpStatement, SeedResult
+from app.services.db_admin.schema_diff import _referenced_identifiers
 from app.services.db_admin.sql_dialect import RollbackGenerator
 
 # Orden canónico de re-aplicación por clase de objeto (prerequisitos → dependientes).
+#
+# ``routine`` va ANTES de ``view``/``materialized_view``: una vista puede llamar a una
+# función del usuario, y en PostgreSQL eso falla si la función todavía no existe. Al
+# revés no pasa (una función que consulta una vista no se valida al crearse en plpgsql).
+# Mismo criterio que ``_BODY_TYPE_ORDER`` en ``schema_diff``.
+#
+# ``index`` va DESPUÉS de ``materialized_view``: en PostgreSQL ``pg_indexes`` incluye los
+# índices de las MATVIEWS (``relkind='m'``), y el dump los emite como ``object_type='index'``.
+# Con los índices antes que las matviews, un ``CREATE INDEX … ON mi_matview`` se ejecutaba
+# antes de que la matview existiera (``42P01``). Poner los índices al final del bloque
+# estructural es seguro para los dos casos (tabla o matview).
 _CLASS_ORDER = [
     "extension",
     "type",
     "sequence",
     "table",
-    "index",
+    "routine",
     "view",
     "materialized_view",
-    "routine",
+    "index",
     "trigger",
     "event",
 ]
@@ -47,6 +59,10 @@ _CLASS_RANK = {name: i for i, name in enumerate(_CLASS_ORDER)}
 
 # Objetos procedurales cuyo cuerpo NO es traducible cross-engine (atan al motor).
 _NON_PORTABLE_TYPES = frozenset({"routine", "trigger", "event"})
+
+# Clases cuyo DDL es un CUERPO que puede nombrar a otros objetos del mismo grupo: se
+# ordenan por dependencia real, no alfabéticamente (ver _order_by_body_references).
+_BODY_CLASSES = frozenset({"view", "materialized_view", "routine", "trigger", "event"})
 
 # Prerequisitos de las tablas: deben ir en una versión <= la de CUALQUIER tabla.
 _PREREQ_TYPES = frozenset({"extension", "type", "sequence"})
@@ -152,8 +168,56 @@ def _topo_sort_tables(tables: list[DumpStatement]) -> list[DumpStatement]:
     return ordered
 
 
+def _order_by_body_references(items: list[DumpStatement]) -> list[DumpStatement]:
+    """
+    Ordena objetos con CUERPO por las referencias que su DDL hace a los demás del grupo.
+
+    Sin esto, el orden dentro de la clase era ALFABÉTICO: una ``v_totales`` que lee de
+    ``v_detalle`` salía primero o segundo según el nombre, y el baseline fallaba con
+    ``1146``/``42P01`` la mitad de las veces. Es el mismo problema que se corrigió en
+    ``schema_diff.order_diff_items``, en el otro camino de creación de versiones.
+
+    Se escanean los identificadores del DDL (mismo criterio que ``schema_diff``) contra los
+    nombres del grupo. Un ciclo o una autorreferencia no rompen nada: el resto se ordena y
+    lo no colocable queda al final, alfabético y determinista.
+    """
+    if len(items) < 2:
+        return list(items)
+    by_name = {s.name: s for s in items}
+    deps: dict[str, set[str]] = {}
+    for s in items:
+        refs = _referenced_identifiers(s.ddl)
+        # ``depends_on`` (cuando el adapter lo pobló) es información FIRME: se suma.
+        refs |= {d.lower() for d in (s.depends_on or [])}
+        deps[s.name] = {
+            other for other in by_name
+            if other != s.name and other.lower() in refs
+        }
+    ordered: list[DumpStatement] = []
+    placed: set[str] = set()
+    remaining = sorted(by_name)
+    while remaining:
+        ready = [n for n in remaining if deps[n] <= placed]
+        if not ready:
+            break
+        for n in ready:
+            ordered.append(by_name[n])
+            remaining.remove(n)
+        placed.update(ready)
+    ordered.extend(by_name[n] for n in remaining)  # ciclo: al final, estable
+    return ordered
+
+
 def order_statements(statements: list[DumpStatement]) -> list[DumpStatement]:
-    """Ordena por clase canónica; dentro de las tablas, orden topológico por FK."""
+    """
+    Ordena por clase canónica; dentro de cada clase, por DEPENDENCIA real.
+
+    - ``table``: topológico por FK (padre antes que hijo).
+    - objetos con cuerpo (``view``/``materialized_view``/``routine``/``trigger``/``event``):
+      topológico por las referencias de su DDL (vista sobre vista, trigger sobre la rutina
+      que llama). Antes era alfabético, que es azar.
+    - el resto: alfabético (no hay dependencias intra-clase que resolver).
+    """
     by_class: dict[str, list[DumpStatement]] = {}
     for s in statements:
         by_class.setdefault(s.object_type, []).append(s)
@@ -165,6 +229,8 @@ def order_statements(statements: list[DumpStatement]) -> list[DumpStatement]:
             continue
         if cls == "table":
             result.extend(_topo_sort_tables(items))
+        elif cls in _BODY_CLASSES:
+            result.extend(_order_by_body_references(items))
         else:
             result.extend(sorted(items, key=lambda s: s.name))
     # Clases desconocidas: al final, deterministas.
