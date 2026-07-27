@@ -50,6 +50,7 @@ from app.models.schema_comparison import SchemaComparison
 from app.models.schema_comparison_item import SchemaComparisonItem
 from app.services import audit
 from app.services.db_admin.factory import get_adapter
+from app.services.db_admin.identifiers import references_gateway_internal_table
 from app.services.db_admin.migrations import MigrationRunner
 from app.services.db_admin.plan_integrity import (
     PlanItem,
@@ -862,6 +863,60 @@ class SchemaComparisonController:
             },
         )
 
+    @staticmethod
+    def _assert_no_gateway_internal_sql(resolved: list[dict], *, operation: str) -> None:
+        """
+        Rechaza (409) ejecutar/adoptar sentencias que toquen la contabilidad INTERNA del
+        gateway (``_gw_v_{slug}`` / ``_gw_stg_*``).
+
+        La causa raíz ya está corregida: ``structural_snapshot`` excluye esas tablas, así
+        que una comparación NUEVA no puede generar ese DDL. Esto cubre las comparaciones
+        **YA PERSISTIDAS antes del fix**, que siguen vivas hasta que expire su TTL
+        (``SCHEMA_COMPARISON_TTL_HOURS``) con el SQL malo guardado en
+        ``schema_comparison_items``.
+
+        Hace falta acá y no alcanza con los guards de migraciones porque la **Opción B**
+        (``/execute``) NO pasa por ``create_migration``: ejecuta el SQL persistido directo
+        con ``MigrationRunner.execute_adhoc``. Los dos sentidos son peligrosos: si el
+        target tenía la tabla de versión, el diff emitió ``DROP TABLE _gw_v_…``; si la
+        tenía el SOURCE, emitió ``CREATE TABLE _gw_v_{slug_del_origen}``, que le inyecta al
+        target una tabla de versión ajena (y en un clon previo al fix podía llegar incluso
+        con su fila, haciendo que el gateway creyera que esa BD está en una versión que no
+        tiene).
+
+        Es 409 y no 422 porque el cliente no puede corregirlo cambiando el input: los
+        ítems son de solo lectura. La salida es **recalcular la comparación** — misma
+        semántica y mismo CTA que el 409 anti-TOCTOU.
+        """
+        offenders: dict[int, list[str]] = {}
+        for d in resolved:
+            hits: list[str] = []
+            for sql in (d.get("sql"), d.get("down_sql")):
+                for prefix in references_gateway_internal_table(sql or ""):
+                    if prefix not in hits:
+                        hits.append(prefix)
+            if hits:
+                offenders[d["id"]] = hits
+        if not offenders:
+            return
+        raise AppHttpException(
+            message=(
+                "Esta comparación fue calculada antes de una corrección del sistema y "
+                "contiene sentencias contra las tablas internas del gateway "
+                f"({', '.join(sorted({p for v in offenders.values() for p in v}))}*), que "
+                "administran el puntero de versión de las migraciones. Ejecutarlas dejaría "
+                "la base de datos sin versión registrada. Recalculá la comparación "
+                "(POST /schema-comparisons) y volvé a intentar: el diff nuevo ya no las "
+                "incluye."
+            ),
+            status_code=409,
+            context={"operation": operation, "offending_item_ids": sorted(offenders)},
+            public_context={
+                "offending_item_ids": sorted(offenders),
+                "recalculate_required": True,
+            },
+        )
+
     def _assert_plan_sane(
         self, plan: list[PlanItem], selected_item_ids: list[int], *, operation: str
     ) -> list:
@@ -1083,6 +1138,7 @@ class SchemaComparisonController:
         # tuviera un hueco, el linter no lo detectaría (ignora dependencias ausentes del
         # subconjunto, porque para entonces ya se asume cerrado).
         self._assert_selection_closed(plan, effective_ids, operation="adopt")
+        self._assert_no_gateway_internal_sql(selected, operation="adopt")
         plan_warnings = self._assert_plan_sane(plan, effective_ids, operation="adopt")
 
         # Anti-TOCTOU antes de derivar/aplicar nada.
@@ -1338,6 +1394,11 @@ class SchemaComparisonController:
                 status_code=422,
                 context={"mode": mode},
             )
+
+        # Comparaciones calculadas ANTES del fix del snapshot pueden traer DDL contra la
+        # contabilidad interna del gateway. La Opción B ejecuta el SQL persistido directo
+        # (no pasa por create_migration), así que el guard tiene que estar acá.
+        self._assert_no_gateway_internal_sql(resolved, operation=f"execute:{mode}")
 
         # Linter de plan: última barrera antes de tocar el motor. Un plan cuyo orden viole
         # una dependencia no se ejecuta (fallaría a mitad, dejando la BD inconsistente).

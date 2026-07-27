@@ -235,3 +235,68 @@ def test_apply_guard_blocks_versions_created_before_the_fix():
     assert exc.value.status_code == 409
     offenders = exc.value.public_context["offending_versions"]
     assert "0007" in offenders and "0006" not in offenders
+
+
+# --------------------------------------------------------------------------- #
+# Comparaciones YA PERSISTIDAS antes del fix (Opción A y Opción B)             #
+# --------------------------------------------------------------------------- #
+def test_stale_comparison_items_are_rejected_before_executing():
+    """
+    La causa raíz está corregida en el snapshot, pero una comparación calculada ANTES del
+    fix sigue viva hasta que expire su TTL con el SQL malo persistido en
+    ``schema_comparison_items``. La **Opción B** (``/execute``) NO pasa por
+    ``create_migration``: ejecuta ese SQL directo con ``execute_adhoc``, así que necesita
+    su propio guard.
+    """
+    from app.controllers.schema_comparison_controller import SchemaComparisonController
+
+    assert_clean = SchemaComparisonController._assert_no_gateway_internal_sql
+
+    # Un conjunto limpio no se bloquea.
+    assert_clean(
+        [{"id": 1, "sql": "ALTER TABLE `invoices` ADD COLUMN `x` INT", "down_sql": None}],
+        operation="execute:all",
+    )
+
+    # El SQL exacto del incidente, en la dirección DROP (target tenía la tabla).
+    with pytest.raises(AppHttpException) as exc:
+        assert_clean(
+            [
+                {"id": 1, "sql": "ALTER TABLE `invoices` ADD COLUMN `x` INT", "down_sql": None},
+                {"id": 2, "sql": "DROP TABLE `_gw_v_test_cirox_main_central`", "down_sql": None},
+            ],
+            operation="execute:all",
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.public_context["offending_item_ids"] == [2]
+    assert exc.value.public_context["recalculate_required"] is True
+
+
+def test_stale_comparison_detects_the_inverse_direction_too():
+    """
+    Dirección SIMÉTRICA e igual de peligrosa: si el ORIGEN era una BD gestionada y el
+    destino no, el diff emitía ``CREATE TABLE _gw_v_{slug_del_origen}``, inyectándole al
+    target una tabla de versión ajena.
+    """
+    from app.controllers.schema_comparison_controller import SchemaComparisonController
+
+    with pytest.raises(AppHttpException) as exc:
+        SchemaComparisonController._assert_no_gateway_internal_sql(
+            [{"id": 7,
+              "sql": "CREATE TABLE `_gw_v_blueprint_origen` (`version_num` VARCHAR(32) NOT NULL)",
+              "down_sql": None}],
+            operation="execute:custom",
+        )
+    assert exc.value.status_code == 409
+
+
+def test_stale_comparison_also_checks_the_rollback_sql():
+    """El ``down_sql`` persistido también se ejecuta (al revertir): entra en el guard."""
+    from app.controllers.schema_comparison_controller import SchemaComparisonController
+
+    with pytest.raises(AppHttpException):
+        SchemaComparisonController._assert_no_gateway_internal_sql(
+            [{"id": 3, "sql": "ALTER TABLE `t` ADD COLUMN `c` INT",
+              "down_sql": "CREATE TABLE `_gw_v_x` (`version_num` VARCHAR(32))"}],
+            operation="adopt",
+        )
