@@ -35,6 +35,7 @@ from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
 from app.services import audit
 from app.services.db_admin import migration_progress
+from app.services.db_admin.identifiers import references_gateway_internal_table
 from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
 from app.services.db_admin.sql_dialect import RollbackGenerator, SqlTranslator
 
@@ -236,6 +237,7 @@ class ModelMigrationController:
             up_mysql = data.get("up_sql_mysql")
             up_pg = data.get("up_sql_postgresql")
             down_sql = data.get("down_sql")
+            self._reject_gateway_internal_sql(up_sql, up_mysql, up_pg, down_sql)
             # Sugerir rollback solo si el admin no proporcionó uno explícito. Un llamador
             # interno (p. ej. adopción de un diff) puede pasar un ``down_sql_suggested`` de
             # mejor calidad (derivado del estado "antes" exacto): se respeta si viene.
@@ -330,6 +332,40 @@ class ModelMigrationController:
             detail=f"migración {assigned_version} creada (id={migration_id})",
         )
         return result
+
+    @staticmethod
+    def _reject_gateway_internal_sql(*sql_variants: str | None) -> None:
+        """
+        Rechaza (422) SQL de migración que nombre la contabilidad INTERNA del gateway.
+
+        Ninguna migración de blueprint tiene un motivo legítimo para tocar
+        ``_gw_v_{slug}`` (la tabla de versión de Alembic) ni ``_gw_stg_*`` (staging de la
+        copia de datos): el gateway las administra en exclusiva.
+
+        Fallo REAL que esto previene (2026-07-27): un diff estructural incluía la tabla de
+        versión del destino y generaba ``DROP TABLE _gw_v_{slug}``. Al aplicarse, Alembic
+        ejecutaba todo el DDL —incluido el DROP de su propia contabilidad— y moría al
+        registrar la versión con ``(1146, "Table '..._gw_v_...' doesn't exist")``, dejando
+        la BD con los cambios aplicados pero sin puntero de versión. La causa raíz se
+        arregló excluyendo estas tablas del snapshot
+        (``identifiers.GATEWAY_TABLE_PREFIXES``); esto es la barrera de creación, para que
+        ni una migración escrita a mano pueda reintroducir el problema.
+        """
+        for sql in sql_variants:
+            hits = references_gateway_internal_table(sql or "")
+            if hits:
+                raise AppHttpException(
+                    message=(
+                        "El SQL de la migración hace referencia a tablas internas del "
+                        f"gateway ({', '.join(hits)}*), que administra el propio sistema "
+                        "(la tabla de versión de Alembic y el staging de copia de datos). "
+                        "Una migración nunca debe tocarlas: aplicarla dejaría la base de "
+                        "datos sin puntero de versión. Quitá esas sentencias del SQL."
+                    ),
+                    status_code=422,
+                    context={"gateway_internal_prefixes": hits},
+                    public_context={"gateway_internal_prefixes": hits},
+                )
 
     @staticmethod
     def _write_statement_manifest(
@@ -711,6 +747,13 @@ class ModelMigrationController:
                             "incomplete_progress": incomplete,
                         },
                     )
+
+            # Misma barrera que en la creación: una corrección manual tampoco puede
+            # introducir SQL contra la contabilidad interna del gateway.
+            self._reject_gateway_internal_sql(
+                data.get("up_sql"), data.get("up_sql_mysql"),
+                data.get("up_sql_postgresql"), data.get("down_sql"),
+            )
 
             if "name" in data and data["name"] is not None:
                 m.name = data["name"]

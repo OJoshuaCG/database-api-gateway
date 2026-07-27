@@ -597,6 +597,34 @@ regenera `down_sql_suggested`. `DELETE` solo borra la **última** versión (la p
 Verificación e2e contra motores reales (`scripts/verify_migrations_e2e.py`, requiere Docker):
 **ejecutada — 153 checks / 0 fallos** (cubre Plan 02 + Plan 09 + UX).
 
+**La contabilidad INTERNA del gateway NO es esquema del usuario (fix de producción,
+2026-07-27)**: `identifiers.GATEWAY_TABLE_PREFIXES = ("_gw_v_", "_gw_stg_")` +
+`is_gateway_internal_table`/`exclude_gateway_internal_tables`/`references_gateway_internal_table`.
+CAUSA RAÍZ del incidente: los CUATRO caminos que enumeran tablas
+(`base_adapter.structural_snapshot`, `list_tables`, `list_table_stats`, y `dump_structure` de
+MySQL y PG) incluían `_gw_v_{slug}` —la tabla de versión de Alembic que el gateway crea DENTRO
+de cada BD gestionada—. Al comparar una BD origen (sin ella) contra una gestionada destino (con
+ella), el diff la veía "en target y no en source" → emitía **`DROP TABLE _gw_v_{slug}`**.
+Adoptado como versión y aplicado: Alembic leía la versión actual OK, ejecutaba TODO el DDL
+(incluido el DROP de su propia contabilidad) y moría al registrar la versión nueva con
+`(1146, "Table '..._gw_v_...' doesn't exist")` — BD con los cambios aplicados pero SIN puntero
+de versión, y en cuarentena. **La auto-reconciliación NO lo detecta**: el fallo ocurre en la
+contabilidad de Alembic, no en una sentencia, así que el checkpoint queda `last == total` →
+no hay "aplicación parcial" → `on_failure=auto` no dispara. El caso SIMÉTRICO es igual de
+grave: origen gestionado + destino sin gestionar → `CREATE TABLE _gw_v_{slug_origen}` inyecta
+una tabla de versión ajena. FIX en 3 capas: (1) los 4 snapshots excluyen esos prefijos;
+(2) `create_migration`/`update_migration` **rechazan (422)** SQL que los nombre (ninguna
+migración tiene motivo legítimo para tocarlos); (3) `_guard_gateway_internal_sql` **bloquea
+(409)** el `apply`/`apply_all` de versiones creadas ANTES del fix, nombrando las ofensoras —
+sin esto, aplicar la versión mala a OTRA BD del blueprint repetía el fallo.
+`version_table_name` toma el prefijo de `GATEWAY_TABLE_PREFIXES` para que el nombre que se
+CREA y el que se EXCLUYE no puedan divergir (test de invariante). `gw_ou_{hash}` (función +
+trigger de PG que emula `ON UPDATE CURRENT_TIMESTAMP`) NO se excluye a propósito: implementa
+el comportamiento de una COLUMNA del usuario, y filtrarlo haría que el diff lo recreara en
+cada corrida. RECUPERACIÓN de una BD ya afectada: `PATCH` la versión para quitar esas
+sentencias (permitido: la aplicación falló, no fue exitosa) → `stamp` en la versión que la BD
+tiene FÍSICAMENTE aplicada (Alembic recrea la tabla de versión y sale de cuarentena).
+
 **PostgreSQL: DDL TRANSACCIONAL — el estado parcial no existe** (`MigrationRunner.use_transactional_ddl`):
 diferencia de motor más importante del módulo. PG ejecuta DDL transaccional, así que una
 migración que falla en la sentencia 10 de 50 **se deshace sola** y el ledger nunca divergió del

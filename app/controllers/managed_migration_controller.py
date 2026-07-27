@@ -38,6 +38,7 @@ from app.services.db_admin.migrations import (
     MigrationRunner,
     MigrationSpec,
 )
+from app.services.db_admin.identifiers import references_gateway_internal_table
 from app.services.db_admin.sql_dialect import SqlTranslator, split_sql_statements
 
 logger = get_logger(__name__)
@@ -236,6 +237,7 @@ class ManagedMigrationController:
             self._guard_cross_engine(session, model.id, engine)
             self._guard_reviewed_baseline(session, model.id)
             self._guard_untranslatable_sql(specs, engine)
+            self._guard_gateway_internal_sql(specs)
             db_name, server_id = md.name, md.server_id
             quarantined = md.status == ProvisionStatus.error
             target = build_target(server)
@@ -376,6 +378,51 @@ class ManagedMigrationController:
                 status_code=422,
                 context={"target_engine": engine.value, "untranslatable": problems},
                 public_context={"untranslatable": problems},
+            )
+
+    @staticmethod
+    def _guard_gateway_internal_sql(specs: list[MigrationSpec]) -> None:
+        """
+        Bloquea (409) aplicar una migración cuyo SQL toque la contabilidad INTERNA del
+        gateway (``_gw_v_{slug}`` / ``_gw_stg_*``).
+
+        Es la red de seguridad para versiones creadas ANTES del fix del snapshot: el diff
+        estructural incluía la tabla de versión del destino y podía generar
+        ``DROP TABLE _gw_v_{slug}``. Aplicar eso ejecuta todo el DDL y después mata a
+        Alembic al registrar la versión (``1146``), dejando la BD con los cambios hechos
+        pero SIN puntero de versión — y como el fallo ocurre en la contabilidad y no en una
+        sentencia, la auto-reconciliación no lo detecta como aplicación parcial.
+
+        Se valida ANTES de tocar el motor y sobre TODAS las variantes de SQL (base +
+        overrides por motor + rollback). La salida es corregir el ``up_sql`` de esa versión
+        con un ``PATCH`` (la creación y la edición ya rechazan este SQL de entrada).
+        """
+        offenders: dict[str, list[str]] = {}
+        for spec in specs:
+            hits: list[str] = []
+            for sql in (spec.up_sql, spec.up_sql_mysql, spec.up_sql_postgresql, spec.down_sql):
+                for prefix in references_gateway_internal_table(sql or ""):
+                    if prefix not in hits:
+                        hits.append(prefix)
+            if hits:
+                offenders[spec.version] = hits
+        if offenders:
+            detail = ", ".join(
+                f"{v} (toca {', '.join(p)}*)" for v, p in sorted(offenders.items())
+            )
+            raise AppHttpException(
+                message=(
+                    f"No se puede aplicar: hay versiones cuyo SQL toca la contabilidad "
+                    f"interna del gateway — {detail}. Esas sentencias borrarían o "
+                    "alterarían la tabla de versión de Alembic y dejarían la BD sin "
+                    "puntero de versión. Corregí el 'up_sql' de esas versiones con un "
+                    "PATCH (quitando esas sentencias) antes de aplicar. Si una BD ya "
+                    "quedó así, recreá su puntero con 'stamp' en la versión que "
+                    "físicamente tiene aplicada."
+                ),
+                status_code=409,
+                context={"model_id": None, "offending_versions": offenders},
+                public_context={"offending_versions": offenders},
             )
 
     @staticmethod
@@ -1248,6 +1295,7 @@ class ManagedMigrationController:
             # distintos), así que se validan una vez por motor distinto — antes se aplicaba
             # sin revisarlos y un blueprint atado a un motor solo se detectaba por el fallo
             # del propio motor, BD por BD.
+            self._guard_gateway_internal_sql(specs)
             for _target, eng in {(None, e) for _t, e in targets.values()}:
                 self._guard_cross_engine(session, model_id, eng)
                 self._guard_untranslatable_sql(specs, eng)
