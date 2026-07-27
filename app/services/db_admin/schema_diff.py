@@ -35,6 +35,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 from sqlglot import exp
 
+from app.services.db_admin.sql_dialect import strip_self_schema_qualifier
 from app.services.db_admin.dtos import (
     CheckConstraintInfo,
     ColumnInfo,
@@ -1002,6 +1003,11 @@ def _maybe_name_note(items: list[DiffItem], sobj, tobj) -> None:
 # ---- Vistas / matviews ----------------------------------------------------- #
 def _diff_views(source: SchemaSnapshot, target: SchemaSnapshot) -> list[DiffItem]:
     items: list[DiffItem] = []
+    # Cada lado se compara con el calificador de su PROPIA base quitado: en MySQL/MariaDB
+    # el cuerpo lleva el nombre de la BD adentro y, sin esto, una BD contra su clon
+    # reportaría todas las vistas como modificadas (ver strip_self_schema_qualifier).
+    src_ctx = (source.database, source.source_engine)
+    tgt_ctx = (target.database, target.source_engine)
     for is_mat, otype in ((False, "view"), (True, "materialized_view")):
         src_map = {v.name: v for v in source.views if v.is_materialized == is_mat}
         tgt_map = {v.name: v for v in target.views if v.is_materialized == is_mat}
@@ -1013,7 +1019,7 @@ def _diff_views(source: SchemaSnapshot, target: SchemaSnapshot) -> list[DiffItem
                     object_type=otype, object_name=n, change_type="new",
                     phase=PHASE_CREATE_REPLACE, source_payload=v, risk=risk,
                 ))
-            elif _view_key(v) != _view_key(tgt_map[n]):
+            elif _view_key(v, *src_ctx) != _view_key(tgt_map[n], *tgt_ctx):
                 risk = RiskFlags(requires_individual_review=True)
                 # Cambiar columnas de una vista/matview obliga DROP+CREATE.
                 if list(v.columns) != list(tgt_map[n].columns):
@@ -1035,13 +1041,16 @@ def _diff_views(source: SchemaSnapshot, target: SchemaSnapshot) -> list[DiffItem
     return items
 
 
-def _view_key(v: ViewInfo) -> tuple:
-    return (normalize_body(v.definition), v.check_option or "", bool(v.security_definer),
+def _view_key(v: ViewInfo, database: str = "", engine: str = "") -> tuple:
+    body = strip_self_schema_qualifier(v.definition, database, engine)
+    return (normalize_body(body), v.check_option or "", bool(v.security_definer),
             tuple(v.columns))
 
 
 # ---- Rutinas --------------------------------------------------------------- #
 def _diff_routines(source: SchemaSnapshot, target: SchemaSnapshot) -> list[DiffItem]:
+    src_ctx = (source.database, source.source_engine)
+    tgt_ctx = (target.database, target.source_engine)
     src_map = {(r.kind.upper(), r.name): r for r in source.routines}
     tgt_map = {(r.kind.upper(), r.name): r for r in target.routines}
     items: list[DiffItem] = []
@@ -1053,7 +1062,7 @@ def _diff_routines(source: SchemaSnapshot, target: SchemaSnapshot) -> list[DiffI
                 phase=PHASE_CREATE_REPLACE, source_payload=r,
                 risk=RiskFlags(requires_individual_review=True),
             ))
-        elif _routine_key(r) != _routine_key(tgt_map[key]):
+        elif _routine_key(r, *src_ctx) != _routine_key(tgt_map[key], *tgt_ctx):
             items.append(DiffItem(
                 object_type="routine", object_name=f"{r.kind}:{r.name}", change_type="modified",
                 phase=PHASE_CREATE_REPLACE, source_payload=r, target_payload=tgt_map[key],
@@ -1070,14 +1079,17 @@ def _diff_routines(source: SchemaSnapshot, target: SchemaSnapshot) -> list[DiffI
     return items
 
 
-def _routine_key(r: RoutineInfo) -> tuple:
+def _routine_key(r: RoutineInfo, database: str = "", engine: str = "") -> tuple:
     params = tuple((p.mode or "", p.type) for p in r.parameters)
-    return (normalize_body(r.body), r.return_type or "", (r.language or "").lower(),
+    body = strip_self_schema_qualifier(r.body, database, engine)
+    return (normalize_body(body), r.return_type or "", (r.language or "").lower(),
             (r.volatility or "").lower(), bool(r.security_definer), params)
 
 
 # ---- Triggers -------------------------------------------------------------- #
 def _diff_triggers(source: SchemaSnapshot, target: SchemaSnapshot) -> list[DiffItem]:
+    src_ctx = (source.database, source.source_engine)
+    tgt_ctx = (target.database, target.source_engine)
     src_map = {(t.table, t.name): t for t in source.triggers}
     tgt_map = {(t.table, t.name): t for t in target.triggers}
     items: list[DiffItem] = []
@@ -1089,7 +1101,7 @@ def _diff_triggers(source: SchemaSnapshot, target: SchemaSnapshot) -> list[DiffI
                 phase=PHASE_CREATE_REPLACE, parent_table=t.table, source_payload=t,
                 risk=RiskFlags(requires_individual_review=True),
             ))
-        elif _trigger_key(t) != _trigger_key(tgt_map[key]):
+        elif _trigger_key(t, *src_ctx) != _trigger_key(tgt_map[key], *tgt_ctx):
             items.append(DiffItem(
                 object_type="trigger", object_name=t.name, change_type="modified",
                 phase=PHASE_CREATE_REPLACE, parent_table=t.table,
@@ -1107,14 +1119,17 @@ def _diff_triggers(source: SchemaSnapshot, target: SchemaSnapshot) -> list[DiffI
     return items
 
 
-def _trigger_key(t: TriggerInfo) -> tuple:
-    return (normalize_body(t.action), (t.timing or "").upper(),
+def _trigger_key(t: TriggerInfo, database: str = "", engine: str = "") -> tuple:
+    action = strip_self_schema_qualifier(t.action, database, engine)
+    return (normalize_body(action), (t.timing or "").upper(),
             tuple(sorted(e.upper() for e in t.events)), (t.level or "").upper(),
             _norm_expr(t.when_condition))
 
 
 # ---- Events (MySQL) -------------------------------------------------------- #
 def _diff_events(source: SchemaSnapshot, target: SchemaSnapshot) -> list[DiffItem]:
+    src_ctx = (source.database, source.source_engine)
+    tgt_ctx = (target.database, target.source_engine)
     src_map = {e.name: e for e in source.events}
     tgt_map = {e.name: e for e in target.events}
     items: list[DiffItem] = []
@@ -1126,7 +1141,7 @@ def _diff_events(source: SchemaSnapshot, target: SchemaSnapshot) -> list[DiffIte
                 phase=PHASE_CREATE_REPLACE, source_payload=e,
                 risk=RiskFlags(requires_individual_review=True),
             ))
-        elif _event_key(e) != _event_key(tgt_map[n]):
+        elif _event_key(e, *src_ctx) != _event_key(tgt_map[n], *tgt_ctx):
             items.append(DiffItem(
                 object_type="event", object_name=n, change_type="modified",
                 phase=PHASE_CREATE_REPLACE, source_payload=e, target_payload=tgt_map[n],
@@ -1142,8 +1157,9 @@ def _diff_events(source: SchemaSnapshot, target: SchemaSnapshot) -> list[DiffIte
     return items
 
 
-def _event_key(e: EventInfo) -> tuple:
-    return (normalize_body(e.body), _norm_expr(e.schedule))
+def _event_key(e: EventInfo, database: str = "", engine: str = "") -> tuple:
+    body = strip_self_schema_qualifier(e.body, database, engine)
+    return (normalize_body(body), _norm_expr(e.schedule))
 
 
 # ---- Secuencias (standalone) ----------------------------------------------- #

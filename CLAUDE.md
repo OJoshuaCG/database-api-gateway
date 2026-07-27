@@ -893,6 +893,23 @@ directo** ad-hoc (Opción B). Guía de uso: `docs/features/schema-comparison.md`
   **Nota operativa**: una versión de blueprint YA adoptada antes de este fix conserva el
   `up_sql` con la sentencia redundante — hay que corregirla con `PATCH` (permitido mientras no
   haya una aplicación EXITOSA; un intento fallido no congela el SQL).
+- **FALSO POSITIVO de vista/rutina/trigger/evento al diffear una BD contra su CLON (fix,
+  2026-07-27)**: MySQL/MariaDB guardan el cuerpo con el esquema CALIFICADO —
+  `information_schema.VIEWS.VIEW_DEFINITION` devuelve SIEMPRE
+  ``select `midb`.`t`.`col` from `midb`.`t` ``— así que dos BDs con el MISMO objeto lógico
+  tienen cuerpos textualmente distintos: cada una lleva su propio nombre adentro. El diff
+  comparaba los cuerpos crudos → **toda** vista/rutina/trigger/evento salía `modified` en
+  cuanto los nombres de las dos BDs diferían (reproducido: 1 item; con el mismo nombre de BD,
+  0 items). `normalize_body` NO alcanzaba: colapsa whitespace y quita el `DEFINER`, pero el
+  nombre de la BD es parte del texto de la consulta. La `requalify_body_schema` que ya
+  existía se aplica al SQL **renderizado** (después del diff), así que corregía el DDL
+  generado pero no evitaba el falso positivo. Fix:
+  `sql_dialect.strip_self_schema_qualifier` quita de cada lado el calificador de su base
+  PROPIA antes de comparar, usado por `_view_key`/`_routine_key`/`_trigger_key`/`_event_key`.
+  NO enmascara diferencias reales: una referencia a OTRA base se conserva en ambos lados
+  (tests que lo verifican). Solo la forma con BACKTICKS, mismo criterio que
+  `requalify_body_schema`, para que lo que el clon RE-ESCRIBE y lo que el diff NORMALIZA sean
+  el mismo concepto. Tests en `tests/test_body_schema_qualifier_diff.py`.
 - **Clasificación new/modified/dropped (fix)**: `primary_key` ya NO es siempre `modified`
   — agregar un PK donde no existía es `new`, eliminarlo por completo es `dropped`, solo un
   PK que cambió existiendo en ambos lados es `modified`. `index`/`unique_constraint`/

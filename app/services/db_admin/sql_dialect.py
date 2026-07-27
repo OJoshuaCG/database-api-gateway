@@ -70,6 +70,35 @@ def requalify_body_schema(sql: str, source_db: str, target_db: str, engine: str)
         return sql
     return sql.replace(f"`{source_db}`.", f"`{target_db}`.")
 
+
+def strip_self_schema_qualifier(sql: str, database: str, engine: str) -> str:
+    """
+    Quita del cuerpo el calificador de su PROPIA base de datos (solo MySQL/MariaDB).
+
+    Sirve para COMPARAR dos cuerpos que viven en BDs de nombre distinto. MySQL/MariaDB
+    guardan la definición con el esquema calificado —
+    ``information_schema.VIEWS.VIEW_DEFINITION`` devuelve siempre
+    ``select `midb`.`t`.`col` from `midb`.`t```— así que dos BDs con el MISMO objeto
+    lógico tienen cuerpos textualmente distintos: cada una lleva su propio nombre adentro.
+
+    Sin esta normalización, diffear una BD contra su CLON reportaba **toda** vista/rutina/
+    trigger/evento como ``modified`` aunque fueran idénticas: un falso positivo garantizado
+    en cuanto los nombres de las dos BDs difieren (verificado en MariaDB). Ojo que
+    ``normalize_body`` NO alcanza para esto: colapsa whitespace y quita el ``DEFINER``,
+    pero el nombre de la BD es parte del texto de la consulta.
+
+    NO enmascara diferencias reales: solo se quita el calificador de la base PROPIA de cada
+    lado. Una referencia cruzada a OTRA base (``` `otra_db`.`t` ```) se conserva en ambos
+    lados, así que si un lado apunta afuera y el otro no, el diff sigue detectándolo.
+
+    Solo la forma con BACKTICKS, igual que ``requalify_body_schema``: es la que emite el
+    servidor al canonicalizar una vista, y mantener el mismo criterio garantiza que lo que
+    el clon RE-ESCRIBE y lo que el diff NORMALIZA sean exactamente el mismo concepto.
+    """
+    if not sql or not database or engine not in _MYSQL_FAMILY_NAMES:
+        return sql
+    return sql.replace(f"`{database}`.", "")
+
 # --------------------------------------------------------------------------- #
 # Detección de cuerpos procedurales (para no cortarlos en su primer ``;``)      #
 # --------------------------------------------------------------------------- #
