@@ -49,6 +49,7 @@ from app.core.remote_engine import (
 from app.exceptions import AppHttpException
 from app.models.enums import EngineType
 from app.services.db_admin import migration_progress
+from app.services.db_admin.identifiers import GATEWAY_TABLE_PREFIXES
 from app.services.db_admin.migration_integrity import validate_version, version_sort_key
 from app.services.db_admin.sql_dialect import (
     RollbackGenerator,
@@ -147,6 +148,12 @@ class StatementResult:
     executed_at: datetime
 
 
+# Prefijo de la tabla de versión, tomado de la lista de objetos internos del gateway
+# (``identifiers.GATEWAY_TABLE_PREFIXES``) para que el nombre que se CREA y el que los
+# snapshots EXCLUYEN no puedan divergir nunca.
+_VERSION_TABLE_PREFIX = GATEWAY_TABLE_PREFIXES[0]  # "_gw_v_"
+
+
 def version_table_name(slug: str) -> str:
     """
     Nombre de la tabla de versión Alembic en la BD destino: ``_gw_v_{slug}``.
@@ -155,9 +162,13 @@ def version_table_name(slug: str) -> str:
     MySQL/MariaDB admiten 64, así que 63 es seguro en los tres motores y evita que
     PostgreSQL trunque silenciosamente y el nombre deje de coincidir entre escritura
     y lectura.
+
+    El prefijo sale de ``identifiers.GATEWAY_TABLE_PREFIXES``: es la MISMA constante que
+    usan los snapshots para excluir esta tabla del diff. Si se cambiara acá sin cambiarla
+    allá, el gateway volvería a generar DDL contra su propia contabilidad.
     """
     safe = "".join(c if (c.isalnum() or c == "_") else "_" for c in slug.lower())
-    return f"_gw_v_{safe}"[:63]
+    return f"{_VERSION_TABLE_PREFIX}{safe}"[:63]
 
 
 class MigrationRunner:

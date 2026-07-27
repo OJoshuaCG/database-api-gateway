@@ -52,7 +52,11 @@ from app.services.db_admin.dtos import (
     UniqueConstraintInfo,
     ViewInfo,
 )
-from app.services.db_admin.identifiers import quote_identifier, validate_identifier
+from app.services.db_admin.identifiers import (
+    exclude_gateway_internal_tables,
+    quote_identifier,
+    validate_identifier,
+)
 from app.services.db_admin.schema_diff import (
     DiffItem,
     RenderedStatement,
@@ -331,11 +335,15 @@ class ServerAdapter(ABC):
 
     def list_tables(self, database: str) -> list[str]:
         # Introspección de un objeto PREEXISTENTE: whitelist ampliada (nombres legados).
+        # Se oculta la contabilidad interna del gateway (``_gw_v_*``/``_gw_stg_*``): no es
+        # esquema del usuario y aparecer en el listado solo invita a operar sobre ella.
         validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         schema = self._inspect_schema(database)
         try:
             with database_connection(self.target, database) as conn:
-                return sorted(inspect(conn).get_table_names(schema=schema))
+                return exclude_gateway_internal_tables(
+                    sorted(inspect(conn).get_table_names(schema=schema))
+                )
         except SQLAlchemyError as exc:
             raise map_driver_error(
                 exc, op="list_tables", target=self.target, extra={"database": database}
@@ -529,9 +537,16 @@ class ServerAdapter(ABC):
         try:
             with database_connection(self.target, database) as conn:
                 insp = inspect(conn)
+                # Se EXCLUYE la contabilidad interna del gateway (``_gw_v_*`` /
+                # ``_gw_stg_*``): no es esquema del usuario. Ver el porqué completo en
+                # ``identifiers.GATEWAY_TABLE_PREFIXES`` — sin este filtro el diff
+                # generaba ``DROP TABLE _gw_v_{slug}`` contra la propia tabla de versión
+                # de Alembic y la migración moría al registrar la versión nueva.
                 tables = [
                     self._build_table_schema(insp, conn, database, t, schema)
-                    for t in sorted(insp.get_table_names(schema=schema))
+                    for t in exclude_gateway_internal_tables(
+                        sorted(insp.get_table_names(schema=schema))
+                    )
                 ]
                 views = self._snapshot_views(conn, database, schema)
                 routines = self._snapshot_routines(conn, database, schema)
@@ -1125,7 +1140,10 @@ class ServerAdapter(ABC):
             with database_connection(self.target, database) as conn:
                 insp = inspect(conn)
                 out: list[TableStat] = []
-                for t in sorted(insp.get_table_names(schema=schema)):
+                # Sin la contabilidad interna del gateway: nunca es candidata a sembrarse.
+                for t in exclude_gateway_internal_tables(
+                    sorted(insp.get_table_names(schema=schema))
+                ):
                     pk = (
                         insp.get_pk_constraint(t, schema=schema).get("constrained_columns")
                         or []

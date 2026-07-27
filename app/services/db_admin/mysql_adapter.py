@@ -34,6 +34,7 @@ from app.services.db_admin.dtos import (
     ViewInfo,
 )
 from app.services.db_admin.identifiers import (
+    exclude_gateway_internal_tables,
     quote_identifier,
     quote_string_literal,
     validate_host,
@@ -157,8 +158,11 @@ class MySQLAdapter(ServerAdapter):
                     if referred and referred != tname:
                         fk_map.setdefault(tname, set()).add(referred)
 
-                # 1) Tablas base (no vistas).
-                tables = [
+                # 1) Tablas base (no vistas). Se excluye la contabilidad interna del
+                #    gateway (``_gw_v_*``/``_gw_stg_*``): un baseline de snapshot que la
+                #    incluyera emitiría ``CREATE TABLE _gw_v_{slug}`` en su versión 0001,
+                #    inyectando una tabla de versión ajena en cada BD donde se aplique.
+                tables = exclude_gateway_internal_tables(
                     r[0]
                     for r in conn.execute(
                         text(
@@ -168,7 +172,7 @@ class MySQLAdapter(ServerAdapter):
                         ),
                         {"db": database},
                     ).fetchall()
-                ]
+                )
                 for t in tables:
                     q = quote_identifier(
                         validate_identifier(t, self.dialect, "tabla", allow_existing=True),

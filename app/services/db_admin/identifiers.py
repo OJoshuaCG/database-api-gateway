@@ -39,6 +39,69 @@ _HOST_RE = re.compile(r"^[A-Za-z0-9_.%:\-]{1,255}$")
 _PRIV_RE = re.compile(r"^[A-Z][A-Z ]*(,\s*[A-Z][A-Z ]*)*$")
 
 
+# --------------------------------------------------------------------------- #
+# Objetos INTERNOS del gateway que viven DENTRO de una BD gestionada            #
+# --------------------------------------------------------------------------- #
+# El gateway crea tablas de contabilidad propias dentro de las BDs que administra:
+#
+#   ``_gw_v_{slug}``   tabla de versión de Alembic por blueprint (migrations.py)
+#   ``_gw_stg_{hash}`` tabla de staging temporal de la copia de datos (data_copy.py)
+#
+# Estas tablas NO son parte del esquema del usuario: son la infraestructura con la que el
+# gateway se administra a sí mismo. **Tienen que quedar FUERA de todo snapshot
+# estructural**, o se filtran al diff y el sistema termina generando DDL contra su propia
+# contabilidad.
+#
+# Fallo REAL que motivó esto (2026-07-27): al comparar una BD origen (sin tabla de versión)
+# contra una BD gestionada destino (con ``_gw_v_{slug}``), el diff clasificaba esa tabla
+# como ``dropped`` —existe en el target, no en el source— y emitía
+# ``DROP TABLE _gw_v_{slug}``. Adoptado como versión de blueprint y aplicado, Alembic leía
+# la versión actual OK, ejecutaba todo el DDL (incluido el DROP de su propia tabla) y al
+# registrar la versión nueva moría con ``(1146, "Table '..._gw_v_...' doesn't exist")``,
+# dejando la BD con los cambios aplicados pero SIN puntero de versión.
+#
+# El caso simétrico es igual de grave: si el ORIGEN es una BD gestionada y el destino no,
+# el diff emitiría ``CREATE TABLE _gw_v_{slug_del_origen}`` sobre el destino, inyectándole
+# una tabla de versión ajena con la versión de otro blueprint.
+#
+# NOTA sobre ``gw_ou_{hash}`` (función + trigger que PostgreSQL usa para emular el
+# ``ON UPDATE CURRENT_TIMESTAMP`` de MySQL): esos SÍ se dejan visibles a propósito.
+# Implementan el comportamiento de una COLUMNA del usuario, así que son parte legítima del
+# esquema resultante; excluirlos haría que el diff intentara recrearlos en cada corrida.
+GATEWAY_TABLE_PREFIXES: tuple[str, ...] = ("_gw_v_", "_gw_stg_")
+
+
+def is_gateway_internal_table(name: str) -> bool:
+    """¿Esta tabla es contabilidad INTERNA del gateway (no del esquema del usuario)?"""
+    if not name:
+        return False
+    lowered = name.lower()
+    return any(lowered.startswith(p) for p in GATEWAY_TABLE_PREFIXES)
+
+
+def exclude_gateway_internal_tables(names) -> list[str]:
+    """Filtra de una lista de tablas las que son contabilidad interna del gateway."""
+    return [n for n in names if not is_gateway_internal_table(n)]
+
+
+def references_gateway_internal_table(sql: str) -> list[str]:
+    """
+    Prefijos de tablas internas del gateway mencionados en un script SQL.
+
+    Lista vacía = el SQL no toca la contabilidad del gateway. Se usa como guard: ninguna
+    migración de blueprint tiene motivo legítimo para nombrar estas tablas, así que
+    encontrarlas es siempre un error de generación (o una versión creada antes del fix del
+    snapshot). Se compara por SUBSTRING a propósito: los prefijos son reservados y
+    distintivos, así que no hace falta parsear el SQL para decidir con certeza — y un
+    falso positivo sería una tabla de usuario llamada ``_gw_v_…``, que el gateway
+    confundiría con su propia contabilidad de todos modos.
+    """
+    if not sql:
+        return []
+    lowered = sql.lower()
+    return [p for p in GATEWAY_TABLE_PREFIXES if p in lowered]
+
+
 def validate_identifier(
     name: str, dialect: str, kind: str = "identificador", *, allow_existing: bool = False
 ) -> str:

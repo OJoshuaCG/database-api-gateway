@@ -37,6 +37,7 @@ from app.services.db_admin.dtos import (
     ViewInfo,
 )
 from app.services.db_admin.identifiers import (
+    exclude_gateway_internal_tables,
     quote_identifier,
     quote_string_literal,
     validate_identifier,
@@ -162,7 +163,9 @@ class PostgresAdapter(ServerAdapter):
 
                 # 4) Tablas (reflexión + compilador CreateTable, en dialecto PG).
                 insp = inspect(conn)
-                table_names = [
+                # Se excluye la contabilidad interna del gateway (``_gw_v_*``/
+                # ``_gw_stg_*``): ver el mismo filtro en MySQLAdapter.dump_structure.
+                table_names = exclude_gateway_internal_tables(
                     r[0]
                     for r in conn.execute(
                         text(
@@ -171,7 +174,7 @@ class PostgresAdapter(ServerAdapter):
                             "ORDER BY table_name"
                         )
                     ).fetchall()
-                ]
+                )
                 for tname in table_names:
                     validate_identifier(tname, self.dialect, "tabla", allow_existing=True)
                     tbl = Table(tname, MetaData(), autoload_with=conn, schema="public")
