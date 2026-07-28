@@ -306,12 +306,24 @@ class PostgresAdapter(ServerAdapter):
     ) -> None:
         validate_identifier(db_name, self.dialect, "base de datos")
         db = quote_identifier(db_name, self.dialect)
-        sql = f"CREATE DATABASE {db}"
+        parts = [f"CREATE DATABASE {db}"]
         if owner:
             validate_identifier(owner, self.dialect, "usuario")
-            sql += f" OWNER {quote_identifier(owner, self.dialect)}"
-        sql += " ENCODING 'UTF8' TEMPLATE template0"
-        self._execute_server([sql], op="create_database", extra={"database": db_name})
+            parts.append(f"OWNER {quote_identifier(owner, self.dialect)}")
+        # ``charset`` → ENCODING (default UTF8). Va como LITERAL de string, no identificador.
+        encoding = charset or "UTF8"
+        parts.append(f"ENCODING {quote_string_literal(encoding, self.dialect)}")
+        # ``collation`` es el LOCALE de la BD (p.ej. 'en_US.UTF-8'); fija LC_COLLATE y LC_CTYPE.
+        # CAVEAT OPERATIVO: el locale DEBE existir en el SO del servidor PostgreSQL, o el
+        # CREATE DATABASE falla con "invalid locale name". Solo se emite si el llamador lo pide.
+        if collation:
+            loc = quote_string_literal(collation, self.dialect)
+            parts.append(f"LC_COLLATE {loc} LC_CTYPE {loc}")
+        # TEMPLATE template0 es REQUERIDO por PG para fijar encoding/locale distintos del default.
+        parts.append("TEMPLATE template0")
+        self._execute_server(
+            [" ".join(parts)], op="create_database", extra={"database": db_name}
+        )
 
     def drop_database(self, db_name) -> None:
         validate_identifier(db_name, self.dialect, "base de datos")
