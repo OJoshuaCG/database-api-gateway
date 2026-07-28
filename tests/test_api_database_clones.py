@@ -78,10 +78,13 @@ def _source_snapshot(db="src_db", engine="mysql") -> SchemaSnapshot:
 class _FakeAdapter:
     """Adapter en memoria: snapshots, list/create/drop de BD y render_diff determinista."""
 
+    dialect = "mysql"
+
     def __init__(self, snaps: dict, existing: set):
         self.snaps = snaps
         self.existing = set(existing)
         self.created: list[str] = []
+        self.create_calls: list[dict] = []  # kwargs de cada create_database (charset/collation)
         self.dropped: list[str] = []
 
     def structural_snapshot(self, database):
@@ -93,6 +96,7 @@ class _FakeAdapter:
     def create_database(self, db_name, charset=None, collation=None, owner=None):
         self.existing.add(db_name)
         self.created.append(db_name)
+        self.create_calls.append({"db_name": db_name, "charset": charset, "collation": collation})
 
     def drop_database(self, db_name):
         self.existing.discard(db_name)
@@ -191,6 +195,51 @@ def test_create_plan_new_target_structure_only(admin_client, monkeypatch):
     assert "structure" in kinds
     # Se creó la BD destino.
     assert any(i["object_type"] == "database" and i["kind"] == "clean" for i in items)
+
+
+def test_new_target_inherits_source_db_default_collation_same_engine(admin_client, monkeypatch):
+    # La BD destino nace con el MISMO default de charset/collation que la origen (mismo motor),
+    # para que no derive (era la causa raíz del loop de falsos positivos del diff).
+    fake = _install(monkeypatch, target_exists=False)
+    fake.snaps["src_db"].db_charset = "utf8mb4"
+    fake.snaps["src_db"].db_collation = "utf8mb4_spanish_ci"
+    sid = _server(admin_client, 3610)
+    oid = _owner(admin_client, sid)
+    src_id = _managed(admin_client, sid, oid, "src_db")
+    r = admin_client.post("/api/v1/database-clones", json={
+        "source_database_id": src_id,
+        "target_server_id": sid, "target_database_name": "dst_db",
+        "target_mode": "new", "include_data": False,
+    })
+    job_id = r.json()["data"]["id"]
+    _pr, ex = _preview_and_execute(admin_client, job_id)
+    assert ex.status_code == 200, ex.text
+    call = next(c for c in fake.create_calls if c["db_name"] == "dst_db")
+    assert call["charset"] == "utf8mb4"
+    assert call["collation"] == "utf8mb4_spanish_ci"
+
+
+def test_new_target_does_not_propagate_db_default_cross_engine(admin_client, monkeypatch):
+    # Cross-engine: los nombres de collation no son portables -> NO se propaga, se cae al default
+    # del motor destino (charset/collation None en el CREATE DATABASE).
+    fake = _install(monkeypatch, target_exists=False)
+    fake.snaps["src_db"].source_engine = "mariadb"  # tgt_adapter.dialect == "mysql"
+    fake.snaps["src_db"].db_charset = "utf8mb4"
+    fake.snaps["src_db"].db_collation = "utf8mb4_uca1400_ai_ci"
+    sid = _server(admin_client, 3611)
+    oid = _owner(admin_client, sid)
+    src_id = _managed(admin_client, sid, oid, "src_db")
+    r = admin_client.post("/api/v1/database-clones", json={
+        "source_database_id": src_id,
+        "target_server_id": sid, "target_database_name": "dst_db",
+        "target_mode": "new", "include_data": False,
+    })
+    job_id = r.json()["data"]["id"]
+    _pr, ex = _preview_and_execute(admin_client, job_id)
+    assert ex.status_code == 200, ex.text
+    call = next(c for c in fake.create_calls if c["db_name"] == "dst_db")
+    assert call["charset"] is None
+    assert call["collation"] is None
 
 
 def test_full_clone_with_data_records_row_counts(admin_client, monkeypatch):

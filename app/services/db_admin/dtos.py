@@ -273,6 +273,13 @@ class SchemaSnapshot(BaseModel):
     database: str
     source_engine: str  # 'mysql' | 'mariadb' | 'postgresql'
     captured_at: str | None = None
+    # Default de charset/collation A NIVEL DE BASE DE DATOS (el que hereda toda tabla/columna
+    # nueva sin cláusula explícita). NO dispara diff — su propósito es que el clon pueda crear la
+    # BD destino con el mismo default que la origen (mismo motor). MySQL/MariaDB lo llena desde
+    # ``information_schema.SCHEMATA``; PostgreSQL best-effort desde ``pg_database``; ``None`` si no
+    # se pudo determinar (el clon cae al default del motor).
+    db_charset: str | None = None
+    db_collation: str | None = None
     tables: list[TableSchema] = Field(default_factory=list)
     views: list[ViewInfo] = Field(default_factory=list)
     routines: list[RoutineInfo] = Field(default_factory=list)

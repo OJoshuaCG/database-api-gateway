@@ -555,6 +555,7 @@ class ServerAdapter(ABC):
                 enum_types = self._snapshot_enum_types(conn, database, schema)
                 extensions = self._snapshot_extensions(conn, database, schema)
                 events = self._snapshot_events(conn, database, schema)
+                db_defaults = self._database_defaults(conn, database, schema)
         except SQLAlchemyError as exc:
             raise map_driver_error(
                 exc, op="structural_snapshot", target=self.target,
@@ -563,6 +564,8 @@ class ServerAdapter(ABC):
         return SchemaSnapshot(
             database=database,
             source_engine=self.dialect,
+            db_charset=db_defaults.get("db_charset"),
+            db_collation=db_defaults.get("db_collation"),
             tables=tables,
             views=views,
             routines=routines,
@@ -576,6 +579,16 @@ class ServerAdapter(ABC):
     # ---- Hooks del snapshot (default vacío; cada adapter sobreescribe) --- #
     def _column_extras(self, conn, database: str, table: str, schema: str) -> dict[str, dict]:
         """{col: {collation, charset, on_update}} — lo que el Inspector no expone fiable."""
+        return {}
+
+    def _database_defaults(self, conn, database: str, schema: str) -> dict[str, str | None]:
+        """
+        Default de charset/collation A NIVEL BD → ``{"db_charset", "db_collation"}``.
+
+        Default vacío (ningún dato) para que el clon caiga al default del motor. Cada adapter
+        que sepa determinarlo lo sobreescribe. NO dispara diff — solo alimenta el
+        ``CREATE DATABASE`` del clon para que el destino herede el mismo default que la origen.
+        """
         return {}
 
     def _table_storage_options(self, conn, database: str, table: str, schema: str) -> dict[str, str]:

@@ -279,6 +279,27 @@ class PostgresAdapter(ServerAdapter):
             has_non_portable=has_non_portable,
         )
 
+    def _database_defaults(self, conn, database, schema) -> dict[str, str | None]:
+        """Default de encoding/locale de la BD desde ``pg_database`` (best-effort).
+
+        ``db_charset`` = nombre de encoding (p.ej. ``UTF8``); ``db_collation`` = locale
+        ``LC_COLLATE`` (p.ej. ``en_US.UTF-8``). Ambos alimentan el ``CREATE DATABASE`` de un
+        clon PG→PG; en un clon cross-engine el llamador los descarta.
+        """
+        row = conn.execute(
+            text(
+                "SELECT pg_encoding_to_char(encoding), datcollate "
+                "FROM pg_database WHERE datname = :db"
+            ),
+            {"db": database},
+        ).fetchone()
+        if not row:
+            return {}
+        return {
+            "db_charset": str(row[0]) if row[0] else None,
+            "db_collation": str(row[1]) if row[1] else None,
+        }
+
     # ------------------------- escritura (Iteración 2) ------------------------ #
     def create_database(
         self, db_name, charset=None, collation=None, owner=None

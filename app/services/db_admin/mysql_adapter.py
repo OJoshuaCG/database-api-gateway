@@ -728,6 +728,22 @@ class MySQLAdapter(ServerAdapter):
                 opts["db_collation"] = str(db_row[1])
         return opts
 
+    def _database_defaults(self, conn, database, schema) -> dict[str, str | None]:
+        """Default de charset/collation de la BD desde ``information_schema.SCHEMATA``."""
+        db_row = conn.execute(
+            text(
+                "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME "
+                "FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = :db"
+            ),
+            {"db": database},
+        ).fetchone()
+        if not db_row:
+            return {}
+        return {
+            "db_charset": str(db_row[0]) if db_row[0] else None,
+            "db_collation": str(db_row[1]) if db_row[1] else None,
+        }
+
     def _snapshot_views(self, conn, database, schema) -> list[ViewInfo]:
         # Se guarda el SELECT (VIEW_DEFINITION) — no el SHOW CREATE completo — para poder
         # re-emitir un CREATE OR REPLACE VIEW controlado (mismo formato que PostgreSQL).

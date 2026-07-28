@@ -1225,15 +1225,23 @@ class CloneController:
         if cancel():
             self._set_status(job_id, CLONE_STATUS_CANCELED, finished=True)
             return
+        # La BD destino nace con el MISMO default de charset/collation que la origen, para que
+        # no derive (era la causa raíz del loop de falsos positivos del diff: un default de BD
+        # distinto en el clon hacía que la MISMA collation física se juzgara "explícita" en un
+        # lado y "heredada" en el otro). Solo mismo motor: los nombres de collation/locale no
+        # son portables cross-engine → en ese caso se cae al default del motor destino.
+        same_engine = source_snap.source_engine == tgt_adapter.dialect
+        db_charset = source_snap.db_charset if same_engine else None
+        db_collation = source_snap.db_collation if same_engine else None
         if ctx["target_mode"] == CLONE_TARGET_NEW:
-            tgt_adapter.create_database(ctx["target_db"])
+            tgt_adapter.create_database(ctx["target_db"], charset=db_charset, collation=db_collation)
             self._record_items(job_id, [dict(seq=seq, kind=CLONE_ITEM_CLEAN, object_type="database",
                                              object_name=ctx["target_db"], status=CLONE_ITEM_APPLIED,
                                              executed_at=_utcnow())])
             seq += 1
         elif ctx["clean_mode"] == CLONE_CLEAN_DROP_DATABASE:
             tgt_adapter.drop_database(ctx["target_db"])
-            tgt_adapter.create_database(ctx["target_db"])
+            tgt_adapter.create_database(ctx["target_db"], charset=db_charset, collation=db_collation)
             self._record_items(job_id, [dict(seq=seq, kind=CLONE_ITEM_CLEAN, object_type="database",
                                              object_name=ctx["target_db"], status=CLONE_ITEM_APPLIED,
                                              executed_at=_utcnow())])
