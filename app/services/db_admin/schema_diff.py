@@ -16,7 +16,12 @@ Reglas anti-falsos-positivos (ver plan, sección "trampas a normalizar"):
   - canonicalización de tipos vía sqlglot (``int(11)`` == ``int`` en MySQL 8);
   - normalización de defaults (casts de PG, ``CURRENT_TIMESTAMP`` vs
     ``current_timestamp()``);
-  - collation/charset "igual al default de la tabla/BD" == no-diff;
+  - collation/charset: se compara el valor FÍSICO resuelto de la columna
+    (``information_schema.COLUMNS.COLLATION_NAME``/``CHARACTER_SET_NAME``), NO una
+    forma "efectiva" relativa al default de cada BD — resolver la herencia por lado
+    hacía que la MISMA collation física se juzgara distinta según los defaults de
+    cada base (falso positivo al comparar una BD contra su clon) y podía enmascarar
+    diferencias reales;
   - estado (AUTO_INCREMENT, last_value, reltuples, versión de extensión) excluido;
   - orden de columnas no es diff;
   - ENUM: MySQL en el string de tipo; PG como ``EnumTypeInfo``;
@@ -272,31 +277,23 @@ def _norm_expr(value: str | None) -> str:
     return re.sub(r"\s+", " ", str(value).strip()).rstrip(";").strip()
 
 
-def effective_collation(col: ColumnInfo, table: TableSchema) -> str | None:
+def _norm_ident(value: str | None) -> str | None:
     """
-    Collation EFECTIVA de la columna aplicando la regla de herencia: si coincide con el
-    default de la tabla (o de la BD), se trata como "no explícita" (None) para no reportar
-    ruido. La divergencia real (tabla/BD) se reporta a nivel ``storage_options``.
+    Nombre de collation/charset normalizado para comparar (case-insensitive).
+
+    ``None`` (columnas no textuales: numéricas, fecha/hora, BLOB/BINARY) se conserva
+    como ``None`` → dos columnas sin collation comparan iguales.
+
+    Se compara el valor FÍSICO tal cual lo devuelve ``information_schema`` (ya resuelto
+    por el motor), sin aplicar herencia de defaults de tabla/BD. NO se fusionan alias
+    cross-flavor: ``utf8``/``utf8mb3`` (3 bytes) NO se equiparan a ``utf8mb4`` (4 bytes),
+    porque son charsets distintos y hacerlo ocultaría una diferencia real de capacidad.
+    La equivalencia cross-flavor MySQL↔MariaDB de nombres de collation queda como
+    follow-up separado.
     """
-    col_coll = (col.collation or "").strip()
-    if not col_coll:
+    if not value:
         return None
-    table_default = (table.storage_options.get("collation") or "").strip()
-    db_default = (table.storage_options.get("db_collation") or "").strip()
-    if col_coll and (col_coll == table_default or col_coll == db_default):
-        return None
-    return col_coll or None
-
-
-def effective_charset(col: ColumnInfo, table: TableSchema) -> str | None:
-    col_cs = (col.charset or "").strip()
-    if not col_cs:
-        return None
-    table_default = (table.storage_options.get("charset") or "").strip()
-    db_default = (table.storage_options.get("db_charset") or "").strip()
-    if col_cs and (col_cs == table_default or col_cs == db_default):
-        return None
-    return col_cs or None
+    return value.strip().lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -436,7 +433,7 @@ def _is_safe_widening(src_canon: str, tgt_canon: str) -> bool:
 # Clasificación de un cambio de columna                                        #
 # --------------------------------------------------------------------------- #
 def _classify_column_modification(
-    src: ColumnInfo, tgt: ColumnInfo, src_tbl: TableSchema, tgt_tbl: TableSchema, engine: str
+    src: ColumnInfo, tgt: ColumnInfo, engine: str
 ) -> tuple[list[str], RiskFlags]:
     changed: list[str] = []
     risk = RiskFlags()
@@ -469,11 +466,16 @@ def _classify_column_modification(
             # DROP DEFAULT: excluido del modo automático (destructivo por plan)
             risk = risk.merge(destructive=True)
 
-    # collation / charset (re-encoding: destructivo)
-    if effective_collation(src, src_tbl) != effective_collation(tgt, tgt_tbl):
+    # collation / charset (re-encoding físico: destructivo).
+    # Se compara el valor RESUELTO de information_schema (COLLATION_NAME/CHARACTER_SET_NAME),
+    # que es la collation/charset física de la columna independientemente de cómo se declaró.
+    # NO se aplica herencia del default de tabla/BD: eso hacía que la MISMA collation física se
+    # juzgara distinto según los defaults de cada BD (falso positivo al comparar una BD contra su
+    # clon) y podía enmascarar diferencias reales.
+    if _norm_ident(src.collation) != _norm_ident(tgt.collation):
         changed.append("collation")
         risk = risk.merge(destructive=True, data_conversion=True)
-    if effective_charset(src, src_tbl) != effective_charset(tgt, tgt_tbl):
+    if _norm_ident(src.charset) != _norm_ident(tgt.charset):
         changed.append("charset")
         risk = risk.merge(destructive=True, data_conversion=True)
 
@@ -759,7 +761,7 @@ def _diff_one_table(src: TableSchema, tgt: TableSchema, engine: str) -> list[Dif
         )
     for n in sorted(common_cols):
         changed, risk = _classify_column_modification(
-            src_cols[n], tgt_cols[n], src, tgt, engine
+            src_cols[n], tgt_cols[n], engine
         )
         if changed:
             phase = PHASE_ALTER_MODIFY
@@ -1954,7 +1956,7 @@ __all__ = [
     "RiskFlags", "DiffItem", "SchemaDiff", "RenderedStatement",
     "build_dependency_graph", "diff_snapshots", "order_diff_items",
     "canonical_type", "normalize_default", "normalize_body",
-    "effective_collation", "effective_charset", "is_narrowing",
+    "is_narrowing",
     "PHASE_CREATE_PREREQ", "PHASE_CREATE_TABLE", "PHASE_ALTER_ADDITIVE",
     "PHASE_ALTER_MODIFY", "PHASE_CREATE_REPLACE", "PHASE_DROP_DEPENDENT",
     "PHASE_ALTER_DESTRUCTIVE", "PHASE_DROP_TABLE", "PHASE_DROP_PREREQ",
