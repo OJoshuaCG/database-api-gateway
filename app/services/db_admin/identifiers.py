@@ -169,6 +169,36 @@ def quote_identifier(name: str, dialect: str) -> str:
     return '"' + name.replace('"', '""') + '"'  # postgresql
 
 
+# --------------------------------------------------------------------------- #
+# Bases de datos de SISTEMA (nunca crear/borrar por API)                        #
+# --------------------------------------------------------------------------- #
+# Los ``drop_database``/``create_database`` de los adapters SOLO validan+quotean el
+# identificador: por sí solos NADA impide un ``DROP DATABASE mysql``. Este guard es la
+# barrera explícita, replicando el estilo de ``_guard_not_root`` (409). Se compara en
+# minúsculas. Mantener sincronizado con ``mysql_adapter._SYSTEM_DATABASES`` (mismo set)
+# y con las de PostgreSQL (``postgres`` + templates).
+_RESERVED_DATABASES: dict[str, frozenset[str]] = {
+    "mysql": frozenset({"information_schema", "mysql", "performance_schema", "sys"}),
+    "mariadb": frozenset({"information_schema", "mysql", "performance_schema", "sys"}),
+    "postgresql": frozenset({"postgres", "template0", "template1"}),
+}
+
+
+def reserved_database_names(dialect: str) -> frozenset[str]:
+    """Nombres de BD reservados/de sistema del motor (no gestionables por API)."""
+    return _RESERVED_DATABASES.get(dialect, frozenset())
+
+
+def ensure_not_reserved_database(name: str, dialect: str) -> None:
+    """Lanza 409 si ``name`` es una base de datos de sistema del motor."""
+    if isinstance(name, str) and name.lower() in reserved_database_names(dialect):
+        raise AppHttpException(
+            message="Operación no permitida sobre una base de datos del sistema.",
+            status_code=409,
+            context={"database": name},
+        )
+
+
 def quote_string_literal(value: str, dialect: str) -> str:
     """
     Escapa un VALOR como string literal SQL. Solo para casos donde el dialecto no

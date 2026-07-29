@@ -23,6 +23,7 @@ from app.exceptions import AppHttpException
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.base_adapter import ServerAdapter
 from app.services.db_admin.dtos import (
+    DatabaseGranteeInfo,
     DumpStatement,
     EngineUserInfo,
     EnumTypeInfo,
@@ -325,12 +326,116 @@ class PostgresAdapter(ServerAdapter):
             [" ".join(parts)], op="create_database", extra={"database": db_name}
         )
 
-    def drop_database(self, db_name) -> None:
-        validate_identifier(db_name, self.dialect, "base de datos")
+    def drop_database(self, db_name, *, force_disconnect=False) -> None:
+        # ``allow_existing``: la BD puede tener un nombre legado que la whitelist estricta
+        # rechaza. PostgreSQL RECHAZA el DROP si hay sesiones abiertas contra la BD
+        # ("database is being accessed by other users"); con ``force_disconnect`` se
+        # terminan primero. La terminación corre en la sesión de NIVEL SERVIDOR (conectada
+        # a ``postgres``, no a la BD que se borra) y excluye el propio backend. Funciona en
+        # todas las versiones (a diferencia de ``WITH (FORCE)``, que es PG 13+). Queda una
+        # ventana de carrera mínima (una conexión nueva entre terminar y dropear); el motor
+        # es la red secundaria si eso ocurre.
+        validate_identifier(db_name, self.dialect, "base de datos", allow_existing=True)
         db = quote_identifier(db_name, self.dialect)
+        if force_disconnect:
+            try:
+                with server_connection(self.target) as conn:
+                    conn.execute(
+                        text(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                            "WHERE datname = :db AND pid <> pg_backend_pid()"
+                        ),
+                        {"db": db_name},
+                    )
+            except SQLAlchemyError as exc:
+                raise map_driver_error(
+                    exc, op="drop_database", target=self.target, extra={"database": db_name}
+                )
         self._execute_server(
             [f"DROP DATABASE {db}"], op="drop_database", extra={"database": db_name}
         )
+
+    def active_connections(self, db_name) -> int:
+        validate_identifier(db_name, self.dialect, "base de datos", allow_existing=True)
+        sql = (
+            "SELECT COUNT(*) FROM pg_stat_activity "
+            "WHERE datname = :db AND pid <> pg_backend_pid()"
+        )
+        try:
+            with server_connection(self.target) as conn:
+                return int(conn.execute(text(sql), {"db": db_name}).scalar() or 0)
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="active_connections", target=self.target, extra={"database": db_name}
+            )
+
+    def list_database_grantees(self, db_name) -> list[DatabaseGranteeInfo]:
+        # DOS niveles (como grant_database): (1) nivel servidor — owner de la BD + ACL de
+        # ``pg_database.datacl`` (CONNECT/CREATE/TEMP), la señal PRIMARIA de "quién tiene
+        # relación con la BD"; (2) nivel BD — grants de objeto del schema public (enriquece,
+        # best-effort). Las vistas ``role_*_grants`` NO cubren CONNECT, por eso se lee datacl.
+        validate_identifier(db_name, self.dialect, "base de datos", allow_existing=True)
+        agg: dict[str, dict] = {}
+
+        def _add(username: str | None, priv: str | None, level: str) -> None:
+            if not username or username.startswith("pg_"):
+                return
+            entry = agg.setdefault(
+                username, {"privs": set(), "levels": set()}
+            )
+            if priv:
+                entry["privs"].add(priv)
+            entry["levels"].add(level)
+
+        # (1) Nivel servidor: owner + datacl.
+        try:
+            with server_connection(self.target) as conn:
+                owner = conn.execute(
+                    text("SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = :db"),
+                    {"db": db_name},
+                ).scalar()
+                if owner:
+                    _add(owner, "OWNER", "database")
+                rows = conn.execute(
+                    text(
+                        "SELECT r.rolname AS grantee, a.privilege_type AS p "
+                        "FROM pg_database d "
+                        "CROSS JOIN LATERAL aclexplode(d.datacl) a "
+                        "JOIN pg_roles r ON r.oid = a.grantee "
+                        "WHERE d.datname = :db"
+                    ),
+                    {"db": db_name},
+                ).fetchall()
+                for grantee, priv in rows:
+                    _add(grantee, priv, "database")
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="list_database_grantees", target=self.target,
+                extra={"database": db_name},
+            )
+
+        # (2) Nivel BD: grants de tabla del schema public (best-effort; enriquece).
+        try:
+            with database_connection(self.target, db_name) as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT grantee, privilege_type FROM information_schema.table_privileges "
+                        "WHERE table_schema = 'public'"
+                    )
+                ).fetchall()
+                for grantee, priv in rows:
+                    if priv != "USAGE":
+                        _add(grantee, priv, "table")
+        except SQLAlchemyError:
+            pass  # el nivel servidor (datacl) es la señal primaria; esto solo enriquece
+
+        return [
+            DatabaseGranteeInfo(
+                username=u, host=None, privileges=sorted(e["privs"]),
+                levels=sorted(e["levels"]), is_global=False,
+            )
+            for u, e in agg.items()
+        ]
 
     def create_user(self, username, password, host="%") -> None:
         validate_identifier(username, self.dialect, "usuario")

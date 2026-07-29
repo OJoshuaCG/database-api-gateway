@@ -5,13 +5,23 @@ CRUD del inventario (solo BD del gateway) + operaciones contra el servidor desti
 (test-connection e introspección de estructura). Todos requieren admin autenticado.
 """
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 
 from app.controllers.grant_controller import GrantController
 from app.controllers.server_controller import ServerController
+from app.controllers.server_database_controller import ServerDatabaseController
 from app.controllers.server_user_controller import ServerUserController
 from app.core.auth import AdminDep
+from app.core.limiter import limiter
 from app.schemas.grant import GrantableRequest, GrantableResult
+from app.schemas.server_database import (
+    DatabaseCreateIn,
+    DatabaseCreateOut,
+    DatabaseDropIn,
+    DatabaseDropOut,
+    DatabaseGranteesOut,
+    DropPreviewOut,
+)
 from app.schemas.server import ReconcileResult, ServerCreate, ServerOut, ServerUpdate
 from app.schemas.server_user import (
     AddHostIn,
@@ -293,6 +303,89 @@ def list_tables(admin: AdminDep, server_id: int, database: str):
 )
 def get_table_schema(admin: AdminDep, server_id: int, database: str, table: str):
     return success(data=ServerController().get_table_schema(server_id, database, table))
+
+
+# --------- Ciclo de vida de BDs a NIVEL SERVIDOR (crear / borrar / usuarios) --------- #
+# Operan por (server_id, database) directamente sobre el motor; NO requieren que la BD
+# esté adoptada en el inventario. Compatibles con MySQL/MariaDB y PostgreSQL.
+@router.post(
+    "/{server_id}/databases",
+    response_model=ApiResponse[DatabaseCreateOut],
+    status_code=201,
+)
+@limiter.limit("10/minute")
+def create_database(
+    request: Request, admin: AdminDep, server_id: int, payload: DatabaseCreateIn
+):
+    """Crea una BD en el servidor. Con ``register=true`` (requiere ``owner_id``) además la registra."""
+    result = ServerDatabaseController().create_database(
+        server_id,
+        name=payload.name,
+        charset=payload.charset,
+        collation=payload.collation,
+        owner=payload.owner,
+        register=payload.register_inventory,
+        owner_id=payload.owner_id,
+        notes=payload.notes,
+        admin=admin,
+    )
+    return success(data=result, message="Base de datos creada.")
+
+
+@router.post(
+    "/{server_id}/databases/{database}/drop-preview",
+    response_model=ApiResponse[DropPreviewOut],
+)
+@limiter.limit("10/minute")
+def drop_database_preview(
+    request: Request, admin: AdminDep, server_id: int, database: str
+):
+    """
+    Paso 1 del borrado: valida la BD, corre guards y devuelve un ``confirm_token`` firmado
+    (TTL 2 min), el conteo de conexiones activas y si está en el inventario. NO borra nada.
+    """
+    return success(
+        data=ServerDatabaseController().drop_preview(server_id, database, admin=admin)
+    )
+
+
+@router.delete(
+    "/{server_id}/databases/{database}",
+    response_model=ApiResponse[DatabaseDropOut],
+)
+@limiter.limit("3/minute")
+def drop_database(
+    request: Request, admin: AdminDep, server_id: int, database: str, payload: DatabaseDropIn
+):
+    """
+    Paso 2 del borrado (IRREVERSIBLE): exige ``confirm_target_name`` == nombre real +
+    ``confirm_token`` vigente. Si la BD está en el inventario, también borra su registro.
+    """
+    result = ServerDatabaseController().drop_database(
+        server_id,
+        database,
+        confirm_target_name=payload.confirm_target_name,
+        confirm_token_value=payload.confirm_token,
+        force_disconnect=payload.force_disconnect,
+        admin=admin,
+    )
+    return success(data=result, message="Base de datos eliminada.")
+
+
+@router.get(
+    "/{server_id}/databases/{database}/users",
+    response_model=ApiResponse[DatabaseGranteesOut],
+)
+@limiter.limit("30/minute")
+def list_database_users(
+    request: Request, admin: AdminDep, server_id: int, database: str
+):
+    """Usuarios/roles con algún privilegio sobre la BD, cruzados con el inventario."""
+    return success(
+        data=ServerDatabaseController().list_database_grantees(
+            server_id, database, admin=admin
+        )
+    )
 
 
 @router.post("/{server_id}/grantable", response_model=ApiResponse[GrantableResult])

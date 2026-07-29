@@ -39,6 +39,22 @@ class EngineUserInfo(BaseModel):
     host: str | None = None  # solo MySQL/MariaDB
 
 
+class DatabaseGranteeInfo(BaseModel):
+    """
+    Usuario/rol con ALGÚN privilegio sobre una base de datos (consulta INVERSA, agrupada
+    por grantee). ``levels`` lista los niveles por los que tiene relación con la BD
+    (``global``/``database``/``table``/``column``/``schema``/``sequence``/``routine``).
+    ``is_global=True`` (solo MySQL/MariaDB) marca privilegios globales ``*.*`` que aplican
+    a TODAS las BDs, no solo a esta. ``host`` es None en PostgreSQL (un ROLE no tiene host).
+    """
+
+    username: str
+    host: str | None = None
+    privileges: list[str] = Field(default_factory=list)
+    levels: list[str] = Field(default_factory=list)
+    is_global: bool = False
+
+
 class ExternalFkDependent(BaseModel):
     """
     FK desde una tabla de OTRA base de datos del mismo servidor hacia una tabla de la BD

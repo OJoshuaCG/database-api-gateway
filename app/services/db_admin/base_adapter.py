@@ -30,6 +30,7 @@ from app.services.db_admin.dtos import (
     ColumnInfo,
     ComputedInfo,
     ConnectionInfo,
+    DatabaseGranteeInfo,
     EngineUserInfo,
     EnumTypeInfo,
     EventInfo,
@@ -187,7 +188,24 @@ class ServerAdapter(ABC):
     ) -> None: ...
 
     @abstractmethod
-    def drop_database(self, db_name: str) -> None: ...
+    def drop_database(self, db_name: str, *, force_disconnect: bool = False) -> None: ...
+
+    def active_connections(self, db_name: str) -> int:
+        """
+        Cantidad de conexiones activas a ``db_name`` (informativo para el preview de
+        borrado). Default 0; cada motor lo implementa (MySQL ``information_schema.
+        PROCESSLIST``; PostgreSQL ``pg_stat_activity``).
+        """
+        return 0
+
+    def list_database_grantees(self, db_name: str) -> list["DatabaseGranteeInfo"]:
+        """
+        Usuarios/roles con ALGÚN privilegio sobre ``db_name`` (consulta INVERSA, agrupada
+        por grantee). Default ``[]``; cada motor lo implementa. En MySQL/MariaDB incluye
+        los privilegios globales ``*.*`` (marcados ``is_global``); en PostgreSQL combina el
+        ``datacl`` de la BD (CONNECT/CREATE/TEMP + owner) con los grants de objeto.
+        """
+        return []
 
     @abstractmethod
     def create_user(self, username: str, password: str, host: str = "%") -> None: ...

@@ -20,6 +20,7 @@ from app.exceptions import AppHttpException
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.base_adapter import ServerAdapter
 from app.services.db_admin.dtos import (
+    DatabaseGranteeInfo,
     DumpStatement,
     EngineUserInfo,
     EventInfo,
@@ -316,12 +317,86 @@ class MySQLAdapter(ServerAdapter):
             sql += f" COLLATE {collation}"
         self._execute_server([sql], op="create_database", extra={"database": db_name})
 
-    def drop_database(self, db_name) -> None:
-        validate_identifier(db_name, self.dialect, "base de datos")
+    def drop_database(self, db_name, *, force_disconnect=False) -> None:
+        # ``allow_existing``: la BD a borrar puede tener un nombre legado (dígito inicial,
+        # ``.-$``) que la whitelist estricta rechaza. ``force_disconnect`` es NO-OP en
+        # MySQL/MariaDB: el motor no bloquea el DROP por conexiones activas (a diferencia
+        # de PostgreSQL); se acepta el kwarg solo por paridad de contrato.
+        validate_identifier(db_name, self.dialect, "base de datos", allow_existing=True)
         db = quote_identifier(db_name, self.dialect)
         self._execute_server(
             [f"DROP DATABASE {db}"], op="drop_database", extra={"database": db_name}
         )
+
+    def active_connections(self, db_name) -> int:
+        validate_identifier(db_name, self.dialect, "base de datos", allow_existing=True)
+        sql = "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE DB = :db"
+        try:
+            with server_connection(self.target) as conn:
+                return int(conn.execute(text(sql), {"db": db_name}).scalar() or 0)
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="active_connections", target=self.target, extra={"database": db_name}
+            )
+
+    # Consulta INVERSA (por BD, agrupada por GRANTEE). Los privilegios globales ``*.*``
+    # (USER_PRIVILEGES) se incluyen SIEMPRE: aplican a TODAS las BDs, así que un usuario con
+    # ``GRANT SELECT ON *.*`` tiene acceso efectivo a ESTA BD aunque no tenga grant directo.
+    _LIST_DB_GRANTEES_SQL = (
+        "SELECT 'global' AS lvl, GRANTEE AS grantee, PRIVILEGE_TYPE AS p "
+        "  FROM information_schema.USER_PRIVILEGES "
+        "UNION ALL SELECT 'database', GRANTEE, PRIVILEGE_TYPE "
+        "  FROM information_schema.SCHEMA_PRIVILEGES WHERE TABLE_SCHEMA = :db "
+        "UNION ALL SELECT 'table', GRANTEE, PRIVILEGE_TYPE "
+        "  FROM information_schema.TABLE_PRIVILEGES WHERE TABLE_SCHEMA = :db "
+        "UNION ALL SELECT 'column', GRANTEE, PRIVILEGE_TYPE "
+        "  FROM information_schema.COLUMN_PRIVILEGES WHERE TABLE_SCHEMA = :db"
+    )
+
+    @staticmethod
+    def _parse_grantee(grantee: str) -> tuple[str, str]:
+        """``information_schema`` reporta el grantee como ``'user'@'host'``."""
+        raw = grantee or ""
+        if "@" in raw:
+            user, host = raw.rsplit("@", 1)
+        else:
+            user, host = raw, "%"
+        return user.strip().strip("'"), host.strip().strip("'")
+
+    def list_database_grantees(self, db_name) -> list[DatabaseGranteeInfo]:
+        validate_identifier(db_name, self.dialect, "base de datos", allow_existing=True)
+        try:
+            with server_connection(self.target) as conn:
+                rows = conn.execute(
+                    text(self._LIST_DB_GRANTEES_SQL), {"db": db_name}
+                ).fetchall()
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="list_database_grantees", target=self.target,
+                extra={"database": db_name},
+            )
+        agg: dict[tuple[str, str], dict] = {}
+        for lvl, grantee, priv in rows:
+            if priv == "USAGE":
+                continue  # "sin privilegios": no denota relación real
+            username, host = self._parse_grantee(grantee)
+            if username in _SYSTEM_USERS or not username:
+                continue
+            entry = agg.setdefault(
+                (username, host), {"privs": set(), "levels": set(), "is_global": False}
+            )
+            entry["privs"].add(priv)
+            entry["levels"].add(lvl)
+            if lvl == "global":
+                entry["is_global"] = True
+        return [
+            DatabaseGranteeInfo(
+                username=u, host=h, privileges=sorted(e["privs"]),
+                levels=sorted(e["levels"]), is_global=e["is_global"],
+            )
+            for (u, h), e in agg.items()
+            if e["privs"]
+        ]
 
     def _user_at_host(self, username: str, host: str) -> str:
         """
