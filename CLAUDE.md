@@ -755,6 +755,23 @@ funciones puras. Pendiente antes de confiar en producción: ciclo apply-parcial�
 contra los 3 motores reales, y la migración Alembic nueva
 (`d1e2f3a4b5c6_add_migration_statement_progress`) contra la BD del gateway real.
 
+**`:` LITERAL en el DDL roto como bind param (fix, 2026-07-29)**: el codegen del archivo de
+revisión Alembic (`migrations.py::_render_statement_calls`) emitía `op.execute({stmt!r})` con
+un str PLANO. `op.execute` con string envuelve el SQL en `sqlalchemy.text()`, que interpreta
+`:nombre` como BIND PARAM → un `:` LITERAL en el DDL (JSON de ejemplo en un `COMMENT` como
+`{"discount_pct":15}`, o `::` de PostgreSQL) reventaba en tiempo de COMPILACIÓN con
+`A value is required for bind parameter '15'` (el SQL nunca llegaba al motor). El camino
+ad-hoc (`execute_adhoc`) YA lo evitaba con `exec_driver_sql`+`_escape_percent`, pero nunca se
+aplicó al camino de Alembic. Trade-off opuesto entre caminos: `op.execute(str)`/`text()` rompe
+con `:` pero el `%` es inofensivo; `exec_driver_sql` es seguro con `:`/`::` pero hay que
+escapar `%`→`%%`. FIX: el codegen ahora emite `op.get_bind().exec_driver_sql(<stmt con %
+escapado>)` — mismo criterio que `execute_adhoc`, cubre `up_sql` y `down_sql` (misma función),
+y beneficia a TODOS los blueprints con `:` en su SQL. NO toca el `up_sql` almacenado →
+checkpoints/checksums/resume intactos. RECUPERACIÓN de un blueprint afectado: el SQL guardado
+es válido (no hay que hacer PATCH); como las tablas usan `CREATE TABLE IF NOT EXISTS`, re-lanzar
+`apply` tras desplegar el fix es idempotente. Verificado con script puntual (reproducción del
+bug + codegen + ciclo `command.upgrade` real contra SQLite) — no con `pytest`.
+
 ## Módulo de Adopción, Reconciliación y Snapshot (Plan 09)
 
 Puente entre el **plano en vivo** (motor real) y el **inventario** del gateway. Guía de uso:
@@ -1103,10 +1120,49 @@ Mejora la LECTURA y la GESTIÓN de los usuarios de un servidor. Guía de uso:
   follow-up. Tests: `tests/test_api_engine_users.py` (adapter mockeado + `_rewrite_grant_line`
   + guard root). **Pendiente**: verificación e2e contra motores reales (add-host/copy-grants).
 
+## Módulo de Ciclo de Vida de BDs a nivel servidor (crear/borrar/usuarios)
+
+Crea y borra bases de datos directamente en un servidor y lista qué usuarios/roles tienen
+permisos sobre una BD, **por identidad** `(server_id, database)` — funcione o no adoptada en
+el inventario. Análogo al CRUD de usuarios por identidad. Guía de uso:
+`docs/features/server-database-lifecycle.md`.
+
+- **Rutas** (`app/routes/v1/servers.py`, prefijo `/servers`): `POST /{id}/databases` (crear;
+  `register` opcional [alias del campo `register_inventory`, requiere `owner_id`] → delega a
+  `ManagedDatabaseController.create_database(provision=True)`); `POST
+  /{id}/databases/{db}/drop-preview` (emite `confirm_token` + `active_connections` +
+  `is_managed`); `DELETE /{id}/databases/{db}` (borra en motor + limpia inventario si es
+  managed); `GET /{id}/databases/{db}/users` (grantees por BD, cruzados con inventario).
+- **Controller**: `app/controllers/server_database_controller.py` (`ServerDatabaseController`,
+  solo orquesta; el motor vive en los adapters).
+- **Confirmación de borrado (doble factor de backend)**: `confirm_target_name == nombre real`
+  (422) + `confirm_token` (`app/services/confirm_token.py`: HMAC-SHA256 con `SECRET_KEY`,
+  expiración EMBEBIDA, TTL 2 min; **stateless**, ligado a `(server_id, db_name)`; 422 si no
+  corresponde/manipulado, 410 si expiró). El nombre obliga a identificar CUÁL BD; el token da
+  frescura/anti-replay. `record_intent` fail-closed antes del DROP.
+- **Guard de BDs de sistema (NUEVO)**: `identifiers.ensure_not_reserved_database` (409) —
+  antes NADA impedía `DROP DATABASE mysql`. MySQL/MariaDB: `information_schema`/`mysql`/
+  `performance_schema`/`sys`; PostgreSQL: `postgres`/`template0`/`template1`. Se aplica en
+  crear y borrar.
+- **Adapters** (`base`/`mysql`/`postgres`): `drop_database(..., force_disconnect=False)` (PG
+  hace `pg_terminate_backend` sobre `pg_stat_activity` antes del DROP — obligatorio si hay
+  conexiones; MySQL no-op); `active_connections(db)`; `list_database_grantees(db)` (consulta
+  INVERSA por BD agrupada por grantee: MySQL incluye globales `*.*` marcados `is_global`; PG
+  combina `pg_database.datacl`+`aclexplode`+owner con `table_privileges`). `drop_database` y
+  las lecturas usan `allow_existing=True` (nombres legacy); `create_database` sigue estricto.
+  DTO `DatabaseGranteeInfo` en `dtos.py`.
+- **Sin migración Alembic** (token stateless; `register` reusa `ManagedDatabase`).
+- **Gotchas**: `register` colisiona con `BaseModel` → el schema usa `register_inventory` con
+  `alias="register"`. PG `collation` es LOCALE del SO (puede fallar con `invalid locale
+  name`). **Pendiente**: verificación e2e contra motores reales (crear/listar/drop con
+  `force_disconnect`; en PG las consultas `aclexplode`/`datacl`/`pg_terminate_backend`).
+  Verificado hasta ahora solo con `FakeAdapter` (sin `pytest`, sin Docker).
+
 ## Documentación
 
 - `docs/` — documentación completa por feature (ver `docs/features/model-migrations.md`
-  para migraciones de blueprints)
+  para migraciones de blueprints; `docs/features/server-database-lifecycle.md` para
+  crear/borrar BDs a nivel servidor y listar usuarios con permisos sobre una BD)
 - `docs/docker-deployment.md` — despliegue Docker en VPS plano (`docker-compose.yml`, nginx + Certbot propios)
 - `docs/dokploy-deployment.md` — despliegue en Dokploy (`docker-compose.dokploy.yml`, sin nginx: usa el Traefik propio de Dokploy)
 - `README_MIGRATIONS.md` — migraciones Alembic de la **BD del gateway** (distinto del módulo de blueprints)
