@@ -195,12 +195,65 @@ def test_write_revision_files_chains_down_revision():
         assert "down_revision = '0001'" in rev2
         # Sin down_sql confirmado => el downgrade levanta NotImplementedError.
         assert "NotImplementedError" in rev1
-        assert "op.execute('ALTER TABLE a DROP COLUMN b')" in rev2
+        assert "op.get_bind().exec_driver_sql('ALTER TABLE a DROP COLUMN b')" in rev2
+
+
+@_no_checkpoint()
+def test_render_does_not_treat_colon_as_bind_param():
+    """
+    Regresión del bug de producción: un ``:`` LITERAL en el DDL (un JSON de ejemplo dentro
+    de un COMMENT, ``{"discount_pct":15}``) hacía que ``op.execute(str)`` -> ``text()``
+    interpretara ``:15`` como bind param y abortara con "A value is required for bind
+    parameter '15'" ANTES de tocar el motor. El codegen debe emitir ``exec_driver_sql`` (sin
+    ``text()``) y escapar ``%``->``%%`` para los drivers pyformat/format.
+    """
+    r = MigrationRunner()
+    ddl = (
+        "CREATE TABLE t (c TEXT) "
+        "COMMENT 'ej {\"discount_pct\":15} — 50% off'"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        vdir = Path(tmp) / "versions"
+        vdir.mkdir()
+        r._write_revision_files(vdir, [_spec("0001", ddl)], EngineType.mysql, _NO_MANAGED_DB)
+        body = (vdir / "rev_0001.py").read_text()
+    assert "op.get_bind().exec_driver_sql(" in body
+    assert "op.execute(" not in body
+    # El ``:15`` sobrevive LITERAL (no se convierte en un placeholder ``%(15)s``).
+    assert '"discount_pct":15' in body
+    assert "%(15)s" not in body
+    # El ``%`` literal quedó escapado a ``%%`` (exec_driver_sql lo requiere).
+    assert "50%% off" in body
 
 
 # --------------------------------------------------------------------------- #
 # Ciclo Alembic real contra SQLite (env.py compartido + command.*)            #
 # --------------------------------------------------------------------------- #
+@_no_checkpoint()
+def test_upgrade_applies_ddl_with_colon_against_sqlite():
+    """
+    End-to-end del fix por el camino Alembic real (``command.upgrade``): un ``:`` dentro de
+    un literal de string del DDL rompía con el viejo ``op.execute`` (bind param). SQLite no
+    soporta COMMENT de columna estilo MySQL, así que el ``:15`` va en un DEFAULT — mismo
+    disparador (``text()`` lo tomaría como bind).
+    """
+    r = MigrationRunner()
+    specs = [_spec("0001", "CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT DEFAULT 'ratio 1:15')",
+                   down="DROP TABLE t")]
+    dbfile = tempfile.mktemp(suffix=".db")
+    engine = create_engine(f"sqlite:///{dbfile}")
+    vt = version_table_name("colon")
+    with tempfile.TemporaryDirectory() as tmp:
+        vdir = Path(tmp) / "versions"
+        vdir.mkdir()
+        r._write_revision_files(vdir, specs, EngineType.mysql, _NO_MANAGED_DB)
+        with engine.connect() as conn:
+            cfg = r._make_config(vdir, conn, vt)
+            command.upgrade(cfg, "0001")  # antes del fix: InvalidRequestError bind param '15'
+            assert r._read_current(conn, vt) == "0001"
+            assert "t" in inspect(conn).get_table_names()
+
+
 @_no_checkpoint()
 def test_full_upgrade_downgrade_stamp_cycle_sqlite():
     r = MigrationRunner()

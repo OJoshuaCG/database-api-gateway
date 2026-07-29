@@ -535,7 +535,14 @@ class MigrationRunner:
         for i, stmt in enumerate(statements, start=1):
             if i <= resume_from:
                 continue  # ya ejecutada en un intento previo (checkpoint confirmado)
-            lines.append(f"    op.execute({stmt!r})")
+            # ``exec_driver_sql`` (no ``op.execute``): ``op.execute`` con un str envuelve el
+            # SQL en ``sqlalchemy.text()``, que interpreta ``:nombre`` como bind param — un
+            # ``:`` LITERAL en el DDL (JSON en un COMMENT, ``::`` de PostgreSQL) rompía con
+            # "A value is required for bind parameter". ``exec_driver_sql`` pasa el SQL crudo
+            # al DBAPI sin ``text()``; a cambio hay que escapar ``%``→``%%`` (los drivers
+            # pyformat/format lo parsean). Mismo criterio que ``execute_adhoc``.
+            escaped = MigrationRunner._escape_percent(stmt)
+            lines.append(f"    op.get_bind().exec_driver_sql({escaped!r})")
             if resumable:
                 lines.append(
                     "    migration_progress.record_statement("

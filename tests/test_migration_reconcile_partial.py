@@ -88,7 +88,7 @@ def test_manifest_that_does_not_reproduce_up_sql_is_discarded():
 
 
 def test_statement_lists_uses_the_manifest_without_resplitting_the_up():
-    """Una fila del manifiesto = una sentencia = un ``op.execute`` (contrato con el ``seq``)."""
+    """Una fila del manifiesto = una sentencia = un ``exec_driver_sql`` (contrato con el ``seq``)."""
     ups, downs, pinned = MigrationRunner().statement_lists(_spec(), EngineType.mysql)
     assert pinned is True
     assert len(ups) == 4
@@ -301,10 +301,10 @@ def test_transactional_mode_disables_the_statement_checkpoint(tmp_path):
     body = (versions / "rev_0003.py").read_text(encoding="utf-8")
     # Ni una sola llamada al checkpoint: es lo que se está verificando.
     assert "migration_progress" not in body
-    # Una sentencia del manifiesto = un op.execute en upgrade() (el downgrade tiene los
+    # Una sentencia del manifiesto = un exec_driver_sql en upgrade() (el downgrade tiene los
     # suyos, así que se cuenta solo en la parte de upgrade).
     upgrade_body = body.split("def downgrade():")[0]
-    assert upgrade_body.count("op.execute(") == 4, upgrade_body
+    assert upgrade_body.count("op.get_bind().exec_driver_sql(") == 4, upgrade_body
 
 
 # --------------------------------------------------------------------------- #
