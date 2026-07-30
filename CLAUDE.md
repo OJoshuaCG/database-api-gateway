@@ -772,6 +772,42 @@ es válido (no hay que hacer PATCH); como las tablas usan `CREATE TABLE IF NOT E
 `apply` tras desplegar el fix es idempotente. Verificado con script puntual (reproducción del
 bug + codegen + ciclo `command.upgrade` real contra SQLite) — no con `pytest`.
 
+**`DELIMITER $$` leído como dollar-quoting de PostgreSQL (fix, 2026-07-30)**: `split_sql_statements`
+procesaba la rama de dollar-quoting (`$tag$…$tag$`) ANTES del chequeo del terminador, así que con
+`DELIMITER $$` activo el token `$$` se leía como apertura de un literal y se "cerraba" en el `$$`
+**siguiente** → dos sentencias pegadas en una
+(`DROP PROCEDURE IF EXISTS \`sp\`$$\n\nCREATE PROCEDURE \`sp\` (…`) que el motor rechaza con
+`(1064, "…syntax… near '$$\n\nCREATE PROCEDURE …'")`. Con `//` (o `;;`, o `|`) nunca pasó: no
+colisionan con nada del scanner — de ahí que el módulo se hubiera probado solo con `//`. El test
+que sí usaba `$$` pasaba **por casualidad**: tenía UN solo `$$` de cierre en todo el script, así
+que no había par que emparejar; el bug aparece desde el segundo `$$` (es decir, en cualquier
+blueprint con más de una rutina, o con `DROP PROCEDURE IF EXISTS …$$` + `CREATE PROCEDURE …$$`).
+FIX: mientras un `DELIMITER` haya fijado un terminador ≠ `;`, un token que arranca con `$` y
+coincide con el terminador NO se trata como dollar-quote y cae al chequeo de fin de sentencia. El
+dollar-quoting de PostgreSQL queda intacto porque ahí el delimitador sigue siendo `;` (tests de
+`$$`/`$body$`/`DO $$`/`::` verificados). Dos bugs hermanos del mismo scanner, corregidos en el
+mismo paso: (1) tanto la directiva `DELIMITER` como el reconocimiento de `CREATE PROCEDURE`
+exigían el buffer **vacío**, así que un comentario previo (lo normal en un dump o en SQL escrito
+a mano) hacía que `DELIMITER` viajara al motor (1064) y que el conteo de `BEGIN…END` no se
+activara (cuerpo partido en su primer `;`) → ahora ambos toleran blancos/comentarios previos
+(`_only_noise`); (2) una "sentencia" de puros comentarios (típico: comentarios al pie tras el
+último terminador) se emitía y el motor la rechazaba con `(1065, 'Query was empty')` → ahora se
+descarta. **Reparto por motor**: el `$$` como terminador es de MySQL/MariaDB (ahí estaba el
+bug); PostgreSQL no usa `DELIMITER` y su dollar-quoting queda intacto (verificado: varias
+funciones `plpgsql` con `$$`/`$body$` en un mismo script, tags anidados, `DO $$`, `::`, `%`) —
+lo que PG SÍ gana son los dos bugs hermanos, porque un comentario antes de un
+`CREATE FUNCTION … BEGIN ATOMIC` (SQL/PSM, sin dollar-quoting) le partía el cuerpo igual que a
+MySQL. LÍMITE CONOCIDO: un script no puede usar `$$` como terminador y como dollar-quoting a la
+vez (token ambiguo, gana el terminador); no es práctico porque `DELIMITER` no existe en
+PostgreSQL — y antes del fix ese caso solo "andaba" con UN objeto en el script. NO toca el
+`up_sql` almacenado (checksums/checkpoints intactos) y, como el patrón
+`DROP PROCEDURE IF EXISTS` + `CREATE PROCEDURE` es idempotente, re-lanzar `apply` tras desplegar
+alcanza; si el fallo dejó la BD en cuarentena (`status=error`, lo esperable: una migración
+procedural no es resumible → sin checkpoint → la auto-reconciliación no dispara), el `apply` de
+recuperación va con `force=true` y al terminar OK la devuelve a `active`. Tests en
+`tests/test_sql_dialect.py`; verificado además el pipeline completo split→codegen→`exec_driver_sql`
+(sin `pytest`: ejecución directa de las funciones, 37/37).
+
 ## Módulo de Adopción, Reconciliación y Snapshot (Plan 09)
 
 Puente entre el **plano en vivo** (motor real) y el **inventario** del gateway. Guía de uso:
