@@ -140,6 +140,17 @@ _NEUTRAL_END_SUFFIXES = frozenset({"IF", "LOOP", "WHILE", "REPEAT"})
 
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
 
+# Blancos y comentarios (``--``, ``#``, ``/* … */``) al inicio de lo acumulado. Sirve para
+# saber si una sentencia todavía no arrancó de verdad: tanto la directiva ``DELIMITER``
+# como el reconocimiento de ``CREATE PROCEDURE`` deben seguir funcionando cuando el script
+# trae comentarios antes (el caso normal de un dump o de SQL escrito a mano).
+_LEADING_NOISE_RE = re.compile(r"(?:\s+|--[^\n]*\n?|\#[^\n]*\n?|/\*.*?\*/)*", re.DOTALL)
+
+
+def _only_noise(text: str) -> bool:
+    """True si ``text`` es solo blancos y/o comentarios (no hay SQL ejecutable)."""
+    return _LEADING_NOISE_RE.match(text).end() == len(text)
+
 
 def _word_at(sql: str, i: int) -> str | None:
     """Palabra que empieza EXACTAMENTE en ``i`` (o None si ahí no arranca una)."""
@@ -185,7 +196,9 @@ def split_sql_statements(sql: str) -> list[str]:
 
     1. **``DELIMITER <tok>``** (explícita, la de cualquier dump de ``mysqldump``): cambia el
        terminador de sentencia. Es una directiva de CLIENTE: se consume acá y nunca se
-       envía al motor.
+       envía al motor. Sirve cualquier token (``//``, ``$$``, ``;;``, …) y se reconoce
+       aunque vengan comentarios antes; mientras el terminador esté activo, un token que
+       arranca con ``$`` NO se lee como dollar-quoting de PostgreSQL (ver abajo).
     2. **Bloques ``BEGIN…END``** (implícita): dentro de una sentencia que abre una rutina
        (``_ROUTINE_START_RE``) se lleva la cuenta de bloques abiertos y un ``;`` solo
        termina la sentencia con la cuenta en cero. Se cuentan como aperturas ``BEGIN``,
@@ -217,7 +230,11 @@ def split_sql_statements(sql: str) -> list[str]:
     depth: int | None = None
 
     def _at_statement_start() -> bool:
-        return not "".join(buf).strip()
+        # Tolerante a comentarios: lo acumulado puede ser blancos y/o comentarios y la
+        # sentencia sigue sin arrancar. Sin esto, un ``-- comentario`` antes de
+        # ``DELIMITER $$`` hacía que la directiva se enviara al motor (1064) y uno antes
+        # de ``CREATE PROCEDURE`` desactivaba el conteo de bloques ``BEGIN…END``.
+        return _only_noise("".join(buf))
 
     while i < n:
         ch = sql[i]
@@ -230,7 +247,9 @@ def split_sql_statements(sql: str) -> list[str]:
             if m:
                 delimiter = m.group(1)
                 i = m.end()
-                buf = []  # la directiva NO se emite: es del cliente, no del motor
+                # La directiva NO se emite: es del cliente, no del motor. Los comentarios
+                # ya acumulados se conservan (documentan la sentencia que sigue); si al
+                # final no queda SQL real, el filtro de ``_only_noise`` los descarta.
                 continue
 
         # ¿Esta sentencia abre una definición de rutina? Solo ahí se cuentan bloques.
@@ -335,7 +354,7 @@ def split_sql_statements(sql: str) -> list[str]:
         # Con un cuerpo procedural abierto (depth > 0) el ``;`` es interno: no termina nada.
         if sql.startswith(delimiter, i) and not depth:
             stmt = "".join(buf).strip()
-            if stmt:
+            if stmt and not _only_noise(stmt):
                 statements.append(stmt)
             buf = []
             depth = None  # la próxima sentencia se re-evalúa desde cero
@@ -346,7 +365,10 @@ def split_sql_statements(sql: str) -> list[str]:
         i += 1
 
     tail = "".join(buf).strip()
-    if tail:
+    # Una "sentencia" que solo tiene comentarios (típico: el ``DELIMITER ;`` final de un
+    # dump precedido de comentarios, o comentarios al pie del script) no se emite: el motor
+    # la rechazaría con ``(1065, 'Query was empty')``.
+    if tail and not _only_noise(tail):
         statements.append(tail)
     return statements
 
