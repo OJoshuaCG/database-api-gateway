@@ -201,6 +201,11 @@ def split_sql_statements(sql: str) -> list[str]:
     PostgreSQL ya venía cubierto por el dollar-quoting (``$$…$$``, ``$body$…$body$``) de
     sus funciones ``plpgsql``; la vía 2 le agrega los cuerpos ``BEGIN ATOMIC`` de SQL/PSM
     (PostgreSQL 14+), que **no** llevan dollar-quoting y antes también se partían.
+
+    **Límite conocido**: un script no puede usar ``$$`` como terminador (vía 1) y como
+    dollar-quoting (PostgreSQL) A LA VEZ — el token es ambiguo y gana el terminador. No es
+    una limitación práctica: ``DELIMITER`` es una directiva del cliente ``mysql`` y no
+    existe en PostgreSQL, donde el ``;`` por defecto ya basta.
     """
     statements: list[str] = []
     buf: list[str] = []
@@ -273,7 +278,16 @@ def split_sql_statements(sql: str) -> list[str]:
             continue
 
         # Dollar-quoting de PostgreSQL: $tag$ ... $tag$
-        if ch == "$":
+        #
+        # OJO: si la directiva ``DELIMITER`` fijó un terminador que empieza con ``$`` (el
+        # ``DELIMITER $$`` idiomático de MySQL/MariaDB, tan común como ``//``), ese token
+        # es el TERMINADOR de sentencia, no la apertura de un literal. Hay que dejarlo
+        # pasar al chequeo de fin de sentencia: si no, ``$$`` abría un dollar-quote que se
+        # cerraba en el ``$$`` SIGUIENTE y pegaba dos sentencias en una sola
+        # (``DROP PROCEDURE …$$ CREATE PROCEDURE …``), que el motor rechaza con
+        # ``(1064, "…syntax… near '$$\\n\\nCREATE PROCEDURE …'")``. Con ``//`` no pasaba
+        # nada porque ``//`` no colisiona con ninguna sintaxis del scanner.
+        if ch == "$" and not (delimiter != ";" and sql.startswith(delimiter, i)):
             tag_end = sql.find("$", i + 1)
             if tag_end != -1 and sql[i + 1 : tag_end].replace("_", "").isalnum() or (
                 tag_end == i + 1
