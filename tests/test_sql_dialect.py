@@ -1,5 +1,7 @@
 """Tests unitarios de split_sql_statements, SqlTranslator y RollbackGenerator."""
 
+import pytest
+
 from app.models.enums import EngineType
 from app.services.db_admin.sql_dialect import (
     RollbackGenerator,
@@ -155,6 +157,60 @@ def test_split_delimiter_with_several_routines():
     assert not any("DELIMITER" in p for p in parts)
 
 
+# Script de referencia: el patron real de un blueprint con stored procedures escrito a
+# mano (comentarios + ``DROP PROCEDURE IF EXISTS`` + ``CREATE PROCEDURE`` por cada SP).
+_ROUTINES_SCRIPT = (
+    "DELIMITER {tok}\n"
+    "\n"
+    "-- (A) sp_a: resolver core\n"
+    "DROP PROCEDURE IF EXISTS `sp_a`{tok}\n"
+    "\n"
+    "CREATE PROCEDURE `sp_a` (IN p int(10) unsigned)\n"
+    "sp_label: BEGIN\n"
+    "    DECLARE v bigint(20) unsigned DEFAULT NULL;\n"
+    "    DECLARE EXIT HANDLER FOR SQLEXCEPTION\n"
+    "    BEGIN\n"
+    "        ROLLBACK;\n"
+    "        RESIGNAL;\n"
+    "    END;\n"
+    "    IF p > 0 THEN SELECT 1; END IF;\n"
+    "END{tok}\n"
+    "\n"
+    "DROP PROCEDURE IF EXISTS `sp_b`{tok}\n"
+    "CREATE PROCEDURE `sp_b`() BEGIN SELECT 2; END{tok}\n"
+    "\n"
+    "DELIMITER ;\n"
+)
+
+
+def test_split_delimiter_dollar_dollar_does_not_glue_statements():
+    """
+    ``DELIMITER $$`` es tan idiomatico como ``//``, pero ``$$`` colisionaba con el
+    dollar-quoting de PostgreSQL: el terminador se leia como apertura de literal y se
+    cerraba en el ``$$`` SIGUIENTE, pegando ``DROP PROCEDURE …$$ CREATE PROCEDURE …`` en
+    una sola sentencia que el motor rechaza con ``(1064, "…near '$$\\n\\nCREATE …'")``.
+    Con un solo ``$$`` de cierre en todo el script el bug no se veia (no habia par que
+    emparejar), y con ``//`` nunca existio.
+    """
+    parts = split_sql_statements(_ROUTINES_SCRIPT.format(tok="$$"))
+    assert len(parts) == 4
+    assert not any("$$" in p or "DELIMITER" in p for p in parts)
+    assert parts[0].endswith("DROP PROCEDURE IF EXISTS `sp_a`")
+    # El cuerpo entero llega en UNA sentencia (los ``;`` internos no cortan).
+    assert parts[1].startswith("CREATE PROCEDURE `sp_a`")
+    assert parts[1].endswith("END")
+    assert "RESIGNAL;" in parts[1] and "END IF;" in parts[1]
+    assert parts[2] == "DROP PROCEDURE IF EXISTS `sp_b`"
+    assert parts[3] == "CREATE PROCEDURE `sp_b`() BEGIN SELECT 2; END"
+
+
+@pytest.mark.parametrize("tok", ["//", "$$", ";;", "$body$", "|"])
+def test_split_delimiter_token_is_irrelevant(tok):
+    """El token elegido no cambia el resultado: mismo script, mismas sentencias."""
+    expected = split_sql_statements(_ROUTINES_SCRIPT.format(tok="//"))
+    assert split_sql_statements(_ROUTINES_SCRIPT.format(tok=tok)) == expected
+
+
 # --------------------------------------------------------------------------- #
 # PostgreSQL                                                                   #
 # --------------------------------------------------------------------------- #
@@ -178,6 +234,54 @@ def test_split_pg_begin_atomic_body_is_kept_intact():
 def test_split_pg_do_block():
     parts = split_sql_statements("DO $$ BEGIN PERFORM 1; END $$; SELECT 1")
     assert len(parts) == 2
+
+
+def test_split_pg_several_dollar_quoted_functions():
+    """
+    Contracara del fix de ``DELIMITER $$``: en PostgreSQL el delimitador sigue siendo ``;``,
+    asi que VARIOS pares ``$$`` en un mismo script son literales y deben seguir
+    agrupandose de a pares — no confundirse con terminadores.
+    """
+    sql = (
+        "-- funciones del tenant\n"
+        "CREATE OR REPLACE FUNCTION f_a(p int) RETURNS int AS $$\n"
+        "BEGIN\n  IF p > 0 THEN RETURN 1; END IF;\n  RETURN 0;\nEND;\n"
+        "$$ LANGUAGE plpgsql;\n"
+        "CREATE OR REPLACE FUNCTION f_b() RETURNS trigger AS $$\n"
+        "BEGIN\n  NEW.updated_at := now();\n  RETURN NEW;\nEND;\n"
+        "$$ LANGUAGE plpgsql;\n"
+        "SELECT '1'::int, 100 || '%';\n"
+    )
+    parts = split_sql_statements(sql)
+    assert len(parts) == 3
+    assert parts[0].endswith("LANGUAGE plpgsql") and "RETURN 1; END IF;" in parts[0]
+    assert parts[1].endswith("LANGUAGE plpgsql") and "RETURN NEW;" in parts[1]
+    assert parts[2] == "SELECT '1'::int, 100 || '%'"
+
+
+def test_split_pg_nested_dollar_quoting_with_tags():
+    sql = "CREATE FUNCTION f() RETURNS text AS $outer$ SELECT $q$a;b$q$; $outer$ LANGUAGE sql"
+    assert split_sql_statements(f"{sql};\nSELECT 1") == [sql, "SELECT 1"]
+
+
+def test_split_delimiter_dollar_with_pg_dollar_quoting_is_unsupported():
+    """
+    LIMITE CONOCIDO (script contradictorio, no una regresion util): ``DELIMITER`` es una
+    directiva del cliente ``mysql`` y NO existe en PostgreSQL, asi que un script no puede
+    usar ``$$`` como terminador y como dollar-quoting a la vez — el token es ambiguo y el
+    terminador gana. En SQL de PostgreSQL no hay que usar ``DELIMITER``: con el ``;`` por
+    defecto el dollar-quoting funciona (ver tests de arriba).
+
+    Antes del fix esto "andaba" solo con UN objeto en el script; con dos, el terminador
+    ``$$`` final se comia el resto igual que en el bug de MySQL.
+    """
+    sql = (
+        "DELIMITER $$\n"
+        "CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql$$\n"
+        "DELIMITER ;\n"
+    )
+    parts = split_sql_statements(sql)
+    assert len(parts) == 3  # el $$ se lee como terminador, no como apertura de literal
 
 
 # --------------------------------------------------------------------------- #
