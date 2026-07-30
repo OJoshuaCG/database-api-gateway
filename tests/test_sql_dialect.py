@@ -211,6 +211,47 @@ def test_split_delimiter_token_is_irrelevant(tok):
     assert split_sql_statements(_ROUTINES_SCRIPT.format(tok=tok)) == expected
 
 
+def test_split_delimiter_directive_after_comments():
+    """
+    La directiva se reconocia solo con el buffer VACIO, asi que un comentario previo (lo
+    normal en un dump o en SQL escrito a mano) la dejaba pasar al motor -> 1064.
+    """
+    sql = (
+        "-- Dumping routines for database 'x'\n"
+        "DELIMITER $$\n"
+        "CREATE PROCEDURE p() BEGIN SELECT 1; END$$\n"
+        "DELIMITER ;\n"
+        "SELECT 9"
+    )
+    parts = split_sql_statements(sql)
+    assert not any("DELIMITER" in p for p in parts)
+    assert len(parts) == 2
+    # El comentario se conserva pegado a la sentencia que documenta (como en cualquier
+    # otro punto del script); lo que NO viaja al motor es la directiva.
+    assert parts[0].endswith("CREATE PROCEDURE p() BEGIN SELECT 1; END")
+    assert parts[0].startswith("-- Dumping routines")
+    assert parts[1] == "SELECT 9"
+
+
+def test_split_comment_before_routine_keeps_body_intact():
+    """
+    Sin DELIMITER, el conteo de bloques ``BEGIN…END`` tambien exigia buffer vacio: un
+    comentario antes del ``CREATE PROCEDURE`` desactivaba el seguimiento y el cuerpo se
+    partia en su primer ``;``.
+    """
+    sql = "-- crea el sp\nCREATE PROCEDURE p() BEGIN DECLARE x int; SELECT 1; END;\nSELECT 9"
+    parts = split_sql_statements(sql)
+    assert len(parts) == 2
+    assert parts[0].endswith("END") and "SELECT 1;" in parts[0]
+    assert parts[1] == "SELECT 9"
+
+
+def test_split_drops_comment_only_statements():
+    """Una "sentencia" de puros comentarios daria ``(1065, 'Query was empty')``."""
+    assert split_sql_statements("SELECT 1;\n-- nada mas\n") == ["SELECT 1"]
+    assert split_sql_statements("-- a\n/* b */\n") == []
+
+
 # --------------------------------------------------------------------------- #
 # PostgreSQL                                                                   #
 # --------------------------------------------------------------------------- #
