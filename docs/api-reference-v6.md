@@ -25,6 +25,7 @@
 
 - [0. La necesidad: por qué existe este módulo](#0-la-necesidad-por-qué-existe-este-módulo)
 - [1. Alcance: qué cubre y qué NO cubre](#1-alcance-qué-cubre-y-qué-no-cubre)
+  - [1.1 Endpoints de OTROS módulos que esta pantalla necesita](#11-endpoints-de-otros-módulos-que-esta-pantalla-necesita)
 - [2. Limitaciones (leer ANTES de diseñar la pantalla)](#2-limitaciones-leer-antes-de-diseñar-la-pantalla)
 - [3. Los cuatro niveles de peligro (`danger`)](#3-los-cuatro-niveles-de-peligro-danger)
 - [4. Modos de conexión: elegir CON QUÉ USUARIO se ejecuta](#4-modos-de-conexión-elegir-con-qué-usuario-se-ejecuta)
@@ -118,6 +119,24 @@ en este módulo.
   local, ni formateo, ni resultados persistidos.
 - **No es para usuarios finales.** Es administración interna: requiere sesión admin del
   gateway.
+
+### 1.1 Endpoints de OTROS módulos que esta pantalla necesita
+
+Los tres endpoints de §5–§7 son todo lo que este módulo expone, pero la pantalla no se puede
+armar solo con ellos: los tres selectores (servidor, base, usuario) se llenan con endpoints
+que ya existen y **están documentados en otro lado**. Se listan acá solo como puntero — su
+contrato completo NO se repite en este documento.
+
+| Para llenar | Endpoint | Devuelve | Documentado en |
+|---|---|---|---|
+| Selector de **servidor** | `GET /servers` 🔒 | Lista paginada de servidores. De acá sale el `engine`, que la UI necesita **antes** del primer preview para decidir si ofrece el modo `impersonate` (solo PostgreSQL) y si muestra el campo `host`. | [`api-reference.md` §6](api-reference.md#6-servidores-servers) |
+| Selector de **base de datos** | `GET /servers/{server_id}/databases` 🔌🔒 | `list[str]` con los nombres de las bases del servidor. | [`api-reference.md` §6](api-reference.md#6-servidores-servers) |
+| Selector de **usuario** (modo `stored`) | `GET /servers/{server_id}/users/grouped` 🔌🔒 | Usuarios agrupados por username con sus hosts, y el flag `supports_hosts`. Es la fuente correcta para el par `username` + `host` del modo `stored`, y para saber si el campo `host` aplica en este motor. | [`api-reference.md` §7.3](api-reference.md#73-vista-agrupada-y-crud-por-identidad-serversidusers) |
+
+> **Nota sobre `supports_hosts`.** Es `false` en PostgreSQL (los roles no tienen host) y `true`
+> en MySQL/MariaDB, donde `'app'@'localhost'` y `'app'@'%'` son **cuentas distintas con permisos
+> distintos**. La consola respeta esa distinción: el `host` que se manda en `connection` forma
+> parte de la identidad a la que queda atado el `confirm_token` (ver [§4](#4-modos-de-conexión-elegir-con-qué-usuario-se-ejecuta)).
 
 ---
 
