@@ -1194,6 +1194,135 @@ el inventario. Análogo al CRUD de usuarios por identidad. Guía de uso:
   `force_disconnect`; en PG las consultas `aclexplode`/`datacl`/`pg_terminate_backend`).
   Verificado hasta ahora solo con `FakeAdapter` (sin `pytest`, sin Docker).
 
+## Módulo de Consola SQL (queries ad-hoc en modo seguro)
+
+Ejecuta SQL arbitrario sobre una BD de un servidor destino **con el usuario del motor que
+se elija**, para verificar permisos reales. Guía de uso: `docs/features/sql-query-console.md`.
+
+- **Rutas** (`app/routes/v1/servers.py`): `POST /{id}/query/preview` (clasifica, estima
+  impacto, emite `confirm_token`), `POST /{id}/query/execute`, `GET /{id}/query/history`.
+- **Archivos**: `query_policy.py` (PURO: clasificación + blocklist + estimación + redacción),
+  `query_runner.py` (conexión, transacción, topes, normalización de valores),
+  `query_console_controller.py`, `schemas/query_console.py`, `models/query_execution.py`
+  (migración `a3b4c5d6e7f8`). Env nuevas `QUERY_*`.
+- **Niveles**: `read` (directo) / `write` / `ddl` (ambos exigen `confirm_target_name` +
+  `confirm_token`) / `blocked` (**403 sin tocar el motor, ni confirmando**). El nivel del
+  lote es el MÁXIMO de sus sentencias. `UPDATE`/`DELETE` piden confirmación **tengan o no
+  `WHERE`** (requisito explícito).
+- **Clasificación por AST (sqlglot), NUNCA por palabras clave**, y tomando el peligro
+  máximo de CUALQUIER nodo del árbol, no solo la raíz: `WITH d AS (DELETE … RETURNING *)
+  SELECT * FROM d` tiene raíz `Select`. **Fail-closed** en todo borde: SQL ilegible, tipo
+  no mapeado o sentencia OPACA (`exp.Command` — verificado que sqlglot degrada ahí `GRANT`,
+  `CREATE USER`, `ALTER SYSTEM`, `CREATE EXTENSION`, `REPLACE INTO`, `DO`, `SET ROLE`,
+  `CALL`, `RENAME TABLE`, `EXPLAIN ANALYZE`) ⇒ peligroso.
+- **La blocklist de TEXTO no es redundante con el AST**: `FLUSH PRIVILEGES` parsea como un
+  `exp.Alias` (indistinguible de una expresión inofensiva) y el DCL entero cae en `Command`
+  sin estructura. Corre sobre texto normalizado (`_scan_normalize`: sin comentarios, con el
+  CONTENIDO de los literales vaciado) para no marcar `WHERE accion='GRANT'` ni dejar evadir
+  con `/*x*/GRANT`. El comentario EJECUTABLE de MySQL `/*!40101 … */` se conserva como
+  código y se le descarta el número de versión (si no, desplaza los patrones anclados en
+  `^`). El escaneo se repite sobre el LOTE CRUDO porque `split_sql_statements` descarta las
+  "sentencias" que son solo comentarios.
+- **`read` lo hace cumplir el MOTOR**: transacción de solo lectura (`START TRANSACTION READ
+  ONLY` en MySQL/MariaDB, `SET TRANSACTION READ ONLY` en PG). Ninguna clasificación
+  estática puede saber si `SELECT fn()` escribe. ORDEN de preparación de sesión: timeouts →
+  read-only → `SET ROLE` (invertirlo rompe: `SET TRANSACTION READ ONLY` deja de estar
+  permitido una vez que la tx ejecutó algo).
+- **Lo prohibido va MÁS ALLÁ de lo destructivo obvio** porque el gateway conecta como
+  pseudo-root y el motor SÍ lo permitiría: DCL (evita el módulo de permisos y su auditoría),
+  acceso a archivos del host (`COPY … FROM PROGRAM` ≈ RCE, `INTO OUTFILE`, `pg_read_file`),
+  estado global (`SET GLOBAL`, `ALTER SYSTEM`, `FLUSH`, `KILL`), `CREATE/DROP DATABASE|SCHEMA`
+  (tienen endpoint propio), control de sesión/transacción, `SET ROLE`/`RESET ROLE`, SQL
+  dinámico (`PREPARE`/`EXECUTE` ejecutarían texto sin clasificar), escritura sobre esquemas
+  del sistema (LEERLOS sí: es parte de probar permisos), `_gw_v_*`/`_gw_stg_*`, y la propia
+  BD de metadatos del gateway (match por host+puerto+nombre, 409).
+- **Estimación de impacto**: el AST del `UPDATE`/`DELETE` se transforma en `SELECT COUNT(*)`
+  con el MISMO `WHERE`, ejecutado con la MISMA credencial. Solo se emite cuando es EXACTO:
+  `DELETE … USING` de PG deja la tabla fuera de alcance y `UPDATE a JOIN b` contaría filas
+  del producto → `null` (la confirmación se exige igual). Red de seguridad: si el conjunto
+  de tablas del COUNT no coincide con el del original, se descarta.
+- **Un rechazo del motor es HTTP 200 con `success:false`**, no un 403: una query denegada es
+  una PRUEBA EXITOSA. Por eso este camino NO usa `map_driver_error` (traduce 1142/42501 a un
+  403 genérico que oculta el mensaje del motor). `map_driver_error` sigue cubriendo los
+  fallos de INFRAESTRUCTURA.
+- **`confirm_token` atado al SQL**: `confirm_token.issue/verify` ganaron `subject` opcional
+  (`{sql_hash}|{modo}|{usuario}|{rol}`). Sin eso, `(operación, server_id, db)` es igual para
+  cualquier consulta sobre esa base → se podría previsualizar un `SELECT` y ejecutar un
+  `DROP` con el mismo token. Los usos históricos (sin `subject`) quedan intactos.
+- **FIX de un bug LATENTE pre-existente**: `remote_engine.get_engine` cacheaba por
+  `(server_id, bd, bulk, local_infile)` — **sin el usuario**. Un `ServerTarget` con otra
+  credencial devolvía el engine pseudo-root: la prueba "como usuario limitado" corría como
+  root, en silencio y dando verde. La clave ahora incluye usuario y timeout efectivo
+  (`statement_timeout_ms` nuevo, que la consola necesita porque el interactivo de 15s es
+  corto).
+- **Modos de conexión**: `admin` (pseudo-root, con warning explícito), `stored` (Fernet del
+  inventario), `provided` (contraseña del request, NUNCA persistida), `impersonate` (**solo
+  PG**: `SET ROLE`; MySQL/MariaDB dan 422 — su `SET ROLE` solo alcanza roles ya otorgados).
+- **SEGUNDA PASADA ADVERSARIAL (2026-08-02)** — 4 BLOQUEANTES, todos corregidos.
+  (1) `stream_results=True` a nivel de CONEXIÓN hacía que SQLAlchemy enrutara TODA sentencia
+  por un cursor con nombre, y psycopg lo compone como `DECLARE … CURSOR FOR <stmt>` (solo
+  acepta consultas) → **PostgreSQL no funcionaba en absoluto**: moría en el
+  `SET TRANSACTION READ ONLY` de `_prepare_session` y salía como 502 "no se pudo conectar".
+  Los tests no lo vieron porque SQLite declara `supports_server_side_cursors=False` y el flag
+  queda en no-op. (2) El tope de filas del lado del gateway NO acotaba el TRANSPORTE:
+  `SSCursor.close()` de pymysql llama `_finish_unbuffered_query()`, que gira leyendo hasta el
+  EOF —el comentario del propio driver dice que no hay forma de que MySQL deje de mandar—, así
+  que `SELECT * FROM tabla_de_50M` con tope de 1000 traía igual las 50M. Fix de (1)+(2): la
+  política emite `fetch_sql` con el `LIMIT` EMPUJADO AL MOTOR (`_limited_sql`; no se acota si
+  cambia la semántica: `FOR UPDATE`, `INTO`, `LIMIT` propio menor, o no-`SELECT`/`UNION`) y se
+  eliminó `stream_results`. (3) `DELIMITER //` agrupaba varias sentencias del servidor en UNA
+  unidad del splitter → el keyword peligroso dejaba de estar en `^` y **toda la blocklist
+  anclada se evadía** (GRANT/DROP DATABASE/SET GLOBAL/PREPARE/DROP USER/SET ROLE pasaban a
+  `write`/`ddl` CONFIRMABLES); ídem `SELECT 1/*!;DROP DATABASE x*/`. Fix: la blocklist corre por
+  SEGMENTO entre `;` del texto normalizado (seguro: los literales ya están vaciados) y
+  `DELIMITER` es `blocked` — no hace falta, el splitter reconoce `BEGIN…END` por sí solo.
+  Efecto colateral aceptado: un cuerpo de rutina con `COMMIT;` queda bloqueado (fail-closed:
+  crear rutina con DCL + llamarla era la escalada). (4) `#` NO es comentario en PostgreSQL (es
+  el XOR de enteros): `SELECT id # 0, lo_import('/etc/shadow') FROM t` salía `read` → se
+  ejecutaba SIN confirmación NI auditoría (`record_intent` solo corre si no es lectura), con
+  lectura arbitraria de archivos del host. `_scan_normalize` ahora recibe el `engine`.
+- **Otros fixes de la misma pasada**: la clave del cache de engines no incluía la CONTRASEÑA
+  → probar un usuario con clave INCORRECTA reusaba el engine de la correcta y respondía
+  "conectó" (la herramienta mentía sobre lo único que existe para verificar); se agregó huella
+  `blake2b` salada por proceso + cuantización del timeout en tramos de 5s + cota FIFO de 256
+  engines (la clave depende de valores que elige el CLIENTE).
+  `is_gateway_metadata_target` comparaba host por TEXTO → con la BD del gateway en el host `db`
+  de un compose bastaba registrar `172.18.0.2` (misma máquina, y pasa el anti-SSRF por diseño)
+  para dropear `audit_log`/`servers`/`server_users`; ahora resuelve ambos hosts a IPs e
+  intersecta, fail-closed. Faltaban en la blocklist: `SET LOCAL/SESSION ROLE`, `set_config()`
+  (se bloquea ENTERA: los literales llegan vaciados y su 1er argumento es indistinguible),
+  `DISCARD`, UDF por `SONAME` (ejecución de código nativo en MySQL/MariaDB), `CREATE LANGUAGE`,
+  FDW/`dblink`/`FEDERATED`/`SUBSCRIPTION` (SSRF iniciado por el MOTOR, invisible al net_guard),
+  `pg_terminate_backend` y familia (salían `read`), `SET search_path`/`statement_timeout`/
+  `foreign_key_checks` (anulan las garantías del runner; `search_path` además desalinea el COUNT
+  del preview respecto del DELETE confirmado), `ALTER DATABASE/SCHEMA`, y `` `mysql`.`user` ``
+  con backticks (se escanea también la variante sin comillas). `FOR UPDATE`/`INTO @` escondidos
+  en un `/*! */` eran invisibles al AST (sqlglot NO tokeniza ese contenido) → `_TEXT_ELEVATORS`
+  como respaldo textual. Timeouts de MySQL/MariaDB incompletos: `max_execution_time` solo aplica
+  a SELECT de solo lectura y `lock_wait_timeout` viene con default de UN AÑO → ahora se emiten
+  los 4 (ambos motores; cada uno es no-op en el otro, y un MariaDB dado de alta como `mysql` es
+  un error de inventario frecuente). `_is_auth_like` depende del MODO (un 1045 con la credencial
+  pseudo-root es gateway mal configurado, NO el resultado de una prueba) y suma `22023` —el
+  SQLSTATE real de un `SET ROLE` a un rol inexistente en PG, porque `check_role()` no fija
+  errcode— y `1130`. SAVEPOINT por conteo en `estimate_impact` (en PG un COUNT fallido abortaba
+  la tx y los demás devolvían null). Cierre transaccional AISLADO: un `commit()` fallido
+  descartaba TODOS los resultados de un lote ya ejecutado. `ddl_persisted` y `policy_miss`
+  (SQLSTATE 25006 / errno 1792 = la política clasificó mal) nuevos en la respuesta. Excepciones
+  no-SQLAlchemy capturadas (`UnicodeDecodeError` del fetch: SQLAlchemy no envuelve ese camino)
+  sin volcar bytes del cliente. El `preview` ahora AUDITA (tocaba el motor con la credencial
+  elegida sin rastro = oráculo de contraseñas a 30/min). Los motivos del 403 pasaron de
+  `context` a `public_context`: `context` solo se expone en development, así que en PRODUCCIÓN
+  el operador recibía "hay sentencias prohibidas" sin saber cuál ni por qué.
+- **Verificación**: 145 casos en 4 archivos (`test_query_policy.py` 101, `test_query_console_security.py`,
+  `test_query_runner_execution.py` 20 con doble de conexión, `test_api_query_console.py` 24 de
+  extremo a extremo con el runner mockeado) + migración con ciclo upgrade/downgrade/upgrade en
+  SQLite. Todo por ejecución DIRECTA de las funciones, **sin `pytest`** (política del proyecto).
+  **PENDIENTE e2e contra motores reales**: `scripts/verify_query_console_e2e.py` está escrito
+  pero NO ejecutado (sin Docker). Lo crítico a confirmar ahí es (a) que la tx READ ONLY rechace
+  DE VERDAD una escritura mal clasificada —es la garantía central del diseño—, (b) `SET ROLE`
+  con RLS en PG, (c) que el `LIMIT` empujado evite bajar la tabla entera, (d) los mensajes
+  nativos de rechazo por permisos en los 3 motores.
+
 ## Documentación
 
 - `docs/` — documentación completa por feature (ver `docs/features/model-migrations.md`
