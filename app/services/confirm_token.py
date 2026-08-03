@@ -26,22 +26,40 @@ from app.exceptions import AppHttpException
 _DEFAULT_TTL_SECONDS = 120
 
 
-def _sign(operation: str, server_id: int, db_name: str, exp: int) -> str:
-    msg = f"{operation}\x1f{server_id}\x1f{db_name}\x1f{exp}".encode("utf-8")
+def _sign(
+    operation: str, server_id: int, db_name: str, exp: int, subject: str = ""
+) -> str:
+    msg = f"{operation}\x1f{server_id}\x1f{db_name}\x1f{exp}"
+    if subject:
+        msg = f"{msg}\x1f{subject}"
     key = (SECRET_KEY or "").encode("utf-8")
-    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def issue(
-    operation: str, server_id: int, db_name: str, ttl_seconds: int = _DEFAULT_TTL_SECONDS
+    operation: str,
+    server_id: int,
+    db_name: str,
+    ttl_seconds: int = _DEFAULT_TTL_SECONDS,
+    *,
+    subject: str = "",
 ) -> tuple[str, datetime]:
-    """Emite ``(token, expires_at)`` para ``(operation, server_id, db_name)``."""
+    """
+    Emite ``(token, expires_at)`` para ``(operation, server_id, db_name[, subject])``.
+
+    ``subject`` ata el token a algo MÁS FINO que la BD. Lo usa la consola SQL, donde
+    ``(operation, server_id, db_name)`` no alcanza: sin atarlo también al hash del SQL y
+    al usuario elegido, se podría pedir el preview de un ``SELECT`` y ejecutar un
+    ``DROP`` con el mismo token, que es exactamente lo que la confirmación debe impedir.
+    """
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
     exp = int(expires_at.timestamp())
-    return f"{exp}.{_sign(operation, server_id, db_name, exp)}", expires_at
+    return f"{exp}.{_sign(operation, server_id, db_name, exp, subject)}", expires_at
 
 
-def verify(token: str, operation: str, server_id: int, db_name: str) -> None:
+def verify(
+    token: str, operation: str, server_id: int, db_name: str, *, subject: str = ""
+) -> None:
     """
     Valida el token. Lanza 422 si es inválido/no corresponde a esta BD, 410 si expiró.
     """
@@ -64,10 +82,15 @@ def verify(token: str, operation: str, server_id: int, db_name: str) -> None:
             status_code=410,
             context={},
         )
-    expected = _sign(operation, server_id, db_name, exp)
+    expected = _sign(operation, server_id, db_name, exp, subject)
     if not hmac.compare_digest(mac, expected):
         raise AppHttpException(
-            message="El token de confirmación no corresponde a esta base de datos.",
+            message=(
+                "El token de confirmación no corresponde a esta operación. Si cambiaste "
+                "el SQL, la base de datos o el usuario, volvé a solicitar el preview."
+                if subject
+                else "El token de confirmación no corresponde a esta base de datos."
+            ),
             status_code=422,
             context={},
         )
