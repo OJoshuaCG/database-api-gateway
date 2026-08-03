@@ -16,6 +16,8 @@ Decisiones:
   sin filtrar jamás la credencial ni la URL de conexión.
 """
 
+import hashlib
+import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -65,9 +67,50 @@ class ServerTarget:
 # Cache de engines
 # ---------------------------------------------------------------------------
 
-# Clave: (server_id, BD efectiva, bulk, mysql_local_infile).
-_engines: dict[tuple[int, str, bool, bool], Engine] = {}
+# Clave: (server_id, usuario, HUELLA de la contraseña, BD efectiva, bulk,
+#         mysql_local_infile, timeout efectivo cuantizado).
+#
+# El USUARIO y la CONTRASEÑA son parte de la clave y no son opcionales. Casi todo el
+# gateway conecta con la credencial pseudo-root del servidor, pero la consola SQL puede
+# conectar como CUALQUIER usuario del motor para probar permisos, y la credencial viaja
+# DENTRO de la URL del engine cacheado. Sin ambos en la clave, la herramienta miente en
+# las dos direcciones:
+#   - sin el usuario: la prueba "como usuario limitado" reusa el engine pseudo-root, corre
+#     como root y da verde siempre;
+#   - sin la contraseña: probar `app_ro` con una clave INCORRECTA reusa el engine de la
+#     clave correcta y responde "conectó" — es decir, valida una credencial inválida.
+# La contraseña entra como huella y nunca en claro: el diccionario es visible en cualquier
+# volcado del proceso.
+_engines: dict[tuple[int, str, str, str, bool, bool, int], Engine] = {}
 _lock = threading.Lock()
+
+# Cota del cache. La clave depende de valores que elige el CLIENTE (usuario, contraseña,
+# timeout), así que sin techo un cliente puede sembrar engines indefinidamente; cada uno
+# arrastra su propio cache de compilación. Con NullPool un engine no mantiene conexiones,
+# así que desalojarlo solo cuesta reconstruir la URL.
+_MAX_ENGINES = 256
+
+# La huella se sala con un valor por PROCESO: sin sal, el diccionario permitiría confirmar
+# una contraseña adivinada comparando hashes.
+_PROCESS_SALT = os.urandom(16)
+
+
+def _password_fingerprint(password: str | None) -> str:
+    return hashlib.blake2b(
+        (password or "").encode("utf-8"), digest_size=16, key=_PROCESS_SALT
+    ).hexdigest()
+
+
+def _quantize_timeout(timeout_ms: int) -> int:
+    """
+    Redondea el timeout hacia arriba en tramos de 5 s para que NO sea un eje libre de la
+    clave del cache: ``timeout_ms`` lo elige el cliente en cada request y, sin cuantizar,
+    cada valor distinto crea un engine nuevo.
+    """
+    if timeout_ms <= 0:
+        return 0
+    step = 5000
+    return ((timeout_ms + step - 1) // step) * step
 
 
 def _require_driver(dialect: str) -> str:
@@ -94,20 +137,30 @@ _SSL_DISABLED = {"", "disable", "disabled", "off", "false", "0", "none"}
 _PG_SSLMODES = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
 
 
+def _effective_timeout_ms(bulk: bool, statement_timeout_ms: int | None) -> int:
+    """
+    Timeout de sentencia efectivo. ``statement_timeout_ms`` explícito manda sobre el par
+    interactivo/bulk: lo usa la consola SQL, cuyo tope es configurable por despliegue y
+    no coincide ni con los 15s interactivos ni con la hora del volcado masivo.
+    """
+    if statement_timeout_ms is not None:
+        return max(0, int(statement_timeout_ms))
+    return REMOTE_BULK_STATEMENT_TIMEOUT_MS if bulk else REMOTE_STATEMENT_TIMEOUT_MS
+
+
 def _connect_args(
     dialect: str,
     ssl_mode: str | None = None,
     *,
     bulk: bool = False,
     mysql_local_infile: bool = False,
+    statement_timeout_ms: int | None = None,
 ) -> dict[str, Any]:
     mode = (ssl_mode or "").strip().lower()
     ssl_enabled = mode not in _SSL_DISABLED
     # ``bulk=True`` (copia de datos del clon): usa un timeout mucho mayor que el
     # interactivo (15s cancelaría lotes de tablas grandes). ``0`` = sin límite.
-    stmt_timeout_ms = (
-        REMOTE_BULK_STATEMENT_TIMEOUT_MS if bulk else REMOTE_STATEMENT_TIMEOUT_MS
-    )
+    stmt_timeout_ms = _effective_timeout_ms(bulk, statement_timeout_ms)
 
     if dialect in ("mysql", "mariadb"):
         # pymysql: timeouts a nivel de socket cubren conexión y ejecución.
@@ -164,6 +217,7 @@ def _build_engine(
     *,
     bulk: bool = False,
     mysql_local_infile: bool = False,
+    statement_timeout_ms: int | None = None,
 ) -> Engine:
     driver = _require_driver(target.dialect)
     url = URL.create(
@@ -178,7 +232,11 @@ def _build_engine(
         url,
         poolclass=NullPool,
         connect_args=_connect_args(
-            target.dialect, target.ssl_mode, bulk=bulk, mysql_local_infile=mysql_local_infile
+            target.dialect,
+            target.ssl_mode,
+            bulk=bulk,
+            mysql_local_infile=mysql_local_infile,
+            statement_timeout_ms=statement_timeout_ms,
         ),
     )
 
@@ -189,23 +247,47 @@ def get_engine(
     *,
     bulk: bool = False,
     mysql_local_infile: bool = False,
+    statement_timeout_ms: int | None = None,
 ) -> Engine:
     """
-    Devuelve un engine cacheado por (server_id, BD efectiva, bulk, mysql_local_infile).
+    Devuelve un engine cacheado por (server_id, usuario, BD efectiva, bulk,
+    mysql_local_infile).
     `database=None` => conexión a nivel servidor (admin). `bulk=True` => timeouts de
     volcado masivo (copia de datos del clon). `mysql_local_infile=True` => habilita
     LOAD DATA LOCAL INFILE en pymysql (solo la conexión de ESCRITURA del clon lo pide).
     Ambos flags entran en la clave de cache para que un engine con ``local_infile``
-    habilitado NUNCA se reuse en una conexión que no lo pidió (ni viceversa).
+    habilitado NUNCA se reuse en una conexión que no lo pidió (ni viceversa); el usuario
+    entra por la razón de seguridad documentada en ``_engines``.
     """
     effective_db = _effective_database(target.dialect, database)
-    key = (target.server_id, effective_db or "", bulk, mysql_local_infile)
+    timeout = _quantize_timeout(_effective_timeout_ms(bulk, statement_timeout_ms))
+    key = (
+        target.server_id,
+        target.admin_user or "",
+        _password_fingerprint(target.admin_password),
+        effective_db or "",
+        bulk,
+        mysql_local_infile,
+        timeout,
+    )
     with _lock:
         engine = _engines.get(key)
         if engine is None:
             engine = _build_engine(
-                target, effective_db, bulk=bulk, mysql_local_infile=mysql_local_infile
+                target,
+                effective_db,
+                bulk=bulk,
+                mysql_local_infile=mysql_local_infile,
+                statement_timeout_ms=timeout if statement_timeout_ms is not None else None,
             )
+            # Desalojo FIFO al llegar al techo (ver ``_MAX_ENGINES``).
+            while len(_engines) >= _MAX_ENGINES:
+                oldest_key, evicted = next(iter(_engines.items()))
+                del _engines[oldest_key]
+                try:
+                    evicted.dispose()
+                except Exception:  # noqa: BLE001 — desalojar nunca rompe la operación
+                    pass
             _engines[key] = engine
         return engine
 
@@ -236,13 +318,21 @@ def database_connection(
     *,
     bulk: bool = False,
     mysql_local_infile: bool = False,
+    statement_timeout_ms: int | None = None,
 ):
     """Conexión a una BD CONCRETA (introspección/migraciones). Revalida el host (anti-SSRF, R2).
     ``bulk=True`` usa timeouts de volcado masivo (copia de datos del clon).
     ``mysql_local_infile=True`` habilita LOAD DATA LOCAL INFILE (solo la conexión de
-    ESCRITURA del clon lo pide; ver ``data_copy``)."""
+    ESCRITURA del clon lo pide; ver ``data_copy``).
+    ``statement_timeout_ms`` fuerza un timeout explícito (lo usa la consola SQL)."""
     validate_remote_host(target.host)
-    engine = get_engine(target, database, bulk=bulk, mysql_local_infile=mysql_local_infile)
+    engine = get_engine(
+        target,
+        database,
+        bulk=bulk,
+        mysql_local_infile=mysql_local_infile,
+        statement_timeout_ms=statement_timeout_ms,
+    )
     conn = engine.connect()
     try:
         yield conn
