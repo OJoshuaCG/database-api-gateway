@@ -16,8 +16,10 @@ se audita fail-closed antes de ejecutar.
 """
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
+from app.core.context import current_http_identifier
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.models.permission_profile import PermissionProfile, PermissionProfileItem
 from app.models.server import Server
@@ -33,6 +35,9 @@ from app.services import audit
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.dtos import EngineUserInfo, GrantInfo, GrantLevel, ObjectRef
 from app.services.db_admin.factory import get_adapter
+
+
+logger = get_logger(__name__)
 
 
 def _grantee_label(grantee: EngineUserInfo) -> str:
@@ -309,6 +314,11 @@ class GrantController:
         el ``object_mapping`` correspondiente en el payload y ejecuta ``grant_object``.
         Los niveles del perfil sin mapeo se omiten (se reportan en ``skipped_levels``).
         Los errores de grant individuales se capturan para dar visibilidad sin abortar.
+
+        Guards, en orden: perfil inexistente → 404; perfil DESACTIVADO → 409; perfil de
+        un motor no aplicable al del servidor → 422 (se admite el cruce dentro de la
+        familia MySQL↔MariaDB si TODOS sus privilegios son otorgables en el motor real);
+        ningún grant aplicado → 422 (antes devolvía 200 y el fallo pasaba inadvertido).
         """
         session = self._session()
         try:
@@ -323,24 +333,57 @@ class GrantController:
                     status_code=404,
                     context={"profile_id": profile_id},
                 )
-            server = get_server_or_404(session, server_id)
-            engine = engine_value(server)
-            if profile.engine != engine:
+            if not profile.is_active:
                 raise AppHttpException(
                     message=(
-                        f"El perfil es para motor '{profile.engine}' pero el servidor usa '{engine}'."
+                        f"El perfil '{profile.name}' está desactivado y no puede aplicarse. "
+                        "Reactivalo antes de asignarlo."
                     ),
-                    status_code=422,
-                    context={"profile_engine": profile.engine, "server_engine": engine},
+                    status_code=409,
+                    context={"profile_id": profile_id},
                 )
+            server = get_server_or_404(session, server_id)
+            engine = engine_value(server)
+            # Los items se necesitan ANTES de decidir la compatibilidad de motor: el cruce
+            # dentro de la familia se valida por PRIVILEGIO, no por nombre de motor.
             items = (
                 session.query(PermissionProfileItem)
                 .filter(PermissionProfileItem.profile_id == profile_id)
                 .all()
             )
             profile_name = profile.name
+            profile_engine = profile.engine
         finally:
             session.close()
+
+        if profile_engine != engine:
+            incompatibles = [
+                f"{it.level}: {it.privileges}"
+                for it in items
+                if not priv_catalog.tokens_valid_for(
+                    engine,
+                    GrantLevel(it.level),
+                    [p.strip() for p in it.privileges.split(",") if p.strip()],
+                )
+            ]
+            if not priv_catalog.same_family(profile_engine, engine) or incompatibles:
+                detail = (
+                    f" Privilegios no válidos en '{engine}': {'; '.join(incompatibles)}."
+                    if incompatibles
+                    else ""
+                )
+                raise AppHttpException(
+                    message=(
+                        f"El perfil es para motor '{profile_engine}' y no es aplicable a un "
+                        f"servidor '{engine}'.{detail}"
+                    ),
+                    status_code=422,
+                    context={
+                        "profile_engine": profile_engine,
+                        "server_engine": engine,
+                        "incompatible_items": incompatibles,
+                    },
+                )
 
         # Índice de mappings por nivel
         mapping_index: dict[GrantLevel, ObjectRef] = {
@@ -353,12 +396,17 @@ class GrantController:
 
         for item in items:
             level = GrantLevel(item.level)
-            privileges = [p.strip() for p in item.privileges.split(",") if p.strip()]
+            raw_privileges = [p.strip() for p in item.privileges.split(",") if p.strip()]
             ref = mapping_index.get(level)
             if ref is None:
                 skipped_levels.append(level.value)
                 continue
             try:
+                # Canonicalizar contra el motor del SERVIDOR (no el del perfil): con el
+                # cruce de familia habilitado, el perfil puede venir del otro motor.
+                privileges, _ = priv_catalog.validate_privileges(
+                    raw_privileges, engine, level
+                )
                 if not adapter.can_grant(level, ref, privileges):
                     errors.append(
                         f"{level.value}: credencial sin permisos suficientes para {privileges}"
@@ -366,8 +414,25 @@ class GrantController:
                     continue
                 adapter.grant_object(grantee, level, ref, privileges)
                 grants_applied += 1
-            except Exception as exc:  # noqa: BLE001 — best-effort; reportar, no abortar
-                errors.append(f"{level.value}: {exc}")
+            except AppHttpException as exc:
+                # Validación del catálogo: el mensaje ya es seguro (no refleja el payload).
+                errors.append(f"{level.value}: {exc.message}")
+            except Exception:
+                # Best-effort: se reporta el nivel fallido y se sigue, no se aborta.
+                # El detalle del motor va al log (con Request ID), NO a la respuesta HTTP:
+                # puede incluir nombres internos o fragmentos de la sentencia.
+                logger.exception(
+                    "%s | apply_profile: fallo al otorgar nivel %s "
+                    "(server_user_id=%s, profile_id=%s)",
+                    current_http_identifier.get(),
+                    level.value,
+                    user_id,
+                    profile_id,
+                )
+                errors.append(
+                    f"{level.value}: el motor rechazó el GRANT "
+                    "(ver logs del gateway con el Request ID de esta respuesta)"
+                )
 
         audit.record(
             "server_user.apply_profile",
@@ -383,6 +448,30 @@ class GrantController:
                 f"{grants_applied} grants aplicados, {len(skipped_levels)} omitidos"
             ),
         )
+        # No aplicar NADA es un fallo, no un éxito silencioso: antes esto devolvía 200 y
+        # los motivos quedaban enterrados en skipped_levels/errors. La auditoría ya quedó
+        # registrada arriba (el intento ocurrió), así que recién ahora se corta.
+        if grants_applied == 0:
+            reasons: list[str] = []
+            if skipped_levels:
+                reasons.append(
+                    "niveles del perfil sin objeto asignado: " + ", ".join(skipped_levels)
+                )
+            if errors:
+                reasons.append("errores: " + "; ".join(errors))
+            raise AppHttpException(
+                message=(
+                    f"No se aplicó ningún permiso del perfil '{profile_name}'. "
+                    + (" | ".join(reasons) if reasons else "El perfil no tiene items.")
+                ),
+                status_code=422,
+                context={
+                    "profile_id": profile_id,
+                    "skipped_levels": skipped_levels,
+                    "errors": errors,
+                },
+            )
+
         return ApplyProfileResult(
             profile_id=profile_id,
             profile_name=profile_name,
