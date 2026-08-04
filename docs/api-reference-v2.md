@@ -314,7 +314,27 @@ curl -b cookies.txt -X POST http://localhost/api/v1/server-users/7/apply-profile
   "message": "Perfil 'app-readwrite' aplicado: 2 grant(s)." }
 ```
 
-> El motor del perfil debe coincidir con el del servidor del usuario, si no `422`.
+**Códigos de error**
+
+| Código | Cuándo |
+|---|---|
+| `404` | El usuario o el perfil no existen. |
+| `409` | El perfil está **desactivado** (`is_active=false`). Reactivalo antes de aplicarlo. |
+| `422` | El motor del perfil **no es aplicable** al del servidor: distinta familia, o misma familia (MySQL↔MariaDB) con algún privilegio no otorgable en el motor real — el mensaje nombra los privilegios ofensores. |
+| `422` | **No se aplicó ningún grant**: ningún nivel del perfil tenía mapeo, o todos fallaron. El mensaje enumera `skipped_levels` y `errors`. |
+
+> **Un perfil de la misma familia SÍ se puede aplicar.** Un perfil `mariadb` es aplicable a
+> un servidor `mysql` (y viceversa) si todos sus privilegios existen en el motor destino; los
+> tokens se recanonalizan contra el motor **del servidor**, no el del perfil. Solo el cruce
+> con PostgreSQL es un rechazo incondicional.
+>
+> **`grants_applied: 0` ya no es un `200`.** Antes, aplicar un perfil sin `object_mappings`
+> devolvía éxito con `grants_applied: 0` y el usuario no veía ningún permiso nuevo sin
+> entender por qué. Ahora eso es `422`. El caso **parcial** (algunos sí, algunos no) sigue
+> siendo `200` con `errors[]` poblado — hay que mirar ese campo.
+>
+> Los mensajes de `errors[]` son **acotados a propósito**: el detalle crudo del motor va al
+> log del gateway con el Request ID de la respuesta, no al cuerpo HTTP.
 
 ---
 
@@ -385,23 +405,41 @@ ningún motor**. Requiere sesión.
 | `name` | string | sí | 1–100 caracteres |
 | `engine` | `EngineType` | sí | `mysql` \| `mariadb` \| `postgresql` |
 | `description` | string \| null | no | máx 255 |
+| `is_active` | bool | no | **default `true`** — un perfil nace activo si no se envía |
 | `items` | list[`PermissionProfileItemIn`] | sí | mínimo 1; cada item: `{ level: GrantLevel, privileges: list[string] }` |
 
 `PermissionProfileUpdate`: `name?`, `description?`, `is_active?`, `items?`. El `engine` es
 **inmutable**; si envías `items`, **reemplazan** por completo los anteriores.
 
 `PermissionProfileOut`: `{ id, name, engine, description?, is_active, items[], created_at, updated_at }`
-donde cada item de salida es `{ level, privileges[], requires_confirmation }`.
+donde cada item de salida es `{ level, privileges[], requires_confirmation }`. Ninguno de esos
+campos puede salir `null` ni con el `engine` en mayúsculas: `engine` es un enum en minúsculas
+(`mysql`/`mariadb`/`postgresql`) y ambos timestamps son NOT NULL desde el INSERT.
+
+> **Niveles válidos por motor.** `global` **no existe** en el catálogo de ningún motor: un
+> item con `level: "global"` se rechaza con `422`. MySQL/MariaDB admiten
+> `database`/`table`/`column`/`routine`; PostgreSQL agrega `schema` y `sequence`.
 
 ### Endpoints
 
 | Método | Ruta | Descripción |
 |---|---|---|
-| `GET` | `/api/v1/permission-profiles` | Lista (filtros `?engine=`, `?active=`). **No paginada.** |
+| `GET` | `/api/v1/permission-profiles` | Lista (filtros `?engine=`, `?active=`, `?exact_engine=`). **No paginada.** |
 | `POST` | `/api/v1/permission-profiles` | Crea un perfil (`201`). |
 | `GET` | `/api/v1/permission-profiles/{profile_id}` | Detalle. |
 | `PATCH` | `/api/v1/permission-profiles/{profile_id}` | Actualiza (items reemplazan). |
 | `DELETE` | `/api/v1/permission-profiles/{profile_id}` | Elimina. |
+
+> **El filtro `?engine=` es compatible por FAMILIA, no por igualdad estricta.**
+> `?engine=mysql` devuelve también los perfiles `mariadb` cuyos privilegios son **todos**
+> otorgables en MySQL, y viceversa (la única asimetría real es `DELETE HISTORY`, exclusivo de
+> MariaDB, que excluye ese perfil del listado para MySQL). PostgreSQL nunca se mezcla.
+> Cada perfil viaja con su `engine` real, así que la UI puede etiquetar los de la familia.
+> Para recuperar la igualdad estricta: `?engine=mysql&exact_engine=true`.
+>
+> Motivo del cambio: con el filtro estricto, un perfil creado para MariaDB no aparecía al
+> pedir `?engine=mysql&active=true` y el selector de «Aplicar perfil» del frontend quedaba
+> vacío sin explicación, pese a ser un perfil perfectamente aplicable.
 
 ```bash
 curl -b cookies.txt -X POST http://localhost/api/v1/permission-profiles \
