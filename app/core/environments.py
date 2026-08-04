@@ -138,6 +138,31 @@ CLONE_DATA_BATCH_ROWS = int(os.getenv("CLONE_DATA_BATCH_ROWS", "1000"))
 # al INSERT parametrizado por lotes (executemany) sin necesidad de re-desplegar código.
 CLONE_BULK_COPY_ENABLED = os.getenv("CLONE_BULK_COPY_ENABLED", "True").lower() == "true"
 
+# ======= Consola SQL (ejecución de queries ad-hoc) ======= #
+# MODO SEGURO. True (default) = toda sentencia que no sea lectura pura exige el ciclo
+# preview→confirmación (token firmado + nombre de la BD), y la lista de sentencias
+# PROHIBIDAS (DCL, acceso a archivos del host, estado global del servidor, tablas
+# internas del gateway) se rechaza incluso confirmando. Ponerlo en False NO desactiva
+# los bloqueos: solo salta la confirmación de write/DDL. Pensado para el día que exista
+# un segundo factor; hoy debe quedar en True.
+QUERY_SAFE_MODE = os.getenv("QUERY_SAFE_MODE", "True").lower() == "true"
+# Tope de filas devueltas por sentencia. Protege la MEMORIA DEL GATEWAY: un
+# ``SELECT * FROM tabla_de_50M`` sin tope se materializa entero y se serializa a JSON.
+# Al superarlo, la respuesta viene con truncated=true.
+QUERY_MAX_ROWS = int(os.getenv("QUERY_MAX_ROWS", "1000"))
+# Timeout por sentencia (ms). El interactivo general (REMOTE_STATEMENT_TIMEOUT_MS, 15s)
+# es corto para una consola; este lo reemplaza solo en este camino.
+QUERY_TIMEOUT_MS = int(os.getenv("QUERY_TIMEOUT_MS", "30000"))
+# Techo del timeout que un request puede pedir. Evita que la consola sea una vía para
+# dejar consultas colgadas indefinidamente en un servidor de producción.
+QUERY_MAX_TIMEOUT_MS = int(os.getenv("QUERY_MAX_TIMEOUT_MS", "300000"))
+# Tope de tamaño del SQL aceptado por request (bytes).
+QUERY_MAX_SQL_BYTES = int(os.getenv("QUERY_MAX_SQL_BYTES", str(256 * 1024)))
+# Tope de caracteres por CELDA devuelta. Un BLOB/TEXT grande se recorta con marca.
+QUERY_MAX_CELL_CHARS = int(os.getenv("QUERY_MAX_CELL_CHARS", "4096"))
+# Tope de caracteres del SQL que se PERSISTE en el historial (con contraseñas redactadas).
+QUERY_HISTORY_SQL_MAX_CHARS = int(os.getenv("QUERY_HISTORY_SQL_MAX_CHARS", "16384"))
+
 # ======= Anti-SSRF (validación de host destino) ======= #
 # Si True (default), al registrar/editar un Server se rechazan destinos peligrosos
 # (loopback, link-local/metadata 169.254.169.254, multicast, reservados). Los rangos

@@ -35,6 +35,7 @@ from app.models.permission_profile import PermissionProfile, PermissionProfileIt
 from app.models.privilege import Privilege
 from app.models.schema_comparison import SchemaComparison
 from app.models.schema_comparison_item import SchemaComparisonItem
+from app.models.query_execution import QueryExecution
 from app.models.server import Server
 from app.models.server_user import ServerUser
 from app.models.user import User
@@ -60,6 +61,7 @@ __all__ = [
     "SchemaComparisonItem",
     "CloneJob",
     "CloneJobItem",
+    "QueryExecution",
     "EngineType",
     "ServerStatus",
     "ProvisionStatus",

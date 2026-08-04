@@ -8,12 +8,20 @@ CRUD del inventario (solo BD del gateway) + operaciones contra el servidor desti
 from fastapi import APIRouter, Query, Request
 
 from app.controllers.grant_controller import GrantController
+from app.controllers.query_console_controller import QueryConsoleController
 from app.controllers.server_controller import ServerController
 from app.controllers.server_database_controller import ServerDatabaseController
 from app.controllers.server_user_controller import ServerUserController
 from app.core.auth import AdminDep
 from app.core.limiter import limiter
 from app.schemas.grant import GrantableRequest, GrantableResult
+from app.schemas.query_console import (
+    QueryExecuteIn,
+    QueryExecuteOut,
+    QueryHistoryOut,
+    QueryPreviewIn,
+    QueryPreviewOut,
+)
 from app.schemas.server_database import (
     DatabaseCreateIn,
     DatabaseCreateOut,
@@ -398,3 +406,88 @@ def check_grantable(admin: AdminDep, server_id: int, payload: GrantableRequest):
         privileges=payload.privileges,
     )
     return success(data=result)
+
+
+# ------------------------- Consola SQL (queries ad-hoc) ------------------------- #
+# Ejecuta SQL arbitrario sobre una BD del servidor, con el usuario del motor que se
+# elija (pseudo-root, uno del inventario, uno con contraseña provista, o un rol
+# adoptado con SET ROLE en PostgreSQL). Modo seguro: todo lo que no sea lectura pura
+# exige el ciclo preview → confirmación, y hay sentencias PROHIBIDAS incluso confirmando.
+@router.post(
+    "/{server_id}/query/preview",
+    response_model=ApiResponse[QueryPreviewOut],
+)
+@limiter.limit("30/minute")
+def preview_query(
+    request: Request, admin: AdminDep, server_id: int, payload: QueryPreviewIn
+):
+    """
+    Paso 1: clasifica el SQL (lectura / escritura / DDL / prohibido), estima cuántas filas
+    afectaría cada UPDATE/DELETE y emite el ``confirm_token`` (TTL 2 min) atado al SQL, la
+    base de datos y el usuario elegidos. NO ejecuta nada.
+    """
+    return success(
+        data=QueryConsoleController().preview(
+            server_id,
+            database=payload.database,
+            sql=payload.sql,
+            connection=payload.connection,
+            estimate_impact=payload.estimate_impact,
+            admin=admin,
+        )
+    )
+
+
+@router.post(
+    "/{server_id}/query/execute",
+    response_model=ApiResponse[QueryExecuteOut],
+)
+@limiter.limit("30/minute")
+def execute_query(
+    request: Request, admin: AdminDep, server_id: int, payload: QueryExecuteIn
+):
+    """
+    Paso 2: ejecuta el lote. Una consulta de solo lectura corre directo (dentro de una
+    transacción READ ONLY); cualquier otra exige ``confirm_target_name`` == nombre de la
+    BD + ``confirm_token`` del preview.
+
+    Un rechazo del MOTOR (por ejemplo por falta de permisos) devuelve **200** con
+    ``success=false`` y el error nativo: es un resultado válido de la prueba, no un fallo
+    de la API.
+    """
+    result = QueryConsoleController().execute(
+        server_id,
+        database=payload.database,
+        sql=payload.sql,
+        connection=payload.connection,
+        confirm_token_value=payload.confirm_token,
+        confirm_target_name=payload.confirm_target_name,
+        dry_run=payload.dry_run,
+        max_rows=payload.max_rows,
+        timeout_ms=payload.timeout_ms,
+        admin=admin,
+    )
+    return success(data=result)
+
+
+@router.get(
+    "/{server_id}/query/history",
+    response_model=ApiResponse[list[QueryHistoryOut]],
+)
+@limiter.limit("60/minute")
+def list_query_history(
+    request: Request,
+    admin: AdminDep,
+    server_id: int,
+    pagination: PaginationDep,
+    database: str | None = Query(default=None, description="Filtra por base de datos."),
+):
+    """Historial de ejecuciones de la consola (sin las filas devueltas, solo conteos)."""
+    items, total = QueryConsoleController().list_history(
+        server_id, database=database, limit=pagination.size, offset=pagination.offset
+    )
+    return paginated(
+        [QueryHistoryOut.model_validate(i) for i in items],
+        total=total,
+        pagination=pagination,
+    )
