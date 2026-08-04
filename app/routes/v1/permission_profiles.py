@@ -25,8 +25,18 @@ def list_profiles(
     admin: AdminDep,
     engine: str | None = Query(None, description="mysql | mariadb | postgresql"),
     active: bool | None = Query(None),
+    exact_engine: bool = Query(
+        False,
+        description=(
+            "Por defecto el filtro de motor es compatible por familia: ?engine=mysql "
+            "también devuelve perfiles mariadb aplicables en MySQL (y viceversa). "
+            "true = igualdad estricta de motor."
+        ),
+    ),
 ):
-    data = PermissionProfileController().list_profiles(engine=engine, active=active)
+    data = PermissionProfileController().list_profiles(
+        engine=engine, active=active, exact_engine=exact_engine
+    )
     return success(data=data)
 
 

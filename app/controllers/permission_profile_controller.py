@@ -99,6 +99,47 @@ class PermissionProfileController:
             .all()
         )
 
+    def _items_of_many(
+        self, session, profile_ids: list[int]
+    ) -> dict[int, list[PermissionProfileItem]]:
+        """Items de varios perfiles en UNA query (evita el N+1 del listado)."""
+        if not profile_ids:
+            return {}
+        rows = (
+            session.query(PermissionProfileItem)
+            .filter(PermissionProfileItem.profile_id.in_(profile_ids))
+            .order_by(PermissionProfileItem.profile_id, PermissionProfileItem.level)
+            .all()
+        )
+        grouped: dict[int, list[PermissionProfileItem]] = {pid: [] for pid in profile_ids}
+        for row in rows:
+            grouped[row.profile_id].append(row)
+        return grouped
+
+    @staticmethod
+    def _applicable_to(
+        profile: PermissionProfile, items: list[PermissionProfileItem], engine: str
+    ) -> bool:
+        """
+        ¿Este perfil es aplicable sobre ``engine``?
+
+        Mismo motor → sí. Motor distinto de la MISMA familia (MySQL↔MariaDB) → solo si
+        TODOS sus privilegios siguen siendo otorgables en el motor destino. Un perfil sin
+        items no es aplicable (fail-closed; no debería existir: `_validate_items` exige ≥1).
+        """
+        if profile.engine == engine:
+            return True
+        if not priv_catalog.same_family(profile.engine, engine):
+            return False
+        if not items:
+            return False
+        return all(
+            priv_catalog.tokens_valid_for(
+                engine, GrantLevel(it.level), [p for p in it.privileges.split(",") if p]
+            )
+            for it in items
+        )
+
     def _get_or_404(self, session, profile_id: int) -> PermissionProfile:
         profile = session.get(PermissionProfile, profile_id)
         if not profile:
@@ -112,18 +153,53 @@ class PermissionProfileController:
     # ------------------------------------------------------------------ #
     # Lectura                                                            #
     # ------------------------------------------------------------------ #
-    def list_profiles(self, engine: str | None = None, active: bool | None = None) -> list[dict]:
+    def list_profiles(
+        self,
+        engine: str | None = None,
+        active: bool | None = None,
+        exact_engine: bool = False,
+    ) -> list[dict]:
+        """
+        Lista perfiles, opcionalmente filtrados por motor y estado.
+
+        El filtro de motor es **compatible por familia**: pedir ``mysql`` también devuelve
+        los perfiles ``mariadb`` cuyos privilegios son TODOS otorgables en MySQL, y
+        viceversa (la única asimetría real es `DELETE HISTORY`, exclusivo de MariaDB).
+        Motivo: un perfil sirve para el otro motor de la familia siempre que su contenido
+        sea válido allí, y esconderlo dejaba el selector de «Aplicar perfil» vacío sin
+        explicación. Con ``exact_engine=True`` se recupera la igualdad estricta.
+
+        El motor de cada perfil viaja en la respuesta (`engine`), así que la UI puede
+        distinguir los de la familia de los del motor exacto.
+        """
         if engine is not None:
             engine = self._engine_value(engine)
         session = self._session()
         try:
             q = session.query(PermissionProfile)
             if engine is not None:
-                q = q.filter(PermissionProfile.engine == engine)
+                if exact_engine:
+                    q = q.filter(PermissionProfile.engine == engine)
+                else:
+                    # Pre-filtro amplio; la compatibilidad fina se decide por token abajo.
+                    q = q.filter(
+                        PermissionProfile.engine.in_(priv_catalog.family_members(engine))
+                    )
             if active is not None:
                 q = q.filter(PermissionProfile.is_active == active)
             profiles = q.order_by(PermissionProfile.engine, PermissionProfile.name).all()
-            return [self._serialize(p, self._items_of(session, p.id)) for p in profiles]
+            items_by_profile = self._items_of_many(session, [p.id for p in profiles])
+            out: list[dict] = []
+            for profile in profiles:
+                items = items_by_profile.get(profile.id, [])
+                if (
+                    engine is not None
+                    and not exact_engine
+                    and not self._applicable_to(profile, items, engine)
+                ):
+                    continue
+                out.append(self._serialize(profile, items))
+            return out
         finally:
             session.close()
 
