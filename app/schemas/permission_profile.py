@@ -17,6 +17,8 @@ class PermissionProfileCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     engine: EngineType
     description: str | None = Field(None, max_length=255)
+    # Opcional: si no se envía, el perfil nace ACTIVO (comportamiento histórico).
+    is_active: bool = True
     items: list[PermissionProfileItemIn] = Field(..., min_length=1)
 
 
