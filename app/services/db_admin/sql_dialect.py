@@ -337,6 +337,65 @@ def split_sql_statements(sql: str) -> list[str]:
     return statements
 
 
+def mask_quoted_spans(sql: str, fill: str = " ") -> str:
+    """
+    Devuelve ``sql`` con el CONTENIDO de cada literal ``'…'`` / ``"…"`` e identificador
+    ``` `…` ``` reemplazado por ``fill``, preservando los delimitadores y la longitud
+    total. El texto FUERA de las comillas queda intacto.
+
+    Para analizar SQL con heurísticas de texto (contar paréntesis, buscar palabras clave)
+    sin que el contenido de un literal contamine el resultado. Analizar el texto crudo es
+    exactamente la clase de error que produjo el DDL inválido de las columnas generadas:
+    un ``COMMENT '… (MariaDB no tiene índices filtrados) …'`` desbalancea cualquier
+    contador de paréntesis ingenuo, y una palabra como ``VIRTUAL`` dentro de un literal
+    no es una palabra clave.
+
+    Escapes reconocidos, ambos necesarios en MySQL/MariaDB:
+
+    - **comilla duplicada** (``''``, ``` `` ```) — la convención de
+      ``split_sql_statements``, válida en cualquier ``sql_mode``;
+    - **backslash** (``\\'``) — el ``sql_mode`` por defecto, que
+      ``quote_string_literal`` ya contempla al ESCRIBIR. Dentro de ``` `…` `` `` el
+      backslash NO escapa (MySQL solo admite el doblado en identificadores).
+
+    Un literal sin cerrar se enmascara hasta el final de la cadena; el llamador puede
+    detectarlo por su cuenta si le importa.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch not in ("'", '"', "`"):
+            out.append(ch)
+            i += 1
+            continue
+        # Apertura de literal/identificador: se copia el delimitador y se rellena
+        # el interior hasta el cierre.
+        out.append(ch)
+        i += 1
+        while i < n:
+            cur = sql[i]
+            # El backslash escapa el carácter siguiente solo en literales de string
+            # ('…' / "…"), no en identificadores con backticks.
+            if cur == "\\" and ch != "`" and i + 1 < n:
+                out.append(fill * 2)
+                i += 2
+                continue
+            if cur == ch:
+                # Delimitador duplicado => escape, seguimos dentro.
+                if i + 1 < n and sql[i + 1] == ch:
+                    out.append(fill * 2)
+                    i += 2
+                    continue
+                out.append(ch)  # cierre real
+                i += 1
+                break
+            out.append(fill)
+            i += 1
+    return "".join(out)
+
+
 # --------------------------------------------------------------------------- #
 # DDL específico de MySQL que sqlglot NO traduce a PostgreSQL                   #
 # --------------------------------------------------------------------------- #
