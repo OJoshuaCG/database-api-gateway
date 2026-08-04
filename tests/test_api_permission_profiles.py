@@ -140,3 +140,113 @@ def test_delete_profile(admin_client):
     pid = admin_client.post("/api/v1/permission-profiles", json=_profile(name="del")).json()["data"]["id"]
     assert admin_client.delete(f"/api/v1/permission-profiles/{pid}").status_code == 200
     assert admin_client.get(f"/api/v1/permission-profiles/{pid}").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Compatibilidad de familia MySQL↔MariaDB en el filtro de motor.
+# Regresión: un perfil `mariadb` no aparecía al pedir `?engine=mysql`, así que el
+# selector de «Aplicar perfil» del frontend salía vacío sin explicación.
+# --------------------------------------------------------------------------- #
+
+
+def test_list_includes_compatible_family_profile(admin_client):
+    """Un perfil mariadb sin privilegios exclusivos SÍ aparece al filtrar por mysql."""
+    admin_client.post(
+        "/api/v1/permission-profiles",
+        json=_profile(
+            name="maria-rw",
+            engine="mariadb",
+            items=[{"level": "table", "privileges": ["SELECT", "INSERT"]}],
+        ),
+    )
+    data = admin_client.get(
+        "/api/v1/permission-profiles", params={"engine": "mysql", "active": True}
+    ).json()["data"]
+    names = {p["name"] for p in data}
+    assert "maria-rw" in names
+    # El motor real del perfil sigue viajando en la respuesta (la UI puede etiquetarlo).
+    assert next(p for p in data if p["name"] == "maria-rw")["engine"] == "mariadb"
+
+
+def test_list_excludes_family_profile_with_exclusive_privilege(admin_client):
+    """DELETE HISTORY es exclusivo de MariaDB: ese perfil NO debe ofrecerse para MySQL."""
+    r = admin_client.post(
+        "/api/v1/permission-profiles",
+        json=_profile(
+            name="maria-hist",
+            engine="mariadb",
+            items=[{"level": "table", "privileges": ["SELECT", "DELETE HISTORY"]}],
+        ),
+    )
+    assert r.status_code == 201, r.text
+    for_mysql = admin_client.get(
+        "/api/v1/permission-profiles", params={"engine": "mysql"}
+    ).json()["data"]
+    assert "maria-hist" not in {p["name"] for p in for_mysql}
+    # Pero sí para su propio motor.
+    for_maria = admin_client.get(
+        "/api/v1/permission-profiles", params={"engine": "mariadb"}
+    ).json()["data"]
+    assert "maria-hist" in {p["name"] for p in for_maria}
+
+
+def test_exact_engine_restores_strict_filter(admin_client):
+    admin_client.post(
+        "/api/v1/permission-profiles",
+        json=_profile(
+            name="maria-strict",
+            engine="mariadb",
+            items=[{"level": "table", "privileges": ["SELECT"]}],
+        ),
+    )
+    data = admin_client.get(
+        "/api/v1/permission-profiles",
+        params={"engine": "mysql", "exact_engine": True},
+    ).json()["data"]
+    assert all(p["engine"] == "mysql" for p in data)
+    assert "maria-strict" not in {p["name"] for p in data}
+
+
+def test_postgresql_never_mixes_with_mysql_family(admin_client):
+    """PostgreSQL no tiene familia: nunca debe aparecer al pedir mysql, ni al revés."""
+    admin_client.post("/api/v1/permission-profiles", json=_profile(name="mix-my"))
+    admin_client.post(
+        "/api/v1/permission-profiles",
+        json=_profile(
+            name="mix-pg",
+            engine="postgresql",
+            items=[{"level": "table", "privileges": ["SELECT"]}],
+        ),
+    )
+    for_pg = admin_client.get(
+        "/api/v1/permission-profiles", params={"engine": "postgresql"}
+    ).json()["data"]
+    assert all(p["engine"] == "postgresql" for p in for_pg)
+    for_my = admin_client.get(
+        "/api/v1/permission-profiles", params={"engine": "mysql"}
+    ).json()["data"]
+    assert "mix-pg" not in {p["name"] for p in for_my}
+
+
+# --------------------------------------------------------------------------- #
+# is_active en la creación (antes solo se podía cambiar por PATCH).
+# --------------------------------------------------------------------------- #
+
+
+def test_create_defaults_to_active(admin_client):
+    r = admin_client.post("/api/v1/permission-profiles", json=_profile(name="act-default"))
+    assert r.status_code == 201, r.text
+    assert r.json()["data"]["is_active"] is True
+
+
+def test_create_can_start_inactive(admin_client):
+    payload = _profile(name="act-off")
+    payload["is_active"] = False
+    r = admin_client.post("/api/v1/permission-profiles", json=payload)
+    assert r.status_code == 201, r.text
+    assert r.json()["data"]["is_active"] is False
+    # Y no debe salir en el listado de activos.
+    active = admin_client.get(
+        "/api/v1/permission-profiles", params={"active": True}
+    ).json()["data"]
+    assert "act-off" not in {p["name"] for p in active}
