@@ -269,3 +269,41 @@ def classify(token: str, dialect: str, level: GrantLevel) -> str:
     if norm in _ALLOW[dialect][level]:
         return "allow"
     return "invalid"
+
+
+# ---------------------------------------------------------------------------
+# Compatibilidad entre motores de la MISMA familia (perfiles de permisos).
+# ---------------------------------------------------------------------------
+
+
+def family_members(dialect: str) -> tuple[str, ...]:
+    """
+    Motores que comparten familia con ``dialect``, incluido él mismo.
+
+    MySQL y MariaDB son la misma familia; PostgreSQL está solo. Sirve para
+    PRE-FILTRAR en SQL: la pertenencia a la familia NO implica que un perfil sea
+    aplicable en el otro motor — eso lo decide ``tokens_valid_for`` token a token.
+    """
+    if dialect in _MYSQL_FAMILY:
+        return _MYSQL_FAMILY
+    return (dialect,)
+
+
+def same_family(a: str, b: str) -> bool:
+    """True si ambos dialectos pertenecen a la misma familia."""
+    return _family(a) == _family(b)
+
+
+def tokens_valid_for(dialect: str, level: GrantLevel, tokens: list[str]) -> bool:
+    """
+    ¿TODOS los ``tokens`` son otorgables en ``(dialect, level)``? Versión booleana
+    de ``validate_privileges`` (mismo criterio, sin lanzar).
+
+    Fail-closed: motor/nivel no soportado, lista vacía o un solo token 'deny'/
+    'invalid' devuelven False. La asimetría real de la familia MySQL es un único
+    token (``DELETE HISTORY``, exclusivo de MariaDB), pero el chequeo es por token
+    para no hardcodear ese caso.
+    """
+    if not tokens or not is_level_supported(dialect, level):
+        return False
+    return all(classify(token, dialect, level) in ("allow", "gate") for token in tokens)

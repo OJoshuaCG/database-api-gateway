@@ -42,6 +42,7 @@ from app.services.db_admin.identifiers import (
     validate_identifier,
     validate_privileges,
 )
+from app.services.db_admin.sql_dialect import mask_quoted_spans
 
 _SYSTEM_DATABASES = ("information_schema", "mysql", "performance_schema", "sys")
 _SYSTEM_USERS = (
@@ -756,13 +757,14 @@ class MySQLAdapter(ServerAdapter):
         out: dict[str, dict] = {}
         rows = conn.execute(
             text(
-                "SELECT COLUMN_NAME, COLLATION_NAME, CHARACTER_SET_NAME, EXTRA, COLUMN_TYPE "
+                "SELECT COLUMN_NAME, COLLATION_NAME, CHARACTER_SET_NAME, EXTRA, COLUMN_TYPE, "
+                "GENERATION_EXPRESSION, COLUMN_COMMENT "
                 "FROM information_schema.COLUMNS "
                 "WHERE TABLE_SCHEMA = :db AND TABLE_NAME = :t"
             ),
             {"db": database, "t": table},
         ).fetchall()
-        for name, coll, cs, extra, column_type in rows:
+        for name, coll, cs, extra, column_type, gen_expr, col_comment in rows:
             on_update = None
             if extra and "on update" in str(extra).lower():
                 on_update = "CURRENT_TIMESTAMP"
@@ -771,6 +773,17 @@ class MySQLAdapter(ServerAdapter):
                 "charset": cs,
                 "on_update": on_update,
                 "column_type": str(column_type) if column_type else None,
+                # Expresión CANÓNICA de la columna generada, tomada de
+                # ``GENERATION_EXPRESSION`` (sin los paréntesis externos de ``AS (...)``,
+                # que el render agrega). Es la fuente correcta frente a la reflexión de
+                # ``SHOW CREATE TABLE`` de SQLAlchemy, cuyo parser cuenta paréntesis sin
+                # entender los literales de string: un ``COMMENT '...( )...'`` en una
+                # columna generada le hace capturar de más (se traga ``VIRTUAL``/``STORED``
+                # y el propio COMMENT) → DDL inválido. En columnas no generadas es ``''``.
+                "generation_expression": (str(gen_expr) if gen_expr else None),
+                # ``COLUMN_COMMENT`` es autoritativo: recupera el comentario que la misma
+                # captura contaminada de SQLAlchemy perdía en las columnas generadas.
+                "comment": (str(col_comment) if col_comment else None),
             }
         return out
 
@@ -959,6 +972,54 @@ class MySQLAdapter(ServerAdapter):
     # validate_identifier + quote_identifier (self._q). Cuerpos de vistas/rutinas/
     # triggers/events se re-emiten tal cual (DEFINER ya saneado) — requieren revisión
     # individual del operador (requires_individual_review).
+    # Tokens que una expresión de generación LIMPIA nunca debería contener: si aparecen
+    # es señal de que la captura se contaminó (típicamente la reflexión de ``SHOW CREATE``
+    # de SQLAlchemy tragándose ``VIRTUAL``/``STORED``/el ``COMMENT`` por paréntesis en el
+    # comentario). Se comparan en mayúsculas contra la expresión completa.
+    _CONTAMINATED_GENEXPR_TOKENS = (
+        " VIRTUAL",
+        " STORED",
+        " COMMENT ",
+        "GENERATED ALWAYS",
+    )
+
+    def _guard_generation_expression(self, col) -> None:
+        """
+        Falla ANTES de tocar el motor si la expresión de una columna generada está
+        malformada. Sin esto, un ``sqltext`` corrupto se emitía dentro de
+        ``GENERATED ALWAYS AS (...)`` y el ``CREATE TABLE`` reventaba en el motor
+        (1064) a mitad de un lote — coherente con la política fail-closed del módulo.
+        """
+        sqltext = col.computed.sqltext or ""
+        # Ambas verificaciones corren sobre el texto ENMASCARADO: un paréntesis o la
+        # palabra ``VIRTUAL`` DENTRO de un literal ('(' , ' VIRTUAL') son contenido
+        # legítimo, y analizarlos como sintaxis daría un falso positivo que bloquearía
+        # una columna válida. Es la misma trampa que causó el bug que este guard cubre.
+        probe = mask_quoted_spans(sqltext)
+        # 1) Paréntesis balanceados (un desbalance rompe el ``AS (...)``).
+        depth = 0
+        for ch in probe:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth < 0:
+                    break
+        balanced = depth == 0
+        # 2) La expresión no debe arrastrar la persistencia ni el COMMENT.
+        upper = probe.upper()
+        contaminated = any(tok in upper for tok in self._CONTAMINATED_GENEXPR_TOKENS)
+        if not balanced or contaminated:
+            raise AppHttpException(
+                message=(
+                    f"La expresión de la columna generada {col.name!r} quedó malformada "
+                    "al capturarla (paréntesis desbalanceados o contaminada con la "
+                    "persistencia/COMMENT). No se puede reconstruir el DDL de forma segura."
+                ),
+                status_code=422,
+                context={"column": col.name, "sqltext": sqltext},
+            )
+
     def _render_column_def(self, col) -> str:
         parts = [self._q(col.name, "columna"), col.type]
         if col.charset:
@@ -970,6 +1031,7 @@ class MySQLAdapter(ServerAdapter):
                 f"COLLATE {validate_identifier(col.collation, self.dialect, 'collation', allow_existing=True)}"
             )
         if col.computed is not None:
+            self._guard_generation_expression(col)
             stored = "STORED" if col.computed.persisted else "VIRTUAL"
             parts.append(f"GENERATED ALWAYS AS ({col.computed.sqltext}) {stored}")
             if not col.nullable:

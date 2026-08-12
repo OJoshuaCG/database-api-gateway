@@ -1323,6 +1323,58 @@ se elija**, para verificar permisos reales. Guía de uso: `docs/features/sql-que
   con RLS en PG, (c) que el `LIMIT` empujado evite bajar la tabla entera, (d) los mensajes
   nativos de rechazo por permisos en los 3 motores.
 
+## Perfiles de permisos: familia MySQL↔MariaDB y fallo silencioso de `apply-profile`
+
+Guía de uso: `docs/features/permissions.md` (§ apply-profile) y `docs/api-reference-v2.md`
+(§4 y §6).
+
+**El filtro `?engine=` de `GET /permission-profiles` era IGUALDAD EXACTA (fix, 2026-08-04)**:
+un perfil creado para `mariadb` no aparecía al pedir `?engine=mysql&active=true`, así que el
+selector «Aplicar perfil» del frontend quedaba **vacío sin explicación** pese a ser un perfil
+perfectamente aplicable. Y aunque apareciera, `apply_profile` lo rechazaba con **422** por lo
+mismo. La noción de familia YA existía en el catálogo de privilegios
+(`privileges.py::_MYSQL_FAMILY`/`_family`) pero **no** en perfiles. FIX: helpers públicos
+`privileges.family_members`/`same_family`/`tokens_valid_for` (versión booleana de
+`validate_privileges`, mismo criterio vía `classify`, fail-closed) + `list_profiles` filtra
+por `engine.in_(familia)` y revalida **token a token** contra el motor pedido. **NO es
+"aflojar el filtro"**: la pertenencia a la familia solo habilita el chequeo; lo que decide es
+que cada privilegio sea otorgable allí. La asimetría real es UNA (`DELETE HISTORY`, exclusivo
+de MariaDB — `_MARIADB_TABLE_EXTRA`), pero el chequeo es por token para no hardcodearla y
+para que agregar un extra al catálogo no reabra el agujero. `?exact_engine=true` recupera la
+igualdad estricta; PostgreSQL nunca se mezcla (`family_members('postgresql')` es un
+singleton). `apply_profile` acepta el cruce con la misma regla y **recanonicaliza los tokens
+contra el motor del SERVIDOR**, no el del perfil (si no, un token válido solo en el origen
+llegaría crudo al `GRANT`).
+
+**`apply-profile` mentía cuando no aplicaba nada (mismo fix)**: devolvía **200** con
+`grants_applied: 0` si ningún nivel del perfil tenía `object_mapping` o si todos los GRANT
+fallaban — el usuario veía éxito y ningún permiso nuevo. Ahora eso es **422** enumerando
+`skipped_levels`/`errors` en el **`message`** (no solo en `context`, que únicamente se ve en
+`development`). El caso **parcial** sigue siendo 200 con `errors[]` poblado, a propósito: el
+endpoint es best-effort por diseño. La auditoría (`server_user.apply_profile`) se registra
+**antes** de lanzar el 422 — el intento ocurrió y debe dejar rastro. Además: un perfil con
+`is_active=false` ahora da **409** (antes se aplicaba igual, contradiciendo el `?active=true`
+con el que la UI los ofrece), y `errors[]` ya **no transcribe `str(exc)` del motor** (podía
+filtrar hosts/nombres internos/fragmentos de sentencia): el detalle va a `logger.exception`
+con el Request ID. Criterio R4 de gateway-security, ya aplicado en usuarios del motor.
+
+`PermissionProfileCreate` ahora acepta **`is_active` opcional (default `true`)**: el
+controller ya hacía `data.get("is_active", True)`, pero el schema no lo admitía y el switch
+«Activo» del formulario nunca se enviaba. Hipótesis descartadas por código durante el
+diagnóstico, útiles para no re-investigarlas: `is_active` **nunca** nace `false`/`NULL`
+(`default=True` + `server_default="1"` NOT NULL); el query param **se llama `active`**, no
+`is_active`; el listado **no es paginado** (`success(data=[...])`); `created_at`/`updated_at`
+no pueden salir `null` (`TimestampMixin`, NOT NULL desde el INSERT). Gotcha para el frontend:
+el nivel **`global` no existe** en `_ALLOW` para ningún motor → un item `level:"global"` da
+422 al crear el perfil.
+
+Verificado con script puntual por HTTP (TestClient + SQLite, adapter mockeado): **21 checks /
+0 fallos**, incluida la reproducción del escenario original (perfil `mariadb` + servidor
+`mysql`) y la matriz de familia. Tests agregados en `tests/test_api_permission_profiles.py` y
+`tests/test_grant_guards.py` — **no ejecutados con `pytest`** (regla del proyecto).
+**Pendiente**: correr esos tests y verificar el cruce de familia contra MySQL y MariaDB
+reales (sin Docker en el entorno donde se implementó).
+
 ## Documentación
 
 - `docs/` — documentación completa por feature (ver `docs/features/model-migrations.md`

@@ -13,7 +13,7 @@ El módulo de permisos granulares permite otorgar, revocar y consultar privilegi
 | `GET`    | `/api/v1/server-users/{user_id}/grants`                     | Sesión admin   | Lista los permisos actuales del usuario en el motor.                     |
 | `POST`   | `/api/v1/server-users/{user_id}/grants`                     | Sesión admin   | Otorga privilegios sobre un objeto (GRANT).                              |
 | `DELETE` | `/api/v1/server-users/{user_id}/grants`                     | Sesión admin   | Revoca privilegios sobre un objeto (REVOKE). Body opcional `cascade`; query `confirm_grantee` si `cascade=true`. |
-| `POST`   | `/api/v1/server-users/{user_id}/apply-profile/{profile_id}` | Sesión admin   | Aplica un perfil de permisos preconfigurado al usuario (best-effort).    |
+| `POST`   | `/api/v1/server-users/{user_id}/apply-profile/{profile_id}` | Sesión admin   | Aplica un perfil de permisos preconfigurado al usuario (best-effort). `409` si el perfil está desactivado; `422` si el motor no es aplicable o si no se aplicó ningún grant. |
 | `POST`   | `/api/v1/server-users/{user_id}/apply-profile/{profile_id}/bulk` | Sesión admin | Aplica el mismo perfil sobre N bases de datos en una llamada (best-effort, `5/minute`). |
 | `POST`   | `/api/v1/server-users/provision`                            | Sesión admin   | Crea usuario en el inventario + provisiona en el motor + grants iniciales.|
 | `POST`   | `/api/v1/servers/{server_id}/grantable`                     | Sesión admin   | Verifica si el admin de conexión puede otorgar los privilegios dados.    |
@@ -315,10 +315,28 @@ Los perfiles de permisos (documentados en detalle en `server-management.md`) def
 
 ### Semántica
 
-- El engine del perfil debe coincidir con el engine del servidor del usuario. Si difieren → **422** inmediato.
+- El engine del perfil debe ser **aplicable** al engine del servidor del usuario. Coinciden → OK.
+  Difieren pero son de la **misma familia** (MySQL↔MariaDB) → se acepta **si todos los
+  privilegios del perfil son otorgables en el motor real** (se revalidan token a token contra
+  el catálogo). En cualquier otro caso → **422**, con los privilegios ofensores en el mensaje.
+  Cruce entre familias (PostgreSQL ↔ MySQL/MariaDB) → **422** siempre.
+- El perfil debe estar **activo**. Aplicar uno con `is_active=false` → **409** (antes se
+  aplicaba igual, contradiciendo el filtro `?active=true` que usa la UI para ofrecerlos).
 - Cada ítem del perfil se intenta de forma independiente (**best-effort**): errores individuales se capturan en `errors[]` sin abortar la operación.
-- Los niveles definidos en el perfil para los que no se provee `object_mappings` se reportan en `skipped_levels[]` y se omiten silenciosamente.
+- Los niveles definidos en el perfil para los que no se provee `object_mappings` se reportan en `skipped_levels[]` y se omiten.
 - Cada ítem pasa por el pre-chequeo `can_grant` antes de ejecutar el `GRANT`. Si el admin no puede delegar el privilegio, el item va a `errors[]`, no lanza 403 global.
+- **Si no se aplicó NINGÚN grant** (`grants_applied == 0`, sea porque ningún nivel tenía
+  mapeo o porque todos fallaron) → **422** enumerando `skipped_levels` y `errors` en el
+  mensaje. Antes esto devolvía `200` y el fallo pasaba inadvertido: el usuario veía un éxito
+  y ningún permiso nuevo. El caso **parcial** (alguno aplicado, alguno no) sigue siendo `200`
+  con `errors[]` poblado.
+- Los errores del motor **no se transcriben crudos** a la respuesta: el detalle va al log del
+  gateway junto al Request ID, y `errors[]` lleva un mensaje acotado (evita filtrar nombres
+  internos, hosts o fragmentos de la sentencia).
+
+**Códigos de estado**: `200` (aplicado, total o parcial) · `404` (usuario o perfil
+inexistente) · `409` (perfil desactivado) · `422` (motor no aplicable, o ningún grant
+aplicado).
 
 ### Ejemplo
 

@@ -21,7 +21,6 @@ from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.models.permission_profile import PermissionProfile, PermissionProfileItem
-from app.models.server import Server
 from app.models.server_user import ServerUser
 from app.schemas.grant import (
     ApplyProfileBulkItemOut,
@@ -29,15 +28,14 @@ from app.schemas.grant import (
     ApplyProfileBulkResult,
     ApplyProfileRequest,
     ApplyProfileResult,
-    GrantRequest,
     GrantableRequest,
+    GrantRequest,
     RevokeRequest,
 )
 from app.services import audit
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.dtos import EngineUserInfo, GrantInfo, GrantLevel, ObjectRef
 from app.services.db_admin.factory import get_adapter
-
 
 logger = get_logger(__name__)
 
@@ -341,16 +339,19 @@ class GrantController:
                     status_code=404,
                     context={"profile_id": profile_id},
                 )
-            server = get_server_or_404(session, server_id)
-            engine = engine_value(server)
-            if profile.engine != engine:
+            if not profile.is_active:
                 raise AppHttpException(
                     message=(
-                        f"El perfil es para motor '{profile.engine}' pero el servidor usa '{engine}'."
+                        f"El perfil '{profile.name}' está desactivado y no puede aplicarse. "
+                        "Reactivalo antes de asignarlo."
                     ),
-                    status_code=422,
-                    context={"profile_engine": profile.engine, "server_engine": engine},
+                    status_code=409,
+                    context={"profile_id": profile_id},
                 )
+            server = get_server_or_404(session, server_id)
+            engine = engine_value(server)
+            # Los items se necesitan ANTES de decidir la compatibilidad de motor: el cruce
+            # dentro de la familia se valida por PRIVILEGIO, no por nombre de motor.
             items = [
                 (row.level, row.privileges)
                 for row in session.query(PermissionProfileItem)
@@ -358,8 +359,38 @@ class GrantController:
                 .all()
             ]
             profile_name = profile.name
+            profile_engine = profile.engine
         finally:
             session.close()
+
+        if profile_engine != engine:
+            incompatibles = [
+                f"{lvl}: {privs}"
+                for lvl, privs in items
+                if not priv_catalog.tokens_valid_for(
+                    engine,
+                    GrantLevel(lvl),
+                    [p.strip() for p in privs.split(",") if p.strip()],
+                )
+            ]
+            if not priv_catalog.same_family(profile_engine, engine) or incompatibles:
+                detail = (
+                    f" Privilegios no válidos en '{engine}': {'; '.join(incompatibles)}."
+                    if incompatibles
+                    else ""
+                )
+                raise AppHttpException(
+                    message=(
+                        f"El perfil es para motor '{profile_engine}' y no es aplicable a un "
+                        f"servidor '{engine}'.{detail}"
+                    ),
+                    status_code=422,
+                    context={
+                        "profile_engine": profile_engine,
+                        "server_engine": engine,
+                        "incompatible_items": incompatibles,
+                    },
+                )
 
         return {
             "server_id": server_id,
@@ -377,6 +408,7 @@ class GrantController:
         mapping_index: dict[GrantLevel, ObjectRef],
         adapter,
         grantee: EngineUserInfo,
+        engine: str,
     ) -> tuple[int, list[str], list[str]]:
         """
         Ejecuta los items de un perfil contra UN conjunto de objetos destino (un
@@ -395,12 +427,17 @@ class GrantController:
 
         for level_raw, privileges_raw in items:
             level = GrantLevel(level_raw)
-            privileges = [p.strip() for p in privileges_raw.split(",") if p.strip()]
+            raw_privileges = [p.strip() for p in privileges_raw.split(",") if p.strip()]
             ref = mapping_index.get(level)
             if ref is None:
                 skipped_levels.append(level.value)
                 continue
             try:
+                # Canonicalizar contra el motor del SERVIDOR (no el del perfil): con el
+                # cruce de familia habilitado, el perfil puede venir del otro motor.
+                privileges, _ = priv_catalog.validate_privileges(
+                    raw_privileges, engine, level
+                )
                 if not adapter.can_grant(level, ref, privileges):
                     errors.append(
                         f"{level.value}: credencial sin permisos suficientes para {privileges}"
@@ -443,7 +480,7 @@ class GrantController:
         }
 
         grants_applied, skipped_levels, errors = self._apply_profile_items(
-            ctx["items"], mapping_index, ctx["adapter"], ctx["grantee"]
+            ctx["items"], mapping_index, ctx["adapter"], ctx["grantee"], ctx["engine"]
         )
 
         audit.record(
@@ -460,6 +497,30 @@ class GrantController:
                 f"{grants_applied} grants aplicados, {len(skipped_levels)} omitidos"
             ),
         )
+        # No aplicar NADA es un fallo, no un éxito silencioso: antes esto devolvía 200 y
+        # los motivos quedaban enterrados en skipped_levels/errors. La auditoría ya quedó
+        # registrada arriba (el intento ocurrió), así que recién ahora se corta.
+        if grants_applied == 0:
+            reasons: list[str] = []
+            if skipped_levels:
+                reasons.append(
+                    "niveles del perfil sin objeto asignado: " + ", ".join(skipped_levels)
+                )
+            if errors:
+                reasons.append("errores: " + "; ".join(errors))
+            raise AppHttpException(
+                message=(
+                    f"No se aplicó ningún permiso del perfil '{ctx['profile_name']}'. "
+                    + (" | ".join(reasons) if reasons else "El perfil no tiene items.")
+                ),
+                status_code=422,
+                context={
+                    "profile_id": profile_id,
+                    "skipped_levels": skipped_levels,
+                    "errors": errors,
+                },
+            )
+
         return ApplyProfileResult(
             profile_id=profile_id,
             profile_name=ctx["profile_name"],
@@ -507,13 +568,13 @@ class GrantController:
             }
             try:
                 applied, skipped, errors = self._apply_profile_items(
-                    ctx["items"], mapping_index, adapter, grantee
+                    ctx["items"], mapping_index, adapter, grantee, ctx["engine"]
                 )
             except AppHttpException as exc:
                 # Fallo que escapa al best-effort por item (p.ej. el motor caído deja de
                 # responder a mitad del lote). Se reporta en ESTA BD y se sigue.
                 applied, skipped, errors = 0, [], [exc.message]
-            except Exception as exc:  # noqa: BLE001 — una BD no debe abortar el lote
+            except Exception as exc:
                 logger.warning(
                     "apply_profile_bulk: error inesperado en BD %s (user_id=%s, "
                     "profile_id=%s): %s",

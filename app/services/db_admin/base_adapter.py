@@ -469,7 +469,14 @@ class ServerAdapter(ABC):
             comp_raw = c.get("computed")
             if comp_raw:
                 computed = ComputedInfo(
-                    sqltext=str(comp_raw.get("sqltext") or ""),
+                    # Preferir la expresión canónica de ``information_schema`` (hook por
+                    # adapter, p.ej. MySQL ``GENERATION_EXPRESSION``) sobre la reflexión de
+                    # ``SHOW CREATE TABLE``, que se corrompe cuando el COMMENT de una columna
+                    # generada contiene paréntesis. Motores sin el hook (p.ej. PG, que
+                    # refleja con ``pg_get_expr`` y no sufre el bug) caen al ``sqltext`` de
+                    # la reflexión → comportamiento intacto.
+                    sqltext=ex.get("generation_expression")
+                    or str(comp_raw.get("sqltext") or ""),
                     persisted=bool(comp_raw.get("persisted")),
                 )
             identity = None
@@ -491,7 +498,13 @@ class ServerAdapter(ABC):
                     default=None if c.get("default") is None else str(c.get("default")),
                     primary_key=c["name"] in pk_set,
                     autoincrement=c.get("autoincrement") in (True, "auto"),
-                    comment=c.get("comment"),
+                    # ``comment`` del hook (MySQL ``COLUMN_COMMENT``) SOLO para columnas
+                    # GENERADAS: es el único caso donde la reflexión de ``SHOW CREATE`` se
+                    # traga el comentario junto con la expresión. Las columnas normales
+                    # conservan el valor reflejado → cero cambio de comportamiento (y cero
+                    # ruido en el diff) en las tablas que hoy funcionan bien.
+                    comment=(ex.get("comment") if computed is not None else None)
+                    or c.get("comment"),
                     collation=ex.get("collation"),
                     charset=ex.get("charset"),
                     computed=computed,
