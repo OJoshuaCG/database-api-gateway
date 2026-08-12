@@ -16,7 +16,7 @@ el controller; endurecimiento futuro con FK compuesta — ver docs/plans/00).
 
 from sqlalchemy.exc import IntegrityError
 
-from app.controllers.common import build_target, get_server_or_404
+from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.exceptions import AppHttpException
@@ -26,7 +26,7 @@ from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.models.server import Server
 from app.models.server_user import ServerUser
-from app.services import audit
+from app.services import audit, charset_catalog
 from app.services.db_admin.factory import get_adapter
 
 
@@ -167,14 +167,26 @@ class ManagedDatabaseController:
             owner_username = owner.username
             target = build_target(server) if provision else None
 
+            # Catálogo GLOBAL de charsets/collations. Se valida acá además de en
+            # ``ServerDatabaseController`` porque este método es entrypoint público por sí
+            # mismo (``POST /managed-databases``). Es idempotente: revalidar valores ya
+            # canónicos devuelve exactamente los mismos. Se aplica también con
+            # ``provision=False`` (la fila declara con qué charset se creará la BD; no tiene
+            # sentido persistir una elección que el gateway rechazaría al aprovisionar).
+            # NO aplica a ``adopt_database``: ahí el charset se LEE del motor (se registra la
+            # realidad existente, no se elige nada).
+            req_charset, req_collation = charset_catalog.resolve_enabled_combination(
+                engine_value(server), data.get("charset"), data.get("collation")
+            )
+
             md = ManagedDatabase(
                 name=data["name"],
                 server_id=server.id,
                 owner_id=owner.id,
                 model_id=data.get("model_id"),
                 model_version=data.get("model_version"),
-                charset=data.get("charset"),
-                collation=data.get("collation"),
+                charset=req_charset,
+                collation=req_collation,
                 status=ProvisionStatus.pending,
                 notes=data.get("notes"),
             )

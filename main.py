@@ -12,14 +12,19 @@ from app.core.versioned_app import (
 )
 from app.routes.health import router as health_router
 from app.routes.v1.routes import router as v1_router
+from app.services.charset_catalog import seed_charset_options
 from app.services.privilege_catalog import seed_privileges
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Arranque: sembrar el administrador único y el catálogo de privilegios.
+    # Arranque: sembrar el administrador único y los catálogos (privilegios y
+    # charsets/collations). Ambos seeds son idempotentes y PRESERVAN los toggles del
+    # operador; hacen falta acá además de en la migración porque un esquema creado con
+    # ``Base.metadata.create_all`` (tests, dev rápido) no pasa por Alembic.
     bootstrap_admin()
     seed_privileges()
+    seed_charset_options()
     # Asegurar una DEK persistida (envelope encryption) en sistema fresco; idempotente.
     from app.core import crypto as _crypto
 

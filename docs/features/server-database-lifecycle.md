@@ -50,6 +50,27 @@ BDs de sistema (ver abajo).
 > existir en el SO** del servidor PostgreSQL, o el `CREATE DATABASE` falla con
 > `invalid locale name`. Siempre se emite `TEMPLATE template0`.
 
+### Catálogo de charsets/collations (qué se puede elegir)
+
+`charset`/`collation` **no son texto libre**: se validan contra el catálogo **global**
+`charset_collation_options` (`GET/POST/PATCH /api/v1/charset-collation-options`) **antes de
+tocar el motor**. Una combinación que no esté `enabled` responde **422** y el `CREATE DATABASE`
+nunca se emite; el `public_context` del error lista las combinaciones habilitadas (viaja también
+en producción, para que el operador sepa qué sí puede elegir).
+
+| Concepto | Detalle |
+|---|---|
+| Alcance | **Global**, no por servidor. `engine_family` agrupa **MySQL + MariaDB** como `mysql`; PostgreSQL aparte |
+| Semántica | ambos ausentes → **no se valida** (el adapter usa su default). Solo `charset` → basta que alguna combinación habilitada lo use. Solo `collation` → debe estar habilitada. Ambos → el **par exacto** |
+| Qué llega al DDL | los valores **canónicos del catálogo**, no el texto del request (el match de charset es case-insensitive; en PostgreSQL el locale se compara tal cual porque es del SO) |
+| Caminos cubiertos | `POST /servers/{id}/databases` (con y sin `register`) y `POST /managed-databases`. **No** aplica a `adopt` ni al clonado: ahí el charset se **lee** del motor (se replica la realidad, no se elige) |
+| Administración | `PATCH {"enabled": …, "is_default": …}`; a lo sumo un `is_default` por familia y un default debe estar habilitado. No hay `DELETE`: se deshabilita |
+| Seed | MySQL: `utf8mb4_unicode_ci` (default) y `utf8mb4_general_ci` habilitadas; `utf8mb4_0900_ai_ci` (solo MySQL 8), `utf8mb3`, `latin1` **deshabilitadas** de referencia. PostgreSQL: `UTF8`/`en_US.UTF-8` (default) habilitada; `C` y `C.UTF-8` deshabilitadas |
+
+> **PostgreSQL:** el catálogo es un **menú curado**, no una garantía: el locale depende del SO
+> de **cada** servidor. Si no existe ahí, el motor responde `invalid locale name` y ese error
+> nativo se propaga traducido — el catálogo no lo reemplaza.
+
 ## 2. Borrar una base de datos (confirmación de doble factor de backend)
 
 El frontend puede sumar su propia triple confirmación visual (botón → SweetAlert → modal),
@@ -176,6 +197,10 @@ Se aplica tanto al crear como al borrar (preview y delete).
 - Todo identificador pasa por `validate_identifier` + `quote_identifier`; los valores
   (encoding/locale) por `quote_string_literal`; `datname`/`DB` en las lecturas van como
   **bind param** (nunca interpolados).
+- El **catálogo de charsets/collations** es una allowlist: acota lo que puede llegar al DDL a
+  valores que salieron de la tabla. Importa sobre todo en PostgreSQL, donde el locale viaja
+  como **literal de string** (no es whitelisteable como identificador). Dar de alta una
+  combinación custom también pasa por una whitelist sintáctica por familia.
 - **Auditoría fail-closed** (`server_database.create` / `server_database.drop`) antes de la
   operación; el `create-only` audita `record_intent` + `record`; el `register` delega su
   auditoría a `/managed-databases`.
@@ -186,6 +211,12 @@ Verificación puntual con `FakeAdapter` (sin motor real): emisión/validación d
 `confirm_token` (incluye TTL, manipulación y cruce de BD/servidor), guards de sistema,
 `confirm_target_name` mismatch, create-only vs register, drop con limpieza de inventario y
 `force_disconnect`, y grantees cruzados con inventario.
+
+Catálogo de charsets/collations: `tests/test_api_charset_collation_options.py` (lógica pura,
+CRUD del catálogo y enforcement en los dos caminos de creación, con adapter mockeado) y ciclo
+`upgrade`/`downgrade`/`upgrade` de la migración `c4d5e6f7a8b9` contra **SQLite**. Sigue
+pendiente la corrida contra motores reales: que un `utf8mb4_0900_ai_ci` habilitado falle en
+MariaDB y que los locales sembrados existan en el SO del PostgreSQL destino.
 
 > ⚠️ **Pendiente antes de producción (gate):** verificación **e2e contra motores reales**
 > (MySQL/MariaDB/PostgreSQL; requiere Docker) del ciclo crear → listar usuarios →

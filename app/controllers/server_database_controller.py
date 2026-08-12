@@ -27,7 +27,7 @@ from app.schemas.server_database import (
     DatabaseGranteesOut,
     DropPreviewOut,
 )
-from app.services import audit, confirm_token
+from app.services import audit, charset_catalog, confirm_token
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import (
     ensure_not_reserved_database,
@@ -71,6 +71,16 @@ class ServerDatabaseController:
         # El nombre lo CREA el gateway → whitelist estricta + guard de sistema.
         validate_identifier(name, dialect, "base de datos")
         ensure_not_reserved_database(name, dialect)
+
+        # Catálogo GLOBAL de charsets/collations: la combinación debe estar HABILITADA antes
+        # de tocar el motor (422 si no). Se reemplazan los valores por la forma CANÓNICA del
+        # catálogo: lo que viaja al DDL sale siempre de la tabla, nunca del texto crudo del
+        # request (importa sobre todo en PostgreSQL, donde el locale va como literal de
+        # string y no como identificador whitelisteado). Si el caller no eligió NADA, no se
+        # valida: el adapter aplica su default, que corresponde a la fila is_default del seed.
+        charset, collation = charset_catalog.resolve_enabled_combination(
+            dialect, charset, collation
+        )
 
         if register:
             if owner_id is None:

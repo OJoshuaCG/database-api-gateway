@@ -17,6 +17,7 @@ Ejemplo:
 
 from app.models.audit_log import AuditLog
 from app.models.base import Base, TimestampMixin
+from app.models.charset_collation_option import CharsetCollationOption
 from app.models.clone_job import CloneJob, CloneJobItem
 from app.models.crypto_key import CryptoKey
 from app.models.database_migration_history import DatabaseMigrationHistory
@@ -55,6 +56,7 @@ __all__ = [
     "AuditLog",
     "CryptoKey",
     "Privilege",
+    "CharsetCollationOption",
     "PermissionProfile",
     "PermissionProfileItem",
     "SchemaComparison",

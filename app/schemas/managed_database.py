@@ -9,6 +9,12 @@ from app.models.enums import ProvisionStatus
 # Whitelist alineada con identifiers.py (validación fail-fast en la API).
 _DBNAME = r"^[A-Za-z_][A-Za-z0-9_]{0,62}$"
 _CHARSET = r"^[A-Za-z0-9_]{1,64}$"
+# En PostgreSQL la "collation" de una BD es el LOCALE del SO ('en_US.UTF-8', 'de_DE@euro'):
+# lleva puntos, guiones y '@', que ``_CHARSET`` rechaza. Este patrón es solo un filtro
+# fail-fast de forma; la autoridad de QUÉ combinación se admite es el catálogo
+# ``charset_collation_options`` (ver app/services/charset_catalog.py), que valida la
+# creación contra la allowlist habilitada antes de tocar el motor.
+_COLLATION = r"^[A-Za-z][A-Za-z0-9_.@\-]{0,127}$"
 
 
 class ManagedDatabaseCreate(BaseModel):
@@ -17,8 +23,12 @@ class ManagedDatabaseCreate(BaseModel):
     owner_id: int = Field(..., ge=1, description="ServerUser propietario, del mismo servidor")
     model_id: int | None = Field(None, ge=1)
     model_version: str | None = Field(None, max_length=50)
-    charset: str | None = Field(None, pattern=_CHARSET, description="MySQL/MariaDB")
-    collation: str | None = Field(None, pattern=_CHARSET, description="MySQL/MariaDB")
+    charset: str | None = Field(
+        None, pattern=_CHARSET, description="MySQL/MariaDB: CHARACTER SET. PostgreSQL: ENCODING."
+    )
+    collation: str | None = Field(
+        None, pattern=_COLLATION, description="MySQL/MariaDB: COLLATE. PostgreSQL: LOCALE."
+    )
     notes: str | None = None
 
 
