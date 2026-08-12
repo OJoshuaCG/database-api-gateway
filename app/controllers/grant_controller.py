@@ -18,11 +18,15 @@ se audita fail-closed antes de ejecutar.
 from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.models.permission_profile import PermissionProfile, PermissionProfileItem
 from app.models.server import Server
 from app.models.server_user import ServerUser
 from app.schemas.grant import (
+    ApplyProfileBulkItemOut,
+    ApplyProfileBulkRequest,
+    ApplyProfileBulkResult,
     ApplyProfileRequest,
     ApplyProfileResult,
     GrantRequest,
@@ -35,9 +39,23 @@ from app.services.db_admin.dtos import EngineUserInfo, GrantInfo, GrantLevel, Ob
 from app.services.db_admin.factory import get_adapter
 
 
+logger = get_logger(__name__)
+
+
 def _grantee_label(grantee: EngineUserInfo) -> str:
     """Etiqueta legible del beneficiario para auditoría: ``user@host`` o ``user``."""
     return f"{grantee.username}@{grantee.host}" if grantee.host else grantee.username
+
+
+def _summarize_names(names: list[str], *, cap: int = 20) -> str:
+    """
+    Lista acotada de nombres para el ``detail`` de auditoría. Con lotes realistas queda
+    completa; con uno patológico (100 BDs) se corta para que ``detail`` siga siendo un
+    resumen legible. Nunca contiene credenciales (son nombres de BD validados).
+    """
+    if len(names) <= cap:
+        return ",".join(names)
+    return ",".join(names[:cap]) + f" (+{len(names) - cap} más)"
 
 
 def _object_name(ref: ObjectRef) -> str | None:
@@ -296,19 +314,19 @@ class GrantController:
     # ------------------------------------------------------------------ #
     # Apply permission profile                                             #
     # ------------------------------------------------------------------ #
-    def apply_profile(
-        self,
-        user_id: int,
-        profile_id: int,
-        payload: ApplyProfileRequest,
-        *,
-        admin: dict | None = None,
-    ) -> ApplyProfileResult:
+    def _load_apply_profile_context(self, user_id: int, profile_id: int) -> dict:
         """
-        Aplica un perfil de permisos a un usuario. Para cada item del perfil, busca
-        el ``object_mapping`` correspondiente en el payload y ejecuta ``grant_object``.
-        Los niveles del perfil sin mapeo se omiten (se reportan en ``skipped_levels``).
-        Los errores de grant individuales se capturan para dar visibilidad sin abortar.
+        Carga en UNA sola sesión todo lo que necesita un apply de perfil: contexto del
+        usuario (ServerUser → Server → adapter), el perfil, la compatibilidad de motor y
+        los items del perfil. Compartido por ``apply_profile`` y ``apply_profile_bulk``
+        para que las validaciones (404 usuario / 404 perfil / 422 motor incompatible)
+        sean idénticas en ambos caminos.
+
+        Los items se MATERIALIZAN a tuplas ``(level_raw, privileges_raw)`` antes de
+        cerrar la sesión: en el camino bulk se recorren N veces (una por BD) DESPUÉS del
+        cierre, y un ORM detached que necesitara refrescar un atributo reventaría a
+        mitad del lote con ``DetachedInstanceError``. Además la sesión de la BD del
+        gateway no debe quedar tomada mientras se abren N conexiones remotas.
         """
         session = self._session()
         try:
@@ -333,27 +351,51 @@ class GrantController:
                     status_code=422,
                     context={"profile_engine": profile.engine, "server_engine": engine},
                 )
-            items = (
-                session.query(PermissionProfileItem)
+            items = [
+                (row.level, row.privileges)
+                for row in session.query(PermissionProfileItem)
                 .filter(PermissionProfileItem.profile_id == profile_id)
                 .all()
-            )
+            ]
             profile_name = profile.name
         finally:
             session.close()
 
-        # Índice de mappings por nivel
-        mapping_index: dict[GrantLevel, ObjectRef] = {
-            m.level: m.object_ref for m in payload.object_mappings
+        return {
+            "server_id": server_id,
+            "adapter": adapter,
+            "grantee": grantee,
+            "grantor": grantor,
+            "engine": engine,
+            "profile_name": profile_name,
+            "items": items,
         }
 
+    @staticmethod
+    def _apply_profile_items(
+        items: list[tuple[str, str]],
+        mapping_index: dict[GrantLevel, ObjectRef],
+        adapter,
+        grantee: EngineUserInfo,
+    ) -> tuple[int, list[str], list[str]]:
+        """
+        Ejecuta los items de un perfil contra UN conjunto de objetos destino (un
+        ``ObjectRef`` por nivel). Devuelve ``(grants_applied, skipped_levels, errors)``.
+
+        Best-effort POR ITEM: un nivel que falla se reporta en ``errors`` y NO aborta los
+        demás niveles — el perfil queda aplicado parcialmente y el operador ve exactamente
+        qué faltó (nunca un rollback implícito de grants ya otorgados).
+
+        Compartido por ``apply_profile`` (una BD) y ``apply_profile_bulk`` (N BDs) para
+        que el criterio de éxito/omisión/error sea idéntico en ambos caminos.
+        """
         grants_applied = 0
         skipped_levels: list[str] = []
         errors: list[str] = []
 
-        for item in items:
-            level = GrantLevel(item.level)
-            privileges = [p.strip() for p in item.privileges.split(",") if p.strip()]
+        for level_raw, privileges_raw in items:
+            level = GrantLevel(level_raw)
+            privileges = [p.strip() for p in privileges_raw.split(",") if p.strip()]
             ref = mapping_index.get(level)
             if ref is None:
                 skipped_levels.append(level.value)
@@ -366,28 +408,159 @@ class GrantController:
                     continue
                 adapter.grant_object(grantee, level, ref, privileges)
                 grants_applied += 1
+            except AppHttpException as exc:
+                # ``exc.message`` es el texto pensado para el cliente. ``str(exc)`` en
+                # cambio vuelca el ``detail`` COMPLETO de la excepción (incluye ``loc``:
+                # archivo/función/línea/código fuente) porque ``HTTPException`` pasa
+                # ``detail`` como argumento posicional a ``Exception.__init__`` — y esto
+                # va en una respuesta 200, así que el filtrado por entorno del exception
+                # handler nunca lo intercepta (se filtraría incluso en producción).
+                errors.append(f"{level.value}: {exc.message}")
             except Exception as exc:  # noqa: BLE001 — best-effort; reportar, no abortar
-                errors.append(f"{level.value}: {exc}")
+                errors.append(f"{level.value}: {type(exc).__name__}")
+
+        return grants_applied, skipped_levels, errors
+
+    def apply_profile(
+        self,
+        user_id: int,
+        profile_id: int,
+        payload: ApplyProfileRequest,
+        *,
+        admin: dict | None = None,
+    ) -> ApplyProfileResult:
+        """
+        Aplica un perfil de permisos a un usuario. Para cada item del perfil, busca
+        el ``object_mapping`` correspondiente en el payload y ejecuta ``grant_object``.
+        Los niveles del perfil sin mapeo se omiten (se reportan en ``skipped_levels``).
+        Los errores de grant individuales se capturan para dar visibilidad sin abortar.
+        """
+        ctx = self._load_apply_profile_context(user_id, profile_id)
+
+        # Índice de mappings por nivel
+        mapping_index: dict[GrantLevel, ObjectRef] = {
+            m.level: m.object_ref for m in payload.object_mappings
+        }
+
+        grants_applied, skipped_levels, errors = self._apply_profile_items(
+            ctx["items"], mapping_index, ctx["adapter"], ctx["grantee"]
+        )
 
         audit.record(
             "server_user.apply_profile",
             admin=admin,
             target_type="server_user",
             target_id=user_id,
-            server_id=server_id,
+            server_id=ctx["server_id"],
             touched_engine=True,
-            grantee=_grantee_label(grantee),
-            grantor=grantor,
+            grantee=_grantee_label(ctx["grantee"]),
+            grantor=ctx["grantor"],
             detail=(
-                f"profile_id={profile_id} ({profile_name}): "
+                f"profile_id={profile_id} ({ctx['profile_name']}): "
                 f"{grants_applied} grants aplicados, {len(skipped_levels)} omitidos"
             ),
         )
         return ApplyProfileResult(
             profile_id=profile_id,
-            profile_name=profile_name,
-            engine=engine,
+            profile_name=ctx["profile_name"],
+            engine=ctx["engine"],
             grants_applied=grants_applied,
             skipped_levels=skipped_levels,
             errors=errors,
+        )
+
+    def apply_profile_bulk(
+        self,
+        user_id: int,
+        profile_id: int,
+        payload: ApplyProfileBulkRequest,
+        *,
+        admin: dict | None = None,
+    ) -> ApplyProfileBulkResult:
+        """
+        Aplica el MISMO perfil al MISMO usuario sobre N bases de datos en una llamada.
+
+        Mismo patrón que ``ManagedMigrationController.apply_all``: contexto cargado UNA
+        vez (la credencial pseudo-root se descifra una sola vez, no por BD), una BD que
+        falla NO aborta el lote, y una única entrada de auditoría agregada al final.
+
+        NO se valida la existencia previa de cada BD contra el motor: si no existe, el
+        propio motor rechaza el GRANT y ese error nativo cae en los ``errors`` de ESE
+        ítem. Es el mismo criterio que ``apply_profile`` (que tampoco la valida) y evita
+        una ronda extra de introspección por BD.
+        """
+        ctx = self._load_apply_profile_context(user_id, profile_id)
+        adapter, grantee = ctx["adapter"], ctx["grantee"]
+
+        results: list[ApplyProfileBulkItemOut] = []
+        total_grants = 0
+
+        for db_name in payload.databases:
+            # ObjectRef NUEVO por iteración: se COPIA en vez de mutar el ref del payload.
+            # Mutar el original filtraría la BD de la iteración k a la k+1 (y a la
+            # respuesta, que serializa el mismo objeto). La copia es superficial —
+            # columns/routine se comparten— y eso es correcto: los refs son de solo
+            # lectura, nadie los muta aguas abajo.
+            mapping_index: dict[GrantLevel, ObjectRef] = {
+                m.level: m.object_ref.model_copy(update={"database": db_name})
+                for m in payload.object_mappings
+            }
+            try:
+                applied, skipped, errors = self._apply_profile_items(
+                    ctx["items"], mapping_index, adapter, grantee
+                )
+            except AppHttpException as exc:
+                # Fallo que escapa al best-effort por item (p.ej. el motor caído deja de
+                # responder a mitad del lote). Se reporta en ESTA BD y se sigue.
+                applied, skipped, errors = 0, [], [exc.message]
+            except Exception as exc:  # noqa: BLE001 — una BD no debe abortar el lote
+                logger.warning(
+                    "apply_profile_bulk: error inesperado en BD %s (user_id=%s, "
+                    "profile_id=%s): %s",
+                    db_name, user_id, profile_id, exc, exc_info=True,
+                )
+                # Solo el TIPO: el mensaje crudo de una excepción inesperada puede
+                # arrastrar detalle interno que no corresponde devolver al cliente.
+                applied, skipped, errors = 0, [], [
+                    f"error inesperado: {type(exc).__name__}"
+                ]
+
+            total_grants += applied
+            results.append(
+                ApplyProfileBulkItemOut(
+                    database=db_name,
+                    grants_applied=applied,
+                    skipped_levels=skipped,
+                    errors=errors,
+                    ok=not errors,
+                )
+            )
+
+        # Auditoría AGREGADA (una fila), igual que apply_profile y apply_all. Se listan
+        # las BDs para que el rastro identifique qué se tocó sin necesitar N filas;
+        # acotado para que 'detail' siga siendo un resumen y no un volcado.
+        failed = [r.database for r in results if not r.ok]
+        audit.record(
+            "server_user.apply_profile_bulk",
+            admin=admin,
+            target_type="server_user",
+            target_id=user_id,
+            server_id=ctx["server_id"],
+            touched_engine=True,
+            grantee=_grantee_label(grantee),
+            grantor=ctx["grantor"],
+            detail=(
+                f"profile_id={profile_id} ({ctx['profile_name']}): "
+                f"{len(payload.databases)} BD(s), {total_grants} grants aplicados, "
+                f"{len(failed)} BD(s) con error"
+                f" | bds={_summarize_names(payload.databases)}"
+                + (f" | fallidas={_summarize_names(failed)}" if failed else "")
+            ),
+        )
+        return ApplyProfileBulkResult(
+            profile_id=profile_id,
+            profile_name=ctx["profile_name"],
+            engine=ctx["engine"],
+            total_databases=len(payload.databases),
+            results=results,
         )

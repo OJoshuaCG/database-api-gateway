@@ -11,12 +11,13 @@ Flags que tocan el motor:
 - ``?drop_remote=true`` en DELETE → DROP USER en el motor.
 """
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 
 from app.controllers.grant_controller import GrantController
 from app.controllers.server_user_controller import ServerUserController
 from app.core.auth import AdminDep
-from app.schemas.grant import ApplyProfileRequest, ApplyProfileResult, GrantInfo, GrantRequest, GrantableResult, RevokeRequest
+from app.core.limiter import limiter
+from app.schemas.grant import ApplyProfileBulkRequest, ApplyProfileBulkResult, ApplyProfileRequest, ApplyProfileResult, GrantInfo, GrantRequest, GrantableResult, RevokeRequest
 from app.schemas.managed_database import ManagedDatabaseOut
 from app.schemas.server_user import AdoptUserIn, ServerUserCreate, ServerUserFullCreate, ServerUserFullOut, ServerUserOut, ServerUserUpdate
 from app.utils.pagination import PaginationDep
@@ -163,6 +164,55 @@ def apply_profile(
     msg = f"Perfil '{result.profile_name}' aplicado: {result.grants_applied} grant(s)."
     if result.errors:
         msg += f" {len(result.errors)} error(es) parciales."
+    return success(data=result, message=msg)
+
+
+@router.post(
+    "/{user_id}/apply-profile/{profile_id}/bulk",
+    response_model=ApiResponse[ApplyProfileBulkResult],
+    summary="Aplicar un perfil de permisos sobre N bases de datos en una llamada",
+)
+# 5/minute: por ítem es más liviano que 'apply-all' de migraciones (un GRANT vs una
+# migración, de ahí que no use su 3/minute), pero el fan-out es igual o peor — con
+# NullPool cada can_grant + grant_object abre su propia conexión remota, así que una
+# llamada de 100 BDs × M niveles puede abrir cientos de conexiones y retener un worker
+# del threadpool decenas de segundos. Por otro lado NUNCA revoca (solo agrega
+# privilegios), así que un error es recuperable con REVOKE: eso justifica ser algo más
+# permisivo que las operaciones destructivas de fan-out (clone/execute, 3/minute).
+@limiter.limit("5/minute")
+def apply_profile_bulk(
+    request: Request,
+    admin: AdminDep,
+    user_id: int,
+    profile_id: int,
+    payload: ApplyProfileBulkRequest,
+):
+    """
+    Aplica el mismo perfil al mismo usuario sobre cada BD de ``databases``.
+
+    El ``database`` de cada ``object_mappings[].object_ref`` se IGNORA: se sobreescribe
+    con el nombre de la BD de la iteración (el resto — schema/table/columns/sequence/
+    routine — se reusa tal cual, asumiendo el mismo esquema relativo en cada BD).
+
+    Best-effort a dos niveles: un nivel del perfil que falla no aborta los demás niveles
+    de esa BD, y una BD que falla no aborta el resto del lote. Siempre 200: revisar
+    ``results[].ok`` y ``results[].errors`` para el detalle por BD.
+
+    Latencia: el trabajo crece con ``len(databases) × niveles del perfil`` y cada paso
+    abre una conexión al servidor destino. Para lotes grandes conviene partir en tandas
+    de ~20 BDs en lugar de agotar la cota de 100.
+    """
+    result = GrantController().apply_profile_bulk(
+        user_id, profile_id, payload, admin=admin
+    )
+    applied = sum(r.grants_applied for r in result.results)
+    failed = [r for r in result.results if not r.ok]
+    msg = (
+        f"Perfil '{result.profile_name}' aplicado en {result.total_databases} BD(s): "
+        f"{applied} grant(s)."
+    )
+    if failed:
+        msg += f" {len(failed)} BD(s) con error(es)."
     return success(data=result, message=msg)
 
 

@@ -14,6 +14,7 @@ El módulo de permisos granulares permite otorgar, revocar y consultar privilegi
 | `POST`   | `/api/v1/server-users/{user_id}/grants`                     | Sesión admin   | Otorga privilegios sobre un objeto (GRANT).                              |
 | `DELETE` | `/api/v1/server-users/{user_id}/grants`                     | Sesión admin   | Revoca privilegios sobre un objeto (REVOKE). Body opcional `cascade`; query `confirm_grantee` si `cascade=true`. |
 | `POST`   | `/api/v1/server-users/{user_id}/apply-profile/{profile_id}` | Sesión admin   | Aplica un perfil de permisos preconfigurado al usuario (best-effort).    |
+| `POST`   | `/api/v1/server-users/{user_id}/apply-profile/{profile_id}/bulk` | Sesión admin | Aplica el mismo perfil sobre N bases de datos en una llamada (best-effort, `5/minute`). |
 | `POST`   | `/api/v1/server-users/provision`                            | Sesión admin   | Crea usuario en el inventario + provisiona en el motor + grants iniciales.|
 | `POST`   | `/api/v1/servers/{server_id}/grantable`                     | Sesión admin   | Verifica si el admin de conexión puede otorgar los privilegios dados.    |
 
@@ -371,6 +372,51 @@ Content-Type: application/json
   "grants_applied": 1,
   "skipped_levels": ["table"],
   "errors": ["database: credencial sin permisos suficientes para ['SELECT']"]
+}
+```
+
+### Aplicar el mismo perfil sobre N bases de datos (`apply-profile/.../bulk`)
+
+`POST /api/v1/server-users/{user_id}/apply-profile/{profile_id}/bulk` aplica el **mismo perfil** al **mismo usuario** sobre una lista de bases de datos en una sola llamada. Es el caso multi-tenant típico: una BD por cliente, con la misma estructura relativa, y un usuario que debe tener el mismo perfil en todas.
+
+- `databases` es una lista de **nombres de BD** (obligatoria, 1 a 100), no de ids de inventario: el módulo de grants trabaja por identidad, así que sirve igual para BDs adoptadas y para BDs crudas del servidor.
+- `object_mappings` es una **plantilla**: `schema`/`table`/`columns`/`sequence`/`routine` se reusan tal cual en cada iteración, y el campo `database` de cada `object_ref` se **ignora y se sobreescribe** con el nombre de la BD de la iteración (mandarlo es opcional). Asume que cada BD del lote expone el mismo esquema relativo.
+- **Best-effort a dos niveles**: un nivel del perfil que falla no aborta los demás niveles de esa BD (igual que el endpoint single), y una BD que falla no aborta el resto del lote. La respuesta es **siempre 200**: el resultado real está en `results[].ok` y `results[].errors`.
+- **No se valida la existencia previa** de cada BD contra el motor. Si no existe, el propio motor rechaza el `GRANT` y ese error nativo queda en los `errors` de ese ítem — mismo criterio que el endpoint single, sin una ronda extra de introspección por BD.
+- **Auditoría agregada**: una sola entrada `server_user.apply_profile_bulk` por llamada (no una por BD), con el conteo de BDs/grants y la lista de BDs tocadas y fallidas en `detail`.
+- **Latencia**: el trabajo crece con `len(databases) × niveles del perfil`, y como los engines remotos usan `NullPool`, cada `can_grant` y cada `GRANT` abren su propia conexión al servidor destino. Conviene partir en tandas de ~20 BDs en lugar de agotar la cota de 100. El rate limit es `5/minute`.
+
+**Request:**
+
+```http
+POST /api/v1/server-users/42/apply-profile/3/bulk
+Content-Type: application/json
+
+{
+  "databases": ["tenant_a", "tenant_b", "tenant_c"],
+  "object_mappings": [
+    { "level": "database", "object_ref": {} },
+    { "level": "table", "object_ref": { "table": "pedidos" } }
+  ]
+}
+```
+
+**Response 200 (una BD con error, las otras aplicadas):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "profile_id": 3,
+    "profile_name": "lector-app",
+    "engine": "mariadb",
+    "total_databases": 3,
+    "results": [
+      { "database": "tenant_a", "grants_applied": 2, "skipped_levels": [], "errors": [], "ok": true },
+      { "database": "tenant_b", "grants_applied": 0, "skipped_levels": [], "errors": ["database: ..."], "ok": false },
+      { "database": "tenant_c", "grants_applied": 2, "skipped_levels": [], "errors": [], "ok": true }
+    ]
+  }
 }
 ```
 
