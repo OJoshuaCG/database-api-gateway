@@ -383,6 +383,22 @@ class ServerUserController:
                             success=True,
                         )
                     )
+                except AppHttpException as exc:
+                    # ``exc.message`` es el texto pensado para el cliente. ``str(exc)``
+                    # vuelca el ``detail`` COMPLETO (incluye ``loc``: archivo/función/
+                    # línea/código fuente) porque ``HTTPException`` lo pasa como
+                    # argumento posicional a ``Exception.__init__`` — y esto va en una
+                    # respuesta 200/201, fuera del alcance del exception handler que
+                    # filtra ese detalle por entorno (se filtraría incluso en producción).
+                    grant_results.append(
+                        GrantApplyResult(
+                            level=grant_spec.level.value,
+                            object=obj_label,
+                            privileges=grant_spec.privileges,
+                            success=False,
+                            error=exc.message,
+                        )
+                    )
                 except Exception as exc:  # noqa: BLE001 — best-effort
                     grant_results.append(
                         GrantApplyResult(
@@ -390,7 +406,7 @@ class ServerUserController:
                             object=obj_label,
                             privileges=grant_spec.privileges,
                             success=False,
-                            error=str(exc),
+                            error=type(exc).__name__,
                         )
                     )
 
