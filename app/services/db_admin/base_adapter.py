@@ -27,6 +27,10 @@ from app.exceptions import AppHttpException
 from app.services.db_admin import snapshot_data
 from app.services.db_admin.dtos import (
     CheckConstraintInfo,
+    CollatableForeignKey,
+    CollationInventory,
+    CollationOptionInfo,
+    ColumnCollationInfo,
     ColumnInfo,
     ComputedInfo,
     ConnectionInfo,
@@ -42,11 +46,13 @@ from app.services.db_admin.dtos import (
     IdentityInfo,
     IndexInfo,
     ObjectRef,
+    RoutineGrantInfo,
     RoutineInfo,
     SchemaSnapshot,
     SeedResult,
     SequenceInfo,
     StructureDump,
+    TableCollationInfo,
     TableSchema,
     TableStat,
     TriggerInfo,
@@ -158,6 +164,113 @@ class ServerAdapter(ABC):
 
         Default: lista vacía (PostgreSQL no soporta FKs cross-database por arquitectura —
         una BD no puede referenciar tablas de otra). MySQL/MariaDB lo sobreescriben.
+        """
+        return []
+
+    # ------------------------------------------------------------------ #
+    # Conversión de charset/collation (feature collation-conversion)      #
+    # ------------------------------------------------------------------ #
+    # DOS operaciones distintas bajo el mismo recurso, según el motor:
+    #
+    # - MySQL/MariaDB (modo ``universal``): BD + tablas + los 5 tipos de objeto con la
+    #   collation CONGELADA en el momento de crearlos (PROCEDURE/FUNCTION/TRIGGER/EVENT/
+    #   VIEW), que solo se arregla con DROP+CREATE verbatim.
+    # - PostgreSQL (modo ``columns``): SOLO ``ALTER TABLE ... ALTER COLUMN ... TYPE ...
+    #   COLLATE ...``. No hay objetos que recrear (PostgreSQL resuelve la collation
+    #   DINÁMICAMENTE en cada llamada, no la congela al crear) ni ``ALTER DATABASE`` posible
+    #   (el ``ENCODING``/``LC_COLLATE`` es INMUTABLE tras el ``CREATE DATABASE``).
+    #
+    # Por eso ``capture_object_ddl``/``routine_grants``/``apply_routine_grants`` siguen en
+    # 422 para PostgreSQL: no son "pendientes de implementar", son pasos que su modo NUNCA
+    # ejecuta. Un 422 desde ahí significaría que el despacho por modo se rompió.
+    supports_collation_conversion: bool = False
+
+    def collation_inventory(
+        self, database: str, *, target_collation: str | None = None
+    ) -> "CollationInventory":
+        """
+        Inventario de conversión: default de charset/collation de la BD, tablas con su
+        charset/collation actual (+ cuántas columnas quedan fuera del objetivo), resumen
+        agrupado por par ``(charset, collation)`` y los 5 tipos de objeto con collation
+        congelada. Solo lectura del catálogo.
+        """
+        raise AppHttpException(
+            message=(
+                "La conversión de charset/collation no está soportada para este motor. "
+                "Solo MySQL/MariaDB arrastran la collation congelada en rutinas, triggers, "
+                "eventos y vistas."
+            ),
+            status_code=422,
+            context={"dialect": self.dialect},
+        )
+
+    def capture_object_ddl(self, database: str, object_type: str, name: str) -> str:
+        """
+        DDL EXACTO de UN objeto (``SHOW CREATE PROCEDURE|FUNCTION|TRIGGER|EVENT|VIEW``),
+        para recrearlo verbatim tras el DROP. Puntual a propósito: usar el dump completo
+        del schema para 3 de 200 objetos sería trabajo desperdiciado.
+        """
+        raise AppHttpException(
+            message="La captura puntual de DDL no está soportada para este motor.",
+            status_code=422,
+            context={"dialect": self.dialect},
+        )
+
+    def routine_grants(
+        self, database: str, routine_type: str, name: str
+    ) -> list["RoutineGrantInfo"]:
+        """
+        Privilegios a nivel de RUTINA sobre una PROCEDURE/FUNCTION concreta, para poder
+        reaplicarlos tras el DROP+CREATE (el motor los borra junto con la rutina).
+        """
+        raise AppHttpException(
+            message="La lectura de privilegios de rutina no está soportada para este motor.",
+            status_code=422,
+            context={"dialect": self.dialect},
+        )
+
+    def apply_routine_grants(
+        self, database: str, grants: list["RoutineGrantInfo"]
+    ) -> int:
+        """Reaplica los privilegios de rutina capturados. Devuelve cuántos se aplicaron."""
+        raise AppHttpException(
+            message="La reaplicación de privilegios de rutina no está soportada para este motor.",
+            status_code=422,
+            context={"dialect": self.dialect},
+        )
+
+    def list_collations(self, database: str) -> list["CollationOptionInfo"]:
+        """
+        Collations que EXISTEN en el servidor y son usables por ``database`` (modo
+        ``columns``). Lista vacía por default: en MySQL/MariaDB el objetivo se valida contra
+        el catálogo GLOBAL del gateway (``charset_collation_options``), no contra el motor.
+
+        PostgreSQL lo sobreescribe leyendo ``pg_collation`` EN VIVO porque su catálogo
+        depende de los locales instalados en el SO de CADA servidor: no hay lista global
+        posible ni compartible entre servidores.
+        """
+        return []
+
+    def columns_to_convert(
+        self, table: "TableCollationInfo", collation: str
+    ) -> list["ColumnCollationInfo"]:
+        """
+        Columnas de ``table`` que hay que alterar para llegar a ``collation`` (modo
+        ``columns``). Lista vacía por default: en el modo ``universal`` la unidad de cambio
+        es la TABLA entera (``CONVERT TO CHARACTER SET``), no la columna.
+        """
+        return []
+
+    def collatable_foreign_keys(self, database: str) -> list["CollatableForeignKey"]:
+        """
+        FKs INTERNAS de ``database`` entre columnas colacionables, para advertir sobre una
+        conversión PARCIAL. Lista vacía por default.
+
+        Es específico del modo ``columns``: en PostgreSQL convertir un lado de una FK de
+        texto y el otro no deja dos columnas con collations explícitas distintas, y las
+        comparaciones entre ellas fallan al EJECUTARSE (no al crear el constraint). El modo
+        ``universal`` ya cubre su caso equivalente por otra vía (MySQL/MariaDB rechazan el
+        propio DDL) y no necesita esta consulta.
         """
         return []
 

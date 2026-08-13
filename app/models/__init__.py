@@ -19,6 +19,10 @@ from app.models.audit_log import AuditLog
 from app.models.base import Base, TimestampMixin
 from app.models.charset_collation_option import CharsetCollationOption
 from app.models.clone_job import CloneJob, CloneJobItem
+from app.models.collation_conversion_job import (
+    CollationConversionJob,
+    CollationConversionJobItem,
+)
 from app.models.crypto_key import CryptoKey
 from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
@@ -63,6 +67,8 @@ __all__ = [
     "SchemaComparisonItem",
     "CloneJob",
     "CloneJobItem",
+    "CollationConversionJob",
+    "CollationConversionJobItem",
     "QueryExecution",
     "EngineType",
     "ServerStatus",

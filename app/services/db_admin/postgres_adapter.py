@@ -23,6 +23,11 @@ from app.exceptions import AppHttpException
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.base_adapter import ServerAdapter
 from app.services.db_admin.dtos import (
+    CollatableForeignKey,
+    CollationGroup,
+    CollationInventory,
+    CollationOptionInfo,
+    ColumnCollationInfo,
     DatabaseGranteeInfo,
     DumpStatement,
     EngineUserInfo,
@@ -34,6 +39,7 @@ from app.services.db_admin.dtos import (
     RoutineInfo,
     SequenceInfo,
     StructureDump,
+    TableCollationInfo,
     TriggerInfo,
     ViewInfo,
 )
@@ -436,6 +442,407 @@ class PostgresAdapter(ServerAdapter):
             )
             for u, e in agg.items()
         ]
+
+    # ------------- conversión de collation (modo ``columns``, PostgreSQL) ----- #
+    # PostgreSQL NO tiene el problema que resuelve el modo ``universal`` de MySQL/MariaDB, y
+    # por eso este bloque implementa una operación DISTINTA, no una traducción del otro:
+    #
+    # 1. NADA de recrear vistas/funciones/triggers: PostgreSQL resuelve la collation
+    #    DINÁMICAMENTE en cada ejecución, contra el tipo real de la columna en ESE momento.
+    #    Una función plpgsql o una vista no congelan nada al crearse, así que ``objects``
+    #    es SIEMPRE ``[]`` y ``capture_object_ddl``/``routine_grants`` nunca se llaman.
+    # 2. NADA de ``ALTER DATABASE``: el ``ENCODING``/``LC_COLLATE``/``LC_CTYPE`` de una BD
+    #    es INMUTABLE tras el ``CREATE DATABASE`` (cambiarlos exige volcar y recargar; para
+    #    eso está el módulo de clonado).
+    # 3. La ÚNICA unidad de cambio es la COLUMNA:
+    #    ``ALTER TABLE t ALTER COLUMN c TYPE <mismo tipo> COLLATE "x"``.
+    supports_collation_conversion = True
+
+    # Whitelist del TEXTO DE TIPO que puede viajar al DDL. El valor sale de
+    # ``format_type()`` (catálogo del motor, no del cliente) y ya viene re-parseable, pero
+    # se interpola en la sentencia: acotarlo es la última barrera si un tipo definido por el
+    # usuario tuviera un nombre exótico. Cubre ``text``, ``character varying(255)``,
+    # ``"MiDominio"``, ``public.citext``, ``text[]``. Lo que no matchee se EXCLUYE del
+    # inventario con una nota, nunca se emite a ciegas.
+    _PG_TYPE_RE = re.compile(r'^[A-Za-z0-9_ ."\[\]().,]{1,200}$')
+
+    # Los nombres de collation son identificadores CASE-SENSITIVE que admiten puntos y
+    # guiones (``en_US.utf8``, ``es-ES-x-icu``), así que se validan con la whitelist
+    # ``allow_existing`` de ``identifiers``. Pero la barrera REAL es otra: el valor tiene que
+    # existir en el catálogo VIVO del servidor (``list_collations``) antes de llegar al DDL.
+
+    def list_collations(self, database: str) -> list[CollationOptionInfo]:
+        """
+        Collations REALES del servidor usables por ``database`` (``pg_collation``).
+
+        Por qué EN VIVO y no desde el catálogo global del gateway: qué collations existen
+        depende de los locales instalados en el SO de ESA máquina (y de si el binario trae
+        ICU). Dos servidores PostgreSQL idénticos en versión pueden tener catálogos
+        distintos, así que una lista global sería falsa. Y no es el mismo espacio de valores
+        que ``charset_collation_options``: ahí viven los ``ENCODING``/``LC_COLLATE`` con los
+        que se CREA una base (locales del SO como ``en_US.UTF-8``); acá, nombres de OBJETOS
+        de ``pg_collation`` (``en_US``, ``C``, ``es-ES-x-icu``).
+
+        Filtro de compatibilidad, TAL CUAL lo define la doc de ``pg_collation``: "PostgreSQL
+        generally ignores all collations that do not have ``collencoding`` equal to either
+        the current database's encoding or -1". ``-1`` = sirve para cualquier encoding.
+        Ofrecer una incompatible daría ``collation "x" for encoding "UTF8" does not exist``
+        al usarla. El filtro va por ``collencoding``, NO por ``collprovider``: que las
+        collations ICU sean independientes del encoding es una consecuencia, no la regla
+        (``ucs_basic``/``pg_c_utf8`` están fijadas a UTF8 y no son ICU).
+
+        ``default`` se EXCLUYE a propósito: no nombra una collation concreta sino "la de la
+        base", así que como OBJETIVO de una conversión no significaría nada (y dejaría la
+        columna sin collation explícita, que es justo el estado del que se quiere salir).
+        """
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        try:
+            with database_connection(self.target, database) as conn:
+                return self._collations(conn)
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="list_collations", target=self.target, extra={"database": database}
+            )
+
+    def _collations(
+        self, conn, notes: list[str] | None = None
+    ) -> list[CollationOptionInfo]:
+        """
+        Lectura de ``pg_collation`` degradando por versión (``collprovider`` es PG 10+ y
+        ``collisdeterministic`` PG 12+: si el SELECT completo falla se reintenta con el
+        nombre solo, en vez de perder el catálogo entero).
+
+        Las collations viven en SCHEMAS y ``collname`` es único por (namespace, encoding),
+        así que un mismo nombre puede existir en más de uno. El ``COLLATE`` que se emite va
+        SIN calificar y lo resuelve el ``search_path``: si un nombre está duplicado se
+        anota, porque ahí el motor podría aplicar una collation distinta de la que el
+        operador creyó elegir.
+        """
+        rows = self._safe_fetch(
+            conn,
+            "SELECT c.collname, n.nspname, c.collprovider, c.collisdeterministic "
+            "FROM pg_collation c JOIN pg_namespace n ON n.oid = c.collnamespace "
+            "WHERE (c.collencoding = -1 OR c.collencoding = ("
+            "  SELECT encoding FROM pg_database WHERE datname = current_database())) "
+            "  AND c.collname <> 'default' "
+            "ORDER BY c.collname, n.nspname",
+        )
+        if not rows:
+            rows = [
+                (r[0], r[1], None, True)
+                for r in self._safe_fetch(
+                    conn,
+                    "SELECT c.collname, n.nspname FROM pg_collation c "
+                    "JOIN pg_namespace n ON n.oid = c.collnamespace "
+                    "WHERE c.collname <> 'default' ORDER BY c.collname, n.nspname",
+                )
+            ]
+        seen: dict[str, set[str]] = {}
+        out: list[CollationOptionInfo] = []
+        for name, schema, provider, deterministic in rows:
+            key = str(name)
+            if not key:
+                continue
+            schemas = seen.setdefault(key, set())
+            if schemas:  # ya emitida: solo se registra el schema para detectar ambigüedad
+                schemas.add(str(schema))
+                continue
+            schemas.add(str(schema))
+            out.append(
+                CollationOptionInfo(
+                    name=key,
+                    provider=str(provider) if provider else None,
+                    deterministic=bool(deterministic) if deterministic is not None else True,
+                )
+            )
+        ambiguous = sorted(n for n, s in seen.items() if len(s) > 1)
+        if ambiguous and notes is not None:
+            sample = ", ".join(ambiguous[:5])
+            notes.append(
+                f"{len(ambiguous)} nombre(s) de collation existen en más de un schema "
+                f"({sample}). El COLLATE se emite sin calificar y lo resuelve el "
+                "search_path, así que podría aplicarse una distinta de la esperada."
+            )
+        return out
+
+    def _collatable_columns(self, conn, notes: list[str]) -> dict[str, list[ColumnCollationInfo]]:
+        """
+        ``{tabla: [columnas colacionables]}`` del schema ``public``.
+
+        La fuente es ``pg_attribute.attcollation``, no una lista de tipos: esa columna es
+        distinta de cero EXACTAMENTE en las columnas que tienen collation (``text``,
+        ``varchar``, ``char``, ``citext``, dominios sobre ellos, arrays de texto), así que
+        no hay que adivinar qué tipos son colacionables en cada versión ni perder los
+        definidos por el usuario. ``format_type`` da el tipo con sus parámetros exactos
+        (``character varying(255)``), imprescindible porque el ``ALTER COLUMN ... TYPE``
+        debe repetir el MISMO tipo.
+
+        ``attcollation`` apunta a la collation ``default`` (``pg_catalog.default``) cuando
+        la columna no declaró ninguna: eso es "hereda la de la base", y se reporta como
+        ``current_collation=None`` + ``is_default_collation=True``.
+        """
+        rows = self._safe_fetch(
+            conn,
+            "SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), "
+            "       co.collname, nco.nspname "
+            "FROM pg_attribute a "
+            "JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "LEFT JOIN pg_collation co ON co.oid = a.attcollation "
+            "LEFT JOIN pg_namespace nco ON nco.oid = co.collnamespace "
+            "WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') "
+            "  AND a.attnum > 0 AND NOT a.attisdropped AND a.attcollation <> 0 "
+            "ORDER BY c.relname, a.attnum",
+        )
+        out: dict[str, list[ColumnCollationInfo]] = {}
+        skipped: list[str] = []
+        for table, column, data_type, collname, coll_schema in rows:
+            type_text = str(data_type or "").strip()
+            if not self._PG_TYPE_RE.match(type_text):
+                skipped.append(f"{table}.{column}")
+                continue
+            is_default = bool(
+                collname is None
+                or (str(collname) == "default" and str(coll_schema or "") == "pg_catalog")
+            )
+            out.setdefault(str(table), []).append(
+                ColumnCollationInfo(
+                    name=str(column),
+                    data_type=type_text,
+                    current_collation=None if is_default else str(collname),
+                    is_default_collation=is_default,
+                )
+            )
+        if skipped:
+            sample = ", ".join(skipped[:5])
+            notes.append(
+                f"{len(skipped)} columna(s) quedaron FUERA de la conversión porque su tipo "
+                f"tiene una forma que el gateway no emite a ciegas en un ALTER COLUMN "
+                f"({sample}). Convertilas a mano si hace falta."
+            )
+        return out
+
+    def collation_inventory(
+        self, database: str, *, target_collation: str | None = None
+    ) -> CollationInventory:
+        """
+        Inventario del modo ``columns``: tablas con sus COLUMNAS de texto y la collation de
+        cada una, resumen agrupado POR COLLATION DE COLUMNA y el catálogo vivo de
+        collations. ``objects`` es siempre ``[]`` (ver el bloque de arriba).
+
+        A diferencia de MySQL/MariaDB, ``charset``/``collation`` de la tabla van en ``None``:
+        PostgreSQL no tiene charset por tabla y la collation es atributo de COLUMNA. El
+        default de la BD (``db_charset`` = encoding, ``db_collation`` = ``LC_COLLATE``) se
+        informa solo como CONTEXTO: es inmutable y esta operación no lo toca.
+        """
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        notes: list[str] = [
+            "PostgreSQL resuelve la collation dinámicamente: las vistas, funciones y "
+            "triggers NO congelan la collation de la sesión que los creó, así que no hay "
+            "objetos que recrear (a diferencia de MySQL/MariaDB).",
+            "El ENCODING y el LC_COLLATE de la base son INMUTABLES tras el CREATE DATABASE: "
+            "esta operación NO los cambia, solo la collation de las columnas indicadas.",
+            "Alcance: solo el schema 'public' (misma limitación que el diff de esquema y el "
+            "clonado).",
+        ]
+        target = (target_collation or "").strip() or None
+        try:
+            with database_connection(self.target, database) as conn:
+                defaults = self._database_defaults(conn, database, "public")
+                collations = self._collations(conn, notes)
+                by_table = self._collatable_columns(conn, notes)
+                table_rows = self._safe_fetch(
+                    conn,
+                    "SELECT c.relname FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') "
+                    "ORDER BY c.relname",
+                )
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="collation_inventory", target=self.target,
+                extra={"database": database},
+            )
+
+        # Misma exclusión que los otros caminos que enumeran tablas: la contabilidad interna
+        # del gateway (``_gw_v_*``/``_gw_stg_*``) no es esquema del usuario.
+        names = exclude_gateway_internal_tables(str(r[0]) for r in table_rows)
+
+        tables: list[TableCollationInfo] = []
+        for name in names:
+            cols = by_table.get(name, [])
+            bad = sum(1 for c in cols if self._column_needs_collation(c, target))
+            tables.append(
+                TableCollationInfo(
+                    name=name,
+                    charset=None,
+                    collation=None,
+                    mismatched_columns=bad,
+                    # Sin objetivo (llamada informativa) no se puede afirmar nada: una tabla
+                    # con columnas de texto queda como "a revisar" y una sin ellas, no.
+                    needs_conversion=(bad > 0) if target else bool(cols),
+                    columns=cols,
+                )
+            )
+
+        return CollationInventory(
+            database=database,
+            engine=self.dialect,
+            db_charset=defaults.get("db_charset"),
+            db_collation=defaults.get("db_collation"),
+            target_charset=None,
+            target_collation=target_collation,
+            tables=tables,
+            summary=self._collation_summary(tables),
+            objects=[],
+            notes=notes,
+            available_collations=collations,
+        )
+
+    def columns_to_convert(
+        self, table: TableCollationInfo, collation: str
+    ) -> list[ColumnCollationInfo]:
+        """Columnas de ``table`` que todavía NO están en ``collation`` (las que se alteran)."""
+        return [
+            c for c in (table.columns or []) if self._column_needs_collation(c, collation)
+        ]
+
+    @staticmethod
+    def _column_needs_collation(col: ColumnCollationInfo, target: str | None) -> bool:
+        """
+        ¿Esta columna hay que convertirla al objetivo?
+
+        Una columna SIN ``COLLATE`` explícito (hereda el default de la base) SIEMPRE cuenta
+        como pendiente aunque el locale de la base coincida con el objetivo: son dos
+        collations distintas para el motor (``pg_catalog.default`` vs. la concreta) y
+        comparar una columna con default contra otra con collation explícita distinta es
+        justamente lo que dispara el conflicto de collation en tiempo de consulta.
+        """
+        if target is None:
+            return False
+        if col.is_default_collation:
+            return True
+        return col.current_collation != target
+
+    @staticmethod
+    def _collation_summary(tables: list[TableCollationInfo]) -> list[CollationGroup]:
+        """
+        Resumen agrupado por collation de COLUMNA: cuántas columnas y en cuántas tablas.
+
+        En el modo ``universal`` el agrupamiento es por tabla porque ahí la collation es un
+        atributo de la tabla; acá lo es de la columna, así que agrupar por tabla no
+        respondería la pregunta ("cuántas collations distintas tengo dando vueltas").
+        """
+        cols: dict[str | None, int] = {}
+        tabs: dict[str | None, set[str]] = {}
+        for t in tables:
+            for c in t.columns or []:
+                key = None if c.is_default_collation else c.current_collation
+                cols[key] = cols.get(key, 0) + 1
+                tabs.setdefault(key, set()).add(t.name)
+        return [
+            CollationGroup(
+                charset=None, collation=key, table_count=len(tabs[key]), column_count=n
+            )
+            for key, n in sorted(cols.items(), key=lambda kv: (-kv[1], str(kv[0] or "")))
+        ]
+
+    def collatable_foreign_keys(self, database: str) -> list[CollatableForeignKey]:
+        """
+        FKs internas entre columnas COLACIONABLES (schema ``public``).
+
+        Sirve para advertir de una conversión PARCIAL con la semántica correcta de
+        PostgreSQL: acá el motor NO rechaza el DDL (a diferencia de MySQL/MariaDB, que
+        exigen la misma collation en ambos lados de la FK y fallan con 3780/1832). Las dos
+        columnas conviven con collations distintas y el problema aparece al CONSULTAR, en
+        el join que la FK justamente promueve.
+
+        Best-effort: si la consulta de catálogo falla, devuelve ``[]`` — un aviso no puede
+        tumbar el preview.
+        """
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        try:
+            with database_connection(self.target, database) as conn:
+                rows = self._safe_fetch(
+                    conn,
+                    "SELECT con.conname, src.relname, sa.attname, tgt.relname, ta.attname "
+                    "FROM pg_constraint con "
+                    "JOIN pg_class src ON src.oid = con.conrelid "
+                    "JOIN pg_class tgt ON tgt.oid = con.confrelid "
+                    "JOIN pg_namespace n ON n.oid = src.relnamespace "
+                    # Se emparejan conkey/confkey posición a posición. Se usa la forma con
+                    # DOS unnest en el SELECT de un LATERAL (y no ``unnest(a, b)``, que solo
+                    # se admite en el nivel superior del FROM) para que funcione igual en
+                    # todas las versiones soportadas.
+                    "JOIN LATERAL (SELECT unnest(con.conkey) AS src_att, "
+                    "                     unnest(con.confkey) AS tgt_att) AS k ON true "
+                    "JOIN pg_attribute sa ON sa.attrelid = con.conrelid "
+                    "     AND sa.attnum = k.src_att "
+                    "JOIN pg_attribute ta ON ta.attrelid = con.confrelid "
+                    "     AND ta.attnum = k.tgt_att "
+                    "WHERE con.contype = 'f' AND n.nspname = 'public' "
+                    "  AND sa.attcollation <> 0 "
+                    "ORDER BY src.relname, sa.attname",
+                )
+        except SQLAlchemyError:
+            return []
+        return [
+            CollatableForeignKey(
+                constraint=str(name) if name else None,
+                table=str(table),
+                column=str(column),
+                referenced_table=str(ref_table),
+                referenced_column=str(ref_column),
+            )
+            for name, table, column, ref_table, ref_column in rows
+        ]
+
+    def render_collation_change(
+        self, database: str, table: str, columns: list[ColumnCollationInfo], collation: str
+    ) -> str:
+        """
+        UNA sentencia ``ALTER TABLE`` con todas las columnas de la tabla que cambian.
+
+        POR QUÉ UNA SOLA y no una por columna: PostgreSQL admite varias acciones en el mismo
+        ``ALTER TABLE``, y agruparlas hace UNA sola pasada sobre la tabla (un solo
+        ACCESS EXCLUSIVE lock, una sola reconstrucción de índices) en lugar de N. Además la
+        deja ATÓMICA: PostgreSQL tiene DDL transaccional, así que si una columna falla la
+        tabla entera queda intacta — no existe el estado "media tabla convertida" que sí
+        hay que temer en MySQL/MariaDB.
+
+        NO se emite ``USING``: el tipo destino es EXACTAMENTE el de origen (solo cambia la
+        cláusula ``COLLATE``), así que la conversión implícita es la identidad. Repetir el
+        tipo con sus parámetros es obligatorio: la gramática de PostgreSQL no tiene un
+        ``ALTER COLUMN ... SET COLLATE``; cambiar la collation de una columna SOLO se puede
+        expresar como un ``SET DATA TYPE``.
+
+        El ``collation`` ya fue validado contra el catálogo VIVO del servidor por el
+        controller; acá se revalida como identificador y se quotea (defensa en profundidad).
+        Va SIEMPRE entre comillas dobles: en PostgreSQL los nombres de collation son
+        case-sensitive y sin comillas ``en_US`` se plegaría a minúsculas.
+        """
+        tbl = quote_identifier(
+            validate_identifier(table, self.dialect, "tabla", allow_existing=True), self.dialect
+        )
+        coll = quote_identifier(
+            validate_identifier(collation, self.dialect, "collation", allow_existing=True),
+            self.dialect,
+        )
+        actions: list[str] = []
+        for col in columns:
+            type_text = (col.data_type or "").strip()
+            if not self._PG_TYPE_RE.match(type_text):
+                raise AppHttpException(
+                    message="El tipo de la columna no se puede emitir de forma segura.",
+                    status_code=422,
+                    context={"table": table, "column": col.name},
+                )
+            name = quote_identifier(
+                validate_identifier(col.name, self.dialect, "columna", allow_existing=True),
+                self.dialect,
+            )
+            actions.append(f"ALTER COLUMN {name} SET DATA TYPE {type_text} COLLATE {coll}")
+        return f'ALTER TABLE "public".{tbl} ' + ", ".join(actions)
 
     def create_user(self, username, password, host="%") -> None:
         validate_identifier(username, self.dialect, "usuario")

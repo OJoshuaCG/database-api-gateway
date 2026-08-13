@@ -396,3 +396,193 @@ class SeedResult(BaseModel):
 # ``StructureDump.table_stats`` referencia ``TableStat`` (definido más abajo): resolver
 # la forward-ref ahora que el nombre existe en el namespace del módulo.
 StructureDump.model_rebuild()
+
+
+# --------------------------------------------------------------------------- #
+# Conversión de charset/collation (feature collation-conversion)               #
+# --------------------------------------------------------------------------- #
+class ColumnCollationInfo(BaseModel):
+    """
+    Una columna COLACIONABLE (de texto) con su collation actual. Solo se llena en el modo
+    ``columns`` (PostgreSQL), donde la COLUMNA es la única unidad de cambio posible.
+
+    ``current_collation`` es el nombre de un objeto de ``pg_collation`` (p. ej. ``en_US``,
+    ``C``, ``es-ES-x-icu``) — NO el locale del ``LC_COLLATE`` de la BD, que es otro espacio
+    de valores. Es ``None`` cuando la columna NO tiene un ``COLLATE`` explícito: en ese caso
+    hereda la collation por defecto de la base (``is_default_collation=True``).
+
+    ``data_type`` es el tipo EXACTO tal como lo reporta el catálogo del motor
+    (``format_type``: ``text``, ``character varying(255)``, ``citext``…). Se conserva
+    verbatim porque el ``ALTER TABLE ... ALTER COLUMN ... TYPE`` que cambia la collation
+    tiene que repetir el MISMO tipo con sus parámetros: cambiarlo por descuido convertiría
+    una operación de collation en una migración de tipos.
+    """
+
+    name: str
+    data_type: str
+    current_collation: str | None = None
+    is_default_collation: bool = False
+
+
+class TableCollationInfo(BaseModel):
+    """
+    Charset/collation ACTUAL de una tabla + cuántas de sus columnas de texto están en
+    una collation distinta de la pedida.
+
+    ``mismatched_columns`` es la parte que no se puede deducir de ``collation``: una tabla
+    cuyo default YA es el objetivo puede tener columnas con ``COLLATE`` explícito distinto
+    (MySQL/MariaDB lo permiten por columna). Decidir "esta tabla no necesita conversión"
+    mirando solo el default sería incorrecto, y ``ALTER TABLE ... CONVERT TO CHARACTER SET``
+    REESCRIBE la tabla completa, así que saltearla cuando no hace falta es un ahorro real.
+
+    ``columns`` SOLO se llena en el modo ``columns`` (PostgreSQL). En MySQL/MariaDB queda
+    ``None`` (no ``[]``: la diferencia entre "este motor no reporta columnas acá" y "esta
+    tabla no tiene columnas de texto" es informativa para el frontend). En PostgreSQL
+    ``charset``/``collation`` van siempre en ``None``: no existe charset por tabla y la
+    collation es un atributo de COLUMNA, no de tabla.
+    """
+
+    name: str
+    charset: str | None = None
+    collation: str | None = None
+    mismatched_columns: int = 0
+    needs_conversion: bool = True
+    columns: list[ColumnCollationInfo] | None = None
+
+
+class CollationGroup(BaseModel):
+    """
+    Cuántas tablas comparten un mismo par (charset, collation). Resumen del inventario.
+
+    ``column_count`` solo se llena en el modo ``columns`` (PostgreSQL), donde el resumen
+    agrupa por la collation de las COLUMNAS: ``table_count`` pasa a ser "en cuántas tablas
+    aparece esta collation" y ``column_count`` "cuántas columnas la usan". En MySQL/MariaDB
+    queda ``None`` y ``table_count`` conserva su significado original.
+    """
+
+    charset: str | None = None
+    collation: str | None = None
+    table_count: int = 0
+    column_count: int | None = None
+
+
+class CollationOptionInfo(BaseModel):
+    """
+    Una collation DISPONIBLE en el servidor destino (fila de ``pg_collation``).
+
+    Es un catálogo POR SERVIDOR y se lee EN VIVO: qué collations existen depende de los
+    locales instalados en el SO de esa máquina (y de si el binario trae ICU), así que no
+    hay lista global posible. NO se confunde con ``charset_collation_options`` (el catálogo
+    global del gateway), que describe el ``ENCODING``/``LC_COLLATE`` con el que se CREA una
+    base: son dos espacios de valores distintos.
+
+    ``deterministic=False`` (PostgreSQL 12+, solo ICU) tiene consecuencias reales: esas
+    collations no admiten comparación por patrón (``LIKE``, expresiones regulares) ni los
+    operadores ``*_pattern_ops`` de índice.
+    """
+
+    name: str
+    provider: str | None = None  # 'c' (libc) | 'i' (ICU) | 'd' (default) | 'b' (builtin, PG17)
+    deterministic: bool = True
+
+
+class CollatableForeignKey(BaseModel):
+    """
+    Un par de columnas COLACIONABLES unidas por una FOREIGN KEY dentro de una misma BD.
+
+    Existe para advertir sobre una conversión PARCIAL en PostgreSQL: si un lado queda con
+    una collation explícita y el otro con otra, las comparaciones entre ambos fallan al
+    ejecutarse. Es el análogo del aviso de FK del modo ``universal``, pero con la semántica
+    de PostgreSQL (conflicto en tiempo de CONSULTA), no la de MySQL (rechazo del DDL).
+    """
+
+    constraint: str | None = None
+    table: str
+    column: str
+    referenced_table: str
+    referenced_column: str
+
+
+class CollationObjectInfo(BaseModel):
+    """
+    Uno de los CINCO tipos de objeto cuyo collation queda CONGELADO en el momento de su
+    creación (PROCEDURE, FUNCTION, TRIGGER, EVENT, VIEW).
+
+    ``collation_connection`` es la collation de la SESIÓN que creó el objeto: es la que
+    heredaron los parámetros ``VARCHAR``/``CHAR`` de una rutina, las variables ``DECLARE``
+    de un trigger/evento y los literales de texto del cuerpo de una vista. NO es "la
+    collation del objeto" en sentido estricto (un objeto no tiene una), pero es LA señal de
+    qué quedó desactualizado tras cambiar el collation de la BD/tablas.
+
+    ``database_collation`` es el default que tenía la BD en ese momento. ``None`` cuando el
+    motor no lo expone para ese tipo de objeto (``information_schema.VIEWS`` no trae esa
+    columna) o cuando la consulta no pudo leerlo.
+    """
+
+    object_type: str  # procedure | function | trigger | event | view
+    name: str
+    character_set_client: str | None = None
+    collation_connection: str | None = None
+    database_collation: str | None = None
+    is_outdated: bool = Field(
+        False,
+        description=(
+            "True si collation_connection difiere de la collation objetivo: el objeto "
+            "necesita DROP+CREATE para dejar de arrastrar la collation vieja."
+        ),
+    )
+
+
+class CollationInventory(BaseModel):
+    """
+    Inventario de conversión de charset/collation de una BD MySQL/MariaDB: default de la
+    BD, tablas con su collation actual, resumen agrupado y los 5 tipos de objeto con
+    collation congelado.
+
+    ``notes`` lleva avisos de lectura parcial (p. ej. ``information_schema.EVENTS`` ausente
+    en una instalación mínima): la lectura es best-effort por consulta, nunca aborta el
+    inventario completo.
+
+    En el modo ``columns`` (PostgreSQL) el mismo DTO se llena distinto y a propósito:
+    ``objects`` es SIEMPRE ``[]`` (PostgreSQL resuelve la collation dinámicamente: no hay
+    nada congelado que recrear), cada tabla trae sus ``columns``, y ``available_collations``
+    trae el catálogo VIVO de ``pg_collation`` de ese servidor.
+    """
+
+    database: str
+    engine: str
+    db_charset: str | None = None
+    db_collation: str | None = None
+    target_charset: str | None = None
+    target_collation: str | None = None
+    tables: list[TableCollationInfo] = Field(default_factory=list)
+    summary: list[CollationGroup] = Field(default_factory=list)
+    objects: list[CollationObjectInfo] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    available_collations: list[CollationOptionInfo] = Field(
+        default_factory=list,
+        description=(
+            "Collations que EXISTEN en este servidor (modo columns/PostgreSQL). Vacío en "
+            "MySQL/MariaDB, donde el objetivo se valida contra el catálogo global."
+        ),
+    )
+
+
+class RoutineGrantInfo(BaseModel):
+    """
+    Un privilegio a nivel de RUTINA (``EXECUTE`` / ``ALTER ROUTINE`` / ``GRANT OPTION``)
+    sobre una PROCEDURE o FUNCTION concreta.
+
+    Existe porque MySQL/MariaDB BORRAN los privilegios de rutina al hacer ``DROP
+    PROCEDURE``/``DROP FUNCTION`` (viven en ``mysql.procs_priv``, con la rutina como parte
+    de la clave): recrear la rutina sin reaplicarlos la deja sin permisos y rompe a quien
+    la invocaba. Las TABLAS, TRIGGERS y EVENTS no necesitan esto (un trigger/evento no
+    tiene privilegios propios; una tabla no se dropea en esta operación).
+    """
+
+    username: str
+    host: str = "%"
+    routine_type: str  # PROCEDURE | FUNCTION
+    routine_name: str
+    privileges: list[str] = Field(default_factory=list)
+    grant_option: bool = False

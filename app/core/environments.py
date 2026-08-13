@@ -138,6 +138,16 @@ CLONE_DATA_BATCH_ROWS = int(os.getenv("CLONE_DATA_BATCH_ROWS", "1000"))
 # al INSERT parametrizado por lotes (executemany) sin necesidad de re-desplegar código.
 CLONE_BULK_COPY_ENABLED = os.getenv("CLONE_BULK_COPY_ENABLED", "True").lower() == "true"
 
+# ======= Conversión de charset/collation (collation conversions) ======= #
+# Vida útil (horas) de un plan de conversión. Tras expirar, execute exige replanear.
+COLLATION_CONVERSION_TTL_HOURS = int(os.getenv("COLLATION_CONVERSION_TTL_HOURS", "24"))
+# Workers del pool in-process que ejecutan las conversiones en segundo plano. Igual que el
+# clon, NO es una cola durable: si el proceso se reinicia, los jobs en curso quedan
+# 'interrupted' (barrido en el lifespan) y se reintentan a mano. Default 1 a propósito: un
+# ``ALTER TABLE ... CONVERT TO CHARACTER SET`` reescribe la tabla completa y varios en
+# paralelo saturan el I/O del servidor destino.
+COLLATION_CONVERSION_MAX_WORKERS = int(os.getenv("COLLATION_CONVERSION_MAX_WORKERS", "1"))
+
 # ======= Consola SQL (ejecución de queries ad-hoc) ======= #
 # MODO SEGURO. True (default) = toda sentencia que no sea lectura pura exige el ciclo
 # preview→confirmación (token firmado + nombre de la BD), y la lista de sentencias

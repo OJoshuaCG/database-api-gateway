@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.routes.v1 import (
     auth,
     charset_collation_options,
+    collation_conversions,
     crypto,
     database_clones,
     database_models,
@@ -26,6 +27,7 @@ router.include_router(model_migrations.router)
 router.include_router(managed_databases.router)
 router.include_router(schema_comparisons.router)
 router.include_router(database_clones.router)
+router.include_router(collation_conversions.router)
 router.include_router(privileges.router)
 router.include_router(charset_collation_options.router)
 router.include_router(permission_profiles.router)

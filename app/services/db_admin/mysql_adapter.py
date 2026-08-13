@@ -8,6 +8,8 @@ Particularidades:
   gateway mantiene en su BD de metadatos, respaldado por `GRANT ALL ON db.*`.
 """
 
+from typing import ClassVar
+
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -20,6 +22,9 @@ from app.exceptions import AppHttpException
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.base_adapter import ServerAdapter
 from app.services.db_admin.dtos import (
+    CollationGroup,
+    CollationInventory,
+    CollationObjectInfo,
     DatabaseGranteeInfo,
     DumpStatement,
     EngineUserInfo,
@@ -28,9 +33,11 @@ from app.services.db_admin.dtos import (
     GrantInfo,
     GrantLevel,
     ObjectRef,
+    RoutineGrantInfo,
     RoutineInfo,
     RoutineParam,
     StructureDump,
+    TableCollationInfo,
     TriggerInfo,
     ViewInfo,
 )
@@ -398,6 +405,492 @@ class MySQLAdapter(ServerAdapter):
             for (u, h), e in agg.items()
             if e["privs"]
         ]
+
+    # ------------- conversión de charset/collation (universal MySQL/MariaDB) -- #
+    # MySQL/MariaDB son los ÚNICOS motores con el problema que este bloque resuelve, y la
+    # documentación oficial de MySQL lo dice sin ambigüedad (ALTER DATABASE):
+    #   "If you change the default character set or collation for a database, any stored
+    #    routines that are to use the new defaults must be dropped and recreated."
+    # El motor CONGELA en cada PROCEDURE/FUNCTION/TRIGGER/EVENT/VIEW la ``collation_connection``
+    # de la sesión que lo creó (es la que heredan los parámetros VARCHAR/CHAR de una rutina,
+    # las variables DECLARE de un trigger/evento y los literales del cuerpo de una vista).
+    # No existe ALTER que cambie eso: la única vía es DROP + CREATE con el MISMO cuerpo.
+    supports_collation_conversion = True
+
+    # (object_type, tabla de information_schema, columna del nombre, columna del schema,
+    #  ¿expone DATABASE_COLLATION?). VERIFICADO contra la doc oficial de MySQL 8.0/8.4 y
+    # MariaDB 10.x/11.x: ROUTINES/TRIGGERS/EVENTS traen las TRES columnas, pero
+    # ``information_schema.VIEWS`` NO tiene ``DATABASE_COLLATION`` en NINGUNO de los dos
+    # motores (su lista documentada son 10 columnas en MySQL; MariaDB agrega ALGORITHM, no
+    # DATABASE_COLLATION). Pedirla en el SELECT de VIEWS haría fallar la consulta entera.
+    _FROZEN_OBJECT_SOURCES: tuple[tuple[str, str, str, str, bool], ...] = (
+        # ROUTINES cubre procedure y function: el object_type real sale de ROUTINE_TYPE.
+        ("routine", "information_schema.ROUTINES", "ROUTINE_NAME", "ROUTINE_SCHEMA", True),
+        ("trigger", "information_schema.TRIGGERS", "TRIGGER_NAME", "TRIGGER_SCHEMA", True),
+        ("event", "information_schema.EVENTS", "EVENT_NAME", "EVENT_SCHEMA", True),
+        ("view", "information_schema.VIEWS", "TABLE_NAME", "TABLE_SCHEMA", False),
+    )
+
+    # object_type → (palabra de SHOW CREATE, candidatos de nombre de columna, índice fallback).
+    # Los índices/nombres replican los que ya usa ``dump_structure``/``_snapshot_*``.
+    _SHOW_CREATE_SPECS: ClassVar[dict[str, tuple[str, tuple[str, ...], int]]] = {
+        "procedure": ("PROCEDURE", ("Create Procedure",), 2),
+        "function": ("FUNCTION", ("Create Function",), 2),
+        "trigger": ("TRIGGER", ("SQL Original Statement",), 2),
+        "event": ("EVENT", ("Create Event",), 3),
+        "view": ("VIEW", ("Create View",), 1),
+    }
+
+    # Privilegios de rutina que el gateway sabe reaplicar. ``mysql.procs_priv.Proc_priv`` es
+    # un SET cuyos valores documentados son EXACTAMENTE 'Execute', 'Alter Routine' y 'Grant'
+    # (MySQL "Set-Type Privilege Column Values"; MariaDB idéntico). 'Grant' no es un
+    # privilegio que se pueda nombrar en un GRANT: se confiere con WITH GRANT OPTION.
+    _PROCS_PRIV_MAP: ClassVar[dict[str, str]] = {
+        "execute": "EXECUTE",
+        "alter routine": "ALTER ROUTINE",
+    }
+
+    @staticmethod
+    def _charset_of(collation: str | None, cs_by_collation: dict[str, str]) -> str | None:
+        """
+        Charset de una collation. ``information_schema.TABLES`` NO expone el charset de la
+        tabla (la doc de MySQL lo dice explícitamente: "The output does not explicitly list
+        the table default character set, but the collation name begins with the character
+        set name"), así que se resuelve contra ``information_schema.COLLATIONS`` y, si esa
+        consulta no estuvo disponible, se cae al prefijo del nombre.
+        """
+        if not collation:
+            return None
+        hit = cs_by_collation.get(collation.lower())
+        if hit:
+            return hit
+        return collation.split("_", 1)[0] or None
+
+    def _collation_charset_map(self, conn) -> dict[str, str]:
+        """``{collation_lower: charset}`` desde ``information_schema.COLLATIONS``."""
+        try:
+            rows = conn.execute(
+                text(
+                    "SELECT COLLATION_NAME, CHARACTER_SET_NAME "
+                    "FROM information_schema.COLLATIONS"
+                )
+            ).fetchall()
+        except SQLAlchemyError:
+            return {}
+        return {str(c).lower(): str(cs) for c, cs in rows if c and cs}
+
+    def _frozen_objects(
+        self, conn, database: str, notes: list[str]
+    ) -> list[CollationObjectInfo]:
+        """
+        Los 5 tipos con collation congelada, con su ``collation_connection``.
+
+        FAIL-CLOSED por FUENTE: cada tabla de ``information_schema`` se consulta por
+        separado y, si la consulta falla (columna ausente en una versión que no
+        contemplamos, ``EVENTS`` inexistente en una instalación mínima, permisos), se
+        reintenta pidiendo SOLO el nombre y se anota el motivo en ``notes``. Así el
+        objeto sigue apareciendo en el inventario (y podrá recrearse) aunque se pierda
+        la señal de "está desactualizado" — nunca se lo oculta en silencio.
+        """
+        out: list[CollationObjectInfo] = []
+        for otype, source, name_col, schema_col, has_db_coll in self._FROZEN_OBJECT_SOURCES:
+            cols = [name_col, "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION"]
+            if has_db_coll:
+                cols.append("DATABASE_COLLATION")
+            if otype == "routine":
+                cols.append("ROUTINE_TYPE")
+            select_list = ", ".join(cols)
+            rows = None
+            degraded = False
+            try:
+                rows = conn.execute(
+                    text(
+                        f"SELECT {select_list} FROM {source} "
+                        f"WHERE {schema_col} = :db ORDER BY {name_col}"
+                    ),
+                    {"db": database},
+                ).fetchall()
+            except SQLAlchemyError:
+                # Reintento degradado: solo el nombre (+ ROUTINE_TYPE para distinguir
+                # procedure de function, sin el cual el objeto no se puede ni recrear).
+                minimal = name_col + (", ROUTINE_TYPE" if otype == "routine" else "")
+                try:
+                    rows = conn.execute(
+                        text(
+                            f"SELECT {minimal} FROM {source} "
+                            f"WHERE {schema_col} = :db ORDER BY {name_col}"
+                        ),
+                        {"db": database},
+                    ).fetchall()
+                    degraded = True
+                    notes.append(
+                        f"No se pudo leer la collation de creación de los objetos de tipo "
+                        f"'{otype}' ({source}); se listan sin esa señal y se recrearán igual "
+                        f"si se seleccionan."
+                    )
+                except SQLAlchemyError:
+                    notes.append(
+                        f"No se pudieron listar los objetos de tipo '{otype}' ({source} no "
+                        f"disponible en este servidor); quedan FUERA de la conversión."
+                    )
+                    continue
+            for row in rows or []:
+                m = row._mapping
+                name = m[name_col]
+                if otype == "routine":
+                    rtype = str(m.get("ROUTINE_TYPE") or "").upper()
+                    real_type = "function" if rtype == "FUNCTION" else "procedure"
+                else:
+                    real_type = otype
+                out.append(
+                    CollationObjectInfo(
+                        object_type=real_type,
+                        name=str(name),
+                        character_set_client=(
+                            None if degraded else (
+                                str(m["CHARACTER_SET_CLIENT"])
+                                if m.get("CHARACTER_SET_CLIENT") else None
+                            )
+                        ),
+                        collation_connection=(
+                            None if degraded else (
+                                str(m["COLLATION_CONNECTION"])
+                                if m.get("COLLATION_CONNECTION") else None
+                            )
+                        ),
+                        database_collation=(
+                            None if (degraded or not has_db_coll) else (
+                                str(m["DATABASE_COLLATION"])
+                                if m.get("DATABASE_COLLATION") else None
+                            )
+                        ),
+                    )
+                )
+        return out
+
+    def collation_inventory(
+        self, database: str, *, target_collation: str | None = None
+    ) -> CollationInventory:
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        target_norm = (target_collation or "").lower() or None
+        notes: list[str] = []
+        try:
+            with database_connection(self.target, database) as conn:
+                cs_by_coll = self._collation_charset_map(conn)
+
+                db_row = conn.execute(
+                    text(
+                        "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME "
+                        "FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = :db"
+                    ),
+                    {"db": database},
+                ).fetchone()
+                db_charset = str(db_row[0]) if db_row and db_row[0] else None
+                db_collation = str(db_row[1]) if db_row and db_row[1] else None
+
+                # Tablas base. Se EXCLUYE la contabilidad interna del gateway
+                # (``_gw_v_*``/``_gw_stg_*``): es el mismo invariante que respetan los otros
+                # cuatro caminos que enumeran tablas (ver identifiers.GATEWAY_TABLE_PREFIXES).
+                # No es esquema del usuario y no debe aparecer en una selección suya.
+                table_rows = conn.execute(
+                    text(
+                        "SELECT TABLE_NAME, TABLE_COLLATION FROM information_schema.TABLES "
+                        "WHERE TABLE_SCHEMA = :db AND TABLE_TYPE = 'BASE TABLE' "
+                        "ORDER BY TABLE_NAME"
+                    ),
+                    {"db": database},
+                ).fetchall()
+                visible = set(exclude_gateway_internal_tables(r[0] for r in table_rows))
+
+                # Collation POR COLUMNA. Imprescindible: una tabla cuyo TABLE_COLLATION ya
+                # es el objetivo puede tener columnas con COLLATE explícito distinto, así que
+                # decidir "no necesita conversión" mirando solo el default sería incorrecto.
+                # ``COLLATION_NAME IS NOT NULL`` deja fuera las columnas no textuales.
+                mismatch: dict[str, int] = {}
+                if target_norm:
+                    try:
+                        for tname, coll in conn.execute(
+                            text(
+                                "SELECT TABLE_NAME, COLLATION_NAME "
+                                "FROM information_schema.COLUMNS "
+                                "WHERE TABLE_SCHEMA = :db AND COLLATION_NAME IS NOT NULL"
+                            ),
+                            {"db": database},
+                        ).fetchall():
+                            if str(coll).lower() != target_norm:
+                                mismatch[str(tname)] = mismatch.get(str(tname), 0) + 1
+                    except SQLAlchemyError:
+                        notes.append(
+                            "No se pudo leer la collation por columna; las tablas se "
+                            "convertirán sin poder saltear las que ya estaban al día."
+                        )
+
+                tables: list[TableCollationInfo] = []
+                for name, coll in table_rows:
+                    if str(name) not in visible:
+                        continue
+                    collation = str(coll) if coll else None
+                    bad_cols = mismatch.get(str(name), 0)
+                    needs = True
+                    if target_norm:
+                        needs = (
+                            collation is None
+                            or collation.lower() != target_norm
+                            or bad_cols > 0
+                        )
+                    tables.append(
+                        TableCollationInfo(
+                            name=str(name),
+                            charset=self._charset_of(collation, cs_by_coll),
+                            collation=collation,
+                            mismatched_columns=bad_cols,
+                            needs_conversion=needs,
+                        )
+                    )
+
+                objects = self._frozen_objects(conn, database, notes)
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="collation_inventory", target=self.target,
+                extra={"database": database},
+            )
+
+        # Resumen agrupado por par (charset, collation): "cuántos collation distintos hay y
+        # cuántas tablas en cada uno".
+        counts: dict[tuple[str | None, str | None], int] = {}
+        for t in tables:
+            key = (t.charset, t.collation)
+            counts[key] = counts.get(key, 0) + 1
+        summary = [
+            CollationGroup(charset=cs, collation=co, table_count=n)
+            for (cs, co), n in sorted(
+                counts.items(), key=lambda kv: (-kv[1], str(kv[0][1] or ""))
+            )
+        ]
+
+        for obj in objects:
+            # Sin señal de collation (lectura degradada) NO se afirma que esté al día:
+            # fail-closed → se marca como desactualizado para que entre en la selección.
+            if target_norm is None:
+                obj.is_outdated = False
+            elif obj.collation_connection is None:
+                obj.is_outdated = True
+            else:
+                obj.is_outdated = obj.collation_connection.lower() != target_norm
+
+        return CollationInventory(
+            database=database,
+            engine=self.dialect,
+            db_charset=db_charset,
+            db_collation=db_collation,
+            target_charset=None,
+            target_collation=target_collation,
+            tables=tables,
+            summary=summary,
+            objects=objects,
+            notes=notes,
+        )
+
+    def capture_object_ddl(self, database: str, object_type: str, name: str) -> str:
+        """
+        DDL exacto de UN objeto vía ``SHOW CREATE``.
+
+        DIFERENCIA DELIBERADA con ``dump_structure``/el clon: acá el ``DEFINER`` **NO se
+        sanea**, se preserva VERBATIM. Aquellos cruzan de servidor, donde un DEFINER que no
+        existe en el destino rompe el CREATE; esta operación recrea el objeto en la MISMA BD
+        del MISMO servidor, así que el usuario del DEFINER sigue existiendo. Y quitarlo NO
+        sería neutro: una rutina/vista ``SQL SECURITY DEFINER`` pasaría a ejecutarse con la
+        credencial pseudo-root del gateway — una ESCALADA DE PRIVILEGIOS silenciosa. Si el
+        pseudo-root no tiene permiso para fijar un DEFINER ajeno (``SET_USER_ID``/``SUPER``),
+        el CREATE falla y el paso se reporta como error, que es el resultado correcto:
+        preferible a recrear el objeto con permisos distintos de los que tenía.
+        """
+        spec = self._SHOW_CREATE_SPECS.get(object_type)
+        if spec is None:
+            raise AppHttpException(
+                message="Tipo de objeto no soportado para captura de DDL.",
+                status_code=422,
+                context={"object_type": object_type},
+            )
+        keyword, candidates, fallback_idx = spec
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        q = quote_identifier(
+            validate_identifier(name, self.dialect, object_type, allow_existing=True),
+            self.dialect,
+        )
+        try:
+            with database_connection(self.target, database) as conn:
+                row = conn.execute(text(f"SHOW CREATE {keyword} {q}")).fetchone()
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="capture_object_ddl", target=self.target,
+                extra={"database": database, "object_type": object_type},
+            )
+        if row is None:
+            raise AppHttpException(
+                message="El objeto no existe en la base de datos.",
+                status_code=404,
+                context={"object_type": object_type, "name": name},
+            )
+        ddl = self._show_create_value(row, candidates, fallback_idx)
+        if not ddl or not str(ddl).strip():
+            # Un SHOW CREATE que devuelve vacío ocurre cuando el usuario no tiene permiso
+            # para ver el cuerpo. Recrear con eso destruiría el objeto: fail-closed.
+            raise AppHttpException(
+                message=(
+                    "El motor no devolvió el DDL del objeto (probable falta de permiso para "
+                    "ver su cuerpo); no se recreará."
+                ),
+                status_code=409,
+                context={"object_type": object_type, "name": name},
+            )
+        return str(ddl)
+
+    def routine_grants(
+        self, database: str, routine_type: str, name: str
+    ) -> list[RoutineGrantInfo]:
+        """
+        Privilegios a nivel de RUTINA sobre ``database.name``, leídos de
+        ``mysql.procs_priv``.
+
+        Hace falta porque MySQL/MariaDB los BORRAN al dropear la rutina. La doc de MySQL es
+        explícita: "MySQL does not automatically revoke any privileges when you drop a
+        database or table. However, if you drop a routine, any routine-level privileges
+        granted for that routine are revoked." MariaDB dice lo mismo. Es una ASIMETRÍA real
+        con las tablas (un DROP TABLE + CREATE TABLE sí conserva sus grants).
+
+        ``mysql.procs_priv`` es la ÚNICA fuente directa: ``information_schema`` NO tiene
+        tabla de privilegios de rutina (llega hasta ``COLUMN_PRIVILEGES`` y se saltea las
+        rutinas). Si no es legible, el fallback recorre ``SHOW GRANTS`` por usuario.
+        """
+        kind = "FUNCTION" if str(routine_type).upper() in ("FUNCTION", "FUNC") else "PROCEDURE"
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        validate_identifier(name, self.dialect, "rutina", allow_existing=True)
+        try:
+            with server_connection(self.target) as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT Host, User, Proc_priv FROM mysql.procs_priv "
+                        "WHERE Db = :db AND Routine_name = :n AND Routine_type = :t"
+                    ),
+                    {"db": database, "n": name, "t": kind},
+                ).fetchall()
+        except SQLAlchemyError:
+            return self._routine_grants_via_show(database, kind, name)
+        out: list[RoutineGrantInfo] = []
+        for host, user, proc_priv in rows:
+            tokens = [t.strip().lower() for t in str(proc_priv or "").split(",") if t.strip()]
+            privs = sorted({self._PROCS_PRIV_MAP[t] for t in tokens if t in self._PROCS_PRIV_MAP})
+            grant_option = "grant" in tokens
+            if not privs and not grant_option:
+                continue
+            out.append(
+                RoutineGrantInfo(
+                    username=str(user), host=str(host or "%"), routine_type=kind,
+                    routine_name=name, privileges=privs, grant_option=grant_option,
+                )
+            )
+        return out
+
+    def _routine_grants_via_show(
+        self, database: str, kind: str, name: str
+    ) -> list[RoutineGrantInfo]:
+        """
+        Fallback de ``routine_grants`` cuando ``mysql.procs_priv`` no es legible: recorre
+        ``SHOW GRANTS FOR`` de cada cuenta y filtra las líneas de ESTA rutina.
+
+        Es más caro (una consulta por cuenta) y menos preciso, así que es el plan B. Si
+        TAMBIÉN falla, propaga la excepción: el controller la traduce en "no se pudieron
+        leer los grants" y NO dropea la rutina (ver ``CollationConversionController``) —
+        dropearla a ciegas destruiría privilegios sin posibilidad de restaurarlos.
+        """
+        target_a = f"{quote_identifier(database, self.dialect)}.{quote_identifier(name, self.dialect)}"
+        target_b = f"{database}.{name}"
+        out: list[RoutineGrantInfo] = []
+        with server_connection(self.target) as conn:
+            accounts = conn.execute(
+                text(
+                    "SELECT User, Host FROM mysql.user "
+                    f"WHERE User NOT IN ({_in_list(_SYSTEM_USERS)})"
+                )
+            ).fetchall()
+            for user, host in accounts:
+                try:
+                    grantee = self._user_at_host(str(user), str(host or "%"))
+                    lines = conn.execute(text(f"SHOW GRANTS FOR {grantee}")).fetchall()
+                except SQLAlchemyError:
+                    continue  # cuenta ilegible/borrada entre consultas: no bloquea al resto
+                for row in lines:
+                    line = str(row[0])
+                    upper = line.upper()
+                    if f" ON {kind} " not in upper:
+                        continue
+                    if target_a not in line and target_b not in line:
+                        continue
+                    privs = sorted(
+                        {
+                            canon
+                            for token, canon in self._PROCS_PRIV_MAP.items()
+                            if token.upper() in upper
+                        }
+                    )
+                    if "ALL PRIVILEGES" in upper:
+                        privs = sorted(set(self._PROCS_PRIV_MAP.values()))
+                    if not privs and "WITH GRANT OPTION" not in upper:
+                        continue
+                    out.append(
+                        RoutineGrantInfo(
+                            username=str(user), host=str(host or "%"), routine_type=kind,
+                            routine_name=name, privileges=privs,
+                            grant_option="WITH GRANT OPTION" in upper,
+                        )
+                    )
+        return out
+
+    def apply_routine_grants(self, database: str, grants: list[RoutineGrantInfo]) -> int:
+        """
+        Reaplica los privilegios de rutina capturados antes del DROP.
+
+        ``GRANT ... ON PROCEDURE|FUNCTION `db`.`rutina` TO 'u'@'h'`` es sintaxis válida en
+        MySQL 8 y MariaDB (ambos documentan ``object_type: TABLE | FUNCTION | PROCEDURE`` y
+        el ``priv_level`` ``db_name.routine_name``). Los privilegios salen del mapa cerrado
+        ``_PROCS_PRIV_MAP`` (nunca del texto del motor) y el grantee pasa por whitelist +
+        quoting como string literal, igual que el resto del DCL del adapter.
+        """
+        if not grants:
+            return 0
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        db_q = quote_identifier(database, self.dialect)
+        allowed = set(self._PROCS_PRIV_MAP.values())
+        statements: list[str] = []
+        for g in grants:
+            kind = "FUNCTION" if g.routine_type.upper() == "FUNCTION" else "PROCEDURE"
+            validate_identifier(g.username, self.dialect, "usuario", allow_existing=True)
+            validate_host(g.host or "%")
+            rname_q = quote_identifier(
+                validate_identifier(g.routine_name, self.dialect, "rutina", allow_existing=True),
+                self.dialect,
+            )
+            privs = [p for p in g.privileges if p in allowed]
+            if not privs:
+                # Solo GRANT OPTION: USAGE es el privilegio "vacío" con el que se confiere
+                # la grant option sin otorgar nada más (mismo criterio que grant_object).
+                privs = ["USAGE"] if g.grant_option else []
+            if not privs:
+                continue
+            stmt = (
+                f"GRANT {', '.join(privs)} ON {kind} {db_q}.{rname_q} "
+                f"TO {self._user_at_host(g.username, g.host or '%')}"
+            )
+            if g.grant_option:
+                stmt += " WITH GRANT OPTION"
+            statements.append(stmt)
+        if not statements:
+            return 0
+        self._execute_server(
+            statements, op="apply_routine_grants", extra={"database": database}
+        )
+        return len(statements)
 
     def _user_at_host(self, username: str, host: str) -> str:
         """

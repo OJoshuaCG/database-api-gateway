@@ -29,10 +29,12 @@ async def lifespan(app: FastAPI):
     from app.core import crypto as _crypto
 
     _crypto.bootstrap_dek()
-    # Barrido: jobs de clonación que quedaron 'running' por un reinicio → 'interrupted'.
-    from app.services import clone_runner
+    # Barrido: jobs asíncronos que quedaron 'running' por un reinicio → 'interrupted'.
+    # Cada worker in-process tiene su propio barrido (los pools son independientes).
+    from app.services import clone_runner, collation_conversion_runner
 
     clone_runner.sweep_interrupted()
+    collation_conversion_runner.sweep_interrupted()
     yield
     # Apagado: liberar los engines de conexión a servidores destino.
     remote_engine.dispose_all()
