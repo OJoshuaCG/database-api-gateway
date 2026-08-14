@@ -448,7 +448,6 @@ GET /api/v1/charset-collation-options?engine_family=mysql&only_enabled=true
 
 ```json
 {
-  "success": true,
   "data": [
     {
       "id": 2,
@@ -482,7 +481,6 @@ GET /api/v1/charset-collation-options
 
 ```json
 {
-  "success": true,
   "data": [
     { "id": 5, "engine_family": "mysql", "charset": "latin1", "collation": "latin1_swedish_ci", "enabled": false, "is_default": false, "created_at": "2026-08-11T09:00:00Z", "updated_at": "2026-08-11T09:00:00Z" },
     { "id": 4, "engine_family": "mysql", "charset": "utf8mb3", "collation": "utf8mb3_general_ci", "enabled": false, "is_default": false, "created_at": "2026-08-11T09:00:00Z", "updated_at": "2026-08-11T09:00:00Z" },
@@ -555,7 +553,6 @@ Content-Type: application/json
 
 ```json
 {
-  "success": true,
   "message": "Combinación agregada al catálogo.",
   "data": {
     "id": 9,
@@ -660,7 +657,6 @@ Content-Type: application/json
 
 ```json
 {
-  "success": true,
   "message": "Catálogo actualizado.",
   "data": {
     "id": 3,
@@ -747,7 +743,6 @@ Content-Type: application/json
 
 ```json
 {
-  "success": true,
   "message": "Base de datos creada.",
   "data": {
     "database": "tienda_2026",
@@ -803,7 +798,6 @@ Content-Type: application/json
 
 ```json
 {
-  "success": true,
   "message": "Base de datos creada y aprovisionada en el motor.",
   "data": {
     "id": 88,
