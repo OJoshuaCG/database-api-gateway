@@ -33,6 +33,7 @@ from app.models.enums import (
     ServerStatus,
 )
 from app.models.managed_database import ManagedDatabase
+from app.models.migration_select_result import MigrationSelectResult
 from app.models.migration_statement_progress import MigrationStatementProgress
 from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
@@ -56,6 +57,7 @@ __all__ = [
     "ModelMigration",
     "DatabaseMigrationHistory",
     "MigrationStatementProgress",
+    "MigrationSelectResult",
     "ModelMigrationStatement",
     "AuditLog",
     "CryptoKey",

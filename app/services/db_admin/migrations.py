@@ -39,6 +39,7 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.core.environments import MIGRATION_CAPTURE_ENABLED
 from app.core.logger import get_logger
 from app.core.remote_engine import (
     ServerTarget,
@@ -48,7 +49,7 @@ from app.core.remote_engine import (
 )
 from app.exceptions import AppHttpException
 from app.models.enums import EngineType
-from app.services.db_admin import migration_progress
+from app.services.db_admin import migration_progress, migration_results
 from app.services.db_admin.identifiers import GATEWAY_TABLE_PREFIXES
 from app.services.db_admin.migration_integrity import validate_version, version_sort_key
 from app.services.db_admin.sql_dialect import (
@@ -104,6 +105,10 @@ class MigrationSpec:
     kind: str = "schema"  # 'schema' | 'data' (los datos no se traducen cross-engine)
     has_non_portable: bool = False  # rutinas/triggers/events no traducibles cross-engine
     source_engine: str | None = None  # motor para el que está renderizado el SQL/manifiesto
+    # OPT-IN: capturar el resultado de las sentencias de LECTURA de esta versión
+    # (``migration_results``). False = comportamiento histórico exacto, byte a byte: el
+    # archivo de revisión generado no contiene una sola línea de captura.
+    capture_selects: bool = False
     # Manifiesto de sentencias (vacío = no hay; se degrada a partir el blob con el
     # splitter, comportamiento histórico). Solo se usa si ``source_engine`` coincide con
     # el motor destino: el SQL traducido cross-engine puede no partirse igual.
@@ -135,6 +140,11 @@ class MigrationResult:
     resumed_from_statement: int | None = None
     statement_total: int | None = None
     failed_at_statement_index: int | None = None
+    # Capturas de SELECT que ESTA corrida escribió en la BD del gateway (ver
+    # ``migration_results.finalize``). Viaja en el resultado —en vez de contarse después con
+    # un ``COUNT``— porque la tabla acumula las capturas de corridas anteriores y ese conteo
+    # afirmaría escrituras que no ocurrieron.
+    captured_results: int = 0
 
 
 @dataclass(frozen=True)
@@ -399,6 +409,11 @@ class MigrationRunner:
                 managed_db_id, spec, "down", down_resumable, len(down_statements)
             )
 
+            # Captura de resultados de SELECT: opt-in POR MIGRACIÓN + kill switch global.
+            # Con ambos en su default (False / no opt-in) el archivo generado es
+            # BYTE A BYTE el de siempre — cero riesgo de regresión sobre el checkpoint.
+            capture = MIGRATION_CAPTURE_ENABLED and spec.capture_selects
+
             (versions_dir / f"rev_{spec.version}.py").write_text(
                 self._render_revision(
                     spec.version, prev, up_statements, down_statements,
@@ -407,6 +422,11 @@ class MigrationRunner:
                     migration_checksum=spec.checksum,
                     up_resumable=up_resumable, down_resumable=down_resumable,
                     up_resume_from=up_resume_from, down_resume_from=down_resume_from,
+                    capture=capture, engine=engine.value,
+                    # En modo transaccional (PostgreSQL) las capturas se bufferizan: escribir
+                    # en la BD del gateway con la transacción del destino abierta expone la
+                    # migración a ``idle_in_transaction_session_timeout``.
+                    capture_buffered=transactional,
                 ),
                 encoding="utf-8",
             )
@@ -472,6 +492,9 @@ class MigrationRunner:
         down_resumable: bool,
         up_resume_from: int,
         down_resume_from: int,
+        capture: bool = False,
+        engine: str = "",
+        capture_buffered: bool = False,
     ) -> str:
         """Genera el cuerpo de un archivo de revisión Alembic con op.execute().
 
@@ -482,27 +505,38 @@ class MigrationRunner:
         caso hace que un resume re-intente UNA sentencia ya aplicada (ruidoso, no
         silencioso). Los índices son ABSOLUTOS respecto al total original, aunque el
         archivo generado solo incluya las sentencias posteriores a ``*_resume_from``.
+
+        Con ``capture=True`` (opt-in de la versión), las sentencias de LECTURA pura se
+        emiten como ``migration_results.capture_statement(...)`` en vez de
+        ``exec_driver_sql`` directo: esa función ejecuta EL MISMO SQL y además guarda su
+        resultado. El resto de las sentencias no cambia, y con ``capture=False`` el archivo
+        es idéntico al histórico.
         """
-        up_body = MigrationRunner._render_statement_calls(
+        up_body, up_captured = MigrationRunner._render_statement_calls(
             up_statements, managed_db_id, migration_id, "up", migration_checksum,
             resumable=up_resumable, resume_from=up_resume_from,
+            capture=capture, engine=engine, capture_buffered=capture_buffered,
         )
 
+        down_captured = False
         if not down_statements:
             down_body = (
                 "    raise NotImplementedError("
                 f"'La migración {version} no tiene rollback (down_sql) confirmado.')"
             )
         else:
-            down_body = MigrationRunner._render_statement_calls(
+            down_body, down_captured = MigrationRunner._render_statement_calls(
                 down_statements, managed_db_id, migration_id, "down", migration_checksum,
                 resumable=down_resumable, resume_from=down_resume_from,
+                capture=capture, engine=engine, capture_buffered=capture_buffered,
             )
 
         needs_progress_import = up_resumable or down_resumable
         import_line = (
             "from app.services.db_admin import migration_progress\n" if needs_progress_import else ""
         )
+        if up_captured or down_captured:
+            import_line += "from app.services.db_admin import migration_results\n"
 
         return (
             "from alembic import op\n"
@@ -527,29 +561,55 @@ class MigrationRunner:
         *,
         resumable: bool,
         resume_from: int,
-    ) -> str:
+        capture: bool = False,
+        engine: str = "",
+        capture_buffered: bool = False,
+    ) -> tuple[str, bool]:
+        """
+        ``(cuerpo, se_emitió_alguna_captura)``. El booleano lo necesita ``_render_revision``
+        para decidir si el archivo importa ``migration_results`` — sin él habría que
+        recalcular ``is_capturable`` por sentencia una segunda vez.
+        """
         total = len(statements)
         if total == 0:
-            return "    pass"
+            return "    pass", False
         lines: list[str] = []
+        captured_any = False
         for i, stmt in enumerate(statements, start=1):
             if i <= resume_from:
-                continue  # ya ejecutada en un intento previo (checkpoint confirmado)
-            # ``exec_driver_sql`` (no ``op.execute``): ``op.execute`` con un str envuelve el
-            # SQL en ``sqlalchemy.text()``, que interpreta ``:nombre`` como bind param — un
-            # ``:`` LITERAL en el DDL (JSON en un COMMENT, ``::`` de PostgreSQL) rompía con
-            # "A value is required for bind parameter". ``exec_driver_sql`` pasa el SQL crudo
-            # al DBAPI sin ``text()``; a cambio hay que escapar ``%``→``%%`` (los drivers
-            # pyformat/format lo parsean). Mismo criterio que ``execute_adhoc``.
-            escaped = MigrationRunner._escape_percent(stmt)
-            lines.append(f"    op.get_bind().exec_driver_sql({escaped!r})")
+                # Ya ejecutada en un intento previo (checkpoint confirmado): no se re-ejecuta
+                # NI se re-captura — la captura de aquel intento se conserva tal cual.
+                continue
+            if capture and migration_results.is_capturable(stmt, engine=engine):
+                captured_any = True
+                # Se emite el SQL SIN escapar: ``capture_statement`` aplica el MISMO
+                # ``_escape_percent`` antes de ejecutar (una sola fuente del escapado) y
+                # necesita el texto original para el hash y el informe.
+                lines.append(
+                    "    migration_results.capture_statement("
+                    f"op.get_bind(), {stmt!r}, "
+                    f"managed_database_id={managed_db_id!r}, "
+                    f"model_migration_id={migration_id!r}, "
+                    f"direction={direction!r}, statement_index={i!r}, "
+                    f"migration_checksum={migration_checksum!r}, "
+                    f"buffered={capture_buffered!r})"
+                )
+            else:
+                # ``exec_driver_sql`` (no ``op.execute``): ``op.execute`` con un str envuelve el
+                # SQL en ``sqlalchemy.text()``, que interpreta ``:nombre`` como bind param — un
+                # ``:`` LITERAL en el DDL (JSON en un COMMENT, ``::`` de PostgreSQL) rompía con
+                # "A value is required for bind parameter". ``exec_driver_sql`` pasa el SQL crudo
+                # al DBAPI sin ``text()``; a cambio hay que escapar ``%``→``%%`` (los drivers
+                # pyformat/format lo parsean). Mismo criterio que ``execute_adhoc``.
+                escaped = MigrationRunner._escape_percent(stmt)
+                lines.append(f"    op.get_bind().exec_driver_sql({escaped!r})")
             if resumable:
                 lines.append(
                     "    migration_progress.record_statement("
                     f"{managed_db_id!r}, {migration_id!r}, {direction!r}, {i!r}, "
                     f"{total!r}, {migration_checksum!r})"
                 )
-        return "\n".join(lines) or "    pass"
+        return ("\n".join(lines) or "    pass"), captured_any
 
     def _make_config(self, versions_dir: Path, connection, version_table: str) -> Config:
         cfg = Config()
@@ -744,6 +804,10 @@ class MigrationRunner:
         falle (la BD queda en la última versión aplicada con éxito).
         """
         results: list[MigrationResult] = []
+        # MISMO criterio que ``_prepared`` (función determinística): decide si el DDL corre
+        # transaccional y, con eso, si las capturas de SELECT se bufferizan hasta conocer el
+        # desenlace de la transacción.
+        transactional = self.use_transactional_ddl(engine, specs)
         with self._prepared(
             target, db_name=db_name, slug=slug, engine=engine, specs=specs,
             managed_db_id=managed_db_id, op="migration_apply",
@@ -755,7 +819,8 @@ class MigrationRunner:
                 # difiere, _resolve_resume_offset dispara un 409 espurio.
                 up_total = len(self.statement_lists(spec, engine)[0])
                 result = self._apply_one(
-                    cfg, spec, managed_db_id=managed_db_id, statement_total=up_total
+                    cfg, spec, managed_db_id=managed_db_id, statement_total=up_total,
+                    buffered=transactional,
                 )
                 results.append(result)
                 if result.status == "failed":
@@ -780,15 +845,27 @@ class MigrationRunner:
             pass  # la conexión se cierra igual al salir de _prepared
 
     def _apply_one(
-        self, cfg: Config, spec: MigrationSpec, *, managed_db_id: int, statement_total: int
+        self, cfg: Config, spec: MigrationSpec, *, managed_db_id: int,
+        statement_total: int, buffered: bool = False,
     ) -> MigrationResult:
         """
         Aplica UNA migración. Antes de ejecutar, consulta si hay un checkpoint de
         sentencia (resume de un fallo parcial previo) para reportarlo en el resultado;
         el archivo de revisión que realmente ejecuta ``command.upgrade`` ya fue generado
         (en ``_write_revision_files``) solo con las sentencias restantes si corresponde.
+
+        ``buffered=True`` (modo transaccional / PostgreSQL) significa que las capturas de
+        SELECT quedaron en memoria: se vuelcan al salir de ``command.upgrade`` —por éxito o
+        por excepción—, que es el único punto donde se sabe si la transacción del destino
+        confirmó o se revirtió. En AUTOCOMMIT ya se escribieron y el volcado es un no-op; el
+        flag también fija la durabilidad que se registra ante un fallo (ver el ``except``),
+        con el mismo criterio que ``rollback_to``.
         """
         t0 = time.monotonic()
+        # Barrido defensivo del buffer en memoria antes de ejecutar: si un intento previo
+        # murió por un BaseException entre una captura y su finalize, sus filas seguirían
+        # acumuladas en el proceso y se volcarían acá con la durabilidad de ESTA corrida.
+        migration_results.begin(managed_db_id, spec.id, "up")
         pre = migration_progress.get_progress(managed_db_id, spec.id, "up")
         resumed_from = (
             pre.last_statement_index
@@ -801,6 +878,10 @@ class MigrationRunner:
             with _ALEMBIC_LOCK:
                 command.upgrade(cfg, spec.version)
             ms = int((time.monotonic() - t0) * 1000)
+            # Capturas de SELECT: la transacción (si hubo) confirmó.
+            captured = migration_results.finalize(
+                managed_db_id, spec.id, "up", committed=True
+            )
             # Éxito total de la dirección: el checkpoint ya no hace falta.
             migration_progress.clear_progress(managed_db_id, spec.id, "up")
             return MigrationResult(
@@ -808,10 +889,19 @@ class MigrationRunner:
                 error=None, execution_ms=ms, applied_at=datetime.now(timezone.utc),
                 resumed=resumed_from is not None, resumed_from_statement=resumed_from,
                 statement_total=statement_total, failed_at_statement_index=None,
+                captured_results=captured,
             )
         except Exception as exc:  # noqa: BLE001 — registrar fallo y detener cadena
             ms = int((time.monotonic() - t0) * 1000)
             logger.warning("Falló la migración %s: %s", spec.version, exc, exc_info=True)
+            # Capturas bufferizadas (PostgreSQL): la transacción se revirtió, así que lo
+            # capturado describe datos que el motor DESHIZO. Se persiste igual —es
+            # diagnóstico válido, y es justo el caso para el que existe la feature— pero
+            # marcado ``rolled_back`` para que nadie lo lea como estado final. En AUTOCOMMIT
+            # no hay buffer: las capturas ya se escribieron como ``committed``.
+            captured = migration_results.finalize(
+                managed_db_id, spec.id, "up", committed=not buffered
+            )
             post = migration_progress.get_progress(managed_db_id, spec.id, "up")
             failed_at = (
                 post.last_statement_index + 1
@@ -824,6 +914,7 @@ class MigrationRunner:
                 applied_at=datetime.now(timezone.utc),
                 resumed=resumed_from is not None, resumed_from_statement=resumed_from,
                 statement_total=statement_total, failed_at_statement_index=failed_at,
+                captured_results=captured,
             )
 
     def rollback_to(
@@ -850,6 +941,9 @@ class MigrationRunner:
         results: list[MigrationResult] = []
         to_key = version_sort_key(to_version) if to_version is not None else None
         by_version = {s.version: s for s in specs}
+        # Igual que en ``apply``: define si las capturas de SELECT del ``down_sql`` se
+        # bufferizan hasta conocer el desenlace de la transacción del destino.
+        transactional = self.use_transactional_ddl(engine, specs)
         with self._prepared(
             target, db_name=db_name, slug=slug, engine=engine, specs=specs,
             managed_db_id=managed_db_id, op="migration_rollback",
@@ -875,12 +969,21 @@ class MigrationRunner:
                     else None
                 )
                 t0 = time.monotonic()
+                if spec:
+                    # Barrido defensivo (ver ``_apply_one``).
+                    migration_results.begin(managed_db_id, mig_id, "down")
+                captured = 0
                 try:
                     with _ALEMBIC_LOCK:
                         command.downgrade(cfg, "-1")
                 except Exception as exc:  # noqa: BLE001 — registrar fallo y detener
                     ms = int((time.monotonic() - t0) * 1000)
                     logger.warning("Falló el rollback de %s: %s", current, exc, exc_info=True)
+                    if spec:
+                        # Ver ``_apply_one``: bufferizado ⇒ la transacción se revirtió.
+                        captured = migration_results.finalize(
+                            managed_db_id, mig_id, "down", committed=not transactional
+                        )
                     post = (
                         migration_progress.get_progress(managed_db_id, mig_id, "down")
                         if spec else None
@@ -896,17 +999,22 @@ class MigrationRunner:
                         applied_at=datetime.now(timezone.utc),
                         resumed=resumed_from is not None, resumed_from_statement=resumed_from,
                         statement_total=down_total, failed_at_statement_index=failed_at,
+                        captured_results=captured,
                     ))
                     self._discard_failed_transaction(conn)
                     break
                 ms = int((time.monotonic() - t0) * 1000)
                 if spec:
+                    captured = migration_results.finalize(
+                        managed_db_id, mig_id, "down", committed=True
+                    )
                     migration_progress.clear_progress(managed_db_id, mig_id, "down")
                 results.append(MigrationResult(
                     migration_id=mig_id, version=current, status="applied",
                     error=None, execution_ms=ms, applied_at=datetime.now(timezone.utc),
                     resumed=resumed_from is not None, resumed_from_statement=resumed_from,
                     statement_total=down_total, failed_at_statement_index=None,
+                    captured_results=captured,
                 ))
                 new_current = self._read_current(conn, version_table)
                 # Salvaguarda anti-bucle: si el puntero no se movió, detener.

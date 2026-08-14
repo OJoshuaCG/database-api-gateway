@@ -136,7 +136,21 @@ class ModelMigration(Base, TimestampMixin):
         comment=(
             "Aprobación del admin (R1): las migraciones escritas a mano nacen True; un "
             "baseline de SNAPSHOT (DDL capturado del motor) nace False y NO se puede "
-            "aplicar hasta que se revise y apruebe (PATCH reviewed=true)"
+            "aplicar hasta que se revise y apruebe (PATCH reviewed=true). Una versión con "
+            "capture_selects=True también nace False"
+        ),
+    )
+
+    capture_selects: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+        comment=(
+            "OPT-IN explícito: si es True, los SELECT de esta versión guardan sus "
+            "resultados (cifrados) en migration_select_results al aplicarse/revertirse. "
+            "Es la única vía por la que el gateway persiste DATOS DE NEGOCIO, así que "
+            "además exige reviewed=true y el flag allow_result_capture en el apply"
         ),
     )
 

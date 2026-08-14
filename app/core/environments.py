@@ -173,6 +173,44 @@ QUERY_MAX_CELL_CHARS = int(os.getenv("QUERY_MAX_CELL_CHARS", "4096"))
 # Tope de caracteres del SQL que se PERSISTE en el historial (con contraseñas redactadas).
 QUERY_HISTORY_SQL_MAX_CHARS = int(os.getenv("QUERY_HISTORY_SQL_MAX_CHARS", "16384"))
 
+# ======= Captura de resultados de SELECT en migraciones de blueprint ======= #
+# KILL SWITCH global. False = ninguna migración captura resultados, ni con
+# capture_selects=true en la versión (el SQL se ejecuta exactamente igual que hoy: la
+# captura nunca cambia lo que corre en el motor). Es la salida de emergencia si esta
+# feature —la única que persiste datos de negocio en el gateway— hay que apagarla sin
+# tocar cada blueprint.
+MIGRATION_CAPTURE_ENABLED = (
+    os.getenv("MIGRATION_CAPTURE_ENABLED", "True").lower() == "true"
+)
+# Tope de filas capturadas por sentencia. El recorte es SOLO de la captura: el SQL que se
+# ejecuta jamás se reescribe (a diferencia de la consola SQL, que empuja un LIMIT al
+# motor) — el texto tiene que coincidir byte a byte con el del checksum de la migración.
+MIGRATION_CAPTURE_MAX_ROWS = int(os.getenv("MIGRATION_CAPTURE_MAX_ROWS", "100"))
+# Tope de caracteres por CELDA capturada (un BLOB/TEXT grande se recorta con marca).
+MIGRATION_CAPTURE_MAX_CELL_CHARS = int(
+    os.getenv("MIGRATION_CAPTURE_MAX_CELL_CHARS", "1024")
+)
+# Tope de bytes del JSON en claro de UNA captura (protege memoria del proceso y la BD del
+# gateway; el cifrado Fernet + base64 infla el valor almacenado ~1.4×).
+MIGRATION_CAPTURE_MAX_BYTES = int(
+    os.getenv("MIGRATION_CAPTURE_MAX_BYTES", str(256 * 1024))
+)
+# Tope de caracteres del SQL que se guarda junto a la captura (con contraseñas redactadas).
+MIGRATION_CAPTURE_SQL_MAX_CHARS = int(
+    os.getenv("MIGRATION_CAPTURE_SQL_MAX_CHARS", "4096")
+)
+# Retención (horas) de las capturas. Son datos de negocio: no se guardan indefinidamente.
+# La purga corre en el arranque (lifespan), se REPITE periódicamente mientras el proceso vive
+# (ver MIGRATION_CAPTURE_PURGE_INTERVAL_MINUTES) y también puede forzarse por endpoint.
+MIGRATION_CAPTURE_TTL_HOURS = int(os.getenv("MIGRATION_CAPTURE_TTL_HOURS", "168"))
+# Cada cuánto se repite la purga por TTL mientras el proceso corre. Solo con la purga del
+# arranque, un gateway que vive semanas (lo normal) NUNCA volvía a purgar: el TTL era una
+# promesa falsa en producción y las capturas se acumulaban indefinidamente. `0` desactiva la
+# tarea periódica (queda solo la del arranque + la purga manual por endpoint).
+MIGRATION_CAPTURE_PURGE_INTERVAL_MINUTES = int(
+    os.getenv("MIGRATION_CAPTURE_PURGE_INTERVAL_MINUTES", "60")
+)
+
 # ======= Anti-SSRF (validación de host destino) ======= #
 # Si True (default), al registrar/editar un Server se rechazan destinos peligrosos
 # (loopback, link-local/metadata 169.254.169.254, multicast, reservados). Los rangos
