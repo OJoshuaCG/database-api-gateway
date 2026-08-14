@@ -146,10 +146,38 @@ _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
 # trae comentarios antes (el caso normal de un dump o de SQL escrito a mano).
 _LEADING_NOISE_RE = re.compile(r"(?:\s+|--[^\n]*\n?|\#[^\n]*\n?|/\*.*?\*/)*", re.DOTALL)
 
+# Igual que el anterior pero SIN tratar ``#`` como comentario. En PostgreSQL ``#`` **no** es
+# un comentario: es el operador XOR de enteros (mismo matiz que resuelve
+# ``query_policy._scan_normalize``, y por el mismo motivo — descartar código ejecutable como
+# si fuera un comentario es un agujero, no una simplificación).
+_LEADING_NOISE_NO_HASH_RE = re.compile(r"(?:\s+|--[^\n]*\n?|/\*.*?\*/)*", re.DOTALL)
+
+
+def strip_leading_noise(text: str, *, hash_is_comment: bool = True) -> str:
+    """
+    ``text`` sin los blancos ni los comentarios INICIALES: devuelve el primer texto
+    ejecutable de la sentencia.
+
+    Existe para que cualquier pre-filtro que mire "con qué palabra arranca esta sentencia"
+    use UN solo criterio de comentarios (el del splitter). ``split_sql_statements`` CONSERVA
+    los comentarios dentro de la sentencia que emite, así que una sentencia real casi siempre
+    empieza con el comentario que la explica.
+
+    ``hash_is_comment=False`` para PostgreSQL (ver ``_LEADING_NOISE_NO_HASH_RE``). El default
+    es ``True`` porque el splitter es agnóstico del motor y su comportamiento histórico
+    (``#`` como comentario) no cambia.
+
+    Un comentario de bloque SIN cerrar no se salta (la alternativa no matchea): el texto
+    vuelve tal cual y quien filtre verá algo que no arranca con una palabra clave —
+    fail-closed, que es lo que se quiere en un pre-filtro.
+    """
+    rx = _LEADING_NOISE_RE if hash_is_comment else _LEADING_NOISE_NO_HASH_RE
+    return text[rx.match(text).end() :]
+
 
 def _only_noise(text: str) -> bool:
     """True si ``text`` es solo blancos y/o comentarios (no hay SQL ejecutable)."""
-    return _LEADING_NOISE_RE.match(text).end() == len(text)
+    return not strip_leading_noise(text)
 
 
 def _word_at(sql: str, i: int) -> str | None:
