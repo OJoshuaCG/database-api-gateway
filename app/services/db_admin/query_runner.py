@@ -50,10 +50,7 @@ cursores server-side.
 
 import time
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, time as time_cls, timedelta
-from decimal import Decimal
 from typing import Any
-from uuid import UUID
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -61,6 +58,7 @@ from app.core.logger import get_logger
 from app.core.remote_engine import ServerTarget, database_connection, map_driver_error
 from app.services.db_admin.identifiers import quote_identifier
 from app.services.db_admin.query_policy import DDL, StatementPlan
+from app.services.db_admin.value_json import json_value
 
 logger = get_logger(__name__)
 
@@ -269,71 +267,10 @@ def _driver_failure(exc: Exception, seq: int) -> ExecError:
 # Normalización de valores para JSON                                           #
 # --------------------------------------------------------------------------- #
 
-
-_MAX_CONTAINER_ITEMS = 200
-_MAX_CONTAINER_DEPTH = 8
-
-
-def _json_value(value: Any, max_chars: int, depth: int = 0) -> Any:
-    """
-    Convierte un valor del driver a algo serializable a JSON, recortando celdas grandes.
-
-    ``Decimal`` se pasa a ``str`` a propósito (un float perdería precisión, que es justo
-    lo que se está inspeccionando en una consola). Los binarios se muestran en hexadecimal
-    con marca de recorte: una consola no debe volcar un BLOB entero por la API.
-    """
-    if value is None or isinstance(value, (bool, int)):
-        return value
-    if isinstance(value, float):
-        # NaN/Infinity no son JSON válido.
-        return value if value == value and abs(value) != float("inf") else str(value)
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        raw = bytes(value)
-        text = raw.hex()
-        if len(text) > max_chars:
-            return f"0x{text[:max_chars]}… ({len(raw)} bytes)"
-        return f"0x{text}"
-    if isinstance(value, (datetime, date, time_cls)):
-        return value.isoformat()
-    if isinstance(value, timedelta):
-        # El tipo TIME de MySQL/MariaDB llega como timedelta y admite valores negativos y
-        # mayores a 24 h. ``str()`` los rendea como ``-1 day, 23:00:00`` (para
-        # ``TIME '-01:00:00'``) o ``34 days, 22:00:00`` (para ``TIME '838:00:00'``):
-        # formalmente correcto e inservible en una consola. Se rearma como HH:MM:SS.
-        total = int(value.total_seconds())
-        sign = "-" if total < 0 else ""
-        total = abs(total)
-        return f"{sign}{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
-    if isinstance(value, UUID):
-        return str(value)
-    if isinstance(value, (set, frozenset)):
-        return sorted(str(v) for v in value)
-    # ``max_chars`` acota cada HOJA, no el total: un JSON/JSONB con miles de cadenas
-    # cortas se serializaría entero. ``_MAX_CONTAINER_ITEMS`` pone el techo de cardinalidad
-    # y ``depth`` corta la recursión de un documento profundo.
-    if isinstance(value, (list, tuple)):
-        if depth >= _MAX_CONTAINER_DEPTH:
-            return f"[…{len(value)} elementos]"
-        head = [_json_value(v, max_chars, depth + 1) for v in value[:_MAX_CONTAINER_ITEMS]]
-        if len(value) > _MAX_CONTAINER_ITEMS:
-            head.append(f"… ({len(value)} elementos en total)")
-        return head
-    if isinstance(value, dict):
-        if depth >= _MAX_CONTAINER_DEPTH:
-            return f"{{…{len(value)} claves}}"
-        items = list(value.items())[:_MAX_CONTAINER_ITEMS]
-        out = {str(k): _json_value(v, max_chars, depth + 1) for k, v in items}
-        if len(value) > _MAX_CONTAINER_ITEMS:
-            out["…"] = f"({len(value)} claves en total)"
-        return out
-    if isinstance(value, str):
-        if len(value) > max_chars:
-            return f"{value[:max_chars]}… (truncado, {len(value)} caracteres)"
-        return value
-    text = str(value)
-    return text if len(text) <= max_chars else f"{text[:max_chars]}…"
+# Vive en ``value_json`` porque la captura de resultados de SELECT dentro de una migración
+# (``migration_results``) necesita EXACTAMENTE el mismo criterio. Se mantiene el alias
+# privado para no cambiar los call-sites (ni los tests) de este módulo.
+_json_value = json_value
 
 
 # --------------------------------------------------------------------------- #
