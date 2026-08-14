@@ -63,9 +63,18 @@ def apply_all(
     dry_run: bool = Query(
         False, description="No aplica: devuelve el plan por BD (pendientes)."
     ),
+    allow_result_capture: bool = Query(
+        False,
+        description=(
+            "Consentimiento explícito para aplicar versiones con 'capture_selects=true': "
+            "esos SELECT guardan filas de CADA BD del blueprint (cifradas) en el gateway. "
+            "Sin este flag, una versión con captura pendiente devuelve 409 por BD."
+        ),
+    ),
 ):
     result = ManagedMigrationController().apply_all(
-        model_id, max_databases=max_databases, force=force, dry_run=dry_run, admin=admin
+        model_id, max_databases=max_databases, force=force, dry_run=dry_run,
+        allow_result_capture=allow_result_capture, admin=admin,
     )
     msg = "Plan masivo (dry-run)." if dry_run else "Aplicación masiva ejecutada."
     return success(data=result, message=msg)

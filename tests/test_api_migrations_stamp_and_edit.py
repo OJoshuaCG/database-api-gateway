@@ -270,3 +270,124 @@ def test_patch_up_sql_with_null_override_explicit_is_allowed(admin_client):
     # Sin override persistido, la traducción cross-engine se recalcula desde el nuevo
     # up_sql (ya no es el override viejo, que referenciaba t1/SERIAL).
     assert "t1_v3" in data["translated"]["postgresql"]
+
+
+# --------------------------------------------------------------------------- #
+# Versiones con CAPTURA: qué invalida la aprobación (reviewed) y qué purga       #
+# --------------------------------------------------------------------------- #
+def _capture_migration(admin_client, slug, *, up_sql, pg_override=None, down_sql=None):
+    """Blueprint con UNA versión que captura resultados, ya APROBADA (reviewed=true)."""
+    r = admin_client.post("/api/v1/database-models", json={"name": slug, "slug": slug})
+    assert r.status_code == 201, r.text
+    model_id = r.json()["data"]["id"]
+    payload = {"version": "0001", "name": "m1", "up_sql": up_sql, "capture_selects": True}
+    if pg_override is not None:
+        payload["up_sql_postgresql"] = pg_override
+    if down_sql is not None:
+        payload["down_sql"] = down_sql
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations", json=payload
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["data"]["reviewed"] is False  # nace SIN revisar
+    mig_id = r.json()["data"]["id"]
+    r = admin_client.patch(
+        f"/api/v1/database-models/{model_id}/migrations/0001", json={"reviewed": True}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["reviewed"] is True
+    return model_id, mig_id
+
+
+def test_limpiar_un_override_con_null_revoca_la_aprobacion(admin_client):
+    """
+    Lo que se aprueba es una CONSULTA CONCRETA, no la versión. Con
+    ``up_sql='SELECT * FROM clientes'`` + ``up_sql_postgresql='SELECT 1'``, aprobar y después
+    limpiar el override con ``null`` cambiaba el SQL efectivo de PostgreSQL al que EXTRAE datos
+    conservando ``reviewed=true``: el mismo agujero que el reset por cambio de SQL, por otra
+    puerta. El criterio es la PRESENCIA de la clave, no que traiga valor.
+    """
+    model_id, _ = _capture_migration(
+        admin_client, "cap-null", up_sql="SELECT * FROM clientes", pg_override="SELECT 1"
+    )
+    r = admin_client.patch(
+        f"/api/v1/database-models/{model_id}/migrations/0001",
+        json={"up_sql_postgresql": None},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["reviewed"] is False
+    assert r.json()["data"]["up_sql_postgresql"] is None
+
+
+def test_up_sql_null_no_cambia_nada_y_no_revoca(admin_client):
+    """``up_sql: null`` no se asigna (el SQL base no puede quedar vacío): no es un cambio."""
+    model_id, _ = _capture_migration(
+        admin_client, "cap-null-base", up_sql="SELECT 1"
+    )
+    r = admin_client.patch(
+        f"/api/v1/database-models/{model_id}/migrations/0001",
+        json={"up_sql": None, "name": "m1-renombrada"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["reviewed"] is True
+    assert r.json()["data"]["up_sql"] == "SELECT 1"
+
+
+def test_cambiar_solo_el_down_sql_purga_las_capturas_de_direccion_down(
+    admin_client, server_payload
+):
+    """
+    Cambiar el ``down_sql`` reordena ``down_statements``, así que una captura de dirección
+    ``down`` queda con su ``statement_index`` apuntando a OTRA sentencia. El checksum la
+    marcaba ``stale``, pero una fila incoherente que hay que interpretar es peor que ninguna.
+    """
+    from app.core import crypto
+    from app.core.database import Database
+    from app.models.migration_select_result import MigrationSelectResult
+
+    model_id, mig_id = _capture_migration(
+        admin_client, "cap-down", up_sql="SELECT 1", down_sql="SELECT 2"
+    )
+    db_id = _managed_db(admin_client, server_payload, model_id, name="capdb")
+
+    session = Database().get_declarative_base_session()
+    try:
+        session.add(
+            MigrationSelectResult(
+                managed_database_id=db_id,
+                model_migration_id=mig_id,
+                direction="down",
+                statement_index=1,
+                migration_checksum="chk",
+                sql_hash="h",
+                sql_text="SELECT 2",
+                status="ok",
+                durability="committed",
+                columns_json=crypto.encrypt('["c"]'),
+                rows_json=crypto.encrypt("[[1]]"),
+                row_count=1,
+                truncated=False,
+                payload_bytes=10,
+                captured_at=datetime(2026, 8, 14, 10, 0, 0),
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    r = admin_client.patch(
+        f"/api/v1/database-models/{model_id}/migrations/0001",
+        json={"down_sql": "SELECT 3; SELECT 4"},
+    )
+    assert r.status_code == 200, r.text
+
+    session = Database().get_declarative_base_session()
+    try:
+        restantes = (
+            session.query(MigrationSelectResult)
+            .filter(MigrationSelectResult.model_migration_id == mig_id)
+            .count()
+        )
+    finally:
+        session.close()
+    assert restantes == 0

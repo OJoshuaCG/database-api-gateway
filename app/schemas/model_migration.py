@@ -28,6 +28,17 @@ class ModelMigrationCreate(BaseModel):
         None, max_length=_MAX_SQL,
         description="Rollback confirmado (opcional). Si se omite, se sugiere uno auto-generado.",
     )
+    capture_selects: bool = Field(
+        False,
+        description=(
+            "OPT-IN: guardar el RESULTADO de las sentencias de lectura de esta versión "
+            "cuando se aplique/revierta (GET .../migrations/{version}/select-results). "
+            "Es la única vía por la que el gateway persiste datos de negocio, así que la "
+            "versión nace SIN revisar (reviewed=false → apply da 409 hasta aprobarla con "
+            "PATCH reviewed=true) y cada apply exige además allow_result_capture=true. "
+            "Los MISMOS dos controles rigen para el rollback: el down_sql también captura."
+        ),
+    )
 
 
 class ModelMigrationPatch(BaseModel):
@@ -49,7 +60,22 @@ class ModelMigrationPatch(BaseModel):
     up_sql_postgresql: str | None = Field(None, max_length=_MAX_SQL, description="Añade/actualiza override PostgreSQL")
     reviewed: bool | None = Field(
         None,
-        description="Aprueba (true) un baseline de snapshot tras revisar su DDL — habilita su apply (R1)",
+        description=(
+            "Aprueba (true) un baseline de snapshot tras revisar su DDL — habilita su apply "
+            "(R1). En una versión con 'capture_selects=true' la aprobación es de una "
+            "CONSULTA CONCRETA: si en la misma llamada (o en una posterior) cambia el SQL "
+            "('up_sql', overrides o 'down_sql'), se vuelve a poner en false automáticamente."
+        ),
+    )
+    capture_selects: bool | None = Field(
+        None,
+        description=(
+            "Activa/desactiva la captura de resultados de los SELECT de esta versión. "
+            "ACTIVARLA vuelve a poner reviewed=false (hay que re-aprobar la versión "
+            "sabiendo que va a extraer datos), y con la captura activa cualquier cambio de "
+            "SQL también revoca la aprobación; desactivarla no purga lo ya capturado — "
+            "para eso está DELETE .../migrations/{version}/select-results."
+        ),
     )
 
 
@@ -69,6 +95,7 @@ class ModelMigrationSummary(BaseModel):
     kind: str = "schema"
     is_baseline: bool = False
     reviewed: bool = True
+    capture_selects: bool = False
     created_at: datetime
 
 
@@ -102,6 +129,14 @@ class ModelMigrationOut(BaseModel):
     )
     reviewed: bool = Field(
         True, description="False = baseline de snapshot pendiente de revisión; no aplicable hasta aprobarse (R1)"
+    )
+    capture_selects: bool = Field(
+        False,
+        description=(
+            "True = los SELECT de esta versión guardan su resultado (cifrado) al aplicarse "
+            "O al revertirse (el down_sql captura igual que el up_sql). Requiere "
+            "reviewed=true y allow_result_capture=true en cada apply y en cada rollback."
+        ),
     )
     created_at: datetime
     updated_at: datetime
@@ -279,6 +314,20 @@ class MigrationApplyOut(BaseModel):
     dry_run: bool = False
     pending_versions: list[str] = Field(default_factory=list)
     results: list[MigrationResultOut] = Field(default_factory=list)
+    captured_select_count: int = Field(
+        0,
+        description=(
+            "Cuántas capturas de resultados de SELECT escribió ESTA corrida (no lo que haya "
+            "acumulado en la tabla de corridas anteriores: contarlo así afirmaba escrituras "
+            "que no habían ocurrido). Es un PUNTERO, no los datos: las filas nunca viajan acá "
+            "(con LOGGER_MIDDLEWARE_SHOW_BODY=true irían al log de aplicación). Se leen —las "
+            "de esta corrida y las anteriores— con "
+            "GET /managed-databases/{id}/migrations/{version}/select-results."
+        ),
+    )
+    select_results_available: bool = Field(
+        False, description="Atajo de captured_select_count > 0 para el frontend."
+    )
     reconciliation: MigrationAutoReconcileOut | None = Field(
         None,
         description=(
@@ -310,6 +359,90 @@ class MigrationRollbackOut(BaseModel):
     no_op: bool = False
     reverted_versions: list[str] = Field(default_factory=list)
     results: list[MigrationResultOut] = Field(default_factory=list)
+    captured_select_count: int = Field(
+        0,
+        description=(
+            "Capturas de SELECT que escribió ESTE rollback (puntero). 0 es lo normal cuando "
+            "el down_sql no tiene lecturas, aunque la versión sí tenga capturas de su apply: "
+            "esas se leen igual con GET .../select-results."
+        ),
+    )
+    select_results_available: bool = Field(
+        False, description="Atajo de captured_select_count > 0 para el frontend."
+    )
+
+
+class MigrationSelectResultItemOut(BaseModel):
+    """
+    UNA sentencia de lectura capturada dentro de una migración.
+
+    ``durability='rolled_back'`` (solo posible en PostgreSQL) significa que el motor deshizo
+    la transacción de la migración: las filas son diagnóstico de lo que se vio DURANTE el
+    intento, no el estado final de la BD.
+    """
+
+    statement_index: int = Field(
+        ..., description="Índice 1-based de la sentencia (el mismo que usa el checkpoint)"
+    )
+    direction: str = Field(..., description="'up' (apply) | 'down' (rollback)")
+    sql: str = Field(..., description="Sentencia capturada (recortada, sin contraseñas)")
+    sql_hash: str
+    status: str = Field(..., description="'ok' | 'error' (la sentencia corrió; la captura falló)")
+    durability: str = Field(..., description="'committed' | 'rolled_back' | 'unknown'")
+    columns: list[str] = Field(default_factory=list)
+    rows: list[list] = Field(
+        default_factory=list,
+        description="Filas como LISTAS (no dicts): una consulta puede repetir nombres de columna.",
+    )
+    row_count: int = 0
+    truncated: bool = Field(
+        False, description="True si el resultado real excedía los topes de filas/bytes."
+    )
+    payload_bytes: int = 0
+    error: str | None = None
+    captured_at: datetime
+    migration_checksum: str
+
+
+class MigrationSelectResultsOut(BaseModel):
+    """Capturas de una versión sobre UNA BD gestionada. Lectura AUDITADA (fail-closed)."""
+
+    managed_database_id: int
+    database_name: str | None = None
+    server_id: int | None = None
+    model_migration_id: int
+    version: str
+    capture_selects: bool = Field(
+        False, description="Si la versión tiene la captura habilitada actualmente."
+    )
+    stale: bool = Field(
+        False,
+        description=(
+            "True si alguna captura fue tomada con un checksum distinto al actual de la "
+            "versión: describe un SQL que ya cambió. (El PATCH que edita el SQL purga estas "
+            "filas, así que en la práctica solo se ve con datos previos a ese fix.)"
+        ),
+    )
+    expected_indexes: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Índices de sentencia que HOY serían capturables en el 'up' de esta versión "
+            "para el motor de esta BD. Se derivan en el momento de la lectura, no se "
+            "persisten."
+        ),
+    )
+    missing_indexes: list[int] = Field(
+        default_factory=list,
+        description=(
+            "De los esperados, los que no tienen captura: típicamente la migración falló "
+            "antes de llegar a esa sentencia, o se aplicó cuando la captura estaba apagada."
+        ),
+    )
+    durability_warning: str | None = Field(
+        None,
+        description="Presente si alguna captura quedó 'rolled_back' (el motor deshizo la migración).",
+    )
+    items: list[MigrationSelectResultItemOut] = Field(default_factory=list)
 
 
 class MigrationHistoryOut(BaseModel):

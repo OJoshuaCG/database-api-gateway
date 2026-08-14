@@ -1,10 +1,16 @@
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
 from app.core import remote_engine
 from app.core.auth import bootstrap_admin
-from app.core.environments import CORS_ORIGINS
+from app.core.environments import (
+    CORS_ORIGINS,
+    MIGRATION_CAPTURE_PURGE_INTERVAL_MINUTES,
+    MIGRATION_CAPTURE_TTL_HOURS,
+)
+from app.core.logger import get_logger
 from app.core.versioned_app import (
     PathScopedCORSMiddleware,
     cors_allow_credentials,
@@ -13,7 +19,38 @@ from app.core.versioned_app import (
 from app.routes.health import router as health_router
 from app.routes.v1.routes import router as v1_router
 from app.services.charset_catalog import seed_charset_options
+from app.services.db_admin import migration_results
 from app.services.privilege_catalog import seed_privileges
+
+logger = get_logger(__name__)
+
+
+async def _purge_captures_periodically(ttl_hours: int, interval_seconds: int) -> None:
+    """
+    Repite la purga por TTL de las capturas de ``SELECT`` mientras el proceso viva.
+
+    Hacerlo SOLO en el arranque volvía el TTL una promesa falsa: un gateway que corre semanas
+    (lo normal en producción) nunca volvía a purgar, y estos son los ÚNICOS datos de negocio
+    que el gateway persiste. La tarea duerme primero: la purga del arranque ya corrió.
+
+    ``purge_expired`` es I/O SÍNCRONO (SQLAlchemy) contra la BD del gateway, así que va a un
+    hilo con ``asyncio.to_thread``. Ejecutarlo directo acá bloquearía el event loop y con él
+    TODAS las requests en vuelo — el mismo criterio por el que los handlers que hacen I/O
+    bloqueante se declaran ``def`` y no ``async def``.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await asyncio.to_thread(migration_results.purge_expired, ttl_hours)
+        except asyncio.CancelledError:
+            # Apagado en curso: propagar para que la tarea termine de verdad.
+            raise
+        except Exception:  # noqa: BLE001 — la retención no puede tumbar el proceso
+            # ``purge_expired`` ya traga sus propios errores; esto cubre lo que quede fuera
+            # (p. ej. no poder crear el hilo) para que un fallo no mate el bucle entero.
+            logger.warning(
+                "Falló una pasada de la purga periódica de capturas de SELECT", exc_info=True
+            )
 
 
 @asynccontextmanager
@@ -35,9 +72,37 @@ async def lifespan(app: FastAPI):
 
     clone_runner.sweep_interrupted()
     collation_conversion_runner.sweep_interrupted()
-    yield
-    # Apagado: liberar los engines de conexión a servidores destino.
-    remote_engine.dispose_all()
+    # Retención: los resultados de SELECT capturados durante una migración son DATOS DE
+    # NEGOCIO y no se guardan indefinidamente. Se purgan los vencidos
+    # (MIGRATION_CAPTURE_TTL_HOURS). No lanza: un fallo acá no puede impedir el arranque.
+    migration_results.purge_expired(MIGRATION_CAPTURE_TTL_HOURS)
+    # ...y se sigue purgando periódicamente: la del arranque sola no cumple el TTL en un
+    # proceso de larga vida (ver el docstring de _purge_captures_periodically).
+    purge_task: asyncio.Task | None = None
+    if MIGRATION_CAPTURE_TTL_HOURS > 0 and MIGRATION_CAPTURE_PURGE_INTERVAL_MINUTES > 0:
+        purge_task = asyncio.create_task(
+            _purge_captures_periodically(
+                MIGRATION_CAPTURE_TTL_HOURS,
+                MIGRATION_CAPTURE_PURGE_INTERVAL_MINUTES * 60,
+            ),
+            name="migration-capture-purge",
+        )
+    try:
+        yield
+    finally:
+        # La limpieza va en ``finally``: si el ciclo de vida se cierra por una excepción (o el
+        # servidor cancela el lifespan), un ``yield`` "pelado" saltearía esto y quedarían la
+        # tarea periódica pendiente ("Task was destroyed but it is pending") y los engines a
+        # los servidores destino sin liberar.
+        #
+        # Cancelar la tarea periódica y ESPERARLA: sin el await, el intérprete cierra el loop
+        # con la tarea todavía pendiente.
+        if purge_task is not None:
+            purge_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await purge_task
+        # Liberar los engines de conexión a servidores destino.
+        remote_engine.dispose_all()
 
 
 # === Main app

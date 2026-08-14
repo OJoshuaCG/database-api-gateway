@@ -195,3 +195,104 @@ def test_apply_dry_run_plan_lists_pending(admin_client, server_payload, monkeypa
     assert data["pending_versions"] == ["0003", "0004", "0005"]
     assert data["to_version"] == "0005"
     assert data["no_op"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Gate de captura sin revisar: ACOTADO a las pendientes reales                  #
+#                                                                             #
+# ``apply?version=X`` aplica un prefijo ESTRICTO de la cadena, así que evaluar el gate sobre
+# TODO el blueprint bloqueaba aplicaciones que no incluían la versión sin revisar — y también
+# el dry_run, que no ejecuta nada.
+# --------------------------------------------------------------------------- #
+def _blueprint_with_capture_tail(admin_client, n=10, slug="bp-capture-scope"):
+    """Blueprint 0001..n donde SOLO la última versión captura resultados (nace sin revisar)."""
+    model_id, versions = _blueprint_with_migrations(admin_client, n=n - 1, slug=slug)
+    v = f"{n:04d}"
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations",
+        json={
+            "version": v,
+            "name": f"m{v}",
+            "up_sql": "SELECT COUNT(*) AS n FROM t1",
+            "capture_selects": True,
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["data"]["reviewed"] is False
+    versions[v] = r.json()["data"]["id"]
+    return model_id, versions
+
+
+def test_apply_hasta_una_version_previa_no_lo_bloquea_una_captura_futura(
+    admin_client, server_payload, monkeypatch
+):
+    model_id, vids = _blueprint_with_capture_tail(admin_client)
+    db_id = _managed_db(admin_client, server_payload, model_id)
+
+    monkeypatch.setattr(MigrationRunner, "get_current_version", lambda self, *a, **k: "0005")
+    monkeypatch.setattr(
+        MigrationRunner, "apply",
+        lambda self, *a, **k: [_mr("0006", vids["0006"]), _mr("0007", vids["0007"])],
+    )
+
+    r = admin_client.post(f"/api/v1/managed-databases/{db_id}/migrations/apply?version=0007")
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["applied_count"] == 2
+    # Nada capturado: ninguna de las pendientes de esta corrida tiene captura.
+    assert r.json()["data"]["captured_select_count"] == 0
+
+
+def test_apply_que_si_incluye_la_version_con_captura_sin_revisar_da_409(
+    admin_client, server_payload, monkeypatch
+):
+    model_id, _vids = _blueprint_with_capture_tail(admin_client)
+    db_id = _managed_db(admin_client, server_payload, model_id)
+
+    monkeypatch.setattr(MigrationRunner, "get_current_version", lambda self, *a, **k: "0005")
+    monkeypatch.setattr(MigrationRunner, "apply", lambda self, *a, **k: [])
+
+    r = admin_client.post(
+        f"/api/v1/managed-databases/{db_id}/migrations/apply"
+        "?version=0010&allow_result_capture=true"
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["public_context"]["unreviewed_capture"] == ["0010"]
+
+
+def test_dry_run_no_lo_bloquea_una_captura_sin_revisar(
+    admin_client, server_payload, monkeypatch
+):
+    """Previsualizar no ejecuta nada: un gate que impide el dry_run solo esconde el plan."""
+    model_id, _vids = _blueprint_with_capture_tail(admin_client)
+    db_id = _managed_db(admin_client, server_payload, model_id)
+
+    monkeypatch.setattr(MigrationRunner, "get_current_version", lambda self, *a, **k: "0005")
+
+    r = admin_client.post(
+        f"/api/v1/managed-databases/{db_id}/migrations/apply?dry_run=true"
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["pending_versions"][-1] == "0010"
+
+
+def test_el_kill_switch_global_neutraliza_el_gate_de_reviewed(
+    admin_client, server_payload, monkeypatch
+):
+    """
+    Con la captura DESACTIVADA globalmente el codegen no emite una sola llamada de captura:
+    el 409 bloqueaba una vía de recuperación por un riesgo que no puede materializarse.
+    """
+    from app.controllers import managed_migration_controller as mod
+
+    model_id, vids = _blueprint_with_capture_tail(admin_client)
+    db_id = _managed_db(admin_client, server_payload, model_id)
+
+    monkeypatch.setattr(MigrationRunner, "get_current_version", lambda self, *a, **k: "0009")
+    monkeypatch.setattr(
+        MigrationRunner, "apply", lambda self, *a, **k: [_mr("0010", vids["0010"])]
+    )
+    monkeypatch.setattr(mod, "MIGRATION_CAPTURE_ENABLED", False)
+
+    r = admin_client.post(f"/api/v1/managed-databases/{db_id}/migrations/apply?version=0010")
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["applied_count"] == 1

@@ -7,7 +7,7 @@ Crea/otorga/borra BDs reales en el motor destino. Flags que tocan el motor:
 - ``?provision=true`` en reassign-owner → re-grant / ALTER OWNER en el motor.
 """
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Path as FPath, Query, Request
 
 from app.controllers.managed_database_controller import ManagedDatabaseController
 from app.controllers.managed_migration_controller import ManagedMigrationController
@@ -26,6 +26,7 @@ from app.schemas.model_migration import (
     MigrationHistoryOut,
     MigrationReconcilePartialOut,
     MigrationRollbackOut,
+    MigrationSelectResultsOut,
     MigrationStatusOut,
 )
 from app.utils.pagination import PaginationDep
@@ -170,10 +171,24 @@ def apply_migrations(
             "versión anterior de forma limpia y solo hay que corregir la migración."
         ),
     ),
+    allow_result_capture: bool = Query(
+        False,
+        description=(
+            "Consentimiento EXPLÍCITO de esta corrida para las versiones con "
+            "'capture_selects=true': sus SELECT guardan el resultado (filas de ESTA base de "
+            "datos, cifradas) en el gateway, legibles luego con "
+            "GET .../migrations/{version}/select-results. Sin el flag, si alguna versión "
+            "PENDIENTE (no todo el blueprint) tiene la captura activada se responde 409 sin "
+            "ejecutar ninguna sentencia de la migración: para saber qué está pendiente el "
+            "gateway lee antes la versión actual del destino, así que sí abre una conexión "
+            "de solo lectura. Mismo 409 si alguna de esas versiones pendientes no está "
+            "revisada (reviewed=false); con dry_run=true ninguno de los dos bloquea."
+        ),
+    ),
 ):
     result = ManagedMigrationController().apply(
         db_id, up_to_version=version, force=force, dry_run=dry_run,
-        on_failure=on_failure, admin=admin,
+        on_failure=on_failure, allow_result_capture=allow_result_capture, admin=admin,
     )
     msg = _apply_message(result, dry_run=dry_run)
     return success(data=result, message=msg)
@@ -242,9 +257,26 @@ def rollback_migration(
             "es anterior a la actual."
         ),
     ),
+    allow_result_capture: bool = Query(
+        False,
+        description=(
+            "Consentimiento EXPLÍCITO de esta corrida para las versiones del camino a "
+            "revertir que tengan 'capture_selects=true': las sentencias de lectura de su "
+            "down_sql guardan el resultado (filas de ESTA base de datos, cifradas) en el "
+            "gateway. Mismo control que en /apply — el rollback también captura. Sin el "
+            "flag se responde 409 sin ejecutar ninguna sentencia de la migración (el "
+            "gateway sí lee antes la versión actual del destino para saber qué camino hay "
+            "que revertir); también 409 si alguna de esas versiones no está revisada "
+            "(reviewed=false)."
+        ),
+    ),
 ):
     result = ManagedMigrationController().rollback(
-        db_id, confirm_version=confirm_version, target_version=target_version, admin=admin
+        db_id,
+        confirm_version=confirm_version,
+        target_version=target_version,
+        allow_result_capture=allow_result_capture,
+        admin=admin,
     )
     return success(data=result, message=_rollback_message(result))
 
@@ -346,14 +378,64 @@ def stamp_migration(
         False,
         description=(
             "Descarta cualquier checkpoint de aplicación parcial detectado para esta BD "
-            "(409 sin esto si existe uno). Úsalo solo tras reconciliar manualmente el "
-            "estado físico real del motor."
+            "(409 sin esto si existe uno) y omite el gate de revisión de una versión con "
+            "'capture_selects=true' aún sin revisar. Úsalo solo tras reconciliar manualmente "
+            "el estado físico real del motor."
         ),
     ),
 ):
     result = ManagedMigrationController().stamp(db_id, version, force=force, admin=admin)
     msg = "Versión marcada (stamp)." + (" Checkpoint parcial descartado." if force else "")
     return success(data=result, message=msg)
+
+
+@router.get(
+    "/{db_id}/migrations/{version}/select-results",
+    response_model=ApiResponse[MigrationSelectResultsOut],
+)
+@limiter.limit("20/minute")
+def migration_select_results(
+    request: Request,
+    admin: AdminDep,
+    db_id: int,
+    version: str = FPath(..., pattern=r"^\d{4,10}$", description="Versión de la migración"),
+):
+    """
+    Resultados capturados de las sentencias de LECTURA de una versión sobre esta BD.
+
+    Solo existen si la versión tiene ``capture_selects=true`` (opt-in), está revisada
+    (``reviewed=true``) y el ``apply``/``rollback`` corrió con ``allow_result_capture=true``
+    — los tres controles rigen para AMBAS direcciones, porque el ``down_sql`` captura igual
+    que el ``up_sql``. Están disponibles tanto si la migración terminó bien como si falló a
+    mitad de camino — que es el caso para el que la feature existe.
+
+    **Devuelve DATOS DE NEGOCIO de la base gestionada** (la única excepción deliberada a la
+    regla de que el gateway no almacena datos): el payload está cifrado en reposo y la
+    lectura se audita fail-closed ANTES de descifrarlo.
+
+    Ojo con ``durability='rolled_back'`` (solo PostgreSQL): esas filas describen lo que se
+    vio DURANTE el intento, no el estado final de la base.
+    """
+    return success(data=ManagedMigrationController().select_results(db_id, version, admin=admin))
+
+
+@router.delete(
+    "/{db_id}/migrations/{version}/select-results",
+    response_model=ApiResponse[None],
+)
+def purge_migration_select_results(
+    admin: AdminDep,
+    db_id: int,
+    version: str = FPath(..., pattern=r"^\d{4,10}$", description="Versión de la migración"),
+):
+    """
+    Purga manual de los resultados capturados de una versión en esta BD.
+
+    Las capturas expiran solas por TTL (``MIGRATION_CAPTURE_TTL_HOURS``, default 7 días);
+    esto es la vía para borrarlas ya, en cuanto el diagnóstico terminó.
+    """
+    deleted = ManagedMigrationController().purge_select_results(db_id, version, admin=admin)
+    return empty(f"{deleted} resultado(s) capturado(s) eliminado(s).")
 
 
 @router.get(

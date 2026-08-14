@@ -34,7 +34,7 @@ from app.models.enums import EngineType, MigrationStatus
 from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
 from app.services import audit
-from app.services.db_admin import migration_progress
+from app.services.db_admin import migration_progress, migration_results
 from app.services.db_admin.identifiers import references_gateway_internal_table
 from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
 from app.services.db_admin.sql_dialect import RollbackGenerator, SqlTranslator
@@ -101,6 +101,7 @@ class ModelMigrationController:
             "is_baseline": m.is_baseline,
             "has_non_portable": m.has_non_portable,
             "reviewed": m.reviewed,
+            "capture_selects": m.capture_selects,
             "created_at": m.created_at,
             "updated_at": m.updated_at,
         }
@@ -119,6 +120,7 @@ class ModelMigrationController:
             "kind": m.kind,
             "is_baseline": m.is_baseline,
             "reviewed": m.reviewed,
+            "capture_selects": m.capture_selects,
             "created_at": m.created_at,
         }
 
@@ -259,6 +261,13 @@ class ModelMigrationController:
             reviewed = data.get("reviewed")
             reviewed = True if reviewed is None else bool(reviewed)
             is_baseline = bool(data.get("is_baseline", False))
+            # Captura de resultados de SELECT: opt-in explícito. Una versión que extrae datos
+            # de negocio nace SIEMPRE sin revisar, aunque el request diga lo contrario — la
+            # aprobación tiene que ser un acto separado, sobre el SQL ya guardado (mismo
+            # criterio que el gate R1 de los baselines de snapshot).
+            capture_selects = bool(data.get("capture_selects", False))
+            if capture_selects:
+                reviewed = False
 
             # Versión: explícita si el admin la pasó; si no, autoasignada (secuencial).
             explicit_version = data.get("version")
@@ -283,6 +292,7 @@ class ModelMigrationController:
                     is_baseline=is_baseline,
                     has_non_portable=has_non_portable,
                     reviewed=reviewed,
+                    capture_selects=capture_selects,
                 )
                 session.add(migration)
                 try:
@@ -702,10 +712,28 @@ class ModelMigrationController:
             # EXITOSAMENTE en alguna BD: editarlo aquí no re-ejecuta nada en el motor, así
             # que la metadata divergiría de lo que realmente corrió. Un intento que solo
             # falló no congela el SQL (ninguna BD depende de él). Fix-forward si ya se aplicó.
-            sql_fields_changing = any(
-                f in data and data[f] is not None
-                for f in ("up_sql", "up_sql_mysql", "up_sql_postgresql")
+            # Se mira la PRESENCIA de la clave, no que traiga valor (el PATCH llega con
+            # ``exclude_unset=True``): limpiar un override con ``null`` CAMBIA el SQL efectivo
+            # de ese motor —pasa a usarse la traducción del ``up_sql`` base— y por lo tanto
+            # cuenta como cambio de SQL. Con la comparación ``is not None`` había un camino
+            # real para saltear la aprobación de una versión con captura: ``up_sql`` que extrae
+            # datos + ``up_sql_postgresql='SELECT 1'`` → PATCH ``reviewed=true`` (se aprueba lo
+            # inocuo) → PATCH ``{"up_sql_postgresql": null}`` → la aprobación sobrevivía y el
+            # SQL efectivo para PostgreSQL pasaba a ser el que extrae datos.
+            # ``up_sql: null`` es la excepción: la asignación de abajo lo ignora (el SQL base no
+            # puede quedar vacío), así que no cambia nada y no debe congelar ni purgar.
+            sql_fields_changing = ("up_sql" in data and data["up_sql"] is not None) or any(
+                f in data for f in ("up_sql_mysql", "up_sql_postgresql")
             )
+            # El ``down_sql`` va APARTE de ``sql_fields_changing`` a propósito: confirmar el
+            # rollback DESPUÉS de aplicar es un flujo documentado y soportado (el 409 de
+            # ``rollback`` pide exactamente eso), así que no puede caer bajo la barrera de
+            # "ya aplicado ⇒ no se toca el SQL" ni purgar el manifiesto. Pero SÍ cuenta para
+            # invalidar la aprobación de una versión con captura: el ``down_sql`` también se
+            # ejecuta y también captura (ver ``capture_review_reset`` más abajo). Se usa
+            # ``in data`` (el PATCH llega con ``exclude_unset=True``) para cubrir también el
+            # caso de LIMPIAR el rollback con ``null``.
+            down_sql_changing = "down_sql" in data
             if applied_successfully and sql_fields_changing:
                 raise AppHttpException(
                     message=(
@@ -794,16 +822,66 @@ class ModelMigrationController:
                 reviewed_approved = bool(data["reviewed"]) and not m.reviewed
                 m.reviewed = bool(data["reviewed"])
 
+            # ACTIVAR la captura de resultados cambia lo que la migración hace con los datos
+            # del cliente, así que invalida cualquier aprobación previa: hay que re-aprobarla
+            # sabiendo que va a extraer filas. Se aplica DESPUÉS del bloque de `reviewed`
+            # para que gane sobre un `reviewed=true` enviado en la misma llamada.
+            capture_enabled_now = False
+            if data.get("capture_selects") is not None:
+                capture_enabled_now = bool(data["capture_selects"]) and not m.capture_selects
+                m.capture_selects = bool(data["capture_selects"])
+                if capture_enabled_now:
+                    m.reviewed = False
+                    reviewed_approved = False
+
+            # ...y CAMBIAR EL SQL de una versión con captura invalida la aprobación por el
+            # mismo motivo: lo que se aprobó fue una CONSULTA CONCRETA, no la versión como
+            # entidad. Sin esto había un camino real: crear con capture_selects=true y
+            # up_sql='SELECT 1' → PATCH reviewed=true (aprobación legítima de algo inocuo) →
+            # PATCH up_sql='SELECT * FROM clientes' (permitido mientras no haya una
+            # aplicación EXITOSA) → apply pasaba el gate de reviewed sin que nadie hubiera
+            # visto la consulta que realmente se iba a ejecutar y capturar.
+            # Cuenta AMBAS direcciones (up_sql/overrides y down_sql): el codegen emite la
+            # captura también para las sentencias del down_sql.
+            # Se evalúa DESPUÉS del bloque de capture_selects para leer el valor final de
+            # ``m.capture_selects`` (el PATCH puede activarla en esta misma llamada) y para
+            # que el reset gane sobre un ``reviewed=true`` enviado en la MISMA llamada —
+            # mismo criterio que ``capture_enabled_now``: aprobar y reescribir en un solo
+            # request no es una revisión verificable.
+            capture_review_reset = (
+                (sql_fields_changing or down_sql_changing)
+                and m.capture_selects
+                and m.reviewed
+            )
+            if capture_review_reset:
+                m.reviewed = False
+                reviewed_approved = False
+
             # El MANIFIESTO de sentencias (``model_migration_statements``) describe el
             # ``up_sql`` que se guardó al crear la versión: si el SQL cambia, el
             # emparejamiento sentencia↔reverso y los índices ``seq`` ya no corresponden.
             # Se BORRA en vez de intentar re-derivarlo: un manifiesto desalineado haría
             # que una reconciliación parcial deshiciera la sentencia equivocada
             # (corrupción silenciosa). La migración vuelve al modo todo-o-nada.
+            purged_captures = 0
             if sql_fields_changing:
                 session.query(ModelMigrationStatement).filter(
                     ModelMigrationStatement.model_migration_id == m.id
                 ).delete(synchronize_session=False)
+            # Mismo razonamiento para las capturas de resultados de SELECT: describen el
+            # resultado de la sentencia número k de un SQL que dejó de existir, y su
+            # ``statement_index`` ya no apunta a lo mismo. Se purgan en ESTA transacción
+            # (no quedan colgadas de un SQL inexistente) — y de paso dejan de retener
+            # datos de negocio que ya no explican nada.
+            #
+            # Incluye el ``down_sql``, que NO entra en ``sql_fields_changing`` (ese flag
+            # gobierna el freeze de "ya aplicada" y el borrado del manifiesto del ``up``):
+            # cambiar el rollback reordena ``down_statements``, así que las capturas de
+            # dirección ``down`` quedarían con su ``statement_index`` apuntando a otra
+            # sentencia. El checksum las marcaba ``stale=true`` en la lectura, pero una fila
+            # incoherente que hay que interpretar es peor que ninguna.
+            if sql_fields_changing or down_sql_changing:
+                purged_captures = migration_results.purge_for_migration(m.id, session=session)
 
             # Recalcular checksum si cambió alguna variante de SQL o el rollback.
             m.checksum = compute_checksum(
@@ -819,7 +897,22 @@ class ModelMigrationController:
             admin=admin,
             target_type="database_model",
             target_id=model_id,
-            detail=f"migración {version} actualizada",
+            detail=(
+                f"migración {version} actualizada"
+                + (
+                    f" (purgadas {purged_captures} captura(s) de resultados de SELECT)"
+                    if purged_captures
+                    else ""
+                )
+                + (" — captura de resultados ACTIVADA (requiere re-aprobación)"
+                   if capture_enabled_now else "")
+                # El motivo del reset se audita igual que el de la activación: sin esto, la
+                # traza mostraría una versión que pasó de reviewed=true a false sin explicar
+                # por qué, y es justo la transición que protege datos de negocio.
+                + (" — SQL modificado en una versión con captura: aprobación (reviewed) "
+                   "REVOCADA, hay que re-aprobar la consulta nueva"
+                   if capture_review_reset else "")
+            ),
         )
         if reviewed_approved:
             audit.record(

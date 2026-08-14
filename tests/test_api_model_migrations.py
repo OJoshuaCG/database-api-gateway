@@ -366,3 +366,88 @@ def test_history_missing_db_404(admin_client):
     assert admin_client.get(
         "/api/v1/managed-databases/9999/migrations/history"
     ).status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Captura de resultados: la aprobación es de una CONSULTA, no de la versión     #
+# --------------------------------------------------------------------------- #
+def _capture_migration(admin_client, model_id, up_sql="SELECT 1", version="0001"):
+    r = _create_migration(
+        admin_client, model_id, version=version, up_sql=up_sql, capture_selects=True
+    )
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    # Nace SIN revisar: es la primera de las tres llaves de la feature.
+    assert data["capture_selects"] is True
+    assert data["reviewed"] is False
+    return data
+
+
+def _patch(admin_client, model_id, version, payload):
+    return admin_client.patch(
+        f"/api/v1/database-models/{model_id}/migrations/{version}", json=payload
+    )
+
+
+def test_capture_reviewed_se_revoca_al_cambiar_el_up_sql(admin_client):
+    """
+    El escenario que abría el agujero: aprobar ``SELECT 1`` y después reescribir el ``up_sql``
+    a ``SELECT * FROM clientes``. Está permitido editar (no hubo aplicación exitosa), así que
+    sin este reset el ``apply`` pasaba el gate de ``reviewed`` sobre una consulta que NADIE
+    revisó.
+    """
+    model_id = _new_model(admin_client, slug="cap1", name="Cap1")
+    _capture_migration(admin_client, model_id)
+
+    assert _patch(admin_client, model_id, "0001", {"reviewed": True}).json()["data"][
+        "reviewed"
+    ] is True
+
+    r = _patch(admin_client, model_id, "0001", {"up_sql": "SELECT * FROM clientes"})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["reviewed"] is False
+
+
+def test_capture_reviewed_se_revoca_al_cambiar_el_down_sql(admin_client):
+    """El ``down_sql`` también se ejecuta y también captura (el rollback no es un no-op)."""
+    model_id = _new_model(admin_client, slug="cap2", name="Cap2")
+    _capture_migration(admin_client, model_id)
+    _patch(admin_client, model_id, "0001", {"reviewed": True})
+
+    r = _patch(admin_client, model_id, "0001", {"down_sql": "SELECT * FROM clientes"})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["reviewed"] is False
+
+
+def test_capture_reviewed_en_la_misma_llamada_que_el_sql_no_aprueba(admin_client):
+    """
+    Aprobar y reescribir en un solo request no es una revisión verificable: gana el reset,
+    mismo criterio que ya se aplicaba al ACTIVAR ``capture_selects``.
+    """
+    model_id = _new_model(admin_client, slug="cap3", name="Cap3")
+    _capture_migration(admin_client, model_id)
+
+    r = _patch(
+        admin_client,
+        model_id,
+        "0001",
+        {"reviewed": True, "up_sql": "SELECT * FROM clientes"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["reviewed"] is False
+
+
+def test_sin_captura_el_cambio_de_sql_no_toca_reviewed(admin_client):
+    """
+    Regresión importante: el reset es SOLO para versiones con captura. Una versión normal
+    (o un baseline de snapshot ya aprobado) no puede perder su aprobación por un PATCH de SQL.
+    """
+    model_id = _new_model(admin_client, slug="cap4", name="Cap4")
+    _create_migration(admin_client, model_id, version="0001")
+    _patch(admin_client, model_id, "0001", {"reviewed": True})
+
+    r = _patch(
+        admin_client, model_id, "0001", {"up_sql": "CREATE TABLE t (id INT PRIMARY KEY)"}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["reviewed"] is True
