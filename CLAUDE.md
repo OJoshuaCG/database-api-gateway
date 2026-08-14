@@ -808,6 +808,172 @@ recuperación va con `force=true` y al terminar OK la devuelve a `active`. Tests
 `tests/test_sql_dialect.py`; verificado además el pipeline completo split→codegen→`exec_driver_sql`
 (sin `pytest`: ejecución directa de las funciones, 37/37).
 
+**Captura de RESULTADOS de `SELECT` dentro de una migración (P0, 2026-08-14)**: una migración
+que verifica algo con un `SELECT` (filas sin backfill, duplicados que bloquean un UNIQUE)
+ejecutaba la consulta y **tiraba el resultado** — Alembic no devuelve nada y el gateway solo
+informaba "aplicada/falló", justo cuando lo que se quería mirar ya cambió. FIX: tabla nueva
+`migration_select_results` (migración `f8a9b0c1d2e3`) + columna
+`model_migrations.capture_selects` + módulo `app/services/db_admin/migration_results.py` +
+hook en `migrations.py::_render_statement_calls` (emite
+`migration_results.capture_statement(...)` en lugar de `exec_driver_sql` para las sentencias de
+lectura). **PRIMERA excepción deliberada** a la regla "el gateway nunca almacena datos de
+negocio" (`app/models/audit_log.py`), y por eso lleva TODAS las salvaguardas juntas: opt-in por
+versión (`capture_selects`, default false) + `reviewed=false` obligatorio al activarlo (409 en
+`apply` hasta aprobar, mismo mecanismo que el gate R1 de los baselines) + consentimiento por
+corrida (`apply?allow_result_capture=true`, 409 antes de tocar el motor — un blueprint se
+replica sobre N BDs de dueños distintos y quien aplica sobre UNA debe saber que va a extraer
+filas de ESA base) + payload **cifrado con la DEK** (no legible por SQL directo contra la BD del
+gateway: todo acceso pasa por el endpoint auditado) + lectura auditada **fail-closed ANTES de
+descifrar** (criterio de `reveal_password`) + TTL (`MIGRATION_CAPTURE_TTL_HOURS=168`, purga en
+el `lifespan`) + kill switch `MIGRATION_CAPTURE_ENABLED`. Endpoints
+`GET`/`DELETE /managed-databases/{id}/migrations/{version}/select-results`; `apply`/`rollback`
+solo devuelven PUNTEROS (`captured_select_count`, `select_results_available`) — nunca las filas,
+que con `LOGGER_MIDDLEWARE_SHOW_BODY=true` irían al log. **PERSISTENCIA HÍBRIDA por motor**,
+decidida por `use_transactional_ddl` (no se reimplementa el criterio): MySQL/MariaDB
+(AUTOCOMMIT) escriben cada captura DE INMEDIATO con una sesión corta propia →
+`durability='committed'`; PostgreSQL (transaccional) las ACUMULA en un buffer en memoria y las
+vuelca cuando `command.upgrade/downgrade` retorna o lanza → `committed`/`rolled_back`. El buffer
+de PG no es optimización: escribir en la BD del gateway con la transacción del destino abierta
+deja esa conexión `idle in transaction` y el `idle_in_transaction_session_timeout` (15s en
+`remote_engine`) puede ABORTAR la migración por una escritura lenta a la BD de metadatos. Tres
+invariantes que NO se pueden romper (con test cada uno): (1) con `capture_selects=false` el
+archivo de revisión generado es **byte a byte** el histórico; (2) la captura **no reescribe el
+SQL** —a diferencia de la consola SQL, que empuja `LIMIT` con `_limited_sql`— porque el texto
+debe coincidir con el `checksum`, así que el tope se aplica al capturar
+(`fetchmany(max_rows+1)` para marcar `truncated` con certeza); (3) **no toca
+`statement_lists`/`total_statements`**, o `_resolve_resume_offset` dispararía un 409 espurio.
+Orden por sentencia: ejecutar → capturar (best-effort: un fallo de captura da `status='error'`
+con motivo acotado, NUNCA `str(exc)` del motor —criterio R4—, y la migración sigue) →
+`record_statement` sin cambios. La compuerta es `is_capturable` (pre-filtro regex barato +
+`query_policy.classify_statement`, AST-first): acá un veredicto `blocked` significa SOLO "no
+capturar", **nunca** "rechazar la migración" (un `GRANT`/`SET FOREIGN_KEY_CHECKS=0` en un
+blueprint se sigue ejecutando igual). Módulo SEPARADO de `migration_progress` a propósito: ese
+es maquinaria fail-closed que decide si resumir es seguro, este es un informe best-effort para
+un humano. `query_runner._json_value` se extrajo a `value_json.py` (serializador compartido:
+`Decimal`→str, `timedelta` de MySQL como HH:MM:SS, BLOB en hex, topes de profundidad/cardinalidad)
+en vez de escribir un segundo criterio. El `PATCH` que cambia `up_sql` PURGA las capturas en la
+misma transacción que ya borra el manifiesto. Verificado: 41 casos por ejecución directa (sin
+`pytest`) + ciclo `command.upgrade` REAL contra SQLite con captura activa (persistida cifrada y
+descifrada de vuelta) + `upgrade/downgrade/upgrade` de la migración en SQLite + `alembic check`
+sin drift para la tabla nueva. **PENDIENTE e2e contra motores reales** (sin Docker): buffer de PG
+vs `idle_in_transaction_session_timeout` y marca `rolled_back`, captura inmediata en
+MySQL/MariaDB sobreviviendo a un fallo posterior, tipos nativos (`JSONB`, `TIME`, `bytea`), y la
+migración contra la BD del gateway real. **`.env.example` NO se pudo actualizar** (permisos del
+entorno): las 6 variables `MIGRATION_CAPTURE_*` están documentadas en
+`app/core/environments.py` y en `docs/features/model-migrations.md`.
+
+**Tres bloqueantes de la revisión de seguridad de esa captura (2026-08-14)**:
+**(B1) el `rollback` capturaba SIN ningún control.** El codegen emite `capture_statement`
+también para las `down_statements` (`_render_revision` recibe UN solo flag `capture` y lo
+aplica a los dos cuerpos), pero `rollback` no llamaba a ninguno de los guards que sí exige
+`apply` → bastaba un `confirm_version` para extraer y persistir filas sin consentimiento.
+Peor, había un camino completo: crear versión con `capture_selects=true` (nace
+`reviewed=false`) → `stamp` a esa versión (sin gate alguno) → `rollback` sobre ella. FIX:
+`rollback` acepta `allow_result_capture` (mismo patrón que `apply`) y llama
+`_guard_reviewed_capture` + `_guard_capture_consent` ANTES de la auditoría de intento y del
+runner. `_guard_reviewed_capture` ganó `migration_ids` para acotar el chequeo **al camino a
+revertir**, NO al blueprint completo: el rollback es la vía de RECUPERACIÓN ante una migración
+mala y bloquearlo por una versión futura sin revisar —que no se va a ejecutar— le quitaría al
+operador su única salida (`apply` quedó mirando todo el blueprint en esta pasada; se corrigió
+después, ver "Segunda pasada adversarial" más abajo).
+`_guard_capture_consent` ganó `direction` (solo cambia el texto del 409: un mensaje que dice
+"aplicación" manda al operador al endpoint equivocado). Defensa en profundidad:
+`_guard_stamp_unreviewed_capture` da **409** al marcar una versión con captura sin revisar
+(el stamp no ejecuta SQL, pero es lo que HABILITA su rollback), con `force=true` como escape
+—necesario: una versión aplicada hace meses a la que después se le activó la captura queda
+`reviewed=false`, y una BD que perdió su puntero de versión debe poder re-stampearla—.
+**(B2) `reviewed=true` sobrevivía un cambio TOTAL del SQL.** Aprobar `SELECT 1` → `PATCH
+up_sql='SELECT * FROM clientes'` (permitido: `_has_successful_application` es False mientras
+no se aplicó con éxito) → `apply` pasaba el gate sin que nadie hubiera visto la consulta real.
+FIX en `update_migration`: con `capture_selects` activo (el actual o el que se setea en el
+mismo PATCH), cambiar `up_sql`/overrides/**`down_sql`** fuerza `reviewed=False` y se audita el
+motivo. El `down_sql` va en una variable APARTE (`down_sql_changing`), **no** dentro de
+`sql_fields_changing`: meterlo ahí habría bloqueado con 409 el flujo documentado de confirmar
+el rollback DESPUÉS de aplicar (que es exactamente lo que pide el 409 de `rollback`) y habría
+purgado el manifiesto sin motivo. El reset GANA sobre un `reviewed=true` enviado en la misma
+llamada (mismo criterio que `capture_enabled_now`).
+**(B3) el TTL solo purgaba en el arranque.** La purga vivía suelta en el `lifespan`, así que en
+un proceso que corre semanas —lo normal— `MIGRATION_CAPTURE_TTL_HOURS` nunca volvía a purgar:
+la retención de los ÚNICOS datos de negocio que el gateway guarda era una promesa falsa. FIX:
+`main.py::_purge_captures_periodically`, tarea `asyncio` creada en el `lifespan` con
+`MIGRATION_CAPTURE_PURGE_INTERVAL_MINUTES` (nueva, default 60; `0` desactiva). Corre con
+`asyncio.to_thread` porque `purge_expired` es I/O SÍNCRONO y en el event loop bloquearía todas
+las requests; se `cancel()` + `await` en el apagado (sin el await queda el warning "Task was
+destroyed but it is pending"); un fallo de una pasada no mata el bucle. Verificado por
+ejecución directa (43 checks) + HTTP con TestClient/SQLite para B2 (12 checks), **sin
+`pytest`**; tests agregados en `tests/test_migration_results.py` y
+`tests/test_api_model_migrations.py` (no ejecutados con `pytest`, política del proyecto).
+
+**Segunda pasada adversarial de CORRECTITUD sobre esa captura (2026-08-14)** — 2 bloqueantes
+verificados empíricamente + 4 defectos menores.
+**(C1) un `SELECT` precedido por un COMENTARIO nunca se capturaba, en SILENCIO.** El
+pre-filtro de `is_capturable` era `^\s*(select|with|table|values)`: solo toleraba BLANCOS. Pero
+`split_sql_statements` **CONSERVA los comentarios dentro** de la sentencia que emite (solo
+descarta las que son SOLO comentarios), y una sentencia de verificación real casi siempre lleva
+delante el comentario que explica qué verifica → la feature **no funcionaba en su caso de uso
+más común**. Agravante: el endpoint de lectura deriva `expected_indexes` con la MISMA función,
+así que `missing_indexes` salía vacío y la respuesta mostraba `items: []` sin error ni aviso.
+FIX: `sql_dialect.strip_leading_noise(text, hash_is_comment=)` (público, reusa el criterio de
+comentarios del splitter — `_only_noise` ahora se define sobre ella, una sola implementación) +
+`migration_results.executable_head`, y el pre-filtro se aplica a ese head. `#` es comentario
+**solo en MySQL/MariaDB**: en PostgreSQL es el XOR de enteros y saltearlo borraría código
+ejecutable (mismo matiz que `query_policy._scan_normalize`, por eso la función necesita el
+motor). El clasificador AST recibe el SQL COMPLETO —sqlglot parsea comentarios sin problema
+(verificado)— y el texto que se ejecuta/hashea no se altera. Comentario de bloque sin cerrar ⇒
+no se captura (fail-closed).
+**(C2) el kill switch global NO neutralizaba el gate de `reviewed`, y bloqueaba el `rollback`
+sin salida.** `_guard_capture_consent` hacía early-return con `not MIGRATION_CAPTURE_ENABLED`;
+`_guard_reviewed_capture` no. Con `MIGRATION_CAPTURE_ENABLED=False` el codegen no emite ni una
+llamada de captura (capturar es FÍSICAMENTE imposible) y sin embargo `apply`/`apply_all`/
+`rollback` seguían respondiendo 409 — y `rollback` **no tiene `force`** (el de `apply` solo
+cubre cuarentena), así que se cerraba la vía de RECUPERACIÓN por un riesgo que no puede
+materializarse. FIX: mismo early-return en `_guard_reviewed_capture`.
+**(C2b) el gate de `reviewed` de `apply` miraba TODO el blueprint.** Su docstring lo justificaba
+con la premisa "lo que se aplica es siempre un prefijo de la cadena", que es **falsa**:
+`apply?version=X` aplica un prefijo ESTRICTO. Con 0001..0010, solo 0010 con
+`capture_selects/reviewed=false` y la BD en 0005, `apply?version=0007` devolvía 409 nombrando
+0010 —que esa corrida no iba a tocar— y ni el `dry_run` se podía previsualizar. FIX: el gate se
+movió de `apply`/`apply_all` a **`_run_apply`** (el único camino de ejecución de ambos), donde
+ya está calculado `compute_pending`, y se invoca con `migration_ids` de las PENDIENTES REALES
+—igual que `rollback`—. Efectos: el `dry_run` ya no se bloquea (no ejecuta nada) y en
+`apply_all` el 409 sale **por BD** con sus propias pendientes, no frenando el lote entero.
+`_run_apply` ganó `model_id` para poder consultarlo.
+**Menores de la misma pasada**: (a) limpiar un override por motor con `null`
+(`{"up_sql_postgresql": null}`) NO revocaba `reviewed` — `sql_fields_changing` exigía
+`is not None` pero la asignación ocurre con la sola presencia de la clave, así que el SQL
+efectivo de PG pasaba a ser la traducción del `up_sql` base (el que extrae datos) con la
+aprobación intacta: era el agujero B2 por otra puerta. Ahora es por PRESENCIA de la clave, con
+`up_sql: null` como única excepción (no se asigna ⇒ no cambia nada). (b) cambiar solo el
+`down_sql` ahora PURGA las capturas (reordena `down_statements` → las filas `direction='down'`
+apuntarían a otra sentencia; el checksum solo las marcaba `stale`), sin meter `down_sql` en
+`sql_fields_changing` (que sigue gobernando el freeze y el manifiesto del `up`).
+(c) `MIGRATION_CAPTURE_MAX_BYTES` y `payload_bytes` medían CARACTERES (`len()` sobre el `str`
+del JSON): con CJK/emoji el payload real pesaba 3-4× el tope y el campo mentía el nombre —
+ahora `len(...encode("utf-8"))`, con una codificación por fila (no se re-codifica el acumulado:
+sería O(n²)); y `truncated` ahora se marca también cuando UNA sola fila rebasa el presupuesto
+(la fila se conserva, pero el campo significa "había más filas/bytes que los topes").
+(d) `captured_select_count` contaba con un `COUNT` de la tabla, que acumula CORRIDAS
+ANTERIORES: una versión aplicada con captura y luego revertida con un `down_sql` sin lecturas
+hacía que el `rollback` informara `1` y **auditara una escritura que no ocurrió**. Ahora
+`migration_results.finalize` devuelve las filas que ESA corrida escribió (contador
+`_written` por migración/dirección para el camino AUTOCOMMIT, donde el buffer está vacío), viaja
+en `MigrationResult.captured_results` y `_capture_pointer` solo suma y audita si hubo escritura
+real; `count_results` se eliminó (dead code que invitaba a repetir el error).
+(e) higiene: el `lifespan` de `main.py` envuelve su limpieza en `try/finally` (si el ciclo
+cerraba por excepción quedaban la tarea de purga pendiente y los engines sin liberar);
+`capture_statement` perdió el parámetro `engine` (muerto) y `_apply_one(buffered=)` ahora sí se
+usa (fija `committed=not buffered` ante un fallo, mismo criterio que `rollback_to`);
+`migration_results.begin()` barre el buffer en memoria al arrancar cada dirección (borde de un
+`BaseException` entre captura y `finalize`); y las descripciones OpenAPI que decían "409 sin
+tocar el motor" ahora aclaran que el gateway lee antes la versión del destino (no muta nada).
+Verificado por ejecución directa de los tests (política: sin `pytest`): 69 casos en
+`tests/test_migration_results.py` + 24 en `tests/test_api_migrations_apply_flow.py` /
+`tests/test_api_migrations_stamp_and_edit.py` (con TestClient+SQLite y el runner mockeado) + sin
+regresiones en `test_api_model_migrations.py` (28), `test_api_migrations_rollback_flow.py` (6),
+`test_api_plan09_adopt_snapshot.py` (15), `test_sql_dialect.py` (40), `test_migration_runner.py`
+(16), `test_migration_reconcile_partial.py` (26) y `test_query_policy.py` (83). **Sigue pendiente
+el e2e contra motores reales.**
+
 ## Módulo de Adopción, Reconciliación y Snapshot (Plan 09)
 
 Puente entre el **plano en vivo** (motor real) y el **inventario** del gateway. Guía de uso:

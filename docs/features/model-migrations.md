@@ -72,15 +72,23 @@ DELETE /api/v1/database-models/{id}/migrations/{version}  # solo la ÚLTIMA vers
 ```http
 GET    /api/v1/managed-databases/{id}/migrations/status     # versión actual vs. pendientes
 POST   /api/v1/managed-databases/{id}/migrations/apply      # ?version= ?force= ?dry_run= — UNA llamada, secuencial (10/min)
-POST   /api/v1/managed-databases/{id}/migrations/rollback   # ?confirm_version= (OBLIG.) ?target_version= — secuencial (10/min)
+POST   /api/v1/managed-databases/{id}/migrations/rollback   # ?confirm_version= (OBLIG.) ?target_version= ?allow_result_capture= — secuencial (10/min)
 POST   /api/v1/managed-databases/{id}/migrations/stamp      # ?version=  (marca sin ejecutar) (10/min)
 GET    /api/v1/managed-databases/{id}/migrations/history    # historial paginado
+GET    /api/v1/managed-databases/{id}/migrations/{version}/select-results     # resultados capturados (AUDITADO) (20/min)
+DELETE /api/v1/managed-databases/{id}/migrations/{version}/select-results     # purga manual de esas capturas
 ```
+
+`apply` **y `rollback`** aceptan además `?allow_result_capture=` — obligatorio si alguna
+versión del camino (pendientes hacia adelante, o versiones a revertir hacia atrás) tiene
+`capture_selects=true`. El rollback lo exige igual que el apply porque el `down_sql`
+**también** captura (ver
+[Capturar el resultado de los `SELECT`](#capturar-el-resultado-de-los-select-de-una-migración)).
 
 ### Aplicación masiva
 
 ```http
-POST   /api/v1/database-models/{id}/migrations/apply-all    # ?max_databases=(1..100) ?force= ?dry_run= (3/min)
+POST   /api/v1/database-models/{id}/migrations/apply-all    # ?max_databases=(1..100) ?force= ?dry_run= ?allow_result_capture= (3/min)
 ```
 
 `apply-all` es **síncrono y acotado** (`max_databases` ≤100); continúa con las demás BDs
@@ -438,6 +446,220 @@ que falla a mitad sigue siendo todo-o-nada. Es viable (el `StructureDump` tiene
 `object_type` + `name`, así que el reverso `DROP <tipo> <nombre>` es derivable) y quedó como
 follow-up.
 
+## Capturar el resultado de los `SELECT` de una migración
+
+### El problema
+
+Una migración a veces necesita **verificar** algo en la BD destino: cuántas filas quedaron
+sin backfill, qué valores violan la `CHECK` que se está por crear, qué duplicados bloquean
+el `UNIQUE`. Ese `SELECT` se ejecutaba y su resultado **se tiraba**: Alembic no devuelve
+nada y el gateway solo informaba "aplicada / falló". Justo en el caso que importa —una
+migración que murió en la sentencia *k*— el estado que se quería mirar ya cambió.
+
+### Cómo se activa (tres llaves, no una)
+
+Esta es la **única** vía por la que el gateway persiste **datos de negocio** (el módulo de
+auditoría declara explícitamente que nunca lo hace: esta es la excepción deliberada). Por eso
+hay que girar tres llaves distintas:
+
+1. **Opt-in por versión**: `capture_selects: true` al crear la migración (o por `PATCH`).
+   Activarlo pone la versión en `reviewed=false`.
+2. **Revisión**: `PATCH .../migrations/{version}` con `reviewed=true`. Mientras no se
+   apruebe, `apply`/`apply-all` responden **409** (mismo mecanismo que el gate R1 de los
+   baselines de snapshot, con su propio mensaje). El gate se evalúa **solo sobre las
+   versiones realmente pendientes** de esa BD, igual que en el rollback (ver abajo).
+3. **Consentimiento de la corrida**: `POST .../migrations/apply?allow_result_capture=true`.
+   Sin el flag, si alguna versión **pendiente** tiene captura activada se responde **409
+   antes de ejecutar ninguna sentencia**. No es redundante con el punto 1: un blueprint se
+   replica sobre N BDs de dueños potencialmente distintos, y quien dispara el `apply` sobre
+   una de ellas tiene que saber que esa corrida va a extraer filas de **esa** base.
+
+Y un **kill switch** global por encima de todo: `MIGRATION_CAPTURE_ENABLED=False` desactiva
+la captura sin tocar ningún blueprint (el SQL se sigue ejecutando idéntico). Con el switch
+apagado **ninguno de los dos gates (2 y 3) bloquea nada**: el codegen no emite una sola
+llamada de captura, así que capturar es *físicamente* imposible y un 409 solo cerraría la vía
+de recuperación (el `rollback` no tiene ningún `force` con el que saltearlo).
+
+Los dos gates corren **después** de leer la versión actual del destino —hace falta para saber
+qué está pendiente—, así que abren una conexión de solo lectura; lo que garantizan es que el
+409 llega **antes de ejecutar cualquier sentencia de la migración**. Con `dry_run=true`
+ninguno bloquea: previsualizar no ejecuta nada.
+
+#### Las tres llaves rigen en AMBAS direcciones
+
+El codegen emite `capture_statement` también para las sentencias del `down_sql`, así que un
+**`rollback` extrae y persiste datos exactamente como un `apply`**. Por eso
+`POST .../migrations/rollback` acepta y **exige** `?allow_result_capture=true` cuando alguna
+versión del camino a revertir tiene la captura activada, y también responde **409** si alguna
+de esas versiones no está revisada.
+
+El gate de `reviewed` del rollback se evalúa **solo sobre las versiones del camino**, no sobre
+el blueprint completo. El rollback es la vía de **recuperación** ante una migración mala;
+bloquearlo por una versión futura sin revisar —que no se va a ejecutar— le quitaría al
+operador su única salida. `apply` sigue **el mismo criterio** (sobre sus pendientes reales):
+mirar todo el blueprint partía de una premisa falsa —que lo aplicado es siempre la cadena
+completa— cuando `apply?version=X` aplica un prefijo **estricto**, así que con 0001..0010 y
+solo 0010 sin revisar, un `apply?version=0007` devolvía 409 nombrando una versión que esa
+corrida no iba a tocar. En `apply-all` el 409 sale **por BD**, con las pendientes de cada una.
+
+`stamp` no ejecuta SQL, pero **es lo que habilita el `rollback` de una versión**: marcar una
+versión con captura aún sin revisar responde **409**. `force=true` lo omite, con el mismo
+significado que ya tiene en ese endpoint ("reconcilié el estado físico a mano") — hace falta
+como escape real: una versión aplicada hace meses a la que después se le activó la captura
+queda `reviewed=false`, y una BD que perdió su puntero de versión necesita poder
+re-stampearla.
+
+#### La aprobación es de una CONSULTA, no de la versión
+
+Si el SQL de una versión con captura cambia por `PATCH` (`up_sql`, los overrides por motor o
+el `down_sql`), `reviewed` **vuelve a `false`** automáticamente y hay que re-aprobar. Sin
+esto había un camino real: crear con `capture_selects=true` y `up_sql='SELECT 1'` → aprobar
+(revisión legítima de algo inocuo) → `PATCH up_sql='SELECT * FROM clientes'` (permitido
+mientras no haya una aplicación **exitosa**) → `apply` pasaba el gate sin que nadie hubiera
+visto la consulta que realmente se iba a ejecutar y capturar.
+
+El reset **gana** sobre un `reviewed=true` enviado en la misma llamada que el SQL nuevo
+(aprobar y reescribir en un solo request no es una revisión verificable) y se **audita** con
+su motivo. En una versión **sin** captura, cambiar el SQL no toca `reviewed`: el gate R1 de
+los baselines de snapshot sigue funcionando como antes.
+
+### Qué se captura y qué no
+
+Candidata solo la **lectura pura**, decidida por `query_policy.classify_statement` (AST con
+sqlglot, nunca por palabra clave) tras un pre-filtro barato de forma
+(`^(select|with|table|values)`). Un `WITH d AS (DELETE … RETURNING *) SELECT * FROM d`
+tiene raíz `Select` y **no** se captura: el clasificador ve la escritura. Un
+`CREATE PROCEDURE … BEGIN … SELECT … END` es **una** sentencia del splitter que arranca con
+`CREATE`, así que no pasa el pre-filtro y no necesita ningún caso especial.
+
+**Los comentarios iniciales no cuentan.** El pre-filtro salta blancos **y comentarios** antes
+de la palabra clave (`sql_dialect.strip_leading_noise`: `-- …`, `/* … */` multilínea, y `#`
+**solo** en MySQL/MariaDB — en PostgreSQL `#` es el XOR de enteros, mismo matiz que
+`query_policy._scan_normalize`). No es un detalle cosmético: `split_sql_statements` **conserva**
+los comentarios dentro de la sentencia que emite, y una sentencia de verificación real casi
+siempre viene precedida del comentario que explica qué verifica — anclado solo en blancos, el
+pre-filtro rechazaba el caso de uso más común y no capturaba nada, **en silencio** (el endpoint
+de lectura deriva `expected_indexes` con la misma función, así que `missing_indexes` tampoco lo
+denunciaba). El clasificador AST sí parsea comentarios, y el texto que se ejecuta y se hashea
+nunca se altera. Un comentario de bloque **sin cerrar** no se salta: la sentencia no pasa el
+pre-filtro (fail-closed).
+
+En este camino, un veredicto `blocked` del clasificador significa **únicamente "no
+capturar"**, nunca "rechazar la migración": un `GRANT` o un `SET FOREIGN_KEY_CHECKS=0` dentro
+de un blueprint se sigue ejecutando exactamente como antes.
+
+### Lectura
+
+```bash
+# Resultados capturados de una versión sobre esta BD (lectura AUDITADA, fail-closed)
+curl -b cookies.txt \
+  "$API/managed-databases/12/migrations/0007/select-results"
+
+# Purga manual (además expiran solas por TTL)
+curl -b cookies.txt -X DELETE \
+  "$API/managed-databases/12/migrations/0007/select-results"
+```
+
+La respuesta trae, además de `items[]` (con `statement_index`, `sql`, `columns`, `rows`,
+`row_count`, `truncated`, `status`, `durability`, `captured_at`):
+
+- `stale`: alguna captura se tomó con un `checksum` distinto al actual de la versión;
+- `expected_indexes` / `missing_indexes`: qué índices de sentencia serían capturables hoy y
+  cuáles no tienen captura (típicamente porque la migración murió antes de llegar);
+- `durability_warning`: presente si alguna fila quedó `rolled_back`.
+
+`apply`/`rollback` **no** devuelven filas, solo punteros (`captured_select_count`,
+`select_results_available`): con `LOGGER_MIDDLEWARE_SHOW_BODY=true` esas filas terminarían en
+el log de aplicación. Ese contador es **lo que escribió esa corrida** (lo devuelve
+`migration_results.finalize`), no un `COUNT` de la tabla: contando la tabla, una versión
+aplicada con captura y después revertida con un `down_sql` sin lecturas hacía que el
+`rollback` informara `captured_select_count: 1` y **auditara una escritura que nunca
+ocurrió**. Un `0` no significa "no hay nada que leer": las capturas de corridas anteriores se
+siguen leyendo con `GET .../select-results`.
+
+### Durabilidad: la diferencia de motor que hay que entender
+
+| Motor | Cómo se persiste | `durability` |
+|---|---|---|
+| MySQL / MariaDB (AUTOCOMMIT) | cada captura se escribe **de inmediato** en la BD del gateway, con su propia sesión corta | `committed` desde el origen |
+| PostgreSQL (transaccional) | las capturas se **acumulan en memoria** y se vuelcan en un lote al salir de `command.upgrade()`/`downgrade()` | `committed` o `rolled_back` según el desenlace real |
+
+El buffer de PostgreSQL no es una optimización: escribir en la BD del gateway mientras la
+transacción del destino sigue abierta deja esa conexión `idle in transaction`, y el
+`idle_in_transaction_session_timeout` (15 s por defecto en `remote_engine`) puede **abortar
+la migración** por culpa de una escritura lenta a la BD de metadatos.
+
+Una fila `rolled_back` describe datos que el motor **deshizo**: es diagnóstico válido de lo
+que se vio durante el intento, **no** el estado final de la base. El endpoint lo avisa.
+
+### Garantías que no se negocian
+
+- **Nunca aborta la migración.** El `SELECT` se ejecuta primero; si la *captura* falla (tipo
+  no serializable, encoding roto, la BD del gateway no responde) se registra
+  `status='error'` con un motivo acotado —nunca `str(exc)` del motor— y la migración sigue.
+- **Nunca reescribe el SQL.** A diferencia de la [consola SQL](sql-query-console.md), que
+  empuja un `LIMIT` al motor, acá el texto que corre tiene que ser byte a byte el del
+  `checksum`. Los topes se aplican al capturar (`fetchmany(max_rows + 1)`, para poder marcar
+  `truncated` con certeza).
+- **Nunca toca la lista de sentencias.** El índice persistido es el mismo del checkpoint y la
+  lista sale siempre de `statement_lists`; si la captura re-partiera el `up_sql` por su
+  cuenta, el conteo cambiaría y `_resolve_resume_offset` dispararía un 409 espurio.
+- **Con `capture_selects=false` el archivo de revisión generado es byte a byte el de
+  siempre** (hay un test que lo verifica): cero riesgo de regresión sobre el checkpoint.
+- Un **resume** no re-ejecuta ni re-captura una sentencia ya aplicada; la captura del intento
+  anterior se conserva tal cual.
+
+### Seguridad y retención
+
+- **Cifrado en reposo**: `columns_json`/`rows_json` van cifrados con la DEK
+  (`app/core/crypto.py`, envelope KEK/DEK). Efecto colateral buscado: no son legibles por SQL
+  directo contra la BD del gateway, así que **todo** acceso pasa por el endpoint auditado.
+- **Auditoría**: la lectura audita con `record_intent` (fail-closed) **antes** de descifrar,
+  igual que `reveal-password`; la escritura audita conteos (`migration.select_results.write`),
+  nunca valores; la purga también.
+- **TTL**: `MIGRATION_CAPTURE_TTL_HOURS` (default `168` = 7 días). La purga corre en el
+  arranque (`lifespan`), **se repite cada `MIGRATION_CAPTURE_PURGE_INTERVAL_MINUTES`** (default
+  60) mientras el proceso vive, y hay endpoint de purga manual. La tarea periódica no es un
+  adorno: con la purga solo del arranque, un gateway que corre semanas —lo normal— nunca
+  volvía a purgar y el TTL era una promesa falsa. Corre en un hilo
+  (`asyncio.to_thread`) porque `purge_expired` hace I/O síncrono, y se cancela y se espera en
+  el apagado del `lifespan` (sin eso el intérprete emite `Task was destroyed but it is
+  pending`).
+- **Purga en cascada por edición**: un `PATCH` que cambia el SQL —`up_sql`, un override por
+  motor **o** el `down_sql`— borra las capturas de esa versión en la misma transacción. No
+  pueden quedar colgadas de un SQL que dejó de existir: su `statement_index` apuntaría a otra
+  sentencia. (El `down_sql` no entra en el freeze de "ya aplicada" ni borra el manifiesto del
+  `up`, pero sí purga: reordena `down_statements`.) **Limpiar un override con `null` cuenta
+  como cambio de SQL** —el SQL efectivo de ese motor pasa a ser la traducción del `up_sql`
+  base—, así que también purga y también revoca `reviewed`; exigir un valor no nulo dejaba
+  abierto el camino "aprobar un override inocuo → borrarlo".
+- **Topes en BYTES UTF-8**: `MIGRATION_CAPTURE_MAX_BYTES` y el `payload_bytes` que viaja por
+  la API se miden con el JSON **codificado**. Medidos en caracteres, un resultado con
+  CJK/emoji pesaba 3-4× el tope y el campo reportaba caracteres con nombre de bytes.
+
+### Variables de entorno
+
+| Variable | Default | Para qué |
+|---|---|---|
+| `MIGRATION_CAPTURE_ENABLED` | `True` | Kill switch global |
+| `MIGRATION_CAPTURE_MAX_ROWS` | `100` | Filas por sentencia (recorte solo de la captura) |
+| `MIGRATION_CAPTURE_MAX_CELL_CHARS` | `1024` | Caracteres por celda |
+| `MIGRATION_CAPTURE_MAX_BYTES` | `262144` | Bytes del JSON en claro de una captura |
+| `MIGRATION_CAPTURE_SQL_MAX_CHARS` | `4096` | SQL guardado junto a la captura (redactado) |
+| `MIGRATION_CAPTURE_TTL_HOURS` | `168` | Retención (`0` = indefinida) |
+| `MIGRATION_CAPTURE_PURGE_INTERVAL_MINUTES` | `60` | Cada cuánto se repite la purga por TTL (`0` = solo en el arranque) |
+
+### Archivos
+
+`app/services/db_admin/migration_results.py` (clasificación + empaquetado + persistencia
+híbrida), `app/services/db_admin/value_json.py` (serializador de valores del driver,
+compartido con la consola SQL), `app/models/migration_select_result.py`, migración
+`f8a9b0c1d2e3`, hook en `migrations.py::_render_statement_calls`, guards y endpoints en
+`managed_migration_controller.py` (`_guard_reviewed_capture`, `_guard_capture_consent`,
+`_guard_stamp_unreviewed_capture`) / `routes/v1/managed_databases.py`, revocación de la
+aprobación al editar el SQL en `model_migration_controller.py::update_migration`, y la tarea
+periódica de purga en `main.py::_purge_captures_periodically`.
+
 ## Límites y consideraciones
 
 | Límite | Valor |
@@ -446,6 +668,7 @@ follow-up.
 | `apply-all` por request | `max_databases` ≤ 100 (síncrono) |
 | Rate limit `apply`/`rollback`/`stamp`/`reconcile-partial` | 10/min |
 | Rate limit `apply-all` | 3/min |
+| Rate limit `GET .../select-results` | 20/min |
 | Concurrencia | advisory lock por BD; `command.*` serializado en el proceso (multiprocessing = Plan 06) |
 
 ## Verificación
@@ -469,6 +692,21 @@ follow-up.
   contra MySQL/MariaDB/PostgreSQL reales, y la migración Alembic
   (`d1e2f3a4b5c6_add_migration_statement_progress`) con upgrade/downgrade/upgrade contra la
   BD del gateway real.
+- **Captura de resultados de `SELECT` — pendiente de verificación e2e**: `tests/test_migration_results.py`
+  (funciones puras, dobles de conexión e invariantes del codegen, 69 casos — incluye el
+  pre-filtro con comentarios por motor, los topes en bytes UTF-8, el conteo por corrida y el
+  alcance del gate de `reviewed`) + los casos de API del gate acotado y del kill switch en
+  `tests/test_api_migrations_apply_flow.py` y de la revocación/purga por `PATCH` en
+  `tests/test_api_migrations_stamp_and_edit.py` + ciclo Alembic
+  real `command.upgrade` contra **SQLite** con captura activada (el resultado se persistió
+  cifrado y se descifró de vuelta) + `upgrade/downgrade/upgrade` de la migración
+  `f8a9b0c1d2e3` contra SQLite. **No** verificado contra MySQL/MariaDB/PostgreSQL reales
+  (sin Docker en el entorno donde se implementó). Lo crítico a confirmar ahí: (a) que el
+  buffer de PostgreSQL evite de verdad el `idle_in_transaction_session_timeout` y que un
+  fallo marque `rolled_back`; (b) que en MySQL/MariaDB la captura inmediata sobreviva a un
+  fallo posterior de la migración; (c) tipos nativos por motor en el serializador
+  (`JSONB`, `TIME` de MySQL como `timedelta`, `bytea`/`BLOB`); (d) la migración Alembic con
+  ciclo completo contra la BD del gateway real.
 
 ---
 
