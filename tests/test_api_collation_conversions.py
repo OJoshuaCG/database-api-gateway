@@ -567,3 +567,58 @@ def test_unknown_charset_collation_pair_is_rejected(admin_client, monkeypatch):
     sid = _server(admin_client, 3718)
     r = _create(admin_client, sid, charset="latin1", collation="latin1_swedish_ci")
     assert r.status_code == 422, r.text
+
+
+def test_universal_mode_requires_target_charset(admin_client, monkeypatch):
+    """
+    Omitir target_charset en MySQL/MariaDB da un 422 CLARO ("target_charset es
+    obligatorio"), no el mensaje ambiguo del catálogo.
+
+    Regresión: antes de este fix, resolve_enabled_combination(dialect, None, collation)
+    resuelve legítimamente la rama "solo collation" y devuelve (None, <collation
+    habilitada>) — un ÉXITO real. El chequeo posterior `if not charset or not collation`
+    lo interpretaba como fallo con un mensaje que no explicaba nada (a diferencia del 422
+    de catálogo, que sí trae `allowed` en public_context).
+    """
+    _install(monkeypatch)
+    sid = _server(admin_client, 3719)
+    r = admin_client.post(
+        f"/api/v1/servers/{sid}/databases/app_db/collation-conversions",
+        json={"target_collation": TARGET_CO},  # sin target_charset
+    )
+    assert r.status_code == 422, r.text
+    assert "target_charset" in r.json()["detail"]["msg"]
+    assert "obligatorio" in r.json()["detail"]["msg"]
+
+
+def test_execute_force_survives_drift_the_worker_would_otherwise_catch(
+    admin_client, monkeypatch
+):
+    """
+    Regresión: execute(force=true) con un inventario que cambió desde el preview
+    devolvía 200 pero el job moría en 'failed' segundos después, porque el WORKER
+    revalida el fingerprint de forma INCONDICIONAL al arrancar (red de seguridad final)
+    y no se enteraba de ese `force`. El fix hace que execute(force=true) adopte el
+    fingerprint actual como base — igual que preview(force=true) — así el worker ya no
+    encuentra drift alguno.
+    """
+    fake = _install(monkeypatch)
+    sid = _server(admin_client, 3720)
+    job_id = _create(admin_client, sid).json()["data"]["id"]
+    token = _preview(admin_client, job_id, tables=["users"]).json()["data"]["confirm_token"]
+
+    # Drift DESPUÉS del preview: una tabla nueva no seleccionada aparece en el motor.
+    fake.inventory.tables.append(
+        TableCollationInfo(
+            name="nueva", charset="utf8mb3", collation="utf8mb3_general_ci",
+            needs_conversion=True,
+        )
+    )
+
+    r = _execute(admin_client, job_id, token, force=True)
+    assert r.status_code == 200, r.text
+
+    final = admin_client.get(f"/api/v1/collation-conversions/{job_id}").json()["data"]
+    assert final["status"] == "succeeded", (
+        f"force=true no sobrevivió al drift: status={final['status']} error={final['error']}"
+    )

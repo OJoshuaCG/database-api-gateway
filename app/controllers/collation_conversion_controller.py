@@ -369,23 +369,35 @@ class CollationConversionController:
 
         charset: str | None = None
         if mode == COLLATION_MODE_UNIVERSAL:
+            # target_charset es OBLIGATORIO acá (a diferencia de create_database, donde
+            # omitirlo es válido): el ALTER DATABASE/ALTER TABLE de este pipeline SIEMPRE
+            # emite ``CHARACTER SET {cs} COLLATE {co}`` juntos (ver _build_plan), así que no
+            # hay DDL válido posible con charset ausente. Validarlo ACÁ, antes de llamar a
+            # resolve_enabled_combination, evita un bug real: pedir "solo collation" hace que
+            # esa función tome legítimamente la rama "solo collation" y devuelva
+            # ``(None, <collation habilitada>)`` — un ÉXITO real que un chequeo posterior de
+            # "¿charset es truthy?" interpretaría como fallo, con un mensaje que no explica
+            # nada (a diferencia del 422 que resolve_enabled_combination ya sabe emitir, con
+            # ``allowed`` en public_context).
+            if not target_charset:
+                raise AppHttpException(
+                    message=(
+                        "target_charset es obligatorio para MySQL/MariaDB: esta operación "
+                        "siempre fija charset y collation juntos (ALTER DATABASE/ALTER TABLE "
+                        "... CHARACTER SET ... COLLATE ... exige ambos)."
+                    ),
+                    status_code=422,
+                    context={"target_charset": target_charset},
+                )
             # Catálogo GLOBAL de charsets/collations: el PAR debe estar HABILITADO antes de
-            # tocar el motor (422 si no), y se reemplazan los valores por la forma CANÓNICA
-            # del catálogo — lo que viaja al DDL sale siempre de la tabla, nunca del texto
-            # crudo del request. Mismo criterio que
+            # tocar el motor (422 si no — resolve_enabled_combination ya lo levanta con
+            # ``allowed`` en public_context), y se reemplazan los valores por la forma
+            # CANÓNICA del catálogo — lo que viaja al DDL sale siempre de la tabla, nunca del
+            # texto crudo del request. Mismo criterio que
             # ``ServerDatabaseController.create_database``.
             charset, collation = charset_catalog.resolve_enabled_combination(
                 dialect, target_charset, target_collation
             )
-            if not charset or not collation:
-                raise AppHttpException(
-                    message=(
-                        "La combinación de charset/collation pedida no está habilitada en el "
-                        "catálogo global."
-                    ),
-                    status_code=422,
-                    context={"charset": target_charset, "collation": target_collation},
-                )
             adapter = get_adapter(target)
             if database not in adapter.list_databases():
                 raise AppHttpException(
@@ -1141,7 +1153,8 @@ class CollationConversionController:
         target = self._job_target_by_server(server_id)
         adapter = get_adapter(target)
         inv = adapter.collation_inventory(database, target_collation=collation)
-        if self._inventory_fingerprint(inv) != fingerprint and not force:
+        current_fp = self._inventory_fingerprint(inv)
+        if current_fp != fingerprint and not force:
             raise AppHttpException(
                 message=(
                     "El inventario de la base de datos cambió desde el preview; volvé a "
@@ -1150,6 +1163,20 @@ class CollationConversionController:
                 status_code=409,
                 context={"collation_conversion_job_id": job_id},
             )
+        if current_fp != fingerprint and force:
+            # ADOPTAR el inventario actual como base, igual que preview(force=true). Sin
+            # esto, force=true acá pasaba este chequeo pero el WORKER (_pipeline) vuelve a
+            # comparar el fingerprint de forma INCONDICIONAL al arrancar — como red de
+            # seguridad final, sin enterarse de este `force` — y encontraba el mismo drift,
+            # matando el job en `failed` unos segundos después sin haber tocado el motor.
+            # force quedaba sin efecto real: 200 en el momento, pero la conversión moría sola.
+            session = self._session()
+            try:
+                job = self._job_or_404(session, job_id)
+                job.source_fingerprint = current_fp
+                session.commit()
+            finally:
+                session.close()
 
         session = self._session()
         try:
