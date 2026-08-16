@@ -7,6 +7,7 @@ from app.core import remote_engine
 from app.core.auth import bootstrap_admin
 from app.core.environments import (
     CORS_ORIGINS,
+    EXPORT_PURGE_INTERVAL_MINUTES,
     MIGRATION_CAPTURE_PURGE_INTERVAL_MINUTES,
     MIGRATION_CAPTURE_TTL_HOURS,
 )
@@ -53,6 +54,40 @@ async def _purge_captures_periodically(ttl_hours: int, interval_seconds: int) ->
             )
 
 
+async def _purge_export_artifacts_periodically(interval_seconds: int) -> None:
+    """
+    Repite la purga por TTL de los artefactos de exportación mientras el proceso viva.
+
+    MISMA plantilla que ``_purge_captures_periodically`` y por el mismo motivo: un artefacto
+    es un archivo con los datos del origen EN CLARO (no hay enmascarado), su TTL es de
+    minutos, y una purga que solo corre al arrancar convierte esa retención en una promesa
+    falsa en un gateway que corre semanas.
+
+    ``purge_expired`` es I/O SÍNCRONO (borrado de archivos + SQLAlchemy), así que va a un
+    hilo con ``asyncio.to_thread``: ejecutarlo en el event loop bloquearía TODAS las requests
+    en vuelo. La tarea duerme primero porque la purga del arranque ya corrió, y un fallo de
+    una pasada no mata el bucle.
+
+    **No** llama a ``sweep_orphans``: ese barrido borra también los archivos ``.part``, y
+    acá sí puede haber una exportación escribiendo el suyo. El barrido de huérfanos corre
+    solo al arrancar, cuando ningún job de este proceso está vivo.
+    """
+    from app.services import export_storage
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await asyncio.to_thread(export_storage.purge_expired)
+        except asyncio.CancelledError:
+            # Apagado en curso: propagar para que la tarea termine de verdad.
+            raise
+        except Exception:  # noqa: BLE001 — la retención no puede tumbar el proceso
+            logger.warning(
+                "Falló una pasada de la purga periódica de artefactos de exportación",
+                exc_info=True,
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Arranque: sembrar el administrador único y los catálogos (privilegios y
@@ -68,10 +103,23 @@ async def lifespan(app: FastAPI):
     _crypto.bootstrap_dek()
     # Barrido: jobs asíncronos que quedaron 'running' por un reinicio → 'interrupted'.
     # Cada worker in-process tiene su propio barrido (los pools son independientes).
-    from app.services import clone_runner, collation_conversion_runner
+    from app.services import (
+        clone_runner,
+        collation_conversion_runner,
+        export_runner,
+        export_storage,
+    )
 
     clone_runner.sweep_interrupted()
     collation_conversion_runner.sweep_interrupted()
+    export_runner.sweep_interrupted()
+    # Artefactos de exportación: primero se purgan los vencidos y después se barren los
+    # HUÉRFANOS (archivos sin fila viva, típicamente de un ``kill -9`` a mitad de la
+    # generación). Sin el segundo barrido, un artefacto con los datos del origen en claro se
+    # queda en disco para siempre. Solo acá puede borrar los ``.part``: en el arranque no hay
+    # ningún job de este proceso escribiendo.
+    export_storage.purge_expired()
+    export_storage.sweep_orphans()
     # Retención: los resultados de SELECT capturados durante una migración son DATOS DE
     # NEGOCIO y no se guardan indefinidamente. Se purgan los vencidos
     # (MIGRATION_CAPTURE_TTL_HOURS). No lanza: un fallo acá no puede impedir el arranque.
@@ -87,6 +135,12 @@ async def lifespan(app: FastAPI):
             ),
             name="migration-capture-purge",
         )
+    export_purge_task: asyncio.Task | None = None
+    if EXPORT_PURGE_INTERVAL_MINUTES > 0:
+        export_purge_task = asyncio.create_task(
+            _purge_export_artifacts_periodically(EXPORT_PURGE_INTERVAL_MINUTES * 60),
+            name="export-artifact-purge",
+        )
     try:
         yield
     finally:
@@ -97,10 +151,11 @@ async def lifespan(app: FastAPI):
         #
         # Cancelar la tarea periódica y ESPERARLA: sin el await, el intérprete cierra el loop
         # con la tarea todavía pendiente.
-        if purge_task is not None:
-            purge_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await purge_task
+        for task in (purge_task, export_purge_task):
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
         # Liberar los engines de conexión a servidores destino.
         remote_engine.dispose_all()
 

@@ -59,6 +59,10 @@ services:
       RATE_LIMIT_REDIS_URL: redis://valkey:6379
     volumes:
       - uploads_data:/app/uploads
+      # Artefactos de exportación. Volumen PROPIO y no el de uploads: aquel es un
+      # buzón de entrada sin TTL, y estos son archivos con los datos del origen en
+      # claro que se purgan por retención (EXPORT_ARTIFACT_TTL_MINUTES).
+      - exports_data:/app/exports
     expose:
       - "8000"
     depends_on:
@@ -143,6 +147,7 @@ services:
 volumes:
   mariadb_data:          # Datos persistentes de la BD de metadatos (MariaDB)
   uploads_data:          # Archivos subidos por la aplicación
+  exports_data:          # Artefactos de exportación (efímeros: TTL corto + purga)
   nginx_logs:            # Logs de acceso/error de Nginx
   certbot_www:           # Directorio para verificación ACME (Let's Encrypt)
   certbot_certs:         # Certificados SSL generados por Certbot

@@ -8,6 +8,7 @@ Particularidades:
   gateway mantiene en su BD de metadatos, respaldado por `GRANT ALL ON db.*`.
 """
 
+import re
 from typing import ClassVar
 
 from sqlalchemy import text
@@ -69,6 +70,205 @@ def _in_list(values: tuple[str, ...]) -> str:
 
 class MySQLAdapter(ServerAdapter):
     dialect = "mysql"
+
+    def export_supported_types(self) -> frozenset[str]:
+        """
+        El núcleo común + ``event`` (el scheduler de MySQL/MariaDB).
+
+        Lo que NO está tampoco es un olvido: en esta familia no existen las vistas
+        materializadas, ni las secuencias autónomas de PostgreSQL, ni los tipos ENUM de
+        catálogo (el ``ENUM`` de MySQL es un tipo de COLUMNA, no un objeto), ni las
+        extensiones.
+        """
+        return super().export_supported_types() | {"event"}
+
+    # ---- Emisión del artefacto de exportación (§7) ----------------------- #
+    # Variables de sesión que el preámbulo cambia y el epílogo RESTAURA. Se guardan en
+    # variables de usuario con prefijo ``@_gw_`` (mismo patrón que ``_gw_v_``/``_gw_stg_``)
+    # en vez de fijar valores "por defecto" al salir: restaurar a un valor supuesto pisaría
+    # la configuración de quien ejecuta el script. Es el mismo mecanismo de ``mysqldump``.
+    # ``CREATE TABLE/EVENT IF NOT EXISTS`` existen desde siempre. Las rutinas y los triggers
+    # NO están: su ``IF NOT EXISTS`` es de MySQL 8.0.29+ / MariaDB 10.1+ y el gateway no
+    # conoce la versión del destino donde se ejecutará el artefacto.
+    _EXPORT_IF_NOT_EXISTS_TYPES = frozenset({"table", "event"})
+    # Las vistas se rendean con ``CREATE OR REPLACE VIEW``: ya son idempotentes.
+    _EXPORT_ALREADY_IDEMPOTENT_TYPES = frozenset({"view"})
+
+    _EXPORT_SESSION_VARS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("_gw_fk_checks", "FOREIGN_KEY_CHECKS"),
+        ("_gw_unique_checks", "UNIQUE_CHECKS"),
+        ("_gw_sql_mode", "SQL_MODE"),
+        ("_gw_time_zone", "TIME_ZONE"),
+    )
+
+    def export_scope_ddl(
+        self, database, mode, *, charset=None, collation=None, if_exists=True
+    ) -> list[str]:
+        mode = str(mode)
+        if mode == "NONE":
+            return []
+        db = self._q(database, "base de datos")
+        out: list[str] = []
+        if mode == "DROP_CREATE":
+            out.append(f"DROP DATABASE {'IF EXISTS ' if if_exists else ''}{db}")
+        create = "CREATE DATABASE"
+        if mode == "CREATE_IF_NOT_EXISTS":
+            create += " IF NOT EXISTS"
+        sql = f"{create} {db}"
+        if charset:
+            cs = validate_identifier(charset, self.dialect, "charset", allow_existing=True)
+            sql += f" DEFAULT CHARACTER SET {cs}"
+        if collation:
+            co = validate_identifier(
+                collation, self.dialect, "collation", allow_existing=True
+            )
+            sql += f" DEFAULT COLLATE {co}"
+        out.append(sql)
+        return out
+
+    def export_session_preamble(
+        self, *, charset=None, collation=None, suspend_constraints=True
+    ) -> list[str]:
+        """
+        Guarda el estado de la sesión, lo relaja para cargar datos y fija el juego de
+        caracteres del script. ``SET NAMES`` va SIEMPRE: sin él, el cliente interpreta el
+        archivo con su charset por defecto y los literales multibyte se corrompen en
+        silencio, que es el peor fallo posible (no aborta nada, solo escribe mal).
+        """
+        out = [
+            f"SET @{var} = @@{sysvar}" for var, sysvar in self._EXPORT_SESSION_VARS
+        ]
+        cs = validate_identifier(
+            charset or "utf8mb4", self.dialect, "charset", allow_existing=True
+        )
+        out.append(f"SET NAMES {cs}")
+        if suspend_constraints:
+            out.append("SET FOREIGN_KEY_CHECKS = 0")
+            out.append("SET UNIQUE_CHECKS = 0")
+        # ``NO_AUTO_VALUE_ON_ZERO``: sin esto un 0 explícito en una columna AUTO_INCREMENT
+        # se convierte en "el siguiente valor" y el volcado deja de reproducir el origen.
+        out.append("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'")
+        # UTC: un TIMESTAMP se guarda en UTC y se muestra en la zona de la SESIÓN, así que
+        # sin fijarla el mismo artefacto restaurado en otra zona corre los valores.
+        out.append("SET TIME_ZONE = '+00:00'")
+        return out
+
+    def export_session_epilogue(self) -> list[str]:
+        return [f"SET {sysvar} = @{var}" for var, sysvar in self._EXPORT_SESSION_VARS]
+
+    def export_use_scope(self, database: str) -> str | None:
+        return f"USE {self._q(database, 'base de datos')}"
+
+    def export_counter_reset(
+        self, table: str, value: int | None, *, column: str | None = None
+    ) -> str | None:
+        # ``column`` no se usa: en MySQL/MariaDB el contador es una opción de la TABLA.
+        if value is None:
+            return None
+        return f"ALTER TABLE {self._q(table, 'tabla')} AUTO_INCREMENT = {int(value)}"
+
+    def export_counter_value_sql(
+        self, database: str, table: str, column: str
+    ) -> tuple[str, dict] | None:
+        """
+        El contador es una propiedad de la TABLA y ``information_schema`` ya publica el
+        PRÓXIMO valor que el motor va a usar — que es exactamente lo que espera
+        ``ALTER TABLE … AUTO_INCREMENT = n``.
+
+        Se lee de ahí y no con un ``MAX(col)+1``: el máximo recorre la tabla entera (caro y
+        además dentro de la transacción de consistencia del job) y no coincide con el
+        contador cuando hubo borrados o huecos por transacciones abortadas.
+        """
+        return (
+            "SELECT AUTO_INCREMENT FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA = :db AND TABLE_NAME = :tbl",
+            {"db": database, "tbl": table},
+        )
+
+    def export_insert_wrapper(
+        self, table, columns, *, variant="insert", primary_key=()
+    ) -> tuple[str, str]:
+        q = self._q(table, "tabla")
+        cols = self._export_column_list(columns)
+        if variant in ("insert", "none"):
+            return f"INSERT INTO {q}{cols} VALUES", ""
+        if variant == "insert_ignore":
+            return f"INSERT IGNORE INTO {q}{cols} VALUES", ""
+        if variant == "replace":
+            # ``REPLACE`` es DELETE+INSERT, no un UPDATE: dispara los ON DELETE de las FKs y
+            # cambia el autoincrement de la fila. Es lo que el usuario pidió, pero no es
+            # equivalente a ``upsert`` y por eso son opciones distintas.
+            return f"REPLACE INTO {q}{cols} VALUES", ""
+        if variant == "upsert":
+            updatable = [c for c in columns if c not in set(primary_key)]
+            if not columns or not updatable:
+                # Sin lista de columnas no hay nada que nombrar en el SET, y si todas las
+                # columnas son la PK el upsert no tiene qué actualizar: en vez de emitir una
+                # sentencia inválida se devuelve un 422 accionable.
+                raise self._export_unsupported_variant("upsert")
+            # ``VALUES(col)`` y no el alias de fila de MySQL 8.0.20+: MariaDB no soporta el
+            # alias, y el artefacto tiene que poder ejecutarse en ambos.
+            assignments = ", ".join(
+                f"{self._q(c, 'columna')} = VALUES({self._q(c, 'columna')})"
+                for c in updatable
+            )
+            return f"INSERT INTO {q}{cols} VALUES", f" ON DUPLICATE KEY UPDATE {assignments}"
+        raise self._export_unsupported_variant(variant)
+
+    def export_definer_clause(self, sql: str, *, mode: str, value=None) -> str:
+        """
+        ``keep`` deja el DDL como está; ``omit`` quita la cláusula; ``replace`` la fija.
+
+        AVISO sobre ``keep``: los cuerpos del ``SchemaSnapshot`` ya vienen SIN ``DEFINER``
+        (``_strip_definer_clause`` corre al capturarlos, porque re-aplicarlos en otro
+        servidor con un usuario inexistente falla). Por eso ``keep`` es, en la práctica,
+        indistinguible de ``omit`` en el camino del snapshot: no hay nada que conservar. Se
+        implementa igual para que el día que exista una fuente que sí lo traiga (un
+        ``SHOW CREATE`` sin sanear) el comportamiento sea el correcto.
+
+        SEGURIDAD: ``definer_value`` es entrada del cliente que termina DENTRO del DDL.
+        No se interpola: se parte en usuario/host, se valida cada parte y se re-emite
+        delimitada con backticks.
+        """
+        mode = str(mode)
+        if mode == "keep":
+            return sql
+        stripped = self._strip_definer_clause(sql)
+        if mode != "replace":
+            return stripped
+        clause = self._export_definer_literal(value)
+        # La cláusula va inmediatamente después de ``CREATE`` (y de ``OR REPLACE`` si
+        # está), que es la única posición que MySQL/MariaDB aceptan.
+        match = re.match(r"(\s*CREATE\s+(?:OR\s+REPLACE\s+)?)", stripped, re.IGNORECASE)
+        if not match:
+            # DDL que no empieza con CREATE: no hay dónde poner el DEFINER. Se deja sin
+            # cláusula en vez de inyectarla en un lugar arbitrario (fail-closed).
+            return stripped
+        head = match.group(1)
+        return f"{head}{clause} {stripped[len(head):]}"
+
+    def _export_definer_literal(self, value: str | None) -> str:
+        """``'app'@'%'`` / ``app@%`` / ``CURRENT_USER`` → ``DEFINER=`app`@`%``` validado."""
+        raw = (value or "").strip()
+        if not raw:
+            raise AppHttpException(
+                message="Falta el valor del DEFINER de reemplazo.",
+                status_code=422,
+                context={"field": "sanitize.definer_value"},
+            )
+        if raw.upper() in ("CURRENT_USER", "CURRENT_USER()"):
+            return "DEFINER=CURRENT_USER"
+        user, sep, host = raw.rpartition("@")
+        if not sep:
+            user, host = raw, "%"
+        user = user.strip().strip("`'\"")
+        host = host.strip().strip("`'\"") or "%"
+        validate_identifier(user, self.dialect, "usuario", allow_existing=True)
+        validate_host(host)
+        return (
+            f"DEFINER={quote_identifier(user, self.dialect)}@"
+            f"{quote_identifier(host, self.dialect)}"
+        )
 
     def _version_sql(self) -> str:
         return "SELECT VERSION()"
@@ -142,18 +342,21 @@ class MySQLAdapter(ServerAdapter):
                 return mapping[key]
         return row[fallback_idx]
 
-    def dump_structure(self, database: str) -> StructureDump:
+    def dump_structure(self, database: str, *, conn=None) -> StructureDump:
         """
         Dump estructural de una BD MySQL/MariaDB vía ``SHOW CREATE *``.
 
         Orden de dependencia: tablas → vistas → rutinas → triggers → events. El
         ``DEFINER`` se sanea (ver base). Solo estructura, nunca filas.
+
+        ``conn`` (§6.4 del módulo de exportación): ver ``ServerAdapter._conn_ctx``.
+        ``None`` = comportamiento histórico (conexión propia).
         """
         validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         statements: list[DumpStatement] = []
         has_non_portable = False
         try:
-            with database_connection(self.target, database) as conn:
+            with self._conn_ctx(database, conn) as conn:
                 # Aristas FK entre tablas (una sola consulta) para depends_on / topo-sort.
                 fk_map: dict[str, set[str]] = {}
                 for tname, referred in conn.execute(

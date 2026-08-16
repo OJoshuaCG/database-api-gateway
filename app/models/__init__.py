@@ -32,6 +32,7 @@ from app.models.enums import (
     ProvisionStatus,
     ServerStatus,
 )
+from app.models.export_job import ExportArtifact, ExportJob, ExportJobItem
 from app.models.managed_database import ManagedDatabase
 from app.models.migration_select_result import MigrationSelectResult
 from app.models.migration_statement_progress import MigrationStatementProgress
@@ -71,6 +72,9 @@ __all__ = [
     "CloneJobItem",
     "CollationConversionJob",
     "CollationConversionJobItem",
+    "ExportJob",
+    "ExportJobItem",
+    "ExportArtifact",
     "QueryExecution",
     "EngineType",
     "ServerStatus",

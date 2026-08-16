@@ -58,6 +58,225 @@ class PostgresAdapter(ServerAdapter):
     # múltiples por username. add_user_host/copy_user_grants heredan el 422 del base.
     supports_hosts = False
 
+    def export_supported_types(self) -> frozenset[str]:
+        """
+        El núcleo común + lo que solo existe acá: vistas materializadas, secuencias
+        autónomas, tipos ENUM de catálogo y extensiones.
+
+        ``event`` NO está: PostgreSQL no tiene scheduler propio (pg_cron es una extensión
+        externa y sus tareas no son objetos del esquema).
+        """
+        return super().export_supported_types() | {
+            "materialized_view",
+            "sequence",
+            "enum_type",
+            "extension",
+        }
+
+    # ---- Emisión del artefacto de exportación (§7) ----------------------- #
+    # PostgreSQL sí arrastra dependencias con CASCADE (y es la única forma de soltar una
+    # tabla de la que cuelga una vista). MySQL/MariaDB aceptan la palabra pero la ignoran.
+    _EXPORT_SUPPORTS_CASCADE = True
+
+    # ``IF NOT EXISTS`` disponible desde PG 9.5 para estos tipos. ``CREATE TYPE`` y
+    # ``CREATE TRIGGER`` NO lo tienen en ninguna versión.
+    _EXPORT_IF_NOT_EXISTS_TYPES = frozenset(
+        {"table", "sequence", "extension", "index", "materialized_view"}
+    )
+    # Vistas (``CREATE OR REPLACE VIEW``) y rutinas (``pg_get_functiondef`` emite
+    # ``CREATE OR REPLACE FUNCTION/PROCEDURE``) ya salen idempotentes del renderer.
+    _EXPORT_ALREADY_IDEMPOTENT_TYPES = frozenset({"view", "routine"})
+
+    # A los tipos no ordenables comunes se suman los GEOMÉTRICOS de PostgreSQL, que
+    # directamente no tienen operador de orden (``could not identify an ordering operator``):
+    # incluirlos en el ORDER BY de respaldo de una tabla sin PK haría fallar la consulta,
+    # no solo perder determinismo.
+    _EXPORT_UNORDERABLE_TYPE_TOKENS = (
+        ServerAdapter._EXPORT_UNORDERABLE_TYPE_TOKENS
+        + ("point", "polygon", "lseg", "box", "path", "circle", "line")
+    )
+
+    def export_scope_ddl(
+        self, database, mode, *, charset=None, collation=None, if_exists=True
+    ) -> list[str]:
+        """
+        ``CREATE/DROP DATABASE`` de PostgreSQL.
+
+        Dos avisos que el preview ya publica y que acá se materializan en el texto: ninguna
+        de las dos sentencias es ejecutable desde una conexión a ESA misma base, ni dentro
+        de un bloque transaccional. Quien ejecute el artefacto tiene que estar conectado a
+        otra base (típicamente ``postgres``).
+        """
+        mode = str(mode)
+        if mode == "NONE":
+            return []
+        db = self._q(database, "base de datos")
+        out: list[str] = []
+        if mode == "DROP_CREATE":
+            out.append(f"DROP DATABASE {'IF EXISTS ' if if_exists else ''}{db}")
+        if mode == "CREATE_IF_NOT_EXISTS":
+            # PostgreSQL NO tiene ``CREATE DATABASE IF NOT EXISTS`` (ninguna versión).
+            # La matriz de compatibilidad ya lo rechaza con un 422 accionable ANTES de
+            # llegar acá; esto es defensa en profundidad para que un camino nuevo no emita
+            # en silencio un script con un error de sintaxis en su segunda línea.
+            raise AppHttpException(
+                message=(
+                    "PostgreSQL no admite CREATE DATABASE IF NOT EXISTS: usá "
+                    "structure.scope_ddl='CREATE' o 'NONE'."
+                ),
+                status_code=422,
+                public_context={
+                    "code": "export.incompatible_option",
+                    "field": "structure.scope_ddl",
+                    "engine": self.dialect,
+                    "allowed": ["NONE", "CREATE", "DROP_CREATE"],
+                },
+            )
+        parts = [f"CREATE DATABASE {db}"]
+        # ``charset`` → ENCODING (LITERAL de string, no identificador); ``collation`` es el
+        # LOCALE del SO y fija LC_COLLATE/LC_CTYPE. Mismo criterio que ``create_database``.
+        if charset:
+            parts.append(f"ENCODING {quote_string_literal(charset, self.dialect)}")
+        if collation:
+            loc = quote_string_literal(collation, self.dialect)
+            parts.append(f"LC_COLLATE {loc} LC_CTYPE {loc}")
+        if charset or collation:
+            # TEMPLATE template0 es REQUERIDO para fijar encoding/locale distintos del default.
+            parts.append("TEMPLATE template0")
+        out.append(" ".join(parts))
+        return out
+
+    def _export_drop_suffix(self, object_type: str, payload) -> list[str]:
+        """``DROP TRIGGER x ON tabla``: en PostgreSQL el trigger pertenece a su tabla."""
+        if object_type == "trigger" and payload is not None:
+            return ["ON", self._q(payload.table, "tabla")]
+        return []
+
+    def export_session_preamble(
+        self, *, charset=None, collation=None, suspend_constraints=True
+    ) -> list[str]:
+        """
+        Preámbulo al estilo ``pg_dump``, y deliberadamente SIN
+        ``SET session_replication_role = 'replica'``.
+
+        Esa variable es la única forma de suspender FKs y triggers en PostgreSQL, pero
+        **exige superusuario**: emitirla haría abortar el script (con ``ON_ERROR_STOP``) o
+        dejar un error confuso en la salida para cualquier operador normal. Y no hace falta:
+        el default del módulo es ``constraints_placement='deferred'``, que emite índices y
+        FKs DESPUÉS de los datos, así que el problema de orden que la variable resolvería ya
+        está resuelto por construcción. Se documenta como hueco conocido del §7.1 en vez de
+        emitir algo que falla en el caso común.
+
+        ``check_function_bodies = false`` sí va: sin él, crear una función que referencia
+        una tabla que todavía no existe falla en la validación del cuerpo.
+        """
+        out = [
+            "SET client_encoding = "
+            f"{quote_string_literal(charset or 'UTF8', self.dialect)}",
+            "SET standard_conforming_strings = on",
+            "SET check_function_bodies = false",
+        ]
+        return out
+
+    def export_session_epilogue(self) -> list[str]:
+        """
+        ``RESET`` en vez de fijar valores: devuelve cada parámetro al que tenía la sesión al
+        conectarse (``postgresql.conf`` / ``ALTER ROLE``). Fijar un valor "por defecto"
+        supuesto pisaría la configuración de quien ejecuta el script.
+        """
+        return [
+            "RESET check_function_bodies",
+            "RESET standard_conforming_strings",
+            "RESET client_encoding",
+            "RESET search_path",
+        ]
+
+    def export_use_scope(self, database: str) -> str | None:
+        """
+        PostgreSQL no tiene ``USE``: el ámbito exportable es el schema ``public`` (misma
+        limitación que el diff, el clon y la conversión de collation), y el contexto se fija
+        con ``search_path``. La base la elige quien se conecta, no el script.
+        """
+        return "SET search_path TO \"public\""
+
+    def export_insert_wrapper(
+        self, table, columns, *, variant="insert", primary_key=()
+    ) -> tuple[str, str]:
+        q = self._q(table, "tabla")
+        cols = self._export_column_list(columns)
+        prefix = f"INSERT INTO {q}{cols} VALUES"
+        if variant in ("insert", "none"):
+            return prefix, ""
+        if variant == "insert_ignore":
+            # Sin lista de conflicto: cubre CUALQUIER restricción única, que es la semántica
+            # de ``INSERT IGNORE`` de MySQL.
+            return prefix, " ON CONFLICT DO NOTHING"
+        if variant == "upsert":
+            updatable = [c for c in columns if c not in set(primary_key)]
+            if not primary_key or not columns or not updatable:
+                # ``ON CONFLICT DO UPDATE`` EXIGE nombrar el conflicto: sin PK no hay
+                # destino de conflicto que declarar y la sentencia no es construible.
+                raise self._export_unsupported_variant("upsert")
+            conflict = ", ".join(self._q(c, "columna") for c in primary_key)
+            assignments = ", ".join(
+                f"{self._q(c, 'columna')} = EXCLUDED.{self._q(c, 'columna')}"
+                for c in updatable
+            )
+            return prefix, f" ON CONFLICT ({conflict}) DO UPDATE SET {assignments}"
+        # ``replace`` (DELETE+INSERT implícito de MySQL) no tiene equivalente en PostgreSQL:
+        # emularlo con DELETE previo cambiaría el significado sin que el usuario lo pidiera.
+        raise self._export_unsupported_variant(variant)
+
+    def export_counter_reset(
+        self, table: str, value: int | None, *, column: str | None = None
+    ) -> str | None:
+        """
+        En PostgreSQL el contador vive en una SECUENCIA, no en la tabla.
+
+        Se resuelve con ``pg_get_serial_sequence`` en vez de construir el nombre a mano
+        (``t_id_seq``): ese nombre depende de cómo se creó la columna —``serial``,
+        ``IDENTITY`` o una secuencia asociada con ``OWNED BY``— y adivinarlo produce
+        ``relation … does not exist`` en cuanto alguien renombró la tabla. ``setval`` es
+        STRICT: si la columna no tiene secuencia detrás, ``pg_get_serial_sequence`` devuelve
+        NULL y la llamada entera devuelve NULL sin error.
+
+        Sin ``column`` no se emite nada: inventar cuál es la columna del contador es
+        exactamente el tipo de suposición que deja un artefacto roto.
+        """
+        if value is None or not column:
+            return None
+        validate_identifier(table, self.dialect, "tabla", allow_existing=True)
+        validate_identifier(column, self.dialect, "columna", allow_existing=True)
+        # Argumentos de ``pg_get_serial_sequence``: LITERALES de texto, no identificadores.
+        qualified = quote_string_literal(f"public.{table}", self.dialect)
+        col = quote_string_literal(column, self.dialect)
+        return (
+            f"SELECT setval(pg_get_serial_sequence({qualified}, {col}), "
+            f"{int(value)}, true)"
+        )
+
+    def export_counter_value_sql(
+        self, database: str, table: str, column: str
+    ) -> tuple[str, dict] | None:
+        """
+        Último valor entregado por la secuencia que respalda la columna.
+
+        Coincide con la semántica de ``setval(seq, n, true)`` que emite
+        ``export_counter_reset`` (fija el ÚLTIMO usado, el próximo será ``n+1``). La
+        secuencia se resuelve con ``pg_get_serial_sequence`` en vez de construir el nombre a
+        mano, por el mismo motivo que allá: el nombre depende de cómo se creó la columna.
+
+        ``pg_sequence_last_value`` devuelve NULL si la secuencia nunca se usó, y
+        ``pg_get_serial_sequence`` devuelve NULL si la columna no tiene secuencia detrás; en
+        ambos casos el resultado es NULL y no se emite ningún ajuste. ``database`` no se usa:
+        la conexión ya está en esa base y el módulo cubre solo el schema ``public``.
+        """
+        return (
+            "SELECT pg_catalog.pg_sequence_last_value("
+            "pg_get_serial_sequence(:qualified, :col))",
+            {"qualified": f"public.{table}", "col": column},
+        )
+
     def _version_sql(self) -> str:
         return "SELECT version()"
 
@@ -91,7 +310,7 @@ class PostgresAdapter(ServerAdapter):
         return [EngineUserInfo(username=r.username, host=None) for r in rows]
 
     # ------------------------- snapshot estructural (Plan 09) ----------------- #
-    def dump_structure(self, database: str) -> StructureDump:
+    def dump_structure(self, database: str, *, conn=None) -> StructureDump:
         """
         Dump estructural de una BD PostgreSQL (schema ``public``).
 
@@ -100,6 +319,9 @@ class PostgresAdapter(ServerAdapter):
         Orden de dependencia: extensiones → tipos → secuencias → tablas → índices →
         vistas → vistas materializadas → rutinas → triggers. Cada bloque opcional
         degrada con gracia si la feature no aplica. Solo estructura, nunca filas.
+
+        ``conn`` (§6.4 del módulo de exportación): ver ``ServerAdapter._conn_ctx``.
+        ``None`` = comportamiento histórico (conexión propia).
         """
         validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         statements: list[DumpStatement] = []
@@ -113,7 +335,7 @@ class PostgresAdapter(ServerAdapter):
                 return []
 
         try:
-            with database_connection(self.target, database) as conn:
+            with self._conn_ctx(database, conn) as conn:
                 # 1) Extensiones (plpgsql viene por defecto: se omite).
                 for (extname,) in _safe(
                     conn,

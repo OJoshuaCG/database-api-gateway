@@ -26,6 +26,10 @@ os.environ.update(
         # Los tests registran servidores con 127.0.0.1 como dummy; el guard anti-SSRF
         # se prueba aparte (tests/test_ssrf_guard.py) activándolo explícitamente.
         "REMOTE_SSRF_GUARD_ENABLED": "False",
+        # Los artefactos de exportación van al directorio temporal de la corrida y no al
+        # /app/exports del contenedor: ningún test debe poder escribir (ni borrar) en la
+        # ruta de producción.
+        "EXPORT_ARTIFACT_DIR": os.path.join(_TMPDIR, "exports"),
     }
 )
 

@@ -13,8 +13,10 @@ Iteración 1 (solo se usarán a partir de la Iteración 2).
 
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from contextlib import contextmanager
 
-from sqlalchemy import MetaData, Table, inspect, select, text
+from sqlalchemy import Connection, MetaData, Table, inspect, select, text
 from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 
 from app.core.remote_engine import (
@@ -69,6 +71,7 @@ from app.services.db_admin.schema_diff import (
     RenderedStatement,
     SchemaDiff,
 )
+from app.services.db_admin.sql_dialect import body_delimiter_wrapper
 
 
 class ServerAdapter(ABC):
@@ -275,12 +278,17 @@ class ServerAdapter(ABC):
         return []
 
     @abstractmethod
-    def dump_structure(self, database: str) -> "StructureDump":
+    def dump_structure(
+        self, database: str, *, conn: Connection | None = None
+    ) -> "StructureDump":
         """
         Dump estructural COMPLETO de la BD (tablas, vistas, rutinas, triggers, y
         según motor: secuencias, tipos, extensiones, events). SOLO estructura, jamás
         filas. Las sentencias vienen YA en orden de dependencia para re-aplicarse.
         Plan 09 (adopción + snapshot como blueprint baseline).
+
+        ``conn`` (§6.4 del módulo de exportación): leer con la conexión del llamador para
+        que el dump entre en su transacción. ``None`` = comportamiento histórico.
         """
 
     @abstractmethod
@@ -450,6 +458,37 @@ class ServerAdapter(ABC):
         self.grant_database(new_owner, db_name, host=new_host)
 
     # ------------------------------------------------------------------ #
+    # Inyección de conexión en la lectura de catálogo (módulo 10, §6.4)   #
+    # ------------------------------------------------------------------ #
+    @contextmanager
+    def _conn_ctx(self, database: str, conn: Connection | None = None):
+        """
+        Conexión con la que leer el catálogo: la que da el llamador, o una nueva.
+
+        Existe por el requisito de **punto único en el tiempo** de la exportación (§19.4):
+        para que la estructura entre en el mismo snapshot que los datos hay que leerla
+        DENTRO de la transacción de lectura del job, y hasta ahora cada método de
+        introspección abría su propia conexión (y por tanto su propia vista de los datos).
+
+        Dos invariantes, ambas deliberadas:
+
+        - Con ``conn`` dado **no se cierra la conexión ni se toca su nivel de aislamiento**.
+          Es del llamador: un ``execution_options(isolation_level=…)`` acá revertiría la
+          transacción REPEATABLE READ que ``export_session`` acaba de abrir, y cerrarla
+          dejaría al resto del job sin snapshot.
+        - Con ``conn=None`` el comportamiento es EXACTAMENTE el histórico
+          (``database_connection`` propia, cerrada al salir). El parámetro es aditivo:
+          los cinco consumidores actuales de estos métodos (clon, schema-comparisons,
+          conversión de collation, migraciones y adopción/snapshot) no cambian de firma
+          efectiva ni de semántica.
+        """
+        if conn is not None:
+            yield conn
+            return
+        with database_connection(self.target, database) as owned:
+            yield owned
+
+    # ------------------------------------------------------------------ #
     # Concreto: conexión e introspección (read-only, cross-dialect)       #
     # ------------------------------------------------------------------ #
     def test_connection(self) -> ConnectionInfo:
@@ -464,14 +503,15 @@ class ServerAdapter(ABC):
             server_version=str(version) if version is not None else None,
         )
 
-    def list_tables(self, database: str) -> list[str]:
+    def list_tables(self, database: str, *, conn: Connection | None = None) -> list[str]:
         # Introspección de un objeto PREEXISTENTE: whitelist ampliada (nombres legados).
         # Se oculta la contabilidad interna del gateway (``_gw_v_*``/``_gw_stg_*``): no es
         # esquema del usuario y aparecer en el listado solo invita a operar sobre ella.
+        # ``conn`` (§6.4): leer dentro de la transacción del llamador. Ver ``_conn_ctx``.
         validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         schema = self._inspect_schema(database)
         try:
-            with database_connection(self.target, database) as conn:
+            with self._conn_ctx(database, conn) as conn:
                 return exclude_gateway_internal_tables(
                     sorted(inspect(conn).get_table_names(schema=schema))
                 )
@@ -666,20 +706,329 @@ class ServerAdapter(ABC):
         )
 
     # ------------------------------------------------------------------ #
+    # Exportación (módulo 10) — capacidades por motor                     #
+    # ------------------------------------------------------------------ #
+    def export_supported_types(self) -> frozenset[str]:
+        """
+        Tipos de objeto que ESTE motor puede exportar (§7 del diseño de exportación).
+
+        Vive en el adapter y no en el controller por el criterio de aceptación
+        arquitectónico del módulo: agregar un cuarto motor debe ser "implementar el
+        adapter y nada más". Una tabla motor→tipos en la capa de orquestación obligaría a
+        tocar dos lugares y a mantenerlos sincronizados a mano.
+
+        El default es el núcleo común a los tres motores soportados. Cada adapter agrega lo
+        suyo: eventos en la familia MySQL; vistas materializadas, secuencias autónomas,
+        tipos ENUM y extensiones en PostgreSQL.
+        """
+        return frozenset({"table", "view", "routine", "trigger"})
+
+    # ---- Emisión del artefacto: toda la diferencia de dialecto (§7) ------ #
+    # CRITERIO DE ACEPTACIÓN ARQUITECTÓNICO del módulo: ``export_writer`` no lleva ni un
+    # ``if engine ==``. Todo lo que cambia entre motores entra y sale por estos métodos, así
+    # que agregar un cuarto motor es implementar el adapter y nada más.
+
+    # Palabra clave del ``DROP`` por tipo de objeto. Los tipos que no aparecen (rutinas) los
+    # resuelve ``_export_drop_keyword``, que necesita mirar el payload.
+    _EXPORT_DROP_KEYWORDS: dict[str, str] = {
+        "table": "TABLE",
+        "view": "VIEW",
+        "materialized_view": "MATERIALIZED VIEW",
+        "sequence": "SEQUENCE",
+        "enum_type": "TYPE",
+        "extension": "EXTENSION",
+        "event": "EVENT",
+        "trigger": "TRIGGER",
+        "routine": "FUNCTION",
+    }
+
+    # ¿El motor admite ``CASCADE`` en el DROP? Solo PostgreSQL. MySQL/MariaDB ACEPTAN la
+    # palabra en ``DROP TABLE`` pero la IGNORAN, y emitirla sugeriría al operador una
+    # garantía de arrastre de dependencias que no existe.
+    _EXPORT_SUPPORTS_CASCADE: bool = False
+
+    # Familias de tipo cuyo ``ORDER BY`` no da un orden fiable, para el desempate por tupla
+    # completa de columnas cuando la tabla NO tiene PK (§8.3). No es solo "el motor lo
+    # rechaza": en MySQL ordenar por un TEXT/BLOB trunca a ``max_sort_length`` (1024 por
+    # defecto), así que dos filas que difieren más allá de ese prefijo quedan empatadas y el
+    # orden vuelve a ser arbitrario. Fail-closed: ante la duda, ``deterministic=False``.
+    _EXPORT_UNORDERABLE_TYPE_TOKENS: tuple[str, ...] = (
+        "blob", "text", "json", "xml", "clob", "geometry", "bytea", "tsvector", "tsquery",
+    )
+
+    def export_scope_ddl(
+        self,
+        database: str,
+        mode: str,
+        *,
+        charset: str | None = None,
+        collation: str | None = None,
+        if_exists: bool = True,
+    ) -> list[str]:
+        """
+        DDL del CONTENEDOR (la base de datos / el esquema) según ``ScopeDdl``.
+
+        ``mode`` llega como el valor del enumerado (``NONE``/``CREATE``/``DROP_CREATE``/
+        ``CREATE_IF_NOT_EXISTS``) y no como el enumerado en sí: el adapter no depende del
+        módulo del spec.
+        """
+        raise NotImplementedError(f"{self.dialect}: export_scope_ddl")
+
+    def export_entity_drop(
+        self,
+        object_type: str,
+        name: str,
+        *,
+        payload=None,
+        if_exists: bool = True,
+        cascade: bool = False,
+    ) -> str:
+        """
+        ``DROP`` de UN objeto para el artefacto. ``payload`` es su DTO del snapshot cuando
+        el motor necesita más que el nombre (el tipo de rutina, la tabla de un trigger).
+
+        ``if_exists`` no es cosmético: un script que aborta al intentar eliminar algo que no
+        existe no sirve en la práctica, que es justamente el caso de uso de ``DROP_CREATE``
+        contra un destino vacío.
+        """
+        keyword = self._export_drop_keyword(object_type, payload)
+        parts = ["DROP", keyword]
+        if if_exists:
+            parts.append("IF EXISTS")
+        parts.append(self._q(name, object_type))
+        parts.extend(self._export_drop_suffix(object_type, payload))
+        if cascade and self._EXPORT_SUPPORTS_CASCADE:
+            parts.append("CASCADE")
+        return " ".join(parts)
+
+    def _export_drop_keyword(self, object_type: str, payload) -> str:
+        keyword = self._EXPORT_DROP_KEYWORDS.get(object_type)
+        if keyword is None:
+            raise AppHttpException(
+                message="Tipo de objeto no exportable para este motor.",
+                status_code=422,
+                context={"object_type": object_type, "dialect": self.dialect},
+            )
+        if object_type == "routine" and payload is not None:
+            return "PROCEDURE" if str(payload.kind).upper() == "PROCEDURE" else "FUNCTION"
+        return keyword
+
+    def _export_drop_suffix(self, object_type: str, payload) -> list[str]:
+        """Cola del DROP que depende del motor (PostgreSQL: ``DROP TRIGGER … ON tabla``)."""
+        return []
+
+    def export_session_preamble(
+        self,
+        *,
+        charset: str | None = None,
+        collation: str | None = None,
+        suspend_constraints: bool = True,
+    ) -> list[str]:
+        """
+        Sentencias de preparación de la sesión que EJECUTA el artefacto.
+
+        Todo lo que se cambie acá tiene que restaurarse en ``export_session_epilogue``: un
+        script que deja la sesión con ``FOREIGN_KEY_CHECKS=0`` es un fallo grave (§8.4).
+        """
+        return []
+
+    def export_session_epilogue(self) -> list[str]:
+        """RESTAURA exactamente lo que tocó ``export_session_preamble``."""
+        return []
+
+    def export_use_scope(self, database: str) -> str | None:
+        """Fija el contexto: ``USE db`` en MySQL, ``SET search_path`` en PostgreSQL."""
+        return None
+
+    def export_counter_reset(
+        self, table: str, value: int | None, *, column: str | None = None
+    ) -> str | None:
+        """
+        Ajuste del contador de autoincremento al final del artefacto.
+
+        ``column`` es la columna que lo lleva: MySQL/MariaDB no la necesitan (el contador es
+        una opción de la TABLA) pero PostgreSQL sí (vive en una secuencia asociada a la
+        columna). Se pasa siempre y cada motor usa lo que le sirve.
+
+        ``None`` (sin valor conocido) = no se emite nada. Nunca se inventa un valor: un
+        contador equivocado es peor que ninguno — deja la tabla generando ids que ya
+        existen.
+        """
+        return None
+
+    def export_counter_value_sql(
+        self, database: str, table: str, column: str
+    ) -> tuple[str, dict] | None:
+        """
+        Consulta que LEE el contador de autoincremento actual, o ``None`` si no aplica.
+
+        Es la contraparte de ``export_counter_reset`` y vive en el MISMO adapter a propósito:
+        el valor que hay que leer depende de la semántica del ``reset`` de cada motor y las
+        dos mitades no pueden divergir. En MySQL/MariaDB ``AUTO_INCREMENT = n`` fija el
+        PRÓXIMO id, así que se lee el próximo; en PostgreSQL ``setval(seq, n, true)`` fija el
+        ÚLTIMO usado, así que se lee el último. Leer "el máximo de la columna" en ambos —lo
+        obvio— dejaría a MySQL generando un id que ya existe.
+
+        Devuelve ``(sql, params)`` para ejecutar con parámetros ligados: los nombres viajan
+        como VALORES a ``information_schema``/``pg_get_serial_sequence``, nunca interpolados.
+        El default ``None`` es fail-closed: un motor que no lo implemente no emite ningún
+        ajuste de contador, en vez de heredar la consulta de otro y devolver un número que
+        no significa lo mismo.
+        """
+        return None
+
+    # Tipos cuyo ``CREATE`` admite ``IF NOT EXISTS`` en ESTE motor, y tipos cuyo renderer YA
+    # emite una forma idempotente (``CREATE OR REPLACE``). Todo lo que no esté en ninguno de
+    # los dos conjuntos NO se puede hacer idempotente: se emite el CREATE normal y el writer
+    # lo reporta. Fail-closed a propósito — varias de estas cláusulas dependen de la VERSIÓN
+    # del motor (``CREATE PROCEDURE IF NOT EXISTS`` es de MySQL 8.0.29+), y el gateway no
+    # conoce la versión del destino donde se va a ejecutar el artefacto, que ni siquiera
+    # tiene por qué ser el servidor de origen.
+    _EXPORT_IF_NOT_EXISTS_TYPES: frozenset[str] = frozenset()
+    _EXPORT_ALREADY_IDEMPOTENT_TYPES: frozenset[str] = frozenset()
+
+    # ``CREATE [OR REPLACE] [MATERIALIZED|UNIQUE|…] <OBJETO>`` — la cabecera tras la que va
+    # el ``IF NOT EXISTS``.
+    _EXPORT_CREATE_HEAD_RE = re.compile(
+        r"\s*CREATE\s+(?:OR\s+REPLACE\s+)?"
+        r"(?:TEMPORARY\s+|TEMP\s+|UNLOGGED\s+|MATERIALIZED\s+|UNIQUE\s+|FULLTEXT\s+"
+        r"|SPATIAL\s+|DEFINER\s*=\s*\S+\s+)*"
+        r"(?:TABLE|VIEW|SEQUENCE|INDEX|EXTENSION|TRIGGER|EVENT|TYPE|SCHEMA|DATABASE)\s+",
+        re.IGNORECASE,
+    )
+    _EXPORT_IF_NOT_EXISTS_RE = re.compile(r"\bIF\s+NOT\s+EXISTS\b", re.IGNORECASE)
+
+    def export_make_idempotent(self, sql: str, object_type: str) -> str | None:
+        """
+        Convierte un ``CREATE`` en su forma idempotente, o ``None`` si no es expresable.
+
+        ``None`` NO es un error: es la respuesta honesta para un tipo cuyo motor no tiene
+        ``IF NOT EXISTS`` (un ``CREATE TYPE`` de PostgreSQL, una rutina de MySQL). El writer
+        emite entonces el ``CREATE`` normal y lo declara en los avisos, en vez de inventar
+        una sintaxis que hace fallar el script justo cuando el usuario pidió que no fallara.
+        """
+        if object_type in self._EXPORT_ALREADY_IDEMPOTENT_TYPES:
+            return sql
+        if object_type not in self._EXPORT_IF_NOT_EXISTS_TYPES:
+            return None
+        if self._EXPORT_IF_NOT_EXISTS_RE.search(sql):
+            return sql
+        match = self._EXPORT_CREATE_HEAD_RE.match(sql)
+        if match is None:
+            return None
+        head = match.group(0)
+        return f"{head}IF NOT EXISTS {sql[len(head):]}"
+
+    def export_body_wrapper(self, object_type: str) -> tuple[str, str] | None:
+        """
+        ``(prefijo, sufijo)`` para envolver un cuerpo procedural, o ``None``.
+
+        Delega en ``sql_dialect.body_delimiter_wrapper``, que es la fuente ÚNICA del
+        criterio (la comparte con la descarga de schema-comparisons).
+        """
+        return body_delimiter_wrapper(object_type, self.dialect)
+
+    def export_definer_clause(self, sql: str, *, mode: str, value: str | None) -> str:
+        """
+        Aplica ``sanitize.definer`` sobre el DDL de un objeto con cuerpo.
+
+        Default no-op: PostgreSQL no tiene cláusula ``DEFINER`` (la propiedad del objeto y
+        ``SECURITY DEFINER`` son mecanismos distintos), y la matriz ya rechaza ahí
+        ``omit``/``replace``.
+        """
+        return sql
+
+    def export_insert_wrapper(
+        self,
+        table: str,
+        columns: Sequence[str],
+        *,
+        variant: str = "insert",
+        primary_key: Sequence[str] = (),
+    ) -> tuple[str, str]:
+        """
+        ``(prefijo, sufijo)`` de una sentencia de datos: ``prefijo`` + tuplas + ``sufijo``.
+
+        ``columns`` vacío = sin lista de columnas (``data.include_column_list=false``).
+
+        El default cubre solo ``insert``, que es el único portable. Las demás variantes son
+        sintaxis PROPIETARIA de cada motor (``INSERT IGNORE``/``REPLACE`` de MySQL,
+        ``ON CONFLICT`` de PostgreSQL) y las implementa cada adapter; un motor que no tenga
+        equivalente devuelve un 422 accionable en vez de emitir un artefacto que su destino
+        rechaza.
+        """
+        prefix = f"INSERT INTO {self._q(table, 'tabla')}{self._export_column_list(columns)} VALUES"
+        if variant in ("insert", "none"):
+            return prefix, ""
+        raise self._export_unsupported_variant(variant)
+
+    def _export_column_list(self, columns: Sequence[str]) -> str:
+        if not columns:
+            return ""
+        return " (" + ", ".join(self._q(c, "columna") for c in columns) + ")"
+
+    def _export_unsupported_variant(self, variant: str) -> AppHttpException:
+        return AppHttpException(
+            message=(
+                f"El motor {self.dialect} no admite la variante de INSERT '{variant}'."
+            ),
+            status_code=422,
+            public_context={
+                "code": "export.incompatible_option",
+                "field": "data.insert_variant",
+                "engine": self.dialect,
+            },
+        )
+
+    def export_row_order_by(self, table: TableSchema) -> list[str]:
+        """
+        Columnas del ``ORDER BY`` que hace determinista el volcado de una tabla (§8.3).
+
+        1. la PK, que es el caso normal;
+        2. sin PK, la tupla COMPLETA de columnas si todas son ordenables de forma fiable;
+        3. si no, lista vacía ⇒ el objeto sale **sin orden garantizado**, se marca
+           ``deterministic: false`` y se avisa. Fingir determinismo ahí sería mentir sobre
+           la comparabilidad de dos volcados, que es justamente para lo que existe §8.3.
+
+        Las columnas GENERADAS se excluyen: no viajan en el ``INSERT`` y ordenar por una
+        expresión calculada no aporta nada que la tupla de columnas reales no dé ya.
+        """
+        if table.primary_key:
+            return list(table.primary_key)
+        plain = [c for c in table.columns if c.computed is None]
+        if not plain:
+            return []
+        if any(not self._export_type_is_orderable(c.type) for c in plain):
+            return []
+        return [c.name for c in plain]
+
+    def _export_type_is_orderable(self, col_type: str) -> bool:
+        lowered = (col_type or "").lower()
+        return not any(tok in lowered for tok in self._EXPORT_UNORDERABLE_TYPE_TOKENS)
+
+    # ------------------------------------------------------------------ #
     # Snapshot estructural CANÓNICO (Plan diff) — SchemaSnapshot           #
     # ------------------------------------------------------------------ #
-    def structural_snapshot(self, database: str) -> SchemaSnapshot:
+    def structural_snapshot(
+        self, database: str, *, conn: Connection | None = None
+    ) -> SchemaSnapshot:
         """
         Snapshot estructural canónico y COMPLETO de la BD (entrada del motor de diff).
 
         Reutiliza el Inspector para tablas y los hooks por adapter para vistas/rutinas/
         triggers/secuencias/tipos/extensiones/events. Solo estructura, jamás filas.
         PostgreSQL cubre solo el schema ``public`` (limitación conocida del sistema).
+
+        ``conn`` (§6.4 del módulo de exportación): lee con la conexión del llamador en vez
+        de abrir una propia, para que el catálogo entre en su transacción de lectura. En
+        PostgreSQL eso da estructura y datos del MISMO instante; en MySQL/MariaDB el
+        diccionario de datos no participa del snapshot MVCC y la garantía sigue siendo solo
+        para datos (§6.2 — se reporta, no se tapa). ``None`` = comportamiento histórico.
         """
         validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         schema = self._inspect_schema(database)
         try:
-            with database_connection(self.target, database) as conn:
+            with self._conn_ctx(database, conn) as conn:
                 insp = inspect(conn)
                 # Se EXCLUYE la contabilidad interna del gateway (``_gw_v_*`` /
                 # ``_gw_stg_*``): no es esquema del usuario. Ver el porqué completo en
@@ -1286,15 +1635,19 @@ class ServerAdapter(ABC):
     # ------------------------------------------------------------------ #
     # Datos-semilla (snapshot selectivo) — read-only, cross-dialect       #
     # ------------------------------------------------------------------ #
-    def list_table_stats(self, database: str) -> list[TableStat]:
+    def list_table_stats(
+        self, database: str, *, conn: Connection | None = None
+    ) -> list[TableStat]:
         """
         Estimación por tabla (filas + tiene PK) para informar la selección de datos.
         Solo métricas del catálogo, NUNCA valores de filas.
+
+        ``conn`` (§6.4): ver ``_conn_ctx``. ``None`` = comportamiento histórico.
         """
         validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         schema = self._inspect_schema(database)
         try:
-            with database_connection(self.target, database) as conn:
+            with self._conn_ctx(database, conn) as conn:
                 insp = inspect(conn)
                 out: list[TableStat] = []
                 # Sin la contabilidad interna del gateway: nunca es candidata a sembrarse.

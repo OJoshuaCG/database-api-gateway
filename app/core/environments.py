@@ -148,6 +148,116 @@ COLLATION_CONVERSION_TTL_HOURS = int(os.getenv("COLLATION_CONVERSION_TTL_HOURS",
 # paralelo saturan el I/O del servidor destino.
 COLLATION_CONVERSION_MAX_WORKERS = int(os.getenv("COLLATION_CONVERSION_MAX_WORKERS", "1"))
 
+# ======= Exportación de bases de datos (database exports) ======= #
+# KILL SWITCH global del módulo. False = ningún endpoint de exportación funciona (409),
+# ni siquiera planear. Existe porque una exportación es, por definición, una EXTRACCIÓN
+# masiva de datos en claro (no hay enmascarado, ver §9.6 del diseño): si el gateway pasa a
+# tratar datos regulados hay que poder apagar la vía de salida sin re-desplegar código.
+EXPORT_ENABLED = os.getenv("EXPORT_ENABLED", "True").lower() == "true"
+# Vida útil (horas) de un PLAN de exportación. Tras expirar, preview/execute exigen
+# replanear (410): un plan viejo describe un catálogo del motor que ya no existe, y su
+# ``source_fingerprint`` dejaría de ser una defensa anti-TOCTOU real.
+EXPORT_TTL_HOURS = int(os.getenv("EXPORT_TTL_HOURS", "24"))
+# Tope de bytes de la entrega EN LÍNEA (``output.delivery='inline'``: texto plano para
+# copiar al portapapeles). Protege la MEMORIA DEL GATEWAY y la del navegador: el modo
+# inline no es un flujo, se materializa entero. El preview publica
+# ``inline_delivery_viable`` contra este valor para que el cliente lo sepa ANTES de lanzar
+# el job; nunca se trunca en silencio (un script truncado que alguien pega y ejecuta es
+# peor que un fallo).
+EXPORT_INLINE_MAX_BYTES = int(os.getenv("EXPORT_INLINE_MAX_BYTES", str(1024 * 1024)))
+# Techo del corte de una sentencia de datos (``data.max_statement_bytes``). El corte real
+# se manda por BYTES y no por filas porque una tabla con LONGTEXT revienta cualquier
+# límite basado en conteo. Un spec que pida más que esto se recorta a este valor: un
+# INSERT gigante supera el ``max_allowed_packet`` del destino y el artefacto no se puede
+# ejecutar.
+EXPORT_MAX_STATEMENT_BYTES = int(
+    os.getenv("EXPORT_MAX_STATEMENT_BYTES", str(1024 * 1024))
+)
+# Filas por sentencia de datos por DEFECTO (``data.rows_per_statement``). Es un techo
+# SUPERIOR, no el corte real (manda ``max_statement_bytes``): sirve para que un INSERT no
+# tenga miles de tuplas aunque cada fila sea diminuta.
+EXPORT_ROWS_PER_STATEMENT = int(os.getenv("EXPORT_ROWS_PER_STATEMENT", "200"))
+# Retención (minutos) del ARTEFACTO una vez que el job termina. El artefacto es un objeto
+# sensible en reposo (§9.3): "no se conserva" (§19.7 del prompt) se implementa como TTL
+# corto + purga garantizada. Lo CONSUME el almacenamiento de F4; se publica ya en
+# /export-capabilities para que el cliente no adivine cuánto tiempo tiene para descargar.
+EXPORT_ARTIFACT_TTL_MINUTES = int(os.getenv("EXPORT_ARTIFACT_TTL_MINUTES", "30"))
+# Duración máxima (segundos) de una corrida antes del aborto duro. Una exportación
+# sostiene una transacción de lectura larga contra el ORIGEN: en PostgreSQL bloquea el
+# VACUUM y en la familia MySQL infla el historial de undo, así que una exportación de
+# horas DEGRADA el servidor de un tercero. Lo consume el runner de F4; se publica acá por
+# el mismo motivo que el TTL del artefacto.
+EXPORT_MAX_DURATION_SECONDS = int(os.getenv("EXPORT_MAX_DURATION_SECONDS", "14400"))
+# Timeout de SENTENCIA (ms) de la conexión dedicada de una exportación. Se pasa EXPLÍCITO a
+# ``database_connection`` en vez de heredar el par interactivo/bulk: el interactivo (15s)
+# cancelaría el SELECT de una tabla grande a mitad, y el bulk (1 h) es un techo pensado para
+# la copia de datos del clon, no para una lectura que además sostiene un snapshot. ``0`` =
+# sin límite (desaconsejado: una consulta colgada mantiene viva la transacción de lectura).
+EXPORT_STATEMENT_TIMEOUT_MS = int(
+    os.getenv("EXPORT_STATEMENT_TIMEOUT_MS", str(30 * 60 * 1000))
+)
+# Timeout de TRANSACCIÓN OCIOSA (ms) — solo PostgreSQL. ``remote_engine`` ata
+# ``idle_in_transaction_session_timeout`` al ``statement_timeout`` en los ``connect_args``
+# del engine, así que sin esto un export estancado sostendría el snapshot de PG (y bloquearía
+# el VACUUM del origen) todo lo que dure el timeout de sentencia. ``export_session`` lo
+# DESACOPLA con un ``SET`` a nivel de sesión sobre su propia conexión — que gana sobre el
+# ``-c`` de la URL— para no cambiar la clave de cache de engines ni el comportamiento de los
+# otros consumidores de ``remote_engine``. ``0`` = sin límite.
+EXPORT_IDLE_TRANSACTION_TIMEOUT_MS = int(
+    os.getenv("EXPORT_IDLE_TRANSACTION_TIMEOUT_MS", str(5 * 60 * 1000))
+)
+# Filas por lote del cursor en streaming (``yield_per``) al leer el ORIGEN. Acota la memoria
+# del gateway: el writer nunca materializa una tabla entera (§8.1). Subirlo reduce viajes de
+# red a costa de RAM por lote; con columnas LONGTEXT/BLOB conviene bajarlo.
+EXPORT_BATCH_ROWS = int(os.getenv("EXPORT_BATCH_ROWS", "1000"))
+# Workers del pool in-process que generan los artefactos. Default 1 A PROPÓSITO: una
+# exportación LEE LA BASE ENTERA del origen y sostiene una transacción larga; varias en
+# paralelo saturan el I/O del servidor de un tercero. Igual que el clon y la conversión de
+# collation, NO es una cola durable: si el proceso se reinicia, los jobs en curso quedan
+# 'interrupted' (barrido en el lifespan) y se relanzan a mano.
+EXPORT_MAX_WORKERS = int(os.getenv("EXPORT_MAX_WORKERS", "1"))
+# Techo de exportaciones EN EJECUCIÓN a la vez (§9.7). Con un solo worker la cola ya
+# serializa, pero sin este tope un cliente puede encolar cientos de jobs y dejar al origen
+# leyéndose durante días: es un vector de degradación y de exfiltración lenta.
+EXPORT_MAX_CONCURRENT_GLOBAL = int(os.getenv("EXPORT_MAX_CONCURRENT_GLOBAL", "2"))
+# Directorio de SPOOL del artefacto. Se crea con modo 0700 (§9.3): el archivo contiene los
+# datos del origen EN CLARO —no hay enmascarado (§9.6)— así que es un objeto sensible en
+# reposo y no puede quedar legible para otros usuarios del contenedor. Debe ser un volumen
+# propio (``exports_data:/app/exports``), NO el de uploads: aquel es un buzón de entrada sin
+# TTL y mezclar ambos ciclos de vida es cómo un artefacto sobrevive a su purga.
+EXPORT_ARTIFACT_DIR = os.getenv("EXPORT_ARTIFACT_DIR", "/app/exports")
+# Espacio libre MÍNIMO (bytes) que debe quedar en el disco del spool DESPUÉS de la
+# estimación del preview. Llenar el disco del gateway no degrada la exportación: tumba el
+# gateway entero (y con él la BD de metadatos si comparten volumen). ``0`` desactiva el
+# chequeo (desaconsejado).
+EXPORT_DISK_MIN_FREE_BYTES = int(
+    os.getenv("EXPORT_DISK_MIN_FREE_BYTES", str(512 * 1024 * 1024))
+)
+# Tope DURO del tamaño del artefacto (§9.7). Al superarlo la corrida aborta y el archivo
+# parcial se borra: es preferible un job fallido con un motivo claro a un disco lleno.
+# ``0`` = sin tope.
+EXPORT_ARTIFACT_MAX_BYTES = int(
+    os.getenv("EXPORT_ARTIFACT_MAX_BYTES", str(5 * 1024 * 1024 * 1024))
+)
+# Descarga de UN SOLO USO (§10.1): al completarse la entrega el archivo se borra y el
+# artefacto pasa a ``consumed``. Es la implementación de "el artefacto no se conserva"
+# (§19.7) que no depende de que el TTL llegue a tiempo. ``False`` permite re-descargar
+# hasta que venza el TTL (útil en desarrollo; en producción alarga la exposición).
+EXPORT_SINGLE_USE_DOWNLOAD = (
+    os.getenv("EXPORT_SINGLE_USE_DOWNLOAD", "True").lower() == "true"
+)
+# Cada cuántos minutos corre la purga de artefactos vencidos. Hacerlo SOLO en el arranque
+# volvería el TTL una promesa falsa en un proceso que corre semanas — el mismo error que ya
+# se corrigió en la purga de capturas de SELECT. ``0`` desactiva la tarea periódica (la del
+# arranque sigue corriendo).
+EXPORT_PURGE_INTERVAL_MINUTES = int(os.getenv("EXPORT_PURGE_INTERVAL_MINUTES", "10"))
+# Tope de archivos DENTRO de un artefacto (un archivo por objeto + fragmentos de
+# ``output.split_max_bytes``). El tope por tamaño no alcanza: con un ``split_max_bytes`` de
+# 1 KB, un artefacto perfectamente legal genera decenas de miles de entradas en el zip —
+# lento de escribir, inmanejable de descomprimir y con el directorio central creciendo en
+# memoria. Al superarlo el job falla con un motivo accionable.
+EXPORT_MAX_PARTS = int(os.getenv("EXPORT_MAX_PARTS", "500"))
+
 # ======= Consola SQL (ejecución de queries ad-hoc) ======= #
 # MODO SEGURO. True (default) = toda sentencia que no sea lectura pura exige el ciclo
 # preview→confirmación (token firmado + nombre de la BD), y la lista de sentencias

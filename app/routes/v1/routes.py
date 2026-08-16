@@ -6,6 +6,7 @@ from app.routes.v1 import (
     collation_conversions,
     crypto,
     database_clones,
+    database_exports,
     database_models,
     managed_databases,
     model_migrations,
@@ -28,6 +29,7 @@ router.include_router(managed_databases.router)
 router.include_router(schema_comparisons.router)
 router.include_router(database_clones.router)
 router.include_router(collation_conversions.router)
+router.include_router(database_exports.router)
 router.include_router(privileges.router)
 router.include_router(charset_collation_options.router)
 router.include_router(permission_profiles.router)

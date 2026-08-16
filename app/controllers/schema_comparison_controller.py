@@ -49,6 +49,7 @@ from app.models.managed_database import ManagedDatabase
 from app.models.schema_comparison import SchemaComparison
 from app.models.schema_comparison_item import SchemaComparisonItem
 from app.services import audit
+from app.services.db_admin.export_spec import sanitize_filename
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import references_gateway_internal_table
 from app.services.db_admin.migrations import MigrationRunner
@@ -63,6 +64,7 @@ from app.services.db_admin.plan_integrity import (
 from app.services.db_admin.schema_diff import diff_snapshots
 from app.services.db_admin.sql_dialect import (
     BODY_OBJECT_TYPES,
+    body_delimiter_wrapper,
     requalify_body_schema,
 )
 
@@ -556,16 +558,16 @@ class SchemaComparisonController:
     # ------------------------------------------------------------------ #
     # Export — descarga del diff como archivo .sql                        #
     # ------------------------------------------------------------------ #
-    # Tipos de objeto con CUERPO procedural (``BEGIN...END``) cuyo SQL lleva ``;``
-    # internos: en MySQL/MariaDB hay que envolverlos con ``DELIMITER`` para que un
-    # cliente de línea de comandos no corte la sentencia en el primer ``;`` del cuerpo.
-    _BODY_TYPES = frozenset({"routine", "trigger", "event"})
-
     @staticmethod
     def _sanitize_filename(name: str) -> str:
-        """Deja solo alfanuméricos, ``.-_`` (resto → ``_``) para un filename seguro."""
-        safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in name)
-        return safe.strip("._") or "db"
+        """
+        Deja solo alfanuméricos, ``.-_`` (resto → ``_``) para un filename seguro.
+
+        El criterio vive en ``export_spec.sanitize_filename`` (lo comparte con el módulo
+        de exportación, que construye nombres desde una plantilla): dos saneadores de
+        nombre de archivo distintos serían dos superficies distintas de recorrido de ruta.
+        """
+        return sanitize_filename(name, fallback="db")
 
     def _render_statement_block(self, it: dict, engine: str) -> str:
         """
@@ -587,9 +589,14 @@ class SchemaComparisonController:
             f"({it['change_type']}){destructive}{review}"
         )
         sql = it["sql"].rstrip().rstrip(";")
-        is_body = it["object_type"] in self._BODY_TYPES and engine in _MYSQL_FAMILY
-        if is_body:
-            body = f"DELIMITER $$\n{sql}$$\nDELIMITER ;"
+        # El criterio de la envoltura vive en ``sql_dialect`` (fuente única): lo comparte
+        # con el writer de exportación vía ``ServerAdapter.export_body_wrapper``. Tenerlo
+        # duplicado acá era garantía de que un día un archivo saliera ejecutable y el otro
+        # roto con la misma rutina adentro.
+        wrapper = body_delimiter_wrapper(it["object_type"], engine)
+        if wrapper is not None:
+            prefix, suffix = wrapper
+            body = f"{prefix}{sql}{suffix}"
         else:
             body = f"{sql};"
         return f"{header}\n{body}"
