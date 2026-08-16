@@ -25,6 +25,27 @@ MAX_CONTAINER_ITEMS = 200
 MAX_CONTAINER_DEPTH = 8
 
 
+def format_timedelta(value: timedelta) -> str:
+    """
+    ``timedelta`` -> ``[-]HH:MM:SS``, el criterio ÚNICO del proyecto para el ``TIME``.
+
+    El tipo ``TIME`` de MySQL/MariaDB llega al driver como ``timedelta`` y admite valores
+    negativos y mayores a 24 h. ``str()`` los rendea como ``-1 day, 23:00:00`` (para
+    ``TIME '-01:00:00'``) o ``34 days, 22:00:00`` (para ``TIME '838:00:00'``): formalmente
+    correcto, inservible para un humano y **no re-insertable** como literal SQL. Se rearma
+    a mano desde ``total_seconds()``, sin normalizar las horas a 24 (``838:00:00`` es un
+    valor legal del tipo).
+
+    Vive acá y no duplicado en cada consumidor porque ya hay tres (consola SQL, captura de
+    resultados de migración y el render de literales de ``sql_literals``): dos criterios
+    distintos para el mismo tipo serían una divergencia garantizada.
+    """
+    total = int(value.total_seconds())
+    sign = "-" if total < 0 else ""
+    total = abs(total)
+    return f"{sign}{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
 def json_value(value: Any, max_chars: int, depth: int = 0) -> Any:
     """
     Convierte un valor del driver a algo serializable a JSON, recortando celdas grandes.
@@ -49,14 +70,7 @@ def json_value(value: Any, max_chars: int, depth: int = 0) -> Any:
     if isinstance(value, (datetime, date, time_cls)):
         return value.isoformat()
     if isinstance(value, timedelta):
-        # El tipo TIME de MySQL/MariaDB llega como timedelta y admite valores negativos y
-        # mayores a 24 h. ``str()`` los rendea como ``-1 day, 23:00:00`` (para
-        # ``TIME '-01:00:00'``) o ``34 days, 22:00:00`` (para ``TIME '838:00:00'``):
-        # formalmente correcto e inservible para un humano. Se rearma como HH:MM:SS.
-        total = int(value.total_seconds())
-        sign = "-" if total < 0 else ""
-        total = abs(total)
-        return f"{sign}{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+        return format_timedelta(value)
     if isinstance(value, UUID):
         return str(value)
     if isinstance(value, (set, frozenset)):
@@ -84,4 +98,9 @@ def json_value(value: Any, max_chars: int, depth: int = 0) -> Any:
     return text if len(text) <= max_chars else f"{text[:max_chars]}…"
 
 
-__all__ = ["MAX_CONTAINER_DEPTH", "MAX_CONTAINER_ITEMS", "json_value"]
+__all__ = [
+    "MAX_CONTAINER_DEPTH",
+    "MAX_CONTAINER_ITEMS",
+    "format_timedelta",
+    "json_value",
+]

@@ -6,6 +6,10 @@ Los valores de las filas se persisten como LITERALES SQL y luego se ejecutan con
 ``render_value`` con manejo tipado exhaustivo + ``quote_string_literal``; los tipos
 desconocidos fallan cerrado (la tabla se omite, nunca se emite SQL dudoso).
 
+``render_value``/``UnsupportedValueError`` viven ahora en ``sql_literals`` (los comparte
+con la exportación de bases de datos) y se REEXPORTAN desde acá: son parte de la API
+histórica de este módulo y hay consumidores que los usan por atributo (``sd.render_value``).
+
 Genera:
 - ``up_sql``  : INSERT idempotente por lotes (upsert). MySQL ``ON DUPLICATE KEY UPDATE``;
   PostgreSQL ``ON CONFLICT (pk) DO UPDATE/NOTHING``. Idempotente porque el baseline se
@@ -19,12 +23,9 @@ las variables de entorno se configuran demasiado altas.
 
 from __future__ import annotations
 
-import json
-from datetime import date, datetime, time
-from decimal import Decimal
-
 from app.services.db_admin.dtos import SeedResult
-from app.services.db_admin.identifiers import quote_identifier, quote_string_literal
+from app.services.db_admin.identifiers import quote_identifier
+from app.services.db_admin.sql_literals import UnsupportedValueError, render_value
 
 # Techos duros (no override-ables por env var).
 HARD_MAX_ROWS = 5000
@@ -33,55 +34,9 @@ HARD_MAX_BYTES = 5 * 1024 * 1024
 _MODES = ("upsert", "insert_ignore")
 
 
-class UnsupportedValueError(Exception):
-    """Un valor de tipo no soportado para render como literal (fail-closed → skip)."""
-
-
 def effective_limits(max_rows: int, max_bytes: int) -> tuple[int, int]:
     """Aplica los techos duros a los límites configurados por el admin/env."""
     return min(int(max_rows), HARD_MAX_ROWS), min(int(max_bytes), HARD_MAX_BYTES)
-
-
-def render_value(value, dialect: str) -> str:
-    """
-    Renderiza un valor Python como literal SQL seguro para ``dialect``. Tipos no
-    soportados → ``UnsupportedValueError`` (fail-closed). NUNCA interpola sin escapar.
-    """
-    if value is None:
-        return "NULL"
-    if isinstance(value, bool):
-        if dialect == "postgresql":
-            return "TRUE" if value else "FALSE"
-        return "1" if value else "0"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        if value != value or value in (float("inf"), float("-inf")):
-            raise UnsupportedValueError("float no finito")
-        return repr(value)
-    if isinstance(value, Decimal):
-        if not value.is_finite():
-            raise UnsupportedValueError("decimal no finito")
-        return str(value)
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        hexs = bytes(value).hex()
-        # PG: decode(...,'hex') es independiente de standard_conforming_strings.
-        return f"decode('{hexs}', 'hex')" if dialect == "postgresql" else f"x'{hexs}'"
-    if isinstance(value, datetime):
-        return quote_string_literal(value.isoformat(sep=" "), dialect)
-    if isinstance(value, (date, time)):
-        return quote_string_literal(value.isoformat(), dialect)
-    if isinstance(value, (dict, list)):
-        s = json.dumps(value, ensure_ascii=False, default=str)
-    elif isinstance(value, str):
-        s = value
-    else:
-        raise UnsupportedValueError(type(value).__name__)
-    # El byte nulo se rechaza como skip (consistente con los tipos no soportados), no
-    # como 422 que abortaría toda la petición.
-    if "\x00" in s:
-        raise UnsupportedValueError("null_byte")
-    return quote_string_literal(s, dialect)
 
 
 def _chunks(seq: list, size: int):
@@ -200,3 +155,14 @@ def build_seed(
         table=table, included=True, reason=None, row_count=len(rendered_rows),
         primary_key=pk, up_sql=up_sql, down_sql=down_sql,
     )
+
+
+__all__ = [
+    "HARD_MAX_BYTES",
+    "HARD_MAX_ROWS",
+    # Reexportados desde ``sql_literals`` por compatibilidad (ver docstring del módulo).
+    "UnsupportedValueError",
+    "build_seed",
+    "effective_limits",
+    "render_value",
+]

@@ -99,6 +99,41 @@ def strip_self_schema_qualifier(sql: str, database: str, engine: str) -> str:
         return sql
     return sql.replace(f"`{database}`.", "")
 
+
+# --------------------------------------------------------------------------- #
+# Envoltura DELIMITER de cuerpos procedurales (para un ARCHIVO, no para el motor)
+# --------------------------------------------------------------------------- #
+# Tipos cuyo cuerpo puede traer ``;`` internos (``BEGIN … END``). Las VISTAS quedan fuera a
+# propósito: su definición es una sola consulta y nunca contiene un ``;``.
+DELIMITER_BODY_TYPES = frozenset({"routine", "trigger", "event"})
+
+# El terminador que se le declara al cliente. ``$$`` es el de ``mysqldump``, así que es el
+# que cualquier cliente estándar (y cualquier operador) espera ver.
+BODY_DELIMITER = "$$"
+
+
+def body_delimiter_wrapper(object_type: str, engine: str) -> tuple[str, str] | None:
+    """
+    ``(prefijo, sufijo)`` para envolver un cuerpo procedural con ``DELIMITER``, o ``None``.
+
+    Es una directiva de **CLIENTE**, no SQL: el gateway ejecuta sentencia por sentencia y no
+    la necesita nunca. Existe solo para que el archivo que descarga una persona sea
+    ejecutable de un tirón en ``mysql``/Workbench/DBeaver, donde el ``;`` del ``DECLARE``
+    cortaría la rutina a la mitad.
+
+    Fuente ÚNICA del criterio, compartida por la descarga de schema-comparisons y por el
+    writer de exportación (``ServerAdapter.export_body_wrapper``). Estaba duplicada en el
+    controller de comparaciones y duplicar una regla de dialecto es cómo terminan divergiendo:
+    un archivo ejecutable y el otro roto, con la misma rutina adentro.
+
+    PostgreSQL devuelve ``None``: usa dollar-quoting, no conoce ``DELIMITER`` y emitirlo
+    haría fallar el script en su primera línea.
+    """
+    if object_type not in DELIMITER_BODY_TYPES or engine not in _MYSQL_FAMILY_NAMES:
+        return None
+    return (f"DELIMITER {BODY_DELIMITER}\n", f"{BODY_DELIMITER}\nDELIMITER ;")
+
+
 # --------------------------------------------------------------------------- #
 # Detección de cuerpos procedurales (para no cortarlos en su primer ``;``)      #
 # --------------------------------------------------------------------------- #
