@@ -88,5 +88,8 @@ Thumbs.db
 .claude/*.tmp
 .claude/worktrees/
 
+# Índice local de CodeGraph (por checkout; nunca se comparte ni se reutiliza)
+.codegraph/
+
 docs/frontend
 
