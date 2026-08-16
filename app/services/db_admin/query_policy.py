@@ -136,6 +136,25 @@ class QueryPlan:
 
 _WS_RE = re.compile(r"\s+")
 
+# Prefijos de comentario EJECUTABLE de la familia MySQL, del más largo al más corto para
+# que ``/*M!`` no se confunda nunca con ``/*``. ``/*!`` lo ejecutan MySQL y MariaDB;
+# ``/*M!`` es exclusivo de MariaDB (y su ``M`` es sensible a mayúsculas en el motor, pero
+# acá se acepta también minúscula: reconocer de más solo sobre-bloquea).
+_EXECUTABLE_COMMENT_PREFIXES = ("/*M!", "/*m!", "/*!")
+
+
+def _executable_comment_prefix(sql: str, i: int) -> int:
+    """
+    Largo del prefijo de comentario ejecutable que abre en ``i``, o ``0`` si no hay.
+
+    Devolver el LARGO y no un booleano es lo que permite que el llamador salte el prefijo
+    correcto (3 para ``/*!``, 4 para ``/*M!``) sin duplicar la tabla de prefijos.
+    """
+    for prefix in _EXECUTABLE_COMMENT_PREFIXES:
+        if sql.startswith(prefix, i):
+            return len(prefix)
+    return 0
+
 
 def _scan_normalize(sql: str, *, engine: str = "mysql") -> str:
     """
@@ -187,14 +206,25 @@ def _scan_normalize(sql: str, *, engine: str = "mysql") -> str:
             out.append(" ")
             continue
         if ch == "/" and sql.startswith("/*", i):
-            if sql.startswith("/*!", i):
-                # Comentario EJECUTABLE de MySQL: se conserva el contenido como código.
-                # El número que sigue a ``/*!`` es la versión MÍNIMA del motor
+            executable = _executable_comment_prefix(sql, i)
+            if executable:
+                # Comentario EJECUTABLE de MySQL/MariaDB: se conserva el contenido como
+                # código. El número que sigue al prefijo es la versión MÍNIMA del motor
                 # (``/*!40101 GRANT … */``), no parte de la sentencia: si no se descarta,
                 # queda como primera palabra y los patrones anclados con ``^`` no matchean
                 # — es decir, sería una evasión trivial de la blocklist.
-                j = sql.find("*/", i + 3)
-                body = re.sub(r"^\d+", "", sql[i + 3 : (n if j == -1 else j)])
+                #
+                # ``/*M!`` es la variante EXCLUSIVA de MariaDB (``/*M!100000 … */``) y su
+                # ausencia acá era un agujero real: el contenido se descartaba como
+                # comentario común, la blocklist nunca lo veía y el motor lo ejecutaba
+                # igual. Con la credencial pseudo-root, un
+                # ``/*M!100000 INTO OUTFILE '/tmp/x' */`` es escritura de archivo
+                # arbitraria en el host de la base del cliente. Se reconoce en los TRES
+                # motores a propósito (fail-closed): un MariaDB dado de alta como ``mysql``
+                # es un error de inventario frecuente, y conservar texto de más solo puede
+                # sobre-bloquear, nunca dejar pasar.
+                j = sql.find("*/", i + executable)
+                body = re.sub(r"^\d+", "", sql[i + executable : (n if j == -1 else j)])
                 out.append(" " + body + " ")
                 i = n if j == -1 else j + 2
                 continue

@@ -491,3 +491,56 @@ def test_deteccion_de_la_propia_base_del_gateway():
     assert not qp.is_gateway_metadata_target(
         host="db.interno", port=3306, database="otra", **args
     )
+
+
+# --------------------------------------------------------------------------- #
+# Comentario ejecutable de MariaDB (``/*M! … */``)                             #
+# --------------------------------------------------------------------------- #
+# Agujero real: ``_scan_normalize`` reconocía ``/*!`` (MySQL) pero NO ``/*M!``, el prefijo
+# EXCLUSIVO de MariaDB. Su contenido se descartaba como comentario común, la blocklist
+# nunca lo veía y el motor lo ejecutaba igual. Con la credencial pseudo-root eso es
+# escritura de archivo arbitraria en el host de la base del cliente.
+
+
+@pytest.mark.parametrize(
+    "sql,code",
+    [
+        (
+            "SELECT a FROM t WHERE 1=1 /*M!100000 INTO OUTFILE '/tmp/x' */",
+            "server_file_access",
+        ),
+        ("SELECT 1 /*M!100000 ; DROP DATABASE prod */", "database_lifecycle"),
+        # Sin número de versión: ``/*M!`` a secas también es ejecutable.
+        ("/*M! GRANT ALL ON *.* TO 'x'@'%' */", "dcl_grant_revoke"),
+    ],
+)
+def test_el_comentario_ejecutable_de_mariadb_no_evade_la_blocklist(sql, code):
+    plan = qp.classify(sql, engine="mariadb")
+    assert plan.danger == qp.BLOCKED
+    assert code in [r.code for r in plan.reasons]
+
+
+def test_el_comentario_ejecutable_de_mariadb_tambien_se_lee_en_mysql():
+    """
+    Fail-closed: un MariaDB dado de alta como ``mysql`` es un error de inventario
+    frecuente, y conservar texto de más solo puede sobre-bloquear, nunca dejar pasar.
+    """
+    plan = qp.classify("SELECT 1 /*M!100000 ; DROP DATABASE prod */", engine=MYSQL)
+    assert plan.danger == qp.BLOCKED
+
+
+def test_el_contenido_de_un_comentario_de_mariadb_se_conserva_como_codigo():
+    scanned = qp._scan_normalize(
+        "SELECT a FROM t WHERE 1=1 /*M!100000 INTO OUTFILE '/tmp/x' */", engine="mariadb"
+    )
+    assert "INTO OUTFILE" in scanned
+    # El número de versión se descarta: si quedara, desplazaría los patrones anclados
+    # en ``^`` y la evasión seguiría en pie por otra puerta.
+    assert "100000" not in scanned
+
+
+def test_un_comentario_de_bloque_normal_sigue_descartandose():
+    """El fix no puede convertir TODO comentario en código: solo los ejecutables."""
+    assert qp._scan_normalize("SELECT 1 /* DROP DATABASE prod */", engine="mysql") == (
+        "SELECT 1"
+    )
