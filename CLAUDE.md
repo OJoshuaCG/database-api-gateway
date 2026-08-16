@@ -1489,6 +1489,261 @@ se elija**, para verificar permisos reales. Guía de uso: `docs/features/sql-que
   con RLS en PG, (c) que el `LIMIT` empujado evite bajar la tabla entera, (d) los mensajes
   nativos de rechazo por permisos en los 3 motores.
 
+## Módulo de Exportación de Bases de Datos (Plan 10)
+
+Exporta **estructura y/o datos** de cualquier BD de un servidor dado de alta (adoptada o no,
+por identidad `server_id`+nombre) a un artefacto descargable, en modo **estrictamente de solo
+lectura** sobre el origen: toda sentencia destructiva existe únicamente como TEXTO dentro del
+artefacto. Guía de uso: `docs/features/database-export.md`; contrato frontend:
+`docs/api-reference-v10.md`; diseño: `docs/plans/10-exportacion-de-bases-de-datos.md`.
+
+- **Flujo** (4º módulo de la familia; se copia el patrón de clon/schema-comparisons/collation):
+  `POST /servers/{sid}/databases/{db}/database-exports` (plan, snapshot + `source_fingerprint` +
+  TTL 24 h) → `GET /database-exports/{id}/objects` → `POST .../resolve-selection` (cierre de
+  dependencias) → `POST .../preview` (**congela** la selección + `confirm_token`; con
+  `dry_run_only` valida sin congelar) → `POST .../execute` (doble factor + re-snapshot +
+  `record_intent` fail-closed, ENCOLA) → `GET .../{id}` (polling) / `.../items` / `.../cancel` /
+  `.../manifest` → `.../download` (FileResponse con `Range`) o `.../content` (texto plano).
+  `GET /servers/{sid}/databases/{db}/export-capabilities` publica todo lo que el formulario
+  necesita.
+- **Archivos**: `app/services/db_admin/export_spec.py` (PURO: enums, matriz de compatibilidad,
+  resolución de selección, validación del `where`, plantillas de nombre),
+  `sql_literals.py` (`render_value`/`render_value_text`, extraído y generalizado de
+  `snapshot_data` SIN tocar `build_seed`), `export_writer.py` (generador incremental
+  sql|csv|json|ndjson, `iter_artifact` es el único punto de entrada del controller),
+  `export_session.py` (transacción de lectura + plazo duro), `app/services/export_package.py`
+  (organización/split/compresión/índice/marca de incompleto), `export_storage.py` (spool,
+  sha256, TTL, purga, huérfanos), `export_runner.py` (3ª copia del worker in-process),
+  `app/controllers/export_controller.py`, `app/routes/v1/database_exports.py`,
+  `app/models/export_job.py` (`ExportJob`/`ExportJobItem`/`ExportArtifact`),
+  `app/schemas/export.py`, migración `a9b0c1d2e3f4`. 18 variables `EXPORT_*`.
+- **`scope_ddl`/`entity_ddl` son un ENUMERADO de 4 valores, no dos booleanos**
+  (`NONE|CREATE|DROP_CREATE|CREATE_IF_NOT_EXISTS`): con banderas el estado "eliminar sin crear"
+  ES representable y hay que parchearlo con validación dispersa; con el enumerado no existe —
+  la regla es el TIPO. `DROP_CREATE` y `CREATE_IF_NOT_EXISTS` NO son redundantes: son las dos
+  idempotencias incompatibles entre sí que la gente quiere. `DROP_CREATE` exige
+  `confirm_scope_drop` == nombre real.
+- **Estructura y datos son DOS conjuntos** con restricción `data ⊆ selection` verificada en el
+  servidor (422 `export.data_without_structure`), con **una excepción decidida**: con ambos
+  `*_ddl` en `NONE` la exportación es "solo datos" y la restricción no aplica — es la ÚNICA
+  forma en que csv/json/ndjson pueden existir. Los datos solo salen de TABLAS.
+- **Consistencia ASIMÉTRICA por motor (§6.2, no es un bug)**: PG cubre catálogo y datos
+  (`execution_options(isolation_level="REPEATABLE READ", postgresql_readonly=True)` + un
+  `SELECT 1` que fuerza el snapshot — **NO un `BEGIN` crudo**: psycopg abre la tx al primer
+  execute y un `BEGIN` nuestro llegaría segundo, el servidor lo ignoraría con un aviso y la
+  sesión quedaría en READ COMMITTED **sin que nada fallara**). MySQL/MariaDB cubre **solo
+  datos**: el snapshot de InnoDB es MVCC de FILAS y el diccionario de datos no participa;
+  congelarlo exigiría `FLUSH TABLES WITH READ LOCK`, que bloquea el servidor entero (misma
+  limitación de `mysqldump --single-transaction`). Se reporta con un aviso en el preview y con
+  `structure_drift_detected` (el fingerprint se re-verifica AL TERMINAR, dentro de la sesión).
+  La familia MySQL se abre en **3 pasos** (`SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE
+  READ` → `SET SESSION TRANSACTION READ ONLY` → `START TRANSACTION WITH CONSISTENT SNAPSHOT`) y
+  no con la lista separada por coma, que no está soportada de forma uniforme.
+- **El export NO toma el advisory lock, y es deliberado**: es de solo lectura, no hay nada que
+  serializar, y sostener el lock durante horas bloquearía clones/conversiones/migraciones sobre
+  esa BD sin ganancia — la consistencia la da el MVCC, que es otro mecanismo (y el lock tampoco
+  arreglaría el hueco de MySQL, que es de diccionario de datos). Solo se toma el guard
+  **in-process** `export_runner.database_guard`. Está anotado en el docstring del runner: quien
+  "arregle" esto agregando el lock introduce un bloqueo de horas sobre la base de un tercero.
+- **Inyección de conexión en `ServerAdapter`** (el cambio caro, toca código compartido por 5
+  features): `base_adapter._conn_ctx(database, conn)` + `conn: Connection | None = None`
+  keyword-only en `structural_snapshot`, `dump_structure`, `list_tables` y `list_table_stats`.
+  Con `conn` dado **no se cierra la conexión ni se toca su nivel de aislamiento** (revertiría la
+  tx REPEATABLE READ del job). Aditivo: los 5 consumidores llaman posicionalmente y siguen igual.
+- **`idle_in_transaction_session_timeout` desacoplado SIN tocar `remote_engine`**: se fija con
+  un `SET` de SESIÓN sobre la conexión propia (`EXPORT_IDLE_TRANSACTION_TIMEOUT_MS`, 5 min), que
+  gana sobre el `-c` de la URL. Cambiar los `connect_args` habría metido otro eje en la clave del
+  cache de engines y habría afectado a los otros 5 consumidores para resolver el problema de uno.
+  Best-effort: si el motor lo rechaza, va a `progress.degradations`.
+- **Rutinas ANTES que vistas** en el orden de emisión (el §8.4 del diseño las tenía al revés):
+  en PG una vista que llama a una función se valida al crearse. Se reusa la ÚNICA fuente del
+  repo (`schema_diff._BODY_TYPE_ORDER`/`snapshot_layout._CLASS_ORDER`) — mantener dos órdenes
+  para lo mismo es cómo se reintrodujo ese bug la vez anterior. El orden fino lo calcula
+  `_order_for_emission` (`_STEP` + topológico) y **el writer no reordena nada**: emite lo que el
+  preview congeló y el `confirm_token` hasheó.
+- **Determinismo (§8.3) es requisito, no adorno**: con `script_comments:false` dos corridas dan
+  el artefacto byte a byte idéntico (los metadatos volátiles viven en el manifiesto, y las
+  entradas del zip llevan fecha fija 1980-01-01). `resolve_selection` usa `fnmatchcase` y NO
+  `fnmatch` a propósito: éste aplica `os.path.normcase` y en Windows el MISMO spec resolvería
+  distinto según el SO. Tabla sin PK → se ordena por la tupla completa de columnas si todas son
+  ordenables; si no (`blob`/`text`/`json`/`bytea`/`tsvector`, y en PG además `point`/`polygon`/
+  `box`/`line`, que **no tienen operador de orden** y harían FALLAR la consulta), sale
+  `deterministic:false` + aviso. Fail-closed: fingir determinismo sería mentir.
+- **Lo que NO se emite, a propósito**: `SET session_replication_role='replica'` en PG (exige
+  superusuario y abortaría el script con `ON_ERROR_STOP`; el default
+  `constraints_placement='deferred'` ya pone índices y FKs después de los datos).
+  `scope_ddl='CREATE_IF_NOT_EXISTS'` es **422 en PG** (`CREATE DATABASE IF NOT EXISTS` no existe);
+  `entity_ddl='CREATE_IF_NOT_EXISTS'` es best-effort por tipo (`export_make_idempotent` → `None`
+  ⇒ CREATE normal + aviso: el `IF NOT EXISTS` de rutinas/triggers depende de la VERSIÓN del motor
+  DESTINO, que el gateway no conoce). `insert_variant='replace'` es 422 en PG.
+- **`sanitize.definer` tiene un 4º valor `auto` (default)**: resuelve a `omit` en la familia
+  MySQL y a `keep` en PG. Sin él, la llamada canónica (`{}`) daba 422 contra PG, donde la matriz
+  prohíbe `omit`/`replace` (allá el DEFINER no es el mismo concepto: propiedad del objeto y
+  `SECURITY DEFINER` son mecanismos distintos, `applicable:false` en capabilities). **`keep` hoy
+  es indistinguible de `omit`**: los cuerpos del `SchemaSnapshot` ya vienen sin DEFINER
+  (`_strip_definer_clause` corre al capturarlos); se implementa igual para el día que haya una
+  fuente que sí lo traiga. Implicación de seguridad: un volcado que conserva
+  ``DEFINER=`root`@`localhost`` crea en el destino objetos que corren como root.
+- **`script_comments` y `object_comments` son opciones SEPARADAS**: la primera es el encabezado
+  y los separadores del SCRIPT (apagarla es lo que da el determinismo); la segunda son los
+  `COMMENT` del ESQUEMA, que son parte de la definición y perderlos es pérdida de información.
+- **La matriz de compatibilidad se PUBLICA y se HACE CUMPLIR con la misma estructura**
+  (`compatibility_matrix()` / `validate_compatibility()`): publicar una promesa que el servidor
+  no cumple es peor que no publicarla. `_NEUTRAL` define el valor neutro de cada opción,
+  `structure.*` es comodín, `"ruta=valor"` prohíbe un valor concreto. **Multiarchivo ⇒ zip
+  SIEMPRE** (`effective_compression` eleva `none`→`zip`; eso NO es 422, es una resolución con
+  aviso — pero `gzip`+multiarchivo SÍ es 422, porque ahí el usuario tiene alternativa).
+- **El `where` por objeto es la única entrada libre que roza una consulta**: se arma la consulta
+  REAL, se clasifica con `query_policy.classify_statement` (debe dar `read`, fail-closed), se
+  rechazan subconsultas/CTEs/UNION y el conjunto de tablas del AST debe ser EXACTAMENTE `{t}`
+  (más ninguna columna calificada con otra base/tabla) → 422 `export.invalid_row_filter` antes
+  de tocar el motor, con `reason` de vocabulario cerrado y **sin devolver el texto del filtro**
+  (regla anti-reflexión). `filename_template` tiene whitelist de 5 tokens y el nombre lo sanea
+  el servidor (incluido el valor sustituido).
+- **Entrega**: `FileResponse` y no `StreamingResponse` porque la Starlette del repo (0.50) ya
+  implementa `Range` ahí. **Un solo uso** (`EXPORT_SINGLE_USE_DOWNLOAD`) — pero una descarga
+  GENUINAMENTE parcial NO consume, o se rompería la reanudación que el `Range` habilita. Lo
+  decide la COBERTURA del rango (`_range_covers_whole_file`, pura, fail-closed hacia no borrar),
+  no la presencia de la cabecera: con esa lectura ingenua un `Range: bytes=0-` bajaba el archivo
+  entero y lo dejaba disponible — el "un solo uso" se anulaba con una cabecera. El
+  `download_count` se incrementa SIEMPRE.
+  Inline: 409 `export.inline_too_large` accionable, **nunca truncar en silencio**. TTL 30 min +
+  purga periódica en el `lifespan` (`asyncio.to_thread`; hacerlo solo en el arranque volvería el
+  TTL una promesa falsa — mismo error ya corregido en las capturas de SELECT) + barrido de
+  huérfanos al arrancar (sin él, un `kill -9` deja artefactos sensibles en disco para siempre).
+  Directorio 0700 en volumen PROPIO `exports_data:/app/exports`, nunca el de uploads.
+- **Auditoría**: `database_export.plan` (`record`, **`touched_engine=True`** — el flag significa
+  "contactó el motor", no "lo mutó", y el plan snapshotea en vivo), `.execute` (`record_intent`
+  fail-closed ANTES de encolar + `record` al terminar), `.download` (`record_intent`
+  fail-closed, `touched_engine=False`, **antes de que salga un solo byte** — mismo criterio que
+  `reveal_password`: una exportación de datos es una DIVULGACIÓN, no una lectura más).
+- **RIESGO ACEPTADO EXPLÍCITO: no hay enmascarado.** El módulo permite extraer datos personales
+  o regulados EN CLARO y no ofrece ningún control técnico para evitarlo. El único control
+  compensatorio en pie es la auditoría, que por eso no es negociable. `EXPORT_ENABLED=False` es
+  el kill switch (409 en todos los endpoints, y el worker lo re-comprueba al arrancar el job: la
+  vía de salida tiene que poder cerrarse sin esperar a que la cola se vacíe). Si el gateway pasa
+  a tratar datos regulados, esto es un **bloqueante de cumplimiento**.
+- **Limitaciones conocidas**: (1) estructura no consistente en MySQL/MariaDB; (2) los cuerpos
+  salen SIN el calificador de la base de origen (era una FUGA, corregida — ver abajo); (3) el
+  artefacto de PG con `DROP_CREATE` no es ejecutable de un tirón (falta el `\connect` que emite
+  `pg_dump --create`; el preview lo avisa); (4) las **particiones no viajan** (el
+  `SchemaSnapshot` no captura `PARTITION BY`) → aviso en vez de degradación silenciosa; (5) **no
+  se emite `REFRESH MATERIALIZED VIEW`**; (6) los jobs NO son durables (worker in-process);
+  (7) PG solo schema `public`; (8) **3ª copia del runner + 2 vocabularios de ítem divergentes**
+  (`applied/failed/skipped` del clon vs `ok/error/skipped` de collation y export) = deuda
+  anotada, el 4º módulo de la familia debería unificarlos.
+- **Verificado** (ejecución directa, sin `pytest`): **87 checks HTTP** de extremo a extremo
+  (`tests/test_api_database_exports.py`, TestClient+SQLite+adapter falso), **27 checks de ciclo
+  real** con el writer real y `MySQLAdapter` real sin motor (execute → run_job → artefacto en
+  disco → descarga con y sin `Range` → hook `counter_value` → purga por TTL → barrido de
+  huérfanos), **81** del writer, **96** del spec, **23** de literales, **17** de endurecimiento
+  (`tests/test_export_hardening.py`), **89** de `query_policy` y **18** de
+  `query_console_security` sin regresión, y la migración con ciclo upgrade/downgrade/upgrade en
+  SQLite.
+- **PENDIENTE — NADA se probó contra motores reales**: `scripts/verify_export_e2e.py` está
+  **escrito pero NUNCA EJECUTADO** (sin Docker; mismo caso que `verify_query_console_e2e.py`).
+  Lo que solo un motor real puede confirmar y por lo tanto NO está verificado: (a) que el
+  artefacto **se ejecute** y el esquema resultante coincida con el origen vía `diff_snapshots`
+  —la prueba de aceptación principal—; (b) que la transacción de `export_session` se abra DE
+  VERDAD (3 pasos de MySQL y `postgresql_readonly` de psycopg) y que el `SET
+  idle_in_transaction_session_timeout` sea aceptado; (c) `export_counter_value_sql`
+  (`information_schema.TABLES.AUTO_INCREMENT` y **`pg_sequence_last_value`, un builtin NO
+  documentado**); (d) el determinismo byte a byte contra un motor; (e) que un csv y un ndjson se
+  REIMPORTEN; (f) los valores límite (binario con `\x00`, fechas extremas, `Decimal` de precisión
+  arbitraria, multibyte); (g) que quitar el calificador propio del cuerpo (fix de la fuga) produzca
+  objetos que el motor acepte al restaurar en una base con OTRO nombre. Tampoco se verificó la migración contra la BD del gateway real ni el
+  consumo de memoria plano / la cancelación con una tabla de millones de filas.
+  **`.env.example` NO se pudo actualizar** (permisos del entorno): las 18 variables `EXPORT_*`
+  están documentadas en `app/core/environments.py` y en `docs/features/database-export.md`.
+
+**Revisión de seguridad post-implementación (2026-08-16) — 3 bloqueantes + 5 recomendaciones +
+1 fuga, TODOS aplicados** (cada uno con test de regresión que falla sin el fix, verificado):
+
+**(B1a) `/*M!` de MariaDB evadía la blocklist ENTERA — y esto golpeaba a la CONSOLA SQL, no solo
+al export.** `query_policy._scan_normalize` reconocía el comentario ejecutable `/*!` de MySQL
+pero **no `/*M!`**, el prefijo exclusivo de MariaDB: su contenido se descartaba como comentario
+común, la blocklist nunca lo veía y **el motor lo ejecutaba igual**. Con la credencial
+pseudo-root, `SELECT a FROM t WHERE 1=1 /*M!100000 INTO OUTFILE '/tmp/x' */` es escritura de
+archivo arbitraria en el host de la base del cliente, y salía clasificado `read` (sin
+confirmación ni auditoría). FIX: `_EXECUTABLE_COMMENT_PREFIXES = ("/*M!", "/*m!", "/*!")` +
+`_executable_comment_prefix` (devuelve el LARGO para que el llamador salte 3 o 4 según el
+prefijo, sin duplicar la tabla). Se reconoce en los **tres** motores a propósito (fail-closed: un
+MariaDB dado de alta como `mysql` es un error de inventario frecuente, y conservar texto de más
+solo sobre-bloquea). El número de versión se sigue descartando: si quedara, desplazaría los
+patrones anclados en `^` y la evasión seguiría por otra puerta.
+
+**(B1b) el filtro de filas confiaba en que sqlglot y el motor coincidieran en qué es código — y
+no coinciden.** `export_spec.validate_row_filter` funda su garantía central ("el conjunto de
+tablas del AST debe ser EXACTAMENTE `{t}`", sin subconsultas/CTE/UNION) en el árbol de sqlglot,
+que **no tokeniza el contenido de un `/*! */`**. Pasaban
+`1=1 /*!50000 UNION SELECT user,authentication_string FROM mysql.user */` y
+`1=1 /*M!100000 INTO OUTFILE …*/` con un árbol que solo veía `1=1`. FIX: se rechaza **cualquier**
+token de comentario (`--`, `/*`, `*/`, y `#` solo en la familia MySQL — en PostgreSQL es el XOR
+de enteros y prohibirlo sería prohibir un operador legítimo; mismo matiz que `_scan_normalize`),
+`reason='comment_not_allowed'`. Un filtro de exportación no tiene ningún uso legítimo para un
+comentario, así que la validación deja de depender de un empate entre parser y motor.
+
+**(B2) la cadena VALIDADA no era la cadena EJECUTADA.** El validador armaba
+`SELECT … FROM t WHERE {text}` (un PREFIJO) y `export_writer._select_sql` construía
+`… WHERE {where} ORDER BY … LIMIT …` **en una sola línea**. Con `where = "1=1 -- "` o `"1=1 #"`
+el `ORDER BY` y el `LIMIT` **quedaban comentados**: la tabla salía ENTERA ignorando el `limit`
+que el operador confirmó y que el `confirm_token` hasheó, `ensure_capacity` quedaba basado en una
+estimación falsa y el manifiesto afirmaba `deterministic: true` sobre un volcado sin orden. FIX:
+constructor **ÚNICO** `export_spec.build_row_select_sql` que llaman validador y writer, filtro
+entre **paréntesis**, y se valida la cadena **FINAL** (con `ORDER BY` y `LIMIT`). El controller
+pasa el `order_by` del adapter y el `limit` del `RowFilter`, y usa las columnas INSERTABLES
+(sin generadas) igual que el writer. Dos defensas independientes: aunque B1b ya prohíbe el
+comentario, los paréntesis impiden que un `OR` suelto se coma la precedencia de la cola.
+
+**(B3) se podía exportar la propia base de metadatos del gateway.** `_validate_scope` solo hacía
+`validate_identifier` + `ensure_not_reserved_database`; nada impedía apuntar el export a la BD
+del gateway si su servidor está en el inventario. El artefacto se llevaría `servers` (incluido
+`root_password_encrypted`), `server_users`, el **`audit_log` completo** —que es el único control
+compensatorio que declara el §9.6— y `migration_select_results`. FIX: se reusa el guard que ya
+usa la consola SQL, `query_policy.is_gateway_metadata_target` (resuelve ambos hosts a IPs e
+interseca, así que registrar la IP en vez del hostname no lo evade) → **409
+`export.scope_not_allowed`** (código nuevo en `ERROR_CODES`). El parámetro `target` de
+`_validate_scope` es **obligatorio, sin default**: con un default, un llamador nuevo se saltearía
+el guard en silencio, que es justo el modo de fallo que esto corrige. El guard es por BASE, no
+por servidor.
+
+**(FUGA) el export no re-calificaba el esquema en los cuerpos.** En MySQL/MariaDB
+`VIEW_DEFINITION` devuelve el cuerpo con la BD de origen calificada
+(`` select `origen`.`t`.`c` from `origen`.`t` ``), así que restaurar el artefacto en una base con
+**otro nombre** dejaba las vistas/rutinas leyendo de la base de **ORIGEN**, en silencio y con los
+permisos de quien restaure. El clon resuelve lo mismo RE-CALIFICANDO (`_requalify_body`) porque
+ahí el destino se conoce; en un export **no se conoce**, así que la respuesta correcta es
+**QUITAR** el calificador propio con `sql_dialect.strip_self_schema_qualifier` — sin él el motor
+resuelve contra la base activa de quien ejecuta el script, que es la semántica esperada de un
+volcado y el criterio de `mysqldump`. FIX: `export_writer._strip_own_schema`, aplicado en
+`_render_plan` **solo a `_BODY_TYPES`** (vista/matview/rutina/trigger/evento). Una referencia a
+OTRA base se conserva (es parte de la definición) y PostgreSQL no se toca (sus cuerpos no llevan
+el nombre de la BASE; el ESQUEMA sí es parte de la definición).
+
+**Recomendaciones de la misma pasada**: **(R1)** `Range` anulaba el "un solo uso" — ver
+"Entrega" arriba. **(R2)** `preview` sobre un job ya ejecutado sobrescribía
+`spec`/`resolved_selection`/`fingerprint`/`token` y el `GET /manifest` dejaba de describir el
+artefacto entregado → `_guard_still_pending` (comparte el código `export.already_executed` con
+`execute`, que ahora también lo usa). **(R3)** `Connection.execution_options()` muta la conexión
+**in-place** (a diferencia de `Engine.execution_options()`) y la conexión del export vive el job
+entero, así que `stream_results` quedaba pegado al re-snapshot final de drift y a
+`counter_value` — el fallo documentado en `query_runner:42-48`, donde psycopg compone un cursor
+con nombre como `DECLARE … CURSOR FOR <stmt>` y solo acepta consultas; ahora las opciones van
+**por sentencia** (`text(sql).execution_options(...)`). **(R4)** `output.file_encoding` aceptaba
+cualquier cadena: como se codifica **por trozo**, `utf-16` incrusta un BOM en cada `write` y el
+artefacto sale corrupto mientras el sha256 lo declara íntegro → whitelist
+(`ALLOWED_FILE_ENCODINGS` + alias) evaluada por la matriz, con el código estable
+`export.incompatible_option`. **(R5)** `_guard_concurrency` contaba solo `running`: con un worker
+el techo era 1 y la COLA quedaba sin acotar → `max(running_en_BD,
+export_runner.inflight_count())`. **NO** se cuenta `pending` de la base: incluye los planes
+creados y nunca ejecutados, que no son trabajo admitido y habrían bloqueado el endpoint por
+planes viejos que nadie va a lanzar; el contador in-flight es exacto, no necesita migración y
+un `submit` fallido lo descuenta.
+
+**Follow-up (NO aplicados)**: **R6** el `confirm_token` no incluye `job_id` en su `subject`;
+**R7** `_guard_owner` solo corre en la descarga; **R8** `_render_plan` materializa TODO el DDL en
+memoria antes de emitir; **R9** `preview`/`objects` no auditan.
+
 ## Perfiles de permisos: familia MySQL↔MariaDB y fallo silencioso de `apply-profile`
 
 Guía de uso: `docs/features/permissions.md` (§ apply-profile) y `docs/api-reference-v2.md`
@@ -1545,7 +1800,8 @@ reales (sin Docker en el entorno donde se implementó).
 
 - `docs/` — documentación completa por feature (ver `docs/features/model-migrations.md`
   para migraciones de blueprints; `docs/features/server-database-lifecycle.md` para
-  crear/borrar BDs a nivel servidor y listar usuarios con permisos sobre una BD)
+  crear/borrar BDs a nivel servidor y listar usuarios con permisos sobre una BD;
+  `docs/features/database-export.md` + `docs/api-reference-v10.md` para la exportación de BDs)
 - `docs/docker-deployment.md` — despliegue Docker en VPS plano (`docker-compose.yml`, nginx + Certbot propios)
 - `docs/dokploy-deployment.md` — despliegue en Dokploy (`docker-compose.dokploy.yml`, sin nginx: usa el Traefik propio de Dokploy)
 - `README_MIGRATIONS.md` — migraciones Alembic de la **BD del gateway** (distinto del módulo de blueprints)
