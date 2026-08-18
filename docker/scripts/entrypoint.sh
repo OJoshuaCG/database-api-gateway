@@ -2,6 +2,24 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Bajar privilegios a appuser tras corregir el ownership de los volúmenes.
+#
+# El contenedor arranca como root (ver Dockerfile) SOLO para esto: un volumen
+# nombrado (p. ej. exports_data) que ya existía con otro ownership -creado
+# antes de este fix, o recreado por Dokploy/Compose sin copiar el ownership de
+# la imagen- deja a appuser sin permiso de escritura, y eso no se corrige
+# reconstruyendo la imagen (Docker solo copia ownership al CREAR el volumen).
+# Corriendo esto en cada arranque, el fix se aplica con un simple redeploy,
+# sin acceso SSH al host.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "$(id -u)" = "0" ]; then
+    mkdir -p /app/exports
+    chown appuser:appuser /app/exports
+    chmod 0700 /app/exports
+    exec gosu appuser "$0" "$@"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Función: esperar a que MariaDB esté lista para conexiones
 # Aunque el healthcheck de Docker Compose ya lo verifica, puede existir una
 # pequeña ventana donde el usuario aún no tiene permisos. Reintentamos aquí.

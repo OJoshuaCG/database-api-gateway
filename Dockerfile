@@ -31,9 +31,11 @@ FROM python:3.13-slim AS production
 # uv disponible en producción para comandos de entorno (alembic, etc.)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# Dependencias de sistema mínimas (curl para el healthcheck)
+# Dependencias de sistema mínimas (curl para el healthcheck, gosu para que el
+# entrypoint pueda arrancar como root y bajar privilegios a appuser)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
+        gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Usuario no-root para mayor seguridad
@@ -45,10 +47,19 @@ WORKDIR /app
 # Copiar entorno virtual y código desde el builder (con ownership correcto)
 COPY --from=builder --chown=appuser:appuser /app /app
 
-# Hacer ejecutable el entrypoint (como root antes de cambiar de usuario)
+# Hacer ejecutable el entrypoint
 RUN chmod +x /app/docker/scripts/entrypoint.sh
 
-USER appuser
+# Directorio de artefactos de exportación (volumen exports_data): se crea con el
+# ownership correcto ANTES de montar el volumen encima. Docker copia el
+# contenido/ownership de este directorio al crear el volumen nombrado por
+# primera vez; sin esto queda root:root y appuser no puede escribir ahí.
+RUN mkdir -p /app/exports && chown appuser:appuser /app/exports && chmod 0700 /app/exports
+
+# Sin USER acá a propósito: el contenedor arranca como root para que el
+# entrypoint pueda corregir el ownership de volúmenes YA EXISTENTES (creados
+# antes de este fix, o con otro ownership por cualquier motivo) antes de bajar
+# privilegios a appuser con gosu. Ver docker/scripts/entrypoint.sh.
 
 # Virtual env en PATH para ejecutar uvicorn/alembic directamente
 ENV PATH="/app/.venv/bin:$PATH" \
