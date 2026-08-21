@@ -8,19 +8,26 @@ contestan fallando:
 - ¿se traduce con certeza a PostgreSQL, o hará falta un ``up_sql_postgresql``?
 - ¿siembra datos? (``INSERT``/``UPDATE``/``DELETE``/``REPLACE``/``LOAD DATA``/``COPY``)
 - ¿fuerza algún ``COLLATE`` / ``CHARACTER SET`` explícito?
-- ¿hay sentencias destructivas (``DROP``/``TRUNCATE``/``DELETE`` sin ``WHERE``)?
+- ¿hay sentencias destructivas (``DROP``, ``TRUNCATE``, ``DELETE`` sin ``WHERE``)?
 - ¿toca la contabilidad interna del gateway (``_gw_*``)?
 - si falla a mitad, ¿se podrá auto-reconciliar?
 
 Todo es PURO: sin motor, sin ORM, sin sesión. Se apoya en las piezas que ya existen
 (``split_sql_statements``, ``query_policy``, ``SqlTranslator``, ``identifiers``) en vez de
-reimplementar un clasificador — el único análisis propio es el de collations, que no
-existía en ningún lado.
+reimplementar un clasificador. El único análisis propio es el de collations, que no existía.
 
-Lo que este módulo NO puede saber: si las tablas que el SQL referencia existen en el
-destino. Un ``ALTER TABLE`` sobre una tabla inexistente es sintácticamente impecable. Para
-eso hace falta consultar el catálogo del motor, y por eso ``referenced_tables`` se expone
-aparte: es la entrada de esa comprobación, que sí abre conexión y vive en el controlador.
+**El dialecto es SIEMPRE MySQL, y no es un parámetro.** El ``up_sql`` de una migración se
+escribe en estilo MySQL por contrato y el gateway lo traduce al aplicar. Cuando este módulo
+aceptaba el motor del DESTINO, validar contra una BD PostgreSQL parseaba SQL de MySQL con la
+gramática equivocada: sqlglot no fallaba, simplemente no reconocía las tablas, y la
+comprobación de catálogo se volvía un no-op silencioso que además decía que todo estaba bien.
+El motor del destino solo decide contra qué catálogo se contrasta, y eso vive en el
+controlador.
+
+Lo que este módulo NO puede saber: si las tablas que el SQL referencia existen en el destino.
+Un ``ALTER TABLE`` sobre una tabla inexistente es sintácticamente impecable. Para eso hace
+falta el catálogo del motor, y por eso ``requires_existing_tables`` se expone aparte: es la
+entrada de esa comprobación.
 """
 
 from __future__ import annotations
@@ -42,12 +49,23 @@ from app.services.db_admin.sql_dialect import (
     split_sql_statements,
 )
 
+# Dialecto de AUTORÍA del `up_sql`. Ver el docstring del módulo: no se parametriza a
+# propósito.
+_DIALECT = "mysql"
+_ENGINE = EngineType.mysql.value
+
+# Por encima de este tamaño no se memoiza: el SQL enorme es raro, y es justo el que llenaría
+# la caché. Sin la cota, 512 entradas de hasta 256 KB retienen ~128 MB en un proceso de larga
+# vida.
+_CACHE_MAX_SQL_BYTES = 64 * 1024
+
 # `query_policy` NO marca estas tres como escritura, y las tres siembran datos:
-#   - `LOAD DATA` y `COPY` caen en la blocklist (danger=blocked, kind=blocked) porque leen
-#     archivos del host; para el clasificador son "prohibidas", no "escrituras".
-#   - `REPLACE INTO` parsea como `exp.Command` genérico, así que sale como kind='unknown'
-#     con danger=ddl.
-# Detectarlas por `danger == WRITE` las dejaría fuera y la insignia de siembra mentiría.
+#   - `LOAD DATA` y `COPY` caen en la blocklist (danger=blocked) porque leen archivos del
+#     host; para el clasificador son "prohibidas", no "escrituras".
+#   - `REPLACE INTO` parsea como `exp.Command` genérico → kind='unknown', danger=ddl.
+# Los patrones van ANCLADOS al inicio de la sentencia: buscarlos sueltos por el texto hacía
+# que `ON UPDATE CASCADE` de una clave foránea —o un `CREATE TRIGGER ... AFTER UPDATE ON`—
+# marcaran como siembra un DDL corriente, y una insignia que se enciende siempre no se mira.
 _SEED_FALLBACK_RE = re.compile(
     r"^\s*(?:REPLACE\s+(?:LOW_PRIORITY\s+|DELAYED\s+)?INTO\b"
     r"|LOAD\s+DATA\b"
@@ -55,12 +73,28 @@ _SEED_FALLBACK_RE = re.compile(
     re.IGNORECASE,
 )
 
-# `DELETE` sin `WHERE` vacía la tabla entera. `DROP`/`TRUNCATE` los da el clasificador por
-# `kind`, así que aquí solo hace falta el caso que depende de la ausencia de una cláusula.
+# Escrituras "normales", también ancladas. Se usan en `quick_facts`, que no tiene AST.
+_QUICK_SEED_RE = re.compile(
+    r"^\s*(?:INSERT\b"
+    r"|REPLACE\b"
+    r"|UPDATE\b"
+    r"|DELETE\s+FROM\b"
+    r"|MERGE\s+INTO\b"
+    r"|LOAD\s+DATA\b"
+    r"|COPY\b)",
+    re.IGNORECASE,
+)
+
+_QUICK_DESTRUCTIVE_RE = re.compile(
+    r"^\s*(?:DROP\s+(?:TABLE|DATABASE|SCHEMA|VIEW|INDEX)\b"
+    r"|TRUNCATE\b"
+    r"|DELETE\s+FROM\b(?![\s\S]*\bWHERE\b)"
+    r"|ALTER\s+TABLE\b[\s\S]*\bDROP\s+(?:COLUMN\b|`|\"|[A-Za-z_]))",
+    re.IGNORECASE,
+)
+
 _DELETE_RE = re.compile(r"^\s*DELETE\b", re.IGNORECASE)
 _WHERE_RE = re.compile(r"\bWHERE\b", re.IGNORECASE)
-
-_DESTRUCTIVE_KINDS = frozenset({"drop", "truncate"})
 
 # El VALOR se captura sobre el texto enmascarado, que conserva las comillas y la longitud
 # exacta: eso permite recortar el nombre real del texto ORIGINAL en las mismas posiciones.
@@ -73,6 +107,11 @@ _CHARSET_RE = re.compile(
     r"\b(?:CHARACTER\s+SET|CHARSET)\s*=?\s*(\"[^\"]*\"|'[^']*'|`[^`]*`|[A-Za-z0-9_.]+)",
     re.IGNORECASE,
 )
+
+# Objetos cuyo cuerpo sqlglot suele entregar como `Command` sin analizar. Se declaran sus
+# tablas como NO requeridas: preferimos callar a inventar un "esta tabla no existe" sobre un
+# cuerpo que no se ha entendido.
+_OPAQUE_CREATE_KINDS = frozenset({"TRIGGER", "PROCEDURE", "FUNCTION", "EVENT"})
 
 
 @dataclass(frozen=True)
@@ -100,25 +139,28 @@ class MigrationFacts:
     destructive_statements: tuple[int, ...]
     parse_errors: tuple[tuple[int, str], ...]
     gateway_internal_tables: tuple[str, ...]
-    referenced_tables: tuple[str, ...]
+    requires_existing_tables: tuple[str, ...]
+    creates_tables: tuple[str, ...]
     postgresql_blockers: tuple[str, ...]
     resumable: bool
 
-    @property
-    def is_valid(self) -> bool:
-        """Sin errores de parseo, sin tablas internas del gateway y traducible."""
-        return not (
-            self.parse_errors or self.gateway_internal_tables or self.postgresql_blockers
-        )
+
+@dataclass(frozen=True)
+class QuickFacts:
+    """Lo mínimo para pintar insignias en un listado, sin AST."""
+
+    has_seed: bool
+    forced_collations: tuple[str, ...]
+    destructive: bool
 
 
 def _extract(pattern: re.Pattern[str], masked: str, original: str) -> list[str]:
     """
     Valores capturados por ``pattern`` sobre el texto ENMASCARADO, recortados del ORIGINAL.
 
-    `mask_quoted_spans` preserva la longitud total, así que los offsets de una y otra
-    cadena coinciden carácter a carácter. Buscar en la máscara evita los falsos positivos
-    de los literales; recortar del original recupera el nombre real cuando el valor venía
+    ``mask_quoted_spans`` preserva la longitud total, así que los offsets de una y otra
+    cadena coinciden carácter a carácter. Buscar en la máscara evita los falsos positivos de
+    los literales; recortar del original recupera el nombre real cuando el valor venía
     entrecomillado (``COLLATE "es_ES"`` de PostgreSQL, que en la máscara es todo espacios).
     """
     out: list[str] = []
@@ -130,66 +172,132 @@ def _extract(pattern: re.Pattern[str], masked: str, original: str) -> list[str]:
     return out
 
 
-def _parse_error(sql: str, dialect: str) -> str | None:
+def _parse(sql: str) -> exp.Expression | None:
+    try:
+        return sqlglot.parse_one(sql, read=_DIALECT)
+    except sqlglot.errors.SqlglotError:
+        return None
+
+
+def _parse_error(sql: str) -> str | None:
     """
     Mensaje de sqlglot al no poder parsear la sentencia, o ``None`` si parsea.
 
-    Solo se llama sobre las sentencias que el clasificador ya marcó como no parseables:
-    ahí ``query_policy`` se traga la excepción (le basta con fallar cerrado), pero para un
+    Solo se llama sobre las sentencias que el clasificador ya marcó como no parseables: ahí
+    ``query_policy`` se traga la excepción (le basta con fallar cerrado), pero para un
     validador el mensaje ES el producto — es lo que dice dónde falta el punto y coma.
     """
     try:
-        sqlglot.parse_one(sql, read=dialect)
+        sqlglot.parse_one(sql, read=_DIALECT)
     except sqlglot.errors.SqlglotError as exc:
-        return str(exc).strip().splitlines()[0] if str(exc).strip() else "SQL no parseable"
+        first = str(exc).strip().splitlines()
+        return first[0] if first else "SQL no parseable"
     return None
 
 
-def _tables_of(sql: str, dialect: str) -> list[str]:
-    """Tablas referenciadas por la sentencia; vacío si no parsea."""
-    try:
-        tree = sqlglot.parse_one(sql, read=dialect)
-    except sqlglot.errors.SqlglotError:
+def _table_name(node: exp.Expression | None) -> str | None:
+    if node is None:
+        return None
+    if isinstance(node, exp.Table):
+        return node.name or None
+    table = node.find(exp.Table)
+    return table.name if table is not None else None
+
+
+def _all_table_names(node: exp.Expression | None) -> list[str]:
+    if node is None:
         return []
+    out: list[str] = []
+    for table in node.find_all(exp.Table):
+        if table.name and table.name not in out:
+            out.append(table.name)
+    return out
+
+
+def _tables_of(tree: exp.Expression) -> tuple[list[str], list[str]]:
+    """
+    Tablas que la sentencia CREA y tablas que necesita PREEXISTENTES.
+
+    La distinción es la que hace usable la comprobación de catálogo: sin ella, un baseline
+    —que es todo ``CREATE TABLE``— reportaba cada una de sus tablas como inexistente, y el
+    aviso que justificaba abrir conexión al motor era el que más ruido producía.
+
+    Ante la duda se declara "no requerida": un falso negativo pasa desapercibido, un falso
+    positivo entrena a ignorar el panel entero.
+    """
+    if isinstance(tree, exp.Create):
+        kind = str(tree.args.get("kind") or "").upper()
+        created = _table_name(tree.this)
+        if kind in _OPAQUE_CREATE_KINDS:
+            # Cuerpo procedural: sqlglot suele devolverlo sin analizar. No se afirma nada.
+            return ([created] if created else []), []
+        if kind == "INDEX":
+            # `CREATE INDEX ... ON t`: no crea tabla, la necesita.
+            target = tree.args.get("table") or tree.this
+            required = [n for n in _all_table_names(target) if n]
+            return [], required
+        # TABLE / VIEW / MATERIALIZED VIEW: crea un nombre; un `AS SELECT` sí necesita sus
+        # fuentes.
+        required = [n for n in _all_table_names(tree.expression) if n != created]
+        return ([created] if created else []), required
+
+    if isinstance(tree, exp.Drop):
+        if tree.args.get("exists"):  # DROP ... IF EXISTS: no exige nada
+            return [], []
+        name = _table_name(tree.this)
+        return [], ([name] if name else [])
+
+    return [], _all_table_names(tree)
+
+
+def _is_destructive(tree: exp.Expression | None, kind: str, masked: str) -> bool:
+    """
+    ``DROP`` (de tabla o de columna), ``TRUNCATE`` o ``DELETE`` sin ``WHERE``.
+
+    Se mira el ÁRBOL y no solo el ``kind`` del clasificador porque
+    ``ALTER TABLE t DROP COLUMN c`` es un ``alter`` para él y sin embargo pierde datos. Esa
+    discrepancia hacía que el listado marcara «destructiva» y el validador no dijera nada
+    sobre el mismo SQL.
+    """
+    if kind in {"drop", "truncate"}:
+        return True
+    if _DELETE_RE.match(masked) and not _WHERE_RE.search(masked):
+        return True
     if tree is None:
-        return []
-    names: list[str] = []
-    for node in tree.find_all(exp.Table):
-        name = node.name
-        if name and name not in names:
-            names.append(name)
-    return names
+        return False
+    if isinstance(tree, exp.Alter) and tree.find(exp.Drop) is not None:
+        return True
+    return isinstance(tree, (exp.Drop,))
 
 
-@lru_cache(maxsize=128)
-def analyze(sql: str, engine: str, *, kind: str = "schema", has_non_portable: bool = False) -> MigrationFacts:
-    """
-    Analiza el SQL de una migración. Memoizado por (sql, motor, kind, portabilidad).
-
-    El ``up_sql`` de una migración es inmutable salvo por un ``PATCH`` —que recalcula el
-    checksum— así que cachear por el texto es seguro. Es el mismo criterio y el mismo tope
-    de orden de magnitud que ``sql_dialect._transpile_cached``: sin caché, cada listado de
-    versiones volvería a parsear todo el SQL de la página.
-    """
+def _analyze_uncached(sql: str, kind: str, has_non_portable: bool) -> MigrationFacts:
     statements = split_sql_statements(sql)
-    dialect = "postgres" if engine == EngineType.postgresql.value else "mysql"
 
     facts: list[StatementFact] = []
-    tables: list[str] = []
+    created: list[str] = []
+    created_lower: set[str] = set()
+    required: list[str] = []
+
     for seq, stmt in enumerate(statements):
-        plan = query_policy.classify_statement(stmt, engine=engine, seq=seq)
+        plan = query_policy.classify_statement(stmt, engine=_ENGINE, seq=seq)
         masked = mask_quoted_spans(stmt)
         codes = {r.code for r in plan.reasons}
+        tree = _parse(stmt)
 
         seeds = plan.danger == query_policy.WRITE or bool(_SEED_FALLBACK_RE.match(masked))
-        destructive = plan.kind in _DESTRUCTIVE_KINDS or (
-            bool(_DELETE_RE.match(masked)) and not _WHERE_RE.search(masked)
-        )
-        parse_error = _parse_error(stmt, dialect) if "unparseable" in codes else None
+        destructive = _is_destructive(tree, plan.kind, masked)
+        parse_error = _parse_error(stmt) if "unparseable" in codes else None
 
-        for name in _tables_of(stmt, dialect):
-            if name not in tables:
-                tables.append(name)
+        if tree is not None:
+            makes, needs = _tables_of(tree)
+            for name in needs:
+                # Solo cuenta lo que NO haya creado una sentencia ANTERIOR del mismo script.
+                if name.lower() not in created_lower and name not in required:
+                    required.append(name)
+            for name in makes:
+                if name.lower() not in created_lower:
+                    created.append(name)
+                    created_lower.add(name.lower())
 
         facts.append(
             StatementFact(
@@ -220,11 +328,11 @@ def analyze(sql: str, engine: str, *, kind: str = "schema", has_non_portable: bo
         destructive_statements=tuple(f.seq for f in facts if f.destructive),
         parse_errors=tuple((f.seq, f.parse_error) for f in facts if f.parse_error),
         gateway_internal_tables=tuple(references_gateway_internal_table(sql)),
-        referenced_tables=tuple(tables),
-        # SIEMPRE contra PostgreSQL: es la única dirección donde la traducción puede
-        # fallar (el up_sql se escribe en estilo MySQL), y es el 422 que hoy solo aparece
-        # al aplicar contra una BD PostgreSQL concreta. Pasar `engine` aquí devolvería
-        # lista vacía al validar desde el formulario, que es cuando más sirve saberlo.
+        requires_existing_tables=tuple(required),
+        creates_tables=tuple(created),
+        # SIEMPRE contra PostgreSQL: es la única dirección donde la traducción puede fallar
+        # (el up_sql se escribe en estilo MySQL). Es el 422 que hoy solo aparece al aplicar
+        # contra una BD PostgreSQL concreta.
         postgresql_blockers=tuple(
             SqlTranslator().translation_blockers(sql, EngineType.postgresql)
         ),
@@ -234,53 +342,72 @@ def analyze(sql: str, engine: str, *, kind: str = "schema", has_non_portable: bo
     )
 
 
-@dataclass(frozen=True)
-class QuickFacts:
-    """Lo mínimo para pintar insignias en un listado, sin AST."""
-
-    has_seed: bool
-    forced_collations: tuple[str, ...]
-    destructive: bool
+@lru_cache(maxsize=128)
+def _analyze_cached(sql: str, kind: str, has_non_portable: bool) -> MigrationFacts:
+    return _analyze_uncached(sql, kind, has_non_portable)
 
 
-# Prefiltros baratos. Mismo criterio que `_MYSQLISM_RE` y `_CAPTURE_PREFILTER_RE` del resto
-# del repo: descartar por texto antes de pagar un parseo.
-_QUICK_SEED_RE = re.compile(
-    r"\b(?:INSERT\s+(?:LOW_PRIORITY\s+|DELAYED\s+|HIGH_PRIORITY\s+|IGNORE\s+)*INTO"
-    r"|REPLACE\s+(?:LOW_PRIORITY\s+|DELAYED\s+)?INTO"
-    r"|UPDATE\s+\w"
-    r"|DELETE\s+FROM"
-    r"|LOAD\s+DATA"
-    r"|MERGE\s+INTO"
-    r"|^\s*COPY\s)",
-    re.IGNORECASE | re.MULTILINE,
-)
-_QUICK_DESTRUCTIVE_RE = re.compile(
-    r"\b(?:DROP\s+(?:TABLE|DATABASE|SCHEMA|COLUMN|INDEX|VIEW)|TRUNCATE\s+(?:TABLE\s+)?\w)",
-    re.IGNORECASE,
-)
+def analyze(
+    sql: str, kind: str = "schema", has_non_portable: bool = False
+) -> MigrationFacts:
+    """
+    Analiza el SQL de una migración. Memoizado por (sql, kind, portabilidad).
+
+    Los parámetros son POSICIONALES a propósito: con keyword-only, ``analyze(s)`` y
+    ``analyze(s, kind='schema')`` ocupaban dos entradas distintas de la caché para el mismo
+    resultado.
+
+    ``kind`` y ``has_non_portable`` vienen de la migración y solo afectan a ``resumable``.
+    Pasarlos importa: una migración ``kind='data'`` NUNCA es reanudable, y con el default se
+    informaba lo contrario.
+
+    El ``up_sql`` es inmutable salvo por un ``PATCH`` —que recalcula el checksum— así que
+    cachear por el texto es seguro. Por encima de ``_CACHE_MAX_SQL_BYTES`` no se cachea:
+    esas entradas son las que harían crecer la memoria sin techo.
+    """
+    if len(sql.encode("utf-8")) > _CACHE_MAX_SQL_BYTES:
+        return _analyze_uncached(sql, kind, has_non_portable)
+    return _analyze_cached(sql, kind, has_non_portable)
 
 
-@lru_cache(maxsize=512)
+def _quick_facts_uncached(sql: str) -> QuickFacts:
+    seeds = False
+    destructive = False
+    for stmt in split_sql_statements(sql):
+        masked = mask_quoted_spans(stmt)
+        if not seeds and _QUICK_SEED_RE.match(masked):
+            seeds = True
+        if not destructive and _QUICK_DESTRUCTIVE_RE.match(masked):
+            destructive = True
+    return QuickFacts(
+        has_seed=seeds,
+        forced_collations=tuple(_extract(_COLLATE_RE, mask_quoted_spans(sql), sql)),
+        destructive=destructive,
+    )
+
+
+@lru_cache(maxsize=256)
+def _quick_facts_cached(sql: str) -> QuickFacts:
+    return _quick_facts_uncached(sql)
+
+
 def quick_facts(sql: str) -> QuickFacts:
     """
     Hechos para las insignias de un LISTADO, solo con regex sobre el SQL enmascarado.
 
-    ``analyze`` parsea cada sentencia con sqlglot (dos veces: clasificador y extracción de
-    tablas). Eso es correcto para el validador, donde el usuario espera por una respuesta y
-    la precisión es el producto, pero pagarlo por cada fila de cada página de versiones —con
-    ``up_sql`` de hasta 256 KB— sería absurdo para decidir si se dibuja una plantita.
+    ``analyze`` parsea cada sentencia con sqlglot (dos veces: clasificador y árbol). Eso es
+    correcto para el validador, donde el usuario espera por una respuesta y la precisión es
+    el producto, pero pagarlo por cada fila de cada página —con ``up_sql`` de hasta 256 KB—
+    sería absurdo para decidir si se dibuja una plantita.
 
-    La contrapartida es precisión: aquí no se distingue un `DELETE` con `WHERE` de uno sin
-    él, ni se detectan construcciones raras. Para una insignia informativa alcanza; el
-    veredicto fino lo da ``analyze`` cuando el usuario pulsa «Validar».
+    Se parte en sentencias y los patrones van ANCLADOS a su inicio. Escanear el blob entero
+    hacía que ``ON UPDATE CASCADE`` o ``AFTER UPDATE ON`` marcaran siembra en DDL corriente.
+    Efecto colateral aceptado: un ``INSERT`` dentro del cuerpo de un trigger deja de contar —
+    y es lo correcto, la migración crea el trigger, no siembra datos.
 
-    La máscara sigue siendo obligatoria: sin ella, un `COMMENT 'ver INSERT INTO …'` pintaría
-    una siembra que no existe.
+    La máscara sigue siendo obligatoria: sin ella, un ``COMMENT 'ver INSERT INTO …'``
+    pintaría una siembra que no existe.
     """
-    masked = mask_quoted_spans(sql)
-    return QuickFacts(
-        has_seed=bool(_QUICK_SEED_RE.search(masked)),
-        forced_collations=tuple(_extract(_COLLATE_RE, masked, sql)),
-        destructive=bool(_QUICK_DESTRUCTIVE_RE.search(masked)),
-    )
+    if len(sql.encode("utf-8")) > _CACHE_MAX_SQL_BYTES:
+        return _quick_facts_uncached(sql)
+    return _quick_facts_cached(sql)

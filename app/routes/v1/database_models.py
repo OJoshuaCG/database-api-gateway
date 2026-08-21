@@ -74,35 +74,43 @@ def delete_model(admin: AdminDep, model_id: int):
 @router.get(
     "/{model_id}/databases", response_model=ApiResponse[list[ModelDatabaseStatusOut]]
 )
-@limiter.limit("10/minute")
-def list_model_databases(
-    request: Request,
-    admin: AdminDep,
-    model_id: int,
-    refresh: bool = Query(
-        False,
-        description=(
-            "🔌 Relee la versión REAL de cada BD destino y resincroniza la copia del gateway. "
-            "Sin él la respuesta se sirve solo con datos locales y no abre ninguna conexión."
-        ),
-    ),
-):
+def list_model_databases(admin: AdminDep, model_id: int):
     """
     BDs del blueprint **con su estado de despliegue** (versión actual, pendientes, parcial).
 
     Antes esto exigía una llamada por BD a ``/migrations/status``, y cada una abría una
     conexión al motor. Los tres campos nuevos salen de datos que el gateway ya tiene, así que
-    la tabla entera cuesta 3 queries locales.
+    la tabla entera cuesta 3 queries locales y **cero conexiones**.
 
-    El rate limit cubre el caso ``refresh=true``, que sí toca los motores.
+    Sin rate limit propio a propósito: es una lectura barata que la UI refresca al reenfocar
+    la ventana. Lo que cuesta es el refresco, y ese tiene su propio endpoint.
     """
-    data = DatabaseModelController().list_model_databases(model_id, refresh=refresh)
-    if refresh:
-        audit.record(
-            "database_model.databases.refresh",
-            admin=admin,
-            target_type="database_model",
-            target_id=model_id,
-            detail=f"versión resincronizada desde el motor en {len(data)} BD(s)",
-        )
+    return success(data=DatabaseModelController().list_model_databases(model_id))
+
+
+@router.post(
+    "/{model_id}/databases/refresh",
+    response_model=ApiResponse[list[ModelDatabaseStatusOut]],
+)
+@limiter.limit("10/minute")
+def refresh_model_databases(request: Request, admin: AdminDep, model_id: int):
+    """
+    🔌 Relee la versión REAL de cada BD del blueprint y resincroniza la copia del gateway.
+
+    Es la vía para corregir el dato si alguien migró una BD por fuera del gateway. Va como
+    ``POST`` y no como ``?refresh=true`` sobre el ``GET`` porque **tiene efectos**: abre
+    conexiones y reescribe ``model_version``. Colgarlo del GET obligaba además a limitar por
+    tasa la lectura barata, que es el 99 % de las llamadas.
+
+    Devuelve la lista ya actualizada para que el cliente no tenga que pedirla otra vez.
+    """
+    data = DatabaseModelController().list_model_databases(model_id, refresh=True)
+    audit.record(
+        "database_model.databases.refresh",
+        admin=admin,
+        target_type="database_model",
+        target_id=model_id,
+        touched_engine=True,
+        detail=f"versión resincronizada desde el motor en {len(data)} BD(s)",
+    )
     return success(data=data)

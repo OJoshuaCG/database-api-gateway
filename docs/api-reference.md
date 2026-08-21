@@ -1073,7 +1073,7 @@ toca ningún motor.** Requiere sesión.
 | `GET` | `/api/v1/database-models/{model_id}` | Detalle. |
 | `PATCH` | `/api/v1/database-models/{model_id}` | Actualiza. |
 | `DELETE` | `/api/v1/database-models/{model_id}` | Elimina. |
-| `GET` | `/api/v1/database-models/{model_id}/databases` | BDs que replican este blueprint, **con su estado de despliegue** (`pending_count`, `pending_versions`, `has_partial_application`). `?refresh=true` 🔌 relee la versión real de cada BD y resincroniza la copia del gateway (10/min). Ver `api-reference-v11.md` §4. |
+| `GET` | `/api/v1/database-models/{model_id}/databases` | BDs que replican este blueprint, **con su estado de despliegue** (`pending_count`, `pending_versions`, `has_partial_application`). El refresco 🔌 vive en `POST .../databases/refresh` (10/min). Ver `api-reference-v11.md` §4. |
 | `POST` | `/api/v1/database-models/from-snapshot` 🔌 | **(Plan 09)** Crea un blueprint cuyo baseline (`0001`) es el snapshot estructural de una BD existente. Rate limit **10/min**. Nace `is_baseline=true` y `reviewed=false` (ver el gate R1 más abajo). |
 
 ```bash

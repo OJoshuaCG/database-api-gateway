@@ -1166,8 +1166,11 @@ class ModelMigrationController:
             model = self._model_or_404(session, model_id)
             up_sql = data.get("up_sql")
             version = data.get("version")
-            if not up_sql and version:
-                up_sql = self._migration_or_404(session, model_id, version).up_sql
+            migration = None
+            if version:
+                migration = self._migration_or_404(session, model_id, version)
+            if not up_sql and migration:
+                up_sql = migration.up_sql
             if not up_sql:
                 raise AppHttpException(
                     message="Indica 'up_sql' (borrador) o 'version' (una ya guardada).",
@@ -1175,9 +1178,18 @@ class ModelMigrationController:
                     context={"model_id": model_id},
                 )
 
+            # `kind` y `has_non_portable` solo salen si se valida una versión ya guardada.
+            # Importan: una migración `kind='data'` NUNCA es reanudable, y con los defaults
+            # el panel informaba lo contrario.
+            kind = migration.kind if migration else "schema"
+            has_non_portable = bool(migration.has_non_portable) if migration else False
+
             target = None
             db_name = None
-            engine = EngineType.mysql
+            # Motor del DESTINO: solo se usa para decidir si la comparación de collation
+            # aplica (es semántica MySQL). El dialecto de análisis lo fija migration_facts.
+            target_engine = EngineType.mysql
+            pending_before: list[str] = []
             db_id = data.get("managed_database_id")
             if db_id is not None:
                 md = session.get(ManagedDatabase, db_id)
@@ -1192,18 +1204,27 @@ class ModelMigrationController:
                     )
                 server = get_server_or_404(session, md.server_id)
                 target = build_target(server)
-                engine = EngineType(engine_value(server))
+                target_engine = EngineType(engine_value(server))
                 db_name = md.name
+                # Versiones que esa BD tiene pendientes ANTES de la que se valida. Si hay
+                # alguna, sus tablas todavía no existen y no tiene sentido presentarlas como
+                # un error: es la pregunta la que está mal planteada, no el SQL.
+                if version:
+                    pending_before = self._versions_before(
+                        session, model_id, md.model_version, version
+                    )
 
             blueprint_collation = model.collation
         finally:
             session.close()
 
-        facts = migration_facts.analyze(up_sql, engine.value)
+        # El dialecto de análisis lo fija el módulo (MySQL, el de autoría del `up_sql`); el
+        # motor del destino solo decide contra qué catálogo se contrasta.
+        facts = migration_facts.analyze(up_sql, kind, has_non_portable)
 
         missing: list[str] = []
         catalog_error: str | None = None
-        if target is not None and db_name and facts.referenced_tables:
+        if target is not None and db_name and facts.requires_existing_tables:
             # Una sola llamada trae el catálogo entero; comparar contra un set en memoria
             # evita una consulta por tabla. La comparación es INSENSIBLE a mayúsculas a
             # propósito: MySQL sobre Linux distingue y PostgreSQL pliega a minúsculas, así
@@ -1211,7 +1232,9 @@ class ModelMigrationController:
             # grita en falso deja de leerse, que es peor que no tenerlo.
             try:
                 existing = {t.lower() for t in get_adapter(target).list_tables(db_name)}
-                missing = [t for t in facts.referenced_tables if t.lower() not in existing]
+                missing = [
+                    t for t in facts.requires_existing_tables if t.lower() not in existing
+                ]
             except AppHttpException as exc:
                 # Motor inalcanzable o credencial inválida: se reporta y se devuelve igual el
                 # análisis estático. Tumbar toda la validación por no poder leer el catálogo
@@ -1236,7 +1259,7 @@ class ModelMigrationController:
         # Solo se comparan collations si el blueprint declaró uno. Y solo tiene sentido en
         # la familia MySQL: PostgreSQL usa encoding + lc_collate, que no son equivalentes.
         conflicts: list[str] = []
-        if blueprint_collation and engine != EngineType.postgresql:
+        if blueprint_collation and target_engine != EngineType.postgresql:
             conflicts = [
                 c for c in facts.forced_collations
                 if c.lower() != blueprint_collation.lower()
@@ -1265,13 +1288,37 @@ class ModelMigrationController:
             "gateway_internal_tables": list(facts.gateway_internal_tables),
             "postgresql_blockers": list(facts.postgresql_blockers),
             "resumable": facts.resumable,
-            "referenced_tables": list(facts.referenced_tables),
+            "referenced_tables": list(facts.requires_existing_tables),
+            "pending_before": pending_before,
             "checked_database": db_name,
             "missing_tables": missing,
             "catalog_error": catalog_error,
             "blueprint_collation": blueprint_collation,
             "collation_conflicts": conflicts,
         }
+
+    @staticmethod
+    def _versions_before(session, model_id: int, current: str | None, version: str) -> list[str]:
+        """
+        Versiones del blueprint que esa BD tiene pendientes ANTES de la que se está validando.
+
+        Si no está vacío, las tablas que crean esas versiones todavía no existen en el
+        destino y aparecerían como "inexistentes" sin serlo. El aviso deja claro que lo que
+        falla es la premisa de la comprobación, no el SQL.
+        """
+        cur = version_sort_key(current) if current else None
+        target = version_sort_key(version)
+        rows = (
+            session.query(ModelMigration.version)
+            .filter(ModelMigration.model_id == model_id)
+            .all()
+        )
+        pending = [
+            r[0]
+            for r in rows
+            if version_sort_key(r[0]) < target and (cur is None or version_sort_key(r[0]) > cur)
+        ]
+        return sorted(pending, key=version_sort_key)
 
     # ------------------------------------------------------------------ #
     # Mantenimiento de current_version del blueprint                      #

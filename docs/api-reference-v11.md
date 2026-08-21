@@ -63,7 +63,12 @@ SQL: el frontend ya sabe pintarla.
 | `DROP` / `TRUNCATE` / `DELETE` sin `WHERE` | `kind` del clasificador, más la ausencia de cláusula para el `DELETE`. |
 | Referencias a la contabilidad interna (`_gw_*`) | `identifiers.references_gateway_internal_table`. |
 | Si un fallo a mitad podrá auto-reconciliarse | `migration_progress.is_resumable`. |
-| **Tablas referenciadas que no existen** | Solo con `managed_database_id`. |
+| **Tablas que el SQL necesita PREEXISTENTES y no existen** | Solo con `managed_database_id`. **Excluye las que la propia migración crea**: sin eso, un baseline —que es todo `CREATE TABLE`— reportaba cada una de sus tablas como ausente, y el aviso que justifica abrir conexión al motor era el que más ruido producía. |
+
+**El dialecto de análisis es siempre MySQL**, el de autoría del `up_sql`, y no el del destino.
+Parsear SQL de MySQL con la gramática de PostgreSQL no falla: sqlglot simplemente no reconoce
+las tablas, `missing_tables` sale vacío y la comprobación **dice que todo está bien sin haber
+comprobado nada**. El motor del destino solo decide contra qué catálogo se contrasta.
 
 **Lo que ningún análisis estático puede detectar** es justamente el error que motivó esto:
 un `ALTER TABLE` sobre una tabla inexistente es **sintácticamente impecable**. Por eso
@@ -84,6 +89,9 @@ existe `managed_database_id`.
   avisos falsos constantes, y un validador que grita en falso deja de leerse. Se pierde
   algún positivo raro; se evita el ruido que lo haría inútil.
 - **Alcance: tablas.** Columnas y tipos quedan fuera.
+- `pending_before` lista las versiones que esa BD tiene pendientes **antes** de la validada.
+  Si no está vacío, las tablas que ESAS versiones crean todavía no existen: lo que falla es la
+  premisa de la comprobación, no el SQL, y `missing_tables` hay que leerlo con eso delante.
 - Si el motor no es alcanzable, `catalog_error` lo dice y **el análisis estático se
   devuelve igual**: perder también lo que sí se pudo comprobar sin conexión sería peor.
 - Es 🔌: rate limit y `audit.record("migration.validate", …)`.
@@ -134,9 +142,11 @@ cero conexiones**: `managed_databases.model_version` es una copia que el gateway
 tras cada apply, `compute_pending` es una función pura y el estado parcial vive en la BD del
 gateway.
 
-`?refresh=true` 🔌 relee la versión REAL de cada BD y resincroniza la copia. Es la vía para
-corregir el dato si alguien migró una BD por fuera del gateway. Rate limit **10/min** y
-auditoría. **Una BD inalcanzable no rompe la tabla**: se conserva su valor cacheado y se
+El refresco vive en su propia acción: **`POST /api/v1/database-models/{model_id}/databases/refresh`**
+🔌, rate limit **10/min** y auditoría. Devuelve la lista ya actualizada. Va como `POST` y no
+como `?refresh=true` sobre el `GET` porque **tiene efectos** —abre conexiones y reescribe
+`model_version`—, y colgarlo del `GET` obligaba a limitar por tasa la lectura barata, que es el
+99 % de las llamadas y la que la UI repite al reenfocar la ventana. **Una BD inalcanzable no rompe la tabla**: se conserva su valor cacheado y se
 sigue — fallar todo porque un servidor de doce esté caído haría inútil la pantalla justo
 cuando más se necesita.
 

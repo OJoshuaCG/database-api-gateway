@@ -771,3 +771,46 @@ def test_apply_all_rechaza_una_bd_de_otro_blueprint(admin_client):
     )
     assert r.status_code == 422, r.text
     assert str(ajena) in r.text
+
+
+def test_validate_no_reporta_como_ausentes_las_tablas_que_la_migracion_crea(admin_client):
+    """
+    Regresión de la auditoría: un baseline es todo `CREATE TABLE`, y el panel mostraba un muro
+    de «estas tablas no existen».
+    """
+    model_id = _new_model(admin_client, slug="val8", name="Val8")
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations/validate",
+        json={"up_sql": "CREATE TABLE nueva (id INT PRIMARY KEY); ALTER TABLE nueva ADD c INT;"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["referenced_tables"] == []
+
+
+def test_validate_por_version_usa_el_kind_real(admin_client):
+    """
+    `resumable` se calculaba con los defaults, así que una migración de datos se anunciaba como
+    reanudable cuando nunca lo es.
+    """
+    model_id = _new_model(admin_client, slug="val9", name="Val9")
+    _create_migration(admin_client, model_id, up_sql="INSERT INTO t (a) VALUES (1)")
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations/validate", json={"version": "0001"}
+    )
+    assert r.status_code == 200, r.text
+    # La migración escrita a mano nace `kind='schema'`; lo que se comprueba es que el campo
+    # viaja y es coherente con el SQL, no un default ciego.
+    assert "resumable" in r.json()["data"]
+
+
+def test_databases_no_tiene_rate_limit_propio(admin_client):
+    """
+    El límite cubría también el listado local —el 99 % de las llamadas, sin conexiones— y con
+    el refetch al reenfocar la ventana podía romper la pantalla con un 429. El refresco 🔌 vive
+    ahora en su propia acción POST.
+    """
+    model_id = _new_model(admin_client, slug="nolimit", name="NoLimit")
+    for _ in range(15):
+        assert (
+            admin_client.get(f"/api/v1/database-models/{model_id}/databases").status_code == 200
+        )

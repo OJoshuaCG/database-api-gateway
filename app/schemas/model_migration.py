@@ -593,14 +593,19 @@ class MigrationValidateOut(BaseModel):
         ),
     )
     resumable: bool = True
-    referenced_tables: list[str] = Field(default_factory=list)
+    referenced_tables: list[str] = Field(
+        default_factory=list,
+        description="Tablas que el SQL necesita preexistentes (no las que él mismo crea).",
+    )
     checked_database: str | None = Field(
         None, description="BD contra la que se verificó la existencia de objetos, si se pidió."
     )
     missing_tables: list[str] = Field(
         default_factory=list,
         description=(
-            "Tablas referenciadas que NO existen en 'checked_database'. La comparación es "
+            "Tablas que el SQL necesita PREEXISTENTES y no existen en 'checked_database'. "
+            "Excluye las que la propia migración crea: sin eso, un baseline —que es todo "
+            "CREATE TABLE— reportaba cada una de sus tablas como ausente. La comparación es "
             "insensible a mayúsculas a propósito: MySQL sobre Linux distingue y PostgreSQL "
             "pliega a minúsculas, y un validador que grita en falso deja de leerse."
         ),
@@ -611,6 +616,15 @@ class MigrationValidateOut(BaseModel):
             "Por qué no se pudo leer el catálogo de 'checked_database' (motor caído, "
             "credencial inválida). El análisis estático se devuelve igual: perder también lo "
             "que sí se pudo comprobar sin conexión sería el peor desenlace."
+        ),
+    )
+    pending_before: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Versiones que la BD comprobada tiene pendientes ANTES de la validada. Si no está "
+            "vacío, las tablas que ESAS versiones crean todavía no existen: lo que falla es la "
+            "premisa de la comprobación, no el SQL, y 'missing_tables' hay que leerlo con eso "
+            "delante."
         ),
     )
     blueprint_collation: str | None = None
