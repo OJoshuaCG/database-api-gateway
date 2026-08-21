@@ -64,7 +64,7 @@ GET    /api/v1/database-models/{id}/migrations            # lista paginada (?pag
 POST   /api/v1/database-models/{id}/migrations            # crea una versión
 GET    /api/v1/database-models/{id}/migrations/{version}  # detalle (con translated + sugerencia)
 PATCH  /api/v1/database-models/{id}/migrations/{version}  # confirma down_sql / añade overrides / corrige up_sql (si no aplicada)
-DELETE /api/v1/database-models/{id}/migrations/{version}  # solo la ÚLTIMA versión y sin historial de aplicación
+DELETE /api/v1/database-models/{id}/migrations/{version}  # solo la ÚLTIMA versión, sin aplicación exitosa ni parcial
 ```
 
 ### Aplicación sobre una BD gestionada (tocan el motor)

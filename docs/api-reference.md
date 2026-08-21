@@ -1073,7 +1073,7 @@ toca ningún motor.** Requiere sesión.
 | `GET` | `/api/v1/database-models/{model_id}` | Detalle. |
 | `PATCH` | `/api/v1/database-models/{model_id}` | Actualiza. |
 | `DELETE` | `/api/v1/database-models/{model_id}` | Elimina. |
-| `GET` | `/api/v1/database-models/{model_id}/databases` | BDs que replican este blueprint. |
+| `GET` | `/api/v1/database-models/{model_id}/databases` | BDs que replican este blueprint, **con su estado de despliegue** (`pending_count`, `pending_versions`, `has_partial_application`). `?refresh=true` 🔌 relee la versión real de cada BD y resincroniza la copia del gateway (10/min). Ver `api-reference-v11.md` §4. |
 | `POST` | `/api/v1/database-models/from-snapshot` 🔌 | **(Plan 09)** Crea un blueprint cuyo baseline (`0001`) es el snapshot estructural de una BD existente. Rate limit **10/min**. Nace `is_baseline=true` y `reviewed=false` (ver el gate R1 más abajo). |
 
 ```bash
@@ -1138,8 +1138,20 @@ created_at }`.
 | `POST` | `/api/v1/database-models/{model_id}/migrations` | Crea una migración (`201`). **`version` es opcional**: si se omite, el gateway autoasigna la siguiente secuencial (max+1). Devuelve `translated` + `down_sql_suggested`. |
 | `GET` | `/api/v1/database-models/{model_id}/migrations/{version}` | Detalle completo. |
 | `PATCH` | `/api/v1/database-models/{model_id}/migrations/{version}` | Confirma `down_sql` / añade overrides / **aprueba un baseline de snapshot** (`reviewed: true`, gate R1). |
-| `DELETE` | `/api/v1/database-models/{model_id}/migrations/{version}` | Elimina — **solo la última versión** (la punta) y **solo si no** tiene historial de aplicación; si no, `409`. |
-| `POST` | `/api/v1/database-models/{model_id}/migrations/apply-all` 🔌 | Aplica a **todas** las BDs del blueprint. Rate limit **3/min**. |
+| `DELETE` | `/api/v1/database-models/{model_id}/migrations/{version}` | Elimina — **solo la última versión** (la punta), **solo si ninguna BD la aplicó con éxito** y **solo si no hay una aplicación parcial sin resolver**; si no, `409`. Un intento que solo **falló** ya **no** bloquea el borrado (antes sí, y como no existe purga de historial la versión quedaba imborrable para siempre): se descarta su historial y queda constancia en auditoría de qué BDs se vieron afectadas. Mismo criterio que el `PATCH` del SQL. |
+| `POST` | `/api/v1/database-models/{model_id}/migrations/apply-all` 🔌 | Aplica a las BDs del blueprint. Con `database_ids` se acota a **destinos concretos** (un id ajeno al blueprint → `422` con la lista); sin él, a todas hasta `max_databases`. Acepta `on_failure`. Rate limit **3/min**. |
+| `POST` | `/api/v1/database-models/{model_id}/migrations/validate` | Analiza el SQL **antes** de aplicarlo: parseo, traducción a PostgreSQL, siembra de datos, `COLLATE` forzados, sentencias destructivas y tablas internas del gateway. Con `managed_database_id` **🔌** comprueba además contra el catálogo de esa BD que las tablas referenciadas existan. Rate limit **20/min**. Ver `api-reference-v11.md`. |
+
+**Banderas de política (en `ModelMigrationSummary` y en `ModelMigrationOut`).** El gateway publica
+la **decisión** de sus propias reglas, no los insumos para recalcularlas: así el cliente puede
+bloquear un campo *antes* de que se escriba, en vez de rechazarlo al guardar, y no hay dos copias
+de la misma política que puedan desincronizarse.
+
+| Campo | Tipo | Significado |
+|---|---|---|
+| `sql_frozen` | bool | El SQL ya no se puede modificar: alguna BD la aplicó con éxito, o hay una aplicación parcial a medias. Es la misma condición que dispara el `409` del `PATCH`. |
+| `deletable` | bool | El `DELETE` pasaría hoy: es la punta, nadie la aplicó con éxito y no hay parcial sin resolver. |
+| `block_reason` | `"applied"` \| `"partial"` \| `"not_tip"` \| `null` | Por qué está restringida. **`not_tip` solo impide borrarla**: editarla sigue permitido. |
 
 **Crear una migración:**
 
