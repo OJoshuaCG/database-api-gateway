@@ -1631,6 +1631,7 @@ class ManagedMigrationController:
         model_id: int,
         *,
         max_databases: int,
+        database_ids: list[int] | None = None,
         force: bool = False,
         dry_run: bool = False,
         on_failure: str = "auto",
@@ -1645,6 +1646,17 @@ class ManagedMigrationController:
         cachea el ``ServerTarget`` por servidor (la credencial se descifra una vez por
         servidor, no por BD).
         """
+        # Mismo guard que ``apply``: el parámetro llega ahora desde la ruta (antes se
+        # aceptaba en la firma pero la ruta no lo exponía, así que siempre valía "auto" y el
+        # selector del frontend no hacía nada). Se valida contra la MISMA tupla para que los
+        # dos caminos no puedan divergir.
+        if on_failure not in self._ON_FAILURE_MODES:
+            raise AppHttpException(
+                message="'on_failure' invalido.",
+                status_code=422,
+                context={"on_failure": on_failure, "allowed": list(self._ON_FAILURE_MODES)},
+            )
+
         session = self._session()
         try:
             model = session.get(DatabaseModel, model_id)
@@ -1666,16 +1678,37 @@ class ManagedMigrationController:
                 .filter(ManagedDatabase.model_id == model_id)
                 .count()
             )
-            db_rows = (
-                session.query(
-                    ManagedDatabase.id, ManagedDatabase.name,
-                    ManagedDatabase.server_id, ManagedDatabase.status,
-                )
-                .filter(ManagedDatabase.model_id == model_id)
-                .order_by(ManagedDatabase.id.asc())
-                .limit(max_databases)
-                .all()
-            )
+            scoped = session.query(
+                ManagedDatabase.id, ManagedDatabase.name,
+                ManagedDatabase.server_id, ManagedDatabase.status,
+            ).filter(ManagedDatabase.model_id == model_id)
+            if database_ids:
+                # Los ids que NO pertenecen al blueprint se rechazan explícitamente en vez de
+                # dejar que el `IN` los ignore en silencio. No es cosmética: es la frontera
+                # que impide aplicar las migraciones de un blueprint a una BD ajena pasando
+                # su id, y el resto del gateway es fail-closed en todas partes.
+                valid = {
+                    r[0]
+                    for r in session.query(ManagedDatabase.id)
+                    .filter(
+                        ManagedDatabase.model_id == model_id,
+                        ManagedDatabase.id.in_(database_ids),
+                    )
+                    .all()
+                }
+                unknown = sorted(set(database_ids) - valid)
+                if unknown:
+                    raise AppHttpException(
+                        message=(
+                            "Hay BDs que no pertenecen a este blueprint: "
+                            f"{', '.join(str(i) for i in unknown)}."
+                        ),
+                        status_code=422,
+                        context={"model_id": model_id, "unknown_database_ids": unknown},
+                        public_context={"unknown_database_ids": unknown},
+                    )
+                scoped = scoped.filter(ManagedDatabase.id.in_(database_ids))
+            db_rows = scoped.order_by(ManagedDatabase.id.asc()).limit(max_databases).all()
             dbs = [(r.id, r.name, r.server_id, r.status) for r in db_rows]
             # ServerTarget + engine por servidor distinto (descifra credencial 1×/servidor).
             targets: dict[int, tuple] = {}
@@ -1730,6 +1763,12 @@ class ManagedMigrationController:
                     )
                     item["ok"] = not out["failed"]
                     item["applied"] = out["results"]
+                    # Paridad con el apply por BD: sin esto, tras un apply masivo no había
+                    # forma de saber en qué BDs quedaron capturas ni cómo llegar a ellas.
+                    item["captured_select_count"] = out.get("captured_select_count", 0)
+                    item["select_results_available"] = out.get(
+                        "select_results_available", False
+                    )
             except AppHttpException as exc:
                 item["error"] = exc.message
             except Exception as exc:  # noqa: BLE001 — una BD no debe abortar el lote

@@ -236,6 +236,70 @@ def incomplete_progress_for_migration(
         session.close()
 
 
+def migrations_with_incomplete_progress(
+    model_migration_ids: list[int], direction: str = "up"
+) -> set[int]:
+    """
+    De un LOTE de migraciones, cuáles tienen progreso incompleto en alguna BD.
+
+    Variante en lote de ``incomplete_progress_for_migration``, para poder serializar una
+    página entera de migraciones con sus banderas de política (``sql_frozen`` /
+    ``deletable``) en UNA query en vez de una por fila. Solo devuelve los ids: el detalle
+    por BD se pide aparte cuando hace falta explicar el 409.
+    """
+    if not model_migration_ids:
+        return set()
+    session = _session()
+    try:
+        rows = (
+            session.query(
+                MigrationStatementProgress.model_migration_id,
+                MigrationStatementProgress.last_statement_index,
+                MigrationStatementProgress.total_statements,
+            )
+            .filter(
+                MigrationStatementProgress.model_migration_id.in_(model_migration_ids),
+                MigrationStatementProgress.direction == direction,
+            )
+            .all()
+        )
+        # El filtro "0 < last < total" se hace en Python igual que en las otras funciones del
+        # módulo: es la misma condición y así no se duplica en dos dialectos.
+        return {r[0] for r in rows if 0 < r[1] < r[2]}
+    finally:
+        session.close()
+
+
+def databases_with_incomplete_progress(
+    managed_database_ids: list[int], direction: str = "up"
+) -> set[int]:
+    """
+    De un LOTE de BDs, cuáles tienen una aplicación parcial sin resolver.
+
+    Gemela de ``migrations_with_incomplete_progress`` pero por BD: permite pintar la columna
+    "parcial" de la tabla de estado de un blueprint con UNA query, en vez de una por fila.
+    """
+    if not managed_database_ids:
+        return set()
+    session = _session()
+    try:
+        rows = (
+            session.query(
+                MigrationStatementProgress.managed_database_id,
+                MigrationStatementProgress.last_statement_index,
+                MigrationStatementProgress.total_statements,
+            )
+            .filter(
+                MigrationStatementProgress.managed_database_id.in_(managed_database_ids),
+                MigrationStatementProgress.direction == direction,
+            )
+            .all()
+        )
+        return {r[0] for r in rows if 0 < r[1] < r[2]}
+    finally:
+        session.close()
+
+
 def incomplete_progress_for_database(
     managed_database_id: int, direction: str = "up"
 ) -> list[dict]:

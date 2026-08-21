@@ -27,14 +27,17 @@ from app.core.environments import (
     SNAPSHOT_DATA_MAX_TABLES,
     SNAPSHOT_MAX_SQL_PER_VERSION,
 )
+from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.exceptions import AppHttpException
 from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
+from app.models.managed_database import ManagedDatabase
 from app.models.enums import EngineType, MigrationStatus
 from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
 from app.services import audit
-from app.services.db_admin import migration_progress, migration_results
+from app.services.db_admin import migration_facts, migration_progress, migration_results
+from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import references_gateway_internal_table
 from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
 from app.services.db_admin.sql_dialect import RollbackGenerator, SqlTranslator
@@ -83,8 +86,15 @@ class ModelMigrationController:
                 out["postgresql"] = pg
         return out
 
-    def _serialize(self, m: ModelMigration) -> dict:
+    def _serialize(self, m: ModelMigration, policy: dict) -> dict:
+        """
+        ``policy`` son las banderas de ``_policy_flags``. Es un parámetro OBLIGATORIO a
+        propósito: con un default, un PATCH de solo el nombre sobre una versión congelada
+        respondería ``sql_frozen: false`` y la UI la creería editable — exactamente el fallo
+        que estos campos vienen a eliminar. Si falta, el error salta en el serializador.
+        """
         return {
+            **policy,
             "id": m.id,
             "model_id": m.model_id,
             "version": m.version,
@@ -102,13 +112,15 @@ class ModelMigrationController:
             "has_non_portable": m.has_non_portable,
             "reviewed": m.reviewed,
             "capture_selects": m.capture_selects,
+            **self._sql_facts(m),
             "created_at": m.created_at,
             "updated_at": m.updated_at,
         }
 
     @staticmethod
-    def _serialize_summary(m: ModelMigration) -> dict:
+    def _serialize_summary(m: ModelMigration, policy: dict) -> dict:
         return {
+            **policy,
             "id": m.id,
             "model_id": m.model_id,
             "version": m.version,
@@ -121,7 +133,30 @@ class ModelMigrationController:
             "is_baseline": m.is_baseline,
             "reviewed": m.reviewed,
             "capture_selects": m.capture_selects,
+            **ModelMigrationController._sql_facts(m),
             "created_at": m.created_at,
+        }
+
+    @staticmethod
+    def _sql_facts(m: ModelMigration) -> dict:
+        """
+        Hechos derivados del SQL para las insignias: siembra, COLLATE forzado, destructiva.
+
+        Usa ``quick_facts`` (regex sobre el SQL enmascarado), NO el análisis con AST: esto se
+        calcula por cada fila de cada página de versiones, y parsear hasta 256 KB por fila para
+        decidir si se dibuja una plantita no se sostiene. El veredicto fino lo da el endpoint
+        de validación cuando el usuario lo pide.
+
+        No se persiste en columnas a propósito: haría falta recalcular en los dos puntos de
+        escritura más un backfill, y la alternativa "calcular al leer y guardar" sería escribir
+        dentro de un GET. La memoización por SQL —que es inmutable salvo PATCH, y el PATCH
+        recalcula el checksum— da el mismo efecto sin tocar el esquema.
+        """
+        facts = migration_facts.quick_facts(m.up_sql)
+        return {
+            "has_seed": facts.has_seed,
+            "forced_collations": list(facts.forced_collations),
+            "destructive": facts.destructive,
         }
 
     # ------------------------------------------------------------------ #
@@ -157,22 +192,112 @@ class ModelMigrationController:
         return m
 
     @staticmethod
-    def _has_history(session, migration_id: int) -> bool:
-        return (
-            session.query(DatabaseMigrationHistory)
-            .filter(DatabaseMigrationHistory.model_migration_id == migration_id)
+    def _policy_flags(
+        session, migrations: list[ModelMigration], *, latest_version: str | None
+    ) -> dict[int, dict]:
+        """
+        Banderas de política por migración: ``sql_frozen``, ``deletable`` y ``block_reason``.
+
+        Se devuelve la DECISIÓN, no sus insumos (conteos de historial). Si el cliente
+        recibiera "cuántas BDs la aplicaron" y dedujera la regla por su cuenta, tendríamos la
+        misma política escrita a los dos lados del contrato: el día que se afine aquí, la UI
+        seguiría con el criterio viejo y volvería el problema que esto viene a resolver —
+        descubrir al guardar que la operación no estaba permitida.
+
+        Son las mismas condiciones que evalúan ``update_migration`` y ``delete_migration``:
+          - ``sql_frozen``: alguna BD ya depende del SQL (aplicación exitosa) o hay una
+            aplicación parcial a medias, que haría que un resume interpretara los índices del
+            checkpoint contra un SQL distinto del que corrió.
+          - ``deletable``: lo anterior, y además ser la punta de la secuencia.
+
+        Dos queries en lote para toda la página (nada de N+1). No se usa ``func.count(...)
+        .filter(...)``: ``FILTER`` es exclusivo de PostgreSQL y la BD de metadatos puede ser
+        MySQL/MariaDB, además de SQLite en los tests.
+        """
+        ids = [m.id for m in migrations]
+        if not ids:
+            return {}
+        applied_ids = {
+            row[0]
+            for row in session.query(DatabaseMigrationHistory.model_migration_id)
+            .filter(
+                DatabaseMigrationHistory.model_migration_id.in_(ids),
+                DatabaseMigrationHistory.status == MigrationStatus.applied,
+            )
+            .distinct()
+            .all()
+        }
+        partial_ids = migration_progress.migrations_with_incomplete_progress(ids, "up")
+
+        flags: dict[int, dict] = {}
+        for m in migrations:
+            applied = m.id in applied_ids
+            partial = m.id in partial_ids
+            is_tip = latest_version is None or m.version == latest_version
+            if applied:
+                reason = "applied"
+            elif partial:
+                reason = "partial"
+            elif not is_tip:
+                reason = "not_tip"
+            else:
+                reason = None
+            flags[m.id] = {
+                "sql_frozen": applied or partial,
+                "deletable": reason is None,
+                # 'not_tip' solo afecta al borrado: esa versión sí se puede editar.
+                "block_reason": reason,
+            }
+        return flags
+
+    def _policy_for(self, session, m: ModelMigration) -> dict:
+        """Banderas de política de UNA migración (atajo sobre ``_policy_flags``)."""
+        latest = self._latest_version(session, m.model_id)
+        return self._policy_flags(session, [m], latest_version=latest)[m.id]
+
+    @staticmethod
+    def _latest_version(session, model_id: int) -> str | None:
+        """Versión punta del blueprint (orden numérico), para la bandera ``deletable``."""
+        row = (
+            session.query(ModelMigration.version)
+            .filter(ModelMigration.model_id == model_id)
+            .order_by(*_VERSION_ORDER_DESC)
             .first()
-            is not None
         )
+        return row[0] if row else None
+
+    @staticmethod
+    def _failed_attempt_targets(session, migration_id: int) -> list[int]:
+        """
+        BDs distintas donde esta migración se intentó y FALLÓ (sin ninguna aplicación exitosa).
+
+        Se usa para dejar constancia en auditoría de lo que el borrado va a descartar: al
+        eliminar la migración, el ``ondelete="CASCADE"`` se lleva sus filas de
+        ``database_migration_history``, que son el único registro estructurado de que esta
+        versión rompió en esas BDs. La entrada de auditoría sobrevive al borrado; el historial no.
+        """
+        rows = (
+            session.query(DatabaseMigrationHistory.managed_database_id)
+            .filter(
+                DatabaseMigrationHistory.model_migration_id == migration_id,
+                DatabaseMigrationHistory.status == MigrationStatus.failed,
+            )
+            .distinct()
+            .all()
+        )
+        return sorted(r[0] for r in rows)
 
     @staticmethod
     def _has_successful_application(session, migration_id: int) -> bool:
         """
         True si la migración se aplicó EXITOSAMENTE en al menos una BD (status=applied).
 
-        Distinto de ``_has_history``: un intento que solo FALLÓ deja historial pero no
-        cambió ninguna BD, así que su SQL todavía puede corregirse. El SQL solo se
-        congela cuando existe una aplicación exitosa (alguna BD ya depende de él).
+        Se filtra por ``applied`` y no por "tiene historial": un intento que solo FALLÓ deja
+        fila en ``database_migration_history`` pero no cambió ninguna BD, así que su SQL
+        todavía puede corregirse y la versión todavía puede borrarse. Lo que congela una
+        versión es que alguna BD ya dependa de ella, no que se haya intentado aplicar.
+
+        Es el predicado que gobierna tanto el 409 de edición del SQL como el de borrado.
         """
         return (
             session.query(DatabaseMigrationHistory)
@@ -196,7 +321,12 @@ class ModelMigrationController:
             q = session.query(ModelMigration).filter(ModelMigration.model_id == model_id)
             total = q.count()
             rows = q.order_by(*_VERSION_ORDER_ASC).limit(limit).offset(offset).all()
-            return [self._serialize_summary(r) for r in rows], total
+            # La punta se busca sobre TODAS las versiones, no sobre la página: con paginación,
+            # la última fila de la página no tiene por qué ser la última del blueprint.
+            flags = self._policy_flags(
+                session, rows, latest_version=self._latest_version(session, model_id)
+            )
+            return [self._serialize_summary(r, flags[r.id]) for r in rows], total
         finally:
             session.close()
 
@@ -204,7 +334,8 @@ class ModelMigrationController:
         session = self._session()
         try:
             self._model_or_404(session, model_id)
-            return self._serialize(self._migration_or_404(session, model_id, version))
+            m = self._migration_or_404(session, model_id, version)
+            return self._serialize(m, self._policy_for(session, m))
         finally:
             session.close()
 
@@ -329,7 +460,7 @@ class ModelMigrationController:
                 ) from last_exc
 
             session.refresh(migration)
-            result = self._serialize(migration)
+            result = self._serialize(migration, self._policy_for(session, migration))
             migration_id = migration.id
             assigned_version = migration.version
         finally:
@@ -889,7 +1020,7 @@ class ModelMigrationController:
             )
             session.commit()
             session.refresh(m)
-            result = self._serialize(m)
+            result = self._serialize(m, self._policy_for(session, m))
         finally:
             session.close()
         audit.record(
@@ -929,15 +1060,48 @@ class ModelMigrationController:
         try:
             self._model_or_404(session, model_id)
             m = self._migration_or_404(session, model_id, version)
-            if self._has_history(session, m.id):
+            # Mismo criterio que `update_migration`: lo que congela una versión es que
+            # ALGUNA BD ya dependa de ella, no que se haya intentado aplicar. Antes se usaba
+            # `_has_history`, que cuenta también los intentos fallidos: una versión que
+            # reventó en la primera sentencia (sin tocar ninguna BD) quedaba imborrable para
+            # siempre, porque no existe purga de historial. La única salida era editarla y
+            # dejarla inerte con un `SELECT ''`.
+            if self._has_successful_application(session, m.id):
                 raise AppHttpException(
                     message=(
-                        "No se puede eliminar una migración con historial de aplicación. "
-                        "Revierta y/o cree una migración compensatoria."
+                        "No se puede eliminar una migración ya aplicada con éxito en alguna "
+                        "BD. Revierta y/o cree una migración compensatoria."
                     ),
                     status_code=409,
                     context={"model_id": model_id, "version": version},
                 )
+            # Un intento fallido puede haber dejado sentencias commiteadas a medias. El
+            # checkpoint es la única evidencia de cuáles, y el CASCADE se lo llevaría en
+            # silencio: sin él, esa BD queda sucia y sin forma de reconciliarla. Es la misma
+            # barrera que `update_migration` ya impone antes de tocar el SQL.
+            incomplete = migration_progress.incomplete_progress_for_migration(
+                m.id, direction="up"
+            )
+            if incomplete:
+                detail = ", ".join(
+                    f"BD {row['managed_database_id']} "
+                    f"({row['last_statement_index']}/{row['total_statements']} sentencias)"
+                    for row in incomplete
+                )
+                raise AppHttpException(
+                    message=(
+                        "No se puede eliminar: hay una aplicación PARCIAL de esta versión "
+                        f"sin resolver ({detail}). Reconcilie esa BD "
+                        "('reconcile-partial') o complete el 'apply' antes de eliminarla."
+                    ),
+                    status_code=409,
+                    context={
+                        "model_id": model_id,
+                        "version": version,
+                        "incomplete_progress": incomplete,
+                    },
+                )
+            discarded = self._failed_attempt_targets(session, m.id)
             # Solo se puede eliminar la ÚLTIMA versión (la punta de la secuencia). Borrar
             # una intermedia dejaría un hueco y una versión posterior podría depender de
             # ella (forward-only encadenado). Para tocar una intermedia: edita, o revierte
@@ -964,13 +1128,150 @@ class ModelMigrationController:
             session.commit()  # borrado + current_version en un único commit
         finally:
             session.close()
+        # El detalle lleva las BDs afectadas porque el CASCADE ya borró sus filas de
+        # historial: esta entrada es lo único que queda de que la versión falló ahí.
+        detail = f"migración {version} eliminada"
+        if discarded:
+            detail += (
+                f" (descartadas {len(discarded)} tentativa(s) fallida(s) en BDs "
+                f"{', '.join(str(db_id) for db_id in discarded)})"
+            )
         audit.record(
             "migration.delete",
             admin=admin,
             target_type="database_model",
             target_id=model_id,
-            detail=f"migración {version} eliminada",
+            detail=detail,
         )
+
+    # ------------------------------------------------------------------ #
+    # Validación estática del SQL (sin aplicar)                           #
+    # ------------------------------------------------------------------ #
+    def validate_migration(self, model_id: int, data: dict, *, admin: dict | None = None) -> dict:
+        """
+        Analiza el SQL de una migración ANTES de aplicarla.
+
+        Existe porque hasta ahora la única forma de saber si un delta era válido era
+        aplicarlo: el 422 de traducción solo salta en un apply contra PostgreSQL, y un
+        error de sintaxis no salta hasta que el motor lo rechaza, con la BD ya en
+        cuarentena.
+
+        Dos niveles. El estático es puro y no toca ningún motor. Con
+        ``managed_database_id`` se añade el que de verdad importa: comprobar contra el
+        catálogo que las tablas referenciadas existen — un ``ALTER TABLE`` sobre una tabla
+        inexistente es sintácticamente impecable y NINGÚN análisis estático lo detecta.
+        """
+        session = self._session()
+        try:
+            model = self._model_or_404(session, model_id)
+            up_sql = data.get("up_sql")
+            version = data.get("version")
+            if not up_sql and version:
+                up_sql = self._migration_or_404(session, model_id, version).up_sql
+            if not up_sql:
+                raise AppHttpException(
+                    message="Indica 'up_sql' (borrador) o 'version' (una ya guardada).",
+                    status_code=422,
+                    context={"model_id": model_id},
+                )
+
+            target = None
+            db_name = None
+            engine = EngineType.mysql
+            db_id = data.get("managed_database_id")
+            if db_id is not None:
+                md = session.get(ManagedDatabase, db_id)
+                # Frontera de autorización, no cosmética: sin esta comprobación se podría
+                # sondear el catálogo de CUALQUIER BD del gateway pasando su id a un
+                # blueprint que no la contiene.
+                if md is None or md.model_id != model_id:
+                    raise AppHttpException(
+                        message="La BD indicada no pertenece a este blueprint.",
+                        status_code=422,
+                        context={"model_id": model_id, "managed_database_id": db_id},
+                    )
+                server = get_server_or_404(session, md.server_id)
+                target = build_target(server)
+                engine = EngineType(engine_value(server))
+                db_name = md.name
+
+            blueprint_collation = model.collation
+        finally:
+            session.close()
+
+        facts = migration_facts.analyze(up_sql, engine.value)
+
+        missing: list[str] = []
+        catalog_error: str | None = None
+        if target is not None and db_name and facts.referenced_tables:
+            # Una sola llamada trae el catálogo entero; comparar contra un set en memoria
+            # evita una consulta por tabla. La comparación es INSENSIBLE a mayúsculas a
+            # propósito: MySQL sobre Linux distingue y PostgreSQL pliega a minúsculas, así
+            # que ser estricto produciría avisos falsos constantes — y un validador que
+            # grita en falso deja de leerse, que es peor que no tenerlo.
+            try:
+                existing = {t.lower() for t in get_adapter(target).list_tables(db_name)}
+                missing = [t for t in facts.referenced_tables if t.lower() not in existing]
+            except AppHttpException as exc:
+                # Motor inalcanzable o credencial inválida: se reporta y se devuelve igual el
+                # análisis estático. Tumbar toda la validación por no poder leer el catálogo
+                # sería el peor desenlace — el usuario perdería también lo que SÍ se pudo
+                # comprobar sin conexión.
+                catalog_error = exc.message
+            audit.record(
+                "migration.validate",
+                admin=admin,
+                target_type="managed_database",
+                target_id=db_id,
+                detail=(
+                    f"validación de SQL contra {db_name}: "
+                    + (
+                        f"catálogo no consultable ({catalog_error})"
+                        if catalog_error
+                        else f"{len(missing)} tabla(s) referenciada(s) inexistente(s)"
+                    )
+                ),
+            )
+
+        # Solo se comparan collations si el blueprint declaró uno. Y solo tiene sentido en
+        # la familia MySQL: PostgreSQL usa encoding + lc_collate, que no son equivalentes.
+        conflicts: list[str] = []
+        if blueprint_collation and engine != EngineType.postgresql:
+            conflicts = [
+                c for c in facts.forced_collations
+                if c.lower() != blueprint_collation.lower()
+            ]
+
+        return {
+            "statements": [
+                {
+                    "seq": f.seq,
+                    "sql": f.sql,
+                    "kind": f.kind,
+                    "danger": f.danger,
+                    "reasons": [{"code": r.code, "message": r.message} for r in f.reasons],
+                    "seeds": f.seeds,
+                    "destructive": f.destructive,
+                    "collations": list(f.collations),
+                    "parse_error": f.parse_error,
+                }
+                for f in facts.statements
+            ],
+            "has_seed": facts.has_seed,
+            "forced_collations": list(facts.forced_collations),
+            "forced_charsets": list(facts.forced_charsets),
+            "destructive_statements": list(facts.destructive_statements),
+            "parse_errors": [{"seq": seq, "message": msg} for seq, msg in facts.parse_errors],
+            "gateway_internal_tables": list(facts.gateway_internal_tables),
+            "postgresql_blockers": list(facts.postgresql_blockers),
+            "resumable": facts.resumable,
+            "referenced_tables": list(facts.referenced_tables),
+            "checked_database": db_name,
+            "missing_tables": missing,
+            "catalog_error": catalog_error,
+            "blueprint_collation": blueprint_collation,
+            "collation_conflicts": conflicts,
+        }
 
     # ------------------------------------------------------------------ #
     # Mantenimiento de current_version del blueprint                      #

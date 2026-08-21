@@ -269,8 +269,8 @@ def _managed_db_for_model(admin_client, model_id, port, name="mdb"):
     return r.json()["data"]["id"]
 
 
-def test_delete_migration_with_history_409(admin_client):
-    """Borrar una migración con historial de aplicación (cualquier desenlace) → 409."""
+def test_delete_migration_applied_successfully_409(admin_client):
+    """Borrar una migración ya aplicada CON ÉXITO en alguna BD → 409 (alguna BD depende de ella)."""
     model_id = _new_model(admin_client, slug="delhist", name="DelHist")
     r = _create_migration(admin_client, model_id)
     mig_id = r.json()["data"]["id"]
@@ -279,9 +279,55 @@ def test_delete_migration_with_history_409(admin_client):
 
     r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0001")
     assert r.status_code == 409, r.text
-    assert "historial" in r.text.lower()
+    assert "aplicada con éxito" in r.text.lower()
 
     # Sigue existiendo.
+    assert admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations/0001"
+    ).status_code == 200
+
+
+def test_delete_migration_allowed_when_history_is_only_failed(admin_client):
+    """
+    Mismo criterio que la EDICIÓN: lo que congela una versión es que alguna BD dependa de
+    ella, no que se haya intentado aplicar.
+
+    Antes, el guard miraba "¿tiene alguna fila de historial?" y una versión que reventó en
+    la primera sentencia —sin tocar ninguna BD— quedaba imborrable para siempre, porque no
+    existe purga de historial. La única salida era editarla y dejarla inerte.
+    """
+    model_id = _new_model(admin_client, slug="delfail", name="DelFail")
+    r = _create_migration(admin_client, model_id)
+    mig_id = r.json()["data"]["id"]
+    db_id = _managed_db_for_model(admin_client, model_id, port=5481)
+    _insert_history_row(db_id, mig_id, status="failed")
+
+    r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0001")
+    assert r.status_code == 200, r.text
+    assert admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations/0001"
+    ).status_code == 404
+
+
+def test_delete_migration_blocked_by_partial_application_409(admin_client):
+    """
+    Un intento fallido puede haber dejado sentencias commiteadas a medias. El checkpoint es
+    la única evidencia de cuáles, y el CASCADE se lo llevaría en silencio: sin ese guard, la
+    BD queda sucia y sin forma de reconciliarla.
+    """
+    from app.services.db_admin import migration_progress
+
+    model_id = _new_model(admin_client, slug="delpartial", name="DelPartial")
+    r = _create_migration(admin_client, model_id)
+    mig = r.json()["data"]
+    db_id = _managed_db_for_model(admin_client, model_id, port=5482)
+    _insert_history_row(db_id, mig["id"], status="failed")
+    # 2 de 5 sentencias commitearon: progreso INCOMPLETO.
+    migration_progress.record_statement(db_id, mig["id"], "up", 2, 5, mig["checksum"])
+
+    r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0001")
+    assert r.status_code == 409, r.text
+    assert "parcial" in r.text.lower()
     assert admin_client.get(
         f"/api/v1/database-models/{model_id}/migrations/0001"
     ).status_code == 200
@@ -451,3 +497,277 @@ def test_sin_captura_el_cambio_de_sql_no_toca_reviewed(admin_client):
     )
     assert r.status_code == 200, r.text
     assert r.json()["data"]["reviewed"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Banderas de política: sql_frozen / deletable / block_reason                  #
+# --------------------------------------------------------------------------- #
+def test_policy_flags_version_limpia(admin_client):
+    """Una versión recién creada (y punta) es editable y borrable."""
+    model_id = _new_model(admin_client, slug="pol1", name="Pol1")
+    _create_migration(admin_client, model_id)
+
+    d = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0001").json()["data"]
+    assert (d["sql_frozen"], d["deletable"], d["block_reason"]) == (False, True, None)
+
+    item = admin_client.get(f"/api/v1/database-models/{model_id}/migrations").json()["data"][0]
+    assert (item["sql_frozen"], item["deletable"], item["block_reason"]) == (False, True, None)
+
+
+def test_policy_flags_aplicada_congela_el_sql(admin_client):
+    model_id = _new_model(admin_client, slug="pol2", name="Pol2")
+    mig_id = _create_migration(admin_client, model_id).json()["data"]["id"]
+    db_id = _managed_db_for_model(admin_client, model_id, port=5490)
+    _insert_history_row(db_id, mig_id, status="applied")
+
+    d = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0001").json()["data"]
+    assert d["sql_frozen"] is True
+    assert d["deletable"] is False
+    assert d["block_reason"] == "applied"
+
+
+def test_policy_flags_solo_fallida_sigue_editable_y_borrable(admin_client):
+    """El caso del incidente: falló en todas las BDs, pero nada depende de ella."""
+    model_id = _new_model(admin_client, slug="pol3", name="Pol3")
+    mig_id = _create_migration(admin_client, model_id).json()["data"]["id"]
+    db_id = _managed_db_for_model(admin_client, model_id, port=5491)
+    _insert_history_row(db_id, mig_id, status="failed")
+
+    d = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0001").json()["data"]
+    assert (d["sql_frozen"], d["deletable"], d["block_reason"]) == (False, True, None)
+
+
+def test_policy_flags_no_punta_bloquea_borrado_pero_no_edicion(admin_client):
+    """`not_tip` es la única razón que NO congela el SQL."""
+    model_id = _new_model(admin_client, slug="pol4", name="Pol4")
+    _create_migration(admin_client, model_id, version="0001")
+    _create_migration(
+        admin_client, model_id, version="0002",
+        up_sql="ALTER TABLE users ADD COLUMN phone VARCHAR(20)",
+    )
+
+    items = admin_client.get(f"/api/v1/database-models/{model_id}/migrations").json()["data"]
+    first, tip = items[0], items[1]
+    assert (first["sql_frozen"], first["deletable"], first["block_reason"]) == (
+        False, False, "not_tip",
+    )
+    assert (tip["sql_frozen"], tip["deletable"], tip["block_reason"]) == (False, True, None)
+
+
+def test_policy_flags_aplicacion_parcial_congela_y_bloquea(admin_client):
+    from app.services.db_admin import migration_progress
+
+    model_id = _new_model(admin_client, slug="pol5", name="Pol5")
+    mig = _create_migration(admin_client, model_id).json()["data"]
+    db_id = _managed_db_for_model(admin_client, model_id, port=5492)
+    migration_progress.record_statement(db_id, mig["id"], "up", 2, 5, mig["checksum"])
+
+    d = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0001").json()["data"]
+    assert d["sql_frozen"] is True
+    assert d["deletable"] is False
+    assert d["block_reason"] == "partial"
+
+
+def test_policy_flags_patch_de_solo_nombre_no_miente(admin_client):
+    """
+    Regresión del diseño: si el serializador pudiera omitir las banderas, un PATCH de solo el
+    nombre sobre una versión congelada respondería `sql_frozen: false` y la UI la creería
+    editable — justo el fallo que estos campos vienen a eliminar.
+    """
+    model_id = _new_model(admin_client, slug="pol6", name="Pol6")
+    mig_id = _create_migration(admin_client, model_id).json()["data"]["id"]
+    db_id = _managed_db_for_model(admin_client, model_id, port=5493)
+    _insert_history_row(db_id, mig_id, status="applied")
+
+    r = admin_client.patch(
+        f"/api/v1/database-models/{model_id}/migrations/0001", json={"name": "otro nombre"}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["sql_frozen"] is True
+
+
+# --------------------------------------------------------------------------- #
+# apply-all: on_failure                                                        #
+# --------------------------------------------------------------------------- #
+def test_apply_all_valida_on_failure(admin_client):
+    """
+    Regresión: la ruta de `apply-all` NO exponía `on_failure`, así que el controlador
+    recibía siempre el default "auto" y el selector del frontend no hacía nada. Ahora el
+    parámetro llega y se valida contra la MISMA lista que el apply por BD.
+    """
+    model_id = _new_model(admin_client, slug="onfail", name="OnFail")
+    _create_migration(admin_client, model_id)
+
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations/apply-all",
+        params={"dry_run": True, "on_failure": "no-existe"},
+    )
+    assert r.status_code == 422, r.text
+    assert "on_failure" in r.text
+
+    # Los tres modos válidos pasan el guard (sin BDs asociadas el resultado es vacío).
+    for mode in ("auto", "reconcile", "leave"):
+        r = admin_client.post(
+            f"/api/v1/database-models/{model_id}/migrations/apply-all",
+            params={"dry_run": True, "on_failure": mode},
+        )
+        assert r.status_code != 422, f"{mode}: {r.text}"
+
+
+# --------------------------------------------------------------------------- #
+# Validación estática del SQL                                                  #
+# --------------------------------------------------------------------------- #
+def test_validate_detecta_sql_roto(admin_client):
+    model_id = _new_model(admin_client, slug="val1", name="Val1")
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations/validate",
+        json={"up_sql": "CREATE TABLE ((("},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["parse_errors"], data
+    assert data["parse_errors"][0]["message"]
+
+
+def test_validate_marca_siembra_y_collate(admin_client):
+    model_id = _new_model(admin_client, slug="val2", name="Val2")
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations/validate",
+        json={
+            "up_sql": (
+                "ALTER TABLE t MODIFY c VARCHAR(10) COLLATE utf8mb4_bin; "
+                "INSERT INTO t (c) VALUES ('x');"
+            )
+        },
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["has_seed"] is True
+    assert data["forced_collations"] == ["utf8mb4_bin"]
+
+
+def test_validate_acepta_una_version_ya_guardada(admin_client):
+    model_id = _new_model(admin_client, slug="val3", name="Val3")
+    _create_migration(admin_client, model_id)
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations/validate",
+        json={"version": "0001"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["statements"]
+
+
+def test_validate_sin_sql_ni_version_422(admin_client):
+    model_id = _new_model(admin_client, slug="val4", name="Val4")
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations/validate", json={}
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_validate_rechaza_una_bd_de_otro_blueprint(admin_client, server_payload):
+    """
+    Frontera de autorización, no cosmética: sin esta comprobación se podría sondear el
+    catálogo de CUALQUIER BD del gateway pasando su id a un blueprint que no la contiene.
+    """
+    otro = _new_model(admin_client, slug="val5-otro", name="Val5Otro")
+    db_id = _managed_db_for_model(admin_client, otro, port=5494)
+    objetivo = _new_model(admin_client, slug="val5", name="Val5")
+
+    r = admin_client.post(
+        f"/api/v1/database-models/{objetivo}/migrations/validate",
+        json={"up_sql": "SELECT 1", "managed_database_id": db_id},
+    )
+    assert r.status_code == 422, r.text
+    assert "no pertenece" in r.text.lower()
+
+
+def test_validate_avisa_del_collate_que_difiere_del_blueprint(admin_client):
+    r = admin_client.post(
+        "/api/v1/database-models",
+        json={
+            "name": "Val6", "slug": "val6",
+            "charset": "utf8mb4", "collation": "utf8mb4_unicode_ci",
+        },
+    )
+    assert r.status_code == 201, r.text
+    model_id = r.json()["data"]["id"]
+    assert r.json()["data"]["collation"] == "utf8mb4_unicode_ci"
+
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations/validate",
+        json={"up_sql": "ALTER TABLE t MODIFY c VARCHAR(10) COLLATE utf8mb4_bin"},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["blueprint_collation"] == "utf8mb4_unicode_ci"
+    assert data["collation_conflicts"] == ["utf8mb4_bin"]
+
+
+def test_validate_no_marca_conflicto_si_coincide(admin_client):
+    r = admin_client.post(
+        "/api/v1/database-models",
+        json={"name": "Val7", "slug": "val7", "collation": "utf8mb4_bin"},
+    )
+    model_id = r.json()["data"]["id"]
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations/validate",
+        json={"up_sql": "ALTER TABLE t MODIFY c VARCHAR(10) COLLATE UTF8MB4_BIN"},
+    )
+    # La comparación es insensible a mayúsculas: los collations no distinguen caja.
+    assert r.json()["data"]["collation_conflicts"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Estado por BD y destinos concretos                                           #
+# --------------------------------------------------------------------------- #
+def test_databases_trae_el_estado_de_despliegue(admin_client):
+    """
+    Antes había que pedir `/migrations/status` por cada BD, y cada una abría conexión al
+    motor. Ahora la tabla entera sale de este listado, con datos locales.
+    """
+    model_id = _new_model(admin_client, slug="est1", name="Est1")
+    _create_migration(admin_client, model_id, version="0001")
+    _create_migration(
+        admin_client, model_id, version="0002",
+        up_sql="ALTER TABLE users ADD COLUMN x INT",
+    )
+    _managed_db_for_model(admin_client, model_id, port=5495)
+
+    r = admin_client.get(f"/api/v1/database-models/{model_id}/databases")
+    assert r.status_code == 200, r.text
+    item = r.json()["data"][0]
+    # BD recién registrada: sin versión aplicada ⇒ todas pendientes.
+    assert item["pending_count"] == 2
+    assert item["pending_versions"] == ["0001", "0002"]
+    assert item["has_partial_application"] is False
+
+
+def test_databases_marca_la_aplicacion_parcial(admin_client):
+    from app.services.db_admin import migration_progress
+
+    model_id = _new_model(admin_client, slug="est2", name="Est2")
+    mig = _create_migration(admin_client, model_id).json()["data"]
+    db_id = _managed_db_for_model(admin_client, model_id, port=5496)
+    migration_progress.record_statement(db_id, mig["id"], "up", 2, 5, mig["checksum"])
+
+    r = admin_client.get(f"/api/v1/database-models/{model_id}/databases")
+    assert r.json()["data"][0]["has_partial_application"] is True
+
+
+def test_apply_all_rechaza_una_bd_de_otro_blueprint(admin_client):
+    """
+    Frontera de autorización: `IN` ignoraría el id ajeno en silencio y el lote seguiría. El
+    422 con la lista es lo que impide aplicar las migraciones de un blueprint a una BD ajena.
+    """
+    otro = _new_model(admin_client, slug="dest-otro", name="DestOtro")
+    ajena = _managed_db_for_model(admin_client, otro, port=5497)
+    model_id = _new_model(admin_client, slug="dest", name="Dest")
+    _create_migration(admin_client, model_id)
+
+    r = admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations/apply-all",
+        params={"dry_run": True, "database_ids": [ajena]},
+    )
+    assert r.status_code == 422, r.text
+    assert str(ajena) in r.text

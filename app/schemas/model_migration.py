@@ -79,10 +79,38 @@ class ModelMigrationPatch(BaseModel):
     )
 
 
+_SQL_FACTS_DESC = (
+    "Hechos derivados del SQL para las insignias del listado. Se calculan con heurísticas de "
+    "texto sobre el SQL enmascarado (barato, se paga por fila), no con el análisis completo: "
+    "para el veredicto fino está POST .../migrations/validate."
+)
+
+
+_SQL_FROZEN_DESC = (
+    "True = el SQL de esta versión ya no se puede modificar: alguna BD la aplicó con éxito, o "
+    "hay una aplicación parcial a medias. Es la MISMA condición que evalúa el 409 del PATCH; se "
+    "publica para que el cliente pueda bloquear el campo de entrada en vez de descubrirlo al "
+    "guardar."
+)
+_DELETABLE_DESC = (
+    "True = el DELETE de esta versión pasaría hoy: es la punta de la secuencia, ninguna BD la "
+    "aplicó con éxito y no hay aplicación parcial sin resolver."
+)
+_BLOCK_REASON_DESC = (
+    "Por qué está restringida, o null si no lo está: 'applied' (alguna BD depende de ella), "
+    "'partial' (aplicación a medias sin resolver) o 'not_tip' (hay versiones posteriores). "
+    "'not_tip' solo impide BORRARLA — editarla sigue permitido."
+)
+
+
 class ModelMigrationSummary(BaseModel):
     """Item compacto para listados (no incluye el SQL completo ni traducciones)."""
 
     model_config = ConfigDict(from_attributes=True)
+
+    sql_frozen: bool = Field(False, description=_SQL_FROZEN_DESC)
+    deletable: bool = Field(True, description=_DELETABLE_DESC)
+    block_reason: str | None = Field(None, description=_BLOCK_REASON_DESC)
 
     id: int
     model_id: int
@@ -96,6 +124,13 @@ class ModelMigrationSummary(BaseModel):
     is_baseline: bool = False
     reviewed: bool = True
     capture_selects: bool = False
+    has_seed: bool = Field(False, description="La migración inserta o modifica datos. " + _SQL_FACTS_DESC)
+    forced_collations: list[str] = Field(
+        default_factory=list, description="COLLATE explícitos encontrados en el SQL."
+    )
+    destructive: bool = Field(
+        False, description="Contiene DROP o TRUNCATE. " + _SQL_FACTS_DESC
+    )
     created_at: datetime
 
 
@@ -103,6 +138,10 @@ class ModelMigrationOut(BaseModel):
     """Detalle completo: incluye SQL, overrides, rollback y traducciones calculadas."""
 
     model_config = ConfigDict(from_attributes=True)
+
+    sql_frozen: bool = Field(False, description=_SQL_FROZEN_DESC)
+    deletable: bool = Field(True, description=_DELETABLE_DESC)
+    block_reason: str | None = Field(None, description=_BLOCK_REASON_DESC)
 
     id: int
     model_id: int
@@ -137,6 +176,13 @@ class ModelMigrationOut(BaseModel):
             "O al revertirse (el down_sql captura igual que el up_sql). Requiere "
             "reviewed=true y allow_result_capture=true en cada apply y en cada rollback."
         ),
+    )
+    has_seed: bool = Field(False, description="La migración inserta o modifica datos. " + _SQL_FACTS_DESC)
+    forced_collations: list[str] = Field(
+        default_factory=list, description="COLLATE explícitos encontrados en el SQL."
+    )
+    destructive: bool = Field(
+        False, description="Contiene DROP o TRUNCATE. " + _SQL_FACTS_DESC
     )
     created_at: datetime
     updated_at: datetime
@@ -471,6 +517,21 @@ class ApplyAllItemOut(BaseModel):
     dry_run: bool = False
     pending_versions: list[str] = Field(default_factory=list)
     error: str | None = None
+    captured_select_count: int = Field(
+        0,
+        description=(
+            "Filas de SELECT capturadas en esta BD durante la corrida. Paridad con "
+            "MigrationApplyOut: sin este dato, tras un apply masivo no había forma de saber "
+            "en qué BDs quedaron capturas."
+        ),
+    )
+    select_results_available: bool = Field(
+        False,
+        description=(
+            "Hay resultados legibles en GET /managed-databases/{id}/migrations/{version}"
+            "/select-results para esta BD."
+        ),
+    )
 
 
 class ApplyAllOut(BaseModel):
@@ -478,3 +539,82 @@ class ApplyAllOut(BaseModel):
     total_databases: int
     processed: int
     results: list[ApplyAllItemOut]
+
+
+# --------------------------------------------------------------------------- #
+# Validación estática del SQL de una migración (sin aplicar)                   #
+# --------------------------------------------------------------------------- #
+class MigrationValidateIn(BaseModel):
+    """
+    Entrada del validador. O bien ``up_sql`` (borrador que aún no existe como versión), o
+    bien ``version`` (una ya guardada, para no reenviar el SQL). Si llegan las dos, manda
+    ``up_sql``: es lo que el usuario tiene delante en el formulario.
+    """
+
+    up_sql: str | None = Field(None, max_length=_MAX_SQL)
+    version: str | None = Field(None, pattern=_VERSION)
+    managed_database_id: int | None = Field(
+        None,
+        description=(
+            "Si se indica, además del análisis estático se comprueba contra el catálogo de "
+            "esa BD que las tablas referenciadas existan. Abre una conexión de solo lectura."
+        ),
+    )
+
+
+class ValidateStatementOut(BaseModel):
+    """Una sentencia analizada. Misma forma que `QueryStatementPlanOut` de la consola SQL."""
+
+    seq: int
+    sql: str
+    kind: str
+    danger: str
+    reasons: list[dict] = Field(default_factory=list)
+    seeds: bool = False
+    destructive: bool = False
+    collations: list[str] = Field(default_factory=list)
+    parse_error: str | None = None
+
+
+class MigrationValidateOut(BaseModel):
+    statements: list[ValidateStatementOut] = Field(default_factory=list)
+    has_seed: bool = False
+    forced_collations: list[str] = Field(default_factory=list)
+    forced_charsets: list[str] = Field(default_factory=list)
+    destructive_statements: list[int] = Field(default_factory=list)
+    parse_errors: list[dict] = Field(default_factory=list)
+    gateway_internal_tables: list[str] = Field(default_factory=list)
+    postgresql_blockers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Construcciones que no se traducen con certeza a PostgreSQL. No vacío = el apply "
+            "contra un destino PostgreSQL respondería 422 salvo que se defina un "
+            "'up_sql_postgresql' explícito."
+        ),
+    )
+    resumable: bool = True
+    referenced_tables: list[str] = Field(default_factory=list)
+    checked_database: str | None = Field(
+        None, description="BD contra la que se verificó la existencia de objetos, si se pidió."
+    )
+    missing_tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Tablas referenciadas que NO existen en 'checked_database'. La comparación es "
+            "insensible a mayúsculas a propósito: MySQL sobre Linux distingue y PostgreSQL "
+            "pliega a minúsculas, y un validador que grita en falso deja de leerse."
+        ),
+    )
+    catalog_error: str | None = Field(
+        None,
+        description=(
+            "Por qué no se pudo leer el catálogo de 'checked_database' (motor caído, "
+            "credencial inválida). El análisis estático se devuelve igual: perder también lo "
+            "que sí se pudo comprobar sin conexión sería el peor desenlace."
+        ),
+    )
+    blueprint_collation: str | None = None
+    collation_conflicts: list[str] = Field(
+        default_factory=list,
+        description="COLLATE forzados que difieren del declarado por el blueprint.",
+    )
