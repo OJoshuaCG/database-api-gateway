@@ -4,7 +4,7 @@ Endpoints de DatabaseModels (blueprints/categorías).
 CRUD puro sobre el inventario del gateway (no toca ningún motor).
 """
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 
 from app.controllers.database_model_controller import DatabaseModelController
 from app.controllers.model_migration_controller import ModelMigrationController
@@ -16,8 +16,9 @@ from app.schemas.database_model import (
     DatabaseModelUpdate,
     FromSnapshotIn,
     FromSnapshotOut,
+    ModelDatabaseStatusOut,
 )
-from app.schemas.managed_database import ManagedDatabaseOut
+from app.services import audit
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
@@ -71,7 +72,37 @@ def delete_model(admin: AdminDep, model_id: int):
 
 
 @router.get(
-    "/{model_id}/databases", response_model=ApiResponse[list[ManagedDatabaseOut]]
+    "/{model_id}/databases", response_model=ApiResponse[list[ModelDatabaseStatusOut]]
 )
-def list_model_databases(admin: AdminDep, model_id: int):
-    return success(data=DatabaseModelController().list_model_databases(model_id))
+@limiter.limit("10/minute")
+def list_model_databases(
+    request: Request,
+    admin: AdminDep,
+    model_id: int,
+    refresh: bool = Query(
+        False,
+        description=(
+            "🔌 Relee la versión REAL de cada BD destino y resincroniza la copia del gateway. "
+            "Sin él la respuesta se sirve solo con datos locales y no abre ninguna conexión."
+        ),
+    ),
+):
+    """
+    BDs del blueprint **con su estado de despliegue** (versión actual, pendientes, parcial).
+
+    Antes esto exigía una llamada por BD a ``/migrations/status``, y cada una abría una
+    conexión al motor. Los tres campos nuevos salen de datos que el gateway ya tiene, así que
+    la tabla entera cuesta 3 queries locales.
+
+    El rate limit cubre el caso ``refresh=true``, que sí toca los motores.
+    """
+    data = DatabaseModelController().list_model_databases(model_id, refresh=refresh)
+    if refresh:
+        audit.record(
+            "database_model.databases.refresh",
+            admin=admin,
+            target_type="database_model",
+            target_id=model_id,
+            detail=f"versión resincronizada desde el motor en {len(data)} BD(s)",
+        )
+    return success(data=data)

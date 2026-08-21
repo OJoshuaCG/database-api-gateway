@@ -5,9 +5,21 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.schemas.managed_database import ManagedDatabaseOut
+
 _SLUG = r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$"
 # Identificador legado (introspección): dígito inicial y `. - $` permitidos.
 _OBJ_NAME = r"^[A-Za-z0-9_$][A-Za-z0-9_$.\-]{0,63}$"
+
+
+_CHARSET_DESC = (
+    "Juego de caracteres de REFERENCIA del esquema. Semántica de la familia MySQL: contra "
+    "destinos PostgreSQL no se compara (usa encoding + lc_collate, que no son equivalentes)."
+)
+_COLLATION_DESC = (
+    "Collation de REFERENCIA del esquema. Si está declarado, el validador avisa cuando una "
+    "migración fuerza uno distinto. Vacío = se compara contra el collation real de las BDs."
+)
 
 
 class DatabaseModelCreate(BaseModel):
@@ -16,6 +28,8 @@ class DatabaseModelCreate(BaseModel):
     description: str | None = None
     current_version: str = Field("0.0.0", max_length=50)
     is_active: bool = True
+    charset: str | None = Field(None, max_length=50, description=_CHARSET_DESC)
+    collation: str | None = Field(None, max_length=100, description=_COLLATION_DESC)
 
 
 class DatabaseModelUpdate(BaseModel):
@@ -24,6 +38,8 @@ class DatabaseModelUpdate(BaseModel):
     description: str | None = None
     current_version: str | None = Field(None, max_length=50)
     is_active: bool | None = None
+    charset: str | None = Field(None, max_length=50, description=_CHARSET_DESC)
+    collation: str | None = Field(None, max_length=100, description=_COLLATION_DESC)
 
 
 class DatabaseModelOut(BaseModel):
@@ -35,6 +51,8 @@ class DatabaseModelOut(BaseModel):
     description: str | None = None
     current_version: str
     is_active: bool
+    charset: str | None = None
+    collation: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -185,3 +203,26 @@ class FromSnapshotOut(BaseModel):
     data_tables_captured: int = 0
     skipped_tables: list[SnapshotSkippedTable] = Field(default_factory=list)
     versions: list[SnapshotVersionOut] = Field(default_factory=list)
+
+
+class ModelDatabaseStatusOut(ManagedDatabaseOut):
+    """
+    Una BD del blueprint con su estado de despliegue.
+
+    Extiende ``ManagedDatabaseOut`` en vez de ser un recurso nuevo: es la misma entidad con
+    tres datos más. Un endpoint hermano solo para esto habría duplicado el listado y obligado
+    al cliente a cruzar dos respuestas.
+
+    ``model_version`` es la copia que el gateway mantiene, no una lectura en vivo del motor.
+    Para forzar la relectura, ``?refresh=true`` (🔌).
+    """
+
+    pending_count: int = 0
+    pending_versions: list[str] = Field(default_factory=list)
+    has_partial_application: bool = Field(
+        False,
+        description=(
+            "Quedaron sentencias a medias de alguna versión. Ojo: 'model_version' NO lo "
+            "refleja — Alembic solo registra la versión cuando el upgrade TERMINA."
+        ),
+    )

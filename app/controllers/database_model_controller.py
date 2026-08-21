@@ -11,6 +11,7 @@ from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.exceptions import AppHttpException
 from app.models.database_model import DatabaseModel
 from app.models.managed_database import ManagedDatabase
+from app.models.model_migration import ModelMigration
 from app.services import audit
 
 
@@ -30,6 +31,8 @@ class DatabaseModelController:
             "description": m.description,
             "current_version": m.current_version,
             "is_active": m.is_active,
+            "charset": m.charset,
+            "collation": m.collation,
             "created_at": m.created_at,
             "updated_at": m.updated_at,
         }
@@ -75,6 +78,8 @@ class DatabaseModelController:
                 description=data.get("description"),
                 current_version=data.get("current_version", "0.0.0"),
                 is_active=data.get("is_active", True),
+                charset=data.get("charset"),
+                collation=data.get("collation"),
             )
             session.add(model)
             try:
@@ -100,6 +105,12 @@ class DatabaseModelController:
         session = self._session()
         try:
             model = self._get_or_404(session, model_id)
+            # `charset`/`collation` se pueden LIMPIAR (volver a "sin declarar"), así que no
+            # pueden ir en el bucle de arriba, que ignora los `None` para distinguir "no
+            # enviado" de "enviado vacío" en los campos obligatorios.
+            for field in ("charset", "collation"):
+                if field in data:
+                    setattr(model, field, data[field])
             for field in ("name", "slug", "description", "current_version", "is_active"):
                 if field in data and data[field] is not None:
                     setattr(model, field, data[field])
@@ -133,9 +144,28 @@ class DatabaseModelController:
             "database_model.delete", admin=admin, target_type="database_model", target_id=model_id
         )
 
-    def list_model_databases(self, model_id: int) -> list[dict]:
-        """BDs gestionadas que replican este blueprint."""
+    def list_model_databases(self, model_id: int, *, refresh: bool = False) -> list[dict]:
+        """
+        BDs gestionadas que replican este blueprint, **con su estado de despliegue**.
+
+        Cada item lleva además ``pending_count``, ``pending_versions`` y
+        ``has_partial_application``: es la respuesta a "¿qué BDs están al día y cuáles no?",
+        que antes exigía una llamada por BD a ``/migrations/status``, y cada una de esas abre
+        una conexión al motor.
+
+        Aquí no se abre ninguna: ``managed_databases.model_version`` es una copia que el
+        gateway ya mantiene (``_sync_model_version_from_engine`` tras cada apply),
+        ``compute_pending`` es una función pura y el estado parcial vive en la BD del
+        gateway. Son 3 queries locales para toda la tabla.
+
+        Con ``refresh=True`` sí se relee la versión real de cada BD destino y se resincroniza
+        la copia: es la vía para corregir el dato si alguien migró una BD por fuera del
+        gateway. Eso convierte la llamada en 🔌 y por eso va con rate limit y auditoría en la
+        ruta, no aquí.
+        """
         from app.controllers.managed_database_controller import ManagedDatabaseController
+        from app.services.db_admin import migration_progress
+        from app.services.db_admin.migration_integrity import version_sort_key
 
         session = self._session()
         try:
@@ -146,6 +176,77 @@ class DatabaseModelController:
                 .order_by(ManagedDatabase.id.desc())
                 .all()
             )
-            return [ManagedDatabaseController._serialize(r) for r in rows]
+            versions = [
+                r[0]
+                for r in session.query(ModelMigration.version)
+                .filter(ModelMigration.model_id == model_id)
+                .all()
+            ]
+            versions.sort(key=version_sort_key)
+            data = [ManagedDatabaseController._serialize(r) for r in rows]
+            current_by_id = {r.id: r.model_version for r in rows}
         finally:
             session.close()
+
+        if refresh:
+            current_by_id = self._resync_model_versions(model_id)
+            for item in data:
+                if item["id"] in current_by_id:
+                    item["model_version"] = current_by_id[item["id"]]
+
+        partial_ids = migration_progress.databases_with_incomplete_progress(
+            [item["id"] for item in data]
+        )
+        for item in data:
+            current = current_by_id.get(item["id"])
+            cur_key = version_sort_key(current) if current else None
+            pending = [
+                v for v in versions if cur_key is None or version_sort_key(v) > cur_key
+            ]
+            item["pending_versions"] = pending
+            item["pending_count"] = len(pending)
+            item["has_partial_application"] = item["id"] in partial_ids
+        return data
+
+    def _resync_model_versions(self, model_id: int) -> dict[int, str | None]:
+        """
+        Relee la versión REAL de cada BD del blueprint y actualiza la copia del gateway. 🔌
+
+        Una BD inalcanzable no rompe la tabla entera: se deja su valor cacheado y se sigue.
+        Fallar todo porque un servidor de doce esté caído haría inútil la pantalla justo
+        cuando más se necesita.
+        """
+        from app.controllers.common import build_target, engine_value, get_server_or_404
+        from app.controllers.managed_migration_controller import ManagedMigrationController
+
+        controller = ManagedMigrationController()
+        out: dict[int, str | None] = {}
+        session = self._session()
+        try:
+            model = session.get(DatabaseModel, model_id)
+            slug = model.slug if model else None
+            rows = (
+                session.query(ManagedDatabase)
+                .filter(ManagedDatabase.model_id == model_id)
+                .all()
+            )
+            targets = {}
+            for row in rows:
+                out[row.id] = row.model_version
+                if not slug:
+                    continue
+                try:
+                    if row.server_id not in targets:
+                        server = get_server_or_404(session, row.server_id)
+                        targets[row.server_id] = build_target(server)
+                    current = controller.runner.get_current_version(
+                        targets[row.server_id], row.name, slug
+                    )
+                    row.model_version = current
+                    out[row.id] = current
+                except AppHttpException:
+                    continue
+            session.commit()
+        finally:
+            session.close()
+        return out

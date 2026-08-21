@@ -62,5 +62,24 @@ class DatabaseModel(Base, TimestampMixin):
         comment="Soft-disable del blueprint",
     )
 
+    # Un blueprint ES el esquema base que sus BDs replican, y el juego de caracteres forma
+    # parte del esquema tanto como las columnas. Declararlo aquí da un valor de REFERENCIA
+    # estable: sirve para avisar cuando una migración fuerza un COLLATE distinto, y para
+    # detectar BDs que se han desviado. Nulable porque los blueprints existentes no lo
+    # tienen y no se puede inventar: mientras esté vacío, la comparación se hace contra el
+    # collation real de las BDs asociadas.
+    #
+    # OJO: es semántica de la familia MySQL. PostgreSQL usa `encoding` + `lc_collate`/
+    # `lc_ctype`, que no son equivalentes, así que la comprobación de deriva solo corre
+    # contra destinos MySQL/MariaDB. Modelarlo por motor sería lo completo, pero hoy nadie
+    # lo necesita y añadiría un objeto de configuración por engine.
+    charset: Mapped[str | None] = mapped_column(
+        String(50), nullable=True, comment="Juego de caracteres de referencia (familia MySQL)"
+    )
+
+    collation: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, comment="Collation de referencia (familia MySQL)"
+    )
+
     def __repr__(self) -> str:
         return f"<DatabaseModel(id={self.id}, slug='{self.slug}')>"
