@@ -39,6 +39,7 @@ modelo de datos/endpoints, decisiones, riesgos, pasos y verificación.
 | 08 | [Production readiness: estado y bloqueantes](08-production-readiness.md) | transversal | 🔴 NO listo (ver bloqueantes) |
 | 09 | [Adopción de BDs/usuarios existentes, reconciliación (drift) y snapshot estructural](09-adopcion-reconciliacion-y-snapshot.md) | 01, 02 | ✅ Implementado (F1–F4; 329 tests, seguridad sin bloqueantes) |
 | 10 | [Exportación de bases de datos (estructura y/o datos, multiformato)](10-exportacion-de-bases-de-datos.md) | 01, 09 | ✅ Implementado (F1–F6) — 🔴 **e2e contra motores reales escrito pero NUNCA ejecutado** (sin Docker) |
+| 11 | [Organización lógica (proyectos/entornos), copia de datos, releases y acceso para agentes (MCP)](11-organizacion-copia-de-datos-releases-y-mcp.md) | 01, 02, 05 | 📋 Propuesta — sin implementar (la feature 3 está **parcialmente** hecha en el módulo de clon) |
 
 ## Diagrama de dependencias
 
@@ -52,6 +53,12 @@ modelo de datos/endpoints, decisiones, riesgos, pasos y verificación.
       └──────────────► 05 (clonado de BDs)   ◄── también usa 02
 
 06 (auditoría, SSO, jobs, observabilidad) — transversal a todo
+
+11 (organización lógica, copia de datos, releases, MCP) — se apoya en 01/02/05
+   entornos ─┬─► releases (necesita el orden de promoción)
+             └─► MCP (el gate de producción necesita saber qué BD es productiva)
+   proyectos ──► releases (un release agrupa blueprints de UN proyecto)
+   copia de solo datos — independiente, extiende 05
 ```
 
 ## Principios que todo plan respeta
