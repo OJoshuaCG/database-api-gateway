@@ -19,6 +19,7 @@ from app.services.db_admin.dtos import (
     RoutineInfo,
     SchemaSnapshot,
     TableSchema,
+    TableStat,
 )
 from app.services.db_admin.migrations import StatementResult
 from app.services.db_admin.schema_diff import RenderedStatement
@@ -86,6 +87,9 @@ class _FakeAdapter:
         self.created: list[str] = []
         self.create_calls: list[dict] = []  # kwargs de cada create_database (charset/collation)
         self.dropped: list[str] = []
+        self.row_estimates: dict[str, int] = {}
+        self.unknown_estimates: set[str] = set()
+        self.charset_supported: bool | None = True
 
     def structural_snapshot(self, database):
         return self.snaps.get(database, SchemaSnapshot(database=database, source_engine="mysql"))
@@ -96,7 +100,9 @@ class _FakeAdapter:
     def create_database(self, db_name, charset=None, collation=None, owner=None):
         self.existing.add(db_name)
         self.created.append(db_name)
-        self.create_calls.append({"db_name": db_name, "charset": charset, "collation": collation})
+        self.create_calls.append({
+            "db_name": db_name, "charset": charset, "collation": collation, "owner": owner,
+        })
 
     def drop_database(self, db_name):
         self.existing.discard(db_name)
@@ -104,6 +110,24 @@ class _FakeAdapter:
 
     def external_fk_dependents(self, database):
         return []
+
+    def list_table_stats(self, database, *, conn=None):
+        # Modela el contrato real: estimación del catálogo + si el catálogo la conoce.
+        snap = self.snaps.get(database)
+        if snap is None:
+            return []
+        return [
+            TableStat(
+                table=t.table,
+                estimated_rows=self.row_estimates.get(t.table, 0),
+                estimated_rows_known=t.table not in self.unknown_estimates,
+                has_primary_key=bool(t.primary_key),
+            )
+            for t in snap.tables
+        ]
+
+    def supports_charset_combination(self, charset, collation):
+        return self.charset_supported
 
     def render_diff(self, diff):
         # Una sentencia por ítem del diff, con SQL determinista.
