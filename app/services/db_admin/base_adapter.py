@@ -292,11 +292,15 @@ class ServerAdapter(ABC):
         """
 
     @abstractmethod
-    def _estimate_rows(self, conn, table: str, schema: str) -> int:
+    def _estimate_rows(self, conn, table: str, schema: str) -> int | None:
         """
         Estimación de filas de una tabla desde el catálogo (rápida, aproximada; NO
         cuenta filas). MySQL: ``information_schema.TABLES.TABLE_ROWS``; PostgreSQL:
         ``pg_class.reltuples``. Solo para informar la selección de datos-semilla.
+
+        ``None`` = **el catálogo no lo sabe** (``reltuples`` en -1 porque nunca corrió
+        ``ANALYZE``, o ``TABLE_ROWS`` en NULL). Devolver 0 en ese caso hacía que una tabla
+        de millones de filas se informara como vacía, que es peor que no informar nada.
         """
 
     # ------------------------------------------------------------------ #
@@ -310,6 +314,26 @@ class ServerAdapter(ABC):
 
     @abstractmethod
     def drop_database(self, db_name: str, *, force_disconnect: bool = False) -> None: ...
+
+    def supports_charset_combination(
+        self, charset: str | None, collation: str | None
+    ) -> bool | None:
+        """
+        ¿Este servidor concreto ofrece esa combinación de charset/collation?
+
+        Existe porque el catálogo del gateway es necesario pero **no suficiente**:
+        ``engine_family`` mete MySQL y MariaDB en la misma familia y no comparten todas las
+        collations (``utf8mb4_0900_ai_ci`` es de MySQL 8; las ``utf8mb4_uca1400_*`` de
+        MariaDB reciente), y en PostgreSQL la collation es un locale del SISTEMA OPERATIVO
+        del host. Preguntarle al motor ANTES de ejecutar evita el peor caso del clon: con
+        ``clean_mode='drop_database'`` el pipeline hace DROP y después CREATE, así que un par
+        que el motor rechaza deja el destino BORRADO.
+
+        Tres respuestas, y la tercera importa: ``True`` = disponible, ``False`` = el motor NO
+        la tiene (bloquea), ``None`` = **no se pudo determinar**. ``None`` no bloquea: un
+        "no sé" que se comporta como "no" prohibiría combinaciones perfectamente válidas.
+        """
+        return None
 
     def active_connections(self, db_name: str) -> int:
         """
@@ -1658,10 +1682,12 @@ class ServerAdapter(ABC):
                         insp.get_pk_constraint(t, schema=schema).get("constrained_columns")
                         or []
                     )
+                    estimate = self._estimate_rows(conn, t, schema)
                     out.append(
                         TableStat(
                             table=t,
-                            estimated_rows=self._estimate_rows(conn, t, schema),
+                            estimated_rows=estimate if estimate is not None else 0,
+                            estimated_rows_known=estimate is not None,
                             has_primary_key=bool(pk),
                         )
                     )

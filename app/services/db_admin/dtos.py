@@ -371,6 +371,15 @@ class TableStat(BaseModel):
 
     table: str
     estimated_rows: int
+    # ``estimated_rows`` NO puede representar "no sé": los dos motores colapsan lo
+    # desconocido a 0 (PostgreSQL cuando ``reltuples`` es -1 —tabla nunca analizada—, MySQL
+    # cuando ``TABLE_ROWS`` es NULL), así que una tabla de 40 millones recién restaurada se
+    # informa como vacía. Este flag distingue "0 filas" de "el catálogo no lo sabe" SIN
+    # cambiar el tipo del campo: pasarlo a ``int | None`` rompería el contrato de
+    # ``GET /servers/{id}/databases/{db}/snapshot`` (el schema del frontend lo declara no
+    # nullable y está embebido, así que un solo null invalida toda la respuesta) y volvería
+    # fail-open el guard de capacidad del export, que trataría lo desconocido como cero.
+    estimated_rows_known: bool = True
     has_primary_key: bool
 
 

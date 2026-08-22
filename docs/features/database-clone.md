@@ -21,9 +21,19 @@ fuente de verdad; el cliente confirma con `confirm_token` + `confirm_target_name
 3. **`POST /database-clones/{id}/resolve-selection`** — dado un conjunto de objetos elegidos,
    devuelve el **cierre de dependencias** (lo que se agrega automáticamente) + las
    **sugerencias advisory**. Es el "seleccioná uno y traé lo necesario" de la UI.
-4. **`POST /database-clones/{id}/preview`** — resuelve el plan final SIN ejecutar: sentencias
-   de limpieza + estructura (DDL exacto en el dialecto destino), tablas de datos, objetos
-   `skipped` (no portables) y el `confirm_token`.
+4. **`POST /database-clones/{id}/preview`** — **acá se manda el SPEC** (qué copiar, con qué
+   charset, con qué owner), se **congela** y se resuelve el plan final SIN ejecutar:
+   sentencias de limpieza + estructura (DDL exacto en el dialecto destino), tablas de datos,
+   objetos `skipped` (no portables), avisos y el `confirm_token`.
+
+   El spec va acá y no en `create` porque el catálogo de objetos del origen solo se puede
+   listar con un `job_id` (paso 2): pedirlo en `create` obliga a elegir a ciegas y a recrear
+   el plan —con su snapshot en vivo, a 10/min— por cada retoque. Mismo criterio que el
+   [export](database-export.md).
+
+   Solo se aplica lo que **viene** en el cuerpo; un campo ausente deja el valor que el plan ya
+   tenía. Si el esquema del destino impide la copia, la respuesta es **200 con
+   `blocking_issues` y `confirm_token` vacío**: el plan se puede ver, pero no confirmar.
 5. **`POST /database-clones/{id}/execute`** — valida `confirm_target_name` + `confirm_token` +
    re-chequea el fingerprint del origen (anti-TOCTOU) + cuarentena, registra la intención
    (auditoría fail-closed) y **encola** el job asíncrono. Rate limit 3/min.
@@ -34,17 +44,119 @@ fuente de verdad; el cliente confirma con `confirm_token` + `confirm_target_name
 
 ## Opciones del plan
 
-- **`include_data`**: `false` = solo estructura; `true` = estructura + **todos** los datos.
+### En `POST /database-clones` (identidad y contenedor)
+
 - **`target_mode`**: `new` (crea la BD; 422 si ya existe) | `existing` (404 si no existe).
-- **`clean_mode`** (solo destino existente): `none` (preservar y hacer *upsert* de datos) |
-  `objects` (borrar objeto por objeto en orden topológico inverso, **preservando la BD y su
-  configuración** — charset/collation/grants) | `drop_database` (**reset total**: DROP + CREATE).
-- **`selection`**: lista de objetos a clonar; `null` = clon **completo**. La selección se
-  expande por el cierre de dependencias.
+- **`clean_mode`** (solo destino existente): `none` (preservar) | `objects` (borrar objeto por
+  objeto en orden topológico inverso, **preservando la BD y su configuración** —
+  charset/collation/grants) | `drop_database` (**reset total**: DROP + CREATE).
 - **`adopt_target`** + **`adopt_owner_id`**: solo en clon **completo** desde un origen
   gestionado **con blueprint**: al terminar, adopta el destino (`origin='adopted'`) y le
   **stampa** el `model_id` + `model_version` del origen (sin re-ejecutar DDL). `adopt_owner_id`
   debe ser un `ServerUser` del servidor **destino**.
+- **`include_data`** y **`selection`**: atajos **LEGACY** que se siguen aceptando y se traducen
+  al spec nuevo (`include_data: true` ⇒ `copy_intent: "structure_and_data"`). Mandar el eje
+  legacy y su equivalente nuevo a la vez es 422.
+
+### En `POST /database-clones/{id}/preview` (el spec)
+
+**`copy_intent`** — qué se copia. Es la INTENCIÓN, no un eje técnico:
+
+| Valor | Qué hace |
+|---|---|
+| `structure_only` | La estructura seleccionada, sin filas. |
+| `structure_and_data` | Estructura + filas. |
+| `data_only` | **Solo filas**, contra objetos que ya existen en el destino. **No se emite una sola sentencia de DDL.** |
+
+`data_only` exige `target_mode='existing'`, `clean_mode='none'` y `data.on_existing` explícito,
+y es incompatible con `adopt_target` (adoptar el destino y stampearle una versión de blueprint
+afirma que la estructura la puso este job).
+
+> **Por qué el contrato expone una intención y no el enumerado de cuatro valores del
+> [export](database-export.md).** De los cuatro, el clon solo puede cumplir dos:
+> `DROP_CREATE` por entidad destruiría los permisos y triggers del objeto en el destino (y su
+> caso de uso ya lo cubre `clean_mode='objects'`), y `CREATE_IF_NOT_EXISTS` está **roto** para
+> todo lo que no sea una tabla — `export_make_idempotent` filtra por `object_type` y en la
+> familia MySQL solo acepta `{table, event}`, mientras el render del diff emite `index`,
+> `foreign_key`, `column`… así que esas sentencias saldrían crudas y morirían con 1061/1826
+> dejando estructura parcial y la BD en cuarentena. Publicar un enumerado donde la mitad
+> responde 422 es una promesa que el servidor no cumple. `EntityDdl` se sigue usando
+> internamente. Si algún día se quiere "creá solo lo que falta", el mecanismo correcto no es
+> `IF NOT EXISTS` por texto: es diffear contra el snapshot del destino, que es literalmente
+> [schema-comparisons](schema-comparison.md).
+
+**`structure`** y **`data`** — selección DECLARATIVA, resuelta contra el catálogo del origen con
+la misma función que usa el export:
+
+```jsonc
+{
+  "copy_intent": "data_only",
+  "data": {
+    "mode": "all_except",              // none | all | include | all_except
+    "exclude_patterns": ["log_*"],     // fnmatch sobre nombres del catálogo, NUNCA SQL
+    "on_existing": "append"            // append | upsert
+  }
+}
+```
+
+- La **exclusión gana** sobre la inclusión.
+- Los datos solo salen de **tablas**.
+- `mode: "include"` con un nombre que el origen no tiene es **422**: sin eso, un nombre mal
+  tecleado daba un job `succeeded` con 0 filas copiadas.
+- El match de `names` es por **nombre, sin tipo**: si una tabla y una rutina se llaman igual,
+  entran las dos. `types` desambigua.
+- La selección de datos **se cierra por FK**. Pedir solo la tabla hija arrastra a la madre, y
+  el preview lo muestra. Sin ese cierre se insertarían filas huérfanas **sin ningún error**,
+  porque la fase de datos corre con las FKs desactivadas y el motor nunca las revalida.
+- `selection` (refs exactas) y `structure` (declarativa) son **mutuamente excluyentes**.
+
+**`data.on_existing`** — qué hacer si la tabla destino ya tiene filas. **Obligatorio y sin
+default en `data_only`**: con la estructura creándose, la fase de datos nunca llegaba a una
+tabla preexistente, así que heredar el `upsert` derivado como default sería estrenar un default
+destructivo disfrazado de compatibilidad. `upsert` sobre una tabla **sin clave primaria**
+degrada a `INSERT` simple, así que reejecutar el job duplicaría filas: el preview lo avisa con
+`clone.upsert_without_primary_key`.
+
+> **Vaciar la tabla destino antes de copiar (`truncate`) todavía no existe.** Requiere el
+> cierre por FK del lado del DESTINO (un `TRUNCATE` aislado sobre una tabla referenciada falla
+> en PostgreSQL incluso con los triggers en `replica`), confirmación propia de pérdida de
+> filas, semántica de cancelación, y verificación contra motores reales de un comportamiento
+> que en MySQL con `FOREIGN_KEY_CHECKS=0` es **indocumentado**. Mientras tanto, para reemplazar
+> el contenido existe `clean_mode='objects'`.
+
+**`target_charset`** — charset/collation de la BD destino, discriminado por `mode`:
+
+```jsonc
+{ "target_charset": { "mode": "override", "charset": "utf8mb4", "collation": "utf8mb4_unicode_ci" } }
+```
+
+- `keep` (default) = heredar del origen si es el mismo motor, o el default del motor destino si
+  es cross-engine. Con `keep` no se admiten `charset`/`collation` (antes se aceptaban y se
+  ignoraban en silencio).
+- Solo aplica cuando el job **crea** la BD (`target_mode='new'` o `clean_mode='drop_database'`);
+  en otro caso, 422. Convertir la collation de una BD existente es
+  [otra operación](collation-conversion.md).
+- Dos validaciones, y la segunda no es opcional: el par tiene que estar **habilitado en el
+  catálogo** del gateway (y lo que viaja al DDL es su forma **canónica**, nunca el texto del
+  request) **y** el servidor destino tiene que ofrecerlo. El catálogo es necesario y no
+  suficiente: `engine_family` mete MySQL y MariaDB en la misma familia y no comparten todas las
+  collations (`utf8mb4_0900_ai_ci` es solo de MySQL 8; las `utf8mb4_uca1400_*` solo de MariaDB
+  reciente), y en PostgreSQL la collation es un **locale del sistema operativo** del host. Que
+  esto se valide en el `preview` es lo que evita el peor caso: con `clean_mode='drop_database'`
+  el worker hace DROP y después CREATE, así que un par que el motor rechaza dejaría el destino
+  **borrado**.
+- Elegir un charset distinto del origen tiene una consecuencia que el preview avisa: las tablas
+  que se crean sin collation explícita heredan el default de la BD, así que un diff posterior
+  origen↔destino va a reportar diferencias. Y el síntoma es **asimétrico**: en MySQL/MariaDB el
+  diff grita en toda columna textual; en PostgreSQL `collation_name` es NULL cuando se hereda,
+  así que el diff se queda **callado** mientras el orden real de los índices cambió.
+
+**`target_owner_user_id`** — `ServerUser` del servidor destino que será `OWNER` de la BD creada.
+**Solo PostgreSQL** (en MySQL/MariaDB una base no tiene dueño: 422). Y fija el dueño **de la
+base**, nada más: las tablas, vistas y secuencias las crea la credencial administrativa del
+gateway y quedan con **su** propiedad, así que el dueño pedido no puede `ALTER` sus propios
+objetos. El preview lo dice explícitamente; reasignarlos requiere `SET ROLE`/`REASSIGN OWNED` y
+es trabajo pendiente.
 
 ## Copia de datos (streaming, asíncrona)
 
@@ -197,6 +309,70 @@ e2e contra motores reales en el entorno donde se implementaron — ver limitacio
   bytes — en tablas MUY anchas con `TEXT`/`BLOB`/JSON grandes puede acercarse a
   `max_allowed_packet` (MySQL); si aparece "packet too large", bajar `CLONE_DATA_BATCH_ROWS`. Sin
   paralelismo entre tablas (secuencial). Batching adaptativo por bytes y reanudación = futuro.
+
+## Guard de compatibilidad del destino (`copy_intent: data_only`)
+
+Cuando este job **no** crea la estructura, las filas van a objetos que el gateway no construyó,
+así que antes de tocar el motor se compara el esquema del origen contra el del destino para las
+tablas que reciben datos. Vive en `clone_spec.data_compat_issues` (puro, sin motor) y **no
+lanza**: devuelve una lista, el `preview` la muestra y el `execute` la rechaza. Si lanzara desde
+el armado del plan, el operador recibiría "incompatible" sin poder ver el plan ni el resto de
+los avisos.
+
+**La calibración de bloqueante vs aviso es POR MOTOR, y no es una preferencia:**
+
+- En **PostgreSQL** `COPY … FROM STDIN` valida los tipos y aborta la tabla de forma atómica: el
+  motor es la red de seguridad y un aviso alcanza.
+- En **MySQL/MariaDB el motor no puede fallar.** El pipeline escribe con `LOAD DATA LOCAL
+  INFILE`, y el modificador `LOCAL` se comporta **siempre** como `IGNORE` y **anula el
+  `sql_mode` restrictivo**. Un truncado de string, un `DECIMAL` redondeado, un `unsigned` fuera
+  de rango, un valor de `ENUM` que el destino no tiene o una colisión de clave única se
+  convierten en **warnings o filas descartadas, sin error** — y `rows_copied` cuenta filas
+  escritas al FIFO, no filas insertadas, así que el job reporta éxito con datos perdidos. Ahí
+  este guard es la **única** defensa.
+
+| Caso | MySQL/MariaDB | PostgreSQL |
+|---|---|---|
+| La tabla no existe en el destino (o el nombre es una vista) | bloquea | bloquea |
+| Columna del origen ausente en el destino | bloquea | bloquea |
+| Columna del destino `NOT NULL` sin default que el origen no aporta | bloquea | bloquea |
+| Columna del destino `GENERATED` o `IDENTITY ALWAYS` | bloquea | bloquea |
+| Narrowing de tipo/longitud/precisión, `ENUM` que no cubre, `unsigned`→firmado | **bloquea** | aviso |
+| Collation distinta en una columna de PK/UNIQUE | **bloquea** | aviso |
+| UNIQUE o CHECK presente **solo** en el destino | **bloquea** | aviso |
+| FK del destino hacia una tabla que este job no puebla | bloquea | bloquea |
+| Otras diferencias de tipo | aviso | aviso |
+
+La collation en una columna de clave bloquea por una razón concreta: `utf8mb4_bin` → `_general_ci`
+hace que `'Alice'` y `'alice'` sean dos filas en el origen y **la misma clave** en el destino, así
+que una se pierde —por el upsert o por el `IGNORE` implícito— sin ningún error.
+
+**Cross-family (MySQL↔PostgreSQL) los tipos no se comparan.** `diff_snapshots` y `canonical_type`
+están definidos para un mismo dialecto y entre familias los nombres difieren por diseño, así que
+compararlos daría un falso bloqueo en cada columna. Se verifica presencia y nulabilidad, se avisa
+que la fidelidad de tipos **no se verificó**, y se bloquea la lista corta de tipos del destino que
+el pipeline no puede alimentar (arrays, geométricos, `tsvector`, `bit varying`).
+
+> **Detalle de implementación que no se puede perder.** `schema_diff.is_narrowing(src, tgt)` está
+> documentado como *"¿convertir la columna de `tgt` (actual) a `src` (deseado) pierde datos?"* —
+> la dirección del **diff**. Una **copia** va al revés (el origen provee, el destino recibe), así
+> que los argumentos van **invertidos** respecto del uso del diff. Leer `DiffItem.risk`, o pasar
+> los argumentos en el orden "natural", clasifica al revés el 100% de los casos de longitud,
+> rango y precisión: `varchar(50)` → `varchar(20)` sale como inofensivo. Hay un test dedicado.
+
+### Triggers vivos en el destino
+
+Toda la maquinaria que difiere la creación de triggers hasta después de la fase de datos (ver
+[más abajo](#objetos-con-cuerpo-vistas-rutinas-funciones-triggers-eventos)) protege solo los
+triggers que **este job crea**. En `data_only` no se crea ninguno: los del destino ya están,
+vivos, y van a dispararse durante la copia.
+
+El preview lo avisa (`clone.target_triggers_will_fire`) nombrándolos, **en los dos motores**. En
+MySQL/MariaDB porque no hay defensa portable (`FOREIGN_KEY_CHECKS=0` no apaga triggers). En
+PostgreSQL porque la garantía no es firme: `session_replication_role='replica'` los apaga, pero es
+un `SET` de superusuario cuyo error se ignora best-effort, así que un pseudo-root sin ese
+privilegio deja los triggers activos **sin que nada falle**. Decir "allá no hay nada que advertir"
+sería fail-open.
 
 ## Cross-engine (portabilidad)
 
@@ -403,6 +579,18 @@ los logs).
   al encolar). Propagar el admin creador del job es mejora pendiente.
 - **Fidelidad de tipos cross-engine**: la estructura cross-family es best-effort (los tipos del
   origen se renderizan tal cual; sin mapeo de tipos exhaustivo). Revisar el preview.
-- **Charset/collation del destino nuevo**: se crea con el default del motor (no se copia el del
-  origen todavía).
+- **Charset/collation del destino nuevo**: si el operador no elige nada, la BD hereda el
+  charset/collation **del origen** cuando es el mismo motor (para que el default no derive y el
+  diff no reporte falsos positivos), y cae al default del motor destino cuando es cross-engine.
+  Con `target_charset.mode='override'` se elige explícitamente. *(Esta línea afirmaba lo
+  contrario del código hasta 2026-08-22.)*
+- **`data.on_existing='truncate'` no existe**: en `data_only` se puede cargar y actualizar
+  filas, no *reemplazar* el contenido. Para reemplazar, `clean_mode='objects'`.
+- **El owner de PostgreSQL es solo de la base**: los objetos quedan con la propiedad de la
+  credencial administrativa del gateway (ver `target_owner_user_id`).
+- **Solo el schema `public` en PostgreSQL**: un destino con las tablas en otro schema produce un
+  "la tabla no existe en el destino" que es correcto pero engañoso.
+- **Las estimaciones de filas son del catálogo**, no un `COUNT`: pueden estar atrasadas
+  (`information_schema_stats_expiry` en MySQL 8) y `row_estimate_known: false` significa que el
+  catálogo no las sabe (PostgreSQL sin `ANALYZE`).
 - Verificación e2e contra motores reales: `scripts/verify_clone_e2e.py` (requiere Docker).

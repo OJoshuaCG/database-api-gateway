@@ -21,6 +21,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
@@ -45,6 +46,9 @@ from app.models.clone_job import (
     CLONE_CLEAN_DROP_DATABASE,
     CLONE_CLEAN_NONE,
     CLONE_CLEAN_OBJECTS,
+    CLONE_COPY_DATA_ONLY,
+    CLONE_COPY_STRUCTURE_AND_DATA,
+    CLONE_COPY_STRUCTURE_ONLY,
     CLONE_ITEM_ADOPT,
     CLONE_ITEM_APPLIED,
     CLONE_ITEM_CLEAN,
@@ -66,12 +70,19 @@ from app.models.clone_job import (
 from app.models.enums import EngineType, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.server_user import ServerUser
-from app.services import audit
+from app.services import audit, charset_catalog
 from app.services.db_admin import clone_dependencies as cdeps
+from app.services.db_admin import clone_spec as cspec
+from app.services.db_admin import export_spec as espec
+from app.services.db_admin import query_policy
 from app.services.db_admin.data_copy import TableCopySpec, copy_tables
 from app.services.db_admin.dtos import SchemaSnapshot
 from app.services.db_admin.factory import get_adapter
-from app.services.db_admin.identifiers import quote_identifier, validate_identifier
+from app.services.db_admin.identifiers import (
+    ensure_not_reserved_database,
+    quote_identifier,
+    validate_identifier,
+)
 from app.services.db_admin.migrations import MigrationRunner
 from app.services.db_admin.schema_diff import diff_snapshots
 from app.services.db_admin.sql_dialect import (
@@ -99,6 +110,11 @@ class _DataSpec:
     primary_key: list[str]
     upsert: bool
     row_estimate: int | None
+    # ``row_estimate=None`` es ambiguo por sí solo (¿no se pidió, o el catálogo no sabe?).
+    # Este flag lo desambigua para la UI. NO entra al ``confirm_token``: un ANALYZE de fondo
+    # entre el preview y el execute invalidaría el token sin que el plan haya cambiado.
+    row_estimate_known: bool = True
+    has_primary_key: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +126,12 @@ class _ExecutionPlan:
     will_adopt: bool
     table_order: list[str]
     warnings: list[str]
+    # Incompatibilidades del DESTINO que impiden ejecutar. El plan las TRANSPORTA en vez de
+    # lanzar: si el guard lanzara desde acá, el ``preview`` no podría renderizar nada y el
+    # operador recibiría "incompatible" sin ver el plan ni el resto de los avisos. Cada
+    # llamador decide (preview → 200 sin token; execute y worker → rechazo).
+    blocking_issues: list[dict] = dataclass_field(default_factory=list)
+    notices: list[dict] = dataclass_field(default_factory=list)
 
 _MYSQL_FAMILY = frozenset({"mysql", "mariadb"})
 # Tipos con cuerpo procedural: no portables cross-engine (atados al motor de origen).
@@ -295,16 +317,30 @@ class CloneController:
         for ev in snap.events:
             yield "event", ev.name
 
-    def _build_inventory(self, snap: SchemaSnapshot, tgt_engine: str, *, include_data: bool) -> dict:
-        """Inventario de objetos + portabilidad + grafo de dependencias."""
-        row_est: dict[str, int] = {}
+    def _build_inventory(
+        self, snap: SchemaSnapshot, tgt_engine: str, *, include_data: bool, stats: dict | None = None
+    ) -> dict:
+        """
+        Inventario de objetos + portabilidad + grafo de dependencias.
+
+        ``stats`` viene del catálogo del motor origen (``list_table_stats``). Este campo
+        estaba en el contrato desde el principio pero el diccionario que lo alimentaba nacía
+        vacío y nunca se poblaba, así que la UI no podía mostrar el tamaño de lo que se va a
+        copiar. ``row_estimate_known=False`` distingue "0 filas" de "el catálogo no lo sabe".
+        """
+        row_est: dict = stats or {}
         objects = []
         for otype, name in self._iter_objects(snap):
             portable, reason = self._portability(otype, snap.source_engine, tgt_engine)
+            st = row_est.get(name) if otype == "table" else None
             objects.append({
                 "object_type": otype, "name": name,
                 "portable": portable, "portability_reason": reason,
-                "row_estimate": row_est.get(name) if (include_data and otype == "table") else None,
+                "row_estimate": (
+                    st.estimated_rows if (st is not None and include_data) else None
+                ),
+                "row_estimate_known": st.estimated_rows_known if st is not None else True,
+                "has_primary_key": st.has_primary_key if st is not None else None,
             })
         auth, advisory = cdeps.build_graph(snap)
         cross = not _same_family(snap.source_engine, tgt_engine)
@@ -359,6 +395,49 @@ class CloneController:
         }
 
     # ------------------------------------------------------------------ #
+    # Guard de alcance                                                    #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _validate_scope(database: str, dialect: str, target) -> None:
+        """
+        Qué bases NO se pueden clonar por lo que SON, no por cómo se pidió.
+
+        Faltaba por completo en este módulo, que es el que más superficie destructiva tiene:
+        nada impedía apuntar un clon con ``clean_mode='objects'`` a la propia base de
+        metadatos del gateway y dropear ``audit_log``/``servers``/``server_users`` — o sea el
+        inventario, las credenciales pseudo-root cifradas de TODOS los servidores y la
+        auditoría, que es el único control compensatorio que el repo declara. Se aplica a los
+        DOS lados: el origen también, porque un clon lo LEE completo.
+
+        Se reusa el guard de la consola SQL (``query_policy.is_gateway_metadata_target``) en
+        vez de escribir un segundo criterio: resuelve ambos hosts a IPs e intersecta, así que
+        registrar el servidor por su IP en lugar de su nombre no lo evade.
+
+        ``target`` es OBLIGATORIO y sin default a propósito (mismo criterio que el export):
+        con un default, un llamador nuevo se saltearía el guard en silencio, que es
+        exactamente el modo de fallo que esto corrige.
+        """
+        validate_identifier(database, dialect, "base de datos", allow_existing=True)
+        ensure_not_reserved_database(database, dialect)
+        if query_policy.is_gateway_metadata_target(
+            host=target.host,
+            port=target.port,
+            database=database,
+            gateway_host=DB_HOST,
+            gateway_port=DB_PORT,
+            gateway_database=DB_NAME,
+        ):
+            raise AppHttpException(
+                message=(
+                    "Esa base de datos es la propia base de metadatos del gateway: no se "
+                    "puede usar como origen ni como destino de un clon."
+                ),
+                status_code=409,
+                public_context={"code": cspec.CODE_SCOPE_NOT_ALLOWED},
+                context={"database": database},
+            )
+
+    # ------------------------------------------------------------------ #
     # Crear plan                                                          #
     # ------------------------------------------------------------------ #
     def create_plan(self, data: dict, *, admin: dict | None = None) -> dict:
@@ -383,14 +462,33 @@ class CloneController:
         include_data = bool(data.get("include_data", False))
         adopt_target = bool(data.get("adopt_target", False))
         selection = data.get("selection")
+        # Traducción del atajo LEGACY al spec nuevo. El spec completo llega en el
+        # ``preview``; acá solo se fija el punto de partida para que un cliente viejo (que
+        # manda ``include_data`` y después previsualiza sin spec) obtenga exactamente el
+        # plan de siempre.
+        copy_intent = (
+            CLONE_COPY_STRUCTURE_AND_DATA if include_data else CLONE_COPY_STRUCTURE_ONLY
+        )
+        on_existing = (
+            (cspec.DataOnExisting.upsert.value
+             if cspec.legacy_upsert(target_mode, clean_mode)
+             else cspec.DataOnExisting.append.value)
+            if include_data
+            else None
+        )
 
         # Guarda: origen y destino no pueden ser la MISMA BD física.
         if src.server_id == tgt.server_id and src.database_name == tgt.database_name:
             raise AppHttpException(
                 message="El origen y el destino no pueden ser la misma base de datos.",
                 status_code=422,
+                public_context={"code": cspec.CODE_SAME_DATABASE},
                 context={"server_id": tgt.server_id, "database": tgt.database_name},
             )
+
+        # Alcance: qué bases no se pueden tocar, en los DOS lados.
+        self._validate_scope(src.database_name, src.engine, src.target)
+        self._validate_scope(tgt.database_name, tgt.engine, tgt.target)
 
         # Existencia en vivo del origen y del destino.
         src_adapter = get_adapter(src.target)
@@ -400,6 +498,7 @@ class CloneController:
             raise AppHttpException(
                 message=f"La BD origen '{src.database_name}' no existe en el servidor.",
                 status_code=404,
+                public_context={"code": cspec.CODE_SOURCE_NOT_FOUND},
                 context={"server_id": src.server_id, "database": src.database_name},
             )
         target_exists = tgt.database_name in tgt_adapter.list_databases()
@@ -407,18 +506,21 @@ class CloneController:
             raise AppHttpException(
                 message=f"La BD destino '{tgt.database_name}' ya existe. Usá target_mode='existing'.",
                 status_code=422,
+                public_context={"code": cspec.CODE_TARGET_ALREADY_EXISTS},
                 context={"server_id": tgt.server_id, "database": tgt.database_name},
             )
         if target_mode == CLONE_TARGET_EXISTING and not target_exists:
             raise AppHttpException(
                 message=f"La BD destino '{tgt.database_name}' no existe. Usá target_mode='new'.",
                 status_code=404,
+                public_context={"code": cspec.CODE_TARGET_NOT_FOUND},
                 context={"server_id": tgt.server_id, "database": tgt.database_name},
             )
         if clean_mode != CLONE_CLEAN_NONE and target_mode == CLONE_TARGET_NEW:
             raise AppHttpException(
                 message="clean_mode solo aplica a un destino existente (target_mode='existing').",
                 status_code=422,
+                public_context={"code": cspec.CODE_CONFLICTING_OPTIONS},
                 context={"clean_mode": clean_mode, "target_mode": target_mode},
             )
 
@@ -428,12 +530,14 @@ class CloneController:
                 raise AppHttpException(
                     message="adopt_target solo es válido en un clon COMPLETO (sin selección parcial).",
                     status_code=422,
+                    public_context={"code": cspec.CODE_ADOPT_REQUIRES_STRUCTURE},
                     context={},
                 )
             if src.model_id is None:
                 raise AppHttpException(
                     message="adopt_target requiere que el origen sea una BD gestionada con blueprint.",
                     status_code=422,
+                    public_context={"code": cspec.CODE_ADOPT_REQUIRES_STRUCTURE},
                     context={"source_managed_id": src.managed_id},
                 )
             # El owner del registro adoptado debe ser un ServerUser del servidor DESTINO.
@@ -445,6 +549,7 @@ class CloneController:
                     raise AppHttpException(
                         message="adopt_owner_id debe ser un usuario del servidor destino.",
                         status_code=422,
+                        public_context={"code": cspec.CODE_OWNER_INVALID},
                         context={"adopt_owner_id": owner_id, "target_server_id": tgt.server_id},
                     )
             finally:
@@ -472,6 +577,12 @@ class CloneController:
                 adopt_target=adopt_target,
                 adopt_owner_id=data.get("adopt_owner_id"),
                 selection=json.dumps(selection) if selection is not None else None,
+                # Predicado EXPLÍCITO, no inferido de ``selection is None``: con la selección
+                # declarativa resuelta a lista explícita, esa inferencia dejaba
+                # ``will_adopt`` en False para siempre y el auto-adopt se apagaba solo.
+                is_full_clone=selection is None,
+                copy_intent=copy_intent,
+                data_on_existing=on_existing,
                 source_fingerprint=src_fp,
                 expires_at=expires,
                 status=CLONE_STATUS_PENDING,
@@ -493,7 +604,8 @@ class CloneController:
             touched_engine=True,  # se snapshoteó el origen (solo lectura)
             detail=(
                 f"plan de clon {job_id}: {src.server_id}/{src.database_name} → "
-                f"{tgt.server_id}/{tgt.database_name} (data={include_data}, mode={target_mode})"
+                f"{tgt.server_id}/{tgt.database_name} "
+                f"(copy={copy_intent}, mode={target_mode}, clean={clean_mode})"
             ),
         )
         return result
@@ -519,18 +631,40 @@ class CloneController:
         finally:
             session.close()
 
-    def list_objects(self, job_id: int) -> dict:
-        """Inventario en vivo del origen + portabilidad + grafo de dependencias."""
+    def list_objects(self, job_id: int, *, with_estimates: bool = False) -> dict:
+        """
+        Inventario en vivo del origen + portabilidad + grafo de dependencias.
+
+        ``with_estimates`` es opt-in porque ``list_table_stats`` consulta el catálogo una vez
+        por tabla: en una BD con doscientas, pedirlo siempre convertiría este endpoint (10/min,
+        con el timeout interactivo por sentencia) en el más caro del módulo. Precedente:
+        ``?include_data_stats=true`` del endpoint de snapshot.
+        """
         session = self._session()
         try:
             job = self._job_or_404(session, job_id)
-            include_data = job.include_data
+            include_data = with_estimates or bool(job.include_data)
+            source_db = job.source_database_name
             src_target, _ = self._load_side_targets(job)
             tgt_engine = job.target_engine
         finally:
             session.close()
-        snap = get_adapter(src_target).structural_snapshot(job.source_database_name)
-        return self._build_inventory(snap, tgt_engine, include_data=include_data)
+        snap = get_adapter(src_target).structural_snapshot(source_db)
+        stats: dict = {}
+        if include_data:
+            # Estimaciones del CATÁLOGO (no un COUNT: contar recorrería cada tabla del
+            # origen, que es justo lo que un catálogo no debe hacer). Best-effort: si el
+            # motor las rechaza, el inventario sale igual sin ellas.
+            try:
+                stats = {
+                    st.table: st
+                    for st in get_adapter(src_target).list_table_stats(source_db)
+                }
+            except AppHttpException:
+                stats = {}
+        return self._build_inventory(
+            snap, tgt_engine, include_data=include_data, stats=stats
+        )
 
     def resolve_selection(self, job_id: int, selection: list[dict]) -> dict:
         """Cierre de dependencias (autoritativo) + advisory para una selección."""
@@ -584,14 +718,25 @@ class CloneController:
         target_snap: SchemaSnapshot | None,
         *,
         tgt_target: ServerTarget,
+        src_target: ServerTarget | None = None,
+        with_estimates: bool = False,
     ) -> _ExecutionPlan:
         """
         Arma el plan determinista: sentencias de limpieza (si aplica), sentencias de
         estructura (CREATE en el dialecto destino) y specs de datos. Reutiliza el pipeline
         diff+render: estructura = diff(origen_filtrado vs vacío) → 'new'; limpieza objeto
         por objeto = diff(vacío vs destino) → 'dropped'.
+
+        ``with_estimates`` solo se activa en los caminos de LECTURA (``objects``/``preview``):
+        la estimación de filas es informativa, cuesta una consulta de catálogo por tabla y no
+        entra al ``confirm_token`` — si entrara, un ``ANALYZE`` de fondo entre el preview y el
+        execute invalidaría el token sin que el plan haya cambiado. El worker no la pide.
         """
         selection = json.loads(job.selection) if job.selection else None
+        data_selection = json.loads(job.data_selection) if job.data_selection else None
+        intent = job.copy_intent or CLONE_COPY_STRUCTURE_ONLY
+        entity_ddl = cspec.entity_ddl_for(cspec.CopyIntent(intent))
+        wants_data = intent in (CLONE_COPY_STRUCTURE_AND_DATA, CLONE_COPY_DATA_ONLY)
         tgt_engine = job.target_engine
         tgt_adapter = get_adapter(tgt_target)
 
@@ -599,28 +744,33 @@ class CloneController:
         filtered = self._filter_snapshot(source_snap, keys)
 
         # --- Estructura: diff(origen filtrado vs destino vacío) → todo 'new' ---------- #
-        empty_tgt = self._empty_snapshot(tgt_engine, job.target_database_name)
-        struct_diff = diff_snapshots(filtered, empty_tgt)
-        rendered = tgt_adapter.render_diff(struct_diff)
-
+        # Con ``entity_ddl=NONE`` (copy='data_only') NO se emite una sola sentencia. El
+        # snapshot filtrado se sigue calculando: lo necesitan las specs de datos, el orden
+        # topológico y el guard de compatibilidad.
         structure: list[_StructStmt] = []
         skipped: list[dict] = []
-        skipped_names: set[str] = set()
-        for r in rendered:
-            portable, reason = self._portability(r.object_type, source_snap.source_engine, tgt_engine)
-            if portable:
-                sql = r.sql
-                if r.object_type in _BODY_TYPES:
-                    sql = self._requalify_body(
-                        sql, source_snap.database, job.target_database_name, tgt_engine
-                    )
-                structure.append(_StructStmt("structure", r.object_type, r.object_name, sql))
-            elif r.object_name not in skipped_names:
-                skipped_names.add(r.object_name)
-                skipped.append({
-                    "object_type": r.object_type, "name": r.object_name,
-                    "portable": False, "portability_reason": reason, "row_estimate": None,
-                })
+        if entity_ddl != espec.EntityDdl.NONE:
+            empty_tgt = self._empty_snapshot(tgt_engine, job.target_database_name)
+            struct_diff = diff_snapshots(filtered, empty_tgt)
+            rendered = tgt_adapter.render_diff(struct_diff)
+            skipped_names: set[str] = set()
+            for r in rendered:
+                portable, reason = self._portability(
+                    r.object_type, source_snap.source_engine, tgt_engine
+                )
+                if portable:
+                    sql = r.sql
+                    if r.object_type in _BODY_TYPES:
+                        sql = self._requalify_body(
+                            sql, source_snap.database, job.target_database_name, tgt_engine
+                        )
+                    structure.append(_StructStmt("structure", r.object_type, r.object_name, sql))
+                elif r.object_name not in skipped_names:
+                    skipped_names.add(r.object_name)
+                    skipped.append({
+                        "object_type": r.object_type, "name": r.object_name,
+                        "portable": False, "portability_reason": reason, "row_estimate": None,
+                    })
 
         # --- Limpieza objeto por objeto (solo clean_mode='objects') ------------------- #
         # 'drop_database' NO produce sentencias aquí: es una operación a nivel servidor que
@@ -634,13 +784,40 @@ class CloneController:
 
         # --- Datos ------------------------------------------------------------------- #
         data_specs: list[_DataSpec] = []
-        if job.include_data:
-            # upsert si preservamos un destino existente; INSERT plano si está limpio/nuevo.
-            upsert = job.clean_mode == CLONE_CLEAN_NONE and job.target_mode == CLONE_TARGET_EXISTING
-            table_keys = {name for (ot, name) in (keys or set()) if ot == "table"} if keys else None
-            ordered = self._data_table_order(filtered)
+        notices: list[dict] = []
+        stats: dict = {}
+        if wants_data and with_estimates and src_target is not None:
+            # Estimaciones del CATÁLOGO (no un COUNT): informan el tamaño de lo que se va a
+            # copiar, que hasta ahora el contrato prometía y nunca poblaba.
+            try:
+                stats = {
+                    st.table: st
+                    for st in get_adapter(src_target).list_table_stats(source_snap.database)
+                }
+            except AppHttpException:
+                stats = {}  # informativo: su ausencia no invalida el plan
+        if wants_data:
+            on_existing = job.data_on_existing
+            upsert = (
+                on_existing == cspec.DataOnExisting.upsert.value
+                if on_existing
+                else cspec.legacy_upsert(job.target_mode, job.clean_mode)
+            )
+            if data_selection is not None:
+                # Eje de datos PROPIO (ya con su cierre por FK resuelto en el preview).
+                table_names: set[str] | None = set(data_selection)
+                order_source = self._filter_snapshot(
+                    source_snap, {("table", n) for n in table_names}
+                )
+            else:
+                # Camino histórico: las tablas con datos se derivan del cierre de estructura.
+                table_names = (
+                    {name for (ot, name) in (keys or set()) if ot == "table"} if keys else None
+                )
+                order_source = filtered
+            ordered = self._data_table_order(order_source)
             for t in ordered:
-                if table_keys is not None and t.table not in table_keys:
+                if table_names is not None and t.table not in table_names:
                     continue
                 # Datos solo si la tabla es portable (misma familia siempre; cross-family: sí).
                 portable, _ = self._portability("table", source_snap.source_engine, tgt_engine)
@@ -649,26 +826,266 @@ class CloneController:
                 # Columnas GENERATED (STORED/VIRTUAL) se excluyen: el motor las recalcula
                 # solo. Escribirles un valor explicito da un warning (MySQL 1906) que en
                 # sql_mode estricto se promueve a error y aborta la tabla completa.
+                st = stats.get(t.table)
                 data_specs.append(_DataSpec(
                     table=t.table,
                     columns=[c.name for c in t.columns if c.computed is None],
                     primary_key=list(t.primary_key),
                     upsert=upsert,
-                    row_estimate=None,
+                    row_estimate=st.estimated_rows if st is not None else None,
+                    row_estimate_known=st.estimated_rows_known if st is not None else True,
+                    has_primary_key=(
+                        st.has_primary_key if st is not None else bool(t.primary_key)
+                    ),
                 ))
+
+        # --- Guard de compatibilidad del DESTINO -------------------------------------- #
+        # Solo cuando este job NO crea la estructura (copy='data_only'): si la crea, las
+        # tablas nacen con el esquema del origen y no hay nada que reconciliar. Acá el motor
+        # NO es la red de seguridad en la familia MySQL (``LOAD DATA LOCAL`` degrada los
+        # errores de tipo a warnings), así que este guard es la única defensa.
+        issues: list[cspec.CompatIssue] = []
+        if data_specs and entity_ddl == espec.EntityDdl.NONE:
+            issues = cspec.data_compat_issues(
+                source=source_snap,
+                target=target_snap,
+                data_columns={d.table: d.columns for d in data_specs},
+                source_engine=source_snap.source_engine,
+                target_engine=tgt_engine,
+            )
+            notices.extend(self._trigger_notices(target_snap, data_specs, tgt_engine))
+
+        for d in data_specs:
+            if d.upsert and d.has_primary_key is False:
+                notices.append({
+                    "code": cspec.WARN_UPSERT_WITHOUT_PRIMARY_KEY,
+                    "message": (
+                        f"La tabla '{d.table}' no tiene clave primaria: el modo 'upsert' "
+                        f"degrada a INSERT simple, así que volver a ejecutar este job "
+                        f"duplicaría sus filas."
+                    ),
+                    "severity": "warning",
+                    "detail": {"table": d.table},
+                })
+        notices.extend(self._charset_notices(job, source_snap))
+        notices.extend(self._owner_notices(job))
+
+        legacy_warnings = (
+            self._autoincrement_pk_warnings(filtered, tgt_engine)
+            if entity_ddl != espec.EntityDdl.NONE
+            else []
+        ) + self._external_fk_warnings(tgt_adapter, job)
+        # ``warnings`` conserva su tipo (lista de strings) porque el cliente descarta la
+        # respuesta ENTERA si el schema no valida; ``notices`` es la versión con código del
+        # mismo contenido.
+        for w in legacy_warnings:
+            notices.append({
+                "code": cspec.WARN_AUTOINCREMENT_KEY_ADDED
+                if "AUTO_INCREMENT" in w
+                else cspec.WARN_EXTERNAL_FK_DEPENDENTS,
+                "message": w,
+                "severity": "warning",
+                "detail": {},
+            })
+        for issue in issues:
+            if not issue.blocking:
+                notices.append({
+                    "code": cspec.WARN_SCHEMA_DIFFERENCE,
+                    "message": self._issue_message(issue),
+                    "severity": "warning",
+                    "detail": {
+                        "table": issue.table, "column": issue.column,
+                        "reason": issue.reason, **issue.detail,
+                    },
+                })
 
         return _ExecutionPlan(
             clean_statements=clean,
             structure_statements=structure,
             data_specs=data_specs,
             skipped=skipped,
-            will_adopt=job.adopt_target and selection is None and job.source_database_id is not None,
+            will_adopt=job.adopt_target and job.is_full_clone and job.source_database_id is not None,
             table_order=[t.table for t in self._data_table_order(filtered)],
-            warnings=(
-                self._autoincrement_pk_warnings(filtered, tgt_engine)
-                + self._external_fk_warnings(tgt_adapter, job)
-            ),
+            warnings=legacy_warnings + [
+                self._issue_message(i) for i in issues if not i.blocking
+            ],
+            blocking_issues=[
+                {
+                    "table": i.table, "reason": i.reason, "blocking": True,
+                    "column": i.column, "detail": i.detail,
+                }
+                for i in issues
+                if i.blocking
+            ],
+            notices=notices,
         )
+
+    # ------------------------------------------------------------------ #
+    # Avisos derivados del plan                                           #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _issue_message(issue) -> str:
+        """Texto legible de una incompatibilidad, desde vocabulario CERRADO."""
+        where = f"{issue.table}.{issue.column}" if issue.column else issue.table
+        texts = {
+            cspec.REASON_TARGET_NOT_INSPECTED: "no se pudo inspeccionar el esquema del destino",
+            cspec.REASON_TABLE_MISSING: "la tabla no existe en el destino",
+            cspec.REASON_TABLE_IS_VIEW: "en el destino ese nombre es una vista, no una tabla",
+            cspec.REASON_COLUMN_MISSING: "la columna no existe en el destino",
+            cspec.REASON_TARGET_NOT_NULL_NO_DEFAULT: (
+                "el destino tiene esa columna NOT NULL y sin default, y el origen no la aporta"
+            ),
+            cspec.REASON_TARGET_GENERATED: "en el destino esa columna es GENERATED (no admite escritura)",
+            cspec.REASON_TARGET_IDENTITY_ALWAYS: (
+                "en el destino esa columna es IDENTITY ALWAYS (no admite un valor explícito)"
+            ),
+            cspec.REASON_TYPE_NARROWING: (
+                "el tipo del destino es más chico que el del origen: los valores se truncarían"
+            ),
+            cspec.REASON_UNSIGNED_TO_SIGNED: (
+                "el origen es UNSIGNED y el destino no: los valores altos no entran"
+            ),
+            cspec.REASON_COLLATION_ON_KEY: (
+                "la collation difiere en una columna de clave: dos filas del origen pueden "
+                "colapsar en una sola en el destino"
+            ),
+            cspec.REASON_COLLATION_DIFFERS: "la collation de la columna difiere",
+            cspec.REASON_TARGET_UNIQUE_EXTRA: (
+                "el destino tiene una clave única que el origen no: puede rechazar o "
+                "descartar filas"
+            ),
+            cspec.REASON_TARGET_CHECK_EXTRA: "el destino tiene un CHECK que el origen no",
+            cspec.REASON_TARGET_FK_OUTSIDE_SELECTION: (
+                "el destino tiene una FK hacia una tabla que este job no puebla: quedarían "
+                "filas huérfanas (la copia corre con las FKs desactivadas y el motor no las "
+                "revalida)"
+            ),
+            cspec.REASON_TYPE_DIFFERS: "el tipo de la columna difiere",
+            cspec.REASON_TYPES_NOT_VERIFIED: (
+                "origen y destino son de familias distintas: la fidelidad de los tipos no se "
+                "verificó"
+            ),
+            cspec.REASON_TYPE_NOT_LOADABLE: (
+                "el tipo del destino no se puede alimentar desde la otra familia de motores"
+            ),
+            cspec.REASON_SOURCE_NULLABLE_TARGET_NOT_NULL: (
+                "el origen admite NULL y el destino no: una fila con NULL fallaría"
+            ),
+        }
+        return f"{where}: {texts.get(issue.reason, issue.reason)}"
+
+    @staticmethod
+    def _trigger_notices(target_snap, data_specs, tgt_engine) -> list[dict]:
+        """
+        Triggers del DESTINO que van a dispararse durante la copia.
+
+        Toda la maquinaria de ``_POST_DATA_BODY_TYPES`` existe porque un trigger de INSERT
+        que puebla otra tabla, disparado durante la copia, duplica filas (ER_DUP_ENTRY 1062
+        en una pivote). Pero esa defensa solo cubre los triggers que ESTE job crea: los
+        difiere hasta después de los datos. En 'data_only' no se crea ninguno — los del
+        destino ya están, vivos.
+
+        Reparto por motor, y el aviso se emite en los DOS porque la garantía de PostgreSQL no
+        es firme: ``session_replication_role='replica'`` los apaga, pero es un ``SET`` de
+        superusuario cuyo error se traga (best-effort en ``data_copy``), así que un
+        pseudo-root sin ese privilegio deja los triggers activos sin que nada falle. Prometer
+        que allá no hay nada que advertir sería fail-open.
+        """
+        if target_snap is None:
+            return []
+        tables = {d.table for d in data_specs}
+        affected: dict[str, list[str]] = {}
+        for tg in target_snap.triggers:
+            if tg.table in tables:
+                affected.setdefault(tg.table, []).append(tg.name)
+        if not affected:
+            return []
+        listed = ", ".join(
+            f"{t} ({', '.join(sorted(names))})" for t, names in sorted(affected.items())
+        )
+        if tgt_engine in ("mysql", "mariadb"):
+            msg = (
+                f"El destino tiene triggers sobre tablas que van a recibir filas y VAN A "
+                f"DISPARARSE durante la copia: {listed}. En MySQL/MariaDB no hay forma "
+                f"portable de desactivarlos (FOREIGN_KEY_CHECKS=0 no los apaga), así que si "
+                f"alguno escribe en otra tabla, la va a modificar."
+            )
+        else:
+            msg = (
+                f"El destino tiene triggers sobre tablas que van a recibir filas: {listed}. "
+                f"El gateway intenta desactivarlos con session_replication_role='replica', "
+                f"pero eso requiere superusuario: si el motor lo rechaza, los triggers "
+                f"disparan igual."
+            )
+        return [{
+            "code": cspec.WARN_TARGET_TRIGGERS_WILL_FIRE,
+            "message": msg,
+            "severity": "warning",
+            "detail": {"tables": {t: sorted(n) for t, n in affected.items()}},
+        }]
+
+    @staticmethod
+    def _charset_notices(job: CloneJob, source_snap: SchemaSnapshot) -> list[dict]:
+        """
+        Consecuencia de elegir un charset/collation distinto del origen.
+
+        Las tablas que se crean SIN collation explícita heredan el default de la BD, así que
+        un diff posterior origen↔destino va a marcar diferencias. Y el síntoma es ASIMÉTRICO:
+        en MySQL/MariaDB ``COLLATION_NAME`` trae siempre la collation física resuelta, así
+        que el diff grita en toda columna textual; en PostgreSQL es NULL cuando se hereda, así
+        que el diff se queda CALLADO mientras el orden real de los índices cambió. El silencio
+        es el caso peor, y por eso se avisa antes.
+        """
+        if not job.target_charset and not job.target_collation:
+            return []
+        src_cs = getattr(source_snap, "db_charset", None)
+        src_co = getattr(source_snap, "db_collation", None)
+        if (job.target_charset or src_cs) == src_cs and (job.target_collation or src_co) == src_co:
+            return []
+        return [{
+            "code": cspec.WARN_CHARSET_DIFFERS_FROM_SOURCE,
+            "message": (
+                f"La BD destino se creará con "
+                f"{job.target_charset or '(default)'}/{job.target_collation or '(default)'}, "
+                f"distinto del origen ({src_cs or '?'}/{src_co or '?'}). Las tablas que se "
+                f"creen sin collation explícita heredarán el default del destino, así que un "
+                f"diff posterior entre las dos bases va a reportar diferencias — y en "
+                f"PostgreSQL puede NO reportarlas aunque el orden de los índices haya "
+                f"cambiado."
+            ),
+            "severity": "warning",
+            "detail": {
+                "target_charset": job.target_charset,
+                "target_collation": job.target_collation,
+                "source_charset": src_cs,
+                "source_collation": src_co,
+            },
+        }]
+
+    @staticmethod
+    def _owner_notices(job: CloneJob) -> list[dict]:
+        """
+        Qué logra REALMENTE el owner en PostgreSQL, dicho sin adornos.
+
+        ``CREATE DATABASE … OWNER x`` fija el dueño de la BASE y nada más: las tablas, vistas
+        y secuencias las crea la conexión pseudo-root y quedan con SU propiedad, así que el
+        dueño pedido no puede ``ALTER`` ni ``DROP`` sus propios objetos. Reasignarlos requiere
+        ``SET ROLE``/``REASSIGN OWNED``, que es trabajo aparte. Prometer "la copia queda a
+        nombre de x" sin esto sería mentir.
+        """
+        if not job.target_owner:
+            return []
+        return [{
+            "code": cspec.WARN_OWNER_OBJECTS_NOT_REASSIGNED,
+            "message": (
+                f"La BD destino se creará con OWNER '{job.target_owner}', pero los objetos "
+                f"(tablas, vistas, secuencias) los crea la credencial administrativa del "
+                f"gateway y quedan con SU propiedad: '{job.target_owner}' será dueño de la "
+                f"base, no de su contenido."
+            ),
+            "severity": "info",
+            "detail": {"owner": job.target_owner},
+        }]
 
     @staticmethod
     def _external_fk_warnings(tgt_adapter, job: CloneJob) -> list[str]:
@@ -820,14 +1237,60 @@ class CloneController:
         return sorted(snap.tables, key=lambda t: (rank.get(t.table, 0), t.table))
 
     # ------------------------------------------------------------------ #
+    # Snapshots que el plan necesita                                      #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _needs_target_snapshot(job: CloneJob) -> bool:
+        """
+        ¿Hay que inspeccionar el destino para armar el plan?
+
+        Dos casos, y solo dos: ``clean_mode='objects'`` (hay que rendear los DROP de lo que
+        el destino tenga) y ``copy='data_only'`` (el guard de compatibilidad compara contra el
+        esquema real del destino). La condición vive ACÁ y no repetida en cada llamador: el
+        plan se arma en TRES lugares (preview, execute y el worker) y el que quedara sin el
+        snapshot armaría un plan sin guard, en silencio.
+        """
+        if job.target_mode != CLONE_TARGET_EXISTING:
+            return False
+        if job.clean_mode == CLONE_CLEAN_OBJECTS:
+            return True
+        return cspec.entity_ddl_for(
+            cspec.CopyIntent(job.copy_intent or CLONE_COPY_STRUCTURE_ONLY)
+        ) == espec.EntityDdl.NONE
+
+    def _snapshots_for(
+        self, job: CloneJob, src_target: ServerTarget, tgt_target: ServerTarget
+    ) -> tuple[SchemaSnapshot, SchemaSnapshot | None]:
+        """Snapshot del origen (siempre) y del destino (si el plan depende de él)."""
+        source_snap = get_adapter(src_target).structural_snapshot(job.source_database_name)
+        target_snap = None
+        if self._needs_target_snapshot(job):
+            target_snap = get_adapter(tgt_target).structural_snapshot(job.target_database_name)
+        return source_snap, target_snap
+
+    # ------------------------------------------------------------------ #
     # Token de confirmación                                               #
     # ------------------------------------------------------------------ #
     @staticmethod
     def clone_execution_token(
-        target_ref: str, target_engine: str, plan: _ExecutionPlan, *, clean_mode: str, target_mode: str
+        target_ref: str, target_engine: str, plan: _ExecutionPlan, *, clean_mode: str,
+        target_mode: str, copy_intent: str, on_existing: str | None,
+        target_charset: str | None, target_collation: str | None, target_owner: str | None,
     ) -> str:
-        """SHA256 del plan EXACTO (modo destino/limpieza + estructura + tablas de datos + adopt)."""
-        parts: list[str] = [str(target_ref), str(target_engine), clean_mode, target_mode]
+        """
+        SHA256 del plan EXACTO.
+
+        Los ejes del CONTENEDOR (charset, collation, owner) y la intención entran
+        explícitamente: no están en el texto de ninguna sentencia —el ``CREATE DATABASE`` lo
+        arma el worker desde los campos del job—, así que sin esto se podría previsualizar con
+        un charset y ejecutar con otro. Las ESTIMACIONES de filas quedan afuera a propósito:
+        un ``ANALYZE`` de fondo entre el preview y el execute invalidaría el token sin que el
+        plan haya cambiado.
+        """
+        parts: list[str] = [
+            str(target_ref), str(target_engine), clean_mode, target_mode, str(copy_intent),
+            str(on_existing), str(target_charset), str(target_collation), str(target_owner),
+        ]
         for s in plan.clean_statements:
             parts.append(f"clean:{s.object_type}:{s.sql}")
         for s in plan.structure_statements:
@@ -838,42 +1301,381 @@ class CloneController:
         blob = "\x1f".join(parts)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
+    def _token_for(self, job: CloneJob, plan: _ExecutionPlan) -> str:
+        """``clone_execution_token`` con todos los ejes tomados del job (una sola fuente)."""
+        return self.clone_execution_token(
+            f"{job.target_server_id}:{job.target_database_name}",
+            job.target_engine,
+            plan,
+            clean_mode=job.clean_mode,
+            target_mode=job.target_mode,
+            copy_intent=job.copy_intent or CLONE_COPY_STRUCTURE_ONLY,
+            on_existing=job.data_on_existing,
+            target_charset=job.target_charset,
+            target_collation=job.target_collation,
+            target_owner=job.target_owner,
+        )
+
     # ------------------------------------------------------------------ #
-    # Preview                                                             #
+    # Preview: acá se CONGELA el spec                                      #
     # ------------------------------------------------------------------ #
-    def preview(self, job_id: int, selection: list[dict] | None, *, update_selection: bool = False) -> dict:
+    def _apply_spec(self, session, job: CloneJob, spec: dict, sent: set[str]) -> None:
         """
-        Resuelve el plan final SIN ejecutar y devuelve el ``confirm_token``. Si
-        ``update_selection`` es True, ``selection`` (incluida None = clon completo) reemplaza
-        la del plan y se re-persiste.
+        Persiste en el job los ejes que el cliente MANDÓ, valida su coherencia y resuelve la
+        selección declarativa contra el catálogo del origen.
+
+        ``sent`` son los campos presentes en el request (``model_fields_set``), no los que
+        tienen valor: un campo ausente deja lo que el plan ya tenía. Antes ``preview``
+        persistía ``selection = None`` en cada llamada, así que un ``POST /preview {}``
+        descartaba la selección que el operador había armado y devolvía —con token válido— el
+        plan de un clon COMPLETO.
         """
+        if "copy_intent" in sent and spec.get("copy_intent") is not None:
+            job.copy_intent = str(spec["copy_intent"])
+        intent = cspec.CopyIntent(job.copy_intent or CLONE_COPY_STRUCTURE_ONLY)
+
+        # --- Selección de estructura: refs exactas o declarativa ------------------- #
+        source_snap = None
+        if "selection" in sent:
+            sel = spec.get("selection")
+            job.selection = json.dumps(sel) if sel is not None else None
+            job.is_full_clone = sel is None
+        elif "structure" in sent and spec.get("structure") is not None:
+            st = spec["structure"]
+            source_snap = get_adapter(
+                build_target(get_server_or_404(session, job.source_server_id))
+            ).structural_snapshot(job.source_database_name)
+            catalog = [
+                espec.CatalogObject(object_type=ot, name=name)
+                for ot, name in self._iter_objects(source_snap)
+            ]
+            resolved = espec.resolve_selection(
+                catalog,
+                espec.Selection(
+                    mode=espec.SelectionMode(st.get("mode", "all")),
+                    types=tuple(st.get("types") or ()),
+                    names=tuple(st.get("names") or ()),
+                    include_patterns=tuple(st.get("include_patterns") or ()),
+                    exclude_patterns=tuple(st.get("exclude_patterns") or ()),
+                ),
+            )
+            self._reject_unknown_names(resolved, st.get("mode", "all"), "structure")
+            full = (
+                st.get("mode", "all") == "all"
+                and not st.get("names")
+                and not st.get("include_patterns")
+                and not st.get("exclude_patterns")
+            )
+            job.selection = None if full else json.dumps(
+                [{"object_type": o.object_type, "name": o.name} for o in resolved.objects]
+            )
+            job.is_full_clone = full
+
+        # --- Selección de datos ---------------------------------------------------- #
+        data = spec.get("data") if "data" in sent else None
+        data_mode = "none"
+        if data is not None:
+            data_mode = data.get("mode", "none")
+            if data.get("on_existing") is not None:
+                job.data_on_existing = str(data["on_existing"])
+            if data_mode == "none":
+                job.data_selection = None
+                job.data_on_existing = None
+            else:
+                if source_snap is None:
+                    source_snap = get_adapter(
+                        build_target(get_server_or_404(session, job.source_server_id))
+                    ).structural_snapshot(job.source_database_name)
+                tables = espec.resolve_selection(
+                    [
+                        espec.CatalogObject(object_type="table", name=t.table)
+                        for t in source_snap.tables
+                    ],
+                    espec.Selection(
+                        mode=espec.DataSelectionMode(data_mode),
+                        types=("table",),
+                        names=tuple(data.get("names") or ()),
+                        include_patterns=tuple(data.get("include_patterns") or ()),
+                        exclude_patterns=tuple(data.get("exclude_patterns") or ()),
+                    ),
+                )
+                self._reject_unknown_names(tables, data_mode, "data")
+                # CIERRE POR FK. Hasta ahora el conjunto de tablas con datos se DERIVABA del
+                # cierre autoritativo de la estructura, así que copiar 'orders' arrastraba
+                # 'customers' por construcción. Con el eje de datos independiente esa
+                # invariante desaparecía, y la fase de datos corre con las FKs desactivadas y
+                # el motor NUNCA las revalida: el resultado serían filas huérfanas
+                # permanentes, sin un solo error.
+                closure = cdeps.resolve_closure(
+                    source_snap,
+                    [
+                        cdeps.ObjectRef(object_type="table", name=o.name)
+                        for o in tables.objects
+                    ],
+                )
+                names = [r.name for r in closure.closure if r.object_type == "table"]
+                job.data_selection = json.dumps(names)
+        elif job.data_selection is None and intent is cspec.CopyIntent.data_only:
+            # ``data_only`` sin bloque de datos: no hay nada que copiar y el plan quedaría
+            # vacío. Lo reporta ``validate_spec`` más abajo con su código.
+            data_mode = "none"
+        elif job.data_selection is not None:
+            data_mode = "include"
+        elif intent is not cspec.CopyIntent.structure_only:
+            data_mode = "all"
+
+        # --- Charset/collation del destino ----------------------------------------- #
+        if "target_charset" in sent and spec.get("target_charset") is not None:
+            cs = spec["target_charset"]
+            if cs.get("mode") == "override":
+                job.target_charset, job.target_collation = self._resolve_charset(
+                    job, cs.get("charset"), cs.get("collation")
+                )
+            else:
+                job.target_charset = None
+                job.target_collation = None
+
+        # --- Owner (solo PostgreSQL) ----------------------------------------------- #
+        if "target_owner_user_id" in sent:
+            owner_id = spec.get("target_owner_user_id")
+            if owner_id is None:
+                job.target_owner_user_id = None
+                job.target_owner = None
+            else:
+                owner = session.get(ServerUser, owner_id)
+                if owner is None or owner.server_id != job.target_server_id:
+                    raise AppHttpException(
+                        message="target_owner_user_id debe ser un usuario del servidor destino.",
+                        status_code=422,
+                        public_context={"code": cspec.CODE_OWNER_INVALID},
+                        context={"target_owner_user_id": owner_id},
+                    )
+                job.target_owner_user_id = owner.id
+                job.target_owner = owner.username
+
+        # --- Coherencia del spec completo ------------------------------------------ #
+        violations = cspec.validate_spec(
+            intent=intent,
+            data_mode=data_mode,
+            on_existing=(
+                cspec.DataOnExisting(job.data_on_existing) if job.data_on_existing else None
+            ),
+            target_mode=job.target_mode,
+            clean_mode=job.clean_mode,
+            adopt_target=job.adopt_target,
+            charset_override=bool(job.target_charset or job.target_collation),
+            owner_requested=job.target_owner is not None,
+            target_engine=job.target_engine,
+        )
+        if violations:
+            first = violations[0]
+            raise AppHttpException(
+                message=first.message,
+                status_code=422,
+                public_context={
+                    "code": first.code,
+                    "violations": [
+                        {"code": v.code, "message": v.message, **v.detail} for v in violations
+                    ],
+                },
+                context={"violations": [v.code for v in violations]},
+            )
+
+        # --- datos ⊆ estructura ---------------------------------------------------- #
+        self._check_data_subset(job, intent)
+        job.include_data = intent is not cspec.CopyIntent.structure_only
+
+    @staticmethod
+    def _reject_unknown_names(resolved, mode: str, which: str) -> None:
+        """
+        Un nombre pedido EXPLÍCITAMENTE que el catálogo no tiene es un 422, no un silencio.
+
+        Sin esto, "copiá los datos de pedidos_2024" mal tecleado resuelve a la lista vacía y
+        el job termina ``succeeded`` con 0 filas copiadas. En ``all_except`` es solo un aviso
+        (excluir algo que ya no existe es un spec viejo, no un error), mismo criterio que el
+        export.
+        """
+        if resolved.unknown_names and mode == "include":
+            raise AppHttpException(
+                message=(
+                    f"Estos nombres no existen en el origen: "
+                    f"{', '.join(resolved.unknown_names)}."
+                ),
+                status_code=422,
+                public_context={
+                    "code": cspec.CODE_UNKNOWN_NAMES,
+                    "unknown_names": list(resolved.unknown_names),
+                    "selection": which,
+                },
+                context={},
+            )
+
+    def _check_data_subset(self, job: CloneJob, intent) -> None:
+        """
+        ``datos ⊆ estructura``, con la excepción ya razonada del export: si el DDL del
+        contenedor y el de las entidades son ambos ``NONE``, la copia es "solo datos" y la
+        restricción no aplica. Se reusa ``export_spec.check_data_subset`` en vez de repetir el
+        criterio.
+
+        Se compara contra el CIERRE de la selección de estructura (lo que realmente se va a
+        crear), no contra la selección cruda: contra la cruda, una tabla de datos que el
+        cierre sí iba a incluir daría un 422 espurio.
+        """
+        if not job.data_selection:
+            return
+        data_tables = json.loads(job.data_selection)
+        structure_keys: set[str] = set()
+        if job.selection:
+            structure_keys = {
+                r["name"] for r in json.loads(job.selection) if r["object_type"] == "table"
+            }
+        structure_sel = espec.ResolvedSelection(
+            objects=tuple(
+                espec.CatalogObject(object_type="table", name=n) for n in structure_keys
+            )
+        )
+        data_sel = espec.ResolvedSelection(
+            objects=tuple(
+                espec.CatalogObject(object_type="table", name=n) for n in data_tables
+            )
+        )
+        opts = espec.StructureOptions(
+            scope_ddl=cspec.scope_ddl_for(job.target_mode, job.clean_mode),
+            entity_ddl=cspec.entity_ddl_for(intent),
+        )
+        # Un clon COMPLETO cubre todas las tablas: no hay selección de estructura que
+        # comparar y la restricción se satisface trivialmente.
+        if job.is_full_clone and opts.entity_ddl != espec.EntityDdl.NONE:
+            return
+        missing = espec.check_data_subset(structure_sel, data_sel, opts)
+        if missing:
+            raise AppHttpException(
+                message=(
+                    f"Estas tablas piden datos pero no están en la selección de estructura, "
+                    f"así que no existirían en el destino: {', '.join(sorted(missing))}."
+                ),
+                status_code=422,
+                public_context={
+                    "code": cspec.CODE_DATA_WITHOUT_STRUCTURE,
+                    "tables": sorted(missing),
+                },
+                context={},
+            )
+
+    def _resolve_charset(
+        self, job: CloneJob, charset: str | None, collation: str | None
+    ) -> tuple[str | None, str | None]:
+        """
+        Valida el par contra el catálogo GLOBAL y devuelve su forma CANÓNICA.
+
+        Dos capas, y la segunda no es opcional: el catálogo es necesario pero **no
+        suficiente**. ``engine_family`` mete MySQL y MariaDB en la misma familia y no tienen
+        las mismas collations (``utf8mb4_0900_ai_ci`` es solo de MySQL 8, las
+        ``utf8mb4_uca1400_*`` solo de MariaDB reciente), y en PostgreSQL la collation es un
+        locale del SISTEMA OPERATIVO que puede no existir en ese host. Así que después del
+        catálogo se pregunta al MOTOR destino.
+
+        Que esto corra en el ``preview`` —y no en el worker— es lo que evita el peor caso: con
+        ``clean_mode='drop_database'`` el pipeline hace DROP y después CREATE, así que un par
+        que el motor rechaza dejaría el destino BORRADO y el job fallado.
+        """
+        dialect = job.target_engine
+        try:
+            canon_cs, canon_co = charset_catalog.resolve_enabled_combination(
+                dialect, charset, collation
+            )
+        except AppHttpException as exc:
+            raise AppHttpException(
+                message=exc.message,
+                status_code=422,
+                public_context={
+                    "code": cspec.CODE_CHARSET_COMBINATION_DISABLED,
+                    "charset": charset,
+                    "collation": collation,
+                },
+                context={"dialect": dialect},
+            ) from exc
+        if canon_cs is None and canon_co is None:
+            return None, None
+        session = self._session()
+        try:
+            tgt_server = get_server_or_404(session, job.target_server_id)
+            tgt_target = build_target(tgt_server)
+        finally:
+            session.close()
+        adapter = get_adapter(tgt_target)
+        supported = adapter.supports_charset_combination(canon_cs, canon_co)
+        if supported is False:
+            raise AppHttpException(
+                message=(
+                    f"El servidor destino no ofrece la combinación "
+                    f"{canon_cs or '(default)'}/{canon_co or '(default)'}. El catálogo la "
+                    f"habilita, pero este motor concreto no la tiene."
+                ),
+                status_code=422,
+                public_context={
+                    "code": cspec.CODE_CHARSET_UNSUPPORTED_BY_ENGINE,
+                    "charset": canon_cs,
+                    "collation": canon_co,
+                },
+                context={"server_id": job.target_server_id},
+            )
+        return canon_cs, canon_co
+
+    def preview(self, job_id: int, *, spec: dict | None = None, sent: set[str] | None = None) -> dict:
+        """
+        Resuelve el plan final SIN ejecutar, lo CONGELA y devuelve el ``confirm_token``.
+
+        ``sent`` son los campos PRESENTES en el request; ``spec`` sus valores. La distinción no
+        es cosmética: ``selection: null`` significa "clon completo" y su AUSENCIA significa "no
+        toques la selección". El parámetro posicional ``selection`` y el flag
+        ``update_selection`` que existían antes se eliminaron a propósito: hacían que la
+        selección se sobrescribiera en cada llamada, y dejarlos como parámetros muertos sería
+        dejar servido el mismo error para el próximo llamador.
+
+        Si hay ``blocking_issues`` el plan se devuelve igual (200) pero **sin token**: el
+        operador tiene que poder VER por qué no se puede ejecutar. Un 422 acá dejaría la
+        pantalla vacía con un "incompatible" y sin forma de diagnosticar.
+        """
+        spec = dict(spec or {})
+        sent = set(sent or ())
+
         session = self._session()
         try:
             job = self._job_or_404(session, job_id)
             self._assert_not_expired(job)
-            if update_selection:
-                job.selection = json.dumps(selection) if selection is not None else None
+            self._guard_still_pending(job)
+            if sent:
+                self._apply_spec(session, job, spec, sent)
                 session.commit()
                 session.refresh(job)
             src_server = get_server_or_404(session, job.source_server_id)
             tgt_server = get_server_or_404(session, job.target_server_id)
             src_target = build_target(src_server)
             tgt_target = build_target(tgt_server)
-            source_snap = get_adapter(src_target).structural_snapshot(job.source_database_name)
-            target_snap = None
-            if job.clean_mode == CLONE_CLEAN_OBJECTS:
-                target_snap = get_adapter(tgt_target).structural_snapshot(job.target_database_name)
-            plan = self._build_execution_plan(job, source_snap, target_snap, tgt_target=tgt_target)
-            target_ref = f"{job.target_server_id}:{job.target_database_name}"
+            source_snap, target_snap = self._snapshots_for(job, src_target, tgt_target)
+            plan = self._build_execution_plan(
+                job, source_snap, target_snap, tgt_target=tgt_target,
+                src_target=src_target, with_estimates=True,
+            )
             target_engine = job.target_engine
             target_managed_id = job.target_database_id
             clean_mode = job.clean_mode
-            target_mode = job.target_mode
             target_db_name = job.target_database_name
-            token = self.clone_execution_token(
-                target_ref, target_engine, plan, clean_mode=clean_mode, target_mode=target_mode
+            effective = {
+                "copy_intent": job.copy_intent or CLONE_COPY_STRUCTURE_ONLY,
+                "data_on_existing": job.data_on_existing,
+                "target_charset": job.target_charset,
+                "target_collation": job.target_collation,
+                "target_owner": job.target_owner,
+            }
+            # El fingerprint del DESTINO se fija acá: en 'data_only' la validez del plan
+            # depende de su esquema tanto como del origen, y hasta ahora nadie lo fijaba.
+            job.target_fingerprint = (
+                _snapshot_fingerprint(target_snap) if target_snap is not None else None
             )
-            job.confirm_token = token
+            token = "" if plan.blocking_issues else self._token_for(job, plan)
+            job.confirm_token = token or None
             session.commit()
         finally:
             session.close()
@@ -899,20 +1701,48 @@ class CloneController:
                 for s in plan.structure_statements
             ],
             "data_tables": [
-                {"table": d.table, "row_estimate": d.row_estimate, "upsert": d.upsert}
+                {
+                    "table": d.table, "row_estimate": d.row_estimate,
+                    "row_estimate_known": d.row_estimate_known,
+                    "has_primary_key": d.has_primary_key, "upsert": d.upsert,
+                }
                 for d in plan.data_specs
             ],
             "skipped": plan.skipped,
             "will_adopt": plan.will_adopt,
             "warnings": plan.warnings,
+            "notices": plan.notices,
+            "blocking_issues": plan.blocking_issues,
             "confirm_token": token,
+            **effective,
         }
+
+    @staticmethod
+    def _guard_still_pending(job: CloneJob) -> None:
+        """
+        Un job ya ejecutado no se puede re-previsualizar.
+
+        Si se pudiera, el spec, el fingerprint y el token del job se sobrescribirían y el
+        plan dejaría de describir lo que realmente se ejecutó — la traza de auditoría pasaría
+        a mentir. Mismo guard (y mismo motivo) que el del export.
+        """
+        if job.status != CLONE_STATUS_PENDING:
+            raise AppHttpException(
+                message=(
+                    f"El job ya está en estado '{job.status}': no se puede volver a "
+                    f"previsualizar. Creá un plan nuevo."
+                ),
+                status_code=409,
+                public_context={"code": cspec.CODE_ALREADY_EXECUTED},
+                context={"status": job.status},
+            )
 
     def _assert_not_expired(self, job: CloneJob) -> None:
         if job.expires_at < _utcnow():
             raise AppHttpException(
                 message="El plan de clonación expiró; vuelve a crearlo.",
                 status_code=410,
+                public_context={"code": cspec.CODE_PLAN_EXPIRED},
                 context={"clone_job_id": job.id},
             )
 
@@ -970,16 +1800,12 @@ class CloneController:
         try:
             job = self._job_or_404(session, job_id)
             self._assert_not_expired(job)
-            if job.status != CLONE_STATUS_PENDING:
-                raise AppHttpException(
-                    message=f"El job ya está en estado '{job.status}'; no se puede re-ejecutar.",
-                    status_code=409,
-                    context={"status": job.status},
-                )
+            self._guard_still_pending(job)
             if confirm_target_name != job.target_database_name:
                 raise AppHttpException(
                     message="confirm_target_name no coincide con el nombre de la BD destino.",
                     status_code=422,
+                    public_context={"code": cspec.CODE_CONFIRM_NAME_MISMATCH},
                     context={},
                 )
             # Cuarentena (solo destino gestionado).
@@ -989,44 +1815,80 @@ class CloneController:
                     raise AppHttpException(
                         message="El destino está en cuarentena (status=error). Reintenta con force=true.",
                         status_code=409,
+                        public_context={"code": cspec.CODE_TARGET_QUARANTINED},
                         context={"target_database_id": job.target_database_id},
                     )
             src_server = get_server_or_404(session, job.source_server_id)
             tgt_server = get_server_or_404(session, job.target_server_id)
             src_target = build_target(src_server)
             tgt_target = build_target(tgt_server)
-            source_db = job.source_database_name
             target_ref = f"{job.target_server_id}:{job.target_database_name}"
-            target_engine = job.target_engine
             clean_mode = job.clean_mode
             target_mode = job.target_mode
+            copy_intent = job.copy_intent or CLONE_COPY_STRUCTURE_ONLY
+            on_existing = job.data_on_existing
             server_id = job.target_server_id
             managed_id = job.target_database_id
         finally:
             session.close()
 
-        # Anti-TOCTOU: re-snapshotear el origen y revalidar el token contra el plan ACTUAL.
-        source_snap = get_adapter(src_target).structural_snapshot(source_db)
+        # Anti-TOCTOU: re-snapshotear y revalidar el token contra el plan ACTUAL.
         session = self._session()
         try:
             job = self._job_or_404(session, job_id)
+            source_snap, target_snap = self._snapshots_for(job, src_target, tgt_target)
             if _snapshot_fingerprint(source_snap) != job.source_fingerprint:
                 raise AppHttpException(
                     message="El esquema del origen cambió desde que se creó el plan; vuelve a crearlo.",
                     status_code=409,
+                    public_context={"code": cspec.CODE_SOURCE_FINGERPRINT_CHANGED},
                     context={"clone_job_id": job_id},
                 )
-            target_snap = None
-            if clean_mode == CLONE_CLEAN_OBJECTS:
-                target_snap = get_adapter(tgt_target).structural_snapshot(job.target_database_name)
-            plan = self._build_execution_plan(job, source_snap, target_snap, tgt_target=tgt_target)
-            expected = self.clone_execution_token(
-                target_ref, target_engine, plan, clean_mode=clean_mode, target_mode=target_mode
+            # Y el del DESTINO, cuando el plan depende de él: en 'data_only' la corrección de
+            # la copia se apoya en el esquema del destino, así que alguien que le agregue una
+            # columna NOT NULL o una clave única entre el preview y el execute cambia el plan
+            # que se confirmó. Sin este chequeo eso pasaba en silencio.
+            if (
+                job.target_fingerprint is not None
+                and target_snap is not None
+                and _snapshot_fingerprint(target_snap) != job.target_fingerprint
+            ):
+                raise AppHttpException(
+                    message=(
+                        "El esquema del destino cambió desde que se previsualizó el plan; "
+                        "vuelve a previsualizar."
+                    ),
+                    status_code=409,
+                    public_context={"code": cspec.CODE_TARGET_FINGERPRINT_CHANGED},
+                    context={"clone_job_id": job_id},
+                )
+            plan = self._build_execution_plan(
+                job, source_snap, target_snap, tgt_target=tgt_target
             )
+            # El guard de compatibilidad se evalúa de nuevo acá, no solo en el preview: es la
+            # última barrera antes de encolar, y el destino pudo cambiar.
+            if plan.blocking_issues:
+                raise AppHttpException(
+                    message=(
+                        "El esquema del destino no admite la copia de datos: "
+                        + "; ".join(
+                            self._issue_message(cspec.CompatIssue(**i))
+                            for i in plan.blocking_issues[:5]
+                        )
+                    ),
+                    status_code=422,
+                    public_context={
+                        "code": cspec.CODE_TARGET_SCHEMA_INCOMPATIBLE,
+                        "issues": plan.blocking_issues,
+                    },
+                    context={},
+                )
+            expected = self._token_for(job, plan)
             if confirm_token != expected:
                 raise AppHttpException(
                     message="confirm_token no coincide con el plan actual; vuelve a previsualizar.",
                     status_code=422,
+                    public_context={"code": cspec.CODE_TOKEN_MISMATCH},
                     context={},
                 )
         finally:
@@ -1040,8 +1902,9 @@ class CloneController:
             target_id=managed_id,
             server_id=server_id,
             detail=(
-                f"clon {job_id} → {target_ref} "
-                f"(clean={clean_mode}, mode={target_mode}, data={bool(plan.data_specs)})"
+                f"clon {job_id} → {target_ref} (copy={copy_intent}, clean={clean_mode}, "
+                f"mode={target_mode}, on_existing={on_existing}, "
+                f"tablas_con_datos={len(plan.data_specs)})"
             ),
         )
 
@@ -1154,7 +2017,11 @@ class CloneController:
                 "server_id": job.target_server_id,
                 "clean_mode": job.clean_mode,
                 "target_mode": job.target_mode,
-                "include_data": job.include_data,
+                "copy_intent": job.copy_intent or CLONE_COPY_STRUCTURE_ONLY,
+                "on_existing": job.data_on_existing,
+                "target_charset": job.target_charset,
+                "target_collation": job.target_collation,
+                "target_owner": job.target_owner,
                 "batch_rows": CLONE_DATA_BATCH_ROWS,
                 "source_fp": job.source_fingerprint,
                 "src_managed_id": job.source_database_id,
@@ -1183,31 +2050,53 @@ class CloneController:
         )
         runner = MigrationRunner()
 
-        # Anti-TOCTOU final (el origen pudo cambiar entre execute y run).
-        source_snap = src_adapter.structural_snapshot(ctx["source_db"])
-        if _snapshot_fingerprint(source_snap) != ctx["source_fp"]:
-            self._set_status(job_id, CLONE_STATUS_FAILED, finished=True,
-                             error="El esquema del origen cambió antes de ejecutar; replanea.")
-            return
-
-        target_snap = None
-        if ctx["clean_mode"] == CLONE_CLEAN_OBJECTS:
-            target_snap = tgt_adapter.structural_snapshot(ctx["target_db"])
-
-        # Reconstruir el plan en el worker (fuente de verdad final).
-        session = self._session()
-        try:
-            job = self._job_or_404(session, job_id)
-            plan = self._build_execution_plan(job, source_snap, target_snap, tgt_target=tgt_target)
-        finally:
-            session.close()
-
         # Todas las fases MUTANTES (limpiar → estructura → datos → adopt) corren bajo UN
         # ÚNICO advisory lock del motor, sostenido durante todo el pipeline en una conexión
         # dedicada del worker. Así se serializan cross-proceso dos clones al mismo destino
         # (o un clon vs. un execute de schema-comparison sobre la misma BD física) — el
         # lock abarca también DROP/CREATE DATABASE y la fase de datos, no solo el DDL.
+        #
+        # Los SNAPSHOTS y el armado del plan van DENTRO del lock, no antes. El worker puede
+        # esperar el lock varios minutos (lo puede tener otro clon o un ``apply`` de
+        # migración sobre la misma BD), y en 'data_only' la corrección de la copia depende del
+        # esquema del destino: snapshotear afuera dejaba una ventana en la que el guard de
+        # compatibilidad validaba contra un esquema ya viejo.
         with runner.advisory_lock(tgt_target, engine=engine, lock_key=lock_key):
+            # Anti-TOCTOU final (el origen pudo cambiar entre execute y run).
+            source_snap = src_adapter.structural_snapshot(ctx["source_db"])
+            if _snapshot_fingerprint(source_snap) != ctx["source_fp"]:
+                self._set_status(job_id, CLONE_STATUS_FAILED, finished=True,
+                                 error="El esquema del origen cambió antes de ejecutar; replanea.")
+                return
+
+            session = self._session()
+            try:
+                job = self._job_or_404(session, job_id)
+                target_snap = None
+                if self._needs_target_snapshot(job):
+                    target_snap = tgt_adapter.structural_snapshot(ctx["target_db"])
+                # Reconstruir el plan en el worker (fuente de verdad final).
+                plan = self._build_execution_plan(
+                    job, source_snap, target_snap, tgt_target=tgt_target
+                )
+            finally:
+                session.close()
+
+            if plan.blocking_issues:
+                # El destino cambió entre el execute y el arranque del worker: no se toca el
+                # motor. El detalle va con vocabulario cerrado, nunca el mensaje del motor.
+                self._set_status(
+                    job_id, CLONE_STATUS_FAILED, finished=True,
+                    error=(
+                        "El esquema del destino no admite la copia de datos: "
+                        + "; ".join(
+                            self._issue_message(cspec.CompatIssue(**i))
+                            for i in plan.blocking_issues[:5]
+                        )
+                    ),
+                )
+                return
+
             self._run_phases(
                 job_id, runner, src_target, tgt_target, ctx, plan, source_snap, cancel, engine, lock_key
             )
@@ -1225,23 +2114,38 @@ class CloneController:
         if cancel():
             self._set_status(job_id, CLONE_STATUS_CANCELED, finished=True)
             return
-        # La BD destino nace con el MISMO default de charset/collation que la origen, para que
-        # no derive (era la causa raíz del loop de falsos positivos del diff: un default de BD
-        # distinto en el clon hacía que la MISMA collation física se juzgara "explícita" en un
-        # lado y "heredada" en el otro). Solo mismo motor: los nombres de collation/locale no
-        # son portables cross-engine → en ese caso se cae al default del motor destino.
+        # Charset/collation de la BD destino, en orden de precedencia:
+        #
+        # 1. Lo que el operador ELIGIÓ en el preview, ya en su forma canónica del catálogo y
+        #    ya verificado contra el motor destino (``_resolve_charset``). Nunca llega texto
+        #    crudo del request hasta acá.
+        # 2. Si no eligió: el MISMO default que la origen, para que no derive (era la causa
+        #    raíz del loop de falsos positivos del diff: un default de BD distinto hacía que
+        #    la MISMA collation física se juzgara "explícita" en un lado y "heredada" en el
+        #    otro). Solo mismo motor: los nombres de collation/locale no son portables
+        #    cross-engine → ahí se cae al default del motor destino.
         same_engine = source_snap.source_engine == tgt_adapter.dialect
-        db_charset = source_snap.db_charset if same_engine else None
-        db_collation = source_snap.db_collation if same_engine else None
+        db_charset = ctx.get("target_charset") or (
+            source_snap.db_charset if same_engine else None
+        )
+        db_collation = ctx.get("target_collation") or (
+            source_snap.db_collation if same_engine else None
+        )
+        # ``owner`` solo tiene semántica en PostgreSQL; el adapter de MySQL lo ignora.
+        db_owner = ctx.get("target_owner")
         if ctx["target_mode"] == CLONE_TARGET_NEW:
-            tgt_adapter.create_database(ctx["target_db"], charset=db_charset, collation=db_collation)
+            tgt_adapter.create_database(
+                ctx["target_db"], charset=db_charset, collation=db_collation, owner=db_owner
+            )
             self._record_items(job_id, [dict(seq=seq, kind=CLONE_ITEM_CLEAN, object_type="database",
                                              object_name=ctx["target_db"], status=CLONE_ITEM_APPLIED,
                                              executed_at=_utcnow())])
             seq += 1
         elif ctx["clean_mode"] == CLONE_CLEAN_DROP_DATABASE:
             tgt_adapter.drop_database(ctx["target_db"])
-            tgt_adapter.create_database(ctx["target_db"], charset=db_charset, collation=db_collation)
+            tgt_adapter.create_database(
+                ctx["target_db"], charset=db_charset, collation=db_collation, owner=db_owner
+            )
             self._record_items(job_id, [dict(seq=seq, kind=CLONE_ITEM_CLEAN, object_type="database",
                                              object_name=ctx["target_db"], status=CLONE_ITEM_APPLIED,
                                              executed_at=_utcnow())])
@@ -1290,7 +2194,11 @@ class CloneController:
                 had_failure = had_failure or failed
 
         # --- Fase: datos ------------------------------------------------------------- #
-        if not had_failure and ctx["include_data"] and plan.data_specs:
+        # UNA sola fuente de verdad para "¿hay datos?": el plan. Antes esto dependía además
+        # de ``ctx["include_data"]``, leído de una columna aparte: si las dos fuentes
+        # discrepaban (p. ej. un job creado antes de un deploy), el worker copiaba todo o
+        # nada según cuál ganara.
+        if not had_failure and plan.data_specs:
             self._set_status(job_id, CLONE_STATUS_RUNNING, phase="data")
             progress["phase"] = "data"
 
@@ -1399,8 +2307,11 @@ class CloneController:
             server_id=ctx["server_id"],
             touched_engine=True,
             detail=(
-                f"clon {job_id} → {ctx['target_ref']} "
-                f"(clean={ctx['clean_mode']}, mode={ctx['target_mode']}, data={ctx['include_data']})"
+                f"clon {job_id} → {ctx['target_ref']} (copy={ctx['copy_intent']}, "
+                f"clean={ctx['clean_mode']}, mode={ctx['target_mode']}, "
+                f"on_existing={ctx['on_existing']}, tablas_con_datos={len(plan.data_specs)}, "
+                f"charset={ctx.get('target_charset') or '-'}/"
+                f"{ctx.get('target_collation') or '-'})"
             ),
         )
 

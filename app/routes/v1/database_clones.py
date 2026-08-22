@@ -5,7 +5,7 @@ Endpoints de clonación de bases de datos entre servidores.
 - GET  /database-clones/{id}                  — resumen + estado del job (polling).
 - GET  /database-clones/{id}/objects          — inventario del origen + portabilidad + grafo.
 - POST /database-clones/{id}/resolve-selection — cierre de dependencias (auto-select de la UI).
-- POST /database-clones/{id}/preview          — resuelve el plan final + confirm_token (sin ejecutar).
+- POST /database-clones/{id}/preview          — manda el SPEC, lo congela, devuelve plan + confirm_token.
 - POST /database-clones/{id}/execute          — valida y ENCOLA la ejecución asíncrona.
 - GET  /database-clones/{id}/items            — pasos ejecutados (paginado).
 - POST /database-clones/{id}/cancel           — cancelación cooperativa.
@@ -14,7 +14,7 @@ Todo detrás de ``AdminDep``. Crear toca el motor (snapshot del origen) → 10/m
 execute es la operación más sensible → 3/min. El resto es solo lectura.
 """
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 
 from app.controllers.clone_controller import CloneController
 from app.core.auth import AdminDep
@@ -50,8 +50,21 @@ def get_clone(admin: AdminDep, job_id: int):
 
 @router.get("/{job_id}/objects", response_model=ApiResponse[CloneInventoryOut])
 @limiter.limit("10/minute")
-def list_clone_objects(request: Request, admin: AdminDep, job_id: int):
-    return success(data=CloneController().list_objects(job_id))
+def list_clone_objects(
+    request: Request,
+    admin: AdminDep,
+    job_id: int,
+    include_data_stats: bool = Query(
+        False,
+        description=(
+            "Incluir la estimación de filas por tabla (una consulta de catálogo por tabla; "
+            "opt-in para no encarecer el inventario de una BD con cientos de tablas)."
+        ),
+    ),
+):
+    return success(
+        data=CloneController().list_objects(job_id, with_estimates=include_data_stats)
+    )
 
 
 @router.post("/{job_id}/resolve-selection", response_model=ApiResponse[CloneClosureOut])
@@ -63,11 +76,35 @@ def resolve_clone_selection(request: Request, admin: AdminDep, job_id: int, payl
     return success(data=data)
 
 
-@router.post("/{job_id}/preview", response_model=ApiResponse[ClonePreviewOut])
+@router.post(
+    "/{job_id}/preview",
+    response_model=ApiResponse[ClonePreviewOut],
+    responses={
+        409: {"description": "El plan expiró, o el job ya se ejecutó y no se puede re-previsualizar."},
+        422: {
+            "description": (
+                "El spec es incoherente (ver 'code' en public_context) o el esquema del "
+                "destino no admite la copia de datos."
+            )
+        },
+    },
+)
 @limiter.limit("10/minute")
 def preview_clone(request: Request, admin: AdminDep, job_id: int, payload: ClonePreviewIn):
-    selection = [s.model_dump() for s in payload.selection] if payload.selection is not None else None
-    data = CloneController().preview(job_id, selection, update_selection=True)
+    """
+    Manda el SPEC, lo congela y devuelve el plan exacto + el ``confirm_token``.
+
+    Solo se aplica lo que VIENE en el cuerpo: un campo ausente deja el valor que el plan ya
+    tenía. Si el esquema del destino impide la copia, la respuesta es **200 con
+    ``blocking_issues`` y sin token** — el plan se puede ver, pero no confirmar.
+    """
+    # ``model_fields_set`` distingue "no lo mandó" de "lo mandó en null", que acá no es lo
+    # mismo: ``selection: null`` significa CLON COMPLETO y su ausencia significa "no toques
+    # la selección".
+    spec = payload.model_dump()
+    data = CloneController().preview(
+        job_id, spec=spec, sent=set(payload.model_fields_set)
+    )
     return success(data=data)
 
 
