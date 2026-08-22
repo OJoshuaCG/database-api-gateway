@@ -46,33 +46,62 @@ def test_requires_auth(client):
 # ─── seed ─────────────────────────────────────────────────────────────────── #
 
 
-def test_seed_creates_the_three_environments(admin_client):
+def test_seed_creates_the_four_environments(admin_client):
+    """Los entornos son un conjunto FIJO de cuatro; la administración es por API a propósito."""
     envs = _envs(admin_client)
-    assert set(envs) == {"development", "staging", "production"}
+    assert set(envs) == {"local", "development", "staging", "production"}
+    # `development` es el default, NO `local`: sumar `local` no cambió el comportamiento de las
+    # bases nuevas. Y sigue siendo el entorno más permisivo, así que "nace clasificada" no
+    # equivale a "nace protegida".
     assert envs["development"]["is_default"] is True
-    assert envs["production"]["blocks_destructive_migrations"] is True
-    assert envs["staging"]["blocks_destructive_migrations"] is False
+    assert [s for s, e in envs.items() if e["is_default"]] == ["development"]
+    # `production` es el único que bloquea destructivas.
+    assert [s for s, e in envs.items() if e["blocks_destructive_migrations"]] == ["production"]
     # Orden de promoción: menor rank = más temprano.
-    assert envs["development"]["rank"] < envs["staging"]["rank"] < envs["production"]["rank"]
+    assert (
+        envs["local"]["rank"]
+        < envs["development"]["rank"]
+        < envs["staging"]["rank"]
+        < envs["production"]["rank"]
+    )
 
 
-def test_seed_rows_match_the_migration(admin_client):
+def _load_migration(glob: str):
     """
-    Las filas literales de la migración == ``environment_seed_rows()``.
-
-    Es lo único que impide la divergencia entre las dos vías de provisión. Se lee el módulo de
-    la migración por ruta porque su nombre de archivo no es un identificador Python válido.
+    Carga un módulo de migración por RUTA: su nombre de archivo no es un identificador Python
+    válido, así que no se puede importar normalmente.
     """
     import importlib.util
     import pathlib
 
-    path = next(
-        pathlib.Path("alembic/versions").glob("*_environments_and_managed_db_link.py")
-    )
-    spec = importlib.util.spec_from_file_location("_mig_env", path)
+    path = next(pathlib.Path("alembic/versions").glob(glob))
+    spec = importlib.util.spec_from_file_location(f"_mig_{path.stem}", path)
     mig = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mig)
-    assert mig._SEED_ROWS == environment_seed_rows()
+    return mig
+
+
+def test_seed_rows_match_the_migrations(admin_client):
+    """
+    ``environment_seed_rows()`` == la UNIÓN de los literales de las migraciones que siembran.
+
+    Es lo único que impide la divergencia entre las dos vías de provisión, y acá divergir SÍ
+    hace daño: cada fila es política, así que un gateway provisionado por Alembic y uno
+    provisionado por ``create_all`` quedarían con políticas distintas.
+
+    Se compara contra la unión y no contra una sola migración porque los entornos se sembraron
+    en dos tandas: ``environments_and_managed_db_link`` creó la tabla con tres filas, y
+    ``environment_local`` sumó la cuarta cuando el conjunto pasó a ser fijo. El orden no importa
+    (la clave es el ``slug``), el contenido sí.
+    """
+    base = _load_migration("*_environments_and_managed_db_link.py")._SEED_ROWS
+    extra = [_load_migration("*_environment_local.py")._LOCAL_ROW]
+
+    from_migrations = {row["slug"]: row for row in [*base, *extra]}
+    from_service = {row["slug"]: row for row in environment_seed_rows()}
+
+    assert from_migrations.keys() == from_service.keys()
+    assert from_migrations == from_service
 
 
 def test_seed_does_not_resurrect_a_deleted_environment(admin_client):

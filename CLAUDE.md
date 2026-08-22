@@ -1935,7 +1935,13 @@ siembra **solo si la tabla está vacía** (a diferencia del catálogo de charset
 es la política y un top-up resucita un `production` borrado o duplica el default); y `slug` se
 normaliza y compara **en Python** porque MySQL compara case-insensitive y PostgreSQL no.
 
-**El default es `development`, o sea el entorno más permisivo.** Una BD nueva nace clasificada pero
+**Los entornos son un conjunto FIJO de cuatro** (`local`, `development`, `staging`,
+`production`) y la administración es **por API a propósito**: la SPA no tiene pantalla de CRUD.
+Los endpoints de escritura existen y funcionan, pero el frontend los registra como
+`⛔ no integrado por decisión`. No agregues una pantalla de CRUD sin discutirlo: la decisión fue
+explícita.
+
+**El default es `development`, o sea el entorno más permisivo** (no `local`)**.** Una BD nueva nace clasificada pero
 **no** nace protegida. La red para encontrar lo mal clasificado es el filtro `only_unassigned` y el
 `database_count` del listado.
 

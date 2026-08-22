@@ -150,8 +150,12 @@ que existiera la columna.
 
 ## Seed: solo si la tabla está vacía
 
-Las tres filas iniciales (`development` rank 10 default, `staging` rank 20, `production` rank 30
-con el bloqueo encendido) se declaran **dos veces**: literalmente en la migración, y en
+Los entornos son un **conjunto fijo de cuatro** y la administración es **por API a propósito**:
+la SPA no tiene pantalla de CRUD (se registra como `⛔ por decisión` en el `api-coverage.md` del
+frontend). Las cuatro filas iniciales (`local` rank 5, `development` rank 10 default,
+`staging` rank 20, `production` rank 30
+con el bloqueo encendido) se declaran **dos veces**: literalmente en las migraciones que las
+siembran, y en
 `app/services/environment_catalog.py` para el arranque de un esquema creado con `create_all` (que
 no pasa por Alembic). Un test compara las dos listas fila por fila.
 

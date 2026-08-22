@@ -97,8 +97,9 @@ ENVIRONMENT_COLORS = ("neutral", "primary", "success", "error", "warning", "info
 # --------------------------------------------------------------------------- #
 def environment_seed_rows() -> list[dict]:
     """
-    Filas iniciales. **Tienen que coincidir exactamente** con el ``op.bulk_insert`` de la
-    migración ``environments_and_managed_db_link``; hay un test que lo verifica.
+    Filas iniciales: los CUATRO entornos fijos. **Tienen que coincidir** con los literales de
+    las migraciones que los siembran (``environments_and_managed_db_link`` las tres primeras
+    y ``environment_local`` la cuarta); hay un test que compara contra la unión de las dos.
 
     ``development`` es el default por decisión explícita del usuario. Consecuencia que hay que
     tener presente y que está documentada en el modelo: el default es el entorno MÁS
@@ -106,6 +107,18 @@ def environment_seed_rows() -> list[dict]:
     seguridad es el filtro ``only_unassigned`` del listado, no el default.
     """
     return [
+        {
+            # `local` es el más permisivo y el más temprano en la promoción. NO es el default:
+            # el default sigue siendo `development` para no cambiar el comportamiento de las
+            # bases existentes ni de las nuevas.
+            "name": "Local",
+            "slug": "local",
+            "rank": 5,
+            "color": "neutral",
+            "is_default": False,
+            "is_active": True,
+            "blocks_destructive_migrations": False,
+        },
         {
             "name": "Desarrollo",
             "slug": "development",
