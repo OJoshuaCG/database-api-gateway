@@ -554,6 +554,41 @@ class PostgresAdapter(ServerAdapter):
             [" ".join(parts)], op="create_database", extra={"database": db_name}
         )
 
+    def supports_charset_combination(self, charset, collation) -> bool | None:
+        """
+        Asimetría honesta con MySQL: acá solo una de las dos mitades se puede afirmar.
+
+        - El **encoding** es verificable (``pg_char_to_encoding`` devuelve -1 si no existe),
+          así que un encoding inválido se bloquea con certeza.
+        - La **collation** de una base es el ``LC_COLLATE``, un locale del SISTEMA OPERATIVO
+          del host. ``pg_collation`` lista las collations REGISTRADAS, que normalmente cubren
+          los locales del SO, pero ``CREATE DATABASE`` acepta cualquier locale que el SO
+          tenga, registrado o no. Así que su ausencia NO demuestra que no exista: se devuelve
+          ``None`` (no sé) en vez de bloquear un locale válido. Lo único que puede confirmar
+          un locale del SO es el ``CREATE`` mismo.
+        """
+        try:
+            with server_connection(self.target) as conn:
+                if charset:
+                    enc = conn.execute(
+                        text("SELECT pg_char_to_encoding(:cs)"), {"cs": charset}
+                    ).scalar()
+                    if enc is None or int(enc) < 0:
+                        return False
+                if collation:
+                    row = conn.execute(
+                        text(
+                            "SELECT 1 FROM pg_collation "
+                            "WHERE collname = :co OR collcollate = :co LIMIT 1"
+                        ),
+                        {"co": collation},
+                    ).scalar()
+                    if not row:
+                        return None  # puede existir en el SO sin estar registrada
+                return True
+        except SQLAlchemyError:
+            return None
+
     def drop_database(self, db_name, *, force_disconnect=False) -> None:
         # ``allow_existing``: la BD puede tener un nombre legado que la whitelist estricta
         # rechaza. PostgreSQL RECHAZA el DROP si hay sesiones abiertas contra la BD

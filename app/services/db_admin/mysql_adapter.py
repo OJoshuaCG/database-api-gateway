@@ -528,6 +528,34 @@ class MySQLAdapter(ServerAdapter):
             sql += f" COLLATE {collation}"
         self._execute_server([sql], op="create_database", extra={"database": db_name})
 
+    def supports_charset_combination(self, charset, collation) -> bool | None:
+        """
+        ``information_schema.COLLATIONS``/``CHARACTER_SETS`` son autoritativos en esta
+        familia, así que acá el veredicto es firme (True/False, nunca None).
+        """
+        try:
+            with server_connection(self.target) as conn:
+                if collation:
+                    row = conn.execute(
+                        text(
+                            "SELECT 1 FROM information_schema.COLLATIONS "
+                            "WHERE COLLATION_NAME = :co"
+                            + (" AND CHARACTER_SET_NAME = :cs" if charset else "")
+                        ),
+                        {"co": collation, **({"cs": charset} if charset else {})},
+                    ).scalar()
+                    return bool(row)
+                row = conn.execute(
+                    text(
+                        "SELECT 1 FROM information_schema.CHARACTER_SETS "
+                        "WHERE CHARACTER_SET_NAME = :cs"
+                    ),
+                    {"cs": charset},
+                ).scalar()
+                return bool(row)
+        except SQLAlchemyError:
+            return None  # no se pudo determinar: no bloquea
+
     def drop_database(self, db_name, *, force_disconnect=False) -> None:
         # ``allow_existing``: la BD a borrar puede tener un nombre legado (dígito inicial,
         # ``.-$``) que la whitelist estricta rechaza. ``force_disconnect`` es NO-OP en

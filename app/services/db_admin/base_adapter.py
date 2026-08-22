@@ -315,6 +315,26 @@ class ServerAdapter(ABC):
     @abstractmethod
     def drop_database(self, db_name: str, *, force_disconnect: bool = False) -> None: ...
 
+    def supports_charset_combination(
+        self, charset: str | None, collation: str | None
+    ) -> bool | None:
+        """
+        ¿Este servidor concreto ofrece esa combinación de charset/collation?
+
+        Existe porque el catálogo del gateway es necesario pero **no suficiente**:
+        ``engine_family`` mete MySQL y MariaDB en la misma familia y no comparten todas las
+        collations (``utf8mb4_0900_ai_ci`` es de MySQL 8; las ``utf8mb4_uca1400_*`` de
+        MariaDB reciente), y en PostgreSQL la collation es un locale del SISTEMA OPERATIVO
+        del host. Preguntarle al motor ANTES de ejecutar evita el peor caso del clon: con
+        ``clean_mode='drop_database'`` el pipeline hace DROP y después CREATE, así que un par
+        que el motor rechaza deja el destino BORRADO.
+
+        Tres respuestas, y la tercera importa: ``True`` = disponible, ``False`` = el motor NO
+        la tiene (bloquea), ``None`` = **no se pudo determinar**. ``None`` no bloquea: un
+        "no sé" que se comporta como "no" prohibiría combinaciones perfectamente válidas.
+        """
+        return None
+
     def active_connections(self, db_name: str) -> int:
         """
         Cantidad de conexiones activas a ``db_name`` (informativo para el preview de
