@@ -119,7 +119,9 @@ ejecución directa de funciones y SQLite. Los scripts existen; nunca se corriero
 | P-29 | Export: `REFRESH MATERIALIZED VIEW` no se emite | Las matviews salen vacías en el destino. | — |
 | P-30 | Export: artefacto de PG con `DROP_CREATE` no es ejecutable de un tirón | Falta el `\connect` que emite `pg_dump --create`. Hoy se avisa en el preview. | — |
 | T-260822-lz-clon-truncate-datos | Clon: `data.on_existing='truncate'` (Fase 2) | Vaciar las tablas del destino antes de copiar, que es lo que pide el caso de uso real ("bajar producción a staging"). Requiere: **cierre FK del destino** (un `TRUNCATE` aislado sobre una tabla referenciada falla en PG aunque los triggers estén en `replica` — BUG #15657 abierto; y en PG hay que listar todas las tablas en UNA sentencia), `confirm_row_loss` propio (hoy el gesto para vaciar 3 tablas es idéntico al de resetear la base), semántica de cancelación (cancelar entre el vaciado y la copia hoy reporta `canceled` **sin cuarentena**, con el destino vacío) y verificación contra motores reales: que `FOREIGN_KEY_CHECKS=0` habilite `TRUNCATE` sobre una tabla referenciada es **indocumentado** en MySQL. `CASCADE` no puede ser el atajo (vaciaría tablas fuera de la selección). Alternativa portable a evaluar: `DELETE FROM` en orden hijo→padre. | — |
-| T-260822-lz-clon-capabilities-frontend | Clon: endpoint de capacidades + matriz publicada, y el frontend (Fase 2) | Lo que evita que el formulario **reimplemente** las reglas cruzadas del servidor y divergan. El export ya publica y hace cumplir con la misma estructura (`ExportCapabilitiesOut`, `compatibility_matrix()`), y el frontend tiene un motor genérico que las consume (`src/features/database-exports/logic.ts`). Incluye lo que rompe hoy en el wizard: `WizardNav` bloquea el avance con selección de estructura vacía (que en solo-datos es la definición del modo), "replanear" rehidrata leyendo solo `include_data`/`clean_mode`/`target_mode` (un job de solo datos vuelve como `CREATE` — el fallo que la feature arregla, y ese camino se recorre justo después de un `failed`), y `warnings: list[str]` se renderiza en gris `text-xs`. | — |
+| T-260822-lz-clon-reconciliacion-y-cierre | Clon: reconciliación post-copia y cierre accionable de dependencias | **Dos incumplimientos del plan aprobado de `T-260822-lz-clon-solo-datos-collation`.** (a) La reconciliación post-copia no se implementó: `clone.row_count_mismatch` quedó como constante muerta, y es la pieza que sostiene el argumento con el que se calibró todo el guard (en la familia MySQL el motor no puede fallar, así que la detección tiene que venir de otro lado). Alcance real ya decidido: solo concluye en `append` (`count_antes + filas_leídas = count_después`); en `upsert` una fila que actualizó a otra es indistinguible de una descartada, así que ahí NO se emite y se avisa que no hay verificación — un chequeo que no puede concluir es peor que su ausencia si se presenta como si concluyera. (b) El cierre de dependencias re-incluye en silencio: debe dar 422 `clone.missing_dependencies` con los sugeridos cuando re-agrega algo excluido EXPLÍCITAMENTE (por nombre o patrón), y mantener el cierre silencioso cuando solo no se mencionó. Criterio de `plan_integrity`. | — |
+| T-260822-lz-clon-contrato-frontend | Clon: lo que el contrato le debe al frontend | Seis adiciones, todas aditivas (verificado que los schemas zod del frontend no usan `.strict()`, así que los campos nuevos se descartan y no rompen la SPA). La importante: **`CloneSummaryOut` no permite reconstruir el plan** — ocho columnas de `clone_jobs` no las expone ningún GET y `preview` da 409 en cuanto el job deja de estar `pending`, así que la información desaparece exactamente cuando se necesita (después de un fallo, que es cuando se usa «Replanear»). Las otras: `severity` sin nivel `danger` obliga a mantener la lista de códigos peligrosos en el cliente; `clone.charset_combination_disabled` emite una forma distinta de la que `errors.ts:497-511` ya parsea y se pierde el repoblado de alternativas; dos notices llegan con `detail` vacío; `CloneItemOut` no expone el `sql` del paso fallido; y `skipped[].object_type` no pertenece al enum documentado (defecto PREEXISTENTE: en un clon cross-engine el `safeParse` del cliente descarta la respuesta entera). | — |
+| T-260822-lz-clon-capabilities-frontend | Clon: endpoint de capacidades + matriz publicada (Fase 2) | Es el cambio que elimina la tabla de intenciones del cliente: con la forma del export (`options` con rutas con puntos, `compatibility`, `limits`, `error_codes`) el motor genérico de `database-exports/logic.ts` se reusa sin escribir nada nuevo. **El plan de UI ya está escrito y NO depende de este endpoint** (ver 🔵 Pendiente de frontend). | — |
 | T-260822-lz-clon-owner-set-role | Clon: el `owner` de PostgreSQL no es real | `CREATE DATABASE … OWNER x` fija el dueño **de la base**; todos los objetos los crea la conexión pseudo-root, así que el dueño pedido **no puede `ALTER`/`DROP` sus propias tablas** — peor que no pasar `owner`. Requiere `SET ROLE` para las fases de DDL y datos (o `REASSIGN OWNED`/`ALTER … OWNER TO` al cerrar) y validar la membresía del pseudo-root en el rol, o el `CREATE DATABASE` falla con 42501 **dentro del worker** (y con `clean_mode='drop_database'`, después del DROP). | — |
 | T-260822-lz-pg-resync-serial | El resync de secuencias de PG no cubre `serial` ni cross-engine | `_resync_postgres_identity_sequences` (`clone_controller.py:740-800`) solo actúa sobre columnas con `col.identity is not None` **del snapshot del ORIGEN**. Una columna `serial` tiene `identity=None` y default `nextval(...)` (por eso existe `PostgresAdapter._serial_type`), y un origen MySQL con `AUTO_INCREMENT` tampoco tiene `identity` ⇒ **la secuencia del destino nunca se resincroniza** y el primer `INSERT` de la aplicación choca la PK (23505). Defecto **preexistente** que el modo solo datos vuelve el camino principal. Fix: elegir las columnas desde el **destino** con `pg_get_serial_sequence(t, c) IS NOT NULL`, que cubre `serial` **e** `identity` y es la función que el código ya usa. | — |
 
@@ -165,11 +167,9 @@ cambio **no** toca el contrato, se queda acá y solo se comenta.
 
 Atajo: `/tarea frontend`.
 
-_Nada pendiente de frontend._
-
 | Ítem | Subtarea ClickUp | Backend cerrado por | Fecha | Breaking changes | Contrato |
 | --- | --- | --- | --- | --- | --- |
-| — | — | — | — | — | — |
+| Clon: copia de solo datos, collation/owner del destino y selección declarativa | [`86e2xzzyh`](https://app.clickup.com/t/86e2xzzyh) | LeoZubiri@outlook.com | 2026-08-22 | **No** para la SPA actual (los schemas zod no usan `.strict()`, así que los campos nuevos se descartan y nada se rompe). Sí hay cambios de comportamiento que el wizard tiene que absorber: el SPEC se manda ahora en `preview` (no en `create`), `confirm_token` puede llegar **vacío** cuando hay `blocking_issues`, y los mensajes de error cambiaron — `wizard/messages.ts` los matchea con expresiones regulares sobre la prosa. | `docs/features/database-clone.md` + `de73439` (schemas y rutas). Plan de UI COMPLETO ya escrito, con recorrido paso por paso, copy, mapeo de códigos `clone.*` y plan de pruebas. |
 
 ---
 
@@ -180,6 +180,7 @@ los bugs corregidos) vive en `CLAUDE.md` y en `docs/features/`.
 
 | Fecha | Ítem | Estado de verificación |
 | --- | --- | --- |
+| 2026-08-22 | **Fix P0 del clon: el atajo legacy `include_data` rompía todo clon con datos** (`T-260822-lz-clon-fix-legacy-on-existing`, subtarea [`86e2y15bm`](https://app.clickup.com/t/86e2y15bm)) | 5 tests nuevos, los 5 verificados contra un worktree de `HEAD` (fallan sin el arreglo); 176 tests del clon y vecinos en verde; Ruff sin violaciones nuevas |
 | 2026-08-22 | **Clon: copia de solo datos, collation/owner del destino elegible y selección declarativa** (`T-260822-lz-clon-solo-datos-collation`, subtarea [`86e2xzzyh`](https://app.clickup.com/t/86e2xzzyh)) | 48 unit del spec/guard + 30 HTTP de la feature + 14 HTTP de no regresión + 23 del ciclo de la migración en SQLite; `alembic check` sin drift nuevo; Ruff limpio en lo nuevo; resultados idénticos al baseline de `HEAD` en 10 módulos vecinos. **Sin e2e contra motores reales** |
 | 2026-08-22 | **Proyectos — agrupación de blueprints** (entidad nombre+descripción≤5000, pivote N:M, CRUD + vincular/desvincular + vista inversa) | 22 checks HTTP por ejecución directa + ciclo upgrade/downgrade/upgrade de la migración en SQLite. **Sin `pytest`** (política del repo) y **sin la migración contra la BD del gateway real** |
 | 2026-08-21 | **Flujo de gestión de tareas** — lista y tarea principal en ClickUp, `TODO.md`, protocolo en `CLAUDE.md` | Verificado por lectura; IDs confirmados contra la API de ClickUp |
@@ -294,6 +295,22 @@ propias tablas).
 "natural" del diff se aprueba la pérdida de datos) y el que ejercita el **worker** en modo solo
 datos (un test de preview no habría visto que la fase de datos se decidía en una cadena `if/elif`
 sobre `clean_mode`).
+
+### Corrección posterior (2026-08-22)
+
+Esta entrega se reportó como completa y **el flujo con datos no funcionaba**: el atajo legacy
+`include_data` persistía un `data_on_existing` derivado por el servidor, y `validate_spec` lo
+leía como una elección del cliente, así que todo preview de la SPA —que manda siempre
+`{selection: …}`— respondía 422 `clone.conflicting_options` sin salida posible. Arreglado en
+`T-260822-lz-clon-fix-legacy-on-existing` ([`86e2y15bm`](https://app.clickup.com/t/86e2y15bm)).
+
+La causa de la ceguera fue el arnés de tests, no el diseño: el helper `_preview_and_execute`
+manda `json={}`, la única forma del cuerpo que la SPA nunca usa. Los 5 tests del arreglo cubren
+las formas reales y se verificó que fallan sin él.
+
+Además se detectaron **dos incumplimientos de este mismo plan** que quedaron como pendientes
+propios: la reconciliación post-copia y el 422 accionable del cierre de dependencias (ver
+🔴 Pendientes).
 
 ### Qué quedó SIN verificar (lo que decide si esto se puede confiar en producción)
 
