@@ -45,6 +45,20 @@ CLONE_CLEAN_DROP_DATABASE = "drop_database"  # reset total: DROP DATABASE + recr
 CLONE_TARGET_NEW = "new"                 # crear una BD nueva
 CLONE_TARGET_EXISTING = "existing"       # usar una BD existente
 
+# CloneJob.copy_intent — INTENCIÓN de copia (lo que el contrato público expone).
+# Se persiste la intención y NO el ``EntityDdl`` derivado: los dos primeros valores derivan
+# al mismo DDL por objeto (``CREATE``) y guardar solo eso perdería la diferencia, que es
+# justo lo que el preview tiene que devolver y lo que el frontend necesita para rehidratar
+# un plan sin degradarlo. El enumerado del export se deriva con ``clone_spec.entity_ddl_for``.
+CLONE_COPY_STRUCTURE_ONLY = "structure_only"          # estructura, sin filas
+CLONE_COPY_STRUCTURE_AND_DATA = "structure_and_data"  # estructura + filas
+CLONE_COPY_DATA_ONLY = "data_only"                    # SOLO filas, sin emitir una sola DDL
+
+# CloneJob.data_on_existing — qué hacer si la tabla destino ya tiene filas.
+# ``truncate`` no existe todavía a propósito (ver ``clone_spec.DataOnExisting``).
+CLONE_ON_EXISTING_APPEND = "append"
+CLONE_ON_EXISTING_UPSERT = "upsert"
+
 # CloneJobItem.kind
 CLONE_ITEM_CLEAN = "clean"
 CLONE_ITEM_STRUCTURE = "structure"
@@ -142,11 +156,71 @@ class CloneJob(Base, TimestampMixin):
         Text, nullable=True,
         comment="JSON de la selección de objetos (cierre resuelto); NULL = clon completo",
     )
+    is_full_clone: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="1",
+        comment=(
+            "True = la selección cubre TODO el origen. Predicado EXPLÍCITO: antes se "
+            "infería de 'selection IS NULL', y con la selección declarativa resuelta a "
+            "lista explícita esa inferencia apagaba el auto-adopt sin que nada falle"
+        ),
+    )
+    copy_intent: Mapped[str] = mapped_column(
+        String(30), nullable=False,
+        default=CLONE_COPY_STRUCTURE_ONLY, server_default=CLONE_COPY_STRUCTURE_ONLY,
+        comment="structure_only | structure_and_data | data_only (solo filas, sin DDL)",
+    )
+    data_selection: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        comment=(
+            "JSON de las tablas que reciben datos (ya con cierre por FK); NULL = derivar "
+            "de la selección de estructura, que es el comportamiento histórico"
+        ),
+    )
+    data_on_existing: Mapped[str | None] = mapped_column(
+        String(20), nullable=True,
+        comment=(
+            "append | upsert cuando la tabla destino ya tiene filas. Obligatorio en "
+            "copy_intent='data_only'; NULL en los planes que crean la estructura"
+        ),
+    )
+    target_charset: Mapped[str | None] = mapped_column(
+        String(50), nullable=True,
+        comment=(
+            "Charset CANÓNICO del catálogo para el CREATE DATABASE del destino; "
+            "NULL = heredar del origen (mismo motor) o el default del motor"
+        ),
+    )
+    target_collation: Mapped[str | None] = mapped_column(
+        String(100), nullable=True,
+        comment="Collation CANÓNICA del catálogo para el CREATE DATABASE del destino",
+    )
+    target_owner_user_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("server_users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="ServerUser del servidor destino que será OWNER de la BD creada (solo PostgreSQL)",
+    )
+    target_owner: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+        comment=(
+            "Username resuelto del owner, para que el worker no dependa de que la fila de "
+            "inventario siga existiendo (mismo criterio que el resto del módulo)"
+        ),
+    )
 
     # ---- Anti-TOCTOU / TTL ------------------------------------------------------ #
     source_fingerprint: Mapped[str] = mapped_column(
         String(64), nullable=False,
         comment="SHA256 del snapshot normalizado del origen al planear (anti-TOCTOU)",
+    )
+    target_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+        comment=(
+            "SHA256 del snapshot del DESTINO al previsualizar. NULL si el plan no depende "
+            "del esquema del destino. En 'data_only' la validez del plan depende del "
+            "destino tanto como del origen, y sin esto nadie la fija"
+        ),
     )
     confirm_token: Mapped[str | None] = mapped_column(
         String(64), nullable=True,
