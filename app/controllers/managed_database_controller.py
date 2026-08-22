@@ -17,6 +17,7 @@ el controller; endurecimiento futuro con FK compuesta — ver docs/plans/00).
 from sqlalchemy.exc import IntegrityError
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
+from app.controllers.environment_controller import EnvironmentController
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.exceptions import AppHttpException
@@ -27,6 +28,7 @@ from app.models.model_migration import ModelMigration
 from app.models.server import Server
 from app.models.server_user import ServerUser
 from app.services import audit, charset_catalog
+from app.services import environment_catalog as ecodes
 from app.services.db_admin.factory import get_adapter
 
 
@@ -46,6 +48,7 @@ class ManagedDatabaseController:
             "owner_id": d.owner_id,
             "model_id": d.model_id,
             "model_version": d.model_version,
+            "environment_id": d.environment_id,
             "charset": d.charset,
             "collation": d.collation,
             "status": d.status,
@@ -113,6 +116,8 @@ class ManagedDatabaseController:
         server_id: int | None = None,
         owner_id: int | None = None,
         model_id: int | None = None,
+        environment_id: int | None = None,
+        only_unassigned: bool = False,
         status: str | None = None,
         engine: EngineType | None = None,
         limit: int,
@@ -120,6 +125,19 @@ class ManagedDatabaseController:
     ) -> tuple[list[dict], int]:
         session = self._session()
         try:
+            # ``environment_id=None`` ya significa "sin filtro", así que "las que NO tienen
+            # entorno" necesita un parámetro propio. Los dos juntos son una contradicción y se
+            # rechazan: devolver lista vacía en silencio sería un filtro que miente.
+            if only_unassigned and environment_id is not None:
+                raise AppHttpException(
+                    message=(
+                        "'environment_id' y 'only_unassigned' son mutuamente excluyentes: "
+                        "el segundo pide justamente las BDs sin entorno."
+                    ),
+                    status_code=422,
+                    public_context={"code": ecodes.CODE_FILTER_CONFLICT},
+                    context={"environment_id": environment_id},
+                )
             q = session.query(ManagedDatabase)
             if server_id is not None:
                 q = q.filter(ManagedDatabase.server_id == server_id)
@@ -127,6 +145,10 @@ class ManagedDatabaseController:
                 q = q.filter(ManagedDatabase.owner_id == owner_id)
             if model_id is not None:
                 q = q.filter(ManagedDatabase.model_id == model_id)
+            if environment_id is not None:
+                q = q.filter(ManagedDatabase.environment_id == environment_id)
+            if only_unassigned:
+                q = q.filter(ManagedDatabase.environment_id.is_(None))
             if status is not None:
                 q = q.filter(ManagedDatabase.status == status)
             if engine is not None:
@@ -179,12 +201,57 @@ class ManagedDatabaseController:
                 engine_value(server), data.get("charset"), data.get("collation")
             )
 
+            # ``model_version`` en el alta se valida contra el blueprint, con el MISMO
+            # criterio que ``adopt_database`` unas líneas más abajo. Antes se persistía el
+            # string crudo del cliente: ``max_length=50`` no exige que sea numérico y
+            # ``version_sort_key`` hace ``int(version)``, así que un "v3-hotfix" reventaba toda
+            # comparación de versiones posterior. Es el mismo agujero que se cerró en el PATCH.
+            declared_version = data.get("model_version")
+            if declared_version is not None:
+                if data.get("model_id") is None:
+                    raise AppHttpException(
+                        message=(
+                            "'model_version' requiere 'model_id' (la versión pertenece a un "
+                            "blueprint)."
+                        ),
+                        status_code=422,
+                        context={"model_version": declared_version},
+                    )
+                if (
+                    session.query(ModelMigration.id)
+                    .filter(
+                        ModelMigration.model_id == data["model_id"],
+                        ModelMigration.version == declared_version,
+                    )
+                    .first()
+                    is None
+                ):
+                    raise AppHttpException(
+                        message=(
+                            f"La versión {declared_version} no existe en el blueprint indicado."
+                        ),
+                        status_code=422,
+                        context={
+                            "model_id": data["model_id"],
+                            "model_version": declared_version,
+                        },
+                    )
+
+            # Entorno: valida que exista y esté activo, o resuelve el marcado ``is_default``
+            # cuando no se manda. OJO con la semántica del POST: la ruta usa ``model_dump()``
+            # sin ``exclude_unset``, así que ausente y ``null`` explícito son indistinguibles y
+            # los DOS reciben el default. Está dicho en el ``description`` del campo.
+            env_id = EnvironmentController.resolve_for_assignment(
+                session, data.get("environment_id")
+            )
+
             md = ManagedDatabase(
                 name=data["name"],
                 server_id=server.id,
                 owner_id=owner.id,
                 model_id=data.get("model_id"),
                 model_version=data.get("model_version"),
+                environment_id=env_id,
                 charset=req_charset,
                 collation=req_collation,
                 status=ProvisionStatus.pending,
@@ -309,11 +376,15 @@ class ManagedDatabaseController:
 
         session = self._session()
         try:
+            env_id = EnvironmentController.resolve_for_assignment(
+                session, data.get("environment_id")
+            )
             md = ManagedDatabase(
                 name=db_name,
                 server_id=server_id,
                 owner_id=data["owner_id"],
                 model_id=data.get("model_id"),
+                environment_id=env_id,
                 charset=data.get("charset"),
                 collation=data.get("collation"),
                 status=ProvisionStatus.active,
@@ -376,19 +447,52 @@ class ManagedDatabaseController:
                     status_code=422,
                     context={"model_id": data["model_id"]},
                 )
-            for field in ("model_id", "model_version", "charset", "collation", "notes"):
+            # ``environment_id`` se valida como en el alta (existe + activo), y ``None``
+            # explícito DESCLASIFICA. Que esté en esta tupla es lo que hace posible
+            # desclasificar: la asignación va por presencia de clave y la ruta usa
+            # ``exclude_unset=True``, así que ``PATCH {"environment_id": null}`` sí distingue
+            # "vaciar" de "no enviado" — pero solo si el campo se recorre acá.
+            if "environment_id" in data and data["environment_id"] is not None:
+                EnvironmentController.resolve_for_assignment(session, data["environment_id"])
+
+            before = {
+                "model_id": md.model_id,
+                "environment_id": md.environment_id,
+                "charset": md.charset,
+                "collation": md.collation,
+            }
+            # ``model_version`` YA NO se acepta acá, y no es un olvido. Era escribible a
+            # ciegas por el cliente, sin confirmación y sin rastro de qué cambió, así que
+            # "declarar que esta BD está en la versión X" era un PATCH — y esa caché es la que
+            # cualquier gate de promoción entre entornos tiene que leer. Además ``max_length=50``
+            # no valida que sea numérico, y ``version_sort_key`` hace ``int(version)``: un
+            # valor como "v3-hotfix" reventaba toda comparación de versiones.
+            # La versión la escriben ``apply`` / ``rollback`` / ``stamp`` releyendo el motor.
+            for field in ("model_id", "environment_id", "charset", "collation", "notes"):
                 if field in data:
                     setattr(md, field, data[field])
             session.commit()
             session.refresh(md)
+            after = {
+                "model_id": md.model_id,
+                "environment_id": md.environment_id,
+                "charset": md.charset,
+                "collation": md.collation,
+            }
+            changed = {k: (before[k], after[k]) for k in before if before[k] != after[k]}
             result = self._serialize(md)
         finally:
             session.close()
+        # Con ``detail`` vacío, una RECLASIFICACIÓN de entorno era indistinguible en el log de
+        # un cambio de ``notes``. Para una columna de política eso no alcanza.
         audit.record(
             "managed_database.update",
             admin=admin,
             target_type="managed_database",
             target_id=db_id,
+            touched_engine=False,
+            detail=" ".join(f"{k}:{old}->{new}" for k, (old, new) in changed.items())
+            or "sin cambios efectivos",
         )
         return result
 

@@ -123,6 +123,19 @@ def test_list_filter_by_engine(admin_client):
 
 
 def test_update_and_delete(admin_client):
+    """
+    CAMBIO DE CONTRATO (T-260822-lz-entornos-clasificacion): ``model_version`` ya NO se puede
+    escribir por PATCH. Antes este test afirmaba que sí, y con el valor ``"2.0.0"`` — que ni
+    siquiera es una versión válida de blueprint (son ``0001``, ``0002``…) y que
+    ``version_sort_key`` reventaba al hacer ``int(version)``. O sea: el test documentaba
+    justamente el agujero, no una capacidad.
+
+    El motivo del cierre: esa columna es la caché de la versión aplicada, y cualquier gate de
+    promoción entre entornos tiene que leerla; si el cliente puede escribirla a ciegas, "promover
+    a producción" se logra tipeando un número. La escriben ``apply`` / ``rollback`` / ``stamp``
+    releyendo el motor, y para declararla a mano está ``POST /{id}/migrations/stamp``, que sí
+    valida que la versión exista en el blueprint.
+    """
     sid = _server(admin_client, 5448)
     oid = _owner(admin_client, sid)
     did = admin_client.post(
@@ -133,7 +146,9 @@ def test_update_and_delete(admin_client):
         f"/api/v1/managed-databases/{did}", json={"model_version": "2.0.0", "notes": "n"}
     )
     assert upd.status_code == 200
-    assert upd.json()["data"]["model_version"] == "2.0.0"
+    # El campo se descarta en silencio (el schema no lo declara), y ``notes`` sí se aplica.
+    assert upd.json()["data"]["model_version"] is None
+    assert upd.json()["data"]["notes"] == "n"
     assert admin_client.delete(f"/api/v1/managed-databases/{did}").status_code == 200
     assert admin_client.get(f"/api/v1/managed-databases/{did}").status_code == 404
 

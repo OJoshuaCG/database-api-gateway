@@ -32,12 +32,14 @@ from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
+from app.models.environment import Environment
 from app.models.enums import EngineType, MigrationStatus, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
 from app.services import audit
-from app.services.db_admin import migration_progress, migration_results
+from app.services import environment_catalog as ecodes
+from app.services.db_admin import migration_facts, migration_progress, migration_results
 from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
 from app.services.db_admin.migrations import (
     ManifestStatement,
@@ -224,6 +226,133 @@ class ManagedMigrationController:
         }
 
     # ------------------------------------------------------------------ #
+    # Guard de entorno: DDL destructivo                                   #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _env_policy_for(session, db_ids: list[int]) -> dict[int, tuple[bool, str]]:
+        """
+        Política de entorno por BD: ``{db_id: (bloquea_destructivas, slug)}``.
+
+        Se resuelve UNA vez por lote y devuelve **valores planos, no filas ORM**: en
+        ``apply_all`` la sesión se cierra antes del bucle, así que instancias del ORM quedarían
+        desligadas y cualquier acceso a un atributo explotaría. Mismo criterio que el cacheo de
+        ``ServerTarget`` por servidor, y que el desempaquetado temprano de ``md.name``/
+        ``md.server_id`` que ya hace ``apply``.
+
+        Las BDs sin entorno NO aparecen en el dict. Eso las deja PERMISIVAS, y es deliberado:
+        romper todos los ``apply-all`` que hoy funcionan no es aceptable, y toda BD existente
+        nació antes de que existiera esta columna.
+
+        ATENCIÓN — esta asimetría no se traslada. Si algún día se agrega el gate de consultas
+        para agentes (plan 11 §6), ahí un entorno sin asignar debe NEGAR, porque no hay
+        comportamiento previo que romper y un default permisivo dejaría toda BD sin clasificar
+        consultable. No "unifiques" los dos comportamientos.
+        """
+        if not db_ids:
+            return {}
+        rows = (
+            session.query(
+                ManagedDatabase.id,
+                Environment.blocks_destructive_migrations,
+                Environment.slug,
+            )
+            .join(Environment, Environment.id == ManagedDatabase.environment_id)
+            .filter(ManagedDatabase.id.in_(db_ids))
+            .all()
+        )
+        return {db_id: (bool(blocks), slug) for db_id, blocks, slug in rows}
+
+    def _destructive_versions(
+        self, specs: list[MigrationSpec], engine: EngineType
+    ) -> dict[str, tuple[str, ...]]:
+        """
+        Qué versiones son destructivas y por qué, para ESTE motor.
+
+        Dos decisiones acá, y las dos son la corrección de un fail-open real:
+
+        1. **NO se lee el manifiesto como fuente primaria.** ``ModelMigrationStatement`` tiene
+           una columna ``destructive`` que parecería la fuente natural, pero esas filas CASI
+           NUNCA EXISTEN: el manifiesto es opcional y lo escribe únicamente la adopción de un
+           diff estructural (``_write_statement_manifest`` corta con
+           ``if not statements or not source_engine: return``, y ``ModelMigrationCreate`` no
+           tiene ni campo ``statements``). O sea: una migración escrita a mano con
+           ``up_sql = "DROP TABLE clientes"`` no produce ni una fila, y un guard basado en el
+           manifiesto la dejaría pasar. La fuente es ``migration_facts.analyze``, que decide
+           por AST y es lo mismo que el listado ya publica como insignia ``destructive``.
+        2. **Se analiza el SQL RESUELTO PARA EL MOTOR**, vía ``select_up_sql``, y no
+           ``spec.up_sql``. Una migración puede traer override por motor
+           (``up_sql_mysql`` / ``up_sql_postgresql``), y el ``DROP`` puede vivir SOLO en el
+           override: mirando ``up_sql`` sería invisible justo en el motor donde se ejecuta.
+
+        El manifiesto se usa igual, en OR: donde existe, agrega información y nunca la quita
+        (fail-closed). ``analyze`` está memoizado, así que el costo real es una vez por SQL.
+        """
+        out: dict[str, tuple[str, ...]] = {}
+        for spec in specs:
+            sql = self.runner.select_up_sql(spec, engine)
+            reasons: list[str] = []
+            facts = migration_facts.analyze(sql, spec.kind, spec.has_non_portable)
+            if facts.destructive_statements:
+                reasons.append(
+                    "sentencias "
+                    + ",".join(str(i) for i in facts.destructive_statements)
+                )
+            if any(st.destructive for st in spec.manifest):
+                reasons.append("manifiesto")
+            if reasons:
+                out[spec.version] = tuple(reasons)
+        return out
+
+    @staticmethod
+    def _guard_environment_destructive(
+        db_id: int,
+        pending: list[MigrationSpec],
+        destructive: dict[str, tuple[str, ...]],
+        env_slug: str,
+    ) -> None:
+        """
+        Rechaza aplicar versiones destructivas a una BD de un entorno que las bloquea.
+
+        Va dentro de ``_run_apply``, justo después de calcular ``pending``, y eso NO es un
+        detalle de ubicación: es lo que hace que el guard cubra los DOS entrypoints (el
+        ``apply`` por BD y ``apply_all``) con una sola inserción, sin una lectura extra al
+        motor y sin abrir una ventana TOCTOU nueva. Los dos guards vecinos
+        (``_guard_reviewed_capture`` y ``_guard_capture_consent``) están acá por el mismo
+        motivo, y el comentario de arriba lo dice explícito.
+
+        Si estuviera solo en el bucle de ``apply_all``, el incentivo sería perverso: ``apply_all``
+        va siempre al head, así que una versión destructiva bloquearía producción de forma
+        permanente en el lote, mientras el ``apply`` por BD la aplicaría con ``?version=`` sin
+        ningún gate. El guard empujaría al camino no cubierto.
+
+        NO se ejecuta en dry-run, y tampoco hace falta pedirlo: ni ``apply`` ni ``apply_all``
+        llaman a ``_run_apply`` cuando ``dry_run=True`` (usan ``_dry_run_plan``). El plan sí
+        informa qué versiones bloquearían, en ``blocked_by``: bloquear el dry-run le quitaría al
+        operador justo la llamada con la que descubre qué lo frena.
+
+        ``force`` NO lo saltea. ``force`` es override de CUARENTENA y nada más; si algún día
+        hace falta un override de política, va un parámetro propio con su propio nombre.
+        """
+        hits = [s.version for s in pending if s.version in destructive]
+        if not hits:
+            return
+        raise AppHttpException(
+            message=(
+                f"El entorno '{env_slug}' bloquea las migraciones destructivas y las versiones "
+                f"{', '.join(hits)} contienen sentencias que pueden perder datos "
+                "(DROP / TRUNCATE / DELETE sin WHERE / ALTER DROP COLUMN). "
+                "'force' no habilita esta operación."
+            ),
+            status_code=409,
+            public_context={
+                "code": ecodes.CODE_DESTRUCTIVE_BLOCKED,
+                "environment_slug": env_slug,
+                "blocked_versions": hits,
+            },
+            context={"managed_database_id": db_id, "reasons": {v: destructive[v] for v in hits}},
+        )
+
+    # ------------------------------------------------------------------ #
     # Aplicación                                                          #
     # ------------------------------------------------------------------ #
     def apply(
@@ -254,6 +383,9 @@ class ManagedMigrationController:
             db_name, server_id = md.name, md.server_id
             quarantined = md.status == ProvisionStatus.error
             target = build_target(server)
+            # Política del entorno, resuelta mientras la sesión sigue abierta (valores planos:
+            # después del close una fila ORM quedaría desligada).
+            env_policy = self._env_policy_for(session, [db_id]).get(db_id)
         finally:
             session.close()
 
@@ -283,7 +415,11 @@ class ManagedMigrationController:
         self._guard_quarantine(db_id, quarantined, force, dry_run)
 
         if dry_run:
-            return self._dry_run_plan(db_id, db_name, server_id, target, slug, specs, up_to_version)
+            return self._dry_run_plan(
+                db_id, db_name, server_id, target, slug, specs, up_to_version,
+                env_policy=env_policy,
+                destructive=self._destructive_versions(specs, engine) if env_policy else None,
+            )
 
         if on_failure not in self._ON_FAILURE_MODES:
             raise AppHttpException(
@@ -297,6 +433,8 @@ class ManagedMigrationController:
             engine=engine, slug=slug, specs=specs, model_id=model.id,
             up_to_version=up_to_version, was_quarantined=quarantined, admin=admin,
             on_failure=on_failure, allow_result_capture=allow_result_capture,
+            env_blocks_destructive=bool(env_policy and env_policy[0]),
+            env_slug=env_policy[1] if env_policy else None,
         )
 
     @staticmethod
@@ -583,12 +721,26 @@ class ManagedMigrationController:
             )
 
     def _dry_run_plan(
-        self, db_id, db_name, server_id, target, slug, specs, up_to_version
+        self, db_id, db_name, server_id, target, slug, specs, up_to_version,
+        *,
+        env_policy: tuple[bool, str] | None = None,
+        destructive: dict[str, tuple[str, ...]] | None = None,
     ) -> dict:
-        """Calcula el plan (pendientes) SIN tocar el motor más que para leer la versión."""
+        """
+        Calcula el plan (pendientes) SIN tocar el motor más que para leer la versión.
+
+        El dry-run **informa** el bloqueo por entorno en ``blocked_by`` pero NO lo aplica: es
+        la llamada con la que el operador descubre qué lo frena, así que hacerla fallar le
+        quitaría el diagnóstico. Precedente exacto del criterio: ``_guard_quarantine`` recibe
+        ``dry_run`` y se saltea. El guard real vive en ``_run_apply``, que este camino no
+        ejecuta.
+        """
         current = self.runner.get_current_version(target, db_name, slug)
         pending = self.runner.compute_pending(current, specs, up_to_version)
         pending_versions = [s.version for s in pending]
+        blocked_by: list[str] = []
+        if env_policy and env_policy[0] and destructive:
+            blocked_by = [v for v in pending_versions if v in destructive]
         return {
             "managed_database_id": db_id,
             "database_name": db_name,
@@ -601,6 +753,8 @@ class ManagedMigrationController:
             "no_op": len(pending) == 0,
             "pending_versions": pending_versions,
             "pending_count": len(pending),
+            "environment_slug": env_policy[1] if env_policy else None,
+            "blocked_by": blocked_by,
         }
 
     # Política ante un fallo a mitad de una migración (solo aplica cuando el motor NO es
@@ -736,6 +890,9 @@ class ManagedMigrationController:
         self, db_id, *, db_name, server_id, target, engine, slug, specs, model_id,
         up_to_version, was_quarantined, admin, on_failure: str = "auto",
         allow_result_capture: bool = False,
+        env_blocks_destructive: bool = False,
+        env_slug: str | None = None,
+        destructive_versions: dict[str, tuple[str, ...]] | None = None,
     ) -> dict:
         """Ejecuta el apply real sobre UNA BD ya cargada/validada (reutilizable por apply_all)."""
         # Simétrico de ROB2: con un rollback a medio ejecutar, aplicar encima opera a
@@ -760,6 +917,18 @@ class ManagedMigrationController:
             finally:
                 session.close()
         self._guard_capture_consent(pending, allow_result_capture)
+        # Guard de entorno, sobre las pendientes REALES de ESTA BD. Va acá por el mismo
+        # criterio que los dos guards de captura de arriba, y con el mismo beneficio: cubre el
+        # ``apply`` por BD y ``apply_all`` de una sola vez, sin releer el motor.
+        if env_blocks_destructive:
+            self._guard_environment_destructive(
+                db_id,
+                pending,
+                destructive_versions
+                if destructive_versions is not None
+                else self._destructive_versions(specs, engine),
+                env_slug or "?",
+            )
         audit.record(
             "migration.apply", status="attempt", admin=admin,
             target_type="managed_database", target_id=db_id, server_id=server_id,
@@ -1214,10 +1383,19 @@ class ManagedMigrationController:
             # reescribe la narrativa de versión por completo, así que el checkpoint
             # quedaría hablando de un estado que el admin acaba de invalidar.
             migration_progress.clear_progress_for_database(db_id)
+        # ``stamp`` DECLARA una versión sin ejecutar una línea de DDL, y con eso reescribe
+        # ``managed_databases.model_version``. O sea que es la puerta trasera de cualquier
+        # política que se apoye en esa caché: un gate de promoción del tipo "no apliques en
+        # producción si staging no está al día" se destraba stampeando las BDs de staging al
+        # head. Ese gate NO existe todavía (ver TODO.md); cuando se construya, tiene que cerrar
+        # este camino y no solo leer la caché. Mientras tanto el rastro es explícito: la
+        # auditoría nombra la versión declarada y la que había antes, para que un stamp usado
+        # como atajo se pueda reconstruir después.
         audit.record(
             "migration.stamp", admin=admin, target_type="managed_database",
             target_id=db_id, server_id=server_id, touched_engine=True,
-            detail=f"stamp {version}" + (" (force: checkpoint parcial descartado)" if force else ""),
+            detail=f"stamp DECLARA version {version} (sin ejecutar DDL)"
+            + (" (force: checkpoint parcial descartado)" if force else ""),
         )
         return self.status(db_id)
 
@@ -1632,6 +1810,7 @@ class ManagedMigrationController:
         *,
         max_databases: int,
         database_ids: list[int] | None = None,
+        environment_id: int | None = None,
         force: bool = False,
         dry_run: bool = False,
         on_failure: str = "auto",
@@ -1682,6 +1861,11 @@ class ManagedMigrationController:
                 ManagedDatabase.id, ManagedDatabase.name,
                 ManagedDatabase.server_id, ManagedDatabase.status,
             ).filter(ManagedDatabase.model_id == model_id)
+            if environment_id is not None:
+                # El filtro va ANTES del ``limit`` de abajo, para que el tope no se consuma con
+                # BDs de otros entornos y "aplicá a desarrollo" no quede recortado por
+                # producción.
+                scoped = scoped.filter(ManagedDatabase.environment_id == environment_id)
             if database_ids:
                 # Los ids que NO pertenecen al blueprint se rechazan explícitamente en vez de
                 # dejar que el `IN` los ignore en silencio. No es cosmética: es la frontera
@@ -1707,9 +1891,45 @@ class ManagedMigrationController:
                         context={"model_id": model_id, "unknown_database_ids": unknown},
                         public_context={"unknown_database_ids": unknown},
                     )
+                # Mismo criterio fail-closed para el cruce con el filtro de entorno: un id que
+                # SÍ pertenece al blueprint pero NO al entorno pedido desaparecería en silencio
+                # del lote, que es exactamente el recorte callado que el bloque de arriba evita
+                # a propósito.
+                if environment_id is not None:
+                    in_env = {
+                        r[0]
+                        for r in session.query(ManagedDatabase.id)
+                        .filter(
+                            ManagedDatabase.id.in_(database_ids),
+                            ManagedDatabase.environment_id == environment_id,
+                        )
+                        .all()
+                    }
+                    outside = sorted(valid - in_env)
+                    if outside:
+                        raise AppHttpException(
+                            message=(
+                                "Hay BDs que no pertenecen al entorno indicado: "
+                                f"{', '.join(str(i) for i in outside)}."
+                            ),
+                            status_code=422,
+                            public_context={
+                                "code": ecodes.CODE_DATABASES_OUTSIDE,
+                                "database_ids_outside": outside,
+                            },
+                            context={"environment_id": environment_id},
+                        )
                 scoped = scoped.filter(ManagedDatabase.id.in_(database_ids))
+            # Coincidencias ANTES del recorte. ``total_databases`` cuenta todas las BDs del
+            # blueprint e ignora los filtros (contrato existente, no se toca porque la SPA lo
+            # imprime literal), así que sin este número "3 de 40 procesadas" no dice si sobraron
+            # 37 o si en ese entorno solo había 3.
+            matched = scoped.count()
             db_rows = scoped.order_by(ManagedDatabase.id.asc()).limit(max_databases).all()
             dbs = [(r.id, r.name, r.server_id, r.status) for r in db_rows]
+            # Política de entorno de TODO el lote en una query (anti-N+1), con valores planos:
+            # la sesión se cierra unas líneas más abajo, antes del bucle.
+            env_policies = self._env_policy_for(session, [d[0] for d in dbs])
             # ServerTarget + engine por servidor distinto (descifra credencial 1×/servidor).
             targets: dict[int, tuple] = {}
             for sid in {d[2] for d in dbs}:
@@ -1736,22 +1956,38 @@ class ManagedMigrationController:
         self._verify_integrity(specs)  # una sola vez para todo el lote
 
         items: list[dict] = []
+        denied: list[int] = []
+        # El set de versiones destructivas depende del MOTOR (por los overrides por motor), y
+        # un lote puede ser heterogéneo. Se memoiza por motor para no re-analizar el mismo SQL
+        # por cada BD; ``migration_facts.analyze`` ya cachea, esto además evita rearmar el dict.
+        _destructive_cache: dict[EngineType, dict[str, tuple[str, ...]]] = {}
+
+        def destructive_by_engine(eng: EngineType) -> dict[str, tuple[str, ...]]:
+            if eng not in _destructive_cache:
+                _destructive_cache[eng] = self._destructive_versions(specs, eng)
+            return _destructive_cache[eng]
+
         for db_id, name, server_id, status in dbs:
             target, engine = targets[server_id]
             item = {
                 "managed_database_id": db_id, "database_name": name,
                 "server_id": server_id, "applied": [], "ok": False,
             }
+            policy = env_policies.get(db_id)
+            item["environment_slug"] = policy[1] if policy else None
             try:
                 quarantined = status == ProvisionStatus.error
                 self._guard_quarantine(db_id, quarantined, force, dry_run)
                 if dry_run:
                     plan = self._dry_run_plan(
-                        db_id, name, server_id, target, slug, specs, None
+                        db_id, name, server_id, target, slug, specs, None,
+                        env_policy=policy,
+                        destructive=destructive_by_engine(engine) if policy else None,
                     )
                     item["ok"] = True
                     item["pending_versions"] = plan["pending_versions"]
                     item["dry_run"] = True
+                    item["blocked_by"] = plan["blocked_by"]
                 else:
                     out = self._run_apply(
                         db_id, db_name=name, server_id=server_id, target=target,
@@ -1760,6 +1996,11 @@ class ManagedMigrationController:
                         was_quarantined=quarantined, admin=admin,
                         on_failure=on_failure,
                         allow_result_capture=allow_result_capture,
+                        env_blocks_destructive=bool(policy and policy[0]),
+                        env_slug=policy[1] if policy else None,
+                        destructive_versions=(
+                            destructive_by_engine(engine) if policy and policy[0] else None
+                        ),
                     )
                     item["ok"] = not out["failed"]
                     item["applied"] = out["results"]
@@ -1771,6 +2012,30 @@ class ManagedMigrationController:
                     )
             except AppHttpException as exc:
                 item["error"] = exc.message
+                # El código estructurado se copia APARTE de la prosa. Este ``except`` se
+                # quedaba solo con ``exc.message`` y tiraba el ``public_context`` a la basura,
+                # así que para los guards del bucle el canal habitual (``public_context`` de la
+                # respuesta HTTP) no existe: la ruta responde 200 con los ítems adentro. Sin
+                # este campo el cliente vuelve a matchear prosa con expresiones regulares.
+                item["error_code"] = (exc.public_context or {}).get("code")
+                if item["error_code"] == ecodes.CODE_DESTRUCTIVE_BLOCKED:
+                    item["blocked_by"] = list(
+                        (exc.public_context or {}).get("blocked_versions") or []
+                    )
+                    denied.append(db_id)
+                    audit.record(
+                        "migration.environment_denied",
+                        status="denied",
+                        admin=admin,
+                        target_type="managed_database",
+                        target_id=db_id,
+                        server_id=server_id,
+                        touched_engine=False,
+                        detail=(
+                            f"guard=destructive environment={item['environment_slug']} "
+                            f"versions={','.join(item['blocked_by'])}"
+                        ),
+                    )
             except Exception as exc:  # noqa: BLE001 — una BD no debe abortar el lote
                 logger.warning("apply_all: error inesperado en BD %s: %s", db_id, exc,
                                exc_info=True)
@@ -1780,11 +2045,15 @@ class ManagedMigrationController:
         audit.record(
             "migration.apply_all", admin=admin, target_type="database_model",
             target_id=model_id, touched_engine=True,
-            detail=f"{len(dbs)}/{total} BDs procesadas" + (" (dry-run)" if dry_run else ""),
+            detail=f"{len(dbs)}/{total} BDs procesadas"
+            + (f" (entorno {environment_id})" if environment_id is not None else "")
+            + (f" — {len(denied)} denegadas por entorno" if denied else "")
+            + (" (dry-run)" if dry_run else ""),
         )
         return {
             "model_id": model_id,
             "total_databases": total,
+            "matched_databases": matched,
             "processed": len(dbs),
             "results": items,
         }

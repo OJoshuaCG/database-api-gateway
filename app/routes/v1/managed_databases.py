@@ -42,6 +42,17 @@ def list_databases(
     server_id: int | None = Query(None, ge=1),
     owner_id: int | None = Query(None, ge=1),
     model_id: int | None = Query(None, ge=1),
+    environment_id: int | None = Query(
+        None, ge=1, description="Filtra por entorno de despliegue."
+    ),
+    only_unassigned: bool = Query(
+        False,
+        description=(
+            "Solo las BDs SIN entorno asignado. Hace falta un flag propio porque "
+            "'environment_id' vacío ya significa 'sin filtro'. Mandar los dos devuelve 422 "
+            "(environment.filter_conflict) en vez de una lista vacía en silencio."
+        ),
+    ),
     status: ProvisionStatus | None = Query(None),
     engine: EngineType | None = Query(
         None, description="Filtra por motor del servidor (join a Server.engine)."
@@ -51,6 +62,8 @@ def list_databases(
         server_id=server_id,
         owner_id=owner_id,
         model_id=model_id,
+        environment_id=environment_id,
+        only_unassigned=only_unassigned,
         status=status,
         engine=engine,
         limit=pagination.size,
@@ -153,10 +166,18 @@ def apply_migrations(
         ),
     ),
     force: bool = Query(
-        False, description="Override de cuarentena tras un fallo previo (inspeccionado)."
+        False,
+        description=(
+            "Override de cuarentena tras un fallo previo (inspeccionado). **NO** saltea el "
+            "bloqueo de migraciones destructivas del entorno: ese guard no tiene override."
+        ),
     ),
     dry_run: bool = Query(
-        False, description="No aplica: devuelve el plan (versión actual + pendientes)."
+        False,
+        description=(
+            "No aplica: devuelve el plan (versión actual + pendientes). Informa en "
+            "'blocked_by' qué versiones bloquearía el entorno, sin fallar."
+        ),
     ),
     on_failure: str = Query(
         "auto",

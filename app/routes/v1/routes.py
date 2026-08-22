@@ -8,6 +8,7 @@ from app.routes.v1 import (
     database_clones,
     database_exports,
     database_models,
+    environments,
     managed_databases,
     model_migrations,
     permission_profiles,
@@ -34,6 +35,7 @@ router.include_router(database_exports.router)
 router.include_router(privileges.router)
 router.include_router(projects.router)
 router.include_router(projects.model_router)
+router.include_router(environments.router)
 router.include_router(charset_collation_options.router)
 router.include_router(permission_profiles.router)
 router.include_router(crypto.router)

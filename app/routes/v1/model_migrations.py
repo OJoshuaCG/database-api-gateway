@@ -69,7 +69,23 @@ def apply_all(
             "es la frontera que impide aplicar sus migraciones a una BD ajena."
         ),
     ),
-    force: bool = Query(False, description="Override de cuarentena en cada BD."),
+    environment_id: int | None = Query(
+        None,
+        ge=1,
+        description=(
+            "Acota el lote a un entorno. Es lo que convierte 'aplicá a todo' en 'aplicá a "
+            "desarrollo'. Se filtra ANTES del tope, así que 'max_databases' no se consume con "
+            "BDs de otros entornos. Combinado con 'database_ids', un id fuera del entorno "
+            "devuelve 422 en vez de desaparecer del lote en silencio."
+        ),
+    ),
+    force: bool = Query(
+        False,
+        description=(
+            "Override de cuarentena en cada BD. **NO** saltea el bloqueo de migraciones "
+            "destructivas por entorno: ese guard no tiene override."
+        ),
+    ),
     dry_run: bool = Query(
         False, description="No aplica: devuelve el plan por BD (pendientes)."
     ),
@@ -91,6 +107,7 @@ def apply_all(
 ):
     result = ManagedMigrationController().apply_all(
         model_id, max_databases=max_databases, database_ids=database_ids,
+        environment_id=environment_id,
         force=force, dry_run=dry_run,
         on_failure=on_failure, allow_result_capture=allow_result_capture, admin=admin,
     )

@@ -2436,6 +2436,13 @@ class CloneController:
                 return  # el origen ya no es gestionado con blueprint; nada que adoptar
             model_id = src_md.model_id
             model_version = src_md.model_version
+            # El ENTORNO del origen viaja igual que el blueprint y la versión. Sin esto el
+            # destino nacía con el entorno por DEFAULT, que es el más permisivo: un clon
+            # completo de una base productiva —o sea, una base con la estructura Y LOS DATOS de
+            # producción— quedaba clasificada como desarrollo y por lo tanto sin el guard de
+            # migraciones destructivas. Heredar es lo correcto acá justamente porque este
+            # camino solo corre en el clon COMPLETO: el destino es una réplica del origen.
+            environment_id = src_md.environment_id
             existing_tgt = (
                 session.query(ManagedDatabase)
                 .filter(ManagedDatabase.server_id == ctx["server_id"],
@@ -2456,6 +2463,10 @@ class CloneController:
                 "owner_id": ctx["adopt_owner_id"],
                 "model_id": model_id,
                 "model_version": model_version,
+                "environment_id": environment_id,
             },
+            # ``admin=None``: ``clone_jobs`` no persiste quién pidió el job, así que acá no hay
+            # autor que propagar. La adopción queda auditada sin autor. Arreglarlo requiere una
+            # columna nueva en la tabla; está anotado como ítem propio en TODO.md.
             admin=None,
         )

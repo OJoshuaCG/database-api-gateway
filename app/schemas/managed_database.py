@@ -22,7 +22,23 @@ class ManagedDatabaseCreate(BaseModel):
     server_id: int = Field(..., ge=1)
     owner_id: int = Field(..., ge=1, description="ServerUser propietario, del mismo servidor")
     model_id: int | None = Field(None, ge=1)
-    model_version: str | None = Field(None, max_length=50)
+    model_version: str | None = Field(
+        None,
+        max_length=50,
+        description=(
+            "Versión de partida declarada. Requiere 'model_id' y tiene que EXISTIR en ese "
+            "blueprint (422 si no): el gateway la compara numéricamente más adelante."
+        ),
+    )
+    environment_id: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "Entorno de despliegue que clasifica la BD. Si se omite se usa el entorno "
+            "marcado is_default. OJO: en este POST omitirlo y mandarlo en null son "
+            "indistinguibles, y los dos reciben el default."
+        ),
+    )
     charset: str | None = Field(
         None, pattern=_CHARSET, description="MySQL/MariaDB: CHARACTER SET. PostgreSQL: ENCODING."
     )
@@ -34,8 +50,22 @@ class ManagedDatabaseCreate(BaseModel):
 
 class ManagedDatabaseUpdate(BaseModel):
     # name/server_id/owner_id NO se editan aquí (owner: usar reassign-owner).
+    #
+    # ``model_version`` TAMPOCO, y no es un olvido: era escribible a ciegas por el cliente, sin
+    # confirmación y sin rastro de qué cambió, así que "declarar que esta BD ya está en la
+    # versión X" era un simple PATCH — y esa caché es la que cualquier gate de promoción entre
+    # entornos tiene que leer. La versión la escriben ``apply`` / ``rollback`` / ``stamp``
+    # releyendo el motor, y para declararla a mano sigue estando ``POST /{id}/migrations/stamp``,
+    # que sí valida que la versión exista en el blueprint.
     model_id: int | None = Field(None, ge=1)
-    model_version: str | None = Field(None, max_length=50)
+    environment_id: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "Reclasifica la BD. Enviar null DESCLASIFICA (la deja sin entorno); no enviarlo "
+            "no cambia nada. El entorno tiene que existir y estar activo."
+        ),
+    )
     charset: str | None = Field(None, pattern=_CHARSET)
     collation: str | None = Field(None, pattern=_CHARSET)
     notes: str | None = None
@@ -55,6 +85,15 @@ class AdoptDatabaseIn(BaseModel):
     server_id: int = Field(..., ge=1)
     owner_id: int = Field(..., ge=1, description="ServerUser propietario, del mismo servidor")
     model_id: int | None = Field(None, ge=1, description="Blueprint a vincular (opcional)")
+    environment_id: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "Entorno de despliegue que clasifica la BD. Si se omite se usa el entorno "
+            "marcado is_default. OJO: en este POST omitirlo y mandarlo en null son "
+            "indistinguibles, y los dos reciben el default."
+        ),
+    )
     model_version: str | None = Field(
         None,
         max_length=50,
@@ -79,6 +118,9 @@ class ManagedDatabaseOut(BaseModel):
     owner_id: int
     model_id: int | None = None
     model_version: str | None = None
+    environment_id: int | None = Field(
+        None, description="Entorno de despliegue que clasifica esta BD; null = sin clasificar"
+    )
     charset: str | None = None
     collation: str | None = None
     status: ProvisionStatus

@@ -359,6 +359,18 @@ class MigrationApplyOut(BaseModel):
     no_op: bool = Field(False, description="True si no había migraciones que aplicar")
     dry_run: bool = False
     pending_versions: list[str] = Field(default_factory=list)
+    environment_slug: str | None = Field(
+        None, description="Entorno de esta BD, o null si no está clasificada."
+    )
+    blocked_by: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Solo en dry-run: versiones pendientes que el entorno bloquearía por ser "
+            "destructivas. INFORMATIVO — el dry-run no falla, justamente para que se pueda ver "
+            "qué frena el apply. En el apply real esas versiones devuelven 409 "
+            "'environment.destructive_blocked'."
+        ),
+    )
     results: list[MigrationResultOut] = Field(default_factory=list)
     captured_select_count: int = Field(
         0,
@@ -517,6 +529,25 @@ class ApplyAllItemOut(BaseModel):
     dry_run: bool = False
     pending_versions: list[str] = Field(default_factory=list)
     error: str | None = None
+    error_code: str | None = Field(
+        None,
+        description=(
+            "Código estable del rechazo (p. ej. 'environment.destructive_blocked'). Va APARTE "
+            "de 'error', que es prosa para mostrar: el except del lote se queda solo con el "
+            "mensaje y descarta el public_context, así que este es el único transporte del "
+            "código para los rechazos por BD."
+        ),
+    )
+    environment_slug: str | None = Field(
+        None, description="Entorno de esta BD, o null si no está clasificada."
+    )
+    blocked_by: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Versiones que el entorno bloquea. En dry-run es INFORMATIVO (el plan no falla); "
+            "en un apply real acompaña al rechazo."
+        ),
+    )
     captured_select_count: int = Field(
         0,
         description=(
@@ -536,7 +567,17 @@ class ApplyAllItemOut(BaseModel):
 
 class ApplyAllOut(BaseModel):
     model_id: int
-    total_databases: int
+    total_databases: int = Field(
+        ..., description="TODAS las BDs del blueprint. No refleja los filtros del lote."
+    )
+    matched_databases: int = Field(
+        0,
+        description=(
+            "BDs que coincidieron con los filtros ANTES del tope 'max_databases'. Comparado "
+            "con 'processed' dice si hubo recorte: sin este número, 'processed 3 / total 40' "
+            "no distingue 'sobraron 37' de 'en ese entorno solo había 3'."
+        ),
+    )
     processed: int
     results: list[ApplyAllItemOut]
 
