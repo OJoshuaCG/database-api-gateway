@@ -139,6 +139,7 @@ los bugs corregidos) vive en `CLAUDE.md` y en `docs/features/`.
 
 | Fecha | Ítem | Estado de verificación |
 | --- | --- | --- |
+| 2026-08-22 | **Proyectos — agrupación de blueprints** (entidad nombre+descripción≤5000, pivote N:M, CRUD + vincular/desvincular + vista inversa) | 22 checks HTTP por ejecución directa + ciclo upgrade/downgrade/upgrade de la migración en SQLite. **Sin `pytest`** (política del repo) y **sin la migración contra la BD del gateway real** |
 | 2026-08-21 | **Flujo de gestión de tareas** — lista y tarea principal en ClickUp, `TODO.md`, protocolo en `CLAUDE.md` | Verificado por lectura; IDs confirmados contra la API de ClickUp |
 | 2026-08-16 | **Plan 10 — Exportación de BDs** (estructura y/o datos, sql/csv/json/ndjson, plan→preview→execute→download) | 87 checks HTTP + 27 de ciclo real + 81 writer + 96 spec + 23 literales + 17 endurecimiento. **Sin e2e contra motores reales** (P-01) |
 | 2026-08-16 | **Revisión de seguridad del export** — 3 bloqueantes + 5 recomendaciones + 1 fuga, todos aplicados. Incluye `/*M!` de MariaDB, que evadía la blocklist entera de la **consola SQL** (vuln preexistente) | Cada fix con test de regresión que falla sin el fix |

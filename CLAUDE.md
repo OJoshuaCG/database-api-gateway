@@ -1766,6 +1766,48 @@ un `submit` fallido lo descuenta.
 **R7** `_guard_owner` solo corre en la descarga; **R8** `_render_plan` materializa TODO el DDL en
 memoria antes de emitir; **R9** `preview`/`objects` no auditan.
 
+## Proyectos — agrupación de blueprints
+
+Entidad **deliberadamente vacía** (nombre + descripción larga) cuyo único fin es agrupar
+blueprints (`DatabaseModel`). Guía de uso: `docs/features/projects.md`.
+
+- **Relación N:M y OPCIONAL en los dos sentidos**, en tabla pivote `project_database_models`
+  con **PK compuesta** `(project_id, model_id)`. Una columna `project_id` en `database_models`
+  habría forzado "un blueprint, un proyecto" y habría que migrarla el primer día que dos
+  iniciativas compartan una base — que es el caso normal ("Citas" con 2 BDs, "Omnicanal" con
+  4). Con PK compuesta un vínculo duplicado es imposible incluso ante un bug del controller.
+- **REGLA DURA: borrar un proyecto borra la entidad y sus VÍNCULOS, nunca los blueprints**
+  (y al revés: borrar un blueprint suelta su pertenencia, no borra proyectos). Un blueprint es
+  el esquema que replican N BDs reales con datos reales; que un AGRUPADOR pueda arrastrarlas
+  sería pérdida de datos por una operación de organización. Tres capas: los dos
+  `ondelete="CASCADE"` apuntan al VÍNCULO; el controller borra los vínculos **explícitamente**
+  en la misma transacción (**no es redundante**: SQLite no aplica FKs sin
+  `PRAGMA foreign_keys`, así que en test el cascade del motor no dispara y quedarían filas
+  huérfanas — por eso `DatabaseModelController.delete_model` también los limpia); y los tests
+  `test_delete_project_keeps_blueprints` / `test_delete_blueprint_keeps_projects`. Por lo mismo
+  el borrado NO pide `confirm_target_name`/`confirm_token`: no se pierde nada irrecuperable.
+- **Endpoints** (`app/routes/v1/projects.py`, dos routers: `/projects` y `/database-models`
+  para la vista inversa, precedente de `model_migrations.py`): `GET|POST /projects`,
+  `GET|PATCH|DELETE /projects/{id}`, `GET|POST /projects/{id}/blueprints`,
+  `DELETE /projects/{id}/blueprints/{model_id}`, `GET /database-models/{id}/projects`.
+- **Vincular es IDEMPOTENTE y TODO-O-NADA**: un blueprint ya vinculado sale en
+  `already_linked` con 200 (reenviar la selección completa desde la UI es la operación
+  natural y no debe fallar); un id inexistente da **422** con `missing_model_ids` y **no
+  vincula ninguno** — misma política de selección explícita que schema-comparisons.
+- **Gotchas**: el tope de 5000 caracteres vive en el schema (`DESCRIPTION_MAX_LENGTH`), no en
+  la columna, que es `Text` — subirlo no requiere migración, y un `VARCHAR(5000)` consumiría
+  presupuesto del límite de 65 535 bytes por fila de MySQL/MariaDB (4 bytes por carácter con
+  `utf8mb4`). `PATCH` asigna `description` por **presencia** de la clave (`null` la limpia; es
+  la única forma de distinguirlo de "no enviado"), y `name` solo si no es `null`.
+  `blueprint_count` sale de UNA query con `GROUP BY` para toda la página (por fila serían 21
+  consultas para 20 proyectos). `GET /{id}/blueprints` no está paginado a propósito.
+  `name` es **único** (409). Ninguna operación abre conexión a un motor
+  (`touched_engine=False` en las 5 acciones auditadas `project.*`).
+- **Verificado**: 22 checks HTTP por ejecución directa (TestClient+SQLite, sin `pytest`) +
+  ciclo upgrade/downgrade/upgrade de la migración `d8e9f0a1b2c3` en SQLite + `alembic check`
+  sin drift para las dos tablas nuevas + no-regresión en `test_api_database_models.py` (6).
+  **Pendiente**: la migración contra la BD del gateway real.
+
 ## Perfiles de permisos: familia MySQL↔MariaDB y fallo silencioso de `apply-profile`
 
 Guía de uso: `docs/features/permissions.md` (§ apply-profile) y `docs/api-reference-v2.md`
@@ -1820,6 +1862,7 @@ reales (sin Docker en el entorno donde se implementó).
 
 ## Documentación
 
+- `docs/features/projects.md` — proyectos (agrupación N:M de blueprints)
 - `docs/` — documentación completa por feature (ver `docs/features/model-migrations.md`
   para migraciones de blueprints; `docs/features/server-database-lifecycle.md` para
   crear/borrar BDs a nivel servidor y listar usuarios con permisos sobre una BD;
