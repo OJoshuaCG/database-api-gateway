@@ -1,0 +1,42 @@
+# Normalización de fin de línea — LF en todo el repo.
+#
+# POR QUÉ EXISTE ESTE ARCHIVO (dos motivos, el segundo es el grave):
+#
+# 1. Churn de diff. Sin esto, el working tree acumula CRLF contra un índice en LF y
+#    `git status` muestra archivos "modificados" que solo cambiaron de terminador. Caso
+#    real: `docs/plans/11-*.md` apareció con 626 inserciones / 626 eliminaciones —número
+#    idéntico, la firma del churn— y cero cambio real de contenido. Se detecta con
+#    `git diff --ignore-cr-at-eol`, que en ese caso devuelve un diff vacío.
+#
+# 2. Los contenedores no arrancan. Git for Windows trae `core.autocrlf=true` por DEFECTO,
+#    así que un clon en Windows entrega los `.sh` con CRLF. Y `docker/scripts/entrypoint.sh`
+#    es el `ENTRYPOINT` del Dockerfile: con CRLF el kernel falla al resolver el shebang
+#    ("bad interpreter: /bin/sh^M") y la imagen no levanta. Lo mismo aplica a
+#    `docker/init/mariadb/01-gateway-admin.sh` y al hook
+#    `.claude/hooks/recordar-protocolo.sh`.
+#
+# Este repo NO versiona binarios (todo es py/md/sql/sh/yml/toml), así que la regla general
+# puede ser agresiva sin riesgo de corromper nada.
+
+* text=auto eol=lf
+
+# Scripts: LF SIEMPRE y de forma explícita, sin depender de la autodetección.
+# Un `.sh` con CRLF no se ejecuta en Linux.
+*.sh text eol=lf
+
+# Preventivo: el día que se versione un binario, que Git no lo toque.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.tar   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.db    binary
+*.sqlite binary
+*.sqlite3 binary
