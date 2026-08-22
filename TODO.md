@@ -124,6 +124,10 @@ ejecución directa de funciones y SQLite. Los scripts existen; nunca se corriero
 | T-260822-lz-clon-capabilities-frontend | Clon: endpoint de capacidades + matriz publicada (Fase 2) | Es el cambio que elimina la tabla de intenciones del cliente: con la forma del export (`options` con rutas con puntos, `compatibility`, `limits`, `error_codes`) el motor genérico de `database-exports/logic.ts` se reusa sin escribir nada nuevo. **El plan de UI ya está escrito y NO depende de este endpoint** (ver 🔵 Pendiente de frontend). | — |
 | T-260822-lz-clon-owner-set-role | Clon: el `owner` de PostgreSQL no es real | `CREATE DATABASE … OWNER x` fija el dueño **de la base**; todos los objetos los crea la conexión pseudo-root, así que el dueño pedido **no puede `ALTER`/`DROP` sus propias tablas** — peor que no pasar `owner`. Requiere `SET ROLE` para las fases de DDL y datos (o `REASSIGN OWNED`/`ALTER … OWNER TO` al cerrar) y validar la membresía del pseudo-root en el rol, o el `CREATE DATABASE` falla con 42501 **dentro del worker** (y con `clean_mode='drop_database'`, después del DROP). | — |
 | T-260822-lz-pg-resync-serial | El resync de secuencias de PG no cubre `serial` ni cross-engine | `_resync_postgres_identity_sequences` (`clone_controller.py:740-800`) solo actúa sobre columnas con `col.identity is not None` **del snapshot del ORIGEN**. Una columna `serial` tiene `identity=None` y default `nextval(...)` (por eso existe `PostgresAdapter._serial_type`), y un origen MySQL con `AUTO_INCREMENT` tampoco tiene `identity` ⇒ **la secuencia del destino nunca se resincroniza** y el primer `INSERT` de la aplicación choca la PK (23505). Defecto **preexistente** que el modo solo datos vuelve el camino principal. Fix: elegir las columnas desde el **destino** con `pg_get_serial_sequence(t, c) IS NOT NULL`, que cubre `serial` **e** `identity` y es la función que el código ya usa. | — |
+| T-260822-lz-entornos-flags-restantes | Entornos: los 4 flags de política que faltan | Se entregó `blocks_destructive_migrations` y **solo ese**, por la regla de "cero flags inertes". Los otros cuatro del §2 del plan 11, cada uno con lo que le falta para ser real: **`requires_confirmation`** → el gesto correcto es `confirm_token` HMAC con `subject` = (slug + ids del lote + versión objetivo), no un slug que `GET /environments` publica (público, constante, sin TTL ni anti-replay); y el guard va **antes** del bucle de `apply_all`, porque desde adentro el 422 es imposible (el `except` de `:1772` conserva solo `exc.message` y la ruta responde 200) y en un lote mixto las BDs sin entorno se aplicarían primero ⇒ media aplicación. **`requires_previous_environment`** → hay que cerrar `stamp` (escribe `model_version` sin ejecutar DDL: es su puerta trasera), restringir el cohorte a `status=active` (hoy `apply_all` no filtra por estado, así que una BD `pending` o `archived` trabaría producción para siempre sin forma de saber cuál), devolver los ids bloqueantes en `public_context`, y hacer que el conjunto **vacío BLOQUEE** (`all([]) == True` es fail-open en el caso más común: blueprint nuevo cuya primera BD es la de producción). El head sí es exacto hoy (`specs[-1].version`). **`max_databases_per_apply`** → con el default de la ruta (`max_databases=10`) un tope de 10 no puede dispararse nunca, y con `id.asc()` en un lote heterogéneo se cumple por accidente; necesita selección por grupo de entorno y reportar los recortes a nivel de lote (`capped_by_environment`), no como ítems falsos que ensucian `processed` y la auditoría. **`allows_agent_queries`** → la crea la feature 5 (MCP), junto con el gate donde `NULL` **niega** (asimetría deliberada con el `NULL` permisivo de `apply_all`, anotada en el docstring de `_env_policy_for`). | — |
+| T-260822-lz-entornos-otros-caminos | El entorno no restringe los demás caminos mutantes | `blocks_destructive_migrations` cubre `apply` y `apply-all`. **No** cubre: `rollback` (`:1004`, ejecuta `down_sql`, destructivo por definición), `reconcile-partial` (`:1452`), el clon con `clean_mode='drop_database'`, la consola SQL (opera por `(server_id, database_name)` y **nunca mira `ManagedDatabase`**, así que no tiene de dónde sacar el entorno), el `DROP DATABASE` a nivel servidor, la conversión de collation, el export (no destruye pero **extrae datos productivos**) y los `DROP USER` / `REVOKE CASCADE`. Todos tienen su propio doble factor (re-tipeo + `confirm_token`), que es lo que hoy los protege. Mientras esto siga así, `docs/features/environments.md` **declara explícitamente** qué restringe el entorno y qué no — si se extiende, hay que actualizar esa sección. | — |
+| T-260822-lz-clon-job-sin-autor | El clon adopta el destino sin autor auditado | `_adopt_target` (`clone_controller.py:2461`) llama a `adopt_database` con `admin=None`, así que la adopción del destino queda auditada **sin quién la originó**. No es un olvido del llamador: `clone_jobs` **no persiste** quién pidió el job (no hay columna de autor en el modelo), así que no hay nada que propagar. Requiere columna nueva + migración. Descubierto al propagar `environment_id` en ese mismo lugar. | — |
+| T-260822-lz-charset-default-carrera | `charset_catalog.update_option` tiene la carrera de `is_default` sin cerrar | `charset_catalog.py:368-377` apaga los demás defaults y después se enciende, sin bloqueo de filas. Con dos requests concurrentes ninguno ve al otro encendido y quedan **dos defaults sin ningún error**, igual en REPEATABLE READ (MySQL/MariaDB) que en READ COMMITTED (PostgreSQL): el `UPDATE` no toma predicate locks sobre filas que no matchean. Su docstring afirma un invariante que el mecanismo no garantiza. `EnvironmentController._claim_default` ya lo resuelve con `with_for_update()` sobre el catálogo (3-10 filas, costo nulo) y sirve de molde. | — |
 
 ### Riesgo de cumplimiento (aceptado explícitamente, anotado para revisión)
 
@@ -170,6 +174,7 @@ Atajo: `/tarea frontend`.
 | Ítem | Subtarea ClickUp | Backend cerrado por | Fecha | Breaking changes | Contrato |
 | --- | --- | --- | --- | --- | --- |
 | Clon: copia de solo datos, collation/owner del destino y selección declarativa | [`86e2xzzyh`](https://app.clickup.com/t/86e2xzzyh) | LeoZubiri@outlook.com | 2026-08-22 | **No** para la SPA actual (los schemas zod no usan `.strict()`, así que los campos nuevos se descartan y nada se rompe). Sí hay cambios de comportamiento que el wizard tiene que absorber: el SPEC se manda ahora en `preview` (no en `create`), `confirm_token` puede llegar **vacío** cuando hay `blocking_issues`, y los mensajes de error cambiaron — `wizard/messages.ts` los matchea con expresiones regulares sobre la prosa. | `docs/features/database-clone.md` + `de73439` (schemas y rutas). Plan de UI COMPLETO ya escrito, con recorrido paso por paso, copy, mapeo de códigos `clone.*` y plan de pruebas. |
+| Entornos: clasificación de BDs + bloqueo de DDL destructivo | [`86e2y21kh`](https://app.clickup.com/t/86e2y21kh) | LeoZubiri@outlook.com | 2026-08-22 | **SÍ, uno**: `model_version` ya NO se acepta en `PATCH /managed-databases/{id}` (se descarta en silencio; el campo salió del schema). Cualquier cliente que lo mandara para "declarar" una versión deja de tener efecto — la vía es `POST /{id}/migrations/stamp`. El resto es ADITIVO y seguro (los schemas zod del frontend no usan `.strict()`, verificado): `environment_id` en `ManagedDatabaseOut` (aparece en **3** endpoints por el `_serialize` compartido), `error_code`/`environment_slug`/`blocked_by` en `ApplyAllItemOut`, `matched_databases` en `ApplyAllOut`, `blocked_by`/`environment_slug` en `MigrationApplyOut`. **Ojo con un defecto PREEXISTENTE del zod**: `applyAllItemSchema` declara `database_name`/`server_id` requeridos y no-nullables mientras el backend los tipa `str \| None`; hay que pasarlos a `.nullish()` o un ítem sin ellos hace que el `safeParse` descarte la respuesta entera. | `docs/features/environments.md` + 5 endpoints nuevos en `/environments` |
 
 ---
 
@@ -203,6 +208,143 @@ los bugs corregidos) vive en `CLAUDE.md` y en `docs/features/`.
 | — | **Plan 07 Fase 1 — Permisos granulares** (GRANT/REVOKE/LIST/GRANTABLE/PROVISION/APPLY-PROFILE) | Fases 2 y 3 pendientes |
 | — | **Ciclo de vida de BDs a nivel servidor** (crear/borrar/usuarios por identidad) | Solo `FakeAdapter`. **Sin e2e** (P-05) |
 | — | **Cifrado de sobre KEK/DEK** (MultiFernet, rotación, guards de producción) | — |
+
+---
+
+## Detalle — `T-260822-lz-entornos-clasificacion` (Feature 1 del §2 del plan 11)
+
+Clasificación de BDs gestionadas por entorno + **un** flag de política efectivamente aplicado.
+Plan completo: `docs/plans/11-organizacion-copia-de-datos-releases-y-mcp.md` §2. Guía del módulo:
+`docs/features/environments.md`.
+
+**El plan se rehízo antes de implementar.** La primera versión se sometió a cuatro revisiones
+(seguridad/bypass, Alembic+modelo de datos, contrato API+frontend, internals de `apply_all`) y
+**no sobrevivió**: de los tres guards que proponía, uno nacía ciego, uno no podía devolver 422
+desde donde estaba puesto, y el tercero se satisfacía con un `PATCH`. Lo que sigue son las
+decisiones del rediseño que no se leen del código.
+
+**Decisiones de diseño que no son obvias:**
+
+1. **Cero flags inertes.** El §2 propone cinco flags; se creó UNO
+   (`blocks_destructive_migrations`), porque es el único que el servidor hace cumplir hoy. Un
+   booleano que la API expone y nadie lee, la SPA lo pinta como control activo: es peor que su
+   ausencia. Los otros cuatro tienen ítem propio con lo que le falta a cada uno.
+2. **El guard NO lee el manifiesto de sentencias.** `ModelMigrationStatement.destructive` parece
+   la fuente natural y era la del plan original, pero esas filas **casi nunca existen**: el
+   manifiesto es opcional y lo escribe únicamente la adopción de un diff estructural
+   (`_write_statement_manifest` corta con `if not statements or not source_engine: return`, y
+   `ModelMigrationCreate` no tiene ni campo `statements`). Una migración escrita a mano con
+   `up_sql = "DROP TABLE clientes"` produce **cero** filas ⇒ el guard la dejaba pasar, por el
+   camino documentado para escribir una migración a mano. La fuente es `migration_facts.analyze`
+   (AST), que además es lo mismo que el listado ya publica como insignia `destructive`. El
+   manifiesto se usa en OR, donde exista.
+3. **Se analiza el SQL RESUELTO POR MOTOR** (`select_up_sql`), no `spec.up_sql`: el `DROP` puede
+   vivir solo en `up_sql_postgresql`, y mirando el SQL base es invisible justo en el motor donde
+   se ejecuta.
+4. **El guard va en `_run_apply`, no en el bucle de `apply_all`.** Punto de inserción: justo
+   después de `pending = compute_pending(...)`, al lado de `_guard_reviewed_capture` y
+   `_guard_capture_consent`, que están ahí por el mismo criterio (el comentario del archivo lo
+   explica). Beneficio: cero lecturas extra al motor, ninguna ventana TOCTOU nueva, y **cubre el
+   `apply` por BD gratis**. Sin eso el incentivo era perverso: `apply_all` va siempre al head, así
+   que una versión destructiva trabaría producción de forma permanente en el lote mientras el
+   `apply` por BD la aplica con `?version=` sin gate. El plan original usaba `_dry_run_plan` por
+   BD desde el bucle: es read-only e idempotente (verificado: no crea la tabla de versión, no
+   audita, no toma el advisory lock) pero era una TERCERA lectura del motor.
+5. **`rank` NO es único.** El único rompía el seed en silencio (slug renombrado ⇒ el seed reinserta
+   con el mismo rank ⇒ `IntegrityError` que el `except` del patrón de seed se traga ⇒ seed muerto
+   para siempre), y no hacía falta: el orden total `(rank, id)` ya da un predecesor determinista.
+   Además sin único un swap de ranks no colisiona en el paso intermedio, que en MySQL/MariaDB no
+   se puede diferir.
+6. **`ON DELETE RESTRICT`, no `SET NULL`.** No calca `model_id` (puntero de capacidad) sino
+   `owner_id` (`RESTRICT`, "reasignar antes de borrar"): `environment_id` es un puntero de
+   POLÍTICA, y con `SET NULL` borrar una fila convertiría N BDs de producción en BDs sin guard, con
+   el guard de acuerdo en que eso está bien.
+7. **`DELETE` sin `force`.** Exige cero BDs asignadas (409 con el conteo). Ningún `DELETE` del repo
+   tiene `force` — los destructivos exigen re-tipear el identificador — y un flag en una URL
+   termina en un script. La vía de retiro de un entorno con BDs es `is_active=false`.
+8. **`is_default` con `with_for_update()`.** El patrón "apagar los demás y después encenderme"
+   tiene una carrera real que deja DOS defaults **sin ningún error** (ver el ítem de
+   `charset_catalog`, que la tiene sin cerrar). El índice único parcial no es portable: MySQL 8 no
+   tiene índices parciales y el truco funcional no existe en MariaDB 11. SQLite ignora
+   `FOR UPDATE`, así que este invariante NO está verificado contra concurrencia real.
+9. **El seed siembra solo si la tabla está VACÍA**, a diferencia de `charset_catalog`, que hace
+   top-up. Su docstring dice que divergir "no hace daño"; **eso no vale acá** porque la fila es la
+   política: un top-up resucita un `production` borrado a propósito sin restaurar el
+   `environment_id` de sus BDs, puede duplicar el default, y deja dos políticas distintas según
+   cómo se provisionó el gateway.
+10. **`slug` se normaliza y compara en Python.** MySQL/MariaDB comparan case-insensitive por
+    default y PostgreSQL no: la misma fila sería duplicado en un motor y dos filas en el otro, y
+    `confirm_slug=PRODUCTION` confirmaría en uno y no en el otro.
+11. **El default es el entorno MÁS PERMISIVO** (`development`, decisión explícita del usuario). Se
+    documenta la consecuencia: una BD nueva nace clasificada pero **no** nace protegida. La red es
+    el filtro `only_unassigned` y el `database_count` del listado.
+12. **`NULL` es permisivo en el guard** (compromiso de compatibilidad), y esa asimetría **NO se
+    traslada** al futuro gate de agentes, donde `NULL` debe negar. Anotado en el docstring de
+    `_env_policy_for` para que nadie lo "unifique".
+13. **El código de error del rechazo va en un campo del ÍTEM, no en `public_context`.** El
+    `except` de `apply_all` conserva solo `exc.message` y la ruta responde 200, así que para los
+    rechazos por BD el canal habitual no existe. De ahí `error_code` en `ApplyAllItemOut`.
+14. **El dry-run informa y no bloquea** (`blocked_by`), porque es la llamada con la que el operador
+    descubre qué lo frena. Precedente: `_guard_quarantine` también se saltea en dry-run. Sale
+    gratis: ni `apply` ni `apply_all` llaman a `_run_apply` cuando `dry_run=True`.
+15. **`force` no saltea el guard**, dicho en el `description` de los dos endpoints y fijado con un
+    test. `force` es override de cuarentena y nada más; en la SPA es un `Switch` sin fricción.
+
+**Agujeros adyacentes cerrados** (sin ellos la barrera nacía burlable):
+
+- **`model_version` fuera del `PATCH`**: era escribible a ciegas, sin confirmación y con un
+  `audit.record` sin `detail`, así que "promover a producción" se lograba tipeando un número. Y
+  `max_length=50` no exigía dígitos mientras `version_sort_key` hace `int(version)`: un
+  `"v3-hotfix"` era un 500 latente. En el ALTA se sigue aceptando pero ahora **validado contra el
+  blueprint**, con el mismo criterio que ya usaba `adopt`.
+- **`environment_id` propagado en el auto-adopt del clon** (`clone_controller.py`): propagaba
+  blueprint y versión pero no el entorno, así que un clon completo de una base productiva
+  —estructura Y DATOS de producción— nacía como desarrollo.
+- **La auditoría del update lleva `detail` con `old → new`**: sin él una reclasificación de entorno
+  era indistinguible de un cambio de `notes`.
+- **`stamp` documentado como la puerta trasera** de cualquier gate que se apoye en la caché de
+  versión, con su auditoría diciendo que DECLARA sin ejecutar DDL.
+
+### Verificado
+
+**Con `pytest` de verdad** (este entorno es Fedora nativo, no WSL2, así que la política de no
+correr la suite por I/O lento no aplica acá): **1652 pasados, 6 skipped, 3 fallos PREEXISTENTES**
+(`test_gateway_internal_tables`, el CORS de `test_health` y `test_snapshot_layout`, los tres
+verificados uno por uno contra el checkout en la punta, donde fallan igual).
+
+- **36 tests nuevos**: 25 de CRUD/invariantes (`tests/test_api_environments.py`) + 11 del guard
+  (`tests/test_environment_guard.py`).
+- **Ciclo real `upgrade → downgrade → upgrade`** contra SQLite, más 13 checks del esquema
+  resultante con `PRAGMA foreign_keys=ON`: el seed, la columna nullable, el índice, la FK con su
+  `RESTRICT`, los dos únicos rechazando duplicados, `rank` aceptando repetidos, y que el `RESTRICT`
+  **dispara de verdad a nivel motor** (los tests del repo usan `create_all` sin activar las FKs, así
+  que sin esto el 409 del controller aparentaría validar producción).
+- **`scripts/check_migration_graph.py`**: 27 revisiones, head único `e4f5a6b7c8d9`.
+- **`alembic check`**: el drift reportado es **solo el preexistente** (`charset_collation_options`,
+  `migration_statement_progress`, `model_migration_statements`, `query_executions`) y ni una entrada
+  de `environments` ni de `managed_databases`.
+- **Ruff**: los archivos nuevos producen exactamente los mismos códigos y cantidades que sus
+  equivalentes preexistentes (1 BLE001, 1 RUF100, 3 UP007, 1 UP035 — el `Union[]` de la plantilla
+  de Alembic y el `noqa` del seed). En los 9 archivos modificados, paridad exacta con la punta:
+  cero violaciones nuevas.
+
+**Dos tests con dientes**, que fallan si se revierte el rediseño: el del **manifiesto ausente**
+(migración escrita a mano con `DROP TABLE` y cero filas de manifiesto ⇒ tiene que bloquear; falla
+contra la implementación del plan original) y el del **override por motor** (`DROP` solo en
+`up_sql_postgresql` ⇒ tiene que bloquear; falla si alguien "simplifica" a `spec.up_sql`). Más el de
+**contención del lote**, que es el que distingue un guard bien ubicado de uno que aborta el lote
+entero — un test que mire solo la BD bloqueada no lo ve.
+
+### Qué quedó SIN verificar
+
+1. **La migración contra la BD del gateway real** (hoy solo SQLite) — se suma a `P-10`.
+2. **La unicidad de `is_default` bajo concurrencia real.** SQLite ignora `FOR UPDATE` en silencio y
+   los tests son single-thread, así que el `with_for_update()` está puesto por análisis del modo de
+   fallo, no verificado contra dos requests simultáneos en MySQL/PostgreSQL.
+3. **El `RESTRICT` en los tres motores.** Verificado contra SQLite con las FKs activadas a mano; en
+   MySQL/MariaDB/PostgreSQL se asume el comportamiento estándar.
+4. **El frontend**: sin tocar. La feature es usable por API; la SPA todavía no tiene selector de
+   entorno ni pinta el badge.
 
 ---
 

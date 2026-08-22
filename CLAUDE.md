@@ -1869,6 +1869,88 @@ un `submit` fallido lo descuenta.
 **R7** `_guard_owner` solo corre en la descarga; **R8** `_render_plan` materializa TODO el DDL en
 memoria antes de emitir; **R9** `preview`/`objects` no auditan.
 
+## Entornos — clasificación de BDs y bloqueo de DDL destructivo
+
+Guía completa: `docs/features/environments.md`. Lo mínimo que hay que saber antes de tocar esto:
+
+**⚠️ Hay DOS cosas llamadas "environment" en este repo.** `app/core/environments.py` es la config
+del PROCESO (`APP_ENV`), y gobierna seguridad real del gateway (flag `Secure` de la cookie,
+exigencia de `ADMIN_PASSWORD`/`SESSION_SECRET`, rechazo del wildcard de CORS, y si `context` se
+expone en los errores). La tabla `environments` clasifica las **BDs de terceros** que el gateway
+administra. Usan los mismos valores (`development`/`production`) para cosas distintas, y
+`GET /health` ya devuelve un campo `environment` con el valor de `APP_ENV`. En el código: la config
+siempre por su constante (`APP_ENV`), la tabla siempre como `Environment`. Nunca "el entorno" a
+secas.
+
+**Un solo flag de política, y es a propósito.** `blocks_destructive_migrations` rechaza aplicar
+versiones con `DROP`/`TRUNCATE`/`DELETE` sin `WHERE`/`ALTER DROP COLUMN` a las BDs de ese entorno.
+Los otros cuatro flags del §2 del plan 11 (`requires_confirmation`,
+`requires_previous_environment`, `max_databases_per_apply`, `allows_agent_queries`) **no existen
+como columna**: regla de "cero flags inertes" — no se crea política que el servidor no haga cumplir
+en la misma entrega, porque la SPA pinta cualquier booleano como un control activo. Cada uno tiene
+su ítem en `TODO.md` con lo que le falta.
+
+**El guard vive en `_run_apply`, después de `compute_pending`.** No en el bucle de `apply_all`. Es
+lo que hace que cubra `apply-all` **y** el `apply` por BD con una sola inserción, sin releer el
+motor. Si lo movés al bucle, el `apply` por BD queda sin gate y ahí se va todo el mundo:
+`apply_all` va siempre al head, así que una versión destructiva traba producción de forma
+permanente en el lote mientras `?version=` la aplica sin control.
+
+**El veredicto "destructivo" NO sale del manifiesto de sentencias.** `ModelMigrationStatement.destructive`
+parece la fuente natural, pero esas filas casi nunca existen (solo las escribe la adopción de un
+diff estructural; `ModelMigrationCreate` no tiene ni campo `statements`), así que una migración
+escrita a mano con `DROP TABLE` produce cero filas y el guard la dejaría pasar. La fuente es
+`migration_facts.analyze` (AST) **sobre el SQL resuelto por motor** (`select_up_sql`), porque el
+`DROP` puede vivir solo en `up_sql_postgresql`. El manifiesto se usa en OR donde exista. Hay dos
+tests que fijan las dos cosas y fallan si se "simplifica".
+
+**`force` NO saltea el guard.** `force` es override de cuarentena y nada más. En la SPA es un
+`Switch` sin fricción, así que si algún día lo saltea, la barrera se abre con un click.
+
+**El dry-run informa y no bloquea** (`blocked_by` en la respuesta). Es la llamada con la que el
+operador descubre qué lo frena. Sale gratis porque ni `apply` ni `apply_all` llaman a `_run_apply`
+en dry-run.
+
+**El código del rechazo va en `error_code` del ÍTEM, no en `public_context`.** El `except` de
+`apply_all` conserva solo `exc.message` y la ruta responde 200, así que para los rechazos por BD el
+canal habitual no existe. Y todo código nuevo del módulo va en `public_context` (que se ve
+siempre), nunca en `context` (solo development): el vocabulario cerrado está en
+`app/services/environment_catalog.py`. **El molde de `ProjectController` tiene este defecto** — usa
+`context=` en sus seis excepciones — así que no lo copies para errores.
+
+**Lo que el entorno NO restringe**: `rollback`, `reconcile-partial`, el clon con
+`clean_mode='drop_database'`, la consola SQL (opera por `(server_id, database_name)` y nunca mira
+`ManagedDatabase`), el `DROP DATABASE` a nivel servidor, la conversión de collation, el export y
+los `DROP USER`/`REVOKE CASCADE`. Todos tienen su propio doble factor. Está declarado explícitamente
+en `docs/features/environments.md`; si extendés el gate, actualizá esa sección.
+
+**Detalles del modelo que tienen motivo:** `rank` **no** es único (el único rompía el seed en
+silencio ante un slug renombrado, y `(rank, id)` ya da un predecesor determinista);
+`environment_id` usa **`ON DELETE RESTRICT`** y no `SET NULL` (es un puntero de política, no de
+capacidad: con `SET NULL` borrar una fila dejaría N BDs de producción sin guard); `is_default` se
+hace cumplir con `with_for_update()` porque el patrón "apagar los demás y después encenderme" deja
+DOS defaults sin ningún error (la misma carrera está **sin cerrar** en
+`charset_catalog.update_option`, cuyo docstring afirma un invariante que no garantiza); el seed
+siembra **solo si la tabla está vacía** (a diferencia del catálogo de charsets, porque acá la fila
+es la política y un top-up resucita un `production` borrado o duplica el default); y `slug` se
+normaliza y compara **en Python** porque MySQL compara case-insensitive y PostgreSQL no.
+
+**El default es `development`, o sea el entorno más permisivo.** Una BD nueva nace clasificada pero
+**no** nace protegida. La red para encontrar lo mal clasificado es el filtro `only_unassigned` y el
+`database_count` del listado.
+
+**`NULL` es permisivo acá, y esa asimetría no se traslada.** Una BD sin entorno pasa el guard
+(compromiso de compatibilidad: no romper los `apply-all` que ya funcionaban). El día que exista el
+gate de consultas para agentes de IA, ahí `NULL` debe **negar**. Está anotado en el docstring de
+`_env_policy_for`; no lo "unifiques".
+
+**`model_version` ya no se escribe por `PATCH /managed-databases/{id}`.** Era escribible a ciegas,
+así que "promover a producción" se lograba tipeando un número — y esa caché es la que cualquier gate
+de promoción tiene que leer. Además `version_sort_key` hace `int(version)` y el schema no exigía
+dígitos, así que un `"v3-hotfix"` era un 500 latente. La escriben `apply`/`rollback`/`stamp`
+releyendo el motor; para declararla a mano está `stamp`, que sí valida contra el blueprint. Ojo:
+**`stamp` es la puerta trasera** de cualquier gate futuro basado en esa caché.
+
 ## Proyectos — agrupación de blueprints
 
 Entidad **deliberadamente vacía** (nombre + descripción larga) cuyo único fin es agrupar
