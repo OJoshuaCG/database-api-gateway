@@ -1,8 +1,25 @@
 """projects + pivote N:M con database_models (agrupación de blueprints)
 
 Revision ID: d8e9f0a1b2c3
-Revises: c7d8e9f0a1b2
+Revises: d3e4f5a6b7c8
 Create Date: 2026-08-22 09:00:00.000000
+
+RE-ENCADENADA (2026-08-22). Nació con ``Revises: c7d8e9f0a1b2``, igual que
+``d3e4f5a6b7c8`` (columnas del spec en ``clone_jobs``), porque las dos se escribieron el
+mismo día en ramas distintas colgadas del mismo padre. Git mergeó los dos archivos sin
+conflicto -son archivos distintos y nunca se tocan-, pero el DAG de Alembic vive DENTRO
+del campo ``down_revision``, así que quedó bifurcado en dos heads y
+``alembic upgrade head`` del ``entrypoint.sh`` dejó de poder resolver a qué revisión ir:
+abortaba antes de abrir transacción y el contenedor no arrancaba.
+
+Se linealiza sobre ``d3e4f5a6b7c8`` y no al revés por una razón, no por gusto: **las dos
+son disjuntas**. Aquella agrega columnas a ``clone_jobs``; esta CREA ``projects`` y
+``project_database_models``. No comparten ni una tabla, así que el orden relativo no
+cambia el resultado y cualquiera de los dos sentidos habría sido correcto.
+
+NO devolver esto a ``c7d8e9f0a1b2``: reabre exactamente el mismo incidente. Si hace falta
+reordenar, se cambia el ``down_revision`` de la OTRA punta; nunca se dejan dos hijas del
+mismo padre. ``scripts/check_migration_graph.py`` lo verifica en cada push.
 
 Un ``Project`` agrupa blueprints y nada más: nombre + descripción larga. La relación es
 N:M y opcional en los dos sentidos, así que va en tabla pivote y no en una columna
@@ -25,7 +42,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = 'd8e9f0a1b2c3'
-down_revision: Union[str, None] = 'c7d8e9f0a1b2'
+down_revision: Union[str, None] = 'd3e4f5a6b7c8'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
