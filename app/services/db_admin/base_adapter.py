@@ -292,11 +292,15 @@ class ServerAdapter(ABC):
         """
 
     @abstractmethod
-    def _estimate_rows(self, conn, table: str, schema: str) -> int:
+    def _estimate_rows(self, conn, table: str, schema: str) -> int | None:
         """
         Estimación de filas de una tabla desde el catálogo (rápida, aproximada; NO
         cuenta filas). MySQL: ``information_schema.TABLES.TABLE_ROWS``; PostgreSQL:
         ``pg_class.reltuples``. Solo para informar la selección de datos-semilla.
+
+        ``None`` = **el catálogo no lo sabe** (``reltuples`` en -1 porque nunca corrió
+        ``ANALYZE``, o ``TABLE_ROWS`` en NULL). Devolver 0 en ese caso hacía que una tabla
+        de millones de filas se informara como vacía, que es peor que no informar nada.
         """
 
     # ------------------------------------------------------------------ #
@@ -1658,10 +1662,12 @@ class ServerAdapter(ABC):
                         insp.get_pk_constraint(t, schema=schema).get("constrained_columns")
                         or []
                     )
+                    estimate = self._estimate_rows(conn, t, schema)
                     out.append(
                         TableStat(
                             table=t,
-                            estimated_rows=self._estimate_rows(conn, t, schema),
+                            estimated_rows=estimate if estimate is not None else 0,
+                            estimated_rows_known=estimate is not None,
                             has_primary_key=bool(pk),
                         )
                     )

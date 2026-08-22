@@ -1429,7 +1429,10 @@ class MySQLAdapter(ServerAdapter):
             return False
         return needed.issubset(grantable)
 
-    def _estimate_rows(self, conn, table: str, schema: str) -> int:
+    def _estimate_rows(self, conn, table: str, schema: str) -> int | None:
+        # ``TABLE_ROWS`` es NULL para objetos donde no aplica (vistas, algunos motores) y
+        # sale de una caché gobernada por ``information_schema_stats_expiry``, así que puede
+        # estar atrasada. NULL => desconocido, no cero.
         row = conn.execute(
             text(
                 "SELECT TABLE_ROWS FROM information_schema.TABLES "
@@ -1437,7 +1440,7 @@ class MySQLAdapter(ServerAdapter):
             ),
             {"s": schema, "t": table},
         ).scalar()
-        return int(row) if row is not None else 0
+        return int(row) if row is not None else None
 
     # ------------------------- snapshot canónico (hooks) ---------------------- #
     def _column_extras(self, conn, database, table, schema) -> dict[str, dict]:

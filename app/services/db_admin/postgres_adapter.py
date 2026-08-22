@@ -1342,7 +1342,9 @@ class PostgresAdapter(ServerAdapter):
         validate_identifier(self._require_field(name, "objeto"), self.dialect, "objeto", allow_existing=True)
         return f"{schema}.{name}"
 
-    def _estimate_rows(self, conn, table: str, schema: str) -> int:
+    def _estimate_rows(self, conn, table: str, schema: str) -> int | None:
+        # ``reltuples = -1`` significa "nunca se analizó" (PG10+), no "cero filas": es el
+        # estado normal de una BD recién restaurada o recién clonada. None => desconocido.
         row = conn.execute(
             text(
                 "SELECT c.reltuples::bigint FROM pg_class c "
@@ -1351,7 +1353,9 @@ class PostgresAdapter(ServerAdapter):
             ),
             {"t": table, "s": schema},
         ).scalar()
-        return int(row) if row is not None and row >= 0 else 0
+        if row is None or int(row) < 0:
+            return None
+        return int(row)
 
     # ------------------------- snapshot canónico (hooks) ---------------------- #
     @staticmethod
