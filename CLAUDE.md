@@ -606,6 +606,54 @@ máquina del usuario sin que se haya pedido.
   la lógica. Sé explícito en tu respuesta sobre qué quedó **sin verificar** por esta razón,
   para que el usuario decida si quiere correr los tests él mismo o pedírtelo.
 
+## Migraciones del gateway: UN SOLO head, siempre
+
+Esto es sobre el `alembic/` **del gateway** (su propia BD de metadatos), no sobre el módulo
+de migraciones de blueprints que viene más abajo.
+
+**Regla: al crear una migración, su `down_revision` debe apuntar al head ACTUAL, y después
+del merge tiene que seguir habiendo un solo head.** Verificalo con
+`python scripts/check_migration_graph.py` (no necesita BD ni `.env`: lee el fuente con `ast`).
+
+**Por qué es una regla y no una preferencia** (incidente del 2026-08-22, producción caída):
+dos ramas crearon una migración cada una colgada del mismo padre `c7d8e9f0a1b2`. Git mergeó
+los dos archivos **sin conflicto** —son archivos distintos que nunca se tocan— pero el DAG de
+Alembic vive DENTRO del campo `down_revision`, así que quedaron dos puntas.
+`alembic upgrade head` es una RESOLUCIÓN DE NOMBRE: con dos candidatos aborta antes de abrir
+transacción, el `set -euo pipefail` del `entrypoint.sh` mata el contenedor y el gateway entra
+en loop de reinicios. La BD no se corrompe (el fallo es previo a tocarla), pero no arranca.
+Este modo de fallo **no lo ve el linter, ni el compilador, ni quien revisa el PR** —cada
+migración es correcta por separado— **ni git**. Aparece recién en producción.
+
+**Al arreglar una bifurcación: ENCADENAR, no `alembic merge heads`.** El merge deja head
+único pero agrega una revisión vacía y conserva la bifurcación en la historia. Encadenar
+(apuntar el `down_revision` de una al `revision` de la otra, y corregir el `Revises:` del
+docstring para que no mienta) deja la historia lineal, que es lo que un despliegue directo
+desde `main` necesita para ser predecible. Si las dos migraciones son disjuntas el orden es
+indiferente; si no, va primero la que deja el esquema en el estado que la otra asume.
+
+**Los `revision` de este repo se eligen A MANO** y con forma secuencial (`d3e4f5a6b7c8`,
+`d8e9f0a1b2c3`), no con el hash aleatorio que genera `alembic revision`. Eso hace que dos
+personas del mismo día elijan plausiblemente el mismo ID, y ese daño es **peor** que una
+bifurcación: una de las dos migraciones queda inalcanzable y su DDL nunca se aplica **sin
+que nada falle**. El guard también lo detecta.
+
+Tres barreras, en orden de cuándo actúan: hook `.githooks/pre-push` (se instala una vez por
+clon con `git config core.hooksPath .githooks`; se puede saltear con `--no-verify`), workflow
+`.github/workflows/migration-graph.yml` (no se puede saltear), y pre-vuelo en
+`docker/scripts/entrypoint.sh` (última red: convierte el mensaje opaco de Alembic en uno que
+nombra las revisiones en conflicto y aclara que la BD no se tocó).
+
+El guard **no usa `alembic.script.ScriptDirectory`** a propósito, y el motivo está medido:
+`ScriptDirectory` **importa** los archivos de migración, así que su veredicto sale del
+`__pycache__` cuando el bytecode está rancio. Reproducido durante la implementación: se editó
+un `down_revision` a un valor de la misma longitud y se restauró dentro del mismo segundo;
+CPython invalida bytecode comparando mtime (granularidad de 1 s) y tamaño, los dos
+coincidieron, y Alembic dictaminó sobre una cadena que ya no estaba en el archivo. Para un
+guard eso falla en la dirección PELIGROSA —aprobar un árbol roto— y justo después de un
+rebase o un cambio de rama, que son las operaciones que producen las bifurcaciones. De ahí
+que lea el fuente con `ast`.
+
 ## Módulo de Migraciones de Blueprints (Plan 02)
 
 Sistema de **migraciones versionadas de blueprints** (`DatabaseModel`): el admin sube
