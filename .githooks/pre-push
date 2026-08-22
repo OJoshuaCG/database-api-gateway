@@ -1,0 +1,49 @@
+#!/bin/bash
+#
+# Verifica el grafo de migraciones Alembic antes de dejar salir un push.
+#
+# Se instala una vez por clon (los hooks no viajan en el repo):
+#
+#     git config core.hooksPath .githooks
+#
+# POR QUÉ EN pre-push Y NO EN pre-commit
+# --------------------------------------
+# Un commit intermedio puede dejar el grafo bifurcado de forma legítima y
+# transitoria mientras se acomoda una rama. Lo que no puede quedar bifurcado es
+# lo que se publica, porque en este proyecto se despliega directo desde main:
+# un push malo es un deploy malo. pre-push es el último momento en que el
+# arreglo todavía es local y cuesta una línea.
+#
+# Esto es una conveniencia, no la garantía: un hook se puede saltear con
+# --no-verify y no existe hasta que alguien corre el 'git config' de arriba. La
+# barrera que no se puede omitir es el workflow de CI.
+
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+GUARD="$REPO_ROOT/scripts/check_migration_graph.py"
+
+if [ ! -f "$GUARD" ]; then
+    # Rama vieja que todavía no tiene el guard: no es motivo para bloquear.
+    exit 0
+fi
+
+# Solo stdlib (ast, pathlib), así que sirve cualquier Python 3 del sistema: no
+# hace falta que el venv del proyecto esté activado ni sincronizado.
+for PY in python3 python; do
+    if command -v "$PY" >/dev/null 2>&1; then
+        if ! "$PY" "$GUARD"; then
+            echo ""
+            echo "pre-push ABORTADO: el grafo de migraciones no es aplicable."
+            echo "Si el árbol quedó con dos heads, el contenedor no va a arrancar"
+            echo "en el deploy. Arreglalo antes de publicar."
+            echo ""
+            echo "Para saltear esto a sabiendas: git push --no-verify"
+            exit 1
+        fi
+        exit 0
+    fi
+done
+
+echo "pre-push: no se encontró python3; se omite el chequeo del grafo de migraciones." >&2
+exit 0

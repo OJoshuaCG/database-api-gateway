@@ -63,6 +63,29 @@ PYEOF
 # Función: aplicar migraciones Alembic
 # ─────────────────────────────────────────────────────────────────────────────
 run_migrations() {
+    # Pre-vuelo del grafo de revisiones ANTES de invocar a Alembic.
+    #
+    # No es redundante con 'alembic upgrade head': cuando el árbol tiene dos
+    # heads, Alembic responde "Multiple head revisions are present for given
+    # argument 'head'" y nada más. Ese mensaje no dice CUÁLES son las dos
+    # puntas, no dice que la BD quedó intacta, y no dice cómo salir — así que
+    # el operador que mira un contenedor reiniciándose en loop no tiene con
+    # qué arrancar. Pasó en producción el 2026-08-22 y costó un rato entender
+    # que la base nunca se había tocado.
+    #
+    # El guard nombra las revisiones en conflicto y explica el arreglo. Es el
+    # MISMO script que corre en el hook de pre-push y en CI, así que un árbol
+    # que llegó hasta acá roto significa que se saltearon los dos.
+    echo "[entrypoint] Verificando el grafo de migraciones..."
+    if ! python scripts/check_migration_graph.py; then
+        echo "[entrypoint] ERROR: el grafo de migraciones no es aplicable."
+        echo "[entrypoint] La base de datos NO se modificó: esto falla al resolver"
+        echo "[entrypoint] a qué revisión ir, antes de abrir cualquier transacción."
+        echo "[entrypoint] Se arregla en el repo (ver el detalle de arriba) y se"
+        echo "[entrypoint] vuelve a desplegar. No hace falta tocar la BD a mano."
+        exit 1
+    fi
+
     echo "[entrypoint] Aplicando migraciones Alembic..."
     alembic upgrade head
     echo "[entrypoint] Migraciones aplicadas correctamente."

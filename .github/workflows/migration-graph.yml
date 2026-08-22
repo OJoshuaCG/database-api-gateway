@@ -1,0 +1,33 @@
+# Barrera que no se puede saltear con --no-verify.
+#
+# El hook de .githooks/pre-push cubre el caso normal, pero no existe hasta que
+# alguien corre 'git config core.hooksPath .githooks' en su clon, y se omite con
+# --no-verify. Como acá se despliega directo desde main, hace falta un chequeo
+# que corra del lado del servidor.
+#
+# Corre también en pull_request para que la bifurcación se vea en la revisión, y
+# no recién cuando ya está en main.
+name: Grafo de migraciones
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check-migration-graph:
+    name: Head único y cadena sana
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No se instalan dependencias a propósito: el guard usa solo la stdlib
+      # (ast, pathlib), sin Alembic, sin base de datos y sin .env. Eso lo hace
+      # rápido y, sobre todo, hace que no pueda fallar por una razón ajena a lo
+      # que está verificando.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Verificar el grafo de revisiones Alembic
+        run: python scripts/check_migration_graph.py
