@@ -40,6 +40,7 @@ from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
 from app.models.permission_profile import PermissionProfile, PermissionProfileItem
 from app.models.privilege import Privilege
+from app.models.project import Project, ProjectDatabaseModel
 from app.models.schema_comparison import SchemaComparison
 from app.models.schema_comparison_item import SchemaComparisonItem
 from app.models.query_execution import QueryExecution
@@ -66,6 +67,8 @@ __all__ = [
     "CharsetCollationOption",
     "PermissionProfile",
     "PermissionProfileItem",
+    "Project",
+    "ProjectDatabaseModel",
     "SchemaComparison",
     "SchemaComparisonItem",
     "CloneJob",

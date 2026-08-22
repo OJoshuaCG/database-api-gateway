@@ -12,6 +12,7 @@ from app.exceptions import AppHttpException
 from app.models.database_model import DatabaseModel
 from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
+from app.models.project import ProjectDatabaseModel
 from app.services import audit
 
 
@@ -136,6 +137,14 @@ class DatabaseModelController:
         session = self._session()
         try:
             model = self._get_or_404(session, model_id)
+            # Los vínculos con proyectos se sueltan explícitamente y no por el CASCADE de
+            # la FK: SQLite no aplica claves foráneas salvo que se active
+            # ``PRAGMA foreign_keys``, así que en test quedarían filas apuntando a un
+            # blueprint inexistente. Lo que desaparece es la PERTENENCIA; los proyectos
+            # siguen existiendo, solo con un blueprint menos.
+            session.query(ProjectDatabaseModel).filter(
+                ProjectDatabaseModel.model_id == model_id
+            ).delete(synchronize_session=False)
             session.delete(model)
             session.commit()
         finally:
