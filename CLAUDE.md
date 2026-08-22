@@ -12,17 +12,72 @@ gateway con credenciales pseudo-root es riesgo operativo, no prolijidad.
   en ClickUp: tarea principal `86e2xzf9d`, lista `901716272178`. Ante discrepancia, para el
   estado gana ClickUp.
 - Ciclo ejecutable: **`/tarea P-XX`** para reclamar, **`/tarea fin P-XX`** para cerrar,
-  **`/tarea estado`** para ver qué hay en curso.
+  **`/tarea frontend`** para ver lo que espera implementación visual, **`/tarea estado`** para
+  ver qué hay en curso.
 - Si una tarea está `in progress`, **se interrumpe** y se informa quién la tiene. No se avanza.
-- Cuatro reglas que si se saltan rompen el mecanismo en silencio: (1) las subtareas del backlog
-  se llaman **`P-XX — <título>`** y las **nuevas** `T-<YYMMDD>-<iniciales>-<slug>` — para algo
-  nuevo **nunca** el siguiente `P-XX` libre, que es secuencial y dos personas simultáneas
-  calculan el mismo; (2) toda búsqueda va con **`include_closed: true`** (viene apagado por
-  defecto, y sin él una tarea ya terminada no aparece y se duplica); (3) después de crear una
-  subtarea se **re-verifica** que no haya duplicado antes de trabajar, porque la ventana entre
-  buscar y crear no se puede cerrar (gana la de `date_created` más antiguo); (4) la **identidad
-  del ejecutor va dentro del texto** del comentario, porque el campo "autor" de ClickUp siempre
-  dice la cuenta del token.
+
+**Los estados significan exactamente esto, y solo esto:**
+
+| Estado | Significa |
+| --- | --- |
+| `to do` | Libre |
+| `in progress` | Alguien la está haciendo — **es lo que la reserva** |
+| `on hold` | Detenida: trabada por algo externo, **o quedó a medias** |
+| `update required` | **Backend listo, PENDIENTE DE FRONTEND.** Nada más |
+| `complete` | Cerrada del todo |
+| `reviewed` | **No se usa en este flujo** |
+
+**Al terminar hay una bifurcación:** si el cambio necesita implementación visual, la tarea va a
+`update required` con un comentario `HANDOFF FRONTEND` (endpoints, breaking changes, schemas, y
+el contrato referenciado con su hash de commit) y **no se cierra** — la pasa a `complete` el
+frontend. Si no necesita frontend, `complete` directo. Para decir que no lo necesita hay que
+poder afirmar que **nada de lo que el frontend ya consume cambió**; ante la duda,
+`update required`.
+
+**REGLA DURA — la jerarquía es de DOS niveles:** tarea principal `86e2xzf9d` → subtareas. Las
+**sub-subtareas** (tercer nivel) existen para **un solo escenario de emergencia**: el backend
+necesita cambiar algo de una tarea que el frontend **está haciendo en ese momento**. **En ningún
+otro caso.** No se usan para descomponer trabajo grande (eso va en el detalle del ítem en
+`TODO.md`, o como tareas hermanas vinculadas), ni para agrupar, ni para separar backend de frontend
+(eso lo hace el estado), ni "para que quede más ordenado". Si aparece un caso que parece
+justificarlo, **no lo crees: planteáselo al usuario** y que se establezca como regla nueva.
+
+**Los recorridos, explícitos** (`be` = backend, `fe` = frontend; las transiciones se componen):
+
+```
+backend puro              to do → in progress(be) → complete
+backend con frontend      to do → in progress(be) → update required → in progress(fe) → complete(fe)
+fix cerrado sin frontend  complete → in progress(be) → complete
+fix cerrado con frontend  complete → in progress(be) → update required → in progress(fe) → complete(fe)
+```
+
+Un fix de algo `complete` que ahora afecta al frontend pasa **por `in progress`** (la reapertura es
+lo que reserva la tarea) y termina en `update required`, no en `complete`.
+
+**El frontend también reclama:** al tomar algo en `update required` lo pasa a `in progress` con un
+`INICIO` de rol frontend. Por eso **el `INICIO` declara el rol obligatoriamente** — `in progress`
+no dice por sí solo si es backend o frontend.
+
+**Si el backend necesita volver a tocar algo ya entregado al frontend, depende de si el frontend
+empezó:**
+
+| Estado | Qué hace el backend |
+| --- | --- |
+| `update required` (el fe no la tomó) | **Reabre la misma tarea:** `HANDOFF INVALIDADO` con `notify_all` antes de tocar código, y al cerrar un handoff de re-entrega con el **delta** (incluyendo **qué NO cambió**, para que no se rehaga trabajo bueno). Si el cambio **no toca el contrato**, se queda en `update required` y solo se comenta. |
+| `in progress` con `INICIO` de **frontend** | **No la toca.** Crea una **sub-subtarea** (`parent` = esa subtarea; verificado que ClickUp acepta 3 niveles) + `add_task_link` + comentario `TRABAJO DERIVADO` con `notify_all` en la madre, declarando el **impacto** en lo que el frontend está haciendo. Así nadie se bloquea: el fe no pierde su trabajo y el be no espera. **No hay cuarto nivel.** |
+
+**Un fix de algo ya `complete` NO crea tarea nueva: se reabre la existente.** Tarea nueva solo
+cuando el trabajo no se puede describir sin cambiar el objetivo declarado de la original, y en ese
+caso se vincula con `clickup_add_task_link`.
+
+**Cuatro reglas que si se saltan rompen el mecanismo en silencio:** (1) las subtareas del backlog
+se llaman **`P-XX — <título>`** y las **nuevas** `T-<YYMMDD>-<iniciales>-<slug>` — para algo nuevo
+**nunca** el siguiente `P-XX` libre, que es secuencial y dos personas simultáneas calculan el
+mismo; (2) toda búsqueda va con **`include_closed: true`** (viene apagado por defecto, y sin él
+una tarea ya terminada no aparece y se duplica); (3) después de crear una subtarea se
+**re-verifica** que no haya duplicado antes de trabajar, porque la ventana entre buscar y crear no
+se puede cerrar (gana la de `date_created` más antiguo); (4) la **identidad (que es el EMAIL de `git config user.email`, NUNCA el nombre: este repo tiene 4 nombres para un mismo email) del ejecutor va dentro
+del texto** del comentario, porque el campo "autor" de ClickUp siempre dice la cuenta del token.
 
 ## Descripción del Proyecto
 

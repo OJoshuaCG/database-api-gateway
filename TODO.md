@@ -32,7 +32,9 @@ Estados disponibles en la lista: `to do` · `in progress` · `on hold` · `updat
    ventana entre buscar y crear no se puede cerrar (ClickUp no tiene locks), pero sí detectar:
    gana la de `date_created` más antiguo, y si empatan, el `id` menor. Si perdiste la carrera,
    **pará y avisá** — no borres la duplicada por tu cuenta.
-4. **El ID de la subtarea se anota en la columna `Subtarea`** en cuanto se crea. Así este
+4. **El ID de la subtarea se anota en la columna `Subtarea` COMO LINK, en cuanto se crea:**
+   `[86e2y1abc](https://app.clickup.com/t/86e2y1abc)`. Un ID pelado obliga a construir la URL a
+   mano cada vez; el link es referencia directa de verdad. Así este
    archivo es el índice `P-XX → subtarea` y no hace falta buscar en ClickUp.
 5. **Las subtareas se crean al tomarlas**, no por adelantado — así no se llena ClickUp de IDs
    que nadie va a ejecutar. Un ítem con `Subtarea: —` todavía no fue tomado.
@@ -40,12 +42,18 @@ Estados disponibles en la lista: `to do` · `in progress` · `on hold` · `updat
    sin él, una tarea ya terminada no aparece y se crea un duplicado exacto.
 7. **Antes de empezar**: validar en ClickUp. Si está `in progress`, se **interrumpe** y se avisa
    quién la tiene. Si está `complete`/`reviewed`, se avisa que ya está hecha.
-8. **Al empezar** se pone `in progress` (eso es lo que reserva la tarea) y **al terminar**
-   `complete` — llegar a `complete` no es opcional: mientras no llegue, bloquea a los demás.
-   Ambos con su comentario.
-9. **`reviewed` lo pone otra persona**, nunca el que hizo el trabajo. `complete` = "terminé";
-   `reviewed` = "alguien más lo verificó".
-10. **La identidad va escrita en el texto del comentario.** Todos los comentarios se publican
+8. **Al empezar** se pone `in progress` — eso es lo que reserva la tarea, y va antes de escribir
+   código, no después.
+9. **Al terminar hay una bifurcación obligatoria: ¿necesita frontend?** Si NO, va a `complete`
+   directo. Si SÍ, va a **`update required`** con un comentario `HANDOFF FRONTEND` y **no se
+   cierra**: la pasa a `complete` el frontend cuando termina. Para decir que NO necesita
+   frontend hay que poder afirmar que nada de lo que el frontend ya consume cambió (rutas, forma
+   de la respuesta, códigos de error, campos obligatorios). **Ante la duda, `update required`.**
+10. **`update required` significa UNA sola cosa: falta el frontend.** Para "quedó a medias" está
+   `on hold`. Si se le dan dos significados, el filtro del frontend se llena de ruido y el
+   mecanismo pierde el sentido. Y **`reviewed` no se usa** en este flujo.
+11. **La identidad es el EMAIL** (`git config user.email`), no el nombre — este repo tiene 4
+   nombres distintos para un mismo email. Va escrita en el texto del comentario: todos se publican
    con la cuenta del token de la integración, así que ClickUp por sí solo no distingue quién
    ejecuta.
 ---
@@ -129,6 +137,34 @@ _Nada en curso._
 | Ítem | Subtarea ClickUp | Ejecutor | Inicio | Qué está tocando |
 | --- | --- | --- | --- | --- |
 | — | — | — | — | — |
+
+---
+
+## 🔵 Pendiente de frontend
+
+Backend **terminado**, esperando implementación visual. En ClickUp estas tareas están en
+**`update required`** — es el estado que el equipo de frontend filtra para saber qué le toca, sin
+crear tareas nuevas ni salir a buscar contexto.
+
+Cada una tiene en ClickUp un comentario **`HANDOFF FRONTEND`** con los endpoints nuevos o
+cambiados, si hay breaking changes, los schemas afectados, y la referencia al contrato
+(`docs/api-reference-vN.md` + hash del commit). **La tarea la cierra el frontend**, no el backend.
+
+**Al tomar una, el frontend la pasa a `in progress`** con un `INICIO` de rol frontend. Si el
+backend necesita cambiar algo MIENTRAS el frontend trabaja, **no toca esa tarea**: abre una
+**sub-subtarea** anidada y avisa en la madre el impacto.
+
+Si el frontend todavía NO la tomó y el backend **cambia el contrato**, primero deja un comentario
+`HANDOFF INVALIDADO` (con notificación) y la tarea vuelve a 🟡 En curso hasta la re-entrega. Si el
+cambio **no** toca el contrato, se queda acá y solo se comenta.
+
+Atajo: `/tarea frontend`.
+
+_Nada pendiente de frontend._
+
+| Ítem | Subtarea ClickUp | Backend cerrado por | Fecha | Breaking changes | Contrato |
+| --- | --- | --- | --- | --- | --- |
+| — | — | — | — | — | — |
 
 ---
 
