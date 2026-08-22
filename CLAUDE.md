@@ -2,6 +2,24 @@
 
 Este documento proporciona contexto y guías para agentes de IA que trabajen en este proyecto.
 
+## Gestión de tareas — OBLIGATORIO ANTES DE TRABAJAR
+
+**Antes de empezar cualquier tarea en este repo, invocá la skill `clickup-task-flow`.** Ahí está
+el protocolo completo. Existe para que dos personas no trabajen lo mismo en paralelo, que en un
+gateway con credenciales pseudo-root es riesgo operativo, no prolijidad.
+
+- El **detalle** de cada tarea vive en `TODO.md` (raíz). El **estado** y **quién trabaja** viven
+  en ClickUp: tarea principal `86e2xzf9d`, lista `901716272178`. Ante discrepancia, para el
+  estado gana ClickUp.
+- Ciclo ejecutable: **`/tarea P-XX`** para reclamar, **`/tarea fin P-XX`** para cerrar,
+  **`/tarea estado`** para ver qué hay en curso.
+- Si una tarea está `in progress`, **se interrumpe** y se informa quién la tiene. No se avanza.
+- Tres reglas que si se saltan rompen el mecanismo en silencio: las subtareas se llaman
+  **`P-XX — <título>`** (el prefijo es la clave única contra duplicados); toda búsqueda va con
+  **`include_closed: true`** (viene apagado por defecto, y sin él una tarea ya terminada no
+  aparece y se duplica); y la **identidad del ejecutor va dentro del texto** del comentario,
+  porque el campo "autor" de ClickUp siempre dice la cuenta del token.
+
 ## Descripción del Proyecto
 
 **Template de FastAPI** diseñado para ser la base de nuevos proyectos. Incluye configuración robusta, mejores prácticas y herramientas esenciales para desarrollo profesional.
