@@ -474,7 +474,13 @@ class ClonePreviewOut(BaseModel):
     # formulario reimplementa las reglas, las dos implementaciones divergen en silencio.
     copy_intent: str = Field(..., description="La intención EFECTIVA del plan congelado.")
     data_on_existing: str | None = Field(
-        None, description="Resuelto: 'append' | 'upsert' | null si no se copian filas."
+        None,
+        description=(
+            "Lo que va a pasar EFECTIVAMENTE con las filas que ya estén en el destino: "
+            "'append' | 'upsert', o null si este plan no copia filas. Es el valor resuelto "
+            "por el servidor, no el que se envió: en los planes creados con el atajo legacy "
+            "'include_data' el modo se deriva y este campo dice cuál salió."
+        ),
     )
     target_charset: str | None = Field(
         None, description="Charset canónico con el que se creará la BD destino (null = heredado)."

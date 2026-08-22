@@ -179,8 +179,14 @@ class CloneJob(Base, TimestampMixin):
     data_on_existing: Mapped[str | None] = mapped_column(
         String(20), nullable=True,
         comment=(
-            "append | upsert cuando la tabla destino ya tiene filas. Obligatorio en "
-            "copy_intent='data_only'; NULL en los planes que crean la estructura"
+            "append | upsert cuando la tabla destino ya tiene filas. Significa 'el operador "
+            "lo ELIGIÓ': solo se escribe con copy_intent='data_only', donde es obligatorio, "
+            "y se limpia en cualquier otra intención. NUNCA guarda la derivación histórica "
+            "del atajo include_data (esa se calcula al armar el plan), porque un valor del "
+            "servidor guardado acá se lee como una elección del cliente y validate_spec lo "
+            "rechaza. Excepción acotada: la migración d3e4f5a6b7c8 lo rellenó para los jobs "
+            "ya TERMINADOS, donde es el registro de lo que se ejecutó — esas filas no pueden "
+            "volver a un preview (el chequeo de expiración corre antes que el de estado)"
         ),
     )
     target_charset: Mapped[str | None] = mapped_column(

@@ -469,13 +469,14 @@ class CloneController:
         copy_intent = (
             CLONE_COPY_STRUCTURE_AND_DATA if include_data else CLONE_COPY_STRUCTURE_ONLY
         )
-        on_existing = (
-            (cspec.DataOnExisting.upsert.value
-             if cspec.legacy_upsert(target_mode, clean_mode)
-             else cspec.DataOnExisting.append.value)
-            if include_data
-            else None
-        )
+        # ``data_on_existing`` NO se persiste acá, y es deliberado: la columna significa
+        # UNA sola cosa, "el operador lo eligió", que es la premisa de la que parte
+        # ``validate_spec`` cuando la rechaza para toda intención que no sea 'data_only'.
+        # Escribir en ella la derivación histórica hacía que un valor del SERVIDOR se leyera
+        # como una elección del CLIENTE: cualquier preview con al menos un campo (y la SPA
+        # manda siempre ``selection``) recibía un 422 clone.conflicting_options del que no
+        # se podía salir. Lo EJECUTADO no cambia: ``_build_execution_plan`` cae a
+        # ``cspec.legacy_upsert(...)`` cuando la columna es NULL.
 
         # Guarda: origen y destino no pueden ser la MISMA BD física.
         if src.server_id == tgt.server_id and src.database_name == tgt.database_name:
@@ -582,7 +583,6 @@ class CloneController:
                 # ``will_adopt`` en False para siempre y el auto-adopt se apagaba solo.
                 is_full_clone=selection is None,
                 copy_intent=copy_intent,
-                data_on_existing=on_existing,
                 source_fingerprint=src_fp,
                 expires_at=expires,
                 status=CLONE_STATUS_PENDING,
@@ -1453,6 +1453,14 @@ class CloneController:
                 job.target_owner_user_id = owner.id
                 job.target_owner = owner.username
 
+        # ``data_on_existing`` solo tiene sentido en 'data_only': en los otros modos las
+        # tablas las crea este mismo job y nacen vacías. Se LIMPIA en vez de arrastrarlo a
+        # ``validate_spec``, que lo rechazaría con un 422 del que no se puede salir. Cubre
+        # dos caminos reales: un plan creado con el atajo legacy que ya traiga el valor, y un
+        # operador que cambia la intención de 'data_only' a otra en un segundo preview.
+        if intent is not cspec.CopyIntent.data_only:
+            job.data_on_existing = None
+
         # --- Coherencia del spec completo ------------------------------------------ #
         violations = cspec.validate_spec(
             intent=intent,
@@ -1664,7 +1672,20 @@ class CloneController:
             target_db_name = job.target_database_name
             effective = {
                 "copy_intent": job.copy_intent or CLONE_COPY_STRUCTURE_ONLY,
-                "data_on_existing": job.data_on_existing,
+                # El valor EFECTIVO, no el elegido. La columna guarda solo lo que el operador
+                # eligió (NULL en los planes legacy, donde el modo se deriva), pero este campo
+                # dice qué va a pasar de verdad con las filas que ya estén en el destino, y
+                # eso sale del plan. Devolver NULL acá mientras la fase de datos hace un
+                # upsert sería mentir en el campo que el cliente muestra.
+                "data_on_existing": (
+                    (
+                        cspec.DataOnExisting.upsert.value
+                        if plan.data_specs[0].upsert
+                        else cspec.DataOnExisting.append.value
+                    )
+                    if plan.data_specs
+                    else None
+                ),
                 "target_charset": job.target_charset,
                 "target_collation": job.target_collation,
                 "target_owner": job.target_owner,
