@@ -83,6 +83,22 @@ class ManagedDatabase(Base, TimestampMixin):
         Text, nullable=True, comment="Notas / detalle de error de aprovisionamiento"
     )
 
+    # RESTRICT y no SET NULL, a diferencia de ``model_id``. Las dos columnas son FKs
+    # nullable, pero apuntan a cosas distintas: ``model_id`` es un puntero de CAPACIDAD
+    # (perderlo significa "esta BD no replica ningún blueprint", que es benigno), y este es
+    # un puntero de POLÍTICA. Con SET NULL, borrar una fila de ``environments`` convertiría N
+    # BDs de producción en BDs sin guard, y el guard estaría de acuerdo con que eso está
+    # bien: la política desaparecería sin que nada falle. El criterio correcto es el de
+    # ``owner_id`` (arriba): reasignar antes de borrar. La vía de retiro de un entorno que
+    # todavía tiene BDs es ``is_active=false``, no el borrado.
+    environment_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("environments.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+        comment="Entorno de despliegue que clasifica esta BD (opcional). RESTRICT: reasignar antes de borrar",
+    )
+
     origin: Mapped[str] = mapped_column(
         String(20),
         nullable=False,

@@ -26,6 +26,7 @@ from app.models.collation_conversion_job import (
 from app.models.crypto_key import CryptoKey
 from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
+from app.models.environment import Environment
 from app.models.enums import (
     EngineType,
     MigrationStatus,
@@ -56,6 +57,7 @@ __all__ = [
     "ServerUser",
     "DatabaseModel",
     "ManagedDatabase",
+    "Environment",
     "ModelMigration",
     "DatabaseMigrationHistory",
     "MigrationStatementProgress",
