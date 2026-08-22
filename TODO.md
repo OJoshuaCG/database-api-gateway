@@ -23,23 +23,29 @@ Estados disponibles en la lista: `to do` · `in progress` · `on hold` · `updat
 ### Reglas mínimas (el detalle está en `CLAUDE.md`)
 
 1. **Toda unidad de trabajo es una subtarea de `86e2xzf9d`.** No se crean tareas sueltas.
-2. **Cada ítem de este archivo tiene un ID estable (`P-XX`) y la subtarea se llama
-   `P-XX — <título>`.** Ese prefijo es la clave única: con nombre libre, dos personas nombran
-   lo mismo distinto y duplican aunque hayan buscado bien.
-3. **El ID de la subtarea se anota en la columna `Subtarea`** en cuanto se crea. Así este
+2. **Cada ítem de este archivo tiene un ID estable y la subtarea se llama con ese ID.** Dos
+   esquemas: los ítems del backlog usan **`P-XX — <título>`** (ID ya asignado, sin riesgo); los
+   ítems **nuevos** creados al vuelo usan **`T-<YYMMDD>-<iniciales>-<slug>`**. Para algo nuevo
+   **nunca** uses "el siguiente `P-XX` libre": es secuencial, dos personas simultáneas calculan
+   el mismo, y el prefijo anti-duplicados termina apuntando a dos trabajos distintos.
+3. **Después de crear una subtarea, RE-VERIFICÁ que no haya duplicado antes de trabajar.** La
+   ventana entre buscar y crear no se puede cerrar (ClickUp no tiene locks), pero sí detectar:
+   gana la de `date_created` más antiguo, y si empatan, el `id` menor. Si perdiste la carrera,
+   **pará y avisá** — no borres la duplicada por tu cuenta.
+4. **El ID de la subtarea se anota en la columna `Subtarea`** en cuanto se crea. Así este
    archivo es el índice `P-XX → subtarea` y no hace falta buscar en ClickUp.
-4. **Las subtareas se crean al tomarlas**, no por adelantado — así no se llena ClickUp de IDs
+5. **Las subtareas se crean al tomarlas**, no por adelantado — así no se llena ClickUp de IDs
    que nadie va a ejecutar. Un ítem con `Subtarea: —` todavía no fue tomado.
-5. **Al buscar en ClickUp, `include_closed: true` es obligatorio.** Viene apagado por defecto:
+6. **Al buscar en ClickUp, `include_closed: true` es obligatorio.** Viene apagado por defecto:
    sin él, una tarea ya terminada no aparece y se crea un duplicado exacto.
-6. **Antes de empezar**: validar en ClickUp. Si está `in progress`, se **interrumpe** y se avisa
+7. **Antes de empezar**: validar en ClickUp. Si está `in progress`, se **interrumpe** y se avisa
    quién la tiene. Si está `complete`/`reviewed`, se avisa que ya está hecha.
-7. **Al empezar** se pone `in progress` (eso es lo que reserva la tarea) y **al terminar**
+8. **Al empezar** se pone `in progress` (eso es lo que reserva la tarea) y **al terminar**
    `complete` — llegar a `complete` no es opcional: mientras no llegue, bloquea a los demás.
    Ambos con su comentario.
-8. **`reviewed` lo pone otra persona**, nunca el que hizo el trabajo. `complete` = "terminé";
+9. **`reviewed` lo pone otra persona**, nunca el que hizo el trabajo. `complete` = "terminé";
    `reviewed` = "alguien más lo verificó".
-9. **La identidad va escrita en el texto del comentario.** Todos los comentarios se publican
+10. **La identidad va escrita en el texto del comentario.** Todos los comentarios se publican
    con la cuenta del token de la integración, así que ClickUp por sí solo no distingue quién
    ejecuta.
 ---

@@ -34,26 +34,84 @@ Ante discrepancia: para el estado gana **ClickUp**; para el detalle gana **`TODO
 En ClickUp va un **resumen simple**. El detalle largo va a `TODO.md`. Duplicarlo en ambos lados
 garantiza que se desincronicen.
 
-## Nomenclatura obligatoria: `P-XX — <título>`
+## Nomenclatura obligatoria — dos esquemas, y el motivo de que sean dos
 
-Cada ítem de `TODO.md` tiene un ID estable (`P-01`, `P-02`, …). La subtarea de ClickUp se llama
-**siempre**:
+El nombre de la subtarea **es** la clave de identidad. Con nombre libre, una persona escribe
+"e2e del export" y otra "verificar exportación": dos tareas, mismo trabajo, ninguna búsqueda las
+cruza. Hay dos esquemas según el origen del ítem.
+
+### A) Ítems del backlog de `TODO.md` → `P-XX — <título>`
+
+Los 31 ítems sembrados en `TODO.md` tienen un ID **estable y ya asignado** (`P-01`…`P-31`). Su
+subtarea se llama:
 
 ```
-P-XX — <título corto del ítem>
+P-07 — e2e del cruce de familia MySQL↔MariaDB en perfiles de permisos
 ```
 
-Y en cuanto se crea, **su ID de ClickUp se escribe de vuelta** en la columna `Subtarea` de
-`TODO.md`.
+No hay riesgo de colisión: el ID ya existe en el archivo, nadie lo inventa.
 
-**Por qué es obligatorio:** con nombre libre, una persona escribe "e2e del export" y otra
-"verificar exportación" — dos tareas, mismo trabajo, ninguna búsqueda las cruza. El prefijo
-`P-XX` es la clave única: se busca `P-07` y solo puede existir una. Y como `TODO.md` queda como
-índice `P-XX → subtarea`, en el caso normal ni hace falta buscar en ClickUp.
+### B) Ítems nuevos, creados al vuelo → `T-<YYMMDD>-<iniciales>-<slug>`
 
-Un ítem que no está en `TODO.md` se agrega **primero al archivo** con el siguiente ID libre, y
-después se crea la subtarea. Nunca al revés.
+Para trabajo que **no está** en `TODO.md`, **NUNCA** uses "el siguiente `P-XX` libre". Ese
+esquema es secuencial y **colisiona**: dos personas que arrancan a la vez leen el mismo archivo,
+las dos calculan `P-32`, y el prefijo —que existe justamente para evitar duplicados— pasa a
+apuntar a dos trabajos distintos. Es el peor modo de falla posible: el mecanismo anti-duplicados
+enmascarando un duplicado.
 
+Usá un ID que **no requiere coordinación** para ser único:
+
+```
+T-<YYMMDD>-<iniciales>-<slug>
+
+T-260821-oc-timeout-pool-conexiones
+T-260821-jc-fix-collation-mariadb
+```
+
+- `YYMMDD` — fecha de hoy
+- `iniciales` — del ejecutor, de `git config user.name` (minúsculas)
+- `slug` — 2 a 4 palabras en kebab-case
+
+Dos personas distintas nunca generan el mismo ID (las iniciales difieren). La misma persona en
+el mismo día tampoco, salvo que elija el mismo slug para dos cosas distintas — y ahí el choque
+es evidente al leerlo, no silencioso.
+
+El ítem se agrega igual a `TODO.md` con su `T-…` como ID, y la subtarea se anota en la columna
+`Subtarea`. El archivo sigue siendo el índice `ID → subtarea`.
+
+## La ventana de colisión no se puede cerrar — se detecta
+
+El chequeo es *buscar, después crear*. No hay lock ni "crear si no existe" atómico en ClickUp,
+así que dos personas pueden pasar el chequeo a la vez:
+
+```
+A: busca → no existe
+B: busca → no existe        ← ambos pasaron
+A: crea la subtarea
+B: crea la subtarea         ← duplicado
+```
+
+La ventana es de segundos y solo afecta a ítems **nuevos** (los del backlog tienen ID fijo). No
+se elimina, pero **sí se detecta** con una re-verificación después de crear — concurrencia
+optimista, el mismo patrón que un `compare-and-set`:
+
+**Inmediatamente después de `clickup_create_task`, y antes de empezar a trabajar:**
+
+1. Volvé a buscar con `clickup_filter_tasks` (`include_closed: true`).
+2. Contá cuántas subtareas hay con **tu mismo ID** (`P-XX` o `T-…`) o, para ítems nuevos, con un
+   **slug equivalente** creado en los últimos minutos.
+3. Si hay **más de una**, perdiste o ganaste la carrera. Resolución **determinística**, para que
+   los dos lados lleguen a la misma conclusión sin hablarse:
+   - Gana la de **`date_created` más antiguo**.
+   - Si empatan al segundo, gana el **`id` de tarea menor** en orden lexicográfico.
+4. **Si ganaste:** seguí trabajando normalmente.
+5. **Si perdiste:** **PARÁ.** No trabajes. Informale al usuario que otra persona reclamó lo
+   mismo unos segundos antes, con quién es (comentario `INICIO` de la ganadora) y el ID de las
+   dos tareas. **No borres la subtarea duplicada por tu cuenta** — proponelo y que el usuario
+   decida; borrar tareas sin supervisión es peor que dejar una duplicada visible.
+
+Sin este paso el duplicado es **invisible**: los dos siguen trabajando y se enteran al mergear.
+Con él, se detecta en segundos.
 ## Identidad del ejecutor
 
 ```bash
@@ -113,13 +171,19 @@ Una sola llamada no garantiza haber visto todo.
 
 ```
 clickup_create_task
-  name:     "P-XX — <título>"
+  name:     "P-XX — <título>"        ← ítem del backlog de TODO.md
+            "T-260821-oc-<slug>"     ← ítem nuevo: NUNCA el siguiente P-XX libre
   list_id:  "901716272178"
-  parent:   "86e2xzf9d"        ← siempre subtarea, nunca tarea suelta
+  parent:   "86e2xzf9d"              ← siempre subtarea, nunca tarea suelta
 ```
 
-Y acto seguido, **escribir el ID devuelto** en la columna `Subtarea` de `TODO.md`. Sin eso, el
-próximo que busque no la encuentra por el camino corto.
+Después de crearla, **en este orden**:
+
+1. **Re-verificá** que no haya un duplicado (ver "La ventana de colisión" arriba). Es el paso que
+   convierte una carrera perdida en algo detectable en segundos en vez de al mergear.
+2. Escribí el ID devuelto en la columna `Subtarea` de `TODO.md`. Sin eso, el próximo que busque
+   no la encuentra por el camino corto.
+3. Si el ítem era nuevo, agregalo también a la tabla de 🔴 Pendientes con su ID `T-…`.
 
 ## Paso 2 — Al empezar
 

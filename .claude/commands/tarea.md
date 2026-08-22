@@ -41,18 +41,44 @@ corresponda según el argumento.
    - **`on hold` / `update required`** → leé el último comentario antes de seguir (hay contexto
      de dónde quedó) y continuá al paso 5.
    - **`to do`** → continuá al paso 5.
-   - **No existe** → creála:
+   - **No existe** → creála con el ID que corresponda:
      ```
      clickup_create_task
-       name:    "P-XX — <título del ítem en TODO.md>"
+       name:    "P-XX — <título del ítem en TODO.md>"   ← ítem del backlog
+                "T-<YYMMDD>-<iniciales>-<slug>"          ← ítem NUEVO
        list_id: "901716272178"
        parent:  "86e2xzf9d"
      ```
-     y escribí el ID devuelto en la columna `Subtarea` de `TODO.md`.
+     Para un ítem nuevo **NUNCA uses el siguiente `P-XX` libre**: es secuencial y dos personas
+     simultáneas calculan el mismo, así que el prefijo anti-duplicados terminaría apuntando a
+     dos trabajos distintos. El esquema `T-<fecha>-<iniciales>-<slug>` es único sin coordinarse.
+
+     Después de crearla, **RE-VERIFICÁ antes de trabajar** (concurrencia optimista — la ventana
+     entre buscar y crear no se puede cerrar, pero sí detectar):
+
+     1. Volvé a buscar con `clickup_filter_tasks` + `include_closed: true`.
+     2. Contá cuántas subtareas hay con tu mismo ID, o con un slug equivalente creado en los
+        últimos minutos.
+     3. Si hay más de una: gana la de **`date_created` más antiguo**; si empatan al segundo, gana
+        el **`id` menor** en orden lexicográfico. La regla es determinística a propósito, para
+        que los dos lados concluyan lo mismo sin hablarse.
+     4. **Si perdiste la carrera: PARÁ.** No trabajes. Informá quién reclamó lo mismo (comentario
+        `INICIO` de la ganadora) y los IDs de ambas. **No borres la duplicada por tu cuenta** —
+        proponelo y que decida el usuario.
+
+     Recién con la re-verificación OK, escribí el ID en la columna `Subtarea` de `TODO.md` (y
+     agregá el ítem a 🔴 Pendientes si era nuevo).
 5. Reclamala, **en este orden**:
    - `clickup_update_task` → `status: "in progress"` (esto es lo que la reserva)
    - `clickup_create_comment` con el bloque `INICIO` y la identidad del ejecutor
    - Mové el ítem a **🟡 En curso** en `TODO.md`, con ejecutor y fecha
+   - Escribí el claim local para el hook de recordatorio (una sola línea):
+     ```bash
+     echo "P-XX — <título> (subtarea <id>, reclamada por <ejecutor>)" > .claude/.tarea-actual
+     ```
+     Sin esto, el recordatorio de cada prompt sigue diciendo "ninguna tarea reclamada" y no te
+     avisa que tenés algo abierto. El archivo es local y está gitignored: es estado de esta
+     máquina, no del repo.
 6. Recién ahora empezá a trabajar. Confirmale al usuario que la tarea quedó reservada, con el
    ID de la subtarea.
 
@@ -72,6 +98,11 @@ corresponda según el argumento.
 6. Mové el ítem a **🟢 Realizadas** en `TODO.md` **con el detalle completo**: archivos tocados,
    decisiones tomadas, y qué quedó sin verificar.
 7. **No pongas `reviewed`.** Ese estado lo pone otra persona; nadie se auto-revisa.
+8. **Borrá el claim local**, que es lo que apaga el recordatorio:
+   ```bash
+   rm -f .claude/.tarea-actual
+   ```
+   Si lo dejás, cada prompt va a seguir insistiendo con una tarea que ya cerraste.
 
 Si el trabajo quedó a medias: `update required` (necesita más trabajo) u `on hold` (trabado por
 algo externo) en lugar de `complete`, siempre con un comentario que diga **dónde quedó**. Nunca
@@ -95,6 +126,9 @@ Paginá hasta `has_more: false` y presentá:
 - Cuántas hay **`complete`** sin pasar a **`reviewed`** — o sea, terminadas pero **sin verificar
   por nadie más**. En este proyecto ese número importa: es la deuda central
 - Qué ítems de `TODO.md` siguen sin subtarea (libres para tomar)
+- **Duplicados sospechosos**: dos o más subtareas con el mismo ID, o con slugs equivalentes
+  creados el mismo día. Es el residuo de una carrera perdida que nadie detectó a tiempo —
+  reportalos con sus `date_created` para que se pueda decidir cuál sobrevive
 
 ---
 
@@ -109,3 +143,17 @@ Paginá hasta `has_more: false` y presentá:
 - **`in progress` va antes de escribir código**, no después. Si va después, la ventana de
   colisión sigue abierta justo cuando más importa.
 - Nada de credenciales, `.env`, ni datos de clientes en los comentarios.
+
+---
+
+## El claim local (`.claude/.tarea-actual`)
+
+Es lo que alimenta al hook `UserPromptSubmit` (`.claude/hooks/recordar-protocolo.sh`), que
+inyecta el recordatorio del protocolo en **cada** prompt. Con claim, el recordatorio te dice
+qué tenés abierto y cómo cerrarlo; sin claim, te recuerda validar antes de empezar.
+
+- Lo escribe el modo **RECLAMAR**, lo borra el modo **CERRAR**.
+- Está **gitignored**: es estado de esta máquina y de esta persona, no del repo.
+- **No es fuente de verdad del estado.** El árbitro sigue siendo ClickUp. Si el claim y ClickUp
+  discrepan (alguien movió el estado desde la web, o quedó un claim viejo), **gana ClickUp** y
+  el claim se corrige.

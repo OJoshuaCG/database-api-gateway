@@ -14,11 +14,15 @@ gateway con credenciales pseudo-root es riesgo operativo, no prolijidad.
 - Ciclo ejecutable: **`/tarea P-XX`** para reclamar, **`/tarea fin P-XX`** para cerrar,
   **`/tarea estado`** para ver qué hay en curso.
 - Si una tarea está `in progress`, **se interrumpe** y se informa quién la tiene. No se avanza.
-- Tres reglas que si se saltan rompen el mecanismo en silencio: las subtareas se llaman
-  **`P-XX — <título>`** (el prefijo es la clave única contra duplicados); toda búsqueda va con
-  **`include_closed: true`** (viene apagado por defecto, y sin él una tarea ya terminada no
-  aparece y se duplica); y la **identidad del ejecutor va dentro del texto** del comentario,
-  porque el campo "autor" de ClickUp siempre dice la cuenta del token.
+- Cuatro reglas que si se saltan rompen el mecanismo en silencio: (1) las subtareas del backlog
+  se llaman **`P-XX — <título>`** y las **nuevas** `T-<YYMMDD>-<iniciales>-<slug>` — para algo
+  nuevo **nunca** el siguiente `P-XX` libre, que es secuencial y dos personas simultáneas
+  calculan el mismo; (2) toda búsqueda va con **`include_closed: true`** (viene apagado por
+  defecto, y sin él una tarea ya terminada no aparece y se duplica); (3) después de crear una
+  subtarea se **re-verifica** que no haya duplicado antes de trabajar, porque la ventana entre
+  buscar y crear no se puede cerrar (gana la de `date_created` más antiguo); (4) la **identidad
+  del ejecutor va dentro del texto** del comentario, porque el campo "autor" de ClickUp siempre
+  dice la cuenta del token.
 
 ## Descripción del Proyecto
 
