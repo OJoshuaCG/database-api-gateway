@@ -747,3 +747,123 @@ def test_selection_and_structure_together_are_rejected(admin_client, monkeypatch
         json={"selection": None, "structure": {"mode": "all"}},
     )
     assert pr.status_code == 422
+
+
+# =========================================================================== #
+# El atajo LEGACY (include_data) — P0                                          #
+# =========================================================================== #
+# Estos tests existen porque los de la primera pasada NO los tenían y por eso se shipeó un
+# 422 que rompía todo clon con datos. La causa de la ceguera fue el arnés: el helper
+# `_preview_and_execute` manda `json={}`, que es la ÚNICA forma del cuerpo que la SPA nunca
+# usa (`use-database-clones.ts:96` manda siempre `{selection: …}`).
+
+
+def _legacy_plan_with_data(admin_client, port):
+    """Plan creado con el atajo legacy `include_data=true` sobre un destino existente."""
+    sid, _oid, src_id = _setup(admin_client, port)
+    r = admin_client.post("/api/v1/database-clones", json={
+        "source_database_id": src_id, "target_server_id": sid,
+        "target_database_name": "dst_db", "target_mode": "existing",
+        "clean_mode": "none", "include_data": True,
+    })
+    assert r.status_code == 201, r.text
+    return r.json()["data"]["id"]
+
+
+def test_legacy_plan_accepts_every_body_shape_the_spa_sends(admin_client, monkeypatch):
+    """
+    EL test del P0. La SPA manda SIEMPRE `{selection: <array|null>}`, así que `_apply_spec`
+    corre en cada preview. Mientras `create_plan` persistía el `on_existing` derivado, dos de
+    estas tres formas devolvían 422 clone.conflicting_options y no había forma de salir: lo
+    único que limpia esa columna es `data.mode='none'`, que además elimina los datos.
+    """
+    _install_data_only(monkeypatch)
+    job = _legacy_plan_with_data(admin_client, 3800)
+    for body in (
+        {},                                                          # lo que cubrían los tests
+        {"selection": None},                                         # la SPA: clon completo
+        {"selection": [{"object_type": "table", "name": "users"}]},   # la SPA: clon parcial
+    ):
+        pr = admin_client.post(f"/api/v1/database-clones/{job}/preview", json=body)
+        assert pr.status_code == 200, f"cuerpo {body} -> {pr.status_code} {pr.text}"
+
+
+def test_legacy_plan_still_upserts_over_a_preserved_target(admin_client, monkeypatch):
+    """
+    No regresión de lo EJECUTADO: quitar la persistencia del valor derivado no puede cambiar
+    lo que la fase de datos hace. Destino existente + clean_mode='none' seguía siendo upsert
+    antes del arreglo y tiene que seguir siéndolo.
+    """
+    _install_data_only(monkeypatch)
+    job = _legacy_plan_with_data(admin_client, 3801)
+    pr = admin_client.post(f"/api/v1/database-clones/{job}/preview", json={"selection": None})
+    assert pr.status_code == 200, pr.text
+    data = pr.json()["data"]
+    assert data["copy_intent"] == "structure_and_data"
+    assert [t["upsert"] for t in data["data_tables"]] == [True]
+    # Y el campo efectivo dice la verdad: la columna guarda NULL (nadie lo eligió) pero lo
+    # que va a pasar con las filas del destino es un upsert.
+    assert data["data_on_existing"] == "upsert"
+
+
+def test_legacy_plan_on_a_fresh_target_appends(admin_client, monkeypatch):
+    """La otra mitad de la derivación histórica: destino que este job crea => append."""
+    fake = _install_data_only(monkeypatch)
+    fake.existing.discard("dst_db")
+    del fake.snaps["dst_db"]
+    sid, _oid, src_id = _setup(admin_client, 3802)
+    r = admin_client.post("/api/v1/database-clones", json={
+        "source_database_id": src_id, "target_server_id": sid,
+        "target_database_name": "dst_db", "target_mode": "new", "include_data": True,
+    })
+    job = r.json()["data"]["id"]
+    pr = admin_client.post(f"/api/v1/database-clones/{job}/preview", json={"selection": None})
+    assert pr.status_code == 200, pr.text
+    data = pr.json()["data"]
+    assert [t["upsert"] for t in data["data_tables"]] == [False]
+    assert data["data_on_existing"] == "append"
+
+
+def test_switching_away_from_data_only_clears_on_existing(admin_client, monkeypatch):
+    """
+    La segunda puerta del mismo defecto: un preview EXITOSO con 'data_only' + 'upsert' deja el
+    valor persistido, y el siguiente preview que cambia de intención lo arrastraba a
+    `validate_spec` y daba el mismo 422 irrecuperable.
+
+    Tiene que ser un preview exitoso: si el primero falla, la sesión no commitea y el valor
+    nunca llega a la BD — el camino no se ejercita.
+    """
+    _install_data_only(monkeypatch)
+    sid, _oid, src_id = _setup(admin_client, 3803)
+    job = _plan(admin_client, sid, src_id=src_id)
+    first = admin_client.post(
+        f"/api/v1/database-clones/{job}/preview",
+        json={"copy_intent": "data_only", "data": {"mode": "all", "on_existing": "upsert"}},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["data"]["data_on_existing"] == "upsert"
+
+    second = admin_client.post(
+        f"/api/v1/database-clones/{job}/preview",
+        json={"copy_intent": "structure_and_data", "data": {"mode": "all"}},
+    )
+    assert second.status_code == 200, second.text
+    data = second.json()["data"]
+    assert data["copy_intent"] == "structure_and_data"
+    # Sigue copiando datos, así que el efectivo NO es null: es el derivado del contenedor.
+    assert data["data_on_existing"] == "upsert"
+
+
+def test_data_only_still_requires_an_explicit_on_existing(admin_client, monkeypatch):
+    """
+    El arreglo NO puede aflojar el requisito: limpiar la columna fuera de 'data_only' no
+    debe convertir la obligación de elegir en un default silencioso.
+    """
+    _install_data_only(monkeypatch)
+    job = _legacy_plan_with_data(admin_client, 3804)
+    pr = admin_client.post(
+        f"/api/v1/database-clones/{job}/preview",
+        json={"copy_intent": "data_only", "data": {"mode": "all"}},
+    )
+    assert pr.status_code == 422
+    assert cspec.CODE_ON_EXISTING_REQUIRED in _codes(pr)
