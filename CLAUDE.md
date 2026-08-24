@@ -943,11 +943,10 @@ hook en `migrations.py::_render_statement_calls` (emite
 `migration_results.capture_statement(...)` en lugar de `exec_driver_sql` para las sentencias de
 lectura). **PRIMERA excepción deliberada** a la regla "el gateway nunca almacena datos de
 negocio" (`app/models/audit_log.py`), y por eso lleva TODAS las salvaguardas juntas: opt-in por
-versión (`capture_selects`, default false) + `reviewed=false` obligatorio al activarlo (409 en
-`apply` hasta aprobar, mismo mecanismo que el gate R1 de los baselines) + consentimiento por
-corrida (`apply?allow_result_capture=true`, 409 antes de tocar el motor — un blueprint se
-replica sobre N BDs de dueños distintos y quien aplica sobre UNA debe saber que va a extraer
-filas de ESA base) + payload **cifrado con la DEK** (no legible por SQL directo contra la BD del
+versión (`capture_selects`, default false) + `reviewed=false` obligatorio al activarlo (409
+`migration.capture_unreviewed` en `apply`/`rollback` hasta aprobar, mismo mecanismo que el gate
+R1 de los baselines; la aprobación es de una CONSULTA y se revoca sola si el SQL cambia)
++ payload **cifrado con la DEK** (no legible por SQL directo contra la BD del
 gateway: todo acceso pasa por el endpoint auditado) + lectura auditada **fail-closed ANTES de
 descifrar** (criterio de `reveal_password`) + TTL (`MIGRATION_CAPTURE_TTL_HOURS=168`, purga en
 el `lifespan`) + kill switch `MIGRATION_CAPTURE_ENABLED`. Endpoints
@@ -986,6 +985,47 @@ MySQL/MariaDB sobreviviendo a un fallo posterior, tipos nativos (`JSONB`, `TIME`
 migración contra la BD del gateway real. **`.env.example` NO se pudo actualizar** (permisos del
 entorno): las 6 variables `MIGRATION_CAPTURE_*` están documentadas en
 `app/core/environments.py` y en `docs/features/model-migrations.md`.
+
+**El consentimiento por corrida se ELIMINÓ (2026-08-24)** — `apply`/`rollback`/`apply-all` ya no
+aceptan `allow_result_capture`, y `_guard_capture_consent` no existe. Queda `_guard_reviewed_capture`
+como ÚNICO gate. El motivo importa, porque "una confirmación más" siempre suena a mejora y esto se
+revierte solo si nadie escribió por qué:
+
+- **La premisa era falsa acá.** El docstring lo justificaba con "un blueprint se replica sobre N BDs
+  de dueños potencialmente distintos, y quien aplica sobre UNA tiene que saber". Esos dueños son los
+  `ServerUser` de las bases DESTINO; a nivel gateway hay un **administrador único**
+  (`app/core/auth.py`: "no gestiona múltiples usuarios", sin roles, sin `users.router` expuesto). La
+  misma persona activa `capture_selects`, aprueba `reviewed` y dispara el apply: no era un segundo
+  par de ojos, solo un segundo momento.
+- **No dejaba rastro.** Pasar el flag **no se auditaba en ninguna parte**. Lo único auditado es la
+  escritura efectiva (`_capture_pointer`), que ocurre con o sin gate — fricción sin evidencia
+  forense. Contraste directo: el guard de entorno SÍ escribe `migration.environment_denied`.
+- **`apply_all` ya lo contradecía**: un único query param autorizaba N bases de entornos distintos.
+- **Saltaba donde el riesgo era menor.** Una BD nueva arranca sin versión ⇒ recibe la cadena
+  COMPLETA y arrastra versiones históricas cuya captura tenía sentido sobre bases con datos; sobre
+  una base recién creada esos SELECT devuelven cero filas. Un gate que se dispara sobre todo en el
+  caso inofensivo entrena el "siempre que sí", y ese reflejo después se aplica en producción: el
+  control quedaba **más débil**, no más fuerte.
+
+Lo reemplaza INFORMACIÓN, no fricción: `will_capture_versions` en el plan del dry-run (molde de
+`blocked_by`), `captured_versions` en la respuesta real —que además arregla un bug: la SPA enlazaba
+a `…/{to_version}/select-results` y un apply 0005→0010 cuya captura ocurrió en 0007 llevaba a una
+página vacía—, y el `detail` de la auditoría de **intento** (escrita antes de tocar el motor)
+nombrando las versiones con captura. El 409 que queda ganó `public_context.code`
+(`migration.capture_unreviewed`, y `migration.capture_unreviewed_stamp` para el `stamp`, donde
+`force` SÍ es escape legítimo): en `apply_all` el guard corre por BD dentro del bucle, así que su
+rechazo viaja como ítem de una respuesta **200** y `error_code` es el único canal clasificable.
+Vocabulario en `app/services/migration_capture_catalog.py`. **No hay migración Alembic**, y el corte
+fue limpio porque el flag nunca llegó a la capa de ejecución (el runner decide con
+`MIGRATION_CAPTURE_ENABLED and spec.capture_selects`). Compatibilidad: FastAPI ignora los query
+params no declarados, así que un cliente viejo que lo siga mandando recibe 200. Hay un test
+anti-regresión (`test_no_queda_ningun_gate_de_consentimiento_por_corrida`) con el razonamiento en su
+docstring. **Si el gateway pasa a ser multiusuario, la respuesta correcta NO es reponer un booleano
+de request, sino separación de roles (quien aprueba ≠ quien aplica).**
+
+**Los bloques B1 y C2/C2b de abajo describen fixes históricos sobre `_guard_capture_consent`, que ya
+no existe.** Se dejan anotados porque explican por qué el `rollback` tiene guards y por qué el kill
+switch los neutraliza — la mitad de `reviewed` de cada uno sigue vigente.
 
 **Tres bloqueantes de la revisión de seguridad de esa captura (2026-08-14)**:
 **(B1) el `rollback` capturaba SIN ningún control.** El codegen emite `capture_statement`

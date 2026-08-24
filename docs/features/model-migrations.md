@@ -72,23 +72,23 @@ DELETE /api/v1/database-models/{id}/migrations/{version}  # solo la ÚLTIMA vers
 ```http
 GET    /api/v1/managed-databases/{id}/migrations/status     # versión actual vs. pendientes
 POST   /api/v1/managed-databases/{id}/migrations/apply      # ?version= ?force= ?dry_run= — UNA llamada, secuencial (10/min)
-POST   /api/v1/managed-databases/{id}/migrations/rollback   # ?confirm_version= (OBLIG.) ?target_version= ?allow_result_capture= — secuencial (10/min)
+POST   /api/v1/managed-databases/{id}/migrations/rollback   # ?confirm_version= (OBLIG.) ?target_version= — secuencial (10/min)
 POST   /api/v1/managed-databases/{id}/migrations/stamp      # ?version=  (marca sin ejecutar) (10/min)
 GET    /api/v1/managed-databases/{id}/migrations/history    # historial paginado
 GET    /api/v1/managed-databases/{id}/migrations/{version}/select-results     # resultados capturados (AUDITADO) (20/min)
 DELETE /api/v1/managed-databases/{id}/migrations/{version}/select-results     # purga manual de esas capturas
 ```
 
-`apply` **y `rollback`** aceptan además `?allow_result_capture=` — obligatorio si alguna
-versión del camino (pendientes hacia adelante, o versiones a revertir hacia atrás) tiene
-`capture_selects=true`. El rollback lo exige igual que el apply porque el `down_sql`
-**también** captura (ver
+`apply` **y `rollback`** responden **409** `migration.capture_unreviewed` si alguna versión
+del camino (pendientes hacia adelante, o versiones a revertir hacia atrás) tiene
+`capture_selects=true` **sin aprobar**. El rollback lo exige igual que el apply porque el
+`down_sql` **también** captura. No hay consentimiento por corrida: se retiró (ver
 [Capturar el resultado de los `SELECT`](#capturar-el-resultado-de-los-select-de-una-migración)).
 
 ### Aplicación masiva
 
 ```http
-POST   /api/v1/database-models/{id}/migrations/apply-all    # ?max_databases=(1..100) ?force= ?dry_run= ?allow_result_capture= (3/min)
+POST   /api/v1/database-models/{id}/migrations/apply-all    # ?max_databases=(1..100) ?force= ?dry_run= (3/min)
 ```
 
 `apply-all` es **síncrono y acotado** (`max_databases` ≤100); continúa con las demás BDs
@@ -478,42 +478,73 @@ el `UNIQUE`. Ese `SELECT` se ejecutaba y su resultado **se tiraba**: Alembic no 
 nada y el gateway solo informaba "aplicada / falló". Justo en el caso que importa —una
 migración que murió en la sentencia *k*— el estado que se quería mirar ya cambió.
 
-### Cómo se activa (tres llaves, no una)
+### Cómo se activa (dos llaves, no una)
 
 Esta es la **única** vía por la que el gateway persiste **datos de negocio** (el módulo de
 auditoría declara explícitamente que nunca lo hace: esta es la excepción deliberada). Por eso
-hay que girar tres llaves distintas:
+hay que girar dos llaves distintas:
 
 1. **Opt-in por versión**: `capture_selects: true` al crear la migración (o por `PATCH`).
    Activarlo pone la versión en `reviewed=false`.
 2. **Revisión**: `PATCH .../migrations/{version}` con `reviewed=true`. Mientras no se
-   apruebe, `apply`/`apply-all` responden **409** (mismo mecanismo que el gate R1 de los
-   baselines de snapshot, con su propio mensaje). El gate se evalúa **solo sobre las
-   versiones realmente pendientes** de esa BD, igual que en el rollback (ver abajo).
-3. **Consentimiento de la corrida**: `POST .../migrations/apply?allow_result_capture=true`.
-   Sin el flag, si alguna versión **pendiente** tiene captura activada se responde **409
-   antes de ejecutar ninguna sentencia**. No es redundante con el punto 1: un blueprint se
-   replica sobre N BDs de dueños potencialmente distintos, y quien dispara el `apply` sobre
-   una de ellas tiene que saber que esa corrida va a extraer filas de **esa** base.
+   apruebe, `apply`/`apply-all` responden **409** `migration.capture_unreviewed` (mismo
+   mecanismo que el gate R1 de los baselines de snapshot, con su propio mensaje). El gate se
+   evalúa **solo sobre las versiones realmente pendientes** de esa BD, igual que en el rollback
+   (ver abajo). Y la aprobación es de una **consulta concreta**: cambiar el SQL la revoca.
 
-Y un **kill switch** global por encima de todo: `MIGRATION_CAPTURE_ENABLED=False` desactiva
-la captura sin tocar ningún blueprint (el SQL se sigue ejecutando idéntico). Con el switch
-apagado **ninguno de los dos gates (2 y 3) bloquea nada**: el codegen no emite una sola
-llamada de captura, así que capturar es *físicamente* imposible y un 409 solo cerraría la vía
-de recuperación (el `rollback` no tiene ningún `force` con el que saltearlo).
+Y un **kill switch** global por encima: `MIGRATION_CAPTURE_ENABLED=False` desactiva la captura
+sin tocar ningún blueprint (el SQL se sigue ejecutando idéntico). Con el switch apagado el gate
+**no bloquea nada**: el codegen no emite una sola llamada de captura, así que capturar es
+*físicamente* imposible y un 409 solo cerraría la vía de recuperación (el `rollback` no tiene
+ningún `force` con el que saltearlo).
 
-Los dos gates corren **después** de leer la versión actual del destino —hace falta para saber
-qué está pendiente—, así que abren una conexión de solo lectura; lo que garantizan es que el
-409 llega **antes de ejecutar cualquier sentencia de la migración**. Con `dry_run=true`
-ninguno bloquea: previsualizar no ejecuta nada.
+El gate corre **después** de leer la versión actual del destino —hace falta para saber qué está
+pendiente—, así que abre una conexión de solo lectura; lo que garantiza es que el 409 llega
+**antes de ejecutar cualquier sentencia de la migración**. Con `dry_run=true` no bloquea:
+previsualizar no ejecuta nada.
 
-#### Las tres llaves rigen en AMBAS direcciones
+#### Hubo una tercera llave, y por qué se retiró
+
+Existió un **consentimiento por corrida** (`?allow_result_capture=true`) que había que repetir
+en cada `apply` y cada `rollback`. Se eliminó (contrato `api-reference-v13.md`). El motivo
+importa, porque "agregar una confirmación más" siempre suena a mejora:
+
+- **La premisa no aplicaba.** Se justificaba con *"un blueprint se replica sobre N BDs de dueños
+  potencialmente distintos, y quien aplica sobre UNA tiene que saber"*. Esos dueños son los
+  `ServerUser` de las bases **destino**; a nivel gateway hay un **administrador único**
+  (`app/core/auth.py`: "no gestiona múltiples usuarios", sin roles ni permisos). La misma
+  persona activa la captura, aprueba `reviewed` y dispara el apply: no era un segundo par de
+  ojos, solo un segundo momento.
+- **No dejaba rastro.** Pasar el flag **no se auditaba**. Lo único auditado es la escritura
+  efectiva, que ocurre con o sin gate — o sea, fricción sin evidencia forense. (El guard de
+  entorno, en cambio, sí registra `migration.environment_denied` al rechazar.)
+- **`apply-all` ya lo contradecía**: un único query param autorizaba **N bases** de entornos
+  distintos, exactamente lo contrario de "conciencia de ESTA base".
+- **Saltaba donde el riesgo era menor.** Una BD nueva arranca sin versión, así que recibe la
+  cadena completa y arrastra versiones históricas cuya captura tenía sentido sobre bases con
+  datos. Sobre una base recién creada esos `SELECT` devuelven cero filas. Un gate que se dispara
+  sobre todo en el caso inofensivo entrena el reflejo "siempre que sí", y ese reflejo después se
+  aplica también en producción: el control quedaba **más débil**, no más fuerte.
+
+**Qué lo reemplaza** (información, no fricción):
+
+- `apply?dry_run=true` devuelve `will_capture_versions`: el pronóstico de qué versiones van a
+  extraer filas, en la llamada que existe para decidir.
+- La respuesta real trae `captured_select_count` y `captured_versions` — esta última es lo que
+  permite enlazar a `…/{version}/select-results` sin adivinar.
+- La auditoría de **intento** (`status="attempt"`, escrita antes de tocar el motor) nombra las
+  versiones con captura de esa corrida. Eso es evidencia que el consentimiento nunca produjo, y
+  queda incluso si la migración muere a mitad.
+
+**Compatibilidad**: FastAPI ignora los query params que no declara, así que un cliente que
+siga mandando `?allow_result_capture=true` recibe 200 en vez de romperse.
+
+#### Las dos llaves rigen en AMBAS direcciones
 
 El codegen emite `capture_statement` también para las sentencias del `down_sql`, así que un
 **`rollback` extrae y persiste datos exactamente como un `apply`**. Por eso
-`POST .../migrations/rollback` acepta y **exige** `?allow_result_capture=true` cuando alguna
-versión del camino a revertir tiene la captura activada, y también responde **409** si alguna
-de esas versiones no está revisada.
+`POST .../migrations/rollback` responde **409** si alguna versión del camino a revertir tiene la
+captura activada y no está revisada.
 
 El gate de `reviewed` del rollback se evalúa **solo sobre las versiones del camino**, no sobre
 el blueprint completo. El rollback es la vía de **recuperación** ante una migración mala;

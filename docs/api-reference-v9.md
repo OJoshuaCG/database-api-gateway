@@ -1,5 +1,13 @@
 # API Reference v9 — Captura de resultados de `SELECT` dentro de una migración
 
+> ⚠️ **Parcialmente superado por [`api-reference-v13.md`](api-reference-v13.md).** El
+> **consentimiento por corrida** (`allow_result_capture`) se eliminó: las "tres llaves" de §2 son
+> ahora **dos** (opt-in + revisión), y el `409` con `public_context.capture_versions` de §3.2/§3.3
+> ya no existe. El 409 que queda es el de captura **sin revisar**, y ahora lleva
+> `public_context.code`. Este documento se conserva sin reescribir porque es el registro de por
+> qué la feature se diseñó así; para lo que rige hoy, v13.
+
+
 > **Guía para el equipo de frontend.** Addendum de [`api-reference.md`](api-reference.md),
 > [`api-reference-v2.md`](api-reference-v2.md), [`api-reference-v3.md`](api-reference-v3.md),
 > [`api-reference-v4.md`](api-reference-v4.md), [`api-reference-v5.md`](api-reference-v5.md),
