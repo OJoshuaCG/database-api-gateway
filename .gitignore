@@ -91,6 +91,10 @@ Thumbs.db
 # Índice local de CodeGraph (por checkout; nunca se comparte ni se reutiliza)
 .codegraph/
 
+# Registro de skills que regenera `gentle-ai skill-registry refresh` en cada prompt.
+# Escanea rutas del HOME de quien trabaja, así que su contenido es distinto por máquina.
+.atl/
+
 docs/frontend
 
 .claude/.tarea-actual
