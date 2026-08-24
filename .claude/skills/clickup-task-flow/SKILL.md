@@ -30,7 +30,7 @@ suyo.
 | --- | --- | --- |
 | `to do` | Libre, nadie la tomó | — |
 | `in progress` | Alguien la está haciendo. **Es lo que reserva la tarea.** Vale para backend Y para frontend: el **rol va declarado en el comentario `INICIO`** | Quien la toma |
-| `on hold` | Detenida: trabada por algo externo, **o quedó a medias** y hay que retomarla | Quien la deja |
+| `on hold` | Detenida: trabada por algo externo, **o quedó a medias** y hay que retomarla. **Incluye el caso en que el frontend la devuelve** porque el backend no entregó lo que el handoff prometía — ver "El frontend devolvió una tarea" | Quien la deja |
 | `update required` | **Backend terminado. PENDIENTE DE FRONTEND.** Nada más. | Quien termina el backend |
 | `complete` | Cerrada del todo. No queda nada pendiente en ningún lado. | Quien la termina |
 | `reviewed` | **NO SE USA en este flujo.** | Nadie |
@@ -50,6 +50,13 @@ preguntar antes de asumir qué quiso decir.
 **`update required` tiene UN solo significado: falta el frontend.** Si se usa también para
 "necesita corrección", el filtro del frontend se llena de ruido y el mecanismo pierde el sentido.
 Para "quedó a medias" está `on hold`.
+
+**`on hold` también es TU bandeja de entrada, y es fácil no darse cuenta.** El frontend no puede
+devolver una tarea a `update required` —ese estado significa "falta el frontend", así que
+devolverla ahí la dejaría en su propio filtro y vos nunca te enterarías—. Cuando descubre que el
+backend no entregó lo que el handoff prometía, la deja en **`on hold`** con un comentario
+`BLOQUEADO POR BACKEND`. Esas tareas **no aparecen en ningún filtro que mires por costumbre**:
+revisalas explícitamente con `/tarea bloqueos`.
 
 ## Reparto de autoridad — quién manda sobre qué
 
@@ -266,7 +273,7 @@ tarea ya `complete` **no aparece** y se crea un duplicado exacto. Si la respuest
 | `update required` | **Backend hecho, falta el frontend.** Si lo que venís a hacer es el **frontend**, tomala. Si venís a hacer **más backend**, avisá que hay un handoff pendiente y decidí con el usuario si es un fix de esa tarea o trabajo nuevo. |
 | `complete` | **NO es un portazo:** informá que ya se hizo, con el resumen del comentario `FIN`. Después aplicá la prueba de "¿tarea nueva o la misma?" (arriba): si es un **fix**, se **reabre**; si es trabajo distinto, **tarea nueva vinculada**. |
 | `to do` | Libre. Se puede tomar. |
-| `on hold` | Se puede tomar, pero **leé primero el último comentario**: dice por qué se detuvo y dónde quedó. |
+| `on hold` | **Leé primero el último comentario**, que dice por qué se detuvo y dónde quedó. Si es un **`BLOQUEADO POR BACKEND`**, el frontend te la devolvió: es trabajo tuyo y tiene prioridad — hay una implementación de frontend parada esperándote (ver "El frontend devolvió una tarea"). Si no, es una tarea que quedó a medias y se puede retomar normalmente. |
 | `reviewed` | Estado **no usado** en este flujo. Preguntá antes de asumir qué significa. |
 | No existe | Crear la subtarea (abajo). |
 
@@ -403,6 +410,94 @@ Una tarea colgada en `in progress` bloquea a todos los demás por nada.
 **No uses `update required` para esto.** Ese estado significa "falta el frontend" y nada más; si
 lo usás para "quedó a medias", el frontend recibe trabajo que no es suyo.
 
+## El frontend devolvió una tarea: `BLOQUEADO POR BACKEND`
+
+Es el camino de vuelta del handoff, y **es el único punto del flujo donde hay alguien parado
+esperándote**. Tratalo con esa prioridad.
+
+### Qué pasó
+
+El frontend reclamó una tarea que vos dejaste en `update required`, empezó a implementar, y
+descubrió que el backend **no entrega lo que el handoff prometía**: otra forma de respuesta, falta
+un campo, el código de error no es el documentado, o la ruta directamente no existe.
+
+No puede devolverla a `update required` —ese estado significa "falta el frontend", así que la
+dejaría en su propio filtro y vos no te enterarías nunca—. La deja en **`on hold`** con un
+comentario `BLOQUEADO POR BACKEND` y `notify_all: true`.
+
+**Por qué esto te puede pasar de largo:** una tarea en `on hold` no está en `to do`, ni en
+`in progress`, ni en `update required`. No aparece en ningún filtro que mires por costumbre. Por
+eso existe **`/tarea bloqueos`** — usalo al arrancar el día, antes de sacar trabajo nuevo del
+backlog.
+
+### Qué te llega
+
+```
+**Ejecutor:** <email>
+**Rol:** frontend
+**Acción:** BLOQUEADO POR BACKEND — <nombre de la tarea>
+**Qué esperaba (según el handoff):** <lo prometido, citando el comentario y su fecha>
+**Qué encontré:** <respuesta real, código de estado, forma del payload>
+**Cómo lo reproduzco:** <request concreto>
+**Qué necesito del backend:** <concreto>
+**Dónde quedé:** <qué parte del frontend ya está hecha y sirve igual>
+```
+
+**El campo `Dónde quedé` es el que decide cómo cerrás.** Te dice cuánto trabajo de frontend ya
+existe y sigue siendo válido. Si hay una implementación a medio hacer del otro lado, **cualquier
+cambio tuyo que vaya más allá de lo estrictamente necesario para desbloquear se la rompe**.
+
+### Qué hacés
+
+**1. Verificá el bloqueo antes de aceptarlo.** Reproducí lo que dice `Cómo lo reproduzco`. Hay tres
+salidas honestas, y la segunda y la tercera se saltean seguido:
+
+- **El bloqueo es real** → seguí al paso 2.
+- **El backend sí cumple, y el frontend leyó mal el contrato** → **no cambies el backend.** Dejá un
+  comentario con la evidencia (la request correcta y su respuesta) y devolvela a
+  `update required`. Cambiar el backend para acomodar una lectura equivocada del contrato es cómo
+  se rompe lo que ya funcionaba en producción.
+- **El contrato estaba mal escrito, pero el código está bien** → arreglá el **documento**, no el
+  código, y devolvela a `update required` citando el hash nuevo.
+
+**2. Reclamala:** `status: "in progress"` + comentario `INICIO` con **`Rol: backend`**. Sigue
+siendo lo que reserva la tarea.
+
+**3. Arreglá solo lo que desbloquea.** Esta no es la oportunidad de mejorar el endpoint de paso.
+Hay una implementación parada del otro lado y **`Dónde quedé` te dice qué no podés romper.** Si de
+verdad hace falta un cambio más grande, eso es **trabajo nuevo**: aplicá la prueba del objetivo
+declarado y abrí una tarea vinculada.
+
+**4. Cerrá a `update required`** —no a `complete`—, con un handoff que **responda al bloqueo punto
+por punto**:
+
+```
+**Ejecutor:** <email>
+**Rol:** backend
+**Acción:** FIN BACKEND (DESBLOQUEO) — <nombre de la tarea>
+**Resumen:** <qué se cambió>
+
+**⚠️ REQUIERE FRONTEND — DESBLOQUEO**
+
+**Bloqueo que se resuelve:** comentario `BLOQUEADO POR BACKEND` del <fecha>
+**Qué encontraste vs. qué hay ahora:** <punto por punto, contra el campo "Qué encontré">
+**Lo que NO cambió:** <para que no se rehaga trabajo que ya estaba bien>
+**Sigue sin resolverse:** <lo que pediste y NO se hizo, y por qué. O "nada">
+**Contrato:** `docs/api-reference-vN.md` § <sección> — commit `<hash nuevo>`
+```
+
+**`Sigue sin resolverse` no es opcional, y es el campo que más se omite.** Si pediste tres cosas y
+se arreglaron dos, el frontend tiene que enterarse **ahora** y no cuando vuelva a chocar contra la
+tercera. Un desbloqueo parcial que se anuncia como completo hace que la tarea rebote una segunda
+vez, y esa vuelta cuesta mucho más que escribir la línea.
+
+**`Lo que NO cambió` tampoco es relleno:** sin esa línea el frontend rehace trabajo que estaba
+bien — y en un desbloqueo eso es casi seguro, porque ya tenía media implementación hecha.
+
+**5. Si NO lo podés desbloquear** (necesitás una decisión de producto, o depende de algo externo):
+**no la dejes en `in progress`.** Volvé a `on hold` con un comentario que diga qué falta y de quién
+depende, y `notify_all: true`. Que quede parada es aceptable; que quede parada **en silencio**, no.
+
 ## Formato de los comentarios
 
 ```
@@ -487,6 +582,19 @@ subtarea madre:   in progress (fe) ───────────────
 
 Así **nadie se bloquea**: el frontend no pierde el trabajo en curso y el backend no se queda
 esperando para hacer un fix que puede hacer ya.
+
+**7. El frontend devuelve la tarea porque el backend no cumplió el handoff**
+
+```
+update required → in progress (fe) → on hold → in progress (be) → update required → in progress (fe) → complete (fe)
+                   (empieza y choca)  (BLOQUEADO   (DESBLOQUEO)
+                                       POR BACKEND)
+```
+
+Es el **camino de vuelta** del handoff, y el único tramo del flujo donde hay alguien parado
+esperándote. El paso por `on hold` no es un descuido: el frontend no puede devolverla a
+`update required` sin volver a metérsela en su propio filtro. **Esas tareas no aparecen en ningún
+filtro que mires por costumbre** — se ven con `/tarea bloqueos`.
 
 ## El backend necesita volver a tocar algo que ya se entregó al frontend
 
@@ -612,6 +720,9 @@ Todos los cambios de estado ocurren en **ClickUp vía MCP**. Ningún estado vive
 | Backend re-toca algo en `update required` **sin cambiar el contrato** | Se **queda** en `update required` + comentario informativo | Se queda en 🔵 |
 | **Backend necesita cambiar algo que el frontend YA está haciendo** | **NO se toca esa tarea.** `create_task` con `parent` = la subtarea + `add_task_link` + comentario `TRABAJO DERIVADO` (`notify_all`) en la madre | Sub-ítem nuevo en 🔴 Pendientes, referenciando a la madre |
 | Se abandona | `on hold` + comentario | Ítem vuelve a 🔴 Pendientes |
+| **El frontend devuelve la tarea** (`BLOQUEADO POR BACKEND`) | Llega en `on hold`. **No sale en ningún filtro habitual: mirala con `/tarea bloqueos`.** Verificá el bloqueo → `in progress` + `INICIO` (rol backend) → arreglá **solo lo que desbloquea** → `update required` + `FIN BACKEND (DESBLOQUEO)` | 🔵 → 🟡 → 🔵 |
+| El bloqueo NO era real (el frontend leyó mal el contrato) | **No cambies el backend.** Comentario con la evidencia → de vuelta a `update required` | Se queda en 🔵 |
+| El bloqueo era del **documento**, no del código | Arreglá el doc, no el código → de vuelta a `update required` citando el hash nuevo | Se queda en 🔵 |
 
 ## Qué NO va a ClickUp
 

@@ -22,7 +22,7 @@ gateway con credenciales pseudo-root es riesgo operativo, no prolijidad.
 | --- | --- |
 | `to do` | Libre |
 | `in progress` | Alguien la está haciendo — **es lo que la reserva** |
-| `on hold` | Detenida: trabada por algo externo, **o quedó a medias** |
+| `on hold` | Detenida: trabada por algo externo, **o quedó a medias**. También es **tu bandeja de entrada**: es donde el frontend devuelve lo que el backend no cumplió |
 | `update required` | **Backend listo, PENDIENTE DE FRONTEND.** Nada más |
 | `complete` | Cerrada del todo |
 | `reviewed` | **No se usa en este flujo** |
@@ -49,6 +49,9 @@ backend puro              to do → in progress(be) → complete
 backend con frontend      to do → in progress(be) → update required → in progress(fe) → complete(fe)
 fix cerrado sin frontend  complete → in progress(be) → complete
 fix cerrado con frontend  complete → in progress(be) → update required → in progress(fe) → complete(fe)
+el fe devuelve la tarea   update required → in progress(fe) → on hold → in progress(be) → update required → in progress(fe) → complete(fe)
+                                            (choca)          (BLOQUEADO   (DESBLOQUEO)
+                                                              POR BACKEND)
 ```
 
 Un fix de algo `complete` que ahora afecta al frontend pasa **por `in progress`** (la reapertura es
@@ -65,6 +68,27 @@ empezó:**
 | --- | --- |
 | `update required` (el fe no la tomó) | **Reabre la misma tarea:** `HANDOFF INVALIDADO` con `notify_all` antes de tocar código, y al cerrar un handoff de re-entrega con el **delta** (incluyendo **qué NO cambió**, para que no se rehaga trabajo bueno). Si el cambio **no toca el contrato**, se queda en `update required` y solo se comenta. |
 | `in progress` con `INICIO` de **frontend** | **No la toca.** Crea una **sub-subtarea** (`parent` = esa subtarea; verificado que ClickUp acepta 3 niveles) + `add_task_link` + comentario `TRABAJO DERIVADO` con `notify_all` en la madre, declarando el **impacto** en lo que el frontend está haciendo. Así nadie se bloquea: el fe no pierde su trabajo y el be no espera. **No hay cuarto nivel.** |
+
+**El camino de VUELTA del handoff: `BLOQUEADO POR BACKEND`.** Cuando el frontend empieza a
+implementar y descubre que el backend no entrega lo que el handoff prometía —otra forma de
+respuesta, falta un campo, el código de error no es el documentado, la ruta no existe— **no puede
+devolverla a `update required`**: ese estado significa "falta el frontend", así que la dejaría en
+su propio filtro y el backend no se enteraría nunca. La deja en **`on hold`** con un comentario
+`BLOQUEADO POR BACKEND` y `notify_all: true`.
+
+**Esas tareas no aparecen en ningún filtro que mires por costumbre** —no están en `to do`, ni en
+`in progress`, ni en `update required`—, y del otro lado hay una implementación parada. Es el único
+tramo del flujo con alguien esperando. Revisalas con **`/tarea bloqueos`** al arrancar el día,
+antes de sacar trabajo nuevo del backlog.
+
+Al recibir una: **verificá el bloqueo antes de aceptarlo.** Si el backend sí cumplía y el frontend
+leyó mal el contrato, **no cambies el backend** — comentá con la evidencia y devolvela a
+`update required`. Si el error estaba en el **documento** y no en el código, arreglá el doc. Si el
+bloqueo es real: `in progress` (rol backend) → arreglá **solo lo que desbloquea**, porque el campo
+`Dónde quedé` te dice qué implementación de frontend no podés romper → cerrá en **`update required`**
+—nunca en `complete`— con un `FIN BACKEND (DESBLOQUEO)` que incluya **`Sigue sin resolverse`**. Ese
+campo es el que más se omite: un desbloqueo parcial anunciado como completo hace que la tarea
+rebote una segunda vez.
 
 **Un fix de algo ya `complete` NO crea tarea nueva: se reabre la existente.** Tarea nueva solo
 cuando el trabajo no se puede describir sin cambiar el objetivo declarado de la original, y en ese

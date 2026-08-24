@@ -24,5 +24,5 @@ if [ -f "$CLAIM" ]; then
     fi
 fi
 
-printf '%s\n' '[protocolo de tareas] Ninguna tarea reclamada en este repo. Si lo que sigue es implementar, arreglar, verificar o refactorizar algo, primero invocá la skill `clickup-task-flow` (o `/tarea P-XX`) para validar en ClickUp que nadie más la esté haciendo. Responder preguntas, leer código o explicar cosas NO requiere reclamar tarea.'
+printf '%s\n' '[protocolo de tareas] Ninguna tarea reclamada en este repo. Si lo que sigue es implementar, arreglar, verificar o refactorizar algo, primero invocá la skill `clickup-task-flow` (o `/tarea P-XX`) para validar en ClickUp que nadie más la esté haciendo. Antes de sacar trabajo nuevo del backlog, mirá `/tarea bloqueos`: son las tareas que el frontend devolvió en `on hold` porque el backend no cumplió el handoff, no salen en ningún otro filtro, y del otro lado hay una implementación parada. Responder preguntas, leer código o explicar cosas NO requiere reclamar tarea.'
 exit 0

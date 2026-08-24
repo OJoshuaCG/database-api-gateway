@@ -16,6 +16,7 @@ corresponda.
 | `fin P-07` | **CERRAR** | Cerrar: `complete` o `update required` según si falta frontend |
 | `fin P-07 <notas>` | **CERRAR** | Idem, con notas para el comentario |
 | `frontend` | **PENDIENTES DE FRONTEND** | Listar lo que espera implementación visual |
+| `bloqueos` | **DEVUELTAS POR EL FRONTEND** | Listar las que el frontend devolvió porque el backend no cumplió el handoff. **No salen en ningún otro filtro** |
 | `estado` (o vacío) | **CONSULTAR** | Qué hay en curso y qué está libre |
 | Texto sin ID | **RESOLVER** | Identificar a qué ítem se refiere antes de seguir |
 
@@ -65,7 +66,10 @@ corresponda.
      - Es trabajo **distinto** o rehacer desde cero → **tarea nueva vinculada** con
        `clickup_add_task_link`.
      - **No está claro** → preguntá al usuario. No crees nada por tu cuenta.
-   - **`on hold`** → leé el último comentario (dice dónde quedó) y seguí al paso 5.
+   - **`on hold`** → leé el último comentario. Si es un **`BLOQUEADO POR BACKEND`**, el frontend
+     te la devolvió y hay una implementación parada esperándote: andá al **modo DESBLOQUEAR**
+     (abajo), que empieza por *verificar* el bloqueo antes de aceptarlo. Si no, dice dónde quedó y
+     seguís al paso 5.
    - **`to do`** → seguí al paso 5.
    - **`reviewed`** → estado no usado en este flujo. Preguntá antes de asumir.
    - **No existe** → creála:
@@ -271,6 +275,95 @@ Este listado es el insumo natural del agente `frontend-planning`.
 
 ---
 
+## Modo DEVUELTAS POR EL FRONTEND (`bloqueos`)
+
+```
+clickup_filter_tasks
+  list_ids: ["901716272178"]
+  statuses: ["on hold"]
+  subtasks: true
+```
+
+De las que vuelvan, quedate con las que tengan un comentario **`BLOQUEADO POR BACKEND`**
+(`clickup_get_task_comments`). Las demás son tareas que quedaron a medias y no son esto.
+
+**Corré esto al arrancar el día, antes de sacar trabajo nuevo del backlog.** Una tarea en
+`on hold` no está en `to do`, ni en `in progress`, ni en `update required`: **no aparece en ningún
+filtro que mires por costumbre**, y del otro lado hay una implementación de frontend parada. Es el
+único tramo del flujo con alguien esperando.
+
+Para cada una, presentá:
+
+- ID, título y link
+- **Qué necesita del backend** (el campo del comentario), que es lo accionable
+- **Qué esperaba vs. qué encontró** — de acá sale si el bloqueo es real
+- **Dónde quedó el frontend**: cuánto trabajo ya existe del otro lado y sigue siendo válido
+- Desde cuándo está parada
+
+Ordenalas por antigüedad: la que lleva más tiempo parada tiene más trabajo detenido detrás.
+
+---
+
+## Modo DESBLOQUEAR
+
+Se entra acá desde `bloqueos`, o desde RECLAMAR cuando una tarea en `on hold` resulta ser un
+`BLOQUEADO POR BACKEND`.
+
+**1. Verificá el bloqueo ANTES de aceptarlo.** Reproducí lo que dice `Cómo lo reproduzco`. Hay
+tres salidas honestas, y las dos últimas se saltean seguido:
+
+- **El bloqueo es real** → seguí al paso 2.
+- **El backend sí cumple; el frontend leyó mal el contrato** → **no cambies el backend.** Dejá un
+  comentario con la evidencia (la request correcta y su respuesta) y devolvela a
+  `update required`. Cambiar el backend para acomodar una lectura equivocada del contrato es cómo
+  se rompe lo que ya andaba en producción.
+- **El contrato estaba mal escrito, pero el código está bien** → arreglá el **documento**, no el
+  código. Devolvela a `update required` citando el hash nuevo.
+
+**2. Reclamala:** `clickup_update_task` → `status: "in progress"`, y comentario `INICIO` con
+**`Rol: backend`**.
+
+**3. Arreglá solo lo que desbloquea.** No es la oportunidad de mejorar el endpoint de paso: hay
+una implementación parada del otro lado y el campo **`Dónde quedé`** te dice qué no podés romper.
+Si de verdad hace falta un cambio más grande, eso es **trabajo nuevo**: aplicá la prueba del
+objetivo declarado y abrí una tarea vinculada.
+
+**4. Cerrá a `update required`** —nunca a `complete`: el frontend todavía tiene que terminar lo
+suyo— con un handoff que **responda al bloqueo punto por punto**:
+
+```
+**Ejecutor:** <email>
+**Rol:** backend
+**Acción:** FIN BACKEND (DESBLOQUEO) — <tarea>
+**Resumen:** <qué se cambió>
+
+**⚠️ REQUIERE FRONTEND — DESBLOQUEO**
+
+**Bloqueo que se resuelve:** comentario `BLOQUEADO POR BACKEND` del <fecha>
+**Qué encontraste vs. qué hay ahora:** <punto por punto, contra el campo "Qué encontré">
+**Lo que NO cambió:** <para que no se rehaga trabajo que ya estaba bien>
+**Sigue sin resolverse:** <lo que pidió y NO se hizo, y por qué. O "nada">
+**Contrato:** `docs/api-reference-vN.md` § <sección> — commit `<hash nuevo>`
+```
+
+**`Sigue sin resolverse` es el campo que más se omite, y el que más caro sale.** Si pidió tres
+cosas y arreglaste dos, el frontend tiene que enterarse **ahora** y no cuando choque con la
+tercera. Un desbloqueo parcial anunciado como completo hace que la tarea rebote una segunda vez, y
+esa vuelta cuesta mucho más que escribir la línea.
+
+**`Lo que NO cambió` tampoco es relleno**, y en un desbloqueo menos que nunca: el frontend ya tenía
+media implementación hecha.
+
+**5. Si NO lo podés desbloquear** (hace falta una decisión de producto, o depende de algo externo):
+**no la dejes en `in progress`.** Volvé a `on hold` con un comentario que diga qué falta y de quién
+depende, y **`notify_all: true`**. Que quede parada es aceptable; que quede parada **en silencio**,
+no.
+
+**6. Borrá el claim local** (`rm -f .claude/.tarea-actual`) cuando la cierres o la vuelvas a dejar
+en `on hold`.
+
+---
+
 ## Modo CONSULTAR
 
 ```
@@ -284,7 +377,9 @@ Paginá hasta `has_more: false` y presentá:
 
 - Qué está **`in progress`**, con quién la tiene (del comentario `INICIO`) y desde cuándo
 - Qué está **`update required`** — o sea, backend listo y **frontend pendiente**
-- Qué está **`on hold`**, con el motivo y dónde quedó
+- Qué está **`on hold`**, con el motivo y dónde quedó. **Separá las que tengan un comentario
+  `BLOQUEADO POR BACKEND`**: no son tareas dormidas, es el frontend devolviéndote trabajo con una
+  implementación parada del otro lado. Van primero
 - Qué ítems de `TODO.md` siguen sin subtarea (libres para tomar)
 - **Duplicados sospechosos**: dos o más subtareas con el mismo ID, o con slugs equivalentes
   creados el mismo día. Es el residuo de una carrera perdida que nadie detectó a tiempo —
@@ -307,6 +402,11 @@ Paginá hasta `has_more: false` y presentá:
 - **`in progress` va antes de escribir código**, no después.
 - **`update required` significa una sola cosa: falta el frontend.** Para "quedó a medias" está
   `on hold`.
+- **`on hold` es también tu bandeja de entrada.** El frontend devuelve ahí lo que el backend no
+  cumplió (`BLOQUEADO POR BACKEND`), porque no puede usar `update required` sin metérselo en su
+  propio filtro. Esas tareas **no aparecen en ningún filtro habitual**: `/tarea bloqueos`.
+- **Un desbloqueo se cierra en `update required`, nunca en `complete`** — el frontend todavía tiene
+  que terminar lo suyo.
 - **`reviewed` no se usa.**
 - Nada de credenciales, `.env`, ni datos de clientes en los comentarios **ni en los adjuntos**.
 

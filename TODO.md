@@ -172,6 +172,12 @@ cambiados, si hay breaking changes, los schemas afectados, y la referencia al co
 backend necesita cambiar algo MIENTRAS el frontend trabaja, **no toca esa tarea**: abre una
 **sub-subtarea** anidada y avisa en la madre el impacto.
 
+**Si el frontend empieza y choca** —el backend no entrega lo que el handoff prometía— la tarea
+**no vuelve acá**. El frontend la deja en **`on hold`** con un comentario `BLOQUEADO POR BACKEND`,
+porque devolverla a `update required` la dejaría en su propio filtro y el backend no se enteraría.
+Esas tareas **vuelven a 🔴 Pendientes marcadas como bloqueadas**, y en ClickUp se ven con
+`/tarea bloqueos` — no salen en ningún otro filtro, y del otro lado hay una implementación parada.
+
 Si el frontend todavía NO la tomó y el backend **cambia el contrato**, primero deja un comentario
 `HANDOFF INVALIDADO` (con notificación) y la tarea vuelve a 🟡 En curso hasta la re-entrega. Si el
 cambio **no** toca el contrato, se queda acá y solo se comenta.
