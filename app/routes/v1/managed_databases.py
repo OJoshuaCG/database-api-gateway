@@ -1,8 +1,11 @@
 """
 Endpoints de ManagedDatabases (bases de datos gestionadas).
 
-Crea/otorga/borra BDs reales en el motor destino. Flags que tocan el motor:
-- ``?provision=true`` en POST → CREATE DATABASE + GRANT al propietario.
+Crea/borra BDs reales en el motor destino. Flags y rutas que tocan el motor:
+- ``?provision=true`` en POST → CREATE DATABASE (**sin GRANT**: crear una BD no otorga ningún
+  privilegio al propietario; se asignan aparte vía ``POST /server-users/{id}/grants``).
+- ``POST /{id}/provision`` → CREATE DATABASE sobre una fila YA registrada que quedó ``pending``
+  o ``error``, sin tener que borrarla y recrearla.
 - ``?drop_remote=true`` en DELETE → DROP DATABASE.
 - ``?provision=true`` en reassign-owner → re-grant / ALTER OWNER en el motor.
 """
@@ -18,6 +21,7 @@ from app.schemas.managed_database import (
     AdoptDatabaseIn,
     ManagedDatabaseCreate,
     ManagedDatabaseOut,
+    ManagedDatabaseProvisionOut,
     ManagedDatabaseUpdate,
     ReassignOwnerIn,
 )
@@ -137,6 +141,49 @@ def reassign_owner(
         db_id, payload.owner_id, provision=provision, admin=admin
     )
     return success(data=updated, message="Propietario reasignado.")
+
+
+@router.post(
+    "/{db_id}/provision", response_model=ApiResponse[ManagedDatabaseProvisionOut]
+)
+@limiter.limit("10/minute")
+def provision_database(
+    request: Request,
+    admin: AdminDep,
+    db_id: int,
+    allow_recreate: bool = Query(
+        False,
+        description=(
+            "Permite aprovisionar una fila que el inventario ya marca 'active'. Es para el "
+            "caso en que la BD se borró por fuera del gateway; sin esto, un 'active' responde "
+            "409 para no enmascarar ese borrado."
+        ),
+    ),
+):
+    """
+    Ejecuta el ``CREATE DATABASE`` faltante sobre una BD **ya registrada** en el inventario 🔌.
+
+    Es la salida para una fila que quedó ``pending`` (registrada sin aprovisionar) o ``error``
+    (el DDL del alta falló). Antes solo se podía borrar la fila y recrearla, perdiendo notas,
+    entorno, blueprint e historial de migraciones.
+
+    **No aplica las migraciones del blueprint** — eso sigue siendo
+    ``POST /{id}/migrations/apply`` — y **no otorga privilegios**: se asignan aparte con
+    ``POST /server-users/{id}/grants``.
+
+    409 si la BD ya existe en el motor: adoptar una base preexistente es
+    ``POST /managed-databases/adopt``.
+    """
+    result = ManagedDatabaseController().provision_database(
+        db_id, allow_recreate=allow_recreate, admin=admin
+    )
+    msg = (
+        "Base de datos creada en el motor."
+        if result["provisioned"]
+        else "La base de datos ya había sido creada por una operación simultánea; "
+        "se reconcilió el estado del inventario."
+    )
+    return success(data=result, message=msg)
 
 
 # --------------------------------------------------------------------------- #

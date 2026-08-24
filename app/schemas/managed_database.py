@@ -128,3 +128,31 @@ class ManagedDatabaseOut(BaseModel):
     origin: str = "provisioned"
     created_at: datetime
     updated_at: datetime
+
+
+class ManagedDatabaseProvisionOut(BaseModel):
+    """
+    Resultado de ``POST /managed-databases/{id}/provision``.
+
+    Tiene forma propia y no es un ``ManagedDatabaseOut`` a secas porque los dos desenlaces
+    exitosos terminan en ``status=active`` y solo ``provisioned`` los distingue: el normal
+    (se ejecutó el ``CREATE DATABASE``) y la convergencia por carrera (otra llamada al mismo
+    endpoint sobre la misma fila ganó y esta recibió 1007/42P04 del motor).
+    """
+
+    database: ManagedDatabaseOut
+    provisioned: bool = Field(
+        ...,
+        description=(
+            "True si esta llamada ejecutó el CREATE DATABASE. False = convergencia por "
+            "carrera: la BD ya había sido creada por una llamada simultánea y el estado se "
+            "reconcilió sin emitir DDL."
+        ),
+    )
+    previous_status: ProvisionStatus = Field(
+        ..., description="Estado que tenía la fila antes de aprovisionar (pending | error | active)"
+    )
+    charset: str | None = Field(
+        None, description="Forma CANÓNICA del catálogo que efectivamente viajó al DDL"
+    )
+    collation: str | None = None

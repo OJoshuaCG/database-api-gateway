@@ -2,13 +2,18 @@
 Controller de ManagedDatabase (bases de datos gestionadas).
 
 Orquesta el inventario del gateway y el aprovisionamiento real en el motor:
-CREATE DATABASE + GRANT al propietario, DROP DATABASE, y reasignación de propietario.
+CREATE DATABASE, DROP DATABASE y reasignación de propietario. **No otorga privilegios**: crear
+una BD (con o sin ``provision``) no le da ningún GRANT al propietario — se asignan aparte, de
+forma explícita y granular, vía ``POST /server-users/{id}/grants``.
 
 Consistencia GW↔motor (sin rollback silencioso):
-    insertar status=pending → ejecutar DDL/DCL → status=active (éxito)
-                                              └→ status=error  (falla; detalle en notas)
+    insertar status=pending → ejecutar DDL → status=active (éxito)
+                                          └→ status=error  (falla; detalle en notas)
 El registro en estado ``error`` se conserva para auditoría/reintento; el error HTTP
 real (502/504/409/...) se propaga al cliente.
+
+Con ``provision=False`` la fila queda en ``pending`` y el motor no se toca. ``provision_database``
+es la vía para completar ese alta después, sin borrar la fila.
 
 Integridad: el propietario debe ser un ServerUser del MISMO servidor (se valida en
 el controller; endurecimiento futuro con FK compuesta — ver docs/plans/00).
@@ -20,6 +25,7 @@ from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.controllers.environment_controller import EnvironmentController
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+from app.core.remote_engine import DUPLICATE_DATABASE_CODES
 from app.exceptions import AppHttpException
 from app.models.database_model import DatabaseModel
 from app.models.enums import EngineType, ProvisionStatus
@@ -29,7 +35,46 @@ from app.models.server import Server
 from app.models.server_user import ServerUser
 from app.services import audit, charset_catalog
 from app.services import environment_catalog as ecodes
+from app.services import provisioning_catalog as pcodes
 from app.services.db_admin.factory import get_adapter
+from app.services.db_admin.identifiers import (
+    ensure_not_reserved_database,
+    validate_identifier,
+)
+
+#: Marca del bloque de diagnóstico que escribe el gateway dentro de ``notes``. Todo lo que NO
+#: empieza con esto es del operador y no se toca.
+_GW_NOTE_MARK = "[gateway]"
+
+
+def _merge_note(existing: str | None, detail: str) -> str:
+    """
+    Conserva la nota del operador y REEMPLAZA el bloque de diagnóstico del gateway.
+
+    Se reemplaza en vez de acumular: si no, cinco reintentos fallidos dejan cinco líneas de lo
+    mismo y la nota del operador queda enterrada.
+    """
+    kept = "\n".join(
+        ln for ln in (existing or "").splitlines() if not ln.startswith(_GW_NOTE_MARK)
+    ).strip()
+    line = f"{_GW_NOTE_MARK} {detail}"
+    return f"{kept}\n{line}" if kept else line
+
+
+def _is_duplicate_database(exc: AppHttpException) -> bool:
+    """
+    ¿El motor rechazó un ``CREATE DATABASE`` porque la base YA existe?
+
+    El status no alcanza: ``map_driver_error`` manda a 409 tanto 1007/42P04 (la base existe)
+    como 1396/42710/2BP01 (usuario duplicado, objeto duplicado, dependencias). Hay que mirar el
+    código nativo, que viaja como STRING en ``context["remote_error_code"]``.
+    """
+    ctx = getattr(exc, "context", None)
+    return (
+        getattr(exc, "status_code", None) == 409
+        and isinstance(ctx, dict)
+        and str(ctx.get("remote_error_code") or "") in DUPLICATE_DATABASE_CODES
+    )
 
 
 class ManagedDatabaseController:
@@ -77,15 +122,29 @@ class ManagedDatabaseController:
             session.close()
 
     def _set_status(
-        self, db_id: int, status: ProvisionStatus, *, detail: str | None = None
+        self,
+        db_id: int,
+        status: ProvisionStatus,
+        *,
+        detail: str | None = None,
+        replace_notes: bool = True,
     ) -> None:
+        """
+        Fija el estado y, opcionalmente, deja un diagnóstico en ``notes``.
+
+        ``replace_notes=False`` CONSERVA la nota del operador y solo reemplaza el bloque
+        marcado del gateway (ver ``_merge_note``). El default sigue siendo ``True`` a
+        propósito: ``create_database`` y ``_set_quarantine`` escriben un texto que la SPA lee
+        tal cual (``useCreateManagedDatabase`` para el toast de error, ``isQuarantined`` en la
+        vista de migraciones), y cambiarles el formato es una decisión de producto aparte.
+        """
         session = self._session()
         try:
             d = session.get(ManagedDatabase, db_id)
             if d:
                 d.status = status
                 if detail is not None:
-                    d.notes = detail
+                    d.notes = detail if replace_notes else _merge_note(d.notes, detail)
                 session.commit()
         finally:
             session.close()
@@ -431,6 +490,194 @@ class ManagedDatabaseController:
             ManagedMigrationController().stamp(db_id, adopt_version, admin=admin)
             result = self._serialize_by_id(db_id)
         return result
+
+    def provision_database(
+        self, db_id: int, *, allow_recreate: bool = False, admin: dict | None = None
+    ) -> dict:
+        """
+        Ejecuta el ``CREATE DATABASE`` faltante sobre una fila YA registrada.
+
+        Es la salida para una BD que quedó registrada sin crearse en el motor (``pending``) o
+        cuyo DDL de alta falló (``error``). Antes de que existiera, la única vía era borrar la
+        fila y recrearla, perdiendo ``notes``, ``environment_id``, ``model_id`` y el historial
+        de migraciones que la referencia.
+
+        **No aplica las migraciones del blueprint** (eso es ``POST /{id}/migrations/apply``) y
+        **no otorga privilegios**: misma política que ``create_database``.
+
+        Si la BD YA existe en el motor responde **409**: adoptar una base preexistente es
+        ``POST /managed-databases/adopt``, y hacerlo acá sería adoptar por la puerta de atrás.
+        """
+        session = self._session()
+        try:
+            md = self._get_or_404(session, db_id)
+            server = get_server_or_404(session, md.server_id)
+            owner = self._require_owner_on_server(session, md.owner_id, md.server_id)
+
+            dialect = engine_value(server)
+            target = build_target(server)
+            owner_username = owner.username
+            db_name, server_id = md.name, md.server_id
+            previous_status = md.status
+            req_charset, req_collation = md.charset, md.collation
+        finally:
+            session.close()
+
+        # Guards de identificador que ``create_database`` NO hace (confía en el regex del
+        # schema) y que ``ServerDatabaseController.create_database`` sí. Importan MÁS acá: la
+        # fila pudo registrarse antes de que el guard existiera, y ahora vamos a emitir DDL con
+        # ese nombre.
+        validate_identifier(db_name, dialect, "base de datos")
+        ensure_not_reserved_database(db_name, dialect)
+
+        # Re-resolver contra el catálogo NO es redundante con el alta: la combinación pudo
+        # DESHABILITARSE entre el registro y el aprovisionamiento, y lo que viaja al DDL tiene
+        # que salir de la tabla (en PostgreSQL la collation va como literal de string). Si el
+        # catálogo cambió, esto da 422 antes de tocar el motor: es preferible a emitir una
+        # combinación que el propio gateway ya rechaza.
+        charset, collation = charset_catalog.resolve_enabled_combination(
+            dialect, req_charset, req_collation
+        )
+
+        self._guard_provision_status(db_id, previous_status, allow_recreate=allow_recreate)
+
+        adapter = get_adapter(target)
+        exists = db_name in adapter.list_databases()
+        # ``error`` está SOBRECARGADO: lo escribe el CREATE de alta que falló (la BD no existe)
+        # y también ``_set_quarantine`` tras una migración fallida (la BD sí existe). El
+        # chequeo físico es lo único que los distingue, y por eso este guard va acá y no arriba.
+        if exists and previous_status == ProvisionStatus.error:
+            raise AppHttpException(
+                message=(
+                    f"La base de datos '{db_name}' ya existe en el motor: su estado 'error' es "
+                    "una CUARENTENA por una migración fallida, no un aprovisionamiento "
+                    "pendiente. Resolvela con POST /managed-databases/"
+                    f"{db_id}/migrations/reconcile-partial o con apply?force=true."
+                ),
+                status_code=409,
+                public_context={
+                    "code": pcodes.CODE_QUARANTINED_NOT_MISSING,
+                    "database": db_name,
+                },
+                context={"managed_database_id": db_id, "server_id": server_id},
+            )
+        if exists:
+            raise AppHttpException(
+                message=(
+                    f"La base de datos '{db_name}' ya existe en el motor, así que no hay nada "
+                    "que aprovisionar. Para traerla al inventario sin recrearla hay que quitar "
+                    f"este registro (DELETE /managed-databases/{db_id}, sin drop_remote) y "
+                    "adoptarla con POST /managed-databases/adopt."
+                ),
+                status_code=409,
+                public_context={"code": pcodes.CODE_EXISTS_IN_ENGINE, "database": db_name},
+                context={"managed_database_id": db_id, "server_id": server_id},
+            )
+
+        # Fail-closed ANTES del DDL: mismo criterio que ``ServerDatabaseController`` para este
+        # mismo CREATE DATABASE. Si la auditoría no se puede persistir, la operación no ocurre.
+        audit.record_intent(
+            "managed_database.provision",
+            admin=admin,
+            target_type="managed_database",
+            target_id=db_id,
+            server_id=server_id,
+            touched_engine=True,
+            detail=f"CREATE DATABASE (re-aprovisionamiento desde '{previous_status.value}')",
+        )
+
+        provisioned = True
+        try:
+            # Sin GRANT, igual que en el alta: crear una BD no otorga ningún privilegio (jamás
+            # ALL PRIVILEGES; eso solo lo tiene la credencial pseudo-root de la conexión). En
+            # PostgreSQL el OWNER nativo lo pone el propio CREATE DATABASE.
+            adapter.create_database(
+                db_name, charset=charset, collation=collation, owner=owner_username
+            )
+        except AppHttpException as exc:
+            # El ``list_databases()` de arriba es CONSEJO, no barrera: hay una ventana TOCTOU
+            # entre él y el CREATE. Dos llamadas simultáneas al mismo endpoint sobre la misma
+            # fila terminan acá, y la que pierde recibe 1007/42P04 — que es un ÉXITO por
+            # carrera, no un error: la BD existe y es la de esta fila. Devolver 409 por un
+            # resultado correcto sería mentir. (Distinto del 409 de arriba, que rechaza adoptar
+            # una base preexistente AJENA.)
+            if not _is_duplicate_database(exc):
+                self._set_status(
+                    db_id,
+                    ProvisionStatus.error,
+                    detail=(
+                        "Error al aprovisionar la BD en el motor "
+                        f"(HTTP {getattr(exc, 'status_code', '?')})."
+                    ),
+                    replace_notes=False,
+                )
+                audit.record(
+                    "managed_database.provision",
+                    status="error",
+                    admin=admin,
+                    target_type="managed_database",
+                    target_id=db_id,
+                    server_id=server_id,
+                    touched_engine=True,
+                    detail="fallo al aprovisionar la BD en el motor",
+                )
+                raise
+            provisioned = False
+
+        self._set_status(db_id, ProvisionStatus.active)
+        audit.record(
+            "managed_database.provision",
+            admin=admin,
+            target_type="managed_database",
+            target_id=db_id,
+            server_id=server_id,
+            touched_engine=True,
+            detail=(
+                None if provisioned else "convergencia por carrera: la BD ya había sido creada"
+            ),
+        )
+        return {
+            # Se RELEE en vez de parchear la serialización previa al DDL: así ``updated_at`` y
+            # ``notes`` son los reales y no los del momento anterior al cambio de estado.
+            "database": self._serialize_by_id(db_id),
+            "provisioned": provisioned,
+            "previous_status": previous_status,
+            "charset": charset,
+            "collation": collation,
+        }
+
+    @staticmethod
+    def _guard_provision_status(
+        db_id: int, status: ProvisionStatus, *, allow_recreate: bool
+    ) -> None:
+        """
+        Estados que NO se aprovisionan. ``pending`` y ``error`` siguen de largo: el primero es
+        el caso normal y el segundo lo desambigua el chequeo físico del llamador.
+        """
+        if status == ProvisionStatus.active and not allow_recreate:
+            raise AppHttpException(
+                message=(
+                    "El inventario marca esta base de datos como activa. Si la borraron por "
+                    "fuera del gateway y hace falta recrearla, repetí la llamada con "
+                    "allow_recreate=true; si no, revisá el servidor antes de emitir DDL."
+                ),
+                status_code=409,
+                public_context={"code": pcodes.CODE_ALREADY_ACTIVE},
+                context={"managed_database_id": db_id, "required": "allow_recreate=true"},
+            )
+        if status == ProvisionStatus.archived:
+            # Sin escape, a propósito. Hoy nada en ``app/`` escribe ``archived``, así que este
+            # guard es inalcanzable — razón de más para que sea el estricto: el día que se
+            # cablee la transición, este endpoint no va a revivir una BD retirada por accidente.
+            raise AppHttpException(
+                message=(
+                    "La base de datos está archivada (retirada del uso). Reactivala en el "
+                    "inventario antes de aprovisionarla."
+                ),
+                status_code=409,
+                public_context={"code": pcodes.CODE_ARCHIVED},
+                context={"managed_database_id": db_id},
+            )
 
     def update_database(
         self, db_id: int, data: dict, *, admin: dict | None = None

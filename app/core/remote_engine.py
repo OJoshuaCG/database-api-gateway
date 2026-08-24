@@ -405,6 +405,25 @@ _ERROR_TABLE: dict[Any, tuple[int, str]] = {
     "42501": _FORBIDDEN,      # insufficient_privilege
 }
 
+# Subconjuntos de ``_ERROR_TABLE`` que un llamador necesita reconocer POR SEPARADO, porque el
+# status HTTP no alcanza para distinguirlos de sus vecinos: 404 lo comparten 1049 y 1008, y 409
+# lo comparten 1007, 1396, 42710 y 2BP01. Viven ACÁ, al lado de la tabla, para que el
+# acoplamiento a los códigos del motor no quede duplicado en dos archivos que pueden divergir:
+# si alguien saca 1049 de la tabla, el mapeo a 404 se rompe y el frozenset queda a la vista en el
+# mismo diff.
+#
+# Se exponen como STRINGS porque es la forma en que ``map_driver_error`` los deja en el
+# ``context`` de la excepción (``context["remote_error_code"] = str(code)``), que es donde los
+# lee el llamador.
+
+#: "La base de datos no existe" — MySQL/MariaDB errno 1049, PostgreSQL SQLSTATE 3D000.
+#: NO incluye 1008 ("can't drop database"), que también mapea a 404: afirmar "no existe" es lo
+#: que dispara un CREATE DATABASE desde la UI, así que el conjunto tiene que ser cerrado.
+UNKNOWN_DATABASE_CODES = frozenset({"1049", "3D000"})
+
+#: "La base de datos ya existe" — MySQL/MariaDB errno 1007, PostgreSQL SQLSTATE 42P04.
+DUPLICATE_DATABASE_CODES = frozenset({"1007", "42P04"})
+
 
 def _extract_code(exc: Exception) -> Any | None:
     """
