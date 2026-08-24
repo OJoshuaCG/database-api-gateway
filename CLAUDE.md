@@ -90,18 +90,35 @@ bloqueo es real: `in progress` (rol backend) → arreglá **solo lo que desbloqu
 campo es el que más se omite: un desbloqueo parcial anunciado como completo hace que la tarea
 rebote una segunda vez.
 
-**Un fix de algo ya `complete` NO crea tarea nueva: se reabre la existente.** Tarea nueva solo
-cuando el trabajo no se puede describir sin cambiar el objetivo declarado de la original, y en ese
-caso se vincula con `clickup_add_task_link`.
+**Un fix de algo `complete` de hace ≤ 30 días NO crea tarea nueva: se reabre la existente.** Tarea
+nueva solo cuando el trabajo no se puede describir sin cambiar el objetivo declarado de la
+original, y en ese caso se vincula con `clickup_add_task_link`.
 
-**Cuatro reglas que si se saltan rompen el mecanismo en silencio:** (1) las subtareas del backlog
+**La ventana de 30 días — qué se reabre y qué no.** Antes de la prueba del objetivo declarado va la
+pregunta de antigüedad, porque puede cerrar el caso sola: si la tarea se cerró hace **más de 30
+días**, **no se reabre aunque sea un fix de eso mismo** — va tarea nueva `T-…` vinculada. Un hilo
+de hace meses ya no describe el estado del código, y reabrirlo mete dos trabajos separados por
+meses en la misma tarea, dejando su `FIN` original describiendo algo que ya no es. La fecha de
+corte sale de `date -d '30 days ago' +%Y-%m-%d`, no se calcula a ojo.
+
+**Pero la ventana es de DECISIÓN, no de búsqueda, y confundirlo rompe dos cosas a la vez.** La
+búsqueda de validación sigue yendo con `include_closed: true` **sin filtro de fecha**: (a)
+`date_closed_from` devuelve **solo tareas cerradas** —verificado contra la API—, así que en la
+búsqueda principal haría desaparecer todo lo que está en `to do`, `in progress`, `update required`
+y `on hold`; y (b) el ID tiene que seguir siendo único contra **todo** el historial — si existe una
+`P-07` cerrada hace un año, no se crea otra `P-07`. Por eso el trabajo derivado de algo viejo usa
+un ID **nuevo** y se vincula, en vez de reciclar el original.
+
+**Cinco reglas que si se saltan rompen el mecanismo en silencio:** (1) las subtareas del backlog
 se llaman **`P-XX — <título>`** y las **nuevas** `T-<YYMMDD>-<iniciales>-<slug>` — para algo nuevo
 **nunca** el siguiente `P-XX` libre, que es secuencial y dos personas simultáneas calculan el
 mismo; (2) toda búsqueda va con **`include_closed: true`** (viene apagado por defecto, y sin él
 una tarea ya terminada no aparece y se duplica); (3) después de crear una subtarea se
 **re-verifica** que no haya duplicado antes de trabajar, porque la ventana entre buscar y crear no
 se puede cerrar (gana la de `date_created` más antiguo); (4) la **identidad (que es el EMAIL de `git config user.email`, NUNCA el nombre: este repo tiene 4 nombres para un mismo email) del ejecutor va dentro
-del texto** del comentario, porque el campo "autor" de ClickUp siempre dice la cuenta del token.
+del texto** del comentario, porque el campo "autor" de ClickUp siempre dice la cuenta del token;
+(5) **`date_closed_from` nunca va en la búsqueda de validación**, solo como segunda llamada cuando
+se quiere listar lo cerrado reciente.
 
 ## Descripción del Proyecto
 

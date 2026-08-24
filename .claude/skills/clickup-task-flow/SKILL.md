@@ -145,10 +145,46 @@ prueba verificable:
 | Situación | Qué se hace |
 | --- | --- |
 | **Fix** de algo que la tarea entregó mal, y la tarea sigue abierta | **Misma tarea.** Comentario explicando el fix. Sin ID nuevo. |
-| **Fix** de algo que ya está `complete` | **Misma tarea: se REABRE** a `in progress` con un comentario que diga qué se rompió y por qué se reabre. Cerrarla de nuevo al terminar. |
+| **Fix** de algo que ya está `complete` **hace 30 días o menos** | **Misma tarea: se REABRE** a `in progress` con un comentario que diga qué se rompió y por qué se reabre. Cerrarla de nuevo al terminar. |
+| **Fix** de algo `complete` de **hace más de 30 días** | **NO se reabre nunca. Tarea nueva `T-…`, vinculada** (ver "La ventana de 30 días"). |
 | **Feature** que extiende la tarea sin cambiar su objetivo | **Misma tarea.** Se actualiza la descripción + comentario. |
 | **Feature** que cambia el objetivo, o toca módulos que la original no tocaba | **Tarea nueva, vinculada.** |
 | Alguien quiere **rehacer** desde cero algo ya `complete` | **Tarea nueva, vinculada.** No es un fix: es trabajo distinto sobre el mismo terreno. |
+
+### La ventana de 30 días: qué se reabre y qué no
+
+La prueba del objetivo declarado decide **si es la misma historia**. La antigüedad decide **si vale
+resucitar el hilo**. Son dos preguntas distintas y hay que hacer las dos — la de antigüedad
+primero, porque puede cerrar el caso sola.
+
+**Si la coincidencia está `complete`, mirá su `date_closed`:**
+
+- **Cerrada hace ≤ 30 días** → prueba del objetivo declarado, como siempre. Si es un fix, se
+  **reabre**.
+- **Cerrada hace > 30 días** → **no se reabre, aunque sea un fix de eso mismo.** Va **tarea nueva
+  `T-<YYMMDD>-<iniciales>-<slug>`**, vinculada con `clickup_add_task_link`.
+
+**Por qué el corte:** una tarea de hace meses arrastra un hilo de comentarios que ya no describe el
+estado del código. Reabrirla mete dos trabajos separados por meses en la misma tarea, y el `FIN`
+original —que alguien va a leer como el resumen de lo entregado— pasa a describir algo que ya no
+es. La vinculación conserva la historia sin resucitar el hilo.
+
+La fecha de corte sale de bash, no la calcules a ojo:
+
+```bash
+date -d '30 days ago' +%Y-%m-%d
+```
+
+**⚠️ La ventana NO se aplica a la búsqueda, solo a la decisión.** La búsqueda de validación sigue
+yendo con `include_closed: true` **y sin filtro de fecha**, por dos motivos:
+
+1. **`date_closed_from` devuelve SOLO tareas cerradas** — verificado contra la API. En la búsqueda
+   principal haría desaparecer todo lo que está en `to do`, `in progress`, `update required` y
+   `on hold`.
+2. **El ID tiene que seguir siendo único contra TODO el historial.** Si existe una `P-07` cerrada
+   hace un año, no podés crear otra `P-07` — el prefijo dejaría de identificar un solo trabajo.
+   Por eso el trabajo derivado de algo viejo usa un ID **nuevo** (`T-…`) y se vincula, en vez de
+   reciclar el original.
 
 ### Cómo vincular
 
@@ -257,7 +293,13 @@ clickup_filter_tasks
   list_ids:        ["901716272178"]
   include_closed:  true          ← OBLIGATORIO
   subtasks:        true
+                                 ← SIN date_closed_from: devuelve solo cerradas
 ```
+
+**Esta búsqueda NO lleva `date_closed_from`.** Verificado contra la API: ese filtro devuelve **solo
+tareas cerradas**, así que acá haría desaparecer todo lo que está en `to do`, `in progress`,
+`update required` y `on hold`. El recorte a 30 días es una regla de **decisión** sobre lo que
+encontrás, no un filtro de la consulta (ver "La ventana de 30 días").
 
 **`include_closed: true` no es opcional.** Viene **apagado por defecto**, así que sin él una
 tarea ya `complete` **no aparece** y se crea un duplicado exacto. Si la respuesta trae
@@ -271,7 +313,7 @@ tarea ya `complete` **no aparece** y se crea un duplicado exacto. Si la respuest
 | --- | --- |
 | `in progress` | Leé el último `INICIO` con `clickup_get_task_comments` para saber **quién** la tiene, **desde cuándo** y con qué **rol**. Si venís a hacer lo mismo que esa persona → **INTERRUMPIR**. Si el `INICIO` es de **frontend** y vos venís a cambiar backend → **no la toques: sub-subtarea** (ver "El backend necesita volver a tocar…"). |
 | `update required` | **Backend hecho, falta el frontend.** Si lo que venís a hacer es el **frontend**, tomala. Si venís a hacer **más backend**, avisá que hay un handoff pendiente y decidí con el usuario si es un fix de esa tarea o trabajo nuevo. |
-| `complete` | **NO es un portazo:** informá que ya se hizo, con el resumen del comentario `FIN`. Después aplicá la prueba de "¿tarea nueva o la misma?" (arriba): si es un **fix**, se **reabre**; si es trabajo distinto, **tarea nueva vinculada**. |
+| `complete` | **NO es un portazo:** informá que ya se hizo, con el resumen del comentario `FIN`. Después mirá su **`date_closed`**: si se cerró hace **más de 30 días**, no se reabre — va tarea nueva vinculada, con ID nuevo. Si es más reciente, aplicá la prueba de "¿tarea nueva o la misma?" (arriba): si es un **fix**, se **reabre**; si es trabajo distinto, **tarea nueva vinculada**. |
 | `to do` | Libre. Se puede tomar. |
 | `on hold` | **Leé primero el último comentario**, que dice por qué se detuvo y dónde quedó. Si es un **`BLOQUEADO POR BACKEND`**, el frontend te la devolvió: es trabajo tuyo y tiene prioridad — hay una implementación de frontend parada esperándote (ver "El frontend devolvió una tarea"). Si no, es una tarea que quedó a medias y se puede retomar normalmente. |
 | `reviewed` | Estado **no usado** en este flujo. Preguntá antes de asumir qué significa. |
