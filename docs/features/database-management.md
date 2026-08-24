@@ -55,6 +55,42 @@ ServerUser.update password (provision=true):
     (el inventario nunca se adelanta al motor)
 ```
 
+### Salir de `pending`: `POST /managed-databases/{id}/provision`
+
+Con `provision=false` (el default del POST) la fila queda **commiteada en `pending`** y el motor
+no se toca: es un registro de inventario puro. Ese estado es el único que nada más del sistema
+lee como guard, así que una BD ahí es indistinguible de una real hasta que algo intenta
+conectarse y falla con un error del driver.
+
+`POST /{id}/provision` ejecuta el `CREATE DATABASE` que faltaba **sobre la fila existente**.
+Importa que sea sobre la fila y no un alta nueva: borrarla y recrearla pierde el `id`, y con él
+las notas, el entorno, el blueprint asignado y las filas de `database_migration_history` que lo
+referencian.
+
+| Estado de la fila | Comportamiento |
+|---|---|
+| `pending` | Aprovisiona. Es el caso normal. |
+| `error` | Aprovisiona **si la BD no existe** en el motor. Si existe, ese `error` es una cuarentena de migraciones: 409 `managed_database.quarantined_not_missing`, que apunta a `reconcile-partial` o `apply?force=true`. |
+| `active` | 409 `managed_database.already_active`. Con `?allow_recreate=true` procede — es el caso "la borraron por fuera del gateway"; sin el gesto explícito, un CREATE silencioso taparía ese borrado. |
+| `archived` | 409 `managed_database.archived`, **sin escape**. |
+
+**Si la BD ya existe físicamente responde 409 `managed_database.exists_in_engine` y no emite
+DDL.** Traer al inventario una base preexistente es `POST /managed-databases/adopt`, que verifica
+su existencia, la deja `active`, marca `origin='adopted'` y puede stampear su versión. Hacerlo
+acá sería adoptar por la puerta de atrás. **Consecuencia que conviene conocer**: una fila
+`pending` cuya base SÍ existe (p. ej. creada con `POST /servers/{id}/databases?register=false`)
+no tiene reconciliación directa — hay que `DELETE /managed-databases/{id}` **sin** `drop_remote`
+(no toca el motor) y después `adopt`, aceptando la pérdida del `id`.
+
+No aplica las migraciones del blueprint (eso sigue siendo `POST /{id}/migrations/apply`) ni
+otorga privilegios. Rate limit 10/min, auditoría `managed_database.provision` con
+`record_intent` fail-closed antes del DDL.
+
+**Carrera**: el chequeo previo contra el motor es consejo, no barrera. Dos llamadas simultáneas
+sobre la misma fila hacen que una reciba errno 1007 / SQLSTATE 42P04 del motor; eso se trata
+como **éxito por convergencia** (`provisioned: false` en la respuesta), no como error — la base
+existe y es la de esa fila.
+
 Toda operación mutante o que toca el motor (incluidos los fallos) queda registrada en
 la tabla de **auditoría** (`audit_log`): acción, objeto, admin, Request ID, IP,
 `touched_engine`, `status`, y un `detail` corto **sin credenciales**. La auditoría es
@@ -85,6 +121,7 @@ CRUD estándar (`GET`/`POST`/`GET {id}`/`PATCH {id}`/`DELETE {id}`) — todo **G
 |---|---|---|
 | GET | `/managed-databases?server_id=&owner_id=&model_id=&status=` | GW |
 | POST | `/managed-databases?provision=true` | GW+motor (`CREATE DATABASE`; **sin GRANT** automático) |
+| POST | `/managed-databases/{id}/provision` | GW+motor (`CREATE DATABASE` sobre una fila ya registrada que quedó `pending`/`error`; 10/min) |
 | GET | `/managed-databases/{id}` | GW |
 | PATCH | `/managed-databases/{id}` | GW (metadatos del inventario) |
 | DELETE | `/managed-databases/{id}?drop_remote=true` | GW+motor (`DROP DATABASE`) |

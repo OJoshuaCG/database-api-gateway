@@ -2261,7 +2261,7 @@ Depende de: un servidor alcanzable (paso B exitoso).
       body: { server_id, username, host?, password }      → crea el usuario (owner)
 2. POST /api/v1/managed-databases?provision=true 🔌
       body: { name, server_id, owner_id, charset?, collation?, model_id? }
-                                                           → CREATE DATABASE + GRANT al owner
+                                                           → CREATE DATABASE (SIN GRANT)
 ```
 
 Dependencias y reglas:
@@ -2269,8 +2269,12 @@ Dependencias y reglas:
   mismo `server_id` (si no, `409`).
 - Con `provision=true`, `password` es obligatorio en el paso 1 (`422` si falta).
 - Si el `CREATE` del paso 2 falla, la BD queda en `status: "error"` (revisa `notes`).
+- **No hay GRANT automático**: el owner no recibe ningún privilegio sobre la BD (en
+  PostgreSQL queda como `OWNER` nativo, que es propiedad y no un grant). Los privilegios se
+  otorgan explícitamente con `POST /server-users/{id}/grants`.
 - Para registrar sin tocar el motor todavía, usa `provision=false`: la BD queda en
-  `pending` y puedes aprovisionarla más adelante.
+  `pending`. Para aprovisionarla más adelante **sobre la misma fila** (sin perder notas,
+  entorno, blueprint ni historial) está `POST /managed-databases/{id}/provision`.
 
 ### E. Reasignar el propietario de una BD
 

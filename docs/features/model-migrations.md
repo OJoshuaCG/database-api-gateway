@@ -213,6 +213,28 @@ fiable:
 
 ## Integridad, cuarentena y recuperación
 
+- **La BD tiene que EXISTIR en el motor.** Una BD registrada sin aprovisionar (`status=pending`)
+  o borrada por fuera del gateway no es un caso teórico: es el estado en que queda toda alta
+  hecha con `?provision=false`. Antes, `GET /migrations/status` propagaba el 404 crudo del
+  driver ("El recurso solicitado no existe en el servidor destino", errno 1049 / SQLSTATE
+  3D000), indistinguible del 404 de "BD gestionada no encontrada", y un `apply` la marcaba en
+  **cuarentena** —enmascarando la causa raíz con un diagnóstico falso—. Ahora:
+  - `GET /migrations/status` responde **200** con `database_exists: false`. Es una lectura y su
+    trabajo es describir la realidad; devolver un error tiraría `pending_versions`, `slug` y
+    `latest_available`, que es justo lo que hace falta para decidir. Con ese flag en `false`,
+    `current_version` es `null` por **ausencia** (no por "todavía sin migraciones") y las
+    pendientes son **todas** las del blueprint.
+  - `apply`, `rollback`, `stamp` y `reconcile-partial` responden **409**
+    `managed_database.not_provisioned` **antes** de tocar nada, así que la BD **no** queda en
+    cuarentena. La salida está en el mensaje: `POST /managed-databases/{id}/provision`.
+  - El **dry-run no se bloquea** (mismo criterio que la cuarentena): informa
+    `database_exists: false` y `no_op: true`. Es la llamada de diagnóstico.
+  - El `status` de la fila **no** se usa como atajo del guard, y es deliberado: está rancio en
+    las dos direcciones (una BD creada con `POST /servers/{id}/databases?register=false` existe
+    con la fila en `pending`; una fila `active` puede apuntar a una base ya borrada). La única
+    fuente de verdad es el plano físico. Un 1049 con la base **presente** tiene otra causa
+    (permisos, carrera con un drop) y se propaga tal cual: afirmar "no existe" mandaría al
+    operador a crear una base que sí está.
 - **Checksum**: antes de aplicar, el gateway re-valida el `checksum` (cubre SQL + versión).
   Si la fila fue alterada directamente en la BD del gateway → **409** (no aplica SQL no
   verificado).

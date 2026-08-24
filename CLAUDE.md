@@ -1447,6 +1447,91 @@ Mejora la LECTURA y la GESTIÓN de los usuarios de un servidor. Guía de uso:
   follow-up. Tests: `tests/test_api_engine_users.py` (adapter mockeado + `_rewrite_grant_line`
   + guard root). **Pendiente**: verificación e2e contra motores reales (add-host/copy-grants).
 
+## Re-aprovisionamiento: salir de `pending` sin borrar la fila
+
+Contrato: `docs/api-reference-v12.md`. Guía: `docs/features/database-management.md`
+(§ «Salir de `pending`») y `docs/features/model-migrations.md` (§ integridad). **Sin migración
+Alembic**: `ProvisionStatus` ya tenía los cuatro valores.
+
+**`ProvisionStatus.pending` existía SOLO para servir al `?provision=false` del alta.** El único
+sitio de `app/` que lo escribe es el insert de `create_database`, que lo voltea a `active` acto
+seguido si `provision=true` — o sea que toda fila que se queda en `pending` es una que se registró
+sin aprovisionar. Y era un estado **inerte**: nada lo leía como guard, así que la BD era
+indistinguible de una real hasta que algo intentaba conectarse y fallaba con un error del driver.
+Por eso el switch «Aprovisionar en el motor» **se eliminó del formulario de la SPA** (el flag sigue
+en la API, que es donde el default fail-safe corresponde): ninguno de sus casos se sostiene —para
+una base preexistente está `adopt`, y el formulario exige un servidor ya cargado con credenciales—.
+
+**`POST /managed-databases/{id}/provision`** ejecuta el `CREATE DATABASE` faltante **sobre la fila
+existente**. Que sea sobre la fila importa: borrarla y recrearla pierde el `id` y con él notas,
+entorno, blueprint y las filas de `database_migration_history` que lo referencian.
+
+**Si la BD ya existe en el motor: 409, no reconciliación** (decisión explícita del usuario). Traer
+al inventario una base preexistente es `adopt`, que verifica existencia, deja `active`, marca
+`origin='adopted'` y puede stampear. **Costo conocido y documentado**: una fila `pending` cuya
+base SÍ existe (p. ej. creada con `?register=false`) no tiene reconciliación directa — hay que
+`DELETE` sin `drop_remote` + `adopt`, perdiendo el `id`.
+
+**`error` está SOBRECARGADO y solo el chequeo físico lo desambigua**: lo escribe el `CREATE` de
+alta que falló (la BD **no** existe) y también `_set_quarantine` tras una migración fallida (la BD
+**sí** existe). Por eso el guard de `error` va DESPUÉS de `list_databases()`, no antes.
+
+**El escape de `active` se llama `allow_recreate`, no `force`.** En este módulo `force` es override
+de cuarentena y no saltea guards; reusar la palabra invitaba a confundir dos cosas distintas.
+
+**El 1007/42P04 tras el chequeo previo es ÉXITO, no error.** `list_databases()` es consejo, no
+barrera: hay una ventana TOCTOU. Dos llamadas simultáneas sobre la misma fila hacen que una reciba
+"la base ya existe" del motor, y eso converge a `active` con `provisioned=False`. **No** se agregó
+ningún lock: el advisory lock del runner se toma sobre una conexión **a la BD destino**, que por
+definición todavía no existe. Y **no** hay `with_for_update()` — `environment_controller` ya
+documenta que SQLite lo ignora en silencio, así que daría falsa exclusión justo donde se verifica.
+
+**`_set_status` ya no pisa `notes` en este camino** (`replace_notes=False` + `_merge_note`, que
+reemplaza el bloque marcado `[gateway]` y conserva lo del operador). El default sigue en `True`:
+`create_database` y `_set_quarantine` escriben un texto que la SPA lee tal cual, y cambiarles el
+formato es decisión aparte (ítem en `TODO.md`).
+
+**Migraciones sobre una BD que no existe en el motor.** `status()` y `_dry_run_plan()` usan
+`_read_current_version_tolerant` y devuelven **200 con `database_exists`**; `apply`/`rollback`/
+`stamp`/`reconcile-partial` dan **409 `managed_database.not_provisioned`**. Detalles que tienen
+motivo:
+
+- **`status` no puede ser un 409.** Es una lectura cuyo trabajo es describir la realidad, y un
+  error tiraría `pending_versions`/`slug`/`latest_available` —todo computable sin el motor— que es
+  justo lo que hace falta para decidir. Además la SPA pintaría `ErrorState`, sin lugar para el CTA.
+- **El guard va donde YA se lee la versión.** En `_run_apply` (cubre `apply` y `apply_all` desde un
+  punto, cero round-trips extra; un `list_databases()` incondicional ahí sería N+1 sobre el lote) y
+  en `rollback` reemplazando su `get_current_version`. En `stamp` y `reconcile-partial` **no** hay
+  chequeo preventivo: el runner ya abre conexión al destino y falla solo, así que solo se
+  **traduce** el 404 opaco con `_translating_unknown_database`. Poner un `list_databases()` ahí
+  agregaba un round-trip y una superficie de fallo nueva sin comprar nada.
+- **Se reconocen SOLO 1049/3D000**, no "cualquier 404": el errno 1008 también mapea a 404, y esto
+  es lo que dispara un `CREATE DATABASE` desde la UI. Los frozensets viven en `remote_engine.py`
+  al lado de `_ERROR_TABLE` para que el acoplamiento no se duplique en dos archivos.
+- **Se re-confirma con `list_databases()` en el camino de error**: un 1049 con la base PRESENTE
+  tiene otra causa (permisos del pseudo-root sobre esa BD, carrera con un drop) y ahí el 404
+  original se propaga. Un "no existe" falso mandaría a crear una base que sí está.
+- **El `status=pending` de la fila NO se usa como atajo del guard**, aunque sea gratis. Está rancio
+  en las DOS direcciones: `?register=false` crea la base con la fila en `pending`, y una fila
+  `active` puede apuntar a una base borrada. Rechazar por `pending` dejaría a la primera sin salida
+  (`provision` le daría 409 por existir). Está anotado en el docstring; no lo "optimices".
+- **El dry-run no se bloquea** (mismo criterio que `_guard_quarantine`): informa y fuerza `no_op`.
+- **Lo que esto evita** no es solo un mensaje feo: antes un `apply` sobre una base inexistente
+  terminaba en `_set_quarantine` marcándola `error` con nota de "migración fallida" —diagnóstico
+  falso que enmascara la causa—, y el 409 de `rollback` afirmaba "no tiene ninguna migración
+  aplicada", que es cierto para una base vacía y mentira para una que no existe.
+
+Verificado por ejecución directa (sin `pytest`, política del repo): 12 checks en
+`tests/test_api_managed_database_provision.py` + 9 en `tests/test_api_migrations_missing_database.py`,
+y sin regresión en `test_api_managed_databases.py` (19), `test_api_migrations_apply_flow.py` (14),
+`test_api_migrations_rollback_flow.py` (6), `test_api_migrations_stamp_and_edit.py` (10),
+`test_migration_reconcile_partial.py` (27), `test_api_model_migrations.py` (50),
+`test_environment_guard.py` (11), `test_api_plan09_adopt_snapshot.py` (15) y
+`test_migration_runner.py` (16). Frontend: `typecheck`, `lint` y `build` en verde (los tests de
+vitest NO se ejecutaron, política de ese repo). **Pendiente**: nada contra motores reales — en
+particular que el errno 1049 llegue efectivamente en `context["remote_error_code"]` desde pymysql
+y `3D000` desde psycopg (está tabulado y coincide con el log del incidente, pero no se ejecutó).
+
 ## Módulo de Ciclo de Vida de BDs a nivel servidor (crear/borrar/usuarios)
 
 Crea y borra bases de datos directamente en un servidor y lista qué usuarios/roles tienen
