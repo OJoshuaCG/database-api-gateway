@@ -96,20 +96,21 @@ def apply_all(
             "alguna BD. Se valida en el controlador contra la misma lista que el apply por BD."
         ),
     ),
-    allow_result_capture: bool = Query(
-        False,
-        description=(
-            "Consentimiento explícito para aplicar versiones con 'capture_selects=true': "
-            "esos SELECT guardan filas de CADA BD del blueprint (cifradas) en el gateway. "
-            "Sin este flag, una versión con captura pendiente devuelve 409 por BD."
-        ),
-    ),
 ):
+    """
+    Aplica las pendientes del blueprint a TODAS sus BDs (síncrono, acotado) 🔌.
+
+    **Captura de resultados**: una versión pendiente con 'capture_selects=true' SIN revisar
+    frena solo a esa BD — el rechazo llega como ítem dentro de una respuesta 200, con
+    'error_code=migration.capture_unreviewed' y las versiones en 'unreviewed_capture'. No hay
+    consentimiento por corrida: se retiró (entre otras razones, porque un único query param
+    autorizaba N bases de entornos distintos, que es lo contrario de lo que decía proteger).
+    """
     result = ManagedMigrationController().apply_all(
         model_id, max_databases=max_databases, database_ids=database_ids,
         environment_id=environment_id,
         force=force, dry_run=dry_run,
-        on_failure=on_failure, allow_result_capture=allow_result_capture, admin=admin,
+        on_failure=on_failure, admin=admin,
     )
     msg = "Plan masivo (dry-run)." if dry_run else "Aplicación masiva ejecutada."
     return success(data=result, message=msg)

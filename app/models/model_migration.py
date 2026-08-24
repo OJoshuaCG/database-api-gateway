@@ -150,7 +150,8 @@ class ModelMigration(Base, TimestampMixin):
             "OPT-IN explícito: si es True, los SELECT de esta versión guardan sus "
             "resultados (cifrados) en migration_select_results al aplicarse/revertirse. "
             "Es la única vía por la que el gateway persiste DATOS DE NEGOCIO, así que "
-            "además exige reviewed=true y el flag allow_result_capture en el apply"
+            "además exige reviewed=true: la aprobación es de la CONSULTA y se revoca sola "
+            "si el SQL cambia"
         ),
     )
 

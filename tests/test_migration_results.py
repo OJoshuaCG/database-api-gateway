@@ -414,32 +414,113 @@ def test_write_revision_files_respeta_el_opt_in_por_migracion():
 # --------------------------------------------------------------------------- #
 # Guards del controller que NO necesitan la BD del gateway                      #
 # --------------------------------------------------------------------------- #
-def test_consentimiento_explicito_por_corrida():
+def test_no_queda_ningun_gate_de_consentimiento_por_corrida():
     """
-    El opt-in de la versión no alcanza: un blueprint se replica sobre N BDs de dueños
-    distintos y quien aplica sobre UNA tiene que saber que va a extraer datos de ESA base.
+    ANTI-REGRESIÓN. El consentimiento por corrida (``allow_result_capture``) se ELIMINÓ.
+
+    Si este test falla es porque alguien lo repuso "por simetría" o "por seguridad". Antes de
+    borrarlo, leé por qué se sacó — está entero en el docstring de ``_capture_versions``:
+
+    - El gateway es **single-admin** (``app/core/auth.py``: "no gestiona múltiples usuarios",
+      sin roles ni permisos). La premisa que lo justificaba ("N BDs de dueños distintos, quien
+      aplica sobre UNA debe saber") habla de los dueños de las bases DESTINO, no de operadores
+      del gateway: no había un segundo par de ojos, solo un segundo momento.
+    - **No se auditaba**: pasar el flag no dejaba rastro en ``audit_log``. Lo único auditado es
+      la escritura efectiva, que ocurre con o sin gate. Era fricción sin evidencia forense.
+    - ``apply_all`` ya lo contradecía: un query param autorizaba N bases de entornos distintos.
+    - Una BD nueva recibe la cadena completa, así que el gate saltaba con más fuerza sobre bases
+      vacías (donde no hay nada que extraer) que sobre las productivas ⇒ fatiga de consentimiento.
+
+    El gate que SÍ queda es ``_guard_reviewed_capture`` (ver
+    ``test_el_gate_de_reviewed_sigue_bloqueando_apply_y_rollback``).
+    """
+    import inspect
+
+    from app.controllers.managed_migration_controller import ManagedMigrationController
+    from app.routes.v1 import managed_databases, model_migrations
+
+    assert not hasattr(ManagedMigrationController, "_guard_capture_consent")
+
+    for fn in (
+        ManagedMigrationController.apply,
+        ManagedMigrationController._run_apply,
+        ManagedMigrationController.rollback,
+        ManagedMigrationController.apply_all,
+        managed_databases.apply_migrations,
+        managed_databases.rollback_migration,
+        model_migrations.apply_all,
+    ):
+        assert "allow_result_capture" not in inspect.signature(fn).parameters, fn.__name__
+
+
+def test_el_gate_de_reviewed_sigue_bloqueando_apply_y_rollback():
+    """
+    Complemento del anterior: quitar el consentimiento NO puede llevarse por delante el gate
+    que queda. Sin esto, "limpiar" el test de arriba podría dejar la captura sin ninguna
+    barrera y nada lo diría.
+    """
+    import inspect
+
+    from app.controllers.managed_migration_controller import ManagedMigrationController
+
+    for fn in (ManagedMigrationController._run_apply, ManagedMigrationController.rollback):
+        assert "_guard_reviewed_capture" in inspect.getsource(fn), fn.__name__
+
+
+def test_el_409_de_reviewed_lleva_code_estable():
+    """
+    En ``apply_all`` el guard corre por BD dentro del bucle, así que su 409 viaja como ítem de
+    una respuesta 200 y el ``public_context`` de la respuesta HTTP no existe para él. El código
+    estable es lo único que le queda al cliente para clasificar sin matchear prosa.
     """
     from app.controllers.managed_migration_controller import ManagedMigrationController
     from app.exceptions import AppHttpException
+    from app.services import migration_capture_catalog as ccodes
 
-    pendientes = [_spec("0001", capture=True), _spec("0002", capture=False)]
+    class _Sess:
+        def query(self, *a):
+            return self
+
+        def filter(self, *a):
+            return self
+
+        def all(self):
+            return [("0010",)]
+
     with pytest.raises(AppHttpException) as exc:
-        ManagedMigrationController._guard_capture_consent(pendientes, False)
+        ManagedMigrationController._guard_reviewed_capture(_Sess(), 1)
     assert exc.value.status_code == 409
-    assert exc.value.public_context == {"capture_versions": ["0001"]}
+    assert exc.value.public_context == {
+        "code": ccodes.CODE_UNREVIEWED_CAPTURE,
+        "unreviewed_capture": ["0010"],
+    }
 
-    # Con el flag explícito procede; sin versiones con captura, tampoco molesta.
-    ManagedMigrationController._guard_capture_consent(pendientes, True)
-    ManagedMigrationController._guard_capture_consent([_spec("0003")], False)
+
+def test_el_catalogo_de_codigos_de_captura_es_cerrado():
+    """Todo literal emitido tiene que estar declarado, o el vocabulario deja de serlo."""
+    from app.services import migration_capture_catalog as ccodes
+
+    assert ccodes.CODE_UNREVIEWED_CAPTURE in ccodes.ERROR_CODES
+    assert ccodes.CODE_UNREVIEWED_CAPTURE_STAMP in ccodes.ERROR_CODES
+    # Dos códigos y no uno: en `stamp` el `force=true` SÍ es escape legítimo, así que un código
+    # único llevaría a la SPA a ofrecer «Forzar» donde no sirve.
+    assert ccodes.CODE_UNREVIEWED_CAPTURE != ccodes.CODE_UNREVIEWED_CAPTURE_STAMP
+    assert all(c.startswith("migration.capture_") for c in ccodes.ERROR_CODES)
 
 
-def test_consentimiento_no_se_pide_si_el_kill_switch_esta_apagado():
+def test_capture_versions_anuncia_y_respeta_el_kill_switch():
+    """La NOTICIA que reemplazó al gate: qué versiones de esta corrida van a capturar."""
     from app.controllers import managed_migration_controller as mod
 
+    ctrl = mod.ManagedMigrationController
+    specs = [_spec("0001", capture=True), _spec("0002"), _spec("0003", capture=True)]
+    assert ctrl._capture_versions(specs) == ["0001", "0003"]
+    assert ctrl._capture_versions([_spec("0002")]) == []
+
+    # Con el kill switch apagado el codegen no emite una sola llamada de captura, así que
+    # anunciarla sería mentir.
     with mock.patch.object(mod, "MIGRATION_CAPTURE_ENABLED", False):
-        mod.ManagedMigrationController._guard_capture_consent(
-            [_spec("0001", capture=True)], False
-        )
+        assert ctrl._capture_versions(specs) == []
 
 
 def test_spec_or_404_compara_versiones_numericamente():
@@ -474,50 +555,43 @@ def test_write_revision_files_respeta_el_kill_switch_global():
 # --------------------------------------------------------------------------- #
 # B1 — el ROLLBACK también captura, y por eso también se controla               #
 # --------------------------------------------------------------------------- #
-def test_consentimiento_tambien_se_exige_en_direccion_down():
+def test_el_rollback_tambien_anuncia_lo_que_captura():
     """
     El codegen emite ``capture_statement`` para el ``down_sql`` (lo verifica
-    ``test_el_down_sql_tambien_captura``), así que un ``rollback`` extrae y persiste datos
-    igual que un ``apply``. Antes de este fix el rollback no llamaba a NINGÚN guard: bastaba
-    un ``confirm_version`` para exfiltrar filas sin el consentimiento que sí exige el apply.
+    ``test_el_down_sql_tambien_captura``), así que un ``rollback`` extrae y persiste datos igual
+    que un ``apply``. Por eso el aviso —y el gate de ``reviewed``— rigen en AMBAS direcciones.
     """
     from app.controllers.managed_migration_controller import ManagedMigrationController
-    from app.exceptions import AppHttpException
 
     camino = [_spec("0002", capture=True), _spec("0001", capture=False)]
-    with pytest.raises(AppHttpException) as exc:
-        ManagedMigrationController._guard_capture_consent(camino, False, direction="down")
-    assert exc.value.status_code == 409
-    assert exc.value.public_context == {"capture_versions": ["0002"]}
-    # El texto tiene que hablar de REVERTIR: un 409 que dice "aplicación" manda al operador
-    # a buscar el flag en el endpoint equivocado.
-    assert "revertir" in exc.value.message
-    ManagedMigrationController._guard_capture_consent(camino, True, direction="down")
+    assert ManagedMigrationController._capture_versions(camino) == ["0002"]
 
 
-def test_rollback_invoca_los_guards_de_captura_antes_de_tocar_el_motor():
-    """Invariante de ORDEN: los dos guards van antes de la auditoría y del runner."""
+def test_rollback_invoca_el_guard_de_captura_antes_de_tocar_el_motor():
+    """
+    Invariante de ORDEN: el guard va antes de la auditoría de intento y del runner.
+
+    Es lo que mantiene cerrado el agujero B1 —antes el rollback no llamaba a NINGÚN guard y
+    bastaba un ``confirm_version`` para exfiltrar filas—. Que el consentimiento por corrida se
+    haya retirado no lo reabre: ``_guard_reviewed_capture`` sigue cubriendo esta dirección.
+    """
     import inspect
 
     from app.controllers.managed_migration_controller import ManagedMigrationController
 
     src = inspect.getsource(ManagedMigrationController.rollback)
-    assert "_guard_capture_consent" in src
     assert "_guard_reviewed_capture" in src
-    assert src.index("_guard_capture_consent") < src.index('status="attempt"')
-    assert src.index("_guard_capture_consent") < src.index("self.runner.rollback_to")
-    assert (
-        "allow_result_capture"
-        in inspect.signature(ManagedMigrationController.rollback).parameters
-    )
+    assert src.index("_guard_reviewed_capture") < src.index('status="attempt"')
+    assert src.index("_guard_reviewed_capture") < src.index("self.runner.rollback_to")
 
 
-def test_endpoint_de_rollback_expone_allow_result_capture():
+def test_endpoint_de_rollback_ya_no_expone_allow_result_capture():
+    """Espejo en el borde HTTP del anti-regresión de arriba."""
     import inspect
 
     from app.routes.v1.managed_databases import rollback_migration
 
-    assert "allow_result_capture" in inspect.signature(rollback_migration).parameters
+    assert "allow_result_capture" not in inspect.signature(rollback_migration).parameters
 
 
 class _CountingQuery:
@@ -863,7 +937,7 @@ def test_capture_pointer_solo_cuenta_lo_de_esta_corrida():
     with mock.patch.object(mod.audit, "record") as auditar:
         assert ctrl._capture_pointer(
             ctrl.__new__(ctrl), 7, sin_escritura, admin=None, server_id=3
-        ) == 0
+        ) == (0, [])
     auditar.assert_not_called()
 
     con_escritura = [
@@ -875,8 +949,38 @@ def test_capture_pointer_solo_cuenta_lo_de_esta_corrida():
     with mock.patch.object(mod.audit, "record") as auditar:
         assert ctrl._capture_pointer(
             ctrl.__new__(ctrl), 7, con_escritura, admin=None, server_id=3
-        ) == 2
+        ) == (2, ["0002"])
     assert auditar.call_args.args[0] == "migration.select_results.write"
+    # El detalle nombra la versión, no solo cuenta: es lo que hace el rastro reconstruible.
+    assert "0002" in auditar.call_args.kwargs["detail"]
+
+
+def test_capture_pointer_nombra_solo_las_versiones_que_escribieron():
+    """
+    ``captured_versions`` es lo que el cliente necesita para enlazar a
+    ``…/{version}/select-results``. Antes adivinaba con ``to_version`` (la última aplicada), así
+    que un apply 0005→0010 cuya captura ocurrió en 0007 enlazaba a una página vacía.
+    """
+    from app.controllers import managed_migration_controller as mod
+
+    ctrl = mod.ManagedMigrationController
+    results = [
+        MigrationResult(
+            migration_id=1, version="0007", status="applied", error=None,
+            execution_ms=1, applied_at=datetime.now(timezone.utc), captured_results=3,
+        ),
+        MigrationResult(
+            migration_id=2, version="0010", status="applied", error=None,
+            execution_ms=1, applied_at=datetime.now(timezone.utc), captured_results=0,
+        ),
+    ]
+    with mock.patch.object(mod.audit, "record"):
+        written, versions = ctrl._capture_pointer(
+            ctrl.__new__(ctrl), 7, results, admin=None, server_id=3
+        )
+    assert written == 3
+    # 0010 se aplicó pero NO capturó: enlazar ahí sería el bug que este campo corrige.
+    assert versions == ["0007"]
 
 
 # --------------------------------------------------------------------------- #
@@ -913,7 +1017,10 @@ def test_guard_reviewed_capture_bloquea_una_version_sin_revisar():
     with pytest.raises(AppHttpException) as exc:
         ManagedMigrationController._guard_reviewed_capture(session, 1)
     assert exc.value.status_code == 409
-    assert exc.value.public_context == {"unreviewed_capture": ["0010"]}
+    assert exc.value.public_context == {
+        "code": "migration.capture_unreviewed",
+        "unreviewed_capture": ["0010"],
+    }
 
 
 def test_guard_reviewed_capture_no_corre_con_el_kill_switch_apagado():

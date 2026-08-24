@@ -41,6 +41,7 @@ from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
 from app.services import audit
 from app.services import environment_catalog as ecodes
+from app.services import migration_capture_catalog as ccodes
 from app.services import provisioning_catalog as pcodes
 from app.services.db_admin import migration_facts, migration_progress, migration_results
 from app.services.db_admin.factory import get_adapter
@@ -463,7 +464,6 @@ class ManagedMigrationController:
         force: bool = False,
         dry_run: bool = False,
         on_failure: str = "auto",
-        allow_result_capture: bool = False,
         admin: dict | None = None,
     ) -> dict:
         session = self._session()
@@ -532,7 +532,7 @@ class ManagedMigrationController:
             db_id, db_name=db_name, server_id=server_id, target=target,
             engine=engine, slug=slug, specs=specs, model_id=model.id,
             up_to_version=up_to_version, was_quarantined=quarantined, admin=admin,
-            on_failure=on_failure, allow_result_capture=allow_result_capture,
+            on_failure=on_failure,
             env_blocks_destructive=bool(env_policy and env_policy[0]),
             env_slug=env_policy[1] if env_policy else None,
         )
@@ -732,8 +732,15 @@ class ManagedMigrationController:
         **Kill switch global.** Con ``MIGRATION_CAPTURE_ENABLED=False`` el codegen no emite ni
         una llamada a ``capture_statement``, así que capturar es FÍSICAMENTE imposible: no hay
         riesgo que gatear, y mantener el 409 solo bloqueaba la recuperación (el ``rollback`` no
-        tiene ningún ``force`` con el que saltearlo). Mismo early-return que
-        ``_guard_capture_consent``.
+        tiene ningún ``force`` con el que saltearlo).
+
+        **Es el ÚNICO gate de la captura.** El consentimiento por corrida
+        (``allow_result_capture``) se retiró — el porqué está en ``_capture_versions``, que ocupa
+        su lugar como noticia. Consecuencia: la calidad de ESTE guard importa más que antes,
+        porque ya no hay una segunda red detrás. Lo que lo sostiene es que la aprobación es de una
+        CONSULTA y no de la versión: cambiar ``up_sql``, los overrides por motor o el ``down_sql``
+        vuelve ``reviewed`` a ``False`` automáticamente (ver ``update_migration``), y ``stamp``
+        tiene su propio guard porque es lo que habilita el ``rollback`` de una versión.
         """
         if not MIGRATION_CAPTURE_ENABLED:
             return
@@ -758,55 +765,53 @@ class ManagedMigrationController:
                 ),
                 status_code=409,
                 context={"model_id": model_id, "unreviewed_capture": versions},
-                public_context={"unreviewed_capture": versions},
+                # ``code`` además de ``unreviewed_capture``: en ``apply_all`` la ruta responde 200
+                # con los rechazos por BD, así que el ``public_context`` de la respuesta HTTP no
+                # existe y el controller copia el código a ``item["error_code"]``. Sin él ese
+                # campo salía ``None`` y el cliente tenía que matchear prosa.
+                public_context={
+                    "code": ccodes.CODE_UNREVIEWED_CAPTURE,
+                    "unreviewed_capture": versions,
+                },
             )
 
     @staticmethod
-    def _guard_capture_consent(
-        pending: list[MigrationSpec],
-        allow_result_capture: bool,
-        *,
-        direction: str = "up",
-    ) -> None:
+    def _capture_versions(specs: list[MigrationSpec]) -> list[str]:
         """
-        Consentimiento EXPLÍCITO por corrida: ejecutar una versión con ``capture_selects``
-        exige ``allow_result_capture=true`` en el request (409 antes de tocar el motor).
+        Versiones del subconjunto que van a capturar el resultado de sus ``SELECT``.
 
-        No es redundante con el opt-in de la versión: un blueprint se replica sobre N BDs de
-        dueños potencialmente distintos, y quien dispara el ``apply`` sobre UNA de ellas
-        tiene que saber que esa corrida va a extraer datos de ESA base. El opt-in lo decidió
-        quien escribió la migración, quizá meses antes y para otra BD.
+        Es una NOTICIA, no un gate. Acá vivía ``_guard_capture_consent``, que exigía
+        ``allow_result_capture=true`` en CADA corrida además del opt-in de la versión y de su
+        aprobación. Se retiró, y el motivo importa para que nadie lo reponga sin releerlo:
 
-        Cubre AMBAS direcciones: el codegen emite ``capture_statement`` también para las
-        sentencias del ``down_sql`` (``_render_revision`` recibe un solo flag ``capture`` y lo
-        aplica a los dos cuerpos), así que un ``rollback`` extrae y persiste datos igual que
-        un ``apply``. ``direction`` solo cambia el texto del 409 para que el operador entienda
-        qué operación está bloqueada.
+        - **La premisa no aplicaba.** Se justificaba con "un blueprint se replica sobre N BDs de
+          dueños potencialmente distintos, y quien aplica sobre UNA tiene que saber". Esos dueños
+          son los ``ServerUser`` de las bases DESTINO; a nivel gateway hay un **administrador
+          único** (``app/core/auth.py``: "no gestiona múltiples usuarios", sin roles ni permisos, y
+          ningún router de usuarios expuesto). La misma persona activa la captura, aprueba
+          ``reviewed`` y dispara el apply: no había un segundo par de ojos, solo un segundo momento.
+        - **No dejaba rastro.** Pasar el flag no se auditaba en ninguna parte. Lo único auditado es
+          la escritura efectiva (``_capture_pointer``), que ocurre con o sin gate — o sea, fricción
+          sin evidencia forense. Compará con el guard de entorno, que sí registra
+          ``migration.environment_denied`` al rechazar.
+        - **``apply_all`` ya lo contradecía**: un único query param autorizaba N bases de entornos
+          distintos, exactamente lo contrario de "conciencia de ESTA base".
+        - Una BD nueva arranca sin versión, así que recibe la cadena COMPLETA y arrastra versiones
+          históricas cuya captura tenía sentido sobre bases con datos. Sobre una base recién creada
+          esos ``SELECT`` devuelven cero filas: el gate saltaba más fuerte donde el riesgo era
+          menor, que es como se entrena el reflejo "siempre que sí" — y ese reflejo después se
+          aplica también en producción. El control quedaba más débil, no más fuerte.
 
-        Si el kill switch global está apagado no se captura nada, así que tampoco hay nada
-        que consentir.
+        El gate que SÍ queda es ``_guard_reviewed_capture``: aprueba una CONSULTA concreta y se
+        revoca sola si el SQL cambia. Lo único que el consentimiento aportaba de verdad —el
+        re-aviso en el momento de ejecutar— se compensa con esta lista, que viaja en el plan del
+        dry-run y en el ``detail`` de la auditoría de intento. Es más de lo que dejaba el flag.
         """
-        if allow_result_capture or not MIGRATION_CAPTURE_ENABLED:
-            return
-        versions = [s.version for s in pending if s.capture_selects]
-        if not versions:
-            return
-        what = (
-            "las versiones pendientes" if direction == "up" else "las versiones a revertir"
-        )
-        operation = "esta aplicación" if direction == "up" else "este rollback"
-        raise AppHttpException(
-            message=(
-                f"Confirmación requerida: {what} "
-                f"{', '.join(versions)} tienen la captura de resultados activada, así que "
-                f"{operation} va a guardar filas de esta base de datos (cifradas) en el "
-                "gateway. Repetí la llamada con allow_result_capture=true si es lo que "
-                "querés, o desactivá capture_selects en esas versiones."
-            ),
-            status_code=409,
-            context={"capture_versions": versions, "required": "allow_result_capture=true"},
-            public_context={"capture_versions": versions},
-        )
+        if not MIGRATION_CAPTURE_ENABLED:
+            # Kill switch: el codegen no emite una sola llamada de captura, así que anunciarla
+            # sería mentir.
+            return []
+        return [s.version for s in specs if s.capture_selects]
 
     @staticmethod
     def _guard_quarantine(db_id: int, quarantined: bool, force: bool, dry_run: bool) -> None:
@@ -839,6 +844,16 @@ class ManagedMigrationController:
         dry-run: se informa con ``database_exists`` y ``no_op``, que es exactamente el
         diagnóstico que el operador vino a buscar.
 
+        ``will_capture_versions`` sigue esa misma forma: es el PRONÓSTICO de qué versiones de esta
+        corrida van a extraer filas y guardarlas (cifradas) en el gateway. Ocupa el lugar del 409
+        de consentimiento que se retiró (ver ``_capture_versions``): la información se da ANTES, en
+        la llamada que existe para decidir, en vez de trabar la que existe para ejecutar.
+
+        El nombre NO es ``capture_versions``, y no es capricho: ese era exactamente el token del
+        ``public_context`` del 409 que se borró, así que reusarlo dejaría el ``grep`` ambiguo para
+        siempre entre "lo que anunciaba el gate muerto" y "lo que anuncia el plan". Y contra
+        ``captured_versions`` (el HECHO, en la respuesta de la corrida real) se diferenciaría en
+        dos letras — un par así se confunde leyendo un diff.
         """
         current, database_exists = self._read_current_version_tolerant(target, db_name, slug)
         pending = self.runner.compute_pending(current, specs, up_to_version)
@@ -847,6 +862,7 @@ class ManagedMigrationController:
         if env_policy and env_policy[0] and destructive:
             blocked_by = [v for v in pending_versions if v in destructive]
         return {
+            "will_capture_versions": self._capture_versions(pending),
             "managed_database_id": db_id,
             "database_name": db_name,
             "server_id": server_id,
@@ -996,7 +1012,6 @@ class ManagedMigrationController:
     def _run_apply(
         self, db_id, *, db_name, server_id, target, engine, slug, specs, model_id,
         up_to_version, was_quarantined, admin, on_failure: str = "auto",
-        allow_result_capture: bool = False,
         env_blocks_destructive: bool = False,
         env_slug: str | None = None,
         destructive_versions: dict[str, tuple[str, ...]] | None = None,
@@ -1018,11 +1033,10 @@ class ManagedMigrationController:
         )
         if not database_exists:
             raise self._not_provisioned(db_id, db_name, server_id, op="aplicar migraciones")
-        # Las DOS llaves de la captura, sobre las versiones que REALMENTE se van a aplicar en
-        # ESTA BD (no sobre todo el blueprint): una versión con captura ya aplicada hace meses
-        # no debe exigir el flag para siempre, y una versión POSTERIOR a la objetivo no debe
-        # bloquear una aplicación que no la incluye. Igual que en ``rollback``, y también acá
-        # (no en ``apply``) para cubrir ``apply_all``, que reporta el 409 por BD.
+        # El gate de la captura, sobre las versiones que REALMENTE se van a aplicar en ESTA BD
+        # (no sobre todo el blueprint): una versión POSTERIOR a la objetivo no debe bloquear una
+        # aplicación que no la incluye. Va acá (no en ``apply``) para cubrir también
+        # ``apply_all``, que reporta el 409 por BD.
         pending = self.runner.compute_pending(from_version, specs, up_to_version)
         capture_pending_ids = [s.id for s in pending if s.capture_selects]
         if capture_pending_ids:
@@ -1033,7 +1047,6 @@ class ManagedMigrationController:
                 )
             finally:
                 session.close()
-        self._guard_capture_consent(pending, allow_result_capture)
         # Guard de entorno, sobre las pendientes REALES de ESTA BD. Va acá por el mismo
         # criterio que los dos guards de captura de arriba, y con el mismo beneficio: cubre el
         # ``apply`` por BD y ``apply_all`` de una sola vez, sin releer el motor.
@@ -1046,10 +1059,18 @@ class ManagedMigrationController:
                 else self._destructive_versions(specs, engine),
                 env_slug or "?",
             )
+        # La auditoría de INTENCIÓN nombra las versiones que van a extraer datos. Es la
+        # contrapartida de haber retirado el consentimiento por corrida: ese flag no dejaba
+        # ningún rastro, así que esto no reemplaza evidencia, la agrega. Queda la intención acá
+        # y el resultado en ``migration.select_results.write`` (``_capture_pointer``).
+        capturing = self._capture_versions(pending)
+        detail = f"apply hasta {up_to_version or 'head'}"
+        if capturing:
+            detail += f" (captura: {', '.join(capturing)})"
         audit.record(
             "migration.apply", status="attempt", admin=admin,
             target_type="managed_database", target_id=db_id, server_id=server_id,
-            touched_engine=True, detail=f"apply hasta {up_to_version or 'head'}",
+            touched_engine=True, detail=detail,
         )
         try:
             results = self.runner.apply(
@@ -1099,10 +1120,13 @@ class ManagedMigrationController:
         )
         applied = [r for r in results if r.status == "applied"]
         to_version = applied[-1].version if applied else from_version
-        captured = self._capture_pointer(db_id, results, admin=admin, server_id=server_id)
+        captured, captured_versions = self._capture_pointer(
+            db_id, results, admin=admin, server_id=server_id
+        )
         return {
             "managed_database_id": db_id,
             "captured_select_count": captured,
+            "captured_versions": captured_versions,
             "select_results_available": captured > 0,
             "database_name": db_name,
             "server_id": server_id,
@@ -1129,10 +1153,10 @@ class ManagedMigrationController:
         *,
         admin: dict | None,
         server_id: int | None,
-    ) -> int:
+    ) -> tuple[int, list[str]]:
         """
-        Cuántas capturas escribió ESTA corrida, y auditoría de esa ESCRITURA (conteos, nunca
-        valores).
+        ``(cuántas capturas escribió ESTA corrida, en qué versiones)`` + auditoría de esa
+        ESCRITURA (conteos y versiones, nunca valores).
 
         El número viene del propio runner (``MigrationResult.captured_results``, que devuelve
         ``migration_results.finalize``), NO de un ``COUNT`` sobre la tabla: la tabla acumula
@@ -1142,11 +1166,19 @@ class ManagedMigrationController:
         ``captured_select_count: 1`` y auditaba una escritura inexistente. Las capturas
         viejas siguen leyéndose con ``GET …/select-results``; el puntero de la respuesta habla
         solo de lo que esta corrida produjo.
+
+        **Las VERSIONES no son adorno**: sin ellas el cliente solo sabe "se capturó algo" y para
+        armar el enlace a ``…/{version}/select-results`` tiene que adivinar. La SPA usaba
+        ``to_version`` (la última aplicada), así que un ``apply`` 0005→0010 cuya captura ocurrió
+        en 0007 enlazaba a ``…/0010/select-results``, que está VACÍO. El dato ya se calculaba acá
+        para contarlo y se tiraba.
         """
         written = sum(r.captured_results for r in results)
         if not written:
-            return 0
-        touched = {r.migration_id for r in results if r.captured_results}
+            return 0, []
+        versions = sorted(
+            {r.version for r in results if r.captured_results}, key=version_sort_key
+        )
         audit.record(
             "migration.select_results.write",
             admin=admin,
@@ -1156,10 +1188,10 @@ class ManagedMigrationController:
             touched_engine=False,
             detail=(
                 f"{written} resultado(s) de SELECT capturados en "
-                f"{len(touched)} versión(es)"
+                f"{len(versions)} versión(es): {', '.join(versions)}"
             ),
         )
-        return written
+        return written, versions
 
     def select_results(
         self, db_id: int, version: str, *, admin: dict | None = None
@@ -1293,7 +1325,6 @@ class ManagedMigrationController:
         *,
         confirm_version: str | None = None,
         target_version: str | None = None,
-        allow_result_capture: bool = False,
         admin: dict | None = None,
     ) -> dict:
         """
@@ -1304,12 +1335,12 @@ class ManagedMigrationController:
         ``confirm_version == versión actual`` (doble intención) y que TODO el camino
         tenga ``down_sql`` confirmado (409 si falta alguno).
 
-        Si alguna versión del camino tiene ``capture_selects=true``, exige además las MISMAS
-        dos llaves que ``apply``: la versión revisada (``reviewed=true``) y el consentimiento
-        de la corrida (``allow_result_capture=true``). No es simetría decorativa: el codegen
-        emite ``capture_statement`` para las sentencias del ``down_sql`` igual que para las
-        del ``up_sql``, así que un rollback extrae y persiste datos de negocio exactamente
-        como un apply.
+        Si alguna versión del camino tiene ``capture_selects=true``, exige lo MISMO que
+        ``apply``: que esas versiones estén revisadas (``reviewed=true``). No es simetría
+        decorativa: el codegen emite ``capture_statement`` para las sentencias del ``down_sql``
+        igual que para las del ``up_sql``, así que un rollback extrae y persiste datos de negocio
+        exactamente como un apply — antes del fix B1 no llamaba a ningún guard y bastaba un
+        ``confirm_version`` para exfiltrar filas.
         """
         session = self._session()
         try:
@@ -1409,9 +1440,9 @@ class ManagedMigrationController:
                 public_context={"missing_down_sql": missing},
             )
 
-        # Captura de resultados: las MISMAS dos llaves que exige ``apply``, sobre el camino
-        # que REALMENTE se va a ejecutar (no sobre todo el blueprint — ver el docstring de
-        # ``_guard_reviewed_capture``). Van acá, después de calcular ``path`` y antes de la
+        # Captura de resultados: el MISMO gate que exige ``apply``, sobre el camino que
+        # REALMENTE se va a ejecutar (no sobre todo el blueprint — ver el docstring de
+        # ``_guard_reviewed_capture``). Va acá, después de calcular ``path`` y antes de la
         # auditoría de intento: se responde 409 sin tocar el motor.
         capture_path_ids = [s.id for s in path if s.capture_selects]
         if capture_path_ids:
@@ -1422,12 +1453,17 @@ class ManagedMigrationController:
                 )
             finally:
                 session.close()
-        self._guard_capture_consent(path, allow_result_capture, direction="down")
 
+        # Mismo criterio que en ``_run_apply``: la intención queda auditada nombrando qué
+        # versiones extraen datos. El ``down_sql`` captura igual que el ``up_sql``.
+        capturing = self._capture_versions(path)
+        detail = f"rollback {current} -> {dest or 'base'}"
+        if capturing:
+            detail += f" (captura: {', '.join(capturing)})"
         audit.record(
             "migration.rollback", status="attempt", admin=admin,
             target_type="managed_database", target_id=db_id, server_id=server_id,
-            touched_engine=True, detail=f"rollback {current} -> {dest or 'base'}",
+            touched_engine=True, detail=detail,
         )
         results = self.runner.rollback_to(
             target, db_name=db_name, slug=slug, engine=engine,
@@ -1451,7 +1487,7 @@ class ManagedMigrationController:
             detail=f"{len(reverted)} revertida(s): {current} -> {new_current or 'base'}"
                    + (" (con fallo)" if failed else ""),
         )
-        captured = self._capture_pointer(
+        captured, captured_versions = self._capture_pointer(
             db_id, results, admin=admin, server_id=server_id
         )
         return {
@@ -1463,6 +1499,7 @@ class ManagedMigrationController:
             "target_version": dest,
             "reverted_count": len(reverted),
             "captured_select_count": captured,
+            "captured_versions": captured_versions,
             "select_results_available": captured > 0,
             "reverted_versions": [r.version for r in reverted],
             "failed": failed,
@@ -1578,7 +1615,12 @@ class ManagedMigrationController:
                 "version": version,
                 "required": "reviewed=true (o force=true)",
             },
-            public_context={"unreviewed_capture": [version]},
+            # Código PROPIO, distinto del de apply/rollback: acá ``force=true`` sí es un escape
+            # legítimo, y con un código único la SPA ofrecería «Forzar» también donde no sirve.
+            public_context={
+                "code": ccodes.CODE_UNREVIEWED_CAPTURE_STAMP,
+                "unreviewed_capture": [version],
+            },
         )
 
     @staticmethod
@@ -1948,7 +1990,6 @@ class ManagedMigrationController:
         force: bool = False,
         dry_run: bool = False,
         on_failure: str = "auto",
-        allow_result_capture: bool = False,
         admin: dict | None = None,
     ) -> dict:
         """
@@ -2129,7 +2170,6 @@ class ManagedMigrationController:
                         up_to_version=None,
                         was_quarantined=quarantined, admin=admin,
                         on_failure=on_failure,
-                        allow_result_capture=allow_result_capture,
                         env_blocks_destructive=bool(policy and policy[0]),
                         env_slug=policy[1] if policy else None,
                         destructive_versions=(
@@ -2141,6 +2181,7 @@ class ManagedMigrationController:
                     # Paridad con el apply por BD: sin esto, tras un apply masivo no había
                     # forma de saber en qué BDs quedaron capturas ni cómo llegar a ellas.
                     item["captured_select_count"] = out.get("captured_select_count", 0)
+                    item["captured_versions"] = out.get("captured_versions", [])
                     item["select_results_available"] = out.get(
                         "select_results_available", False
                     )
@@ -2168,6 +2209,26 @@ class ManagedMigrationController:
                         detail=(
                             f"guard=destructive environment={item['environment_slug']} "
                             f"versions={','.join(item['blocked_by'])}"
+                        ),
+                    )
+                elif item["error_code"] == ccodes.CODE_UNREVIEWED_CAPTURE:
+                    # Mismo criterio que el rechazo por entorno: un guard que frena una BD del
+                    # lote tiene que dejar rastro propio. La ruta responde 200, así que sin esto
+                    # el rechazo solo vive dentro del JSON de la respuesta.
+                    item["unreviewed_capture"] = list(
+                        (exc.public_context or {}).get("unreviewed_capture") or []
+                    )
+                    audit.record(
+                        "migration.capture_review_denied",
+                        status="denied",
+                        admin=admin,
+                        target_type="managed_database",
+                        target_id=db_id,
+                        server_id=server_id,
+                        touched_engine=False,
+                        detail=(
+                            "guard=unreviewed_capture "
+                            f"versions={','.join(item['unreviewed_capture'])}"
                         ),
                     )
             except Exception as exc:  # noqa: BLE001 — una BD no debe abortar el lote

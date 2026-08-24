@@ -12,8 +12,8 @@ quería mirar ya cambió.
 **La excepción deliberada a la regla del audit log.** ``app/models/audit_log.py`` declara
 que el gateway NUNCA almacena datos de negocio. Esta tabla es la PRIMERA excepción y por
 eso lleva todas las salvaguardas juntas: es **opt-in por migración**
-(``model_migrations.capture_selects``), exige **confirmación explícita** en el ``apply``
-(``allow_result_capture``), exige **revisión previa** (``reviewed``), el payload va
+(``model_migrations.capture_selects``), exige **revisión previa de la CONSULTA**
+(``reviewed``, que se revoca sola si el SQL cambia), el payload va
 **CIFRADO con la DEK** (envelope encryption — no es legible por SQL directo contra la BD
 del gateway, todo acceso pasa por el endpoint auditado), la lectura se **audita
 fail-closed** y las filas **expiran** (``MIGRATION_CAPTURE_TTL_HOURS``).

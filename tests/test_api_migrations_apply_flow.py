@@ -252,11 +252,84 @@ def test_apply_que_si_incluye_la_version_con_captura_sin_revisar_da_409(
     monkeypatch.setattr(MigrationRunner, "apply", lambda self, *a, **k: [])
 
     r = admin_client.post(
-        f"/api/v1/managed-databases/{db_id}/migrations/apply"
-        "?version=0010&allow_result_capture=true"
+        f"/api/v1/managed-databases/{db_id}/migrations/apply?version=0010"
     )
     assert r.status_code == 409, r.text
-    assert r.json()["detail"]["public_context"]["unreviewed_capture"] == ["0010"]
+    pc = r.json()["detail"]["public_context"]
+    assert pc["unreviewed_capture"] == ["0010"]
+    # Código estable: es lo único que el cliente puede clasificar sin matchear prosa, y en
+    # `apply_all` es lo ÚNICO que llega (ahí el rechazo viaja por ítem dentro de un 200).
+    assert pc["code"] == "migration.capture_unreviewed"
+
+
+def test_apply_con_captura_APROBADA_no_pide_ningun_flag(
+    admin_client, server_payload, monkeypatch
+):
+    """
+    EL CASO DEL INCIDENTE. Antes, una versión con ``capture_selects`` aprobada seguía exigiendo
+    ``allow_result_capture=true`` en CADA corrida, así que crear BDs nuevas a partir de un
+    blueprint chocaba con un 409 por versiones históricas que sobre una base vacía no tienen
+    nada que extraer. Ese consentimiento se retiró: con la versión aprobada, el apply procede.
+    """
+    model_id, vids = _blueprint_with_capture_tail(admin_client)
+    # Aprobar la versión que captura: eso es —y ahora es lo único que es— la llave.
+    r = admin_client.patch(
+        f"/api/v1/database-models/{model_id}/migrations/0010",
+        json={"reviewed": True},
+    )
+    assert r.status_code == 200, r.text
+
+    db_id = _managed_db(admin_client, server_payload, model_id)
+    monkeypatch.setattr(MigrationRunner, "get_current_version", lambda self, *a, **k: "0009")
+    monkeypatch.setattr(
+        MigrationRunner, "apply", lambda self, *a, **k: [_mr("0010", vids["0010"])]
+    )
+
+    r = admin_client.post(f"/api/v1/managed-databases/{db_id}/migrations/apply")
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["applied_count"] == 1
+
+
+def test_un_query_param_desconocido_no_rompe_el_apply(
+    admin_client, server_payload, monkeypatch
+):
+    """
+    Compatibilidad: FastAPI ignora los query params no declarados, así que un cliente viejo que
+    siga mandando ``allow_result_capture=true`` recibe 200 en vez de romperse. Sin este test la
+    afirmación de la doc es teoría.
+    """
+    model_id, vids = _blueprint_with_capture_tail(admin_client)
+    admin_client.patch(
+        f"/api/v1/database-models/{model_id}/migrations/0010", json={"reviewed": True}
+    )
+    db_id = _managed_db(admin_client, server_payload, model_id)
+    monkeypatch.setattr(MigrationRunner, "get_current_version", lambda self, *a, **k: "0009")
+    monkeypatch.setattr(
+        MigrationRunner, "apply", lambda self, *a, **k: [_mr("0010", vids["0010"])]
+    )
+
+    r = admin_client.post(
+        f"/api/v1/managed-databases/{db_id}/migrations/apply?allow_result_capture=true"
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_el_dry_run_anuncia_lo_que_capturaria(
+    admin_client, server_payload, monkeypatch
+):
+    """La NOTICIA que reemplazó al gate: se da ANTES, en la llamada que existe para decidir."""
+    model_id, _vids = _blueprint_with_capture_tail(admin_client)
+    admin_client.patch(
+        f"/api/v1/database-models/{model_id}/migrations/0010", json={"reviewed": True}
+    )
+    db_id = _managed_db(admin_client, server_payload, model_id)
+    monkeypatch.setattr(MigrationRunner, "get_current_version", lambda self, *a, **k: "0009")
+
+    r = admin_client.post(
+        f"/api/v1/managed-databases/{db_id}/migrations/apply?dry_run=true"
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["will_capture_versions"] == ["0010"]
 
 
 def test_dry_run_no_lo_bloquea_una_captura_sin_revisar(

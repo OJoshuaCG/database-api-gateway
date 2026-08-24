@@ -239,24 +239,21 @@ def apply_migrations(
             "versión anterior de forma limpia y solo hay que corregir la migración."
         ),
     ),
-    allow_result_capture: bool = Query(
-        False,
-        description=(
-            "Consentimiento EXPLÍCITO de esta corrida para las versiones con "
-            "'capture_selects=true': sus SELECT guardan el resultado (filas de ESTA base de "
-            "datos, cifradas) en el gateway, legibles luego con "
-            "GET .../migrations/{version}/select-results. Sin el flag, si alguna versión "
-            "PENDIENTE (no todo el blueprint) tiene la captura activada se responde 409 sin "
-            "ejecutar ninguna sentencia de la migración: para saber qué está pendiente el "
-            "gateway lee antes la versión actual del destino, así que sí abre una conexión "
-            "de solo lectura. Mismo 409 si alguna de esas versiones pendientes no está "
-            "revisada (reviewed=false); con dry_run=true ninguno de los dos bloquea."
-        ),
-    ),
 ):
+    """
+    Aplica las versiones pendientes del blueprint sobre esta BD 🔌.
+
+    **Captura de resultados**: si alguna versión PENDIENTE (no todo el blueprint) tiene
+    'capture_selects=true' y NO está revisada, se responde 409
+    'migration.capture_unreviewed' sin ejecutar ninguna sentencia de la migración — para saber
+    qué está pendiente el gateway lee antes la versión actual del destino, así que sí abre una
+    conexión de solo lectura. Ese es el único gate: el consentimiento por corrida
+    ('allow_result_capture') se retiró. Con 'dry_run=true' no bloquea y el plan informa en
+    'will_capture_versions' qué versiones van a capturar.
+    """
     result = ManagedMigrationController().apply(
         db_id, up_to_version=version, force=force, dry_run=dry_run,
-        on_failure=on_failure, allow_result_capture=allow_result_capture, admin=admin,
+        on_failure=on_failure, admin=admin,
     )
     msg = _apply_message(result, dry_run=dry_run)
     return success(data=result, message=msg)
@@ -325,25 +322,20 @@ def rollback_migration(
             "es anterior a la actual."
         ),
     ),
-    allow_result_capture: bool = Query(
-        False,
-        description=(
-            "Consentimiento EXPLÍCITO de esta corrida para las versiones del camino a "
-            "revertir que tengan 'capture_selects=true': las sentencias de lectura de su "
-            "down_sql guardan el resultado (filas de ESTA base de datos, cifradas) en el "
-            "gateway. Mismo control que en /apply — el rollback también captura. Sin el "
-            "flag se responde 409 sin ejecutar ninguna sentencia de la migración (el "
-            "gateway sí lee antes la versión actual del destino para saber qué camino hay "
-            "que revertir); también 409 si alguna de esas versiones no está revisada "
-            "(reviewed=false)."
-        ),
-    ),
 ):
+    """
+    Revierte esta BD secuencialmente hasta 'target_version' 🔌 (operación DESTRUCTIVA).
+
+    **Captura de resultados**: el rollback captura igual que el apply (el codegen emite la
+    llamada también para el down_sql), así que rige el MISMO gate — 409
+    'migration.capture_unreviewed' si alguna versión del camino a revertir tiene
+    'capture_selects=true' sin revisar, sin ejecutar ninguna sentencia de la migración (el
+    gateway sí lee antes la versión actual del destino para saber qué camino hay que revertir).
+    """
     result = ManagedMigrationController().rollback(
         db_id,
         confirm_version=confirm_version,
         target_version=target_version,
-        allow_result_capture=allow_result_capture,
         admin=admin,
     )
     return success(data=result, message=_rollback_message(result))
@@ -471,10 +463,9 @@ def migration_select_results(
     """
     Resultados capturados de las sentencias de LECTURA de una versión sobre esta BD.
 
-    Solo existen si la versión tiene ``capture_selects=true`` (opt-in), está revisada
-    (``reviewed=true``) y el ``apply``/``rollback`` corrió con ``allow_result_capture=true``
-    — los tres controles rigen para AMBAS direcciones, porque el ``down_sql`` captura igual
-    que el ``up_sql``. Están disponibles tanto si la migración terminó bien como si falló a
+    Solo existen si la versión tiene ``capture_selects=true`` (opt-in) y está revisada
+    (``reviewed=true``) — los dos controles rigen para AMBAS direcciones, porque el
+    ``down_sql`` captura igual que el ``up_sql``. Están disponibles tanto si la migración terminó bien como si falló a
     mitad de camino — que es el caso para el que la feature existe.
 
     **Devuelve DATOS DE NEGOCIO de la base gestionada** (la única excepción deliberada a la

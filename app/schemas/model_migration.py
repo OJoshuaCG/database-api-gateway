@@ -34,9 +34,10 @@ class ModelMigrationCreate(BaseModel):
             "OPT-IN: guardar el RESULTADO de las sentencias de lectura de esta versión "
             "cuando se aplique/revierta (GET .../migrations/{version}/select-results). "
             "Es la única vía por la que el gateway persiste datos de negocio, así que la "
-            "versión nace SIN revisar (reviewed=false → apply da 409 hasta aprobarla con "
-            "PATCH reviewed=true) y cada apply exige además allow_result_capture=true. "
-            "Los MISMOS dos controles rigen para el rollback: el down_sql también captura."
+            "versión nace SIN revisar: reviewed=false → apply/rollback dan 409 hasta aprobarla "
+            "con PATCH reviewed=true. Esa aprobación es de una CONSULTA concreta y se revoca "
+            "sola si el SQL cambia. El MISMO control rige para el rollback: el down_sql también "
+            "captura."
         ),
     )
 
@@ -174,7 +175,7 @@ class ModelMigrationOut(BaseModel):
         description=(
             "True = los SELECT de esta versión guardan su resultado (cifrado) al aplicarse "
             "O al revertirse (el down_sql captura igual que el up_sql). Requiere "
-            "reviewed=true y allow_result_capture=true en cada apply y en cada rollback."
+            "reviewed=true, tanto para el apply como para el rollback."
         ),
     )
     has_seed: bool = Field(False, description="La migración inserta o modifica datos. " + _SQL_FACTS_DESC)
@@ -221,7 +222,7 @@ class MigrationStatusOut(BaseModel):
         description=(
             "False si la BD NO existe en el motor destino: quedó registrada en el inventario "
             "sin aprovisionarse, o alguien la borró por fuera del gateway. Con esto en false, "
-            "'current_version' es null por AUSENCIA (no por 'todavía sin migraciones') y "
+            "'current_version' es null por AUSENCIA y no por 'todavía sin migraciones', y "
             "'pending_versions' lista TODAS las del blueprint. Toda operación que ejecuta "
             "(apply/rollback/stamp/reconcile-partial) responde 409 hasta que se aprovisione "
             "con POST /managed-databases/{id}/provision."
@@ -392,6 +393,25 @@ class MigrationApplyOut(BaseModel):
         ),
     )
     results: list[MigrationResultOut] = Field(default_factory=list)
+    captured_versions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Versiones en las que ESTA corrida escribió capturas. No es adorno: es lo que hace "
+            "falta para armar el enlace a GET .../migrations/{version}/select-results. Sin este "
+            "campo el cliente adivinaba con 'to_version', así que un apply 0005→0010 cuya "
+            "captura ocurrió en 0007 enlazaba a una página vacía."
+        ),
+    )
+    will_capture_versions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Solo en dry-run: versiones pendientes que van a guardar el resultado de sus SELECT "
+            "(filas de esta base, cifradas) en el gateway. Es un AVISO, no un bloqueo — el plan "
+            "no falla por esto. Reemplaza al 409 de consentimiento por corrida que se retiró: la "
+            "información se da en la llamada que existe para decidir, no trabando la que existe "
+            "para ejecutar. Distinto de 'captured_versions', que es el HECHO de la corrida real."
+        ),
+    )
     captured_select_count: int = Field(
         0,
         description=(
@@ -443,6 +463,13 @@ class MigrationRollbackOut(BaseModel):
             "Capturas de SELECT que escribió ESTE rollback (puntero). 0 es lo normal cuando "
             "el down_sql no tiene lecturas, aunque la versión sí tenga capturas de su apply: "
             "esas se leen igual con GET .../select-results."
+        ),
+    )
+    captured_versions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Versiones en las que ESTE rollback escribió capturas. Es lo que hace falta para "
+            "enlazar a GET .../migrations/{version}/select-results sin adivinar."
         ),
     )
     select_results_available: bool = Field(
@@ -574,6 +601,23 @@ class ApplyAllItemOut(BaseModel):
             "Filas de SELECT capturadas en esta BD durante la corrida. Paridad con "
             "MigrationApplyOut: sin este dato, tras un apply masivo no había forma de saber "
             "en qué BDs quedaron capturas."
+        ),
+    )
+    captured_versions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Versiones en las que se escribieron capturas en ESTA BD. Sin esto el cliente "
+            "adivinaba con la última versión aplicada del ítem, que no tiene por qué ser en la "
+            "que se capturó."
+        ),
+    )
+    unreviewed_capture: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Versiones con captura SIN revisar que frenaron a esta BD. Acompaña a "
+            "error_code='migration.capture_unreviewed'. Este rechazo viaja por ítem dentro de "
+            "una respuesta 200 (el guard corre por BD dentro del bucle), así que el "
+            "public_context de la respuesta HTTP no existe para él."
         ),
     )
     select_results_available: bool = Field(
