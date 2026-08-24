@@ -216,6 +216,17 @@ class MigrationStatusOut(BaseModel):
     managed_database_id: int
     model_id: int | None = None
     slug: str | None = None
+    database_exists: bool = Field(
+        True,
+        description=(
+            "False si la BD NO existe en el motor destino: quedó registrada en el inventario "
+            "sin aprovisionarse, o alguien la borró por fuera del gateway. Con esto en false, "
+            "'current_version' es null por AUSENCIA (no por 'todavía sin migraciones') y "
+            "'pending_versions' lista TODAS las del blueprint. Toda operación que ejecuta "
+            "(apply/rollback/stamp/reconcile-partial) responde 409 hasta que se aprovisione "
+            "con POST /managed-databases/{id}/provision."
+        ),
+    )
     current_version: str | None = None
     latest_available: str | None = None
     pending_count: int
@@ -358,6 +369,15 @@ class MigrationApplyOut(BaseModel):
     quarantined: bool = False
     no_op: bool = Field(False, description="True si no había migraciones que aplicar")
     dry_run: bool = False
+    database_exists: bool = Field(
+        True,
+        description=(
+            "Solo en dry-run: False si la BD no existe en el motor destino (registrada sin "
+            "aprovisionar, o borrada por fuera). El dry-run INFORMA y no falla —es la llamada "
+            "de diagnóstico—, pero fuerza 'no_op'; el apply real responde 409 "
+            "'managed_database.not_provisioned'."
+        ),
+    )
     pending_versions: list[str] = Field(default_factory=list)
     environment_slug: str | None = Field(
         None, description="Entorno de esta BD, o null si no está clasificada."

@@ -15,6 +15,7 @@ Integridad: antes de tocar el motor se re-valida el ``checksum`` de cada migraci
 """
 
 import re
+from contextlib import contextmanager
 
 from sqlalchemy import or_ as sa_or
 
@@ -29,6 +30,7 @@ from app.core.environments import (
     MIGRATION_CAPTURE_ENABLED,
 )
 from app.core.logger import get_logger
+from app.core.remote_engine import UNKNOWN_DATABASE_CODES
 from app.exceptions import AppHttpException
 from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
@@ -39,7 +41,9 @@ from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
 from app.services import audit
 from app.services import environment_catalog as ecodes
+from app.services import provisioning_catalog as pcodes
 from app.services.db_admin import migration_facts, migration_progress, migration_results
+from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
 from app.services.db_admin.migrations import (
     ManifestStatement,
@@ -88,6 +92,96 @@ class ManagedMigrationController:
                 context={"managed_database_id": db_id, "model_id": md.model_id},
             )
         return md, server, model
+
+    # ------------------------------------------------------------------ #
+    # La BD puede NO existir en el motor                                  #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _is_unknown_database(exc: AppHttpException) -> bool:
+        """
+        ¿El 404 que subió el runner significa "la base no existe" (1049 / 3D000)?
+
+        Mirar solo el status NO alcanza: el errno 1008 ("can't drop database") también mapea a
+        404. Y esto es lo que va a disparar un CREATE DATABASE desde la UI, así que el conjunto
+        de códigos tiene que ser cerrado. El código nativo viaja como STRING en el ``context``
+        de la excepción; ese atributo es accesible in-process aunque el handler solo lo publique
+        en ``development``.
+        """
+        ctx = getattr(exc, "context", None)
+        return (
+            getattr(exc, "status_code", None) == 404
+            and isinstance(ctx, dict)
+            and str(ctx.get("remote_error_code") or "") in UNKNOWN_DATABASE_CODES
+        )
+
+    def _read_current_version_tolerant(
+        self, target, db_name: str, slug: str
+    ) -> tuple[str | None, bool]:
+        """
+        ``(current_version, database_exists)`` — no explota si la BD no existe en el motor.
+
+        Cuesta CERO en el camino feliz: ``list_databases()`` solo se paga cuando el driver ya
+        falló. La re-confirmación no es paranoia: un 1049 con la BD PRESENTE tiene otra causa
+        (privilegios del pseudo-root sobre esa base, carrera con un drop) y ahí el 404 original
+        tiene que propagarse tal cual — un "no existe" falso mandaría al operador a crear una
+        base que sí está.
+        """
+        try:
+            return self.runner.get_current_version(target, db_name, slug), True
+        except AppHttpException as exc:
+            if not self._is_unknown_database(exc):
+                raise
+            if db_name in get_adapter(target).list_databases():
+                raise
+            return None, False
+
+    @contextmanager
+    def _translating_unknown_database(
+        self, target, db_id: int, db_name: str, server_id: int, *, op: str
+    ):
+        """
+        Convierte el 404 opaco del driver (1049/3D000) en un 409 ACCIONABLE.
+
+        Se usa donde el propio runner ya abre conexión a la BD destino (``stamp``,
+        ``reconcile_partial``): ahí un ``list_databases()`` preventivo sería un round-trip de
+        más y una superficie de fallo nueva, sin comprar nada — el runner ya falla solo si la
+        base no está. Lo que faltaba no era detectarlo, era **decirlo**: el 404 genérico ("El
+        recurso solicitado no existe en el servidor destino") es indistinguible del 404 de "BD
+        no encontrada en el inventario" y no nombra la salida.
+
+        La confirmación con ``list_databases()`` se paga SOLO en el camino de error, y sirve
+        para no afirmar "no existe" cuando el 1049 viene de otra causa (privilegios del
+        pseudo-root sobre esa base, carrera con un drop): ahí el 404 original se propaga.
+
+        **El estado ``pending`` de la fila NO se usa como atajo, y es deliberado.** Está rancio
+        en las DOS direcciones: una BD creada con ``POST /servers/{id}/databases?register=false``
+        EXISTE con la fila en ``pending``, y una fila ``active`` puede apuntar a una base que
+        alguien dropeó. Rechazar por ``pending`` dejaría a la primera sin salida (``provision``
+        le daría 409 por existir). El plano físico es la única fuente de verdad.
+        """
+        try:
+            yield
+        except AppHttpException as exc:
+            if not self._is_unknown_database(exc):
+                raise
+            if db_name in get_adapter(target).list_databases():
+                raise
+            raise self._not_provisioned(db_id, db_name, server_id, op=op) from exc
+
+    @staticmethod
+    def _not_provisioned(
+        db_id: int, db_name: str, server_id: int, *, op: str
+    ) -> AppHttpException:
+        return AppHttpException(
+            message=(
+                f"La base de datos '{db_name}' no existe en el motor: nunca se aprovisionó "
+                f"(o se borró por fuera del gateway). No hay nada sobre lo que {op}. "
+                f"Aprovisionala con POST /managed-databases/{db_id}/provision y reintentá."
+            ),
+            status_code=409,
+            public_context={"code": pcodes.CODE_NOT_PROVISIONED, "database": db_name},
+            context={"managed_database_id": db_id, "server_id": server_id},
+        )
 
     @staticmethod
     def _load_specs(session, model_id: int) -> list[MigrationSpec]:
@@ -175,7 +269,12 @@ class ManagedMigrationController:
         finally:
             session.close()
 
-        current = self.runner.get_current_version(target, db_name, slug)
+        # ``status`` es una LECTURA cuyo trabajo entero es describir la realidad, así que "la
+        # BD no existe en el motor" es un estado que describir, no un fallo de la petición: se
+        # informa con ``database_exists`` y se devuelve 200. Un 409 acá tiraría justo lo que el
+        # operador necesita para decidir (pendientes, slug, blueprint — todo computable sin el
+        # motor) y dejaría a la SPA pintando un ErrorState sin lugar donde poner el CTA.
+        current, database_exists = self._read_current_version_tolerant(target, db_name, slug)
         latest = specs[-1].version if specs else None
         pending = self.runner.compute_pending(current, specs)
         # Aplicación PARCIAL pendiente: ``current_version`` NO la refleja (Alembic no
@@ -187,6 +286,7 @@ class ManagedMigrationController:
             "managed_database_id": db_id,
             "model_id": model_id,
             "slug": slug,
+            "database_exists": database_exists,
             "current_version": current,
             "latest_available": latest,
             "pending_count": len(pending),
@@ -734,8 +834,13 @@ class ManagedMigrationController:
         quitaría el diagnóstico. Precedente exacto del criterio: ``_guard_quarantine`` recibe
         ``dry_run`` y se saltea. El guard real vive en ``_run_apply``, que este camino no
         ejecuta.
+
+        Por el mismo criterio, una BD que NO existe en el motor tampoco hace fallar el
+        dry-run: se informa con ``database_exists`` y ``no_op``, que es exactamente el
+        diagnóstico que el operador vino a buscar.
+
         """
-        current = self.runner.get_current_version(target, db_name, slug)
+        current, database_exists = self._read_current_version_tolerant(target, db_name, slug)
         pending = self.runner.compute_pending(current, specs, up_to_version)
         pending_versions = [s.version for s in pending]
         blocked_by: list[str] = []
@@ -746,11 +851,13 @@ class ManagedMigrationController:
             "database_name": db_name,
             "server_id": server_id,
             "dry_run": True,
+            "database_exists": database_exists,
             "from_version": current,
             "current_version": current,  # alias retrocompatible
             "to_version": pending_versions[-1] if pending_versions else current,
             "target_version": up_to_version,
-            "no_op": len(pending) == 0,
+            # Sin base física no hay nada que aplicar, por más pendientes que liste el plan.
+            "no_op": len(pending) == 0 or not database_exists,
             "pending_versions": pending_versions,
             "pending_count": len(pending),
             "environment_slug": env_policy[1] if env_policy else None,
@@ -899,8 +1006,18 @@ class ManagedMigrationController:
         # ciegas. Va acá (no en apply()) para cubrir también apply_all, que captura la
         # excepción por BD sin abortar el lote.
         self._guard_partial_down_before_apply(db_id, specs)
-        # Versión ANTES de aplicar (read-only) para reportar el salto from→to.
-        from_version = self.runner.get_current_version(target, db_name, slug)
+        # Versión ANTES de aplicar (read-only) para reportar el salto from→to. Se lee con el
+        # lector TOLERANTE para poder distinguir "sin migraciones" de "sin base": el 404 crudo
+        # del driver (1049/3D000) es indistinguible del 404 de "BD no encontrada en el
+        # inventario", y —peor— dejar seguir el apply termina en ``_set_quarantine`` marcando
+        # la BD en ``error``, que enmascara la causa real. Cuesta cero en el camino feliz, y
+        # cubre ``apply`` Y ``apply_all`` desde este único punto (mismo criterio que los tres
+        # guards de abajo). Un ``list_databases()`` incondicional acá sería N+1 sobre el lote.
+        from_version, database_exists = self._read_current_version_tolerant(
+            target, db_name, slug
+        )
+        if not database_exists:
+            raise self._not_provisioned(db_id, db_name, server_id, op="aplicar migraciones")
         # Las DOS llaves de la captura, sobre las versiones que REALMENTE se van a aplicar en
         # ESTA BD (no sobre todo el blueprint): una versión con captura ya aplicada hace meses
         # no debe exigir el flag para siempre, y una versión POSTERIOR a la objetivo no debe
@@ -1210,7 +1327,12 @@ class ManagedMigrationController:
         # corrupción que este módulo existe para evitar.
         self._guard_partial_before_rollback(db_id, specs)
 
-        current = self.runner.get_current_version(target, db_name, slug)
+        # El chequeo de NO-EXISTENCIA va PRIMERO: el 409 de más abajo ("no tiene ninguna
+        # migración aplicada") es verdadero para una BD vacía y MENTIROSO para una que no
+        # existe, y manda al operador a buscar el problema donde no está.
+        current, database_exists = self._read_current_version_tolerant(target, db_name, slug)
+        if not database_exists:
+            raise self._not_provisioned(db_id, db_name, server_id, op="revertir")
         if current is None:
             raise AppHttpException(
                 message="La BD no tiene ninguna migración aplicada para revertir.",
@@ -1366,10 +1488,17 @@ class ManagedMigrationController:
 
         self._guard_partial_checkpoint(db_id, force)
 
-        self.runner.stamp(
-            target, db_name=db_name, slug=slug, engine=engine,
-            managed_db_id=db_id, specs=specs, version=version,
-        )
+        # ``runner.stamp`` abre conexión a la BD destino, así que una base inexistente YA falla
+        # ahí y nunca llega a ``_set_model_version``/``_set_quarantine``. Lo que faltaba era que
+        # el error dijera algo útil: sin esto sube el 404 genérico del driver, que no distingue
+        # "la base no existe" de "la BD gestionada no está en el inventario" ni nombra la salida.
+        with self._translating_unknown_database(
+            target, db_id, db_name, server_id, op="marcar una versión"
+        ):
+            self.runner.stamp(
+                target, db_name=db_name, slug=slug, engine=engine,
+                managed_db_id=db_id, specs=specs, version=version,
+            )
         self._set_model_version(db_id, version)
         # El stamp es una AFIRMACIÓN explícita del admin ("esta BD está en la versión X"):
         # reconcilia el estado, así que también saca a la BD de cuarentena si un apply
@@ -1754,15 +1883,20 @@ class ManagedMigrationController:
                 f"{row['last_statement_index']} aplicadas"
             ),
         )
-        results = self.runner.reconcile_partial(
-            target,
-            db_name=db_name,
-            engine=engine,
-            managed_db_id=db_id,
-            spec=spec,
-            inverses=plan["inverses"],
-            total_statements=row["total_statements"],
-        )
+        # Mismo criterio que ``stamp``: el runner ya abre conexión al destino, así que acá solo
+        # se traduce el 404 opaco a un 409 que nombra la salida.
+        with self._translating_unknown_database(
+            target, db_id, db_name, server_id, op="reconciliar"
+        ):
+            results = self.runner.reconcile_partial(
+                target,
+                db_name=db_name,
+                engine=engine,
+                managed_db_id=db_id,
+                spec=spec,
+                inverses=plan["inverses"],
+                total_statements=row["total_statements"],
+            )
         failed = any(r.status == "failed" for r in results)
         remaining = migration_progress.get_progress(db_id, spec.id, "up")
         fully_reconciled = not failed and remaining is None
