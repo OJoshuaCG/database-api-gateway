@@ -1,0 +1,128 @@
+# `alembic upgrade head` contra motores REALES y efímeros.
+#
+# QUÉ AGREGA SOBRE migration-graph.yml — no se solapan
+# ---------------------------------------------------
+# `migration-graph.yml` lee los fuentes con `ast` y verifica la FORMA del grafo: que
+# haya un solo head y que la cadena sea alcanzable. No ejecuta nada, así que no puede
+# ver si el DDL de una migración es válido. Una revisión con un `op.alter_column` que
+# el motor rechaza pasa ese guard y rompe recién en el deploy — y acá se despliega
+# directo desde main, con las migraciones inline en el arranque del contenedor
+# (`entrypoint.sh`), así que el fallo se ve como un contenedor en loop de reinicios.
+#
+# Este workflow las APLICA de verdad, en los dos motores que el gateway soporta para su
+# propia BD de metadatos. Es el "gate de migración (MariaDB efímera)" que pide
+# docs/plans/08-production-readiness.md.
+#
+# Se prueba el `downgrade` de la última revisión a propósito: el repo tiene deuda
+# registrada de `downgrade()` rotos (P-27), y un downgrade que no funciona significa
+# que no hay vuelta atrás cuando una migración sale mal en producción.
+#
+# Sin `.env` ni secretos: alembic/env.py arma la URL desde las variables DB_* que lee
+# app/core/environments.py, y `APP_ENV=development` evita los guards de arranque que
+# exigen ADMIN_PASSWORD y orígenes CORS explícitos en producción.
+name: Migraciones aplicables
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Mínimo privilegio para el GITHUB_TOKEN. Sin esto corre con los permisos amplios por
+# defecto, y ninguno de estos jobs necesita escribir nada: solo leen el árbol. Importa
+# porque una acción de terceros comprometida hereda el token del workflow.
+permissions:
+  contents: read
+
+# Un push nuevo al mismo PR vuelve obsoleta la corrida anterior: se cancela para no
+# quemar minutos. En `main` NO se cancela: ahí cada corrida es el gate de un commit que
+# ya se desplegó, y perderla es perder la verificación.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  mariadb:
+    name: MariaDB efímera
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: ci-root
+          MARIADB_DATABASE: gateway_ci
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    env:
+      APP_ENV: development
+      DB_ENGINE: mysql+pymysql
+      DB_HOST: 127.0.0.1
+      DB_PORT: '3306'
+      DB_USER: root
+      DB_PASS: ci-root
+      DB_NAME: gateway_ci
+      SECRET_KEY: ci-solo-para-migraciones
+      CRYPTO_KEY_SALT: ci-salt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+
+      - name: upgrade head
+        run: uv run alembic upgrade head
+
+      # Que el upgrade haya salido por 0 no dice que la BD quedó EN head: una
+      # migración puede aplicar su DDL y no mover el puntero. `alembic current` imprime
+      # la revisión con el sufijo `(head)` solo cuando no queda nada por aplicar
+      # (verificado a mano contra un SQLite temporal: imprime `a6b7c8d9e0f1 (head)`).
+      - name: la BD quedó EN head
+        run: uv run alembic current | grep -q '(head)'
+
+      - name: downgrade de la última revisión, y de vuelta
+        run: |
+          uv run alembic downgrade -1
+          uv run alembic upgrade head
+
+  postgres:
+    name: PostgreSQL efímero
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ci-root
+          POSTGRES_DB: gateway_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd=pg_isready
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    env:
+      APP_ENV: development
+      DB_ENGINE: postgresql+psycopg
+      DB_HOST: 127.0.0.1
+      DB_PORT: '5432'
+      DB_USER: postgres
+      DB_PASS: ci-root
+      DB_NAME: gateway_ci
+      SECRET_KEY: ci-solo-para-migraciones
+      CRYPTO_KEY_SALT: ci-salt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+
+      - name: upgrade head
+        run: uv run alembic upgrade head
+
+      - name: la BD quedó EN head
+        run: uv run alembic current | grep -q '(head)'
+
+      - name: downgrade de la última revisión, y de vuelta
+        run: |
+          uv run alembic downgrade -1
+          uv run alembic upgrade head
