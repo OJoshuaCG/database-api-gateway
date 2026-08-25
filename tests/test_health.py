@@ -43,11 +43,23 @@ def test_health_endpoints_send_cors_header(client):
     aunque la respuesta llegue con 200).
     """
     origin = "http://localhost:5173"
-    r = client.get("/health", headers={"Origin": origin})
-    assert r.headers.get("access-control-allow-origin") == origin
-
-    r = client.get("/health/ready", headers={"Origin": origin})
-    assert r.headers.get("access-control-allow-origin") == origin
+    for path in ("/health", "/health/ready"):
+        acao = client.get(path, headers={"Origin": origin}).headers.get(
+            "access-control-allow-origin"
+        )
+        # Se verifica la GARANTÍA (el navegador puede leer la respuesta desde `origin`),
+        # no su codificación: son dos formas válidas de lo mismo y cuál sale depende de la
+        # config, no del middleware.
+        #
+        # Con `CORS_ORIGINS="*"` —el default de `environments.py` y lo que hay en el
+        # entorno de test, que no lo fija— Starlette responde `*`; con una lista EXPLÍCITA
+        # refleja el origin. La aserción original exigía el reflejo, así que estaba roja
+        # con la única config bajo la que corre. No se puede cubrir la otra forma acá: el
+        # middleware se construye al importar `main` con el valor ya leído, así que
+        # cambiar la variable después no lo afecta.
+        #
+        # Lo que esto sí protege es la regresión del docstring: que el header NO salga.
+        assert acao in ("*", origin), f"{path} respondió ACAO={acao!r}"
 
 
 def test_v1_cors_preflight_not_blocked_by_main_app_cors(client):

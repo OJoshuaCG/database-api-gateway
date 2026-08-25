@@ -133,9 +133,28 @@ def test_structural_snapshot_excludes_the_version_table(monkeypatch):
     # Doble liviano: se invoca el método REAL (sin ligar) sobre un objeto que solo aporta
     # los hooks que ``structural_snapshot`` usa. Evita implementar los ~13 métodos
     # abstractos de ServerAdapter, que no participan de este caso.
+    #
+    # Los hooks que YA tienen implementación real en ``ServerAdapter`` se toman prestados de
+    # ahí, no se stubbean. El doble solo define los abstractos, que es lo que justifica que
+    # exista.
+    #
+    # No es un detalle de estilo: este test estuvo ROTO sin que nadie lo viera porque se
+    # escribió con duck-typing contra el conjunto de hooks que ``structural_snapshot`` usaba
+    # EN SU MOMENTO. Después aparecieron ``_conn_ctx`` (la inyección de conexión de la
+    # exportación, §6.4) y ``_database_defaults``, y el doble dejó de encajar: moría con
+    # AttributeError y el test pasó a no cubrir nada. Prestando los reales, un hook nuevo con
+    # default se hereda solo y solo rompe el test si de verdad cambia el contrato.
+    #
+    # Con ``_conn_ctx`` hay un motivo extra: es quien abre la conexión ahora, y con
+    # ``conn=None`` cae al camino histórico (``database_connection`` propia), así que el
+    # ``monkeypatch`` de abajo vuelve a tener efecto. Con un stub el test pasaría sin
+    # ejercitar la ruta que usa producción.
     class _FakeAdapter:
         dialect = "mysql"
         target = None
+
+        _conn_ctx = ba.ServerAdapter._conn_ctx
+        _database_defaults = ba.ServerAdapter._database_defaults
 
         def _inspect_schema(self, database):
             return database
