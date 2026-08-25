@@ -75,6 +75,34 @@ lo que le agregues lo paga todo el equipo en todas sus
 conversaciones. Mové el contenido a docs/ (las 7 reglas están al
 principio del propio CLAUDE.md)."
 
+# Ruff, el MISMO set que bloquea en CI.
+#
+# Va aparte de run_guard porque, a diferencia de los otros dos, NO es stdlib: necesita el
+# venv. Así que es best-effort y se SALTEA en silencio si ruff no está — el hook no puede
+# fallar por una razón ajena a lo que verifica, y `uv sync` puede no haberse corrido nunca en
+# este clon.
+#
+# No se pasa ningún `--select`: el set vive en `[tool.ruff.lint]` de pyproject.toml, así que
+# esto da exactamente lo mismo que el gate. Duplicar las reglas acá es garantizar que un día
+# digan cosas distintas.
+RUFF=""
+if [ -x "$REPO_ROOT/.venv/bin/ruff" ]; then
+    RUFF="$REPO_ROOT/.venv/bin/ruff"
+elif command -v ruff >/dev/null 2>&1; then
+    RUFF="ruff"
+fi
+
+if [ -n "$RUFF" ]; then
+    if ! (cd "$REPO_ROOT" && "$RUFF" check .); then
+        echo ""
+        echo "pre-push ABORTADO: ruff encontro hallazgos que BLOQUEAN el merge en CI."
+        echo "Son errores reales (imports huerfanos, variables sin usar, nombres"
+        echo "indefinidos), no estilo. Arreglalos ahora y te ahorras la vuelta del PR."
+        echo ""
+        FAILED=1
+    fi
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     echo "Para saltear esto a sabiendas: git push --no-verify"
     exit 1
