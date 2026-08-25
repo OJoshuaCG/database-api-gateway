@@ -31,6 +31,7 @@ from app.core.environments import (
 )
 from app.core.logger import get_logger
 from app.exceptions import AppHttpException
+from app.models.audit_log import AuditLog
 from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
 from app.models.enums import EngineType, MigrationStatus
@@ -38,6 +39,7 @@ from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
 from app.services import audit
+from app.services import confirm_token as confirm_token_service
 from app.services import migration_freeze_catalog as freeze_codes
 from app.services.db_admin import migration_facts, migration_progress, migration_results
 from app.services.db_admin.factory import get_adapter
@@ -421,6 +423,11 @@ class ModelMigrationController:
         # BD dependa de la versión HOY. Ver el bloque de ``_still_applied_cached``.
         applied_ids = ModelMigrationController._still_applied_cached(session, migrations)
         partial_ids = migration_progress.migrations_with_incomplete_progress(ids, "up")
+        # Una versión editada DESPUÉS de haberse aplicado ya no describe lo que esas BDs
+        # tienen físicamente. No restringe nada (el SQL nuevo es el que corre de acá en
+        # más): es la señal para que la UI no muestre la versión como si fuera fiel al
+        # plano de todas sus BDs.
+        diverged_ids = ModelMigrationController._divergent_migration_ids(session, ids)
 
         flags: dict[int, dict] = {}
         for m in migrations:
@@ -440,6 +447,7 @@ class ModelMigrationController:
                 "deletable": reason is None,
                 # 'not_tip' solo afecta al borrado: esa versión sí se puede editar.
                 "block_reason": reason,
+                "sql_diverged": m.id in diverged_ids,
             }
         return flags
 
@@ -501,6 +509,193 @@ class ModelMigrationController:
             .first()
             is not None
         )
+
+    # ------------------------------------------------------------------ #
+    # Edición de una versión que YA está aplicada                          #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _resulting_checksum(m: ModelMigration, data: dict) -> str:
+        """Checksum que la versión TENDRÁ si se aplica ``data``.
+
+        Es el ``subject`` del ``confirm_token``, y por eso se calcula con la MISMA función
+        que el checksum persistido: el token queda atado al contenido exacto que se
+        previsualizó. Sin eso, ``(operación, model_id, version)`` es igual para cualquier
+        edición de esa versión, así que se podría pedir el preview de una corrección inocua
+        y mandar otra en el PATCH — que es justo lo que la confirmación debe impedir (mismo
+        razonamiento que el ``subject`` de la consola SQL).
+
+        Las reglas de asignación replican las de ``update_migration``, y tienen que seguir
+        haciéndolo: se mira la PRESENCIA de la clave (el PATCH llega con
+        ``exclude_unset=True``), salvo ``up_sql``, que con ``None`` no se asigna porque el
+        SQL base no puede quedar vacío. Si divergen, el token deja de coincidir y el PATCH
+        se rechaza con 422 — falla en la dirección segura, pero es ruido evitable.
+        """
+        up = data["up_sql"] if data.get("up_sql") is not None else m.up_sql
+        # ``.get(k, default)`` y no ``if k in data``: con la clave PRESENTE y valor ``None``
+        # (limpiar un override) devuelve None, que es justo el SQL efectivo resultante.
+        my = data.get("up_sql_mysql", m.up_sql_mysql)
+        pg = data.get("up_sql_postgresql", m.up_sql_postgresql)
+        down = data.get("down_sql", m.down_sql)
+        return compute_checksum(up, my, pg, down, m.version)
+
+    @classmethod
+    def _authorize_applied_edit(
+        cls,
+        m: ModelMigration,
+        *,
+        data: dict,
+        confirm_version: str | None,
+        confirm_token: str | None,
+        blocking: list[dict],
+        model_id: int,
+        version: str,
+    ) -> None:
+        """Deja pasar la edición de una versión VIGENTE, o lanza el 409/422 que corresponda.
+
+        El freeze NO se abre solo: sin los dos factores, la respuesta es el mismo 409
+        ``model_migration.sql_frozen`` de siempre, con el mismo ``public_context``. Lo único
+        que cambia es que el mensaje ahora NOMBRA la vía de excepción, porque un 409 que
+        oculta la única salida obliga a leer el código para encontrarla.
+
+        Los dos factores son los del resto del repo y cubren cosas distintas:
+        ``confirm_version`` obliga a identificar CONSCIENTEMENTE qué versión se toca (molde
+        de ``confirm_target_name``), y ``confirm_token`` da frescura, anti-replay y —vía
+        ``subject``— ata la autorización al SQL exacto que se previsualizó.
+
+        Se reusa ``confirm_token`` con ``server_id=model_id`` y ``db_name=version``. No es
+        una identidad física de BD como en el resto de sus usos, pero el HMAC no interpreta
+        esos campos: solo los firma. Se documenta acá para que nadie lea el token de una
+        edición de blueprint como si apuntara a un servidor.
+        """
+        if not confirm_token:
+            raise AppHttpException(
+                message=(
+                    "No se puede modificar el SQL: "
+                    f"{cls._describe_blocking(blocking)} Cree una nueva versión para "
+                    "corregir (fix-forward), o revierta esas BDs primero. Si la corrección "
+                    "tiene que quedar en ESTA versión para que las BDs nuevas no repitan el "
+                    "defecto, pida el preview de edición y reenvíe el PATCH con "
+                    "'confirm_version' y 'confirm_token': la edición NO re-ejecuta nada, así "
+                    "que esas BDs quedarán divergentes y el gateway lo registrará."
+                ),
+                status_code=409,
+                public_context={
+                    "code": freeze_codes.CODE_SQL_FROZEN,
+                    "version": version,
+                    "blocking_databases": blocking,
+                    # La UI necesita distinguir "no se puede" de "se puede confirmando".
+                    "override_available": True,
+                },
+                context={"model_id": model_id, "version": version},
+            )
+        if confirm_version != version:
+            raise AppHttpException(
+                message=(
+                    "La confirmación no coincide: para editar una versión ya aplicada, "
+                    f"'confirm_version' debe ser exactamente '{version}'."
+                ),
+                status_code=422,
+                public_context={
+                    "code": freeze_codes.CODE_EDIT_CONFIRM_MISMATCH,
+                    "version": version,
+                },
+                context={"model_id": model_id, "version": version},
+            )
+        confirm_token_service.verify(
+            confirm_token,
+            freeze_codes.CONFIRM_OPERATION,
+            model_id,
+            version,
+            subject=cls._resulting_checksum(m, data),
+        )
+
+    @staticmethod
+    def _divergent_migration_ids(session, migration_ids: list[int]) -> set[int]:
+        """IDs de versión cuyo SQL se editó DESPUÉS de haberse aplicado en alguna BD.
+
+        Una sola query en lote para toda la página (mismo criterio que
+        ``_applied_history_targets``: por fila serían N consultas para pintar una insignia).
+
+        **No se filtra por ``status``** a propósito. La vía de edición escribe una entrada
+        ``attempt`` fail-closed ANTES de commitear y una ``success`` después; si el proceso
+        muere entre las dos, queda solo el ``attempt`` — y esa versión igual puede haber
+        quedado divergente. Contar únicamente los ``success`` haría desaparecer justo el caso
+        que peor se diagnostica. Fail-closed: marcar de más es ruido, marcar de menos es la
+        mentira silenciosa que toda esta vía existe para evitar.
+        """
+        if not migration_ids:
+            return set()
+        rows = (
+            session.query(AuditLog.target_id)
+            .filter(
+                AuditLog.action == freeze_codes.AUDIT_ACTION_EDITED_AFTER_APPLY,
+                AuditLog.target_type == freeze_codes.AUDIT_TARGET_TYPE,
+                AuditLog.target_id.in_(migration_ids),
+            )
+            .distinct()
+            .all()
+        )
+        return {r[0] for r in rows if r[0] is not None}
+
+    def preview_sql_edit(
+        self, model_id: int, version: str, data: dict, *, admin: dict | None = None
+    ) -> dict:
+        """Emite el ``confirm_token`` para editar una versión, y dice a QUIÉN va a divergir.
+
+        Es de solo lectura sobre el inventario, pero **sí lee la versión del motor** de cada
+        BD con historial (``_still_applied_live``): el conjunto de BDs que van a quedar
+        divergentes es la información por la que existe esta llamada, y una caché atrasada
+        la volvería una promesa. Por eso también se audita.
+
+        Si la versión NO está vigente en ninguna BD, se devuelve ``requires_confirmation``
+        en False y **sin token**: ese caso ya lo permite el PATCH común, y emitir un token
+        que no hace falta entrena a mandarlo siempre.
+        """
+        session = self._session()
+        try:
+            self._model_or_404(session, model_id)
+            m = self._migration_or_404(session, model_id, version)
+            # ``touched_engine`` tiene que reflejar si se CONTACTÓ el motor, no si el
+            # resultado fue bloqueante: con historial se abre conexión aunque después todas
+            # las BDs estén por debajo de la versión y ``blocking`` salga vacío.
+            consulted_engine = self._has_successful_application(session, m.id)
+            blocking = self._still_applied_live(session, m) if consulted_engine else []
+            resulting = self._resulting_checksum(m, data)
+            # Se copia el id ANTES de cerrar: fuera del ``with`` la instancia queda
+            # DETACHED y tocar un atributo puede intentar recargarlo sobre una sesión
+            # cerrada. La auditoría va después del cierre para no sostener la conexión.
+            migration_id = m.id
+            token = expires = None
+            if blocking:
+                token, expires = confirm_token_service.issue(
+                    freeze_codes.CONFIRM_OPERATION,
+                    model_id,
+                    version,
+                    subject=resulting,
+                )
+        finally:
+            session.close()
+        audit.record(
+            "migration.edit_preview",
+            admin=admin,
+            target_type=freeze_codes.AUDIT_TARGET_TYPE,
+            target_id=migration_id,
+            touched_engine=consulted_engine,
+            detail=(
+                f"preview de edición de la versión {version} del blueprint {model_id}: "
+                f"{len(blocking)} BD(s) quedarían divergentes"
+            ),
+        )
+        return {
+            "model_id": model_id,
+            "version": version,
+            "requires_confirmation": bool(blocking),
+            "blocking_databases": blocking,
+            "resulting_checksum": resulting,
+            "confirm_version": version,
+            "confirm_token": token,
+            "expires_at": expires,
+        }
 
     # ------------------------------------------------------------------ #
     # Lectura                                                             #
@@ -1026,6 +1221,11 @@ class ModelMigrationController:
     def update_migration(
         self, model_id: int, version: str, data: dict, *, admin: dict | None = None
     ) -> dict:
+        # Se SACAN de ``data`` antes de cualquier otra cosa: son factores de
+        # autorización, no campos de la migración, y dejarlos adentro los expondría a
+        # los bucles de asignación de más abajo.
+        confirm_version = data.pop("confirm_version", None)
+        confirm_token = data.pop("confirm_token", None)
         session = self._session()
         try:
             self._model_or_404(session, model_id)
@@ -1063,23 +1263,22 @@ class ModelMigrationController:
             # HOY, y eso se confirma leyendo el motor. La lectura en vivo se hace únicamente
             # cuando de verdad se está por cambiar el SQL, para no abrir conexiones en un
             # PATCH que solo toca el nombre.
+            # ``diverging`` queda con las BDs que este PATCH vuelve divergentes: ya no
+            # van a coincidir con el SQL que la versión declara. Es lo que se audita.
+            diverging: list[dict] = []
             if applied_successfully and sql_fields_changing:
                 blocking = self._still_applied_live(session, m)
                 if blocking:
-                    raise AppHttpException(
-                        message=(
-                            "No se puede modificar el SQL: "
-                            f"{self._describe_blocking(blocking)} Cree una nueva versión "
-                            "para corregir (fix-forward), o revierta esas BDs primero."
-                        ),
-                        status_code=409,
-                        public_context={
-                            "code": freeze_codes.CODE_SQL_FROZEN,
-                            "version": version,
-                            "blocking_databases": blocking,
-                        },
-                        context={"model_id": model_id, "version": version},
+                    self._authorize_applied_edit(
+                        m,
+                        data=data,
+                        confirm_version=confirm_version,
+                        confirm_token=confirm_token,
+                        blocking=blocking,
+                        model_id=model_id,
+                        version=version,
                     )
+                    diverging = blocking
 
             # Una aplicación PARCIAL (checkpoint de sentencia incompleto: algunas
             # sentencias del up_sql ACTUAL ya commitearon en alguna BD, pero no todas)
@@ -1118,6 +1317,41 @@ class ModelMigrationController:
                 data.get("up_sql"), data.get("up_sql_mysql"),
                 data.get("up_sql_postgresql"), data.get("down_sql"),
             )
+
+            # Rastro de la divergencia: FAIL-CLOSED (si no se puede persistir,
+            # ``record_intent`` lanza 500 y la edición NO ocurre) y en ESTE punto exacto,
+            # que no es casual. Va DESPUÉS de todos los guards —si alguno rechazara luego,
+            # quedaría un 'attempt' marcando como divergente una versión que nadie llegó a
+            # tocar— y ANTES de la primera mutación, porque a partir de la próxima línea la
+            # transacción toma el lock de escritura sobre la BD de metadatos y la sesión
+            # aparte que abre ``record_intent`` no podría commitear (en SQLite es un
+            # 'database is locked' duro; en MySQL/PG funcionaría, y esa diferencia es
+            # justamente la que haría que el fallo apareciera recién en los tests).
+            #
+            # Que sea fail-closed es deliberado: el valor entero de esta vía está en que la
+            # divergencia quede registrada. Una edición de una versión vigente SIN rastro es
+            # exactamente el daño que el freeze impedía, así que perder el registro tiene
+            # que costar la operación. Mismo criterio que ``reveal_password`` y la descarga
+            # de un export.
+            if diverging:
+                previous_checksum = m.checksum
+                divergent_ids = ", ".join(
+                    str(row["managed_database_id"]) for row in diverging
+                )
+                audit.record_intent(
+                    freeze_codes.AUDIT_ACTION_EDITED_AFTER_APPLY,
+                    admin=admin,
+                    target_type=freeze_codes.AUDIT_TARGET_TYPE,
+                    target_id=m.id,
+                    touched_engine=False,
+                    detail=(
+                        f"blueprint {model_id}: se edita el SQL de la versión {version}, "
+                        f"vigente en {len(diverging)} BD(s). La edición NO re-ejecuta "
+                        f"nada: esas BDs conservan FÍSICAMENTE lo que ya corrió y la "
+                        f"versión deja de describirlas. BDs divergentes: {divergent_ids}. "
+                        f"checksum previo {previous_checksum}"
+                    ),
+                )
 
             if "name" in data and data["name"] is not None:
                 m.name = data["name"]
@@ -1250,6 +1484,21 @@ class ModelMigrationController:
                    if capture_review_reset else "")
             ),
         )
+        if diverging:
+            # Segunda entrada, ya con el checksum nuevo: cierra el par attempt/success.
+            # ``_divergent_migration_ids`` NO filtra por status justamente para que un
+            # proceso que muera entre las dos siga marcando la versión como divergente.
+            audit.record(
+                freeze_codes.AUDIT_ACTION_EDITED_AFTER_APPLY,
+                admin=admin,
+                target_type=freeze_codes.AUDIT_TARGET_TYPE,
+                target_id=result["id"],
+                touched_engine=False,
+                detail=(
+                    f"blueprint {model_id}: versión {version} editada estando vigente en "
+                    f"{len(diverging)} BD(s); checksum nuevo {result['checksum']}"
+                ),
+            )
         if reviewed_approved:
             audit.record(
                 "migration.review",

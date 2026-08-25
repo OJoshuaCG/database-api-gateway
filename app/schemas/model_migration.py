@@ -51,9 +51,11 @@ class ModelMigrationPatch(BaseModel):
         min_length=1,
         max_length=_MAX_SQL,
         description=(
-            "Corrige el SQL base del delta (dialecto de referencia: MySQL). SOLO permitido "
-            "si la migración NO se ha aplicado en ninguna BD (409 si ya se aplicó → usa "
-            "fix-forward). Al cambiarlo se regenera el rollback sugerido y el checksum."
+            "Corrige el SQL base del delta (dialecto de referencia: MySQL). Si alguna BD "
+            "tiene la versión aplicada HOY, el default sigue siendo 409 "
+            "'model_migration.sql_frozen' (fix-forward); para editarla igual hay que "
+            "reenviar 'confirm_version' + 'confirm_token' del edit-preview, asumiendo la "
+            "divergencia. Al cambiarlo se regenera el rollback sugerido y el checksum."
         ),
     )
     down_sql: str | None = Field(None, max_length=_MAX_SQL, description="Confirma el rollback de esta versión")
@@ -78,6 +80,27 @@ class ModelMigrationPatch(BaseModel):
             "para eso está DELETE .../migrations/{version}/select-results."
         ),
     )
+    confirm_version: str | None = Field(
+        None,
+        description=(
+            "SOLO para editar el SQL de una versión que alguna BD tiene aplicada HOY. Debe "
+            "ser exactamente la versión de la ruta; obliga a identificar conscientemente qué "
+            "se toca (mismo criterio que 'confirm_target_name' al borrar una BD). Va junto "
+            "con 'confirm_token'; sin ambos, la edición sigue respondiendo 409 "
+            "'model_migration.sql_frozen'."
+        ),
+    )
+    confirm_token: str | None = Field(
+        None,
+        description=(
+            "Token emitido por POST .../migrations/{version}/edit-preview, atado al SQL "
+            "EXACTO que se previsualizó (TTL corto). Si el SQL de este PATCH no es el que se "
+            "previsualizó, el token no valida (422). ATENCIÓN: editar NO re-ejecuta nada — "
+            "las BDs que ya aplicaron la versión conservan físicamente lo que corrió y "
+            "quedan divergentes; el gateway lo registra en auditoría y marca la versión con "
+            "'sql_diverged'."
+        ),
+    )
 
 
 _SQL_FACTS_DESC = (
@@ -97,6 +120,14 @@ _DELETABLE_DESC = (
     "True = el DELETE de esta versión pasaría hoy: es la punta de la secuencia, ninguna BD la "
     "aplicó con éxito y no hay aplicación parcial sin resolver."
 )
+_SQL_DIVERGED_DESC = (
+    "True = el SQL de esta versión se editó DESPUÉS de que alguna BD la aplicara, así que "
+    "esa(s) BD(s) conservan físicamente lo que corrió antes y esta versión ya no las "
+    "describe. NO restringe nada —el SQL nuevo es el que se aplica de acá en más— pero la "
+    "UI no debería mostrar la versión como fiel al plano de todas sus BDs. El detalle (qué "
+    "BDs, cuándo, con qué checksum previo) está en el log de auditoría, acción "
+    "'migration.sql_edited_after_apply'."
+)
 _BLOCK_REASON_DESC = (
     "Por qué está restringida, o null si no lo está: 'applied' (alguna BD depende de ella), "
     "'partial' (aplicación a medias sin resolver) o 'not_tip' (hay versiones posteriores). "
@@ -112,6 +143,7 @@ class ModelMigrationSummary(BaseModel):
     sql_frozen: bool = Field(False, description=_SQL_FROZEN_DESC)
     deletable: bool = Field(True, description=_DELETABLE_DESC)
     block_reason: str | None = Field(None, description=_BLOCK_REASON_DESC)
+    sql_diverged: bool = Field(False, description=_SQL_DIVERGED_DESC)
 
     id: int
     model_id: int
@@ -143,6 +175,7 @@ class ModelMigrationOut(BaseModel):
     sql_frozen: bool = Field(False, description=_SQL_FROZEN_DESC)
     deletable: bool = Field(True, description=_DELETABLE_DESC)
     block_reason: str | None = Field(None, description=_BLOCK_REASON_DESC)
+    sql_diverged: bool = Field(False, description=_SQL_DIVERGED_DESC)
 
     id: int
     model_id: int
@@ -736,4 +769,61 @@ class MigrationValidateOut(BaseModel):
     collation_conflicts: list[str] = Field(
         default_factory=list,
         description="COLLATE forzados que difieren del declarado por el blueprint.",
+    )
+
+
+class MigrationEditPreviewIn(BaseModel):
+    """
+    Cuerpo de ``POST .../migrations/{version}/edit-preview``.
+
+    Son los MISMOS campos de SQL del PATCH, y tienen que serlo: el token se ata al checksum
+    que la versión tendrá una vez aplicados, así que previsualizar con un SQL y mandar otro
+    en el PATCH invalida el token. Los campos no enviados conservan su valor actual, igual
+    que en el PATCH.
+    """
+
+    up_sql: str | None = Field(None, min_length=1, max_length=_MAX_SQL)
+    down_sql: str | None = Field(None, max_length=_MAX_SQL)
+    up_sql_mysql: str | None = Field(None, max_length=_MAX_SQL)
+    up_sql_postgresql: str | None = Field(None, max_length=_MAX_SQL)
+
+
+class MigrationEditPreviewOut(BaseModel):
+    """
+    Qué habilita la edición y a QUIÉN va a dejar divergente.
+
+    ``blocking_databases`` no es informativo de más: es el conjunto de BDs cuyo plano físico
+    va a dejar de coincidir con lo que la versión declara. Se lee del MOTOR, no de la caché
+    del inventario, porque es la información por la que existe esta llamada.
+    """
+
+    model_id: int
+    version: str
+    requires_confirmation: bool = Field(
+        ...,
+        description=(
+            "False = ninguna BD tiene esta versión vigente, así que el PATCH común ya la "
+            "edita y NO se emite token. True = hace falta reenviar 'confirm_version' + "
+            "'confirm_token' en el PATCH."
+        ),
+    )
+    blocking_databases: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "BDs que hoy tienen la versión aplicada y quedarán divergentes. Cada ítem trae "
+            "'managed_database_id', 'reason' (vocabulario cerrado: still_applied, "
+            "unreadable, unknown_database, unknown_blueprint) y 'current_version'. Una BD "
+            "ILEGIBLE cuenta como bloqueante (fail-closed): un motor caído no es prueba de "
+            "que ya no tenga la versión."
+        ),
+    )
+    resulting_checksum: str = Field(
+        ..., description="Checksum que tendrá la versión con el SQL propuesto."
+    )
+    confirm_version: str = Field(..., description="Valor a reenviar en el PATCH.")
+    confirm_token: str | None = Field(
+        None, description="Token a reenviar en el PATCH. null si no hace falta confirmar."
+    )
+    expires_at: datetime | None = Field(
+        None, description="Vencimiento del token. Vencido: pedir el preview de nuevo (410)."
     )
