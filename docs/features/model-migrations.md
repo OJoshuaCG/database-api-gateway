@@ -891,6 +891,61 @@ compartido con la consola SQL), `app/models/migration_select_result.py`, migraci
 aprobación al editar el SQL en `model_migration_controller.py::update_migration`, y la tarea
 periódica de purga en `main.py::_purge_captures_periodically`.
 
+## El timeout de sentencia va por OPERACIÓN, no por versión
+
+`apply`, `rollback` y `reconcile-partial` ejecutan **DDL del usuario**, así que corren con el
+timeout de volcado (`REMOTE_BULK_STATEMENT_TIMEOUT_MS`, 1 h por default; `0` = sin límite).
+`stamp` y la lectura de la versión actual **no**: se quedan con el interactivo de 15 s, porque no
+ejecutan SQL del usuario y una escritura de metadatos que tarda una hora tiene que fallar rápido.
+
+**El eje es la operación, y no la versión.** Lo natural es pensar al revés —"esta migración tiene
+DDL pesado, marquémosla"— y no funciona: cuánto tarda un `ALTER TABLE` depende del **volumen de
+datos de la BD destino**, no del texto de la sentencia. La misma versión es instantánea en una
+hermana chica y tarda minutos en una grande, y una que hoy tarda dos segundos va a tardar cinco
+cuando la tabla crezca. Una marca por versión codificaría una propiedad que la versión no tiene.
+
+**Por qué los 15 s no eran una protección.** El reflejo es que subir el timeout deja pasar una
+migración descontrolada. Con *ese* timeout no era así: en MySQL/MariaDB son
+`read_timeout`/`write_timeout` **de socket, del CLIENTE**, y **no cancelan nada en el motor**. Lo
+que hacían era romper la conexión mientras el servidor seguía ejecutando, así que:
+
+1. el checkpoint no registraba la sentencia,
+2. el motor la completaba igual,
+3. el próximo `apply` la reejecutaba,
+4. y volvía a cortar a los 15 s.
+
+Un **bucle que no termina**, con la contabilidad desincronizada del plano físico — el estado que
+todo este módulo está diseñado para evitar. No limitaba el daño: solo le hacía perder el rastro al
+gateway. En PostgreSQL sí es un `statement_timeout` de servidor (cancela limpio), y ahí el DDL
+transaccional hace que un fallo se deshaga solo.
+
+**Consecuencia operativa que hay que aceptar:** `POST /migrations/apply` es síncrono, así que un
+apply largo sostiene la request y su hilo mientras dura. Es el mismo costo que ya asumió la
+conversión de collation, y la alternativa era el bucle.
+
+### El proxy sigue cortando a los 60 s, y eso es OTRO problema
+
+`docker/nginx/conf.d/app.conf` tiene `proxy_read_timeout 60s`, así que un apply que tarde más
+devuelve un **504 al cliente** aunque el servidor siga trabajando. **No se subió ese valor acá a
+propósito**: es un timeout de *todos* los endpoints, y dejarlo sin límite convierte cualquier
+request en una que puede colgarse. Merece su propia decisión (probablemente un `location` con
+timeout propio para las rutas de apply, no un default nuevo).
+
+Lo importante es que **ya no es el mismo problema**, y la diferencia es la que hace que este fix
+sirva igual:
+
+| | Antes | Ahora |
+|---|---|---|
+| Conexión a la BD | la mataba el gateway a los 15 s | se sostiene |
+| Checkpoint | **no** registraba la sentencia | la registra |
+| Próximo `apply` | **la reejecutaba ⇒ bucle** | retoma donde iba |
+| Respuesta HTTP | error a los 15 s | 504 del proxy a los 60 s |
+
+El handler es `def` y no `async def`, así que FastAPI lo corre en un hilo del pool y **no lo puede
+cancelar**: cuando nginx deja de esperar, la migración sigue y termina. El estado del servidor
+queda **correcto** — lo que falta es que el operador lo vea, y para eso está
+`GET /managed-databases/{id}/migrations/status`, que informa la versión real y el progreso parcial.
+
 ## Límites y consideraciones
 
 | Límite | Valor |

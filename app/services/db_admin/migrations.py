@@ -732,6 +732,7 @@ class MigrationRunner:
         specs: list[MigrationSpec],
         managed_db_id: int,
         op: str,
+        bulk: bool = False,
     ):
         """
         Context manager que centraliza el preámbulo de toda operación del runner:
@@ -754,6 +755,35 @@ class MigrationRunner:
           conexión) y la defensa es el checkpoint por sentencia + la reconciliación.
 
         Mapea errores de driver a AppHttpException con el ``op`` correspondiente.
+
+        ``bulk`` — el timeout de sentencia, y va por OPERACIÓN, no por versión
+        -------------------------------------------------------------------
+        Lo piden en ``True`` las operaciones que ejecutan **DDL del usuario** (``apply``,
+        ``rollback_to``); ``stamp`` lo deja en ``False`` porque no ejecuta SQL —solo escribe la
+        tabla de versión— y ahí un timeout largo sería un defecto: una escritura de metadatos
+        que tarda una hora tiene que fallar rápido.
+
+        **El eje es la operación y no la versión**, y la distinción importa porque lo natural es
+        pensar al revés: "esta migración tiene DDL pesado, marquémosla". No sirve. Cuánto tarda
+        un ``ALTER TABLE`` depende del **volumen de datos de la BD destino**, no del texto de la
+        sentencia: la MISMA versión es instantánea en una hermana chica y tarda minutos en una
+        grande, y una que hoy tarda dos segundos va a tardar cinco minutos cuando la tabla
+        crezca. Una marca por versión codifica una propiedad que la versión no tiene.
+
+        **Por qué el interactivo de 15s no era una protección que acá se pierda.** El reflejo es
+        que subirlo deja pasar una migración descontrolada, y con ese timeout no era así: en
+        MySQL/MariaDB son ``read_timeout``/``write_timeout`` **de socket, del CLIENTE**
+        (``remote_engine._connect_args``), y **no cancelan nada en el motor**. Lo que hacía era
+        romper la conexión mientras el servidor seguía ejecutando: el checkpoint no registraba
+        la sentencia, el motor la completaba igual, y el próximo ``apply`` la reejecutaba — un
+        bucle que no termina nunca, con la contabilidad desincronizada del plano físico. O sea
+        que no limitaba el daño, solo le hacía perder el rastro al gateway. En PostgreSQL sí es
+        un ``statement_timeout`` de servidor (cancela limpio), y ahí el DDL transaccional hace
+        que un fallo se deshaga solo.
+
+        Consecuencia operativa que hay que aceptar: ``POST /migrations/apply`` es síncrono, así
+        que un apply largo sostiene la request y su hilo mientras dura. Es el mismo costo que ya
+        asumió la conversión de collation, y la alternativa era el bucle.
         """
         version_table = version_table_name(slug)
         transactional = self.use_transactional_ddl(engine, specs)
@@ -766,11 +796,11 @@ class MigrationRunner:
             try:
                 if transactional:
                     with self.advisory_lock(target, engine=engine, lock_key=managed_db_id):
-                        with database_connection(target, db_name) as conn:
+                        with database_connection(target, db_name, bulk=bulk) as conn:
                             cfg = self._make_config(versions_dir, conn, version_table)
                             yield conn, cfg, version_table
                 else:
-                    with database_connection(target, db_name) as conn:
+                    with database_connection(target, db_name, bulk=bulk) as conn:
                         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
                         self._acquire_lock(conn, engine, managed_db_id)
                         try:
@@ -810,7 +840,7 @@ class MigrationRunner:
         transactional = self.use_transactional_ddl(engine, specs)
         with self._prepared(
             target, db_name=db_name, slug=slug, engine=engine, specs=specs,
-            managed_db_id=managed_db_id, op="migration_apply",
+            managed_db_id=managed_db_id, op="migration_apply", bulk=True,
         ) as (conn, cfg, version_table):
             current = self._read_current(conn, version_table)
             pending = self.compute_pending(current, specs, up_to_version)
@@ -946,7 +976,7 @@ class MigrationRunner:
         transactional = self.use_transactional_ddl(engine, specs)
         with self._prepared(
             target, db_name=db_name, slug=slug, engine=engine, specs=specs,
-            managed_db_id=managed_db_id, op="migration_rollback",
+            managed_db_id=managed_db_id, op="migration_rollback", bulk=True,
         ) as (conn, cfg, version_table):
             current = self._read_current(conn, version_table)
             while current is not None and (
@@ -1072,7 +1102,11 @@ class MigrationRunner:
             else:
                 grouped.append((seq, [sql]))
         try:
-            with database_connection(target, db_name) as conn:
+            # ``bulk=True`` por el mismo motivo que ``apply``: los reversos son DDL del usuario
+            # sobre las mismas tablas, así que tardan lo mismo. Y acá cortar por timeout es
+            # peor todavía — es el camino de RECUPERACIÓN de una aplicación parcial, el último
+            # que puede permitirse dejar la BD a mitad de camino.
+            with database_connection(target, db_name, bulk=True) as conn:
                 conn = conn.execution_options(isolation_level="AUTOCOMMIT")
                 self._acquire_lock(conn, engine, managed_db_id)
                 try:

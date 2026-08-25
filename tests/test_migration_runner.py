@@ -340,3 +340,113 @@ def test_sequential_downgrade_to_target_version_sqlite():
             assert r._read_current(conn, vt) == "0001"          # versión actualizada
             tables = set(inspect(conn).get_table_names())
             assert "a" in tables and not {"b", "c", "d"} & tables  # esquema revertido
+
+
+# =========================================================================== #
+# Timeout de sentencia: va por OPERACIÓN, no por versión                      #
+# =========================================================================== #
+def _capture_connection_flags(monkeypatch) -> list[dict]:
+    """
+    Intercepta ``database_connection`` del runner y registra con qué flags se abre cada
+    conexión. Devuelve la lista de llamadas; la conexión cedida es un doble inerte, así que
+    estos tests miran SOLO los flags, no lo que se ejecuta.
+    """
+    from app.services.db_admin import migrations as mig
+
+    calls: list[dict] = []
+
+    @contextmanager
+    def fake_conn(target, db_name, *, bulk=False, **kw):
+        calls.append({"db_name": db_name, "bulk": bulk})
+        raise SQLAlchemyError("corte deliberado: solo interesa el flag de la conexión")
+        yield  # pragma: no cover — inalcanzable, deja la función como generador
+
+    monkeypatch.setattr(mig, "database_connection", fake_conn)
+    return calls
+
+
+def _run_and_swallow(fn):
+    """Ejecuta y se traga el AppHttpException del corte deliberado del doble."""
+    from app.exceptions import AppHttpException
+
+    try:
+        fn()
+    except (AppHttpException, SQLAlchemyError):
+        pass
+
+
+def test_apply_and_rollback_use_the_bulk_timeout(monkeypatch):
+    """
+    `apply` y `rollback_to` ejecutan DDL del usuario, así que van con el timeout de volcado.
+
+    El interactivo de 15 s NO era una protección que acá se pierda: en MySQL/MariaDB son
+    `read_timeout`/`write_timeout` de socket DEL CLIENTE y no cancelan nada en el motor.
+    Rompían la conexión mientras el servidor seguía ejecutando, el checkpoint no registraba la
+    sentencia, el motor la completaba igual y el próximo `apply` la reejecutaba: un bucle que
+    no termina, con la contabilidad desincronizada del plano físico.
+    """
+    from app.core.remote_engine import ServerTarget
+
+    calls = _capture_connection_flags(monkeypatch)
+    runner = MigrationRunner()
+    target = ServerTarget(
+        server_id=1, dialect="mysql", host="10.0.0.5", port=3306,
+        admin_user="root", admin_password="pw",
+    )
+    specs = [_spec("0001", "ALTER TABLE t ADD COLUMN c INT")]
+
+    _run_and_swallow(lambda: runner.apply(
+        target, db_name="db", slug="s", engine=EngineType.mysql,
+        managed_db_id=_NO_MANAGED_DB, specs=specs,
+    ))
+    _run_and_swallow(lambda: runner.rollback_to(
+        target, db_name="db", slug="s", engine=EngineType.mysql,
+        managed_db_id=_NO_MANAGED_DB, specs=specs, to_version=None,
+    ))
+
+    assert calls, "no se llegó a abrir ninguna conexión"
+    assert all(c["bulk"] is True for c in calls), calls
+
+
+def test_stamp_keeps_the_interactive_timeout(monkeypatch):
+    """
+    `stamp` NO ejecuta SQL del usuario: solo escribe la tabla de versión. Un timeout largo
+    ahí sería un defecto, no una mejora — una escritura de metadatos que tarda una hora tiene
+    que fallar rápido.
+
+    Es lo que fija que el eje sea la OPERACIÓN y no el runner entero.
+    """
+    from app.core.remote_engine import ServerTarget
+
+    calls = _capture_connection_flags(monkeypatch)
+    runner = MigrationRunner()
+    target = ServerTarget(
+        server_id=1, dialect="mysql", host="10.0.0.5", port=3306,
+        admin_user="root", admin_password="pw",
+    )
+    specs = [_spec("0001", "ALTER TABLE t ADD COLUMN c INT")]
+
+    _run_and_swallow(lambda: runner.stamp(
+        target, db_name="db", slug="s", engine=EngineType.mysql,
+        managed_db_id=_NO_MANAGED_DB, specs=specs, version="0001",
+    ))
+
+    assert calls, "no se llegó a abrir ninguna conexión"
+    assert all(c["bulk"] is False for c in calls), calls
+
+
+def test_reading_the_current_version_keeps_the_interactive_timeout(monkeypatch):
+    """Leer la versión es un SELECT sobre la tabla de versión: no necesita el timeout largo."""
+    from app.core.remote_engine import ServerTarget
+
+    calls = _capture_connection_flags(monkeypatch)
+    runner = MigrationRunner()
+    target = ServerTarget(
+        server_id=1, dialect="mysql", host="10.0.0.5", port=3306,
+        admin_user="root", admin_password="pw",
+    )
+
+    _run_and_swallow(lambda: runner.get_current_version(target, "db", "s"))
+
+    assert calls, "no se llegó a abrir ninguna conexión"
+    assert all(c["bulk"] is False for c in calls), calls
