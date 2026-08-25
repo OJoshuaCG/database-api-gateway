@@ -593,3 +593,54 @@ class CollationBatchStatusOut(BaseModel):
 
     batch: CollationBatchSummaryOut
     jobs: list[CollationConversionSummaryOut] = Field(default_factory=list)
+
+
+class CollationBlueprintVersionIn(BaseModel):
+    """Materializa el lote como versión del blueprint (y la stampea en sus N BDs)."""
+
+    name: str | None = Field(
+        None,
+        max_length=200,
+        description=(
+            "Nombre de la versión. Por defecto 'Collation <charset>/<collation>'. Se trunca a "
+            "200 caracteres: es el ancho de la columna y MySQL estricto responde 1406."
+        ),
+    )
+
+
+class CollationVersionStampOut(BaseModel):
+    managed_database_id: int
+    ok: bool = False
+    error: str | None = None
+
+
+class CollationBlueprintVersionOut(BaseModel):
+    """
+    Resultado de crear la versión de CONTABILIDAD.
+
+    La versión se crea y se STAMPEA; no está pensada para aplicarse nunca. La conversión ya la
+    hizo cada job leyendo su propio inventario — esto solo evita que el ledger del blueprint
+    mienta sobre lo que sus bases tienen físicamente.
+    """
+
+    batch_id: int
+    model_id: int
+    version: str
+    migration_id: int
+    statement_count: int
+    stamped: list[CollationVersionStampOut] = Field(default_factory=list)
+    pending_stamp: list[int] = Field(
+        default_factory=list,
+        description=(
+            "BDs cuyo stamp falló. La versión NO se borra: existe y es correcta, lo que falta "
+            "es la marca de esas bases, que se puede poner a mano con /migrations/stamp."
+        ),
+    )
+    note: str = Field(
+        ...,
+        description=(
+            "Advertencia estable sobre qué NO garantiza esta versión. Mostrarla: una BD que se "
+            "agregue al blueprint después la tendrá pendiente, y aplicarla le convertiría las "
+            "tablas sin recrearle los objetos con la collation congelada."
+        ),
+    )

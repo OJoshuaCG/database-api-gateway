@@ -44,6 +44,7 @@ o la UI no puede distinguir "en cola" de "colgado".
 from fastapi import APIRouter, Request
 
 from app.controllers.collation_conversion_controller import CollationConversionController
+from app.controllers.database_model_controller import DatabaseModelController
 from app.core.auth import AdminDep
 from app.core.limiter import limiter
 from app.schemas.collation_conversion import (
@@ -52,7 +53,10 @@ from app.schemas.collation_conversion import (
     CollationBatchExecuteOut,
     CollationBatchPlanOut,
     CollationBatchStatusOut,
+    CollationBlueprintVersionIn,
+    CollationBlueprintVersionOut,
 )
+from app.schemas.database_model import CollationDriftOut
 from app.utils.response import ApiResponse, success
 
 router = APIRouter(prefix="/database-models", tags=["Collation Batches"])
@@ -167,3 +171,64 @@ def cancel_collation_batch(
         data=CollationConversionController().cancel_batch(model_id, batch_id, admin=admin),
         message="Cancelación del lote solicitada.",
     )
+
+
+@router.post(
+    "/{model_id}/collation-conversions/{batch_id}/blueprint-version",
+    response_model=ApiResponse[CollationBlueprintVersionOut],
+    status_code=201,
+)
+@limiter.limit("3/minute")
+def create_collation_blueprint_version(
+    request: Request,
+    admin: AdminDep,
+    model_id: int,
+    batch_id: int,
+    payload: CollationBlueprintVersionIn,
+):
+    """
+    🔌 Registra el lote como versión del blueprint y la **stampea** en sus N BDs.
+
+    La versión es CONTABILIDAD de algo ya ocurrido: se crea y se marca, **no se aplica**. La
+    conversión la hizo cada job leyendo su propio inventario, que es lo único que puede recrear
+    los objetos con la collation congelada de cada base.
+
+    Es una llamada explícita del operador y no un hook del worker a propósito: el worker
+    sostiene el advisory lock del motor con la misma clave que `stamp` pide en otra conexión
+    (el `GET_LOCK` esperaría 30 s y daría 409, siempre), no tiene `admin` ni Request ID, y su
+    `except` reetiquetaría como fallida una conversión ya ocurrida e irreversible.
+
+    Rechaza con 409 y `public_context.code` si el lote no terminó bien, si el blueprint tiene
+    bases de otro motor, si alguna activa quedó fuera del lote, si alguna no está en el head,
+    si los conjuntos de tablas difieren, si alguna conversión fue parcial, si alguna base está
+    en cuarentena, o si el SQL supera el tope por versión.
+    """
+    data = CollationConversionController().create_blueprint_version(
+        model_id, batch_id, name=payload.name, admin=admin
+    )
+    return success(
+        data=data,
+        message=f"Versión {data['version']} creada y stampeada. NO se aplicó: es contabilidad.",
+    )
+
+
+@router.get(
+    "/{model_id}/collation-drift",
+    response_model=ApiResponse[CollationDriftOut],
+)
+def get_collation_drift(admin: AdminDep, model_id: int):
+    """
+    Qué BDs del blueprint se desviaron del charset/collation declarado.
+
+    **No abre ninguna conexión al motor** — por eso no lleva rate limit: se compara contra la
+    copia que el gateway ya mantiene en el inventario (y que la conversión sincroniza al
+    terminar). La respuesta declara `source: "cached"` y trae `source_note`: presentar una
+    caché como verdad del motor sería mentir en una pantalla que se usa para decidir
+    conversiones.
+
+    Convierte `DatabaseModel.charset`/`.collation` —que existían con un comentario diciendo
+    que servían para esto y que nadie leía— en una referencia usable. Ojo con `unknown`: no
+    es `ok`, y pintarlos iguales le diría al operador que todo está bien sobre bases de las
+    que no se sabe nada.
+    """
+    return success(data=DatabaseModelController().collation_drift(model_id))

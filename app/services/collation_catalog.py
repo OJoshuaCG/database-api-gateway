@@ -66,9 +66,56 @@ CODE_BATCH_NO_ELIGIBLE_DATABASES = "collation.batch_no_eligible_databases"
 # `target_charset` contra PostgreSQL). No aborta el lote: sale como ítem con `ok:false`.
 CODE_ENGINE_NOT_APPLICABLE = "collation.engine_not_applicable"
 
+# --------------------------------------------------------------------------- #
+# Versión de contabilidad (se crea y se STAMPEA; nunca se aplica)              #
+# --------------------------------------------------------------------------- #
+
+# Algún job del lote no terminó bien. Versionar una conversión que falló afirmaría en el
+# ledger algo que el plano físico no tiene.
+CODE_VERSION_BATCH_NOT_COMPLETE = "collation.version_batch_not_complete"
+
+# El blueprint tiene BDs fuera de la familia MySQL. El SQL de la versión es de MySQL, y una
+# hermana PostgreSQL quedaría con la cadena trabada de forma PERMANENTE: no puede existir un
+# `up_sql_postgresql` válido porque su `LC_COLLATE` es inmutable tras el CREATE DATABASE.
+CODE_VERSION_OTHER_ENGINES = "collation.version_blueprint_has_other_engines"
+
+# Alguna BD activa del blueprint no participó del lote. La versión se STAMPEA en las que
+# participaron; una que quedó afuera la tendría PENDIENTE, y aplicarla le convertiría las
+# tablas sin recrearle los objetos congelados — el incidente que el módulo evita.
+CODE_VERSION_DATABASES_MISSING = "collation.version_databases_missing_from_batch"
+
+# Alguna BD del lote no está en el head del blueprint. Dos motivos independientes: el SQL sale
+# de un inventario que no refleja las versiones intermedias, y stampear `max+1` afirmaría que
+# esas intermedias se aplicaron.
+CODE_VERSION_NOT_AT_HEAD = "collation.version_not_at_head"
+
+# Los conjuntos de tablas de los jobs no coinciden: hay deriva estructural entre las BDs del
+# blueprint que hay que resolver antes de declarar una versión común.
+CODE_VERSION_TABLE_SETS_DIFFER = "collation.version_table_sets_differ"
+
+# Algún job convirtió solo una parte de sus tablas. Convertir parcialmente UNA base es una
+# decisión informada del operador; propagar esa incoherencia de FKs a N bases como versión de
+# blueprint no es la misma decisión.
+CODE_VERSION_PARTIAL_SELECTION = "collation.version_partial_selection"
+
+# El `up_sql` supera el tope de tamaño por versión.
+CODE_VERSION_TOO_LARGE = "collation.version_too_large"
+
+# Alguna BD del lote ya estaba en cuarentena ANTES de arrancar. `stamp` limpia la cuarentena,
+# así que stampearla borraría en silencio la marca de "revisá esta base".
+CODE_VERSION_QUARANTINED_BEFORE = "collation.version_quarantined_before_batch"
+
 ALL_CODES: frozenset[str] = frozenset(
     {
         CODE_SCOPE_NOT_ALLOWED,
+        CODE_VERSION_BATCH_NOT_COMPLETE,
+        CODE_VERSION_OTHER_ENGINES,
+        CODE_VERSION_DATABASES_MISSING,
+        CODE_VERSION_NOT_AT_HEAD,
+        CODE_VERSION_TABLE_SETS_DIFFER,
+        CODE_VERSION_PARTIAL_SELECTION,
+        CODE_VERSION_TOO_LARGE,
+        CODE_VERSION_QUARANTINED_BEFORE,
         CODE_BATCH_DATABASE_SET_MISMATCH,
         CODE_BATCH_CONFIRMATION_REQUIRED,
         CODE_BATCH_NOT_PENDING,

@@ -452,3 +452,359 @@ def test_sweep_leaves_standalone_pending_jobs_alone(admin_client, monkeypatch):
     finally:
         session.close()
     assert estado == "pending", "un plan suelto sin ejecutar no se debe cerrar"
+
+
+# =========================================================================== #
+# Fase C — versión de CONTABILIDAD                                            #
+# =========================================================================== #
+def _run_batch(admin_client, monkeypatch, port, names=("db_a", "db_b")):
+    """Lote completo y exitoso. Devuelve (model_id, batch_id, {name: db_id})."""
+    _install(monkeypatch, databases=list(names))
+    model_id, _sid, ids = _setup(admin_client, port, names=names)
+    plan = _plan(admin_client, model_id).json()["data"]
+    assert _exec(admin_client, model_id, plan).status_code == 200
+    return model_id, plan["batch_id"], ids
+
+
+def _version(admin_client, model_id, batch_id, **kw):
+    return admin_client.post(
+        f"/api/v1/database-models/{model_id}/collation-conversions/"
+        f"{batch_id}/blueprint-version",
+        json=kw,
+    )
+
+
+class _StampSpy:
+    """Runner falso que además responde a get_current_version/stamp como el real."""
+
+    current: str | None = None
+    stamped: list[tuple[str, str]] = []
+
+    def get_current_version(self, target, db_name, slug):
+        return type(self).current
+
+    def stamp(self, target, *, db_name, slug, engine, managed_db_id, specs, version):
+        type(self).stamped.append((db_name, version))
+
+
+def test_version_is_created_and_stamped_never_applied(admin_client, monkeypatch):
+    """
+    El camino feliz: una versión con el SQL SIN calificar, stampeada en las N BDs.
+
+    Sin calificar es lo que la hace replicable: la migración corre conectada al destino, y
+    `ALTER DATABASE` sin nombre aplica a la base por defecto de la conexión (documentado en
+    MySQL 8 y MariaDB). Con el nombre de la base origen adentro, aplicarla a una hermana
+    convertiría la base EQUIVOCADA, en silencio.
+    """
+    import app.controllers.managed_migration_controller as mmc
+
+    model_id, batch_id, ids = _run_batch(admin_client, monkeypatch, 3941)
+    _StampSpy.current, _StampSpy.stamped = None, []
+    monkeypatch.setattr(cc, "MigrationRunner", _StampSpy)
+    monkeypatch.setattr(
+        mmc.ManagedMigrationController,
+        "stamp",
+        lambda self, db_id, version, **kw: _StampSpy.stamped.append((db_id, version)),
+    )
+
+    r = _version(admin_client, model_id, batch_id)
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    assert data["version"] == "0001"
+    assert data["pending_stamp"] == []
+    assert len(data["stamped"]) == 2
+    assert sorted(s[0] for s in _StampSpy.stamped) == sorted(ids.values())
+
+    # El GET de una versión toma la VERSIÓN en el path, no el id de la fila.
+    mig = admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations/{data['version']}"
+    ).json()["data"]
+    sql = mig["up_sql"]
+    # Sin calificar: ni el nombre de la base en el ALTER DATABASE ni en los ALTER TABLE.
+    assert "ALTER DATABASE CHARACTER SET" in sql
+    assert "db_a" not in sql and "db_b" not in sql
+    assert "ALTER TABLE `users` CONVERT TO CHARACTER SET" in sql
+    # Incluye las tablas que en el origen ya estaban al día: una hermana futura puede no estarlo.
+    assert "`already_ok`" in sql
+    # Sin reverso: RollbackGenerator devuelve None para este SQL, y eso es la verdad.
+    assert mig["down_sql"] is None
+    assert mig["down_sql_suggested"] is None
+    # No es DDL capturado del motor, así que no congela el blueprint con el gate R1.
+    assert mig["is_baseline"] is False
+    assert mig["reviewed"] is True
+
+
+def test_version_requires_every_job_to_have_succeeded(admin_client, monkeypatch):
+    """Versionar un lote que falló afirmaría en el ledger algo que el plano físico no tiene."""
+    _install(monkeypatch)
+    model_id, _sid, _ids = _setup(admin_client, 3942)
+    plan = _plan(admin_client, model_id).json()["data"]
+    _FakeRunner.fail_substrings = ["ALTER DATABASE"]
+    assert _exec(admin_client, model_id, plan).status_code == 200
+
+    r = _version(admin_client, model_id, plan["batch_id"])
+    assert r.status_code == 409, r.text
+    assert (
+        r.json()["detail"]["public_context"]["code"]
+        == "collation.version_batch_not_complete"
+    )
+
+
+def test_version_rejects_blueprint_with_other_engines(admin_client, monkeypatch):
+    """
+    Una hermana PostgreSQL quedaría con la cadena trabada de forma PERMANENTE: el SQL es de
+    MySQL y no puede existir un `up_sql_postgresql` válido, porque su LC_COLLATE es inmutable
+    tras el CREATE DATABASE.
+    """
+    model_id, batch_id, _ids = _run_batch(admin_client, monkeypatch, 3943)
+    # Se agrega al MISMO blueprint una BD en un servidor PostgreSQL.
+    pg_sid = _server(admin_client, 5443, engine="postgresql")
+    pg_owner = _owner(admin_client, pg_sid, username="pgown")
+    pg_db = _managed(admin_client, pg_sid, pg_owner, "db_pg", model_id)
+    _activate(pg_db)
+
+    r = _version(admin_client, model_id, batch_id)
+    assert r.status_code == 409, r.text
+    pc = r.json()["detail"]["public_context"]
+    assert pc["code"] == "collation.version_blueprint_has_other_engines"
+    assert "postgresql" in pc["engines"]
+
+
+def test_version_rejects_databases_left_out_of_the_batch(admin_client, monkeypatch):
+    """
+    Una BD activa que quedó afuera tendría la versión PENDIENTE, y aplicarla le convertiría
+    las tablas sin recrearle los objetos congelados — el incidente que el módulo evita.
+    """
+    model_id, batch_id, _ids = _run_batch(admin_client, monkeypatch, 3944)
+    sid2 = _server(admin_client, 3945)
+    owner2 = _owner(admin_client, sid2, username="own2")
+    afuera = _managed(admin_client, sid2, owner2, "db_z", model_id)
+    _activate(afuera)
+
+    r = _version(admin_client, model_id, batch_id)
+    assert r.status_code == 409, r.text
+    pc = r.json()["detail"]["public_context"]
+    assert pc["code"] == "collation.version_databases_missing_from_batch"
+    assert pc["missing_database_ids"] == [afuera]
+
+
+def test_version_rejects_a_database_behind_the_head(admin_client, monkeypatch):
+    """
+    Dos motivos independientes, y los dos importan: el SQL sale de un inventario que no
+    refleja las versiones intermedias, y stampear max+1 sobre una BD atrasada afirmaría que
+    esas intermedias se aplicaron.
+    """
+    _install(monkeypatch)
+    model_id, _sid, _ids = _setup(admin_client, 3946)
+    # El blueprint tiene una versión previa que las BDs NO aplicaron.
+    assert admin_client.post(
+        f"/api/v1/database-models/{model_id}/migrations",
+        json={"version": "0001", "name": "previa", "up_sql": "SELECT 1"},
+    ).status_code == 201
+    plan = _plan(admin_client, model_id).json()["data"]
+    assert _exec(admin_client, model_id, plan).status_code == 200
+
+    _StampSpy.current = None  # ninguna BD tiene versión aplicada → atrasadas
+    monkeypatch.setattr(cc, "MigrationRunner", _StampSpy)
+    r = _version(admin_client, model_id, plan["batch_id"])
+    assert r.status_code == 409, r.text
+    pc = r.json()["detail"]["public_context"]
+    assert pc["code"] == "collation.version_not_at_head"
+    assert pc["head_version"] == "0001"
+
+
+def test_version_rejects_partial_conversion(admin_client, monkeypatch):
+    """
+    Convertir parcialmente UNA base es una decisión informada. Propagar esa incoherencia de
+    collation entre los dos lados de una FK a N bases no es la misma decisión.
+    """
+    _install(monkeypatch)
+    model_id, _sid, _ids = _setup(admin_client, 3947)
+    # scope explícito con UNA sola tabla: quedan tablas que necesitan conversión afuera.
+    plan = _plan(
+        admin_client, model_id, scope="explicit", tables=["users"], objects="none"
+    ).json()["data"]
+    assert _exec(admin_client, model_id, plan).status_code == 200
+
+    _StampSpy.current = None
+    monkeypatch.setattr(cc, "MigrationRunner", _StampSpy)
+    r = _version(admin_client, model_id, plan["batch_id"])
+    assert r.status_code == 409, r.text
+    assert (
+        r.json()["detail"]["public_context"]["code"]
+        == "collation.version_partial_selection"
+    )
+
+
+def test_version_is_created_only_once_per_batch(admin_client, monkeypatch):
+    import app.controllers.managed_migration_controller as mmc
+
+    model_id, batch_id, _ids = _run_batch(admin_client, monkeypatch, 3948)
+    _StampSpy.current, _StampSpy.stamped = None, []
+    monkeypatch.setattr(cc, "MigrationRunner", _StampSpy)
+    monkeypatch.setattr(mmc.ManagedMigrationController, "stamp",
+                        lambda self, db_id, version, **kw: None)
+
+    assert _version(admin_client, model_id, batch_id).status_code == 201
+    r = _version(admin_client, model_id, batch_id)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["public_context"]["code"] == "collation.batch_not_pending"
+
+
+def test_version_manifest_reconstructs_up_sql_via_the_real_join(admin_client, monkeypatch):
+    """
+    El invariante que se rompe EN SILENCIO: `usable_manifest` reconstruye el up_sql uniendo el
+    manifiesto con `_MANIFEST_JOIN`, y si no coincide DESCARTA el manifiesto con un warning en
+    el log — perdiendo `reconcile-partial` sin que nada falle.
+
+    Por eso el test invoca `usable_manifest` DE VERDAD sobre el spec cargado con `_load_specs`,
+    en vez de reimplementar el join: un test que hiciera `";\\n".join(...)` seguiría en verde
+    si alguien cambiara la constante.
+    """
+    import app.controllers.managed_migration_controller as mmc
+    from app.controllers.managed_migration_controller import ManagedMigrationController
+    from app.core.database import Database
+    from app.models.enums import EngineType
+    from app.services.db_admin.migrations import MigrationRunner as RealRunner
+
+    model_id, batch_id, _ids = _run_batch(admin_client, monkeypatch, 3949)
+    _StampSpy.current = None
+    monkeypatch.setattr(cc, "MigrationRunner", _StampSpy)
+    monkeypatch.setattr(mmc.ManagedMigrationController, "stamp",
+                        lambda self, db_id, version, **kw: None)
+    r = _version(admin_client, model_id, batch_id)
+    assert r.status_code == 201, r.text
+    esperadas = r.json()["data"]["statement_count"]
+
+    session = Database().get_declarative_base_session()
+    try:
+        specs = ManagedMigrationController()._load_specs(session, model_id)
+    finally:
+        session.close()
+    spec = next(s for s in specs if s.version == r.json()["data"]["version"])
+    manifest = RealRunner().usable_manifest(spec, EngineType.mysql)
+    assert len(manifest) == esperadas, "el manifiesto no reconstruye el up_sql"
+    assert all(m.destructive for m in manifest), (
+        "un cambio de charset re-codifica cada valor de texto: schema_diff ya lo clasifica "
+        "destructivo, y el manifiesto tiene que decir lo mismo"
+    )
+
+
+# =========================================================================== #
+# Fase D — deriva de collation contra la declaración del blueprint            #
+# =========================================================================== #
+def _drift(admin_client, model_id):
+    r = admin_client.get(f"/api/v1/database-models/{model_id}/collation-drift")
+    assert r.status_code == 200, r.text
+    return r.json()["data"]
+
+
+def _declare(admin_client, model_id, charset, collation):
+    r = admin_client.patch(
+        f"/api/v1/database-models/{model_id}",
+        json={"charset": charset, "collation": collation},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_drift_opens_no_engine_connection(admin_client, monkeypatch):
+    """
+    La deriva NO toca el motor. Se verifica con un adapter que explota si lo llaman: si
+    mañana alguien "mejora" esto leyendo el motor, este test lo detiene — la promesa de
+    `source: "cached"` es lo que hace la respuesta honesta.
+    """
+    import app.controllers.database_model_controller as dmc
+
+    def _explota(target):
+        raise AssertionError("la deriva NO debe abrir conexiones al motor")
+
+    monkeypatch.setattr(dmc, "get_adapter", _explota, raising=False)
+    _install(monkeypatch)
+    model_id, _sid, _ids = _setup(admin_client, 3951)
+
+    data = _drift(admin_client, model_id)
+    assert data["source"] == "cached"
+    assert "no del motor" in data["source_note"]
+    assert len(data["databases"]) == 2
+
+
+def test_drift_undeclared_when_blueprint_has_no_target(admin_client, monkeypatch):
+    """Sin declaración no se inventa un objetivo: todas quedan `undeclared`."""
+    _install(monkeypatch)
+    model_id, _sid, _ids = _setup(admin_client, 3952)
+    data = _drift(admin_client, model_id)
+    assert data["declared"] is None
+    assert {d["status"] for d in data["databases"]} == {"undeclared"}
+
+
+def test_drift_unknown_is_not_ok(admin_client, monkeypatch):
+    """
+    Una BD sin dato es `unknown`, NO `ok`. Pintarlas iguales le diría al operador que todo
+    está bien sobre bases de las que no se sabe nada.
+    """
+    _install(monkeypatch)
+    model_id, _sid, _ids = _setup(admin_client, 3953)
+    _declare(admin_client, model_id, TARGET_CS, TARGET_CO)
+    data = _drift(admin_client, model_id)
+    assert {d["status"] for d in data["databases"]} == {"unknown"}
+    assert {d["source_of_truth"] for d in data["databases"]} == {"unknown"}
+
+
+def test_drift_detects_a_diverged_database(admin_client, monkeypatch):
+    _install(monkeypatch)
+    model_id, _sid, ids = _setup(admin_client, 3954)
+    _declare(admin_client, model_id, TARGET_CS, TARGET_CO)
+    # Una al día, otra desviada.
+    admin_client.patch(
+        f"/api/v1/managed-databases/{ids['db_a']}",
+        json={"charset": TARGET_CS, "collation": TARGET_CO},
+    )
+    admin_client.patch(
+        f"/api/v1/managed-databases/{ids['db_b']}",
+        json={"charset": TARGET_CS, "collation": "utf8mb4_general_ci"},
+    )
+    por_id = {d["managed_database_id"]: d for d in _drift(admin_client, model_id)["databases"]}
+    assert por_id[ids["db_a"]]["status"] == "ok"
+    assert por_id[ids["db_b"]]["status"] == "drifted"
+    # Campos sin los que el panel sería un callejón sin salida.
+    assert por_id[ids["db_b"]]["server_name"]
+    assert por_id[ids["db_b"]]["engine"] == "mysql"
+
+
+def test_drift_marks_postgresql_as_not_applicable(admin_client, monkeypatch):
+    """
+    En PostgreSQL el concepto es `encoding` + `lc_collate`, que no son equivalentes — el
+    propio modelo lo declara. Compararlo contra un charset de MySQL sería un falso positivo.
+    """
+    _install(monkeypatch)
+    model_id, _sid, _ids = _setup(admin_client, 3955)
+    _declare(admin_client, model_id, TARGET_CS, TARGET_CO)
+    pg_sid = _server(admin_client, 5455, engine="postgresql")
+    pg_owner = _owner(admin_client, pg_sid, username="pgd")
+    pg_db = _managed(admin_client, pg_sid, pg_owner, "db_pg", model_id)
+    _activate(pg_db)
+
+    por_id = {d["managed_database_id"]: d for d in _drift(admin_client, model_id)["databases"]}
+    assert por_id[pg_db]["status"] == "not_applicable"
+
+
+def test_conversion_moves_a_database_from_drifted_to_ok(admin_client, monkeypatch):
+    """
+    El ciclo completo: se declara el objetivo, la deriva lo marca, el lote lo corrige.
+
+    Es lo que hace que la declaración del blueprint deje de ser un campo inerte.
+    """
+    _install(monkeypatch)
+    model_id, _sid, ids = _setup(admin_client, 3956)
+    _declare(admin_client, model_id, TARGET_CS, TARGET_CO)
+    for db_id in ids.values():
+        admin_client.patch(
+            f"/api/v1/managed-databases/{db_id}",
+            json={"charset": TARGET_CS, "collation": "utf8mb4_general_ci"},
+        )
+    assert {d["status"] for d in _drift(admin_client, model_id)["databases"]} == {"drifted"}
+
+    plan = _plan(admin_client, model_id).json()["data"]
+    assert _exec(admin_client, model_id, plan).status_code == 200
+
+    assert {d["status"] for d in _drift(admin_client, model_id)["databases"]} == {"ok"}

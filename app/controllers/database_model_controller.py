@@ -259,3 +259,132 @@ class DatabaseModelController:
         finally:
             session.close()
         return out
+
+    # ------------------------------------------------------------------ #
+    # Deriva de charset/collation contra la declaración del blueprint     #
+    # ------------------------------------------------------------------ #
+    _DRIFT_OK = "ok"
+    _DRIFT_DRIFTED = "drifted"
+    _DRIFT_UNKNOWN = "unknown"
+    _DRIFT_UNDECLARED = "undeclared"
+    _DRIFT_NOT_APPLICABLE = "not_applicable"
+
+    def collation_drift(self, model_id: int) -> dict:
+        """
+        Qué BDs del blueprint se desviaron del charset/collation declarado.
+
+        ``DatabaseModel.charset``/``.collation`` existen desde hace tiempo con un comentario
+        que dice que sirven "para detectar BDs que se han desviado" — y hasta acá **nadie los
+        leía**. Esto los convierte en referencia usable.
+
+        **CERO conexiones al motor.** Se compara contra ``ManagedDatabase.charset``/
+        ``.collation``, que son la copia que el gateway ya mantiene (y que la conversión
+        sincroniza al terminar). Por eso la respuesta declara ``source: "cached"``: presentar
+        una caché como verdad del motor sería mentir en una pantalla que se va a usar para
+        decidir conversiones.
+
+        Cinco estados, y ``unknown`` **no** es ``ok``:
+
+        - ``undeclared``: el blueprint no declaró objetivo. No se inventa uno.
+        - ``not_applicable``: la BD es PostgreSQL. Allá el concepto es ``encoding`` +
+          ``lc_collate``, que no son equivalentes — el propio modelo lo declara.
+        - ``unknown``: la fila no tiene el dato. No se sabe, que es distinto de estar al día.
+        - ``drifted`` / ``ok``: hay dato y difiere, o coincide.
+
+        ``source_of_truth`` por fila dice de dónde sale ese dato, y no es adorno:
+        ``charset``/``collation`` son **escribibles a mano** por ``PATCH
+        /managed-databases/{id}``, así que una fila puede decir ``ok`` porque alguien lo tipeó.
+        Es el mismo defecto que el repo ya corrigió para ``model_version`` (ver
+        ``T-260824-lz-charset-managed-patch`` en ``TODO.md``); mientras siga abierto, la UI
+        necesita poder distinguir un dato leído del motor de una afirmación.
+        """
+        from app.controllers.common import engine_value
+        from app.models.server import Server
+
+        session = self._session()
+        try:
+            model = self._get_or_404(session, model_id)
+            declared_cs, declared_co = model.charset, model.collation
+            slug = model.slug
+            rows = (
+                session.query(ManagedDatabase, Server)
+                .join(Server, ManagedDatabase.server_id == Server.id)
+                .filter(ManagedDatabase.model_id == model_id)
+                .order_by(ManagedDatabase.id.asc())
+                .all()
+            )
+            env_names: dict[int, str] = {}
+            env_ids = {md.environment_id for md, _s in rows if md.environment_id}
+            if env_ids:
+                from app.models.environment import Environment
+
+                env_names = {
+                    e.id: e.slug
+                    for e in session.query(Environment)
+                    .filter(Environment.id.in_(env_ids))
+                    .all()
+                }
+            items = []
+            for md, server in rows:
+                engine = engine_value(server)
+                if declared_cs is None and declared_co is None:
+                    status = self._DRIFT_UNDECLARED
+                elif engine == "postgresql":
+                    status = self._DRIFT_NOT_APPLICABLE
+                elif md.charset is None and md.collation is None:
+                    status = self._DRIFT_UNKNOWN
+                elif (declared_cs and md.charset != declared_cs) or (
+                    declared_co and md.collation != declared_co
+                ):
+                    status = self._DRIFT_DRIFTED
+                else:
+                    status = self._DRIFT_OK
+                items.append(
+                    {
+                        "managed_database_id": md.id,
+                        "database_name": md.name,
+                        "server_id": md.server_id,
+                        "server_name": server.name,
+                        "engine": engine,
+                        "environment_slug": env_names.get(md.environment_id),
+                        "charset": md.charset,
+                        "collation": md.collation,
+                        "status": status,
+                        "source_of_truth": self._source_of_truth(md),
+                    }
+                )
+        finally:
+            session.close()
+
+        return {
+            "model_id": model_id,
+            "model_slug": slug,
+            "declared": (
+                {"charset": declared_cs, "collation": declared_co}
+                if (declared_cs or declared_co)
+                else None
+            ),
+            "source": "cached",
+            "source_note": (
+                "Lectura del inventario del gateway, no del motor. Puede estar desactualizada."
+            ),
+            "databases": items,
+        }
+
+    @staticmethod
+    def _source_of_truth(md) -> str:
+        """
+        De dónde sale el charset/collation de esta fila, con vocabulario cerrado.
+
+        Es una aproximación honesta, no una certeza: el gateway no registra por columna quién
+        la escribió. ``adopted`` sale de ``origin``; sin dato es ``unknown``; con dato y
+        aprovisionada por el gateway, ``provisioned``. Lo que NO se puede distinguir hoy es un
+        valor escrito por una conversión de uno tipeado a mano por ``PATCH`` — de ahí el ítem
+        de deuda: mientras esas columnas sean escribibles a ciegas, ``ok`` puede ser una
+        afirmación en vez de un hecho.
+        """
+        if md.charset is None and md.collation is None:
+            return "unknown"
+        if (md.origin or "") == "adopted":
+            return "adopted"
+        return "provisioned"

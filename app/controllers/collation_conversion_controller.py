@@ -53,6 +53,7 @@ from app.controllers.schema_comparison_controller import _synthetic_lock_key
 from app.core.database import Database
 from app.core.environments import (
     COLLATION_CONVERSION_TTL_HOURS,
+    SNAPSHOT_MAX_SQL_PER_VERSION,
     DB_HOST,
     DB_NAME,
     DB_PASS,
@@ -96,6 +97,7 @@ from app.models.collation_conversion_job import (
 )
 from app.models.enums import EngineType, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
+from app.models.server import Server
 from app.services import audit, charset_catalog, collation_catalog
 from app.services.db_admin import query_policy
 from app.services.db_admin.factory import get_adapter
@@ -105,6 +107,7 @@ from app.services.db_admin.identifiers import (
     validate_identifier,
 )
 from app.services.db_admin.migrations import MigrationRunner
+from app.services.db_admin.privileges import family_members
 
 logger = get_logger(__name__)
 
@@ -132,6 +135,17 @@ _DROP_KEYWORDS: dict[str, str] = {
 # una acción ``ALTER COLUMN ... COLLATE`` por columna de PostgreSQL. Ambas se cuentan y se
 # ejecutan en la MISMA fase (``tables``) para que el polling del frontend no cambie.
 _CONVERT_ACTIONS = ("convert_table", "convert_columns")
+# Motores cuyo DDL de conversión (CONVERT TO CHARACTER SET) es el mismo. Se deriva del
+# catálogo de privilegios en vez de escribir la tupla a mano: es la única definición de
+# "familia MySQL" del repo, y duplicarla es cómo divergen.
+_MYSQL_FAMILY_ENGINES = frozenset(family_members("mysql"))
+
+# Separador con el que se une el `up_sql` de una versión, ligado a su ÚNICA fuente.
+# `usable_manifest` reconstruye el blob uniendo el manifiesto con esta constante y, si no
+# coincide, DESCARTA el manifiesto con un warning en el log —perdiendo `reconcile-partial`
+# sin que nada falle—. Se resuelve al IMPORTAR y no en cada uso: así un doble de test del
+# runner no puede cambiar en silencio un invariante del que depende producción.
+_MANIFEST_JOIN = MigrationRunner._MANIFEST_JOIN
 
 # Intervalo mínimo entre persistencias del progreso a la BD del gateway (throttle).
 _PROGRESS_PERSIST_SECONDS = 3.0
@@ -2726,3 +2740,401 @@ class CollationConversionController:
             detail=f"lote {batch_id}: cancelación pedida sobre {marked} job(s) sin terminar",
         )
         return self.list_batch(model_id, batch_id)
+
+    # ------------------------------------------------------------------ #
+    # Fase C — versión de CONTABILIDAD del lote                           #
+    # ------------------------------------------------------------------ #
+    # Se crea y se STAMPEA en las N BDs; NO está pensada para aplicarse nunca. La conversión
+    # ya la hizo cada job leyendo su propio inventario; esto solo evita que el ledger del
+    # blueprint mienta sobre lo que sus bases tienen físicamente.
+
+    def _version_statements(self, job_row: tuple) -> tuple[list[str], set[str], bool]:
+        """
+        Sentencias de la versión para UN job, más su conjunto de tablas y si fue parcial.
+
+        El plan se RECONSTRUYE desde ``job.selection`` + un inventario fresco, igual que hacen
+        ``preview`` y ``execute``. Dos razones:
+
+        1. Las tablas que ya no existen viven en ``plan.missing_tables`` y **no** son pasos, así
+           que quedan fuera solas. Iterar la selección metería un ``CONVERT TO`` de una tabla
+           inexistente y la versión fallaría con 1146 en TODAS las hermanas.
+        2. Los ítems persistidos tampoco sirven: los de "la tabla ya no existe" y los de "ya
+           estaba al día" son ambos ``skipped``, y distinguirlos por el texto del error sería
+           frágil.
+
+        Se incluyen los pasos ``skip`` (tablas ya al día en el origen): una hermana futura puede
+        no estarlo. Ojo que esos ``_Step`` se construyen **sin** ``sql``, así que hay que
+        re-renderizar — leer ``step.sql`` daría ``None``.
+
+        El SQL va **sin calificar** con el nombre de la base: la migración corre conectada al
+        destino. ``ALTER DATABASE`` sin nombre aplica a la base por defecto de la conexión
+        (documentado en MySQL 8 y en MariaDB).
+        """
+        (
+            _jid, server_id, db_name, selection_json, charset, collation, _md_id
+        ) = job_row
+        target = self._job_target_by_server(server_id)
+        adapter = get_adapter(target)
+        inv = adapter.collation_inventory(db_name, target_collation=collation)
+        session = self._session()
+        try:
+            job = self._job_or_404(session, _jid)
+            plan = self._build_plan(job, inv, json.loads(selection_json), adapter)
+        finally:
+            session.close()
+
+        dialect = "mysql"
+        cs = validate_identifier(charset, dialect, "charset")
+        co = validate_identifier(collation, dialect, "collation")
+
+        stmts: list[str] = []
+        if plan.include_database_default:
+            stmts.append(f"ALTER DATABASE CHARACTER SET {cs} COLLATE {co}")
+
+        tables: set[str] = set()
+        for step in plan.steps:
+            if step.object_type != COLLATION_OBJ_TABLE:
+                continue
+            if step.action not in (*_CONVERT_ACTIONS, "skip"):
+                continue
+            name = step.object_name
+            tables.add(name)
+            t_q = quote_identifier(
+                validate_identifier(name, dialect, "tabla", allow_existing=True), dialect
+            )
+            stmts.append(f"ALTER TABLE {t_q} CONVERT TO CHARACTER SET {cs} COLLATE {co}")
+
+        # PARCIAL = quedaron tablas del inventario que necesitan conversión y no están en el
+        # plan. Propagar eso a N bases como versión no es la misma decisión que convertir
+        # parcialmente UNA (MySQL exige la misma collation en los dos lados de una FK).
+        partial = any(
+            t.needs_conversion and t.name not in tables for t in inv.tables
+        )
+        return stmts, tables, partial
+
+    def create_blueprint_version(
+        self, model_id: int, batch_id: int, *, name: str | None = None,
+        admin: dict | None = None,
+    ) -> dict:
+        """
+        Materializa el lote como una versión del blueprint y la STAMPEA en sus N BDs.
+
+        Es una llamada EXPLÍCITA del operador y no un hook del worker, y eso resuelve cuatro
+        cosas de una: (a) el worker sostiene el advisory lock del motor durante todo su
+        ``_finish``, con la MISMA clave que ``stamp`` pide en otra conexión — el ``GET_LOCK``
+        esperaría 30 s y devolvería 409, siempre; (b) ``run_job`` envuelve el pipeline en un
+        ``except`` que reetiquetaría como fallida una conversión ya ocurrida e irreversible;
+        (c) acá hay ``admin`` y Request ID reales, y el worker no los hereda; (d) un fallo es
+        un HTTP que el operador ve, no un estado que descubre horas después.
+
+        La versión nace ``is_baseline=False, reviewed=True`` porque **no es DDL capturado del
+        motor**: son ``ALTER TABLE`` que construye el gateway con un charset/collation ya
+        canonizado por el catálogo. Con ``is_baseline=True, reviewed=False`` congelaría
+        ``apply``/``apply_all`` de TODO el blueprint hasta que alguien la aprobara
+        (``_guard_reviewed_baseline`` es un tripwire de blueprint entero). El control
+        compensatorio es otro: el guard de entornos ahora ve la conversión de charset como
+        destructiva, así que la versión queda bloqueada en los entornos protegidos.
+        """
+        # Imports LOCALES: `model_migration_controller` y `managed_migration_controller`
+        # importan de acá por otras vías, así que a nivel de módulo esto sería un ciclo. Es el
+        # patrón que el repo ya usa para dependencias cruzadas entre controllers.
+        from app.controllers.managed_migration_controller import ManagedMigrationController
+        from app.controllers.model_migration_controller import (
+            _VERSION_ORDER_DESC,
+            ModelMigrationController,
+        )
+        from app.models.database_model import DatabaseModel
+        from app.models.model_migration import ModelMigration
+
+        def _reject(code: str, message: str, **ctx):
+            raise AppHttpException(
+                message=message,
+                status_code=409,
+                public_context={"code": code, **ctx},
+                context={"batch_id": batch_id, "model_id": model_id},
+            )
+
+        session = self._session()
+        try:
+            batch = session.get(CollationConversionBatch, batch_id)
+            if batch is None or batch.model_id != model_id:
+                raise AppHttpException(
+                    message="Lote de conversión no encontrado.",
+                    status_code=404,
+                    context={"batch_id": batch_id, "model_id": model_id},
+                )
+            if batch.blueprint_version_id is not None:
+                _reject(
+                    collation_catalog.CODE_BATCH_NOT_PENDING,
+                    "Este lote ya tiene una versión de blueprint asociada.",
+                    blueprint_version_id=batch.blueprint_version_id,
+                )
+            model = session.get(DatabaseModel, model_id)
+            slug = model.slug if model else None
+
+            jobs = (
+                session.query(CollationConversionJob)
+                .filter(CollationConversionJob.batch_id == batch_id)
+                .order_by(CollationConversionJob.batch_seq.asc())
+                .all()
+            )
+            not_done = [j.database_name for j in jobs if j.status != COLLATION_STATUS_SUCCEEDED]
+            if not jobs or not_done:
+                _reject(
+                    collation_catalog.CODE_VERSION_BATCH_NOT_COMPLETE,
+                    "El lote no terminó correctamente en todas sus bases de datos.",
+                    unfinished=not_done,
+                )
+
+            # Toda BD del blueprint tiene que ser de la familia MySQL: el SQL de la versión es
+            # de MySQL y una hermana PostgreSQL quedaría con la cadena trabada de forma
+            # PERMANENTE (no puede existir un up_sql_postgresql válido).
+            engines = {
+                (s.engine or "").lower()
+                for s in session.query(Server)
+                .join(ManagedDatabase, ManagedDatabase.server_id == Server.id)
+                .filter(ManagedDatabase.model_id == model_id)
+                .all()
+            }
+            foreign = sorted(e for e in engines if e and e not in _MYSQL_FAMILY_ENGINES)
+            if foreign:
+                _reject(
+                    collation_catalog.CODE_VERSION_OTHER_ENGINES,
+                    "El blueprint tiene bases de datos de un motor al que este SQL no aplica.",
+                    engines=foreign,
+                )
+
+            in_batch = {j.database_id for j in jobs if j.database_id is not None}
+            active_ids = {
+                md.id for md in self._eligible_databases(session, model_id, None)
+            }
+            missing = sorted(active_ids - in_batch)
+            if missing:
+                _reject(
+                    collation_catalog.CODE_VERSION_DATABASES_MISSING,
+                    (
+                        "Hay bases de datos activas del blueprint que no participaron del "
+                        "lote; la versión quedaría pendiente para ellas."
+                    ),
+                    missing_database_ids=missing,
+                )
+
+            quarantined = sorted(
+                md.id
+                for md in session.query(ManagedDatabase)
+                .filter(
+                    ManagedDatabase.id.in_(in_batch or {0}),
+                    ManagedDatabase.status == ProvisionStatus.error,
+                )
+                .all()
+            )
+            if quarantined:
+                _reject(
+                    collation_catalog.CODE_VERSION_QUARANTINED_BEFORE,
+                    (
+                        "Alguna base de datos del lote está en cuarentena. Stampear la "
+                        "limpiaría en silencio: revisala primero."
+                    ),
+                    quarantined_database_ids=quarantined,
+                )
+
+            head = (
+                session.query(ModelMigration.version)
+                .filter(ModelMigration.model_id == model_id)
+                .order_by(*_VERSION_ORDER_DESC)
+                .first()
+            )
+            head_version = head[0] if head else None
+            job_rows = [
+                (
+                    j.id, j.server_id, j.database_name, j.selection,
+                    j.target_charset, j.target_collation, j.database_id,
+                )
+                for j in jobs
+            ]
+            db_ids = [j.database_id for j in jobs if j.database_id is not None]
+            target_charset, target_collation = batch.target_charset, batch.target_collation
+        finally:
+            session.close()
+
+        # HEAD por BD: el SQL sale de un inventario que no refleja las versiones intermedias,
+        # y stampear max+1 sobre una BD atrasada afirmaría que esas intermedias se aplicaron.
+        runner = MigrationRunner()
+        behind: list[int] = []
+        for db_id in db_ids:
+            current = self._current_version_of(db_id, runner)
+            if current != head_version:
+                behind.append(db_id)
+        if behind:
+            _reject(
+                collation_catalog.CODE_VERSION_NOT_AT_HEAD,
+                (
+                    "Alguna base de datos del lote no está en la última versión del "
+                    "blueprint; aplicá las pendientes antes de versionar la conversión."
+                ),
+                head_version=head_version,
+                databases_behind=behind,
+            )
+
+        all_stmts: list[str] = []
+        table_sets: list[set[str]] = []
+        for row in job_rows:
+            stmts, tables, partial = self._version_statements(row)
+            if partial:
+                _reject(
+                    collation_catalog.CODE_VERSION_PARTIAL_SELECTION,
+                    (
+                        "Alguna base de datos convirtió solo parte de sus tablas. Versionar "
+                        "una conversión parcial propagaría la incoherencia de collation entre "
+                        "los dos lados de una FK a todas las bases del blueprint."
+                    ),
+                    database_name=row[2],
+                )
+            table_sets.append(tables)
+            if not all_stmts:
+                all_stmts = stmts
+
+        if any(ts != table_sets[0] for ts in table_sets[1:]):
+            _reject(
+                collation_catalog.CODE_VERSION_TABLE_SETS_DIFFER,
+                (
+                    "Las bases de datos del lote no tienen el mismo conjunto de tablas: hay "
+                    "deriva estructural que hay que resolver antes de declarar una versión "
+                    "común."
+                ),
+            )
+
+        up_sql = _MANIFEST_JOIN.join(all_stmts)
+        if not up_sql.strip():
+            _reject(
+                collation_catalog.CODE_VERSION_BATCH_NOT_COMPLETE,
+                "El lote no produjo ninguna sentencia versionable.",
+            )
+        if len(up_sql.encode("utf-8")) > SNAPSHOT_MAX_SQL_PER_VERSION:
+            _reject(
+                collation_catalog.CODE_VERSION_TOO_LARGE,
+                "El SQL de la versión supera el tope de tamaño por versión.",
+                bytes=len(up_sql.encode("utf-8")),
+                max_bytes=SNAPSHOT_MAX_SQL_PER_VERSION,
+            )
+
+        next_version = f"{(int(head_version) + 1) if head_version else 1:04d}"
+        # Nombre acotado a la columna: String(200), y MySQL en modo estricto responde 1406.
+        version_name = (name or f"Collation {target_charset}/{target_collation}")[:200]
+
+        # Intención fail-closed ANTES de escribir en el artefacto compartido: la versión la van
+        # a referenciar N bases, así que el rastro tiene que existir aunque el proceso muera.
+        audit.record_intent(
+            "collation_conversion.blueprint_version",
+            admin=admin,
+            target_type="database_model",
+            target_id=model_id,
+            touched_engine=False,
+            detail=(
+                f"lote {batch_id}: crear versión {next_version} de '{slug}' "
+                f"({len(all_stmts)} sentencia(s)) y stampearla en {len(db_ids)} BD(s)"
+            ),
+        )
+
+        migration = ModelMigrationController().create_migration(
+            model_id,
+            {
+                # EXPLÍCITA, no autoasignada: con version=None, create_migration asigna max+1 y
+                # REINTENTA 5 veces, así que si alguien crea N+1 entre el chequeo de head y la
+                # asignación, la nueva aterriza en N+2 y el stamp afirmaría que N+1 se aplicó.
+                # Con versión explícita hay 409 ante colisión, que es el desenlace correcto.
+                "version": next_version,
+                "name": version_name,
+                "up_sql": up_sql,
+                "up_sql_mysql": up_sql,
+                "source_engine": "mysql",
+                "kind": "schema",
+                "is_baseline": False,
+                "reviewed": True,
+                "has_non_portable": False,
+                # Sin down_sql NI down_sql_suggested: RollbackGenerator devuelve None para este
+                # SQL, que es LA VERDAD. Un reverso derivado de las collations previas del
+                # origen sería peor que nada — se publica, la doc del módulo empuja a
+                # promoverlo con PATCH, y ejecutarlo re-codifica hacia atrás (pérdida de
+                # caracteres irreversible) con collations que las hermanas nunca tuvieron.
+                "statements": [
+                    {
+                        "up_sql": s,
+                        "down_sql": None,
+                        "down_confirmed": False,
+                        "object_type": (
+                            COLLATION_OBJ_DATABASE
+                            if s.startswith("ALTER DATABASE")
+                            else COLLATION_OBJ_TABLE
+                        ),
+                        "object_name": None,
+                        "op_group": None,
+                        # Coherente con schema_diff, que clasifica un cambio de charset como
+                        # destructivo con data_conversion: re-codifica cada valor de texto.
+                        "destructive": True,
+                    }
+                    for s in all_stmts
+                ],
+            },
+            admin=admin,
+        )
+        version = migration["version"]
+
+        stamped: list[dict] = []
+        for db_id in db_ids:
+            row = {"managed_database_id": db_id, "ok": False, "error": None}
+            try:
+                ManagedMigrationController().stamp(db_id, version, admin=admin)
+                row["ok"] = True
+            except AppHttpException as exc:
+                row["error"] = exc.message
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "blueprint_version: stamp falló en BD %s: %s", db_id, exc, exc_info=True
+                )
+                row["error"] = f"error inesperado: {type(exc).__name__}"
+            stamped.append(row)
+
+        session = self._session()
+        try:
+            batch = session.get(CollationConversionBatch, batch_id)
+            batch.blueprint_version_id = migration["id"]
+            session.commit()
+        finally:
+            session.close()
+
+        pendientes = [s["managed_database_id"] for s in stamped if not s["ok"]]
+        return {
+            "batch_id": batch_id,
+            "model_id": model_id,
+            "version": version,
+            "migration_id": migration["id"],
+            "statement_count": len(all_stmts),
+            "stamped": stamped,
+            # La versión NO se borra si un stamp falla: existe y es correcta, lo que falta es
+            # la marca de esa base. Se nombra para que el operador la stampee a mano.
+            "pending_stamp": pendientes,
+            "note": (
+                "Esta versión es CONTABILIDAD: se stampeó, no se aplicó. Una BD que se agregue "
+                "al blueprint después la tendrá pendiente, y aplicarla le convertiría las "
+                "tablas SIN recrearle los objetos con la collation congelada — para esa base "
+                "el camino correcto es su propio job de conversión y después stamp."
+            ),
+        }
+
+    def _current_version_of(self, db_id: int, runner) -> str | None:
+        """Versión que la BD tiene realmente aplicada en el motor (``_gw_v_{slug}``)."""
+        from app.models.database_model import DatabaseModel
+
+        session = self._session()
+        try:
+            md = session.get(ManagedDatabase, db_id)
+            if md is None or md.model_id is None:
+                return None
+            model = session.get(DatabaseModel, md.model_id)
+            server = get_server_or_404(session, md.server_id)
+            slug, db_name = model.slug, md.name
+            target = build_target(server)
+        finally:
+            session.close()
+        return runner.get_current_version(target, db_name, slug)
