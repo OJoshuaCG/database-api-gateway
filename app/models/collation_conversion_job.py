@@ -225,6 +225,37 @@ class CollationConversionJob(Base, TimestampMixin):
         DateTime, nullable=True, comment="Momento en que el worker terminó (éxito/fallo/cancel)"
     )
 
+    # ---- Pertenencia a un LOTE por blueprint -------------------------------------- #
+    batch_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("collation_conversion_batches.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="Lote al que pertenece este job (NULL si es una conversión suelta)",
+    )
+    batch_seq: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment=(
+            "Posición 1-based dentro del lote. NO es cosmético: los jobs corren EN SERIE "
+            "(COLLATION_CONVERSION_MAX_WORKERS default 1) y sin esto la UI no puede decir "
+            "'la 4 de 12' ni ordenar la tabla de forma estable — el estado por sí solo no "
+            "distingue 'en cola' de 'ya terminada' en un orden reproducible"
+        ),
+    )
+
+    # ---- Totales CONGELADOS del preview ------------------------------------------- #
+    # ``progress`` solo cuenta lo HECHO, nunca el total, así que sin esto una barra de avance
+    # no tiene denominador. Hoy la SPA lo parchea guardando los totales del preview en estado
+    # de React — que se pierde al recargar, justo en una operación que dura horas, y que en un
+    # lote de N bases sería imposible de sostener (harían falta N previews en memoria).
+    tables_total: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="Tablas a convertir según el plan confirmado"
+    )
+    objects_total: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="Objetos a recrear según el plan confirmado"
+    )
+
     def __repr__(self) -> str:
         return (
             f"<CollationConversionJob(id={self.id}, "
