@@ -141,7 +141,7 @@ ejecución directa de funciones y SQLite. Los scripts existen; nunca se corriero
 | T-260822-lz-contratos-nullish | **13 campos de 7 schemas zod declarados requeridos contra un backend que los tipa `X \| None`** — 2 ROTOS HOY | Causa raíz: `ApiResponse._exclude_none` (`app/utils/response.py:64-67`) filtra **solo las claves del envelope**, así que los `None` anidados salen como `null`; y en zod `.optional()` **rechaza `null`**. Combinado con el `safeParse` del envelope completo (`client.ts:128-133`), una divergencia de UN campo cuesta la respuesta ENTERA. **Rotos hoy:** `database-exports.ts:416-417` (`has_primary_key`/`has_triggers` vs `bool \| None`; el controller emite `None` para todo objeto que no es tabla ⇒ `GET /database-exports/{id}/objects` se descarta entero en cualquier BD con una vista o rutina — es el selector de objetos de esa pantalla) y `database-exports.ts:631-632` (`phase`/`status`, nullables POR DISEÑO ⇒ el polling de `.../items` descarta la lista **mientras el job corre**). **Latentes:** `database-exports.ts:675,680,687` · `:245,256` · `:646` · `migration-select-results.ts:54-55` · `db-migrations.ts:28-29` · `reconcilePartialResultSchema` (`db-migrations.ts:197-198`). Fix mecánico (`.nullish()`) + un test por schema. **Regla:** un campo que el backend tipa `X \| None` va `.nullish()`, nunca `.optional()` ni requerido. | — |
 | T-260822-lz-filtros-en-url | Los filtros del inventario de BDs no viven en la URL | `ManagedDatabasesPage` usa `useState` sueltos y no `useSearchParams`, así que los filtros se pierden al recargar y **no son enlazables**. Consecuencia concreta ya visible: la pestaña de Entornos muestra el conteo de BDs por entorno pero **no puede enlazar** a «ver esas N bases» (el link iría sin filtro), y el 409 `environment.has_databases` del borrado por API tampoco tiene una salida de un click. Precedente de cómo hacerlo: `AdminPage` ya sincroniza su pestaña con un validador. | — |
 | T-260822-lz-callout-a-ui | Promover `Callout` a `components/ui` | Vive dentro de `database-exports` y su propio docstring advierte el riesgo de inlinear el `div`: *"es donde se cuela la banda roja que debía ser ámbar — y en esta pantalla el color ES la información"*. Entornos ya necesita bandas en tres lugares (diálogo de apply, apply por BD, filtro sin clasificar) y las inlineó; con un cuarto consumidor conviene el primitivo compartido. | — |
-| T-260822-lz-frontend-proyectos | **Proyectos no existe en la SPA** | El backend se entregó y la tarea se cerró como `complete` (que en el protocolo significa "no requiere frontend"), pero hay **cero hits de "project" en todo `src/`**: ni contrato zod, ni ruta, ni pantalla. El módulo está entregado e inalcanzable desde la interfaz. Hay que decidir si de verdad iba sin UI o si se cerró mal. | — |
+| ~~T-260822-lz-frontend-proyectos~~ ✅ **RESUELTO** | **Proyectos no existía en la SPA** | **Se había cerrado mal.** Sí requiere frontend: la tarea `86e2y0zq9` se reabrió y quedó en `update required` con handoff. Ya existe el contrato (`docs/api-reference-v16.md`) y el plan de UI completo (`docs/frontend/plan-proyectos.md`, 6 vistas). De paso salió un bloqueante real: las **siete** excepciones de `ProjectController` usaban `context=`, que solo se expone en `development`, así que el `missing_model_ids` del 422 —el dato que hace utilizable ese error— **no llegaba en producción**. Corregido con `app/services/project_catalog.py`. | — |
 | T-260822-lz-form-bd-dos-componentes | `ManagedDatabaseForm`: partir en dos componentes por modo | `useForm<ManagedDatabaseFormValues>` se tipa con la INTERFAZ, no con el schema (el schema entra solo como `zodResolver`), así que TypeScript ayuda en 1 de 4 caminos: avisa en el mapper por excess-property check, pero no en `register('campo')` ni en los `defaultValues` del modal. Con una unión discriminada por modo —o directamente dos componentes, que ya comparten poco— el `mode` pasa a ser un discriminante que TS puede usar. Descubierto al sacar `model_version` del modo edición. | — |
 
 ### Riesgo de cumplimiento (aceptado explícitamente, anotado para revisión)
@@ -192,7 +192,8 @@ Atajo: `/tarea frontend`.
 
 | Ítem | Subtarea ClickUp | Backend cerrado por | Fecha | Breaking changes | Contrato |
 | --- | --- | --- | --- | --- | --- |
-| T-260824-ojoshuac-editar-version-aplicada | [`86e2z0gmj`](https://app.clickup.com/t/86e2z0gmj) | ojoshuacg@gmail.com | 2026-08-24 | **No.** Todo lo nuevo es aditivo: un endpoint (`edit-preview`), dos campos OPCIONALES en el `PATCH` (`confirm_version`/`confirm_token`), un campo nuevo en las respuestas (`sql_diverged`) y una clave nueva en el `public_context` del 409 (`override_available`). Un cliente que los ignore sigue funcionando igual. **Pero `api-reference-v14.md` queda CORREGIDO**: decía «No hay `force`» y «No ofrecer «Forzar»» para los dos 409, y eso ya no vale para `model_migration.sql_frozen`. | `docs/api-reference-v15.md` + `docs/features/model-migrations.md` (§ «Editar igual una versión vigente») — commits `a966b18` (código), `602c567` (tests) y `89380ce` (contrato y guía). |
+| T-260822-oc-projects-agrupar-blueprints (REABIERTA) | [`86e2y0zq9`](https://app.clickup.com/t/86e2y0zq9) | ojoshuacg@gmail.com | 2026-08-24 | **Sí, respecto de lo que había:** los seis errores del módulo ahora traen `public_context.code` y el 422 de vinculación expone `missing_model_ids` fuera de `development`. Un cliente que leyera `detail.context` deja de funcionar en producción — pero **no había cliente**: cero hits de "project" en `src/`. | `docs/api-reference-v16.md` + plan de UI completo en `docs/frontend/plan-proyectos.md` (6 vistas, copy propuesto, plan de pruebas y 6 preguntas abiertas). |
+| T-260824-ojoshuac-editar-version-aplicada | [`86e2z0gmj`](https://app.clickup.com/t/86e2z0gmj) | ojoshuacg@gmail.com | 2026-08-24 | **No.** Todo lo nuevo es aditivo: un endpoint (`edit-preview`), dos campos OPCIONALES en el `PATCH` (`confirm_version`/`confirm_token`), un campo nuevo en las respuestas (`sql_diverged`) y una clave nueva en el `public_context` del 409 (`override_available`). Un cliente que los ignore sigue funcionando igual. **Pero `api-reference-v14.md` queda CORREGIDO**: decía «No hay `force`» y «No ofrecer «Forzar»» para los dos 409, y eso ya no vale para `model_migration.sql_frozen`. | `docs/api-reference-v15.md` + `docs/features/model-migrations.md` (§ «Editar igual una versión vigente») — commits `a966b18` (código), `602c567` (tests) y `89380ce` (contrato y guía). **Plan de UI completo** en `docs/frontend/plan-editar-version-aplicada.md` (6 vistas, copy literal de los 11 mensajes delicados, ciclo de vida del token y tabla «qué revisar si ya se implementó según v14»). |
 | Clon: copia de solo datos, collation/owner del destino y selección declarativa | [`86e2xzzyh`](https://app.clickup.com/t/86e2xzzyh) | LeoZubiri@outlook.com | 2026-08-22 | **No** para la SPA actual (los schemas zod no usan `.strict()`, así que los campos nuevos se descartan y nada se rompe). Sí hay cambios de comportamiento que el wizard tiene que absorber: el SPEC se manda ahora en `preview` (no en `create`), `confirm_token` puede llegar **vacío** cuando hay `blocking_issues`, y los mensajes de error cambiaron — `wizard/messages.ts` los matchea con expresiones regulares sobre la prosa. | `docs/features/database-clone.md` + `de73439` (schemas y rutas). Plan de UI COMPLETO ya escrito, con recorrido paso por paso, copy, mapeo de códigos `clone.*` y plan de pruebas. |
 
 ---
@@ -585,3 +586,56 @@ fixtures a mano. **11/11** en `test_api_migrations_edit_applied.py`; sin regresi
 la versión con MySQL/MariaDB/PostgreSQL en este camino (los tests usan un doble). No hay
 migración Alembic, así que no hay nada que probar contra la BD del gateway. Los tests **no se
 corrieron con `pytest`**.
+
+---
+
+## Detalle — `T-260822-oc-projects-agrupar-blueprints` (reapertura: contrato y handoff)
+
+La tarea se había cerrado en `complete`, que en este protocolo significa «no queda nada
+pendiente en ningún lado». Era falso: el módulo quedó entregado e **inalcanzable desde la
+interfaz** (cero hits de «project» en `src/`). Se reabrió para escribir el contrato y hacer el
+handoff que faltaba, y se cerró en `update required`, que es donde debió cerrarse.
+
+### El bloqueante que apareció al escribir el contrato
+
+Las **siete** excepciones de `ProjectController` usaban `context=` en vez de
+`public_context["code"]`. `context` solo se expone en `development`, así que en producción:
+
+- ningún error del módulo se podía **clasificar** (solo prosa), y
+- el `missing_model_ids` del 422 de vinculación **desaparecía** — y ese 422 es todo-o-nada a
+  propósito: su valor entero está en poder decir CUÁLES ids no existen. Sin el dato, la UI dice
+  «hay blueprints inexistentes» y no puede señalar ninguno.
+
+Escribir un contrato que dijera «leé `missing_model_ids`» garantizaba un `BLOQUEADO POR
+BACKEND`, así que se corrigió: vocabulario cerrado en `app/services/project_catalog.py` con seis
+códigos. Dos pares que **no** son intercambiables y por eso tienen código propio:
+`project.name_taken` vs `project.link_conflict` (ambos 409, pero uno se arregla cambiando un
+dato y el otro repitiendo la llamada), y `project.blueprint_not_linked` vs
+`project.blueprint_not_found` (ambos 404: uno es la relación, el otro el recurso).
+
+Se sacó de `CLAUDE.md` la advertencia que nombraba este defecto: quedó obsoleta y además decía
+«seis excepciones» cuando eran siete.
+
+### Dos hallazgos del plan de UI que se corrigieron en el backend
+
+Al planear la UI de la edición de versiones aplicadas salieron dos huecos del mismo tipo, en
+`update_migration`:
+
+- el 409 de **aplicación parcial** y el de **overrides obsoletos** tampoco tenían código, y sus
+  datos (`incomplete_progress`, `stale_overrides`) viajaban solo en `context`. Se agregaron
+  `model_migration.partial_application` y `model_migration.stale_overrides`.
+
+Y un hecho del contrato que faltaba documentar: **`down_sql` NO está congelado**. El freeze mira
+solo `up_sql` y los overrides. Si la UI deshabilita el formulario entero cuando `sql_frozen` es
+`true`, cierra la única salida del 409 de `rollback` y deja la versión sin forma de revertirse.
+Quedó en `docs/api-reference-v15.md` §4.bis.
+
+### Verificación
+
+**Sin `pytest`** (política del repo): ejecución directa. **22/22** en `test_api_projects.py`,
+**11/11** en `test_api_migrations_edit_applied.py`, **57/57** en `test_api_model_migrations.py`.
+Ruff limpio. `scripts/check_claude_md_size.py` en verde (188/250).
+
+**Sin verificar:** que los planes de UI se correspondan con la SPA real (no se leyó `src/`); los
+`public_context` nuevos no tienen test propio que afirme la forma del payload — los tests
+existentes pasan porque afirman status y prosa, no el `code`. Vale la pena agregarlos.
