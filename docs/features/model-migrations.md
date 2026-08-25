@@ -350,11 +350,87 @@ en producción el operador recibiría el mensaje sin poder clasificarlo ni elegi
 
 | HTTP | `public_context.code` | Cuándo | Salida |
 |---|---|---|---|
-| 409 | `model_migration.sql_frozen` | `PATCH` que cambia el SQL efectivo (`up_sql` u overrides) de una versión vigente. | Fix-forward con una versión nueva, **o** revertir en las BDs que la nombran. |
+| 409 | `model_migration.sql_frozen` | `PATCH` que cambia el SQL efectivo (`up_sql` u overrides) de una versión vigente. | Fix-forward con una versión nueva, revertir en las BDs que la nombran, **o** editar igual asumiendo la divergencia (ver abajo). |
 | 409 | `model_migration.still_applied` | `DELETE` de una versión vigente. Borrarla dejaría esa BD con objetos que ninguna versión del blueprint describe. | Revertir primero, o crear una migración compensatoria. |
+| 422 | `model_migration.edit_confirm_mismatch` | `PATCH` con `confirm_version` distinto de la versión de la ruta. | Reenviar con la versión exacta. |
+
+El 409 de `sql_frozen` trae además `override_available: true`, para que la UI pueda distinguir
+"no se puede" de "se puede confirmando" sin tener que interpretar la prosa del mensaje.
 
 Ambos traen `version` y `blocking_databases[]`, con un ítem por BD que bloquea:
 `managed_database_id`, `reason` y —cuando aplica— `current_version`.
+
+### Editar igual una versión vigente (y qué se paga por hacerlo)
+
+El freeze supone que la salida siempre es fix-forward, y para un cambio de comportamiento eso
+es cierto. Pero hay correcciones cuyo valor está justamente en que las **BDs nuevas** no
+repitan el defecto. El caso testigo es un `COLLATE` hardcodeado en el DDL de las primeras
+versiones: describir la corrección con una versión al final de la cadena obliga a toda base
+nueva a **crearse mal y convertirse después**.
+
+Para eso existe la vía de excepción. **No abre el freeze: lo atraviesa, con dos factores y
+dejando rastro.**
+
+#### Lo que se paga, dicho sin vueltas
+
+Editar `up_sql` **no re-ejecuta nada**. Las BDs que ya aplicaron la versión conservan
+**físicamente** lo que corrió, así que su `_gw_v_{slug}` pasa a afirmar una versión cuyo texto
+ya no es el que se les aplicó. Esa divergencia es **real e irreversible**; lo único que se
+puede evitar es que quede en **silencio**, y de eso se ocupa el rastro.
+
+Consecuencia práctica que conviene tener presente: las BDs viejas **siguen necesitando la
+corrección por otra vía**. Para collation, esa vía es la
+[conversión de charset/collation](collation-conversion.md), que además recrea rutinas,
+triggers y vistas —que congelan la collation de la sesión que las creó— y evita el
+`Illegal mix of collations`. Un `CONVERT TO CHARACTER SET` metido a mano en una versión de
+blueprint **no** hace eso.
+
+#### El recorrido
+
+1. **`POST /database-models/{id}/migrations/{version}/edit-preview`** con los mismos campos de
+   SQL que va a llevar el `PATCH`. Responde:
+   - `requires_confirmation` — `false` si ninguna BD tiene la versión vigente (ahí el `PATCH`
+     común ya la edita, y **no se emite token**: uno que no hace falta entrena a mandarlo
+     siempre);
+   - `blocking_databases[]` — **quiénes van a quedar divergentes**, leído del **motor**;
+   - `confirm_token` + `expires_at` y `resulting_checksum`.
+2. **`PATCH .../migrations/{version}`** con el mismo SQL más `confirm_version` y
+   `confirm_token`.
+
+#### Por qué dos factores y no uno
+
+Cubren cosas distintas, y por eso no se puede quitar ninguno:
+
+- **`confirm_version`** obliga a identificar conscientemente **qué versión** se toca. Es el
+  molde de `confirm_target_name` al borrar una BD.
+- **`confirm_token`** da frescura y anti-replay, y —vía su `subject`— ata la autorización al
+  **SQL exacto** que se previsualizó. Sin eso, `(operación, model_id, version)` es igual para
+  cualquier edición de esa versión: se podría pedir el preview de una corrección inocua,
+  mirar un `blocking_databases` tranquilizador, y mandar otra cosa en el `PATCH`.
+
+#### El rastro, y por qué es fail-closed
+
+La edición se registra en `audit_log` con la acción **`migration.sql_edited_after_apply`**,
+anclada al id de la **migración** (`target_type='model_migration'`), con las BDs divergentes y
+el checksum previo en el `detail`.
+
+La entrada de intención se escribe **antes** de tocar nada y es **fail-closed**: si no se puede
+persistir, la operación aborta con 500 y la edición **no ocurre**. Es deliberado — el valor
+entero de esta vía está en que la divergencia quede registrada, así que perder el registro
+tiene que costar la operación. Mismo criterio que revelar una contraseña o descargar un export.
+
+De ahí se deriva la bandera **`sql_diverged`** del listado y del detalle: `true` = esta versión
+se editó después de que alguna BD la aplicara, así que ya no describe el plano de todas sus
+BDs. **No restringe nada** (el SQL nuevo es el que se aplica de acá en más); es señal para la
+UI. Se cuenta también la entrada `attempt`, no solo la `success`: si el proceso muere entre las
+dos, la versión igual pudo quedar divergente, y marcar de menos es precisamente la mentira
+silenciosa que todo esto viene a evitar.
+
+#### Lo que esta vía NO toca
+
+El `DELETE` sigue sin excepción: `model_migration.still_applied` no tiene override. Borrar
+la descripción de cambios que están físicamente en una BD deja esa base con objetos que
+**ninguna** versión del blueprint describe, y eso no se arregla con un rastro.
 
 ### Los cuatro `reason`
 

@@ -192,6 +192,7 @@ Atajo: `/tarea frontend`.
 
 | Ítem | Subtarea ClickUp | Backend cerrado por | Fecha | Breaking changes | Contrato |
 | --- | --- | --- | --- | --- | --- |
+| T-260824-ojoshuac-editar-version-aplicada | [`86e2z0gmj`](https://app.clickup.com/t/86e2z0gmj) | ojoshuacg@gmail.com | 2026-08-24 | **No.** Todo lo nuevo es aditivo: un endpoint (`edit-preview`), dos campos OPCIONALES en el `PATCH` (`confirm_version`/`confirm_token`), un campo nuevo en las respuestas (`sql_diverged`) y una clave nueva en el `public_context` del 409 (`override_available`). Un cliente que los ignore sigue funcionando igual. **Pero `api-reference-v14.md` queda CORREGIDO**: decía «No hay `force`» y «No ofrecer «Forzar»» para los dos 409, y eso ya no vale para `model_migration.sql_frozen`. | `docs/api-reference-v15.md` + `docs/features/model-migrations.md` (§ «Editar igual una versión vigente»). **Sin commitear todavía** (el usuario no pidió commit): el hash va cuando se commitee. |
 | Clon: copia de solo datos, collation/owner del destino y selección declarativa | [`86e2xzzyh`](https://app.clickup.com/t/86e2xzzyh) | LeoZubiri@outlook.com | 2026-08-22 | **No** para la SPA actual (los schemas zod no usan `.strict()`, así que los campos nuevos se descartan y nada se rompe). Sí hay cambios de comportamiento que el wizard tiene que absorber: el SPEC se manda ahora en `preview` (no en `create`), `confirm_token` puede llegar **vacío** cuando hay `blocking_issues`, y los mensajes de error cambiaron — `wizard/messages.ts` los matchea con expresiones regulares sobre la prosa. | `docs/features/database-clone.md` + `de73439` (schemas y rutas). Plan de UI COMPLETO ya escrito, con recorrido paso por paso, copy, mapeo de códigos `clone.*` y plan de pruebas. |
 
 ---
@@ -501,3 +502,86 @@ Tampoco se corrió la suite con `pytest` (P-11) ni se tocó el **frontend**: has
 paso de selección bloquea el avance con la selección de estructura vacía, que en este modo es la
 definición del modo, y "replanear" rehidrata el plan leyendo solo los campos legacy). La feature
 es usable **por API**.
+
+---
+
+## Detalle — `T-260824-ojoshuac-editar-version-aplicada`
+
+Editar el SQL de una versión de blueprint que **ya está aplicada** en una o más BDs, hasta
+ahora bloqueado con 409 `model_migration.sql_frozen` sin ninguna salida más que fix-forward.
+
+### Por qué
+
+El `COLLATE` está hardcodeado en el DDL de las primeras versiones de un blueprint. Corregirlo
+con una versión nueva al final de la cadena obliga a **toda BD nueva a crearse mal y
+convertirse después**. La corrección tiene que quedar en la versión original para que las bases
+nuevas nazcan bien.
+
+### Lo que NO resuelve, y hay que repetirlo
+
+Editar `up_sql` **no re-ejecuta nada**. Las BDs que ya aplicaron la versión conservan
+FÍSICAMENTE lo que corrió — incluidas rutinas, triggers y vistas con la collation vieja
+congelada. Esas bases **siguen necesitando** la conversión de charset/collation
+(`T-260824-lz-collation-lote-y-version`). Esta tarea arregla el futuro, no el pasado.
+
+### Diseño
+
+- **El freeze sigue siendo el default.** Sin los dos factores, el 409 es idéntico al de antes.
+  Se le agregó `override_available: true` al `public_context` para que la UI distinga «no se
+  puede» de «se puede confirmando» sin interpretar prosa.
+- **Doble factor**, molde del resto del repo: `confirm_version` (qué versión) + `confirm_token`
+  (frescura, anti-replay y **qué SQL**, vía el `subject` del HMAC, que es el checksum
+  resultante). Emitido por `POST .../migrations/{version}/edit-preview`, que además devuelve
+  **quiénes van a quedar divergentes**, leído del motor.
+- **Registro de divergencia en `audit_log`** (acción `migration.sql_edited_after_apply`,
+  `target_type='model_migration'`, `target_id` = id de la migración), **fail-closed antes de la
+  primera mutación**: si no se puede persistir, la operación aborta y la edición no ocurre.
+- Bandera derivada **`sql_diverged`** en listado y detalle, con una query en lote.
+
+### Dos decisiones que tienen motivo
+
+1. **Sin migración Alembic, a propósito.** El registro va en `audit_log` y no en una columna
+   nueva de `model_migrations`. Motivo operativo: el head es único (`a6b7c8d9e0f1`) y
+   `86e2ywnrg` está **en curso** con capacidad de crear otra migración; colgar una segunda del
+   mismo padre reproduce el incidente del 2026-08-22 (heads bifurcados, gateway en loop de
+   reinicios, git mergea sin conflicto). Motivo semántico: "esta versión se editó después de
+   haberse aplicado" es un **hecho histórico** que no se revoca, y `audit_log` además no cuelga
+   de `managed_databases`, así que el rastro sobrevive a dar de baja las BDs divergentes.
+2. **La bandera cuenta también las entradas `attempt`, no solo las `success`.** Si el proceso
+   muere entre las dos, la versión igual pudo quedar divergente. Marcar de más es ruido; marcar
+   de menos es la mentira silenciosa que toda la vía existe para evitar.
+
+### Fuera de alcance (decisión explícita del usuario)
+
+Restricción por entorno. Se evaluó limitar el desbloqueo a entornos no productivos usando el
+módulo de entornos, y el usuario pidió dejarlo afuera. **No** se agregó ningún flag a
+`environments`.
+
+### El `DELETE` no cambia
+
+`model_migration.still_applied` sigue sin override. Borrar la descripción de cambios que están
+físicamente en una BD deja esa base con objetos que ninguna versión describe, y eso no se
+arregla con un rastro.
+
+### Archivos
+
+`app/controllers/model_migration_controller.py` (helpers `_resulting_checksum`,
+`_authorize_applied_edit`, `_divergent_migration_ids`, `preview_sql_edit`; `_policy_flags` y
+`update_migration`), `app/services/migration_freeze_catalog.py`,
+`app/schemas/model_migration.py`, `app/routes/v1/model_migrations.py`,
+`tests/test_api_migrations_edit_applied.py`, `docs/api-reference-v15.md`,
+`docs/features/model-migrations.md`.
+
+### Verificación
+
+**Sin `pytest`** (política del repo): ejecución directa de las funciones de test inyectando las
+fixtures a mano. **11/11** en `test_api_migrations_edit_applied.py`; sin regresión en
+`test_api_model_migrations.py` (57), `test_api_migrations_stamp_and_edit.py` (10),
+`test_api_migrations_apply_flow.py` (17), `test_api_migrations_rollback_flow.py` (6) y
+`test_api_migrations_missing_database.py` (9). Ruff limpio en lo nuevo (el `B008` de
+`model_migrations.py` es **preexistente**, verificado contra `HEAD`).
+
+**Sin verificar:** nada contra motores reales — en particular que `_still_applied_live` lea bien
+la versión con MySQL/MariaDB/PostgreSQL en este camino (los tests usan un doble). No hay
+migración Alembic, así que no hay nada que probar contra la BD del gateway. Los tests **no se
+corrieron con `pytest`**.
