@@ -87,7 +87,8 @@ from app.models.collation_conversion_job import (
 )
 from app.models.enums import EngineType, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
-from app.services import audit, charset_catalog
+from app.services import audit, charset_catalog, collation_catalog
+from app.services.db_admin import query_policy
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import (
     ensure_not_reserved_database,
@@ -349,6 +350,46 @@ class CollationConversionController:
     # ------------------------------------------------------------------ #
     # Crear plan                                                          #
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _guard_gateway_metadata(database: str, target: ServerTarget) -> None:
+        """
+        Impide convertir la PROPIA base de metadatos del gateway.
+
+        `ensure_not_reserved_database` cubre las BDs de sistema del motor (`mysql`,
+        `information_schema`, `postgres`…), pero **no** la base del gateway, que para el motor
+        es una base de usuario común. Si su servidor está dado de alta en el inventario —el
+        caso normal en un compose—, nada impedía apuntarle una conversión:
+        `ALTER TABLE audit_log CONVERT TO …` reescribe la tabla completa **mientras el gateway
+        escribe en ella**, y `audit_log` es el único control compensatorio que el sistema
+        declara para todo lo demás; `servers` guarda `root_password_encrypted`.
+
+        Se reusa el guard de la consola SQL (`query_policy.is_gateway_metadata_target`) en vez
+        de escribir un segundo criterio: resuelve ambos hosts a IPs e intersecta, así que
+        registrar el servidor por su IP en lugar de por su nombre no lo evade, y es
+        fail-closed si la resolución falla. Mismo molde que `clone_controller` y
+        `export_controller`.
+
+        `target` es OBLIGATORIO y sin default a propósito: con un default, un llamador nuevo
+        se saltearía el guard en silencio — exactamente el modo de fallo que esto corrige.
+        """
+        if query_policy.is_gateway_metadata_target(
+            host=target.host,
+            port=target.port,
+            database=database,
+            gateway_host=DB_HOST,
+            gateway_port=DB_PORT,
+            gateway_database=DB_NAME,
+        ):
+            raise AppHttpException(
+                message=(
+                    "Esa base de datos es la propia base de metadatos del gateway: no se "
+                    "puede convertir su charset/collation."
+                ),
+                status_code=409,
+                public_context={"code": collation_catalog.CODE_SCOPE_NOT_ALLOWED},
+                context={"database": database},
+            )
+
     def create_plan(
         self,
         server_id: int,
@@ -366,6 +407,7 @@ class CollationConversionController:
         # dejar el servidor inconsistente.
         validate_identifier(database, dialect, "base de datos", allow_existing=True)
         ensure_not_reserved_database(database, dialect)
+        self._guard_gateway_metadata(database, target)
 
         charset: str | None = None
         if mode == COLLATION_MODE_UNIVERSAL:
@@ -914,7 +956,10 @@ class CollationConversionController:
                 f"objetivo: {sample}{more}. MySQL/MariaDB exigen la misma collation en ambos "
                 "lados de una FK y comparar columnas de collations distintas produce "
                 "'Illegal mix of collations': una conversión parcial puede romper consultas "
-                "que hoy funcionan."
+                "que hoy funcionan. La conversión se ejecuta con los chequeos de FK "
+                "DESACTIVADOS (el motor prohíbe convertir el charset de una tabla con una "
+                "columna de texto en una FK), así que el DDL NO va a fallar: la incoherencia "
+                "entre los dos lados aparece recién al CONSULTAR."
             )
 
         outdated = [o for o in inv.objects if o.is_outdated]
@@ -1476,12 +1521,23 @@ class CollationConversionController:
             else ""
         )
 
-        def run_one(sql: str, *, prepend_session: bool = False) -> tuple[bool, str | None, int | None]:
-            """Ejecuta una sentencia (opcionalmente precedida por el SET NAMES objetivo)."""
+        def run_one(
+            sql: str, *, prepend_session: bool = False, disable_fk_checks: bool = False
+        ) -> tuple[bool, str | None, int | None]:
+            """
+            Ejecuta una sentencia (opcionalmente precedida por el SET NAMES objetivo).
+
+            ``bulk=True`` SIEMPRE: el timeout interactivo de 15 s es de socket del CLIENTE en
+            MySQL/MariaDB, así que cortaría un ``CONVERT TO`` de cualquier tabla no trivial
+            **mientras el motor la sigue reescribiendo** — el paso quedaría marcado como
+            fallido y la BD en cuarentena por una sentencia que en realidad se completa. Esta
+            feature es asíncrona precisamente porque sus pasos tardan minutos u horas.
+            """
             statements = ([session_sql] if prepend_session else []) + [sql]
             results = runner.execute_adhoc(
                 target, db_name=db_name, engine=engine, lock_key=lock_key,
                 statements=statements, already_locked=True, stop_on_error=True,
+                disable_fk_checks=disable_fk_checks, bulk=True,
             )
             by_index = {r.index: r for r in results}
             total_ms = sum(r.execution_ms or 0 for r in results)
@@ -1550,7 +1606,15 @@ class CollationConversionController:
                     ))
                     seq += 1
                     continue
-                ok, err, ms = run_one(step.sql)
+                # FK checks DESACTIVADOS solo acá. MySQL PROHÍBE la conversión de charset
+                # sobre una tabla con una columna de texto usada en una FK
+                # (doc oficial de ALTER TABLE: "character set conversion is not permitted…
+                # The workaround is to disable foreign_key_checks"), y no es un caso raro:
+                # lo dispara cualquier esquema con una FK sobre varchar. No se extiende al
+                # ALTER DATABASE (no toca tablas) ni a la fase de objetos (un DROP/CREATE de
+                # rutina no está sujeto a esta restricción y desactivarlo ahí solo ampliaría
+                # la ventana sin comprar nada).
+                ok, err, ms = run_one(step.sql, disable_fk_checks=True)
                 had_failure = had_failure or not ok
                 self._record_item(job_id, dict(
                     seq=seq, object_type=step.object_type, object_name=step.object_name,
@@ -1697,7 +1761,7 @@ class CollationConversionController:
         results = runner.execute_adhoc(
             target, db_name=db_name, engine=engine, lock_key=lock_key,
             statements=[session_sql, drop_sql, ddl],
-            already_locked=True, stop_on_error=True,
+            already_locked=True, stop_on_error=True, bulk=True,
         )
         ms = int((time.monotonic() - t0) * 1000)
         by_index = {r.index: r for r in results}
@@ -1773,6 +1837,61 @@ class CollationConversionController:
         finally:
             session.close()
 
+    def _sync_managed_charset(self, job_id: int, ctx: dict) -> None:
+        """
+        Refleja en el inventario el charset/collation que la conversión acaba de fijar.
+
+        Sin esto, ``ManagedDatabase.charset``/``.collation`` quedan con el valor de cuando se
+        creó la BD y la fila MIENTE después de cada conversión exitosa — y esas columnas son
+        las que cualquier detección de deriva contra el blueprint tiene que leer.
+
+        Tres condiciones, y ninguna es opcional:
+
+        1. **Solo en modo ``universal``.** En ``columns`` (PostgreSQL) el objetivo es la
+           collation de una COLUMNA, no el ``LC_COLLATE`` de la base — que además es inmutable
+           tras el ``CREATE DATABASE``. Escribirlo ahí mezclaría dos conceptos que el propio
+           módulo separa.
+        2. **Solo si la BD está en el inventario.** Una BD cruda no tiene fila que actualizar.
+        3. **Solo si el ``ALTER DATABASE`` se ejecutó Y salió ``ok``.** Esas columnas son el
+           DEFAULT DE LA BASE, y ese paso es OPCIONAL (``include_database_default``): una
+           conversión que convierte todas las tablas pero no toca el default deja la base con
+           el default viejo. Sincronizar incondicionalmente cambiaría una fila STALE por una
+           fila FALSA, que es peor: la deriva la reportaría como al día.
+
+        Se lee el ÍTEM persistido en vez de un flag en memoria a propósito: el ítem es lo que
+        efectivamente pasó contra el motor.
+        """
+        if ctx.get("mode") != COLLATION_MODE_UNIVERSAL or ctx.get("managed_id") is None:
+            return
+        session = self._session()
+        try:
+            applied = (
+                session.query(CollationConversionJobItem.id)
+                .filter(
+                    CollationConversionJobItem.job_id == job_id,
+                    CollationConversionJobItem.object_type == COLLATION_OBJ_DATABASE,
+                    CollationConversionJobItem.status == COLLATION_ITEM_OK,
+                )
+                .first()
+            )
+            if applied is None:
+                return
+            md = session.get(ManagedDatabase, ctx["managed_id"])
+            if md is None:
+                return
+            md.charset = ctx.get("charset")
+            md.collation = ctx.get("collation")
+            session.commit()
+        except Exception:  # noqa: BLE001 — nunca tumbar un job ya terminado por esto
+            session.rollback()
+            logger.warning(
+                "No se pudo sincronizar charset/collation del inventario (job %s)",
+                job_id,
+                exc_info=True,
+            )
+        finally:
+            session.close()
+
     def _finish(
         self, job_id: int, ctx: dict, *, failed: bool, seq: int, progress: dict,
         error: str | None = None,
@@ -1791,6 +1910,8 @@ class CollationConversionController:
         # la protege del próximo execute hasta que un admin la revise (force).
         if failed and ctx["managed_id"] is not None:
             self._quarantine(ctx["managed_id"])
+        if not failed:
+            self._sync_managed_charset(job_id, ctx)
         # Auditoría AGREGADA del resultado (una entrada, patrón apply_profile_bulk/apply_all).
         # El worker corre fuera del ciclo de request: sin Request ID/admin; la intención ya
         # quedó registrada con record_intent al encolar.

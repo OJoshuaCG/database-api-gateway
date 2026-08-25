@@ -120,7 +120,8 @@ class _FakeRunner:
         yield
 
     def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
-                      already_locked=False, stop_on_error=True, disable_fk_checks=False):
+                      already_locked=False, stop_on_error=True, disable_fk_checks=False,
+                      bulk=False):
         type(self).executed.append(list(statements))
         out = []
         for i, stmt in enumerate(statements):
