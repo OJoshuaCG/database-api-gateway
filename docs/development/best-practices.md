@@ -429,6 +429,55 @@ async def get_user_stats(user_id: int):
 
 ## Testing
 
+### Cómo se corren los tests en este repo: `scripts/run_tests_direct.py`
+
+**`pytest` no se corre** como chequeo automático (ver "Ejecución de tests (pytest) — NO por
+defecto" en `CLAUDE.md`: la suite tarda varios minutos y correrla tras cada cambio genera carga
+real en la máquina de quien trabaja). La herramienta de verificación es un **ejecutor directo**:
+
+```bash
+.venv/bin/python scripts/run_tests_direct.py tests.test_api_servers
+.venv/bin/python scripts/run_tests_direct.py tests.test_health cors   # filtro por nombre
+```
+
+Carga las fixtures REALES de `tests/conftest.py`, resuelve las locales del módulo, expande
+`@pytest.mark.parametrize`, construye el `TestClient` solo si la cadena de fixtures lo declara,
+y trata `pytest.skip` como skip. Sus límites están declarados en el docstring del script.
+
+**Por qué está versionado y no se escribe al vuelo:** antes vivía en un scratchpad y se
+reescribía por sesión, así que acumuló cinco huecos y dos de ellos volvieron después de haber
+sido corregidos. El más caro no fue un test que no corría sino uno que corría verificando otra
+cosa: el arnés fabricaba `server_payload` con valores distintos a los reales, y eso dejó **dos
+aserciones de seguridad sin poder fallar** (la que verifica que la contraseña no se filtre
+buscaba un string que el payload falso jamás enviaba; la del bloqueo de loopback usaba un host
+que no es loopback). Esa fixture la usan 56 tests en 12 archivos.
+
+Si un test nuevo necesita algo que el arnés no soporta, **agregalo al script y sumale un caso a
+`tests/test_run_tests_direct.py`** — no escribas un arnés propio, que es exactamente cómo
+volvieron los huecos.
+
+### Verificar por mutación, y la trampa del `.pyc`
+
+El verde de un test no prueba que cubra algo: hay que **romper a propósito** lo que dice cubrir
+y ver que se ponga rojo. Es lo único que distingue un test que verifica de uno que acompaña.
+
+Pero si la mutación es sobre un archivo de `app/`, hay una trampa que produce resultados falsos
+**después** de restaurar. Python valida el `.pyc` contra el par (mtime del fuente **en segundos
+enteros**, tamaño en bytes). Una mutación que intercambia dos líneas deja el tamaño idéntico, y
+un script que muta, corre y restaura lo hace dentro del mismo segundo: el par no cambia, Python
+**no recompila**, y todo proceso posterior carga el bytecode **mutado** desde un fuente que
+`git diff` reporta limpio. Es un peligro específico de scripts y agentes — a mano nadie muta y
+restaura en menos de un segundo.
+
+Ya costó una auditoría completa: dos tests rojos, uno de ellos sano, sobre código intacto.
+
+`scripts/run_tests_direct.py` se protege con `sys.dont_write_bytecode = True` (cuesta ~7% de
+arranque). Si mutás desde otro proceso, **limpiá la caché después de restaurar**:
+
+```bash
+find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
+```
+
 ### Instalar Dependencias de Testing
 
 ```bash
