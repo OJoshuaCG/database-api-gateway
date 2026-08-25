@@ -24,6 +24,7 @@ no depender de un apply real end-to-end, igual que
 from datetime import datetime
 
 from app.services.db_admin.migrations import MigrationResult, MigrationRunner
+from tests.test_api_model_migrations import _engine_version
 
 
 # --------------------------------------------------------------------------- #
@@ -86,11 +87,19 @@ def _mr(version, mig_id, status="applied"):
     )
 
 
-def _insert_history(db_id, mig_id, status, when=None):
-    """Inserta una fila de historial directamente (sin pasar por un apply real)."""
+def _insert_history(db_id, mig_id, status, when=None, db_version=None):
+    """Inserta una fila de historial directamente (sin pasar por un apply real).
+
+    ``db_version`` fija además ``ManagedDatabase.model_version``. Es obligatorio cuando el
+    test quiere representar "esta BD depende de la versión": el historial es un log de
+    EVENTOS que el ``rollback`` escribe con el MISMO ``status='applied'``, así que ya no
+    congela nada por sí solo. Ver ``_insert_history_row`` en
+    ``tests/test_api_model_migrations.py``.
+    """
     from app.core.database import Database
     from app.models.database_migration_history import DatabaseMigrationHistory
     from app.models.enums import MigrationStatus
+    from app.models.managed_database import ManagedDatabase
 
     s = Database().get_declarative_base_session()
     try:
@@ -104,6 +113,8 @@ def _insert_history(db_id, mig_id, status, when=None):
                 execution_ms=1,
             )
         )
+        if db_version is not None:
+            s.get(ManagedDatabase, db_id).model_version = db_version
         s.commit()
     finally:
         s.close()
@@ -189,17 +200,24 @@ def test_patch_up_sql_allowed_without_history(admin_client):
 
 
 def test_patch_up_sql_blocked_after_successful_application(admin_client, server_payload):
+    """La BD está parada EN 0001, así que el SQL de 0001 describe lo que hay en el motor.
+
+    El fixture fija la versión de la BD además del historial: éste solo habilita la
+    consulta cara, y el veredicto lo da la versión que reporta el motor (por eso el doble).
+    """
     model_id, mig_id = _blueprint_with_migration(admin_client, slug="edit-b")
     db_id = _managed_db(admin_client, server_payload, model_id, port=3503)
-    _insert_history(db_id, mig_id, "applied")
+    _insert_history(db_id, mig_id, "applied", db_version="0001")
 
-    r = admin_client.patch(
-        f"/api/v1/database-models/{model_id}/migrations/0001",
-        json={"up_sql": "CREATE TABLE t1_fixed (id INT PRIMARY KEY)"},
-    )
+    with _engine_version("0001"):
+        r = admin_client.patch(
+            f"/api/v1/database-models/{model_id}/migrations/0001",
+            json={"up_sql": "CREATE TABLE t1_fixed (id INT PRIMARY KEY)"},
+        )
     assert r.status_code == 409, r.text
     body = r.text.lower()
     assert "fix-forward" in body or "no se puede modificar" in body
+    assert r.json()["detail"]["public_context"]["code"] == "model_migration.sql_frozen"
 
 
 def test_patch_up_sql_allowed_when_history_is_only_failed(admin_client, server_payload):

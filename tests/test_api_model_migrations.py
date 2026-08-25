@@ -1,5 +1,7 @@
 """Endpoints de migraciones de blueprints: CRUD, checksum, traducción, rollback sugerido."""
 
+from contextlib import contextmanager
+
 
 def _new_model(admin_client, slug="whatsapp", name="Whatsapp") -> int:
     r = admin_client.post("/api/v1/database-models", json={"name": name, "slug": slug})
@@ -225,13 +227,27 @@ def test_delete_migration(admin_client):
     ).status_code == 404
 
 
-def _insert_history_row(managed_db_id, migration_id, status="applied"):
-    """Inserta una fila de historial directamente (sin apply real end-to-end)."""
+def _insert_history_row(managed_db_id, migration_id, status="applied", db_version=None):
+    """Inserta una fila de historial directamente (sin apply real end-to-end).
+
+    ``db_version`` fija además la versión CACHEADA de la BD gestionada
+    (``ManagedDatabase.model_version``), y hay que pasarla siempre que el test quiera
+    representar "esta BD depende de la versión". El historial por sí solo ya no alcanza: es
+    un log de EVENTOS que nunca se revoca —``_record_history`` escribe ``applied`` tanto en
+    el ``apply`` como en el ``rollback``, y no hay columna ``direction``—, así que lo que
+    congela una versión es la versión ACTUAL de la BD, no que alguna vez haya corrido.
+
+    Sin ``db_version`` la BD queda como la deja el alta por API (``model_version = NULL``),
+    o sea "está en la base y no tiene ninguna versión aplicada": ese es exactamente el
+    estado de una BD que revirtió todo, y el ``apply`` real nunca lo combina con historial
+    ``applied`` vigente.
+    """
     from datetime import datetime
 
     from app.core.database import Database
     from app.models.database_migration_history import DatabaseMigrationHistory
     from app.models.enums import MigrationStatus
+    from app.models.managed_database import ManagedDatabase
 
     s = Database().get_declarative_base_session()
     try:
@@ -245,9 +261,56 @@ def _insert_history_row(managed_db_id, migration_id, status="applied"):
                 execution_ms=1,
             )
         )
+        if db_version is not None:
+            s.get(ManagedDatabase, managed_db_id).model_version = db_version
         s.commit()
     finally:
         s.close()
+
+
+#: Centinela para ``_engine_version``: el motor no se puede leer (caído, base sin
+#: aprovisionar, credenciales rotas).
+_ENGINE_UNREADABLE = object()
+
+
+@contextmanager
+def _engine_version(version):
+    """Doble del motor para el guard AUTORITATIVO de edición/borrado de versiones.
+
+    ``update_migration`` y ``delete_migration`` no deciden con la caché del inventario:
+    leen la versión ACTUAL de cada BD con ``MigrationRunner.get_current_version``, porque
+    están por autorizar algo irreversible. Los fixtures registran servidores con hosts
+    inventados, así que sin este doble toda conexión falla y el fail-closed responde 409 con
+    ``reason='unreadable'``: el test pasaría, pero por un motivo distinto del que dice
+    probar.
+
+    ``version`` es lo que el motor reporta para CUALQUIER BD del bloque; el centinela
+    ``_ENGINE_UNREADABLE`` simula un motor ilegible, y su excepción lleva credenciales a
+    propósito para poder verificar que no se filtran al ``message`` del 409 (criterio R4).
+
+    Se parchean atributos del MÓDULO del controller —no de las clases originales— porque es
+    ahí donde se resuelven en tiempo de llamada, y se restauran en ``finally`` para no
+    contaminar el resto de la suite.
+    """
+    import app.controllers.model_migration_controller as mod
+
+    class _Runner:
+        def get_current_version(self, target, db_name, slug):
+            if version is _ENGINE_UNREADABLE:
+                raise RuntimeError(
+                    "(2003, \"Can't connect to server on '10.0.0.9:5480' (user=root "
+                    "password=rootpw)\")"
+                )
+            return version
+
+    originales = (mod.MigrationRunner, mod.build_target, mod.get_server_or_404)
+    mod.MigrationRunner = _Runner
+    mod.build_target = lambda server: object()
+    mod.get_server_or_404 = lambda session, server_id: object()
+    try:
+        yield
+    finally:
+        mod.MigrationRunner, mod.build_target, mod.get_server_or_404 = originales
 
 
 def _managed_db_for_model(admin_client, model_id, port, name="mdb"):
@@ -270,16 +333,31 @@ def _managed_db_for_model(admin_client, model_id, port, name="mdb"):
 
 
 def test_delete_migration_applied_successfully_409(admin_client):
-    """Borrar una migración ya aplicada CON ÉXITO en alguna BD → 409 (alguna BD depende de ella)."""
+    """Borrar una versión que alguna BD tiene aplicada HOY → 409, y la versión sobrevive.
+
+    El fixture fija ``model_version='0001'``: la BD está parada en esa versión, o sea que
+    depende de ella. Con el historial solo no alcanzaría —una fila ``applied`` la escribe
+    igual el ``rollback``—, y por eso el guard autoritativo confirma leyendo el motor.
+    """
     model_id = _new_model(admin_client, slug="delhist", name="DelHist")
     r = _create_migration(admin_client, model_id)
     mig_id = r.json()["data"]["id"]
     db_id = _managed_db_for_model(admin_client, model_id, port=5480)
-    _insert_history_row(db_id, mig_id, status="applied")
+    _insert_history_row(db_id, mig_id, status="applied", db_version="0001")
 
-    r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0001")
+    with _engine_version("0001"):
+        r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0001")
     assert r.status_code == 409, r.text
-    assert "aplicada con éxito" in r.text.lower()
+    pc = r.json()["detail"]["public_context"]
+    assert pc["code"] == "model_migration.still_applied"
+    assert pc["version"] == "0001"
+    assert pc["blocking_databases"] == [
+        {
+            "managed_database_id": db_id,
+            "reason": "still_applied",
+            "current_version": "0001",
+        }
+    ]
 
     # Sigue existiendo.
     assert admin_client.get(
@@ -515,10 +593,11 @@ def test_policy_flags_version_limpia(admin_client):
 
 
 def test_policy_flags_aplicada_congela_el_sql(admin_client):
+    """Una BD parada EN la versión la congela. Las banderas salen de la caché, sin motor."""
     model_id = _new_model(admin_client, slug="pol2", name="Pol2")
     mig_id = _create_migration(admin_client, model_id).json()["data"]["id"]
     db_id = _managed_db_for_model(admin_client, model_id, port=5490)
-    _insert_history_row(db_id, mig_id, status="applied")
+    _insert_history_row(db_id, mig_id, status="applied", db_version="0001")
 
     d = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0001").json()["data"]
     assert d["sql_frozen"] is True
@@ -577,13 +656,208 @@ def test_policy_flags_patch_de_solo_nombre_no_miente(admin_client):
     model_id = _new_model(admin_client, slug="pol6", name="Pol6")
     mig_id = _create_migration(admin_client, model_id).json()["data"]["id"]
     db_id = _managed_db_for_model(admin_client, model_id, port=5493)
-    _insert_history_row(db_id, mig_id, status="applied")
+    _insert_history_row(db_id, mig_id, status="applied", db_version="0001")
 
     r = admin_client.patch(
         f"/api/v1/database-models/{model_id}/migrations/0001", json={"name": "otro nombre"}
     )
     assert r.status_code == 200, r.text
     assert r.json()["data"]["sql_frozen"] is True
+
+# --------------------------------------------------------------------------- #
+# Vigencia de una versión: lo que congela es la versión ACTUAL, no el historial #
+# --------------------------------------------------------------------------- #
+def _blueprint_con_tres_versiones(admin_client, slug, port, db_version):
+    """Blueprint 0001/0002/0003 + una BD que las corrió TODAS y hoy está en `db_version`.
+
+    Es el escenario del incidente: el historial afirma que las tres se aplicaron con éxito
+    (y eso nunca se revoca), pero la BD puede haber revertido después.
+    """
+    model_id = _new_model(admin_client, slug=slug, name=slug)
+    ids = []
+    for v in ("0001", "0002", "0003"):
+        r = _create_migration(
+            admin_client, model_id, version=v, up_sql=f"CREATE TABLE t{v} (id INT PRIMARY KEY)"
+        )
+        assert r.status_code == 201, r.text
+        ids.append(r.json()["data"]["id"])
+    db_id = _managed_db_for_model(admin_client, model_id, port=port, name=f"db{port}")
+    for i, mig_id in enumerate(ids):
+        # La versión de la BD se fija una sola vez, con la última fila de historial.
+        _insert_history_row(
+            db_id,
+            mig_id,
+            status="applied",
+            db_version=db_version if i == len(ids) - 1 else None,
+        )
+    return model_id, ids, db_id
+
+
+def test_version_revertida_vuelve_a_ser_editable_y_borrable(admin_client):
+    """El caso que motivó el cambio: revertir en todas las BDs DESCONGELA la versión.
+
+    `database_migration_history` es un log de EVENTOS. `_record_history` escribe
+    `status='applied'` tanto desde el `apply` como desde el `rollback`, y ni la tabla ni
+    `MigrationResult` tienen columna `direction`: esa fila no se revoca nunca. Con el guard
+    viejo —"¿existe alguna fila applied?"— una versión revertida correctamente quedaba
+    congelada de por vida, sin ninguna salida: no hay purga de historial, el `DELETE` no
+    acepta `force`, y el `CASCADE` que borraría esas filas cuelga del borrado de la
+    migración, que es justo lo que el historial bloquea. La única salida era fix-forward.
+
+    Con la BD parada en 0002, la 0003 ya no describe nada del motor: se puede editar y
+    borrar.
+    """
+    model_id, _ids, _db_id = _blueprint_con_tres_versiones(
+        admin_client, slug="revert", port=5494, db_version="0002"
+    )
+
+    d = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0003").json()["data"]
+    assert (d["sql_frozen"], d["deletable"], d["block_reason"]) == (False, True, None)
+
+    with _engine_version("0002"):
+        r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0003")
+    assert r.status_code == 200, r.text
+    assert admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations/0003"
+    ).status_code == 404
+
+
+def test_version_vigente_sigue_congelada(admin_client):
+    """Mismo historial, pero la BD SIGUE en 0003: la versión describe lo que hay en el motor.
+
+    Es la mitad que no se puede aflojar. Borrarla no revierte nada: dejaría esa BD con
+    objetos que ninguna versión del blueprint describe.
+    """
+    model_id, _ids, db_id = _blueprint_con_tres_versiones(
+        admin_client, slug="vigente", port=5495, db_version="0003"
+    )
+
+    d = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0003").json()["data"]
+    assert (d["sql_frozen"], d["deletable"], d["block_reason"]) == (True, False, "applied")
+
+    with _engine_version("0003"):
+        r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0003")
+    assert r.status_code == 409, r.text
+    pc = r.json()["detail"]["public_context"]
+    assert pc["code"] == "model_migration.still_applied"
+    assert pc["blocking_databases"] == [
+        {
+            "managed_database_id": db_id,
+            "reason": "still_applied",
+            "current_version": "0003",
+        }
+    ]
+
+
+def test_version_posterior_tambien_congela(admin_client):
+    """Las migraciones son forward-only encadenadas: estar en 0003 implica tener la 0001.
+
+    Por eso el criterio es ">= la versión", no "== la versión". Si fuera igualdad, una BD al
+    día dejaría borrar todas las versiones intermedias que sí describen su esquema.
+    """
+    model_id, _ids, _db_id = _blueprint_con_tres_versiones(
+        admin_client, slug="posterior", port=5496, db_version="0003"
+    )
+
+    d = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0001").json()["data"]
+    assert d["sql_frozen"] is True
+    assert d["block_reason"] == "applied"
+
+    with _engine_version("0003"):
+        r = _patch(admin_client, model_id, "0001", {"up_sql": "CREATE TABLE otra (id INT)"})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["public_context"]["code"] == "model_migration.sql_frozen"
+
+
+def test_motor_ilegible_es_fail_closed(admin_client):
+    """Un motor que no responde NO es permiso para borrar: 409 con `reason='unreadable'`.
+
+    Nótese que la CACHÉ dice que la BD está en 0002 (la versión 0003 se ve borrable en el
+    listado), y aun así la mutación se rechaza: el veredicto autoritativo es el del motor, y
+    cuando no se puede leer se falla cerrado. Tratar la caída como "ya no la tiene"
+    convertiría un corte de red en autorización para destruir metadata.
+    """
+    model_id, _ids, db_id = _blueprint_con_tres_versiones(
+        admin_client, slug="ilegible", port=5497, db_version="0002"
+    )
+
+    with _engine_version(_ENGINE_UNREADABLE):
+        r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0003")
+    assert r.status_code == 409, r.text
+    pc = r.json()["detail"]["public_context"]
+    assert pc["code"] == "model_migration.still_applied"
+    assert pc["blocking_databases"] == [
+        {"managed_database_id": db_id, "reason": "unreadable"}
+    ]
+    assert admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations/0003"
+    ).status_code == 200
+
+
+def test_el_409_no_filtra_el_mensaje_del_motor(admin_client):
+    """Criterio R4: el error del motor puede llevar host, usuario o contraseña.
+
+    El `message` y el `public_context` solo pueden nombrar el id de la BD y un motivo del
+    vocabulario cerrado; el detalle va al log correlacionado por Request ID.
+    """
+    model_id, _ids, _db_id = _blueprint_con_tres_versiones(
+        admin_client, slug="r4", port=5498, db_version="0002"
+    )
+
+    with _engine_version(_ENGINE_UNREADABLE):
+        r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0003")
+    assert r.status_code == 409, r.text
+    cuerpo = r.text.lower()
+    for filtracion in ("rootpw", "10.0.0.9", "2003", "can't connect"):
+        assert filtracion not in cuerpo, f"se filtró {filtracion!r}: {r.text}"
+
+
+def test_version_cacheada_ilegible_sigue_congelada(admin_client):
+    """`model_version` no numérico ⇒ fail-closed: la versión sigue congelada.
+
+    `version_sort_key` hace `int(version)` y nada garantiza que la caché sea numérica: se
+    escribe releyendo el motor, y un `stamp` a mano puede dejar cualquier cosa. Ante un
+    valor que no se puede ordenar, la respuesta segura es "sí la alcanza".
+    """
+    model_id, ids, db_id = _blueprint_con_tres_versiones(
+        admin_client, slug="rara", port=5499, db_version="v3-hotfix"
+    )
+    assert ids  # el blueprint quedó armado
+
+    d = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0003").json()["data"]
+    assert d["sql_frozen"] is True
+    assert d["deletable"] is False
+
+    with _engine_version("v3-hotfix"):
+        r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0003")
+    assert r.status_code == 409, r.text
+    pc = r.json()["detail"]["public_context"]
+    assert pc["blocking_databases"] == [
+        {
+            "managed_database_id": db_id,
+            "reason": "still_applied",
+            "current_version": "v3-hotfix",
+        }
+    ]
+
+
+def test_solo_historial_fallido_no_lee_el_motor(admin_client):
+    """Anti-regresión: el historial sigue siendo el PRIMER filtro, y es barato.
+
+    Una versión que solo falló no tiene ninguna fila `applied`, así que ni se llega a abrir
+    conexión: si se llegara, este test fallaría con 409 `unreadable` en vez de 200. Es lo
+    que evita que un PATCH de una versión nunca aplicada dependa de que el motor esté vivo.
+    """
+    model_id = _new_model(admin_client, slug="solofail", name="SoloFail")
+    mig_id = _create_migration(admin_client, model_id).json()["data"]["id"]
+    db_id = _managed_db_for_model(admin_client, model_id, port=5500)
+    _insert_history_row(db_id, mig_id, status="failed", db_version="0001")
+
+    with _engine_version(_ENGINE_UNREADABLE):
+        r = _patch(admin_client, model_id, "0001", {"up_sql": "CREATE TABLE ok (id INT)"})
+        assert r.status_code == 200, r.text
+        r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0001")
+    assert r.status_code == 200, r.text
 
 
 # --------------------------------------------------------------------------- #

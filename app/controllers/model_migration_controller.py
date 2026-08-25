@@ -14,6 +14,8 @@ motor) usando ``MigrationRunner``.
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
+from app.controllers.common import build_target, engine_value, get_server_or_404
+from app.core.context import current_http_identifier
 from app.core.database import Database
 from app.core.environments import (
     DB_HOST,
@@ -27,20 +29,24 @@ from app.core.environments import (
     SNAPSHOT_DATA_MAX_TABLES,
     SNAPSHOT_MAX_SQL_PER_VERSION,
 )
-from app.controllers.common import build_target, engine_value, get_server_or_404
+from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
-from app.models.managed_database import ManagedDatabase
 from app.models.enums import EngineType, MigrationStatus
+from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
 from app.services import audit
+from app.services import migration_freeze_catalog as freeze_codes
 from app.services.db_admin import migration_facts, migration_progress, migration_results
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import references_gateway_internal_table
 from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
+from app.services.db_admin.migrations import MigrationRunner
 from app.services.db_admin.sql_dialect import RollbackGenerator, SqlTranslator
+
+logger = get_logger(__name__)
 
 # Orden NUMÉRICO de versión en SQL: (longitud, valor) equivale al orden entero para
 # strings de solo dígitos (incl. con ceros a la izquierda), evitando el bug del orden
@@ -191,6 +197,199 @@ class ModelMigrationController:
             )
         return m
 
+    # ------------------------------------------------------------------ #
+    # Vigencia de una versión: ¿alguna BD la tiene aplicada HOY?           #
+    # ------------------------------------------------------------------ #
+    # ``database_migration_history`` es un LOG DE EVENTOS, no un estado. Una fila
+    # ``status='applied'`` dice "esta versión corrió con éxito sobre esta BD alguna vez", y
+    # eso no se revoca nunca: ``_record_history`` se llama tanto desde el camino ``apply``
+    # como desde el ``rollback``, y ninguno de los dos deja rastro de la DIRECCIÓN (ni
+    # ``MigrationResult`` ni la tabla tienen columna ``direction``). Consecuencia: con solo
+    # el historial, una versión revertida CORRECTAMENTE en todas las BDs quedaba congelada
+    # de por vida, sin ninguna forma de editarla ni eliminarla — no existe purga de
+    # historial, y el ``CASCADE`` que borraría esas filas cuelga del borrado de la migración,
+    # que es justo lo que el historial bloquea.
+    #
+    # Por eso el historial pasa a ser el PRIMER filtro (barato, sin abrir conexiones) y la
+    # decisión final la da la VERSIÓN ACTUAL de esas BDs. Las migraciones son forward-only
+    # encadenadas: una BD en la versión N tiene aplicadas todas las <= N. Así que "la
+    # versión V sigue vigente" es "alguna de las BDs que la aplicaron está hoy en V o
+    # posterior".
+    #
+    # LÍMITE CONOCIDO Y ACEPTADO: ``stamp`` mueve el puntero sin ejecutar ni deshacer DDL,
+    # así que una BD stampeada hacia atrás reporta una versión anterior conservando
+    # físicamente los cambios de V. Para esa BD, desbloquear V permite borrar la DESCRIPCIÓN
+    # de cambios que siguen en el motor. No es un descuido: ``stamp`` es la puerta trasera
+    # declarada de cualquier gate basado en la versión, y el módulo ya lo documenta así.
+
+    @staticmethod
+    def _describe_blocking(blocking: list[dict]) -> str:
+        """Frase legible con las BDs que bloquean, para el ``message`` del 409.
+
+        El dato estructurado va igual en ``public_context['blocking_databases']``; esto es
+        para que el mensaje diga CUÁL BD y POR QUÉ sin obligar a inspeccionar el payload. No
+        se vuelca ningún mensaje del motor (criterio R4): solo el id y un motivo del
+        vocabulario cerrado.
+        """
+        partes = []
+        for row in blocking:
+            db_id = row["managed_database_id"]
+            reason = row.get("reason")
+            if reason == freeze_codes.REASON_STILL_APPLIED:
+                actual = row.get("current_version")
+                partes.append(f"BD {db_id} está en la versión {actual}")
+            elif reason == freeze_codes.REASON_UNREADABLE:
+                partes.append(f"no se pudo leer la versión de la BD {db_id}")
+            elif reason == freeze_codes.REASON_UNKNOWN_DATABASE:
+                partes.append(f"la BD {db_id} tiene historial pero no está en el inventario")
+            else:
+                partes.append(f"no se pudo resolver el blueprint de la BD {db_id}")
+        return ", ".join(partes) + "."
+
+    @staticmethod
+    def _applied_history_targets(session, migration_ids: list[int]) -> dict[int, set[int]]:
+        """``{migration_id: {managed_database_id, ...}}`` con aplicación EXITOSA histórica.
+
+        Una sola query para todo el lote. Las BDs dadas de baja del inventario no aparecen:
+        el ``ondelete='CASCADE'`` de ``managed_database_id`` ya se llevó sus filas.
+        """
+        if not migration_ids:
+            return {}
+        rows = (
+            session.query(
+                DatabaseMigrationHistory.model_migration_id,
+                DatabaseMigrationHistory.managed_database_id,
+            )
+            .filter(
+                DatabaseMigrationHistory.model_migration_id.in_(migration_ids),
+                DatabaseMigrationHistory.status == MigrationStatus.applied,
+            )
+            .distinct()
+            .all()
+        )
+        out: dict[int, set[int]] = {}
+        for migration_id, db_id in rows:
+            out.setdefault(migration_id, set()).add(db_id)
+        return out
+
+    @staticmethod
+    def _reaches_version(current: str | None, version: str) -> bool:
+        """¿``current`` es la versión ``version`` o una posterior? Fail-closed.
+
+        ``version_sort_key`` hace ``int(version)`` y nada garantiza que la versión CACHEADA
+        en el inventario sea numérica (se escribió releyendo el motor, que puede traer
+        cualquier cosa si alguien stampeó a mano). Un valor ilegible se trata como "sí la
+        alcanza": ante la duda, la versión sigue congelada. Lo contrario permitiría borrar
+        por un error de parseo.
+        """
+        if current is None:
+            return False
+        try:
+            return version_sort_key(current) >= version_sort_key(version)
+        except (TypeError, ValueError):
+            return True
+
+    @classmethod
+    def _still_applied_cached(
+        cls, session, migrations: list[ModelMigration]
+    ) -> set[int]:
+        """IDs de migración que HOY siguen aplicadas en alguna BD, según la CACHÉ.
+
+        Usa ``ManagedDatabase.model_version`` (la caché del inventario) y no el motor: esto
+        corre por cada fila de cada página del listado de versiones, y abrir una conexión por
+        BD para pintar un botón no se sostiene. El veredicto autoritativo —el que ejecuta la
+        mutación— lee el motor en vivo (``_still_applied_live``).
+
+        La divergencia posible es en la dirección segura: si la caché quedó atrasada, el
+        listado puede ofrecer un botón que después el guard rechaza con 409. Al revés no
+        puede pasar sin que la caché sobreestime la versión, y eso solo congela de más.
+        """
+        targets = cls._applied_history_targets(session, [m.id for m in migrations])
+        db_ids = {db_id for ids in targets.values() for db_id in ids}
+        if not db_ids:
+            return set()
+        versions = dict(
+            session.query(ManagedDatabase.id, ManagedDatabase.model_version)
+            .filter(ManagedDatabase.id.in_(db_ids))
+            .all()
+        )
+        still: set[int] = set()
+        for m in migrations:
+            for db_id in targets.get(m.id, ()):
+                # Una BD con historial cuya fila ya no está en el inventario no debería
+                # existir (CASCADE), pero si aparece se cuenta como vigente: no se puede
+                # probar lo contrario.
+                if db_id not in versions or cls._reaches_version(versions[db_id], m.version):
+                    still.add(m.id)
+                    break
+        return still
+
+    @classmethod
+    def _still_applied_live(cls, session, m: ModelMigration) -> list[dict]:
+        """BDs que HOY tienen aplicada ``m``, leyendo la versión DEL MOTOR.
+
+        Es el veredicto autoritativo, y por eso abre conexiones: la caché del inventario la
+        escriben ``apply``/``rollback``/``stamp`` releyendo el motor, pero nada garantiza que
+        esté fresca, y acá se está por autorizar algo irreversible (borrar una versión, o
+        cambiar el SQL de una que ya corrió).
+
+        Fail-closed: una BD que no se puede leer —motor caído, base sin aprovisionar,
+        credenciales rotas— cuenta como VIGENTE y aparece en la lista con ``reason``. Tratar
+        un fallo de lectura como "ya no la tiene" convertiría una caída de red en permiso
+        para borrar.
+
+        Se devuelve la lista de BDs bloqueantes (vacía ⇒ la versión está libre), no un
+        booleano, porque el 409 tiene que poder nombrar cuáles y por qué.
+        """
+        db_ids = cls._applied_history_targets(session, [m.id]).get(m.id, set())
+        if not db_ids:
+            return []
+        model = session.query(DatabaseModel).filter(DatabaseModel.id == m.model_id).first()
+        if model is None:  # sin slug no hay tabla de versión que leer
+            return [{"managed_database_id": db_id, "reason": freeze_codes.REASON_UNKNOWN_BLUEPRINT}
+                    for db_id in sorted(db_ids)]
+
+        runner = MigrationRunner()
+        blocking: list[dict] = []
+        for db_id in sorted(db_ids):
+            md = (
+                session.query(ManagedDatabase)
+                .filter(ManagedDatabase.id == db_id)
+                .first()
+            )
+            if md is None:
+                blocking.append({"managed_database_id": db_id, "reason": freeze_codes.REASON_UNKNOWN_DATABASE})
+                continue
+            try:
+                server = get_server_or_404(session, md.server_id)
+                current = runner.get_current_version(
+                    build_target(server), md.name, model.slug
+                )
+            except Exception:
+                # No se distingue el motivo a propósito: el mensaje del motor puede llevar
+                # host, usuario o fragmentos de sentencia (criterio R4 del módulo). El
+                # detalle va al log con el Request ID.
+                logger.exception(
+                    "%s | no se pudo leer la versión de la BD %s al evaluar la vigencia "
+                    "de la migración %s",
+                    current_http_identifier.get(),
+                    db_id,
+                    m.version,
+                )
+                blocking.append(
+                    {"managed_database_id": db_id, "reason": freeze_codes.REASON_UNREADABLE}
+                )
+                continue
+            if cls._reaches_version(current, m.version):
+                blocking.append(
+                    {
+                        "managed_database_id": db_id,
+                        "reason": freeze_codes.REASON_STILL_APPLIED,
+                        "current_version": current,
+                    }
+                )
+        return blocking
+
     @staticmethod
     def _policy_flags(
         session, migrations: list[ModelMigration], *, latest_version: str | None
@@ -217,16 +416,10 @@ class ModelMigrationController:
         ids = [m.id for m in migrations]
         if not ids:
             return {}
-        applied_ids = {
-            row[0]
-            for row in session.query(DatabaseMigrationHistory.model_migration_id)
-            .filter(
-                DatabaseMigrationHistory.model_migration_id.in_(ids),
-                DatabaseMigrationHistory.status == MigrationStatus.applied,
-            )
-            .distinct()
-            .all()
-        }
+        # No alcanza con "tiene historial de aplicación exitosa": eso es un evento pasado que
+        # nunca se revoca (el rollback escribe el MISMO status). Lo que congela es que alguna
+        # BD dependa de la versión HOY. Ver el bloque de ``_still_applied_cached``.
+        applied_ids = ModelMigrationController._still_applied_cached(session, migrations)
         partial_ids = migration_progress.migrations_with_incomplete_progress(ids, "up")
 
         flags: dict[int, dict] = {}
@@ -865,16 +1058,28 @@ class ModelMigrationController:
             # ``in data`` (el PATCH llega con ``exclude_unset=True``) para cubrir también el
             # caso de LIMPIAR el rollback con ``null``.
             down_sql_changing = "down_sql" in data
+            # El historial es solo el PRIMER filtro (barato). Que la versión haya corrido
+            # alguna vez no la congela: lo que la congela es que alguna BD dependa de ella
+            # HOY, y eso se confirma leyendo el motor. La lectura en vivo se hace únicamente
+            # cuando de verdad se está por cambiar el SQL, para no abrir conexiones en un
+            # PATCH que solo toca el nombre.
             if applied_successfully and sql_fields_changing:
-                raise AppHttpException(
-                    message=(
-                        "La migración ya fue aplicada exitosamente en alguna BD: no se "
-                        "puede modificar su SQL. Cree una nueva migración para corregir "
-                        "(fix-forward)."
-                    ),
-                    status_code=409,
-                    context={"model_id": model_id, "version": version},
-                )
+                blocking = self._still_applied_live(session, m)
+                if blocking:
+                    raise AppHttpException(
+                        message=(
+                            "No se puede modificar el SQL: "
+                            f"{self._describe_blocking(blocking)} Cree una nueva versión "
+                            "para corregir (fix-forward), o revierta esas BDs primero."
+                        ),
+                        status_code=409,
+                        public_context={
+                            "code": freeze_codes.CODE_SQL_FROZEN,
+                            "version": version,
+                            "blocking_databases": blocking,
+                        },
+                        context={"model_id": model_id, "version": version},
+                    )
 
             # Una aplicación PARCIAL (checkpoint de sentencia incompleto: algunas
             # sentencias del up_sql ACTUAL ya commitearon en alguna BD, pero no todas)
@@ -1067,14 +1272,27 @@ class ModelMigrationController:
             # siempre, porque no existe purga de historial. La única salida era editarla y
             # dejarla inerte con un `SELECT ''`.
             if self._has_successful_application(session, m.id):
-                raise AppHttpException(
-                    message=(
-                        "No se puede eliminar una migración ya aplicada con éxito en alguna "
-                        "BD. Revierta y/o cree una migración compensatoria."
-                    ),
-                    status_code=409,
-                    context={"model_id": model_id, "version": version},
-                )
+                # Mismo criterio que ``update_migration``: el historial es un log de eventos
+                # que nunca se revoca, así que solo sirve de primer filtro. El veredicto lo da
+                # la versión ACTUAL leída del motor.
+                blocking = self._still_applied_live(session, m)
+                if blocking:
+                    raise AppHttpException(
+                        message=(
+                            "No se puede eliminar la versión: "
+                            f"{self._describe_blocking(blocking)} Eliminarla no revierte "
+                            "nada en el motor: esas BDs quedarían con objetos que ninguna "
+                            "versión del blueprint describe. Revierta primero, o cree una "
+                            "migración compensatoria."
+                        ),
+                        status_code=409,
+                        public_context={
+                            "code": freeze_codes.CODE_STILL_APPLIED,
+                            "version": version,
+                            "blocking_databases": blocking,
+                        },
+                        context={"model_id": model_id, "version": version},
+                    )
             # Un intento fallido puede haber dejado sentencias commiteadas a medias. El
             # checkpoint es la única evidencia de cuáles, y el CASCADE se lo llevaría en
             # silencio: sin él, esa BD queda sucia y sin forma de reconciliarla. Es la misma
