@@ -387,6 +387,22 @@ class ManagedMigrationController:
 
         El manifiesto se usa igual, en OR: donde existe, agrega información y nunca la quita
         (fail-closed). ``analyze`` está memoizado, así que el costo real es una vez por SQL.
+
+        3. **La CONVERSIÓN de charset/collation cuenta como destructiva**, aunque el AST no la
+           vea. ``sqlglot`` degrada ``ALTER TABLE … CONVERT TO CHARACTER SET`` y
+           ``ALTER DATABASE … CHARACTER SET`` a ``exp.Command`` (opaco), así que
+           ``_is_destructive`` devuelve False y sin esto pasaban a producción sin gate — pese
+           a re-codificar FÍSICAMENTE cada valor de texto de cada tabla, con pérdida de
+           caracteres si el charset destino es más angosto y hasta cambios de TIPO de columna
+           (``TEXT``→``MEDIUMTEXT``). El repo ya lo clasificaba así en el otro camino
+           (``schema_diff.py``: "re-encoding físico: destructivo", con ``data_conversion``);
+           los dos clasificadores se contradecían y el permisivo era justo el que gobierna
+           este guard.
+
+           El detector es de FORMA, no de mención (``migration_facts._CHARSET_CONVERSION_RE``):
+           usar ``forced_charsets`` habría marcado el ``DEFAULT CHARSET=utf8mb4`` de
+           prácticamente todo ``CREATE TABLE`` de MySQL y habría bloqueado media base
+           instalada de golpe.
         """
         out: dict[str, tuple[str, ...]] = {}
         for spec in specs:
@@ -397,6 +413,11 @@ class ManagedMigrationController:
                 reasons.append(
                     "sentencias "
                     + ",".join(str(i) for i in facts.destructive_statements)
+                )
+            if facts.charset_conversion_statements:
+                reasons.append(
+                    "conversión de charset/collation en sentencias "
+                    + ",".join(str(i) for i in facts.charset_conversion_statements)
                 )
             if any(st.destructive for st in spec.manifest):
                 reasons.append("manifiesto")

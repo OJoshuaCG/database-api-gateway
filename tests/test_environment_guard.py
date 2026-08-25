@@ -414,3 +414,90 @@ def test_database_ids_outside_environment_is_422(
     pc = r.json()["detail"]["public_context"]
     assert pc["code"] == "environment.databases_outside_environment"
     assert pc["database_ids_outside"] == [prod_id]
+
+
+# --------------------------------------------------------------------------- #
+# Conversión de charset/collation (T-260824-lz-collation-lote-y-version)       #
+# --------------------------------------------------------------------------- #
+CONVERT_SQL = (
+    "ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
+    "ALTER TABLE `users` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+)
+
+
+def test_charset_conversion_is_destructive_for_the_guard():
+    """
+    Una conversión de charset RE-CODIFICA FÍSICAMENTE cada valor de texto de cada tabla:
+    hacia un charset más angosto reemplaza los caracteres no representables (pérdida de datos
+    sin error) y puede cambiar el TIPO de la columna (``TEXT``→``MEDIUMTEXT``).
+
+    El AST no la ve: sqlglot degrada ambas sentencias a ``exp.Command``, así que
+    ``_is_destructive`` devuelve False y hasta este fix pasaban a producción sin gate — pese a
+    que el OTRO clasificador del repo (``schema_diff``) ya las marca
+    ``destructive=True, data_conversion=True`` con el comentario "re-encoding físico:
+    destructivo". Los dos clasificadores se contradecían y el permisivo era el que gobierna
+    este guard.
+    """
+    facts = migration_facts.analyze(CONVERT_SQL, "schema", False)
+    # Premisa verificada, no asumida: el AST efectivamente NO las ve.
+    assert facts.destructive_statements == (), facts.destructive_statements
+    # Y sin embargo el guard sí.
+    # ``seq`` es 0-based acá, igual que en ``destructive_statements``.
+    assert facts.charset_conversion_statements == (0, 1), facts.charset_conversion_statements
+
+
+def test_create_table_with_default_charset_is_not_destructive():
+    """
+    El falso positivo que habría roto producción entera.
+
+    ``forced_charsets`` parece la señal natural, pero ``_CHARSET_RE`` matchea CUALQUIER
+    mención de ``CHARACTER SET``/``CHARSET`` — incluido el ``DEFAULT CHARSET=utf8mb4`` que
+    lleva prácticamente todo ``CREATE TABLE`` de MySQL. Un guard basado en esa lista habría
+    marcado como destructiva casi toda migración del parque y bloqueado `apply`/`apply_all`
+    en producción de golpe. Por eso el detector es de FORMA (la conversión), no de mención.
+    """
+    corpus = [
+        "CREATE TABLE t (id INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 "
+        "COLLATE=utf8mb4_unicode_ci",
+        "CREATE TABLE t (nombre VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin)",
+        "ALTER TABLE t ADD COLUMN c VARCHAR(10) CHARACTER SET utf8mb4",
+        # Enmascarado de literales: la mención dentro de un string no cuenta.
+        "INSERT INTO logs (msg) VALUES ('ALTER DATABASE x CHARACTER SET utf8')",
+    ]
+    for sql in corpus:
+        facts = migration_facts.analyze(sql, "schema", False)
+        assert facts.charset_conversion_statements == (), f"falso positivo en {sql!r}"
+    # Premisa del test, verificada y no asumida: los tres primeros SÍ pueblan
+    # ``forced_charsets``, o sea que un guard basado en esa lista los habría bloqueado.
+    for sql in corpus[:3]:
+        assert migration_facts.analyze(sql, "schema", False).forced_charsets, sql
+
+    # Un COLLATE sin CHARSET tampoco es conversión (cambia la definición de UNA columna).
+    solo_collate = "ALTER TABLE t MODIFY c VARCHAR(10) COLLATE utf8mb4_bin"
+    solo_facts = migration_facts.analyze(solo_collate, "schema", False)
+    assert solo_facts.charset_conversion_statements == ()
+
+
+def test_charset_conversion_blocked_in_protected_environment(
+    admin_client, server_payload, monkeypatch
+):
+    """De punta a punta: una versión de conversión no llega a una BD de producción."""
+    envs = _env_ids(admin_client)
+    model_id = _blueprint(
+        admin_client, "bp-charset",
+        [{"version": "0001", "name": "collation", "up_sql": CONVERT_SQL}],
+    )
+    sid = _server(admin_client, server_payload, port=3421)
+    oid = _owner(admin_client, sid)
+    _db(
+        admin_client, server_id=sid, owner_id=oid, model_id=model_id,
+        name="proddb", environment_id=envs["production"],
+    )
+
+    _fresh_engine(monkeypatch)
+    r = admin_client.post(f"/api/v1/database-models/{model_id}/migrations/apply-all")
+    assert r.status_code == 200, r.text
+    item = r.json()["data"]["results"][0]
+    assert item["ok"] is False
+    assert item["error_code"] == "environment.destructive_blocked"
+    assert item["blocked_by"] == ["0001"]

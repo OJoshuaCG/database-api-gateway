@@ -108,6 +108,37 @@ _CHARSET_RE = re.compile(
     re.IGNORECASE,
 )
 
+# CONVERSIÓN de charset/collation, que es OTRA COSA que MENCIONARLO.
+#
+# Ojo con la tentación de usar ``forced_charsets`` para esto: ``_CHARSET_RE`` matchea
+# CUALQUIER mención de ``CHARACTER SET``/``CHARSET``, incluido el ``DEFAULT CHARSET=utf8mb4``
+# que lleva prácticamente todo ``CREATE TABLE`` de MySQL. Un guard basado en esa lista
+# marcaría como destructiva casi toda migración existente del parque y bloquearía
+# ``apply``/``apply_all`` en producción de golpe. Lo que interesa es la FORMA que reescribe
+# datos ya almacenados:
+#
+#   - ``ALTER TABLE t CONVERT TO CHARACTER SET x``  → re-codifica cada valor de texto de la
+#     tabla. Hacia un charset más angosto (utf8mb4 → latin1) REEMPLAZA los caracteres que no
+#     son representables: pérdida de datos silenciosa. Además puede cambiar el TIPO de una
+#     columna (``TEXT``→``MEDIUMTEXT``) para que entre el texto re-codificado.
+#   - ``ALTER DATABASE d CHARACTER SET x`` / ``COLLATE y`` → cambia el default que heredan los
+#     objetos nuevos. No re-codifica nada por sí solo, pero es la otra mitad de la misma
+#     operación y omitirla dejaría el veredicto a mitad de camino.
+#
+# El propio repo ya clasifica esto como destructivo en el OTRO camino: ``schema_diff.py``
+# marca ``destructive=True, data_conversion=True`` ante un cambio de collation o charset de
+# columna, con el comentario "re-encoding físico: destructivo". Sin este detector los dos
+# clasificadores del repo se contradicen, y el de migraciones —que es el que gobierna el
+# guard de entornos— es el permisivo.
+#
+# sqlglot NO ayuda acá: degrada ambas sentencias a ``exp.Command`` (verificado), así que
+# ``_is_destructive`` no las ve. De ahí que sea un detector de texto sobre la máscara.
+_CHARSET_CONVERSION_RE = re.compile(
+    r"\bCONVERT\s+TO\s+(?:CHARACTER\s+SET|CHARSET)\b"
+    r"|\bALTER\s+(?:DATABASE|SCHEMA)\b[^;]*?\b(?:CHARACTER\s+SET|CHARSET|COLLATE)\b",
+    re.IGNORECASE,
+)
+
 # Objetos cuyo cuerpo sqlglot suele entregar como `Command` sin analizar. Se declaran sus
 # tablas como NO requeridas: preferimos callar a inventar un "esta tabla no existe" sobre un
 # cuerpo que no se ha entendido.
@@ -127,6 +158,9 @@ class StatementFact:
     destructive: bool
     collations: tuple[str, ...]
     charsets: tuple[str, ...]
+    # True si la sentencia CONVIERTE charset/collation (no si simplemente lo menciona).
+    # Ver ``_CHARSET_CONVERSION_RE`` para por qué la distinción no es cosmética.
+    charset_conversion: bool
     parse_error: str | None
 
 
@@ -137,6 +171,10 @@ class MigrationFacts:
     forced_collations: tuple[str, ...]
     forced_charsets: tuple[str, ...]
     destructive_statements: tuple[int, ...]
+    # ``seq`` de las sentencias que CONVIERTEN charset/collation. Lo consume el guard de
+    # entornos (``blocks_destructive_migrations``), que sin esto no ve una migración capaz de
+    # re-codificar todas las tablas de una base de producción.
+    charset_conversion_statements: tuple[int, ...]
     parse_errors: tuple[tuple[int, str], ...]
     gateway_internal_tables: tuple[str, ...]
     requires_existing_tables: tuple[str, ...]
@@ -310,6 +348,7 @@ def _analyze_uncached(sql: str, kind: str, has_non_portable: bool) -> MigrationF
                 destructive=destructive,
                 collations=tuple(_extract(_COLLATE_RE, masked, stmt)),
                 charsets=tuple(_extract(_CHARSET_RE, masked, stmt)),
+                charset_conversion=bool(_CHARSET_CONVERSION_RE.search(masked)),
                 parse_error=parse_error,
             )
         )
@@ -326,6 +365,7 @@ def _analyze_uncached(sql: str, kind: str, has_non_portable: bool) -> MigrationF
         forced_collations=tuple(collations),
         forced_charsets=tuple(charsets),
         destructive_statements=tuple(f.seq for f in facts if f.destructive),
+        charset_conversion_statements=tuple(f.seq for f in facts if f.charset_conversion),
         parse_errors=tuple((f.seq, f.parse_error) for f in facts if f.parse_error),
         gateway_internal_tables=tuple(references_gateway_internal_table(sql)),
         requires_existing_tables=tuple(required),
