@@ -17,7 +17,7 @@ from app.controllers.grant_controller import GrantController
 from app.controllers.server_user_controller import ServerUserController
 from app.core.auth import AdminDep
 from app.core.limiter import limiter
-from app.schemas.grant import ApplyProfileBulkRequest, ApplyProfileBulkResult, ApplyProfileRequest, ApplyProfileResult, GrantInfo, GrantRequest, GrantableResult, RevokeRequest
+from app.schemas.grant import ApplyProfileBulkRequest, ApplyProfileBulkResult, ApplyProfileRequest, ApplyProfileResult, GrantInfo, GrantRequest, RevokeRequest
 from app.schemas.managed_database import ManagedDatabaseOut
 from app.schemas.server_user import AdoptUserIn, ServerUserCreate, ServerUserFullCreate, ServerUserFullOut, ServerUserOut, ServerUserUpdate
 from app.utils.pagination import PaginationDep

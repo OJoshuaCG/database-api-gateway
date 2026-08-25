@@ -4,7 +4,7 @@ Endpoints de DatabaseModels (blueprints/categorías).
 CRUD puro sobre el inventario del gateway (no toca ningún motor).
 """
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Request
 
 from app.controllers.database_model_controller import DatabaseModelController
 from app.controllers.model_migration_controller import ModelMigrationController

@@ -91,7 +91,7 @@ def test_pending_absent_creates_and_activates(admin_client, monkeypatch):
 
 def test_error_absent_is_retried(admin_client, monkeypatch):
     """Una fila en ``error`` por un CREATE fallido SÍ se puede reintentar."""
-    adapter = _patch(monkeypatch, _Adapter(on_create=AppHttpException("caido", 502)))
+    _patch(monkeypatch, _Adapter(on_create=AppHttpException("caido", 502)))
     sid = _server(admin_client, 5561)
     oid = _owner(admin_client, sid, "eown")
     r = admin_client.post(

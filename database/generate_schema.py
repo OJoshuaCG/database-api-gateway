@@ -89,7 +89,7 @@ def main() -> None:
     write_full_schema(tables)
     n = write_privilege_seed()
     print(f"OK: {len(tables)} tablas -> database/gateway/tables/")
-    print(f"OK: esquema completo -> database/gateway/schema.sql")
+    print("OK: esquema completo -> database/gateway/schema.sql")
     print(f"OK: {n} filas de catálogo -> database/gateway/seeds/privileges.sql")
 
 
