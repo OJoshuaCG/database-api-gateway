@@ -954,12 +954,25 @@ de entrega a "archivo" y explicá por qué.
 ### 5.7 Módulo apagado
 
 ```
-cualquier endpoint → 409 { "public_context": { "code": "export.disabled" } }
+endpoints 1–6, 11 y 12 → 409 { "public_context": { "code": "export.disabled" } }
+endpoints 7, 8, 9 y 10  → responden normalmente
 ```
 
 `EXPORT_ENABLED=False` es el kill switch. Mostrá un estado vacío explicativo ("la exportación
 está deshabilitada en este gateway") y **ocultá el punto de entrada** en la navegación, no un
 error por cada clic.
+
+**El alcance NO es "cualquier endpoint", y la diferencia importa para la UI.** El guard cubre
+los 8 endpoints que crean trabajo o entregan bytes (capacidades, crear plan, catálogo,
+resolver selección, preview, ejecutar, descargar y contenido en línea). Quedan **fuera a
+propósito** los 4 de observación y freno: `GET /database-exports/{id}` (7),
+`GET .../items` (8), `POST .../cancel` (9) y `GET .../manifest` (10).
+
+El motivo: si se apaga el módulo mientras hay un job corriendo, el operador tiene que poder
+**verlo y detenerlo**. Bloquear la cancelación sería lo contrario de lo que el kill switch
+persigue. Consecuencia práctica: con el módulo apagado, una vista de monitor abierta sobre un
+job en curso **sigue funcionando** — no la desmontes al recibir un `export.disabled` en otra
+llamada.
 
 ---
 
@@ -1003,7 +1016,7 @@ No están en `capabilities.error_codes` pero los vas a recibir:
 
 | Código | HTTP | Cuándo |
 |---|---|---|
-| `export.disabled` | 409 | kill switch `EXPORT_ENABLED=False` — en **cualquier** endpoint |
+| `export.disabled` | 409 | kill switch `EXPORT_ENABLED=False` — en los endpoints **1–6, 11 y 12**. Los de observación y freno (7, 8, 9, 10) siguen respondiendo a propósito: ver y cancelar un job en curso tiene que seguir siendo posible con el módulo apagado (§5.7) |
 | `export.already_executed` | 409 | `execute` **o `preview`** sobre un plan que ya no está `pending` (trae `status`). Un job es de un solo uso: re-previsualizar uno ya ejecutado reescribiría la selección congelada y el `manifest` dejaría de describir el artefacto entregado. Creá un plan nuevo |
 | `export.not_previewed` | 409 | `execute` sin haber previsualizado |
 | `export.not_ready` | 409 | `download`/`content` con el job en `pending`/`running` (trae `status`) |
