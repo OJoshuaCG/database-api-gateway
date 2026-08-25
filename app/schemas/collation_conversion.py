@@ -350,6 +350,33 @@ class CollationConversionSummaryOut(BaseModel):
     expires_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    batch_id: int | None = Field(
+        None,
+        description=(
+            "Lote de blueprint al que pertenece este job, o null si es una conversión suelta. "
+            "Permite volver al lote desde un deep-link a un job."
+        ),
+    )
+    batch_seq: int | None = Field(
+        None,
+        description=(
+            "Posición 1-based dentro del lote, o null si no pertenece a uno. Los jobs de un "
+            "lote corren EN SERIE, así que es lo único que permite decir 'la 4 de 12' y "
+            "ordenar la tabla de forma estable: el estado por sí solo no distingue 'en cola' "
+            "de 'ya terminada' en un orden reproducible."
+        ),
+    )
+    tables_total: int | None = Field(
+        None,
+        description=(
+            "Tablas a convertir según el plan confirmado. Es el DENOMINADOR de la barra de "
+            "avance: `progress` solo cuenta lo hecho y nunca el total. Null si el job todavía "
+            "no se previsualizó."
+        ),
+    )
+    objects_total: int | None = Field(
+        None, description="Objetos a recrear según el plan confirmado. Mismo uso que el anterior."
+    )
 
 
 class CollationConversionItemOut(BaseModel):
@@ -374,3 +401,195 @@ class CollationConversionItemOut(BaseModel):
     )
     execution_ms: int | None = None
     executed_at: datetime | None = None
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# LOTE por blueprint — convertir TODAS las BDs de un blueprint en un gesto    #
+# ─────────────────────────────────────────────────────────────────────────── #
+class CollationBatchCreate(BaseModel):
+    """
+    Plan de lote. La selección es DECLARATIVA y se resuelve contra el inventario propio de
+    cada BD: con `scope='all_tables'` cada base convierte SUS tablas, no las del vecino.
+    """
+
+    target_charset: str | None = Field(
+        None,
+        min_length=1,
+        max_length=64,
+        description=(
+            "Obligatorio en MySQL/MariaDB (el DDL fija charset y collation juntos). Las BDs "
+            "PostgreSQL del blueprint salen como ítem con error_code "
+            "'collation.engine_not_applicable' sin abortar el lote."
+        ),
+    )
+    target_collation: str = Field(..., min_length=1, max_length=64)
+    scope: Literal["all_tables", "explicit"] = Field(
+        "all_tables",
+        description=(
+            "all_tables: cada BD convierte todas sus tablas (resuelto contra su propio "
+            "inventario). explicit: solo las de `tables`."
+        ),
+    )
+    tables: list[str] = Field(default_factory=list, description="Solo con scope='explicit'.")
+    objects: Literal["all", "none"] = Field(
+        "all",
+        description=(
+            "all: recrea los objetos con la collation congelada desactualizada de cada BD. "
+            "none: los deja como están — es EXACTAMENTE el caso que esta herramienta existe "
+            "para evitar, así que el preview lo avisa."
+        ),
+    )
+    include_database_default: bool = True
+    environment_id: int | None = Field(
+        None, description="Acota el lote a las BDs de ese entorno."
+    )
+    max_databases: int = Field(
+        10,
+        ge=1,
+        le=100,
+        description=(
+            "Tope de BDs por lote. Si deja elegibles afuera, la respuesta trae capped=true — "
+            "el recorte se reporta, no se silencia."
+        ),
+    )
+
+
+class CollationBatchExecuteIn(BaseModel):
+    """
+    Confirmación del lote. Repone lo que un lote se lleva: N re-tipeos por uno.
+
+    El `batch_token` lo genera el servidor, así que aporta FRESCURA, no INTENCIÓN. Por eso
+    además hacen falta el slug del blueprint, el conjunto de BDs echado de vuelta y el
+    re-tipeo por base en los entornos que bloquean migraciones destructivas.
+    """
+
+    confirm_model_slug: str = Field(..., description="Slug exacto del blueprint.")
+    confirm_token: str = Field(..., description="El batch_token del plan.")
+    database_ids: list[int] = Field(
+        ...,
+        description=(
+            "El conjunto previsualizado, echado de vuelta. Cualquier diferencia es 422 "
+            "fail-closed: no se recorta ni se amplía, y `force` tampoco puede agregar."
+        ),
+    )
+    confirmations: dict[int, str] = Field(
+        default_factory=dict,
+        description=(
+            "managed_database_id → nombre exacto re-tipeado. Obligatorio para toda BD cuyo "
+            "entorno tenga blocks_destructive_migrations=true."
+        ),
+    )
+    force: bool = Field(
+        False,
+        description=(
+            "Override de cuarentena y de drift de inventario, por BD. NO amplía el conjunto "
+            "de bases ni saltea el re-tipeo."
+        ),
+    )
+
+
+class CollationBatchDatabaseOut(BaseModel):
+    """Una BD dentro del plan del lote. Misma forma que ApplyAllItemOut, a propósito."""
+
+    managed_database_id: int
+    server_id: int
+    database_name: str
+    batch_seq: int
+    job_id: int | None = None
+    ok: bool = False
+    error: str | None = None
+    error_code: str | None = Field(
+        None,
+        description=(
+            "Código estable del rechazo de ESA BD. La respuesta es 200 aunque haya ítems "
+            "fallados, así que este campo es el único canal clasificable. Un ítem con "
+            "ok=false y sin error_code es un fallo genérico, nunca un bloqueo."
+        ),
+    )
+    tables_to_convert: int = 0
+    objects_to_recreate: int = 0
+    include_database_default: bool = True
+    missing_tables: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    confirm_token: str | None = None
+
+
+class CollationBatchPlanOut(BaseModel):
+    """Plan del lote resuelto, con el token que lo confirma."""
+
+    batch_id: int
+    model_id: int
+    model_slug: str
+    target_charset: str | None = None
+    target_collation: str
+    total_eligible: int
+    max_databases: int
+    capped: bool = False
+    batch_token: str
+    expires_at: datetime
+    runs_serially: bool = Field(
+        True,
+        description=(
+            "Los jobs corren EN SERIE (COLLATION_CONVERSION_MAX_WORKERS default 1). La UI "
+            "tiene que decirlo o el lote parece colgado."
+        ),
+    )
+    databases: list[CollationBatchDatabaseOut] = Field(default_factory=list)
+
+
+class CollationBatchExecuteItemOut(BaseModel):
+    """Resultado de encolar una BD del lote."""
+
+    managed_database_id: int | None = None
+    database_name: str
+    job_id: int
+    batch_seq: int | None = None
+    ok: bool = False
+    error: str | None = None
+    error_code: str | None = None
+
+
+class CollationBatchExecuteOut(BaseModel):
+    batch_id: int
+    model_id: int
+    enqueued: int
+    runs_serially: bool = True
+    results: list[CollationBatchExecuteItemOut] = Field(default_factory=list)
+
+
+class CollationBatchCountsOut(BaseModel):
+    """Agregado del lote, para no recorrer N filas en cada tick del polling."""
+
+    total: int = 0
+    queued: int = 0
+    running: int = 0
+    done: int = 0
+    failed: int = 0
+    canceled: int = 0
+
+
+class CollationBatchSummaryOut(BaseModel):
+    batch_id: int
+    model_id: int
+    target_charset: str | None = None
+    target_collation: str
+    status: str = Field(..., description="pending | running | done | failed | canceled")
+    error: str | None = None
+    total: int = 0
+    max_databases: int = 10
+    capped: bool = False
+    blueprint_version_id: int | None = None
+    created_by_username: str | None = None
+    expires_at: datetime
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    runs_serially: bool = True
+    counts: CollationBatchCountsOut
+
+
+class CollationBatchStatusOut(BaseModel):
+    """Polling del lote: cabecera + un job por BD (con batch_seq y totales congelados)."""
+
+    batch: CollationBatchSummaryOut
+    jobs: list[CollationConversionSummaryOut] = Field(default_factory=list)

@@ -59,9 +59,18 @@ from app.core.environments import (
     DB_PORT,
     DB_USER,
 )
+from app.core.context import current_http_identifier
 from app.core.logger import get_logger
 from app.core.remote_engine import ServerTarget
 from app.exceptions import AppHttpException
+from app.models.collation_conversion_batch import (
+    BATCH_STATUS_CANCELED,
+    BATCH_STATUS_DONE,
+    BATCH_STATUS_FAILED,
+    BATCH_STATUS_PENDING,
+    BATCH_STATUS_RUNNING,
+    CollationConversionBatch,
+)
 from app.models.collation_conversion_job import (
     COLLATION_ITEM_ERROR,
     COLLATION_ITEM_OK,
@@ -322,6 +331,13 @@ class CollationConversionController:
             "expires_at": job.expires_at,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
+            # Pertenencia al lote y totales congelados. ``batch_seq`` deja a la UI decir
+            # "la 4 de 12": los jobs corren EN SERIE y el estado por sí solo no da un orden
+            # reproducible. ``*_total`` son el denominador que ``progress`` nunca trae.
+            "batch_id": job.batch_id,
+            "batch_seq": job.batch_seq,
+            "tables_total": job.tables_total,
+            "objects_total": job.objects_total,
         }
 
     @staticmethod
@@ -398,7 +414,15 @@ class CollationConversionController:
         target_charset: str | None,
         target_collation: str,
         admin: dict | None = None,
+        batch_id: int | None = None,
+        batch_seq: int | None = None,
     ) -> dict:
+        """
+        ``batch_id``/``batch_seq`` son keyword-only y opcionales: los fija el bucle del lote
+        para que cada job sepa a qué lote pertenece y en qué posición corre. El flujo unitario
+        no los pasa y sigue creando jobs sueltos, que es lo que distingue un plan hecho a mano
+        (legítimamente ``pending`` hasta su TTL) de uno admitido a una cola.
+        """
         dialect, target, managed_id = self._load_context(server_id, database)
         mode = self._mode_for_dialect(dialect)
 
@@ -480,6 +504,8 @@ class CollationConversionController:
                 source_fingerprint=self._inventory_fingerprint(inv),
                 expires_at=expires,
                 status=COLLATION_STATUS_PENDING,
+                batch_id=batch_id,
+                batch_seq=batch_seq,
             )
             session.add(job)
             session.commit()
@@ -1097,6 +1123,15 @@ class CollationConversionController:
                 job.source_fingerprint = current_fp
             job.previous_db_charset = inv.db_charset
             job.previous_db_collation = inv.db_collation
+            # Totales CONGELADOS del plan confirmado. ``progress`` solo cuenta lo HECHO y nunca
+            # el total, así que sin esto una barra de avance no tiene denominador: hoy la SPA lo
+            # parchea guardando los totales del preview en estado de React, que se pierde al
+            # recargar — justo en una operación que dura horas. En un lote de N bases eso es
+            # directamente insostenible (harían falta N previews en memoria).
+            job.tables_total = sum(
+                1 for s in plan.steps if s.action in _CONVERT_ACTIONS
+            )
+            job.objects_total = sum(1 for s in plan.steps if s.action == "recreate")
             session.commit()
         finally:
             session.close()
@@ -1140,15 +1175,29 @@ class CollationConversionController:
     # ------------------------------------------------------------------ #
     # Execute (valida y encola el job asíncrono)                          #
     # ------------------------------------------------------------------ #
-    def execute(
+    def _validate_job_execution(
         self,
         job_id: int,
         *,
         confirm_target_name: str,
         confirm_token: str,
         force: bool = False,
-        admin: dict | None = None,
     ) -> dict:
+        """
+        TODA la validación previa a ejecutar un job, en un solo lugar.
+
+        Existe extraída porque la comparte el ``execute`` unitario **y** el del lote, y son
+        exactamente los guards que no pueden divergir: estado, TTL, selección previsualizada,
+        re-tipeo del nombre, cuarentena, anti-TOCTOU del inventario y token contra el plan
+        RECALCULADO. La alternativa —que el lote llame al ``execute`` público por BD— no sirve:
+        ese método además audita su propia intención y encola por su cuenta, así que el lote
+        perdería el control del orden y de ``batch_seq``, y duplicaría la auditoría. Copiar la
+        secuencia a mano es la otra alternativa, y es la que garantiza que en seis meses un
+        guard nuevo esté en uno solo de los dos caminos.
+
+        Devuelve el contexto que el llamador necesita para auditar y encolar. No audita ni
+        encola: eso es decisión del llamador.
+        """
         session = self._session()
         try:
             job = self._job_or_404(session, job_id)
@@ -1247,20 +1296,55 @@ class CollationConversionController:
                 context={"steps": len(plan.steps)},
             )
 
+        return {
+            "server_id": server_id,
+            "database": database,
+            "charset": charset,
+            "collation": collation,
+            "managed_id": managed_id,
+            "db_ref": db_ref,
+            "plan": plan,
+        }
+
+    @staticmethod
+    def _execution_detail(job_id: int, ctx: dict) -> str:
+        """Texto de auditoría de un job, compartido por el camino unitario y el de lote."""
+        plan = ctx["plan"]
+        return (
+            f"conversión {job_id}: {ctx['db_ref']} → "
+            f"{ctx['charset'] or '-'}/{ctx['collation']} "
+            f"(tablas={sum(1 for s in plan.steps if s.action in _CONVERT_ACTIONS)}, "
+            f"columnas={sum(len(s.columns) for s in plan.steps)}, "
+            f"objetos={sum(1 for s in plan.steps if s.action == 'recreate')})"
+        )
+
+    def execute(
+        self,
+        job_id: int,
+        *,
+        confirm_target_name: str,
+        confirm_token: str,
+        force: bool = False,
+        admin: dict | None = None,
+    ) -> dict:
+        ctx = self._validate_job_execution(
+            job_id,
+            confirm_target_name=confirm_target_name,
+            confirm_token=confirm_token,
+            force=force,
+        )
+
         # Auditoría de intención FAIL-CLOSED antes de encolar: rastro durable garantizado.
         audit.record_intent(
             "collation_conversion.execute",
             admin=admin,
-            target_type="managed_database" if managed_id is not None else "server_database",
-            target_id=managed_id,
-            server_id=server_id,
-            touched_engine=True,
-            detail=(
-                f"conversión {job_id}: {db_ref} → {charset or '-'}/{collation} "
-                f"(tablas={sum(1 for s in plan.steps if s.action in _CONVERT_ACTIONS)}, "
-                f"columnas={sum(len(s.columns) for s in plan.steps)}, "
-                f"objetos={sum(1 for s in plan.steps if s.action == 'recreate')})"
+            target_type=(
+                "managed_database" if ctx["managed_id"] is not None else "server_database"
             ),
+            target_id=ctx["managed_id"],
+            server_id=ctx["server_id"],
+            touched_engine=True,
+            detail=self._execution_detail(job_id, ctx),
         )
 
         from app.services import collation_conversion_runner
@@ -1278,6 +1362,9 @@ class CollationConversionController:
         NO interrumpe un ``ALTER TABLE ... CONVERT TO CHARACTER SET`` en curso — esa
         sentencia la ejecuta el motor y solo terminaría matando la conexión, lo que dejaría
         la tabla a medio reescribir. Cancelar detiene los pasos que TODAVÍA no empezaron.
+
+        Un job que todavía estaba EN COLA no llega a ejecutar nada: el reclamo de ``run_job``
+        mira ``cancel_requested`` y lo cierra como ``canceled`` sin tocar el motor.
         """
         session = self._session()
         try:
@@ -1291,12 +1378,47 @@ class CollationConversionController:
             job.cancel_requested = True
             session.commit()
             session.refresh(job)
-            return self._serialize_summary(job)
+            result = self._serialize_summary(job)
+            managed_id, server_id = job.database_id, job.server_id
+            db_ref, prev_status = f"{job.server_id}:{job.database_name}", job.status
         finally:
             session.close()
 
+        # Cancelar una conversión en curso es una decisión operativa con consecuencias (deja
+        # la BD a mitad de camino) y hasta acá no dejaba NINGÚN rastro: el parámetro ``admin``
+        # existía sin usarse y la ruta ni lo pasaba.
+        audit.record(
+            "collation_conversion.cancel",
+            admin=admin,
+            target_type="managed_database" if managed_id is not None else "server_database",
+            target_id=managed_id,
+            server_id=server_id,
+            touched_engine=False,
+            detail=f"cancelación pedida sobre la conversión {job_id} ({db_ref}, {prev_status})",
+        )
+        return result
+
     def sweep_interrupted(self) -> int:
-        """Marca ``running → interrupted`` (barrido de arranque tras un reinicio)."""
+        """
+        Barrido de arranque tras un reinicio. Marca ``running → interrupted`` y, además,
+        cierra los jobs de un LOTE que quedaron esperando en la cola.
+
+        Lo segundo no es simetría: es lo que evita que un lote quede colgado para siempre. La
+        cola del ``ThreadPoolExecutor`` **no es durable** y muere con el proceso, así que con
+        ``COLLATION_CONVERSION_MAX_WORKERS`` en 1 un reinicio a mitad de un lote de 12 deja un
+        job ``interrupted`` y **once en ``pending`` que nadie va a volver a encolar** — más el
+        lote en ``running`` eterno.
+
+        La condición del ``batch_id`` es la parte importante: un job ``pending`` **sin** lote es
+        un plan creado y todavía no ejecutado, que es un estado perfectamente legítimo (es lo
+        que deja ``create_plan``) y **no se debe tocar**. Solo se cierran los que ya fueron
+        ADMITIDOS a un lote en ejecución.
+
+        **No se re-encolan** a propósito: el ``source_fingerprint`` pudo cambiar mientras el
+        proceso estaba caído y el ``confirm_token`` autorizaba un plan sobre un inventario que
+        ya no es el actual. Reanudar sola una operación irreversible sin que un humano vuelva a
+        confirmar es exactamente lo que el resto del módulo evita; el operador replanifica.
+        """
         session = self._session()
         try:
             rows = (
@@ -1311,8 +1433,44 @@ class CollationConversionController:
                     "El proceso se reinició mientras el job estaba en ejecución. Revisá los "
                     "ítems ya aplicados antes de crear un plan nuevo."
                 )
+
+            batch_ids = [
+                b.id
+                for b in session.query(CollationConversionBatch.id)
+                .filter(CollationConversionBatch.status == BATCH_STATUS_RUNNING)
+                .all()
+            ]
+            queued: list[CollationConversionJob] = []
+            if batch_ids:
+                queued = (
+                    session.query(CollationConversionJob)
+                    .filter(
+                        CollationConversionJob.status == COLLATION_STATUS_PENDING,
+                        CollationConversionJob.batch_id.in_(batch_ids),
+                    )
+                    .all()
+                )
+                for job in queued:
+                    job.status = COLLATION_STATUS_INTERRUPTED
+                    job.finished_at = _utcnow()
+                    job.error = (
+                        "El proceso se reinició mientras el job esperaba en la cola del lote; "
+                        "nunca llegó a ejecutarse. La cola no sobrevive un reinicio: volvé a "
+                        "planificar el lote para las BDs que falten."
+                    )
+                for batch in (
+                    session.query(CollationConversionBatch)
+                    .filter(CollationConversionBatch.id.in_(batch_ids))
+                    .all()
+                ):
+                    batch.status = BATCH_STATUS_FAILED
+                    batch.finished_at = _utcnow()
+                    batch.error = (
+                        "El proceso se reinició mientras el lote estaba en ejecución."
+                    )
+
             session.commit()
-            return len(rows)
+            return len(rows) + len(queued)
         finally:
             session.close()
 
@@ -1400,6 +1558,13 @@ class CollationConversionController:
         """
         # 1) Reclamar ATÓMICAMENTE (pending → running): si dos workers compiten por el mismo
         #    job, solo uno afecta 1 fila; el otro sale sin hacer nada.
+        #
+        #    ``cancel_requested`` entra en el filtro, y no es un detalle: los dos únicos puntos
+        #    de corte cooperativo están DENTRO de los bucles de tablas y de objetos, así que un
+        #    job cancelado mientras esperaba en la cola igual se reclamaba, entraba al pipeline
+        #    y ejecutaba la fase 1 COMPLETA — el ``ALTER DATABASE``— antes de mirar la marca.
+        #    Cancelar una conversión encolada cambiaba igual el default de la BD. Con un lote
+        #    eso vacía de sentido el "frená el resto": cada BD pendiente recibiría el cambio.
         session = self._session()
         try:
             claimed = (
@@ -1407,6 +1572,7 @@ class CollationConversionController:
                 .filter(
                     CollationConversionJob.id == job_id,
                     CollationConversionJob.status == COLLATION_STATUS_PENDING,
+                    CollationConversionJob.cancel_requested.is_(False),
                 )
                 .update(
                     {
@@ -1419,6 +1585,20 @@ class CollationConversionController:
             )
             session.commit()
             if not claimed:
+                # El reclamo falla por DOS motivos distintos y el ``return`` silencioso de
+                # antes no los distinguía: otro worker se lo llevó (nada que hacer), o el job
+                # fue cancelado antes de arrancar (hay que cerrarlo, o queda `pending` para
+                # siempre porque nadie lo va a volver a encolar).
+                job = session.get(CollationConversionJob, job_id)
+                if (
+                    job is not None
+                    and job.status == COLLATION_STATUS_PENDING
+                    and job.cancel_requested
+                ):
+                    job.status = COLLATION_STATUS_CANCELED
+                    job.finished_at = _utcnow()
+                    job.phase = None
+                    session.commit()
                 return
         finally:
             session.close()
@@ -1927,3 +2107,622 @@ class CollationConversionController:
                 f"({seq} paso(s))"
             ),
         )
+
+    # ------------------------------------------------------------------ #
+    # LOTE por blueprint                                                  #
+    # ------------------------------------------------------------------ #
+    # Convertir la collation de TODAS las BDs de un blueprint en un gesto. NO es una migración
+    # de blueprint, y el motivo es de fondo: una versión estática no puede recrear los objetos
+    # con la collation congelada de cada hermana (necesita el cuerpo, los grants y el DEFINER
+    # de ESA base, no los del origen), así que aplicarla dejaría las tablas convertidas y las
+    # rutinas/vistas en la collation vieja — el `Illegal mix of collations` que este módulo
+    # entero existe para evitar. El lote son N conversiones REALES, cada una leyendo su propio
+    # inventario. Ver el docstring de ``app/models/collation_conversion_batch.py``.
+
+    def _eligible_databases(self, session, model_id: int, environment_id: int | None):
+        """
+        BDs del blueprint que pueden entrar a un lote, en orden estable por id.
+
+        Solo ``status == active``. Una BD ``pending`` no existe en el motor, una ``error`` está
+        en cuarentena y una ``archived`` fue retirada de uso: convertir cualquiera de las tres
+        es, en el mejor caso, un fallo ruidoso. (``apply_all`` no filtra por estado y eso ya
+        está fichado como defecto en ``TODO.md``; no se repite acá.)
+        """
+        q = session.query(ManagedDatabase).filter(
+            ManagedDatabase.model_id == model_id,
+            ManagedDatabase.status == ProvisionStatus.active,
+        )
+        if environment_id is not None:
+            q = q.filter(ManagedDatabase.environment_id == environment_id)
+        return q.order_by(ManagedDatabase.id.asc()).all()
+
+    @staticmethod
+    def batch_token(model_id: int, target: tuple[str | None, str], resolved: list[dict]) -> str:
+        """
+        Hash del lote RESUELTO: blueprint + objetivo + conjunto de BDs + token de cada job.
+
+        Los tokens por job **no alcanzan solos**: con esa firma, agregar o quitar una BD entre
+        planificar y ejecutar no invalidaría nada mientras los demás tokens siguieran válidos.
+        Por eso entran también los ids y la cantidad.
+
+        Es un sha256 PERSISTIDO y recomputado server-side, igual que ``execution_token`` y que
+        el clon — no el HMAC stateless de ``app/services/confirm_token.py``. Acá hay una fila
+        donde anclar el plan; ese servicio existe para los casos que no la tienen, y mezclar
+        los dos patrones dentro de un módulo obliga a leer dos veces para saber cuál aplica.
+        """
+        parts = [str(model_id), target[0] or "", target[1], str(len(resolved))]
+        for r in sorted(resolved, key=lambda x: x["managed_database_id"]):
+            parts.append(
+                f"{r['managed_database_id']}:{r['job_id']}:{r.get('confirm_token') or ''}"
+            )
+        return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()
+
+    def create_batch_plan(
+        self,
+        model_id: int,
+        *,
+        target_charset: str | None,
+        target_collation: str,
+        scope: str = "all_tables",
+        tables: list[str] | None = None,
+        objects: str = "all",
+        include_database_default: bool = True,
+        environment_id: int | None = None,
+        max_databases: int = 10,
+        admin: dict | None = None,
+    ) -> dict:
+        """
+        Planifica el lote: un job por BD elegible, previsualizado, con el ``batch_token``.
+
+        Reusa ``create_plan`` + ``preview`` **por BD** a propósito, aunque cueste 2-3 lecturas
+        de catálogo por base. Un camino "optimizado" que no pase por esos dos métodos deja de
+        heredar sus validaciones (catálogo de charsets, existencia de la BD, guard de la BD de
+        metadatos, TTL, fingerprint) y es exactamente así como los dos caminos se separan. Si
+        el costo molesta, la optimización correcta es cachear el inventario DENTRO de la
+        corrida, no saltear los métodos.
+
+        La selección es DECLARATIVA y se resuelve contra el inventario propio de cada BD: con
+        ``scope='all_tables'`` cada base convierte sus propias tablas, no las del vecino.
+        """
+        from app.models.database_model import DatabaseModel
+
+        session = self._session()
+        try:
+            model = session.get(DatabaseModel, model_id)
+            if model is None:
+                raise AppHttpException(
+                    message="Blueprint no encontrado.",
+                    status_code=404,
+                    context={"model_id": model_id},
+                )
+            model_slug = model.slug
+            candidates = self._eligible_databases(session, model_id, environment_id)
+            total_eligible = len(candidates)
+            selected = candidates[: max(1, max_databases)]
+            capped = total_eligible > len(selected)
+            refs = [(md.id, md.server_id, md.name) for md in selected]
+        finally:
+            session.close()
+
+        if not refs:
+            raise AppHttpException(
+                message=(
+                    "El blueprint no tiene ninguna base de datos activa que se pueda convertir."
+                ),
+                status_code=422,
+                public_context={"code": collation_catalog.CODE_BATCH_NO_ELIGIBLE_DATABASES},
+                context={"model_id": model_id, "environment_id": environment_id},
+            )
+
+        expires = _utcnow() + timedelta(hours=COLLATION_CONVERSION_TTL_HOURS)
+        session = self._session()
+        try:
+            batch = CollationConversionBatch(
+                model_id=model_id,
+                target_charset=target_charset,
+                target_collation=target_collation,
+                total=len(refs),
+                max_databases=max_databases,
+                capped=capped,
+                expires_at=expires,
+                status=BATCH_STATUS_PENDING,
+                created_by_admin_id=(admin or {}).get("id"),
+                created_by_username=(admin or {}).get("username"),
+                origin_request_id=current_http_identifier.get(),
+            )
+            session.add(batch)
+            session.commit()
+            session.refresh(batch)
+            batch_id = batch.id
+        finally:
+            session.close()
+
+        resolved: list[dict] = []
+        for seq, (md_id, server_id, db_name) in enumerate(refs, start=1):
+            item: dict = {
+                "managed_database_id": md_id,
+                "server_id": server_id,
+                "database_name": db_name,
+                "batch_seq": seq,
+                "job_id": None,
+                "ok": False,
+                "error": None,
+                "error_code": None,
+                "tables_to_convert": 0,
+                "objects_to_recreate": 0,
+                "include_database_default": include_database_default,
+                "missing_tables": [],
+                "warnings": [],
+                "confirm_token": None,
+            }
+            try:
+                plan = self.create_plan(
+                    server_id,
+                    db_name,
+                    target_charset=target_charset,
+                    target_collation=target_collation,
+                    admin=admin,
+                    batch_id=batch_id,
+                    batch_seq=seq,
+                )
+                item["job_id"] = plan["id"]
+                inv = self.get_objects(plan["id"])
+                sel_tables = (
+                    [t["name"] for t in inv["tables"]]
+                    if scope == "all_tables"
+                    else list(tables or [])
+                )
+                sel_objects = (
+                    [
+                        {"object_type": o["object_type"], "name": o["name"]}
+                        for o in inv["objects"]
+                        if o.get("is_outdated")
+                    ]
+                    if objects == "all"
+                    else []
+                )
+                pv = self.preview(
+                    plan["id"],
+                    tables=sel_tables,
+                    objects=sel_objects,
+                    include_database_default=include_database_default,
+                )
+                item.update(
+                    ok=True,
+                    tables_to_convert=pv["tables_to_convert"],
+                    objects_to_recreate=pv["objects_to_recreate"],
+                    include_database_default=pv["include_database_default"],
+                    missing_tables=pv["missing_tables"],
+                    warnings=pv["warnings"],
+                    confirm_token=pv["confirm_token"],
+                )
+            except AppHttpException as exc:
+                # Una BD que no aplica NO aborta el lote: se reporta como ítem y las demás
+                # siguen. Mismo criterio "reportar, no abortar" que ``apply_all``.
+                item["error"] = exc.message
+                item["error_code"] = (exc.public_context or {}).get(
+                    "code"
+                ) or collation_catalog.CODE_ENGINE_NOT_APPLICABLE
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "create_batch_plan: error inesperado en BD %s: %s", md_id, exc,
+                    exc_info=True,
+                )
+                item["error"] = f"error inesperado: {type(exc).__name__}"
+            resolved.append(item)
+
+        token = self.batch_token(
+            model_id, (target_charset, target_collation),
+            [r for r in resolved if r["ok"]],
+        )
+        session = self._session()
+        try:
+            batch = session.get(CollationConversionBatch, batch_id)
+            batch.confirm_token = token
+            session.commit()
+        finally:
+            session.close()
+
+        audit.record(
+            "collation_conversion.batch_plan",
+            admin=admin,
+            target_type="database_model",
+            target_id=model_id,
+            touched_engine=True,
+            detail=(
+                f"lote {batch_id} planificado sobre {len(refs)}/{total_eligible} BD(s) de "
+                f"'{model_slug}' → {target_charset or '-'}/{target_collation}"
+            ),
+        )
+        return {
+            "batch_id": batch_id,
+            "model_id": model_id,
+            "model_slug": model_slug,
+            "target_charset": target_charset,
+            "target_collation": target_collation,
+            "total_eligible": total_eligible,
+            "max_databases": max_databases,
+            "capped": capped,
+            "batch_token": token,
+            "expires_at": expires,
+            "runs_serially": True,
+            "databases": resolved,
+        }
+
+    def _protected_database_ids(self, session, ids: list[int]) -> set[int]:
+        """
+        Cuáles de esas BDs viven en un entorno que bloquea migraciones destructivas.
+
+        Es lo que decide para cuáles se exige re-tipeo del nombre. Una BD **sin** entorno no
+        cuenta como protegida: es el mismo compromiso de compatibilidad que ya toma
+        ``_env_policy_for`` del guard de migraciones (``NULL`` es permisivo ahí), y divergir
+        acá dejaría dos nociones de "protegido" en el mismo sistema.
+        """
+        from app.models.environment import Environment
+
+        if not ids:
+            return set()
+        rows = (
+            session.query(ManagedDatabase.id)
+            .join(Environment, ManagedDatabase.environment_id == Environment.id)
+            .filter(
+                ManagedDatabase.id.in_(ids),
+                Environment.blocks_destructive_migrations.is_(True),
+            )
+            .all()
+        )
+        return {r[0] for r in rows}
+
+    def execute_batch(
+        self,
+        model_id: int,
+        batch_id: int,
+        *,
+        confirm_model_slug: str,
+        confirm_token: str,
+        database_ids: list[int],
+        confirmations: dict[int, str] | None = None,
+        force: bool = False,
+        admin: dict | None = None,
+    ) -> dict:
+        """
+        Confirma y encola el lote. Es el punto donde se repone lo que un lote se lleva.
+
+        ``TODO.md`` declara por escrito que lo que protege la conversión de collation es *"su
+        propio doble factor (re-tipeo + confirm_token)"*. Un lote reemplaza N re-tipeos por
+        uno, y el ``batch_token`` —generado por el servidor— aporta **frescura**, no
+        **intención**. Es literalmente el argumento con el que este repo eliminó el
+        consentimiento por corrida de la captura de SELECT. Así que el lote exige, junto:
+
+        1. ``confirm_model_slug`` == el slug del blueprint.
+        2. ``database_ids`` echado de vuelta, IDÉNTICO al conjunto previsualizado → 422
+           fail-closed ante cualquier diferencia. Molde de ``apply_all``, que rechaza en vez de
+           recortar en silencio. ``force`` **no puede ampliar el conjunto**.
+        3. ``confirmations``: el nombre re-tipeado de cada BD cuyo entorno bloquea migraciones
+           destructivas. No inventa política nueva: repone el doble factor por base
+           exactamente donde ``TODO.md`` dice que vive.
+        4. El ``batch_token`` recomputado server-side sobre el lote resuelto.
+        5. Por cada job, ``_validate_job_execution`` — el MISMO camino del ``execute``
+           unitario, no una versión resumida.
+        """
+        session = self._session()
+        try:
+            batch = session.get(CollationConversionBatch, batch_id)
+            if batch is None or batch.model_id != model_id:
+                raise AppHttpException(
+                    message="Lote de conversión no encontrado.",
+                    status_code=404,
+                    context={"batch_id": batch_id, "model_id": model_id},
+                )
+            if batch.status != BATCH_STATUS_PENDING:
+                raise AppHttpException(
+                    message=f"El lote ya está en estado '{batch.status}'; no se puede re-ejecutar.",
+                    status_code=409,
+                    public_context={"code": collation_catalog.CODE_BATCH_NOT_PENDING},
+                    context={"status": batch.status},
+                )
+            if batch.expires_at < _utcnow():
+                raise AppHttpException(
+                    message="El plan del lote expiró; volvé a planificarlo.",
+                    status_code=410,
+                    context={"batch_id": batch_id},
+                )
+            from app.models.database_model import DatabaseModel
+
+            model = session.get(DatabaseModel, model_id)
+            if model is None or confirm_model_slug != model.slug:
+                raise AppHttpException(
+                    message="confirm_model_slug no coincide con el slug del blueprint.",
+                    status_code=422,
+                    context={"required": "confirm_model_slug == blueprint.slug"},
+                )
+            jobs = (
+                session.query(CollationConversionJob)
+                .filter(
+                    CollationConversionJob.batch_id == batch_id,
+                    CollationConversionJob.status == COLLATION_STATUS_PENDING,
+                )
+                .order_by(CollationConversionJob.batch_seq.asc())
+                .all()
+            )
+            planned = [
+                (j.id, j.batch_seq, j.database_id, j.database_name, j.confirm_token)
+                for j in jobs
+                if j.confirm_token is not None
+            ]
+            target = (batch.target_charset, batch.target_collation)
+            expected_token = batch.confirm_token
+            protected = self._protected_database_ids(
+                session, [p[2] for p in planned if p[2] is not None]
+            )
+        finally:
+            session.close()
+
+        planned_ids = sorted(p[2] for p in planned if p[2] is not None)
+        got_ids = sorted(set(database_ids))
+        if got_ids != planned_ids:
+            # FAIL-CLOSED: ni se recorta ni se amplía. ``force`` tampoco: si dejara agregar,
+            # alguien lo usaría para meter las BDs que quedaron en cuarentena o fuera del tope.
+            raise AppHttpException(
+                message=(
+                    "El conjunto de bases de datos no coincide con el que se previsualizó; "
+                    "volvé a planificar el lote."
+                ),
+                status_code=422,
+                public_context={
+                    "code": collation_catalog.CODE_BATCH_DATABASE_SET_MISMATCH,
+                    "planned_database_ids": planned_ids,
+                    "received_database_ids": got_ids,
+                },
+                context={"batch_id": batch_id},
+            )
+
+        confirmations = confirmations or {}
+        missing_confirmations = [
+            md_id
+            for (_jid, _seq, md_id, db_name, _tok) in planned
+            if md_id in protected and confirmations.get(md_id) != db_name
+        ]
+        if missing_confirmations:
+            raise AppHttpException(
+                message=(
+                    "Falta re-tipear el nombre exacto de las bases de datos cuyo entorno "
+                    "bloquea migraciones destructivas."
+                ),
+                status_code=422,
+                public_context={
+                    "code": collation_catalog.CODE_BATCH_CONFIRMATION_REQUIRED,
+                    "requires_confirmation": missing_confirmations,
+                },
+                context={"batch_id": batch_id},
+            )
+
+        recomputed = self.batch_token(
+            model_id,
+            target,
+            [
+                {"managed_database_id": md_id, "job_id": jid, "confirm_token": tok}
+                for (jid, _seq, md_id, _name, tok) in planned
+            ],
+        )
+        if confirm_token != expected_token or confirm_token != recomputed:
+            raise AppHttpException(
+                message="confirm_token no coincide con el lote actual; volvé a planificarlo.",
+                status_code=422,
+                context={"batch_id": batch_id},
+            )
+
+        # Intención del LOTE, fail-closed, antes de validar/encolar nada.
+        audit.record_intent(
+            "collation_conversion.batch_execute",
+            admin=admin,
+            target_type="database_model",
+            target_id=model_id,
+            touched_engine=True,
+            detail=(
+                f"lote {batch_id}: {len(planned)} BD(s) de '{confirm_model_slug}' → "
+                f"{target[0] or '-'}/{target[1]}"
+            ),
+        )
+
+        results: list[dict] = []
+        enqueued = 0
+        for (jid, seq, md_id, db_name, tok) in planned:
+            item = {
+                "managed_database_id": md_id,
+                "database_name": db_name,
+                "job_id": jid,
+                "batch_seq": seq,
+                "ok": False,
+                "error": None,
+                "error_code": None,
+            }
+            try:
+                ctx = self._validate_job_execution(
+                    jid, confirm_target_name=db_name, confirm_token=tok, force=force
+                )
+                # Intención POR BD además de la del lote: diez conversiones de producción no
+                # pueden dejar una sola fila de auditoría.
+                audit.record_intent(
+                    "collation_conversion.execute",
+                    admin=admin,
+                    target_type=(
+                        "managed_database" if ctx["managed_id"] is not None
+                        else "server_database"
+                    ),
+                    target_id=ctx["managed_id"],
+                    server_id=ctx["server_id"],
+                    touched_engine=True,
+                    detail=f"[lote {batch_id}] " + self._execution_detail(jid, ctx),
+                )
+                from app.services import collation_conversion_runner
+
+                collation_conversion_runner.enqueue(jid)
+                item["ok"] = True
+                enqueued += 1
+            except AppHttpException as exc:
+                item["error"] = exc.message
+                item["error_code"] = (exc.public_context or {}).get("code")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "execute_batch: error inesperado en job %s: %s", jid, exc, exc_info=True
+                )
+                item["error"] = f"error inesperado: {type(exc).__name__}"
+            results.append(item)
+
+        session = self._session()
+        try:
+            batch = session.get(CollationConversionBatch, batch_id)
+            batch.status = BATCH_STATUS_RUNNING if enqueued else BATCH_STATUS_FAILED
+            batch.started_at = _utcnow()
+            if not enqueued:
+                batch.finished_at = _utcnow()
+                batch.error = "Ninguna base de datos del lote pudo encolarse."
+            session.commit()
+        finally:
+            session.close()
+
+        return {
+            "batch_id": batch_id,
+            "model_id": model_id,
+            "enqueued": enqueued,
+            "runs_serially": True,
+            "results": results,
+        }
+
+    _TERMINAL_JOB_STATUSES = (
+        COLLATION_STATUS_SUCCEEDED,
+        COLLATION_STATUS_FAILED,
+        COLLATION_STATUS_INTERRUPTED,
+        COLLATION_STATUS_CANCELED,
+    )
+
+    def list_batch(self, model_id: int, batch_id: int) -> dict:
+        """
+        Estado del lote + sus jobs, para el polling.
+
+        **El desenlace del lote se DERIVA acá, no lo escribe ningún worker.** Solo se persisten
+        las transiciones que tienen un autor claro: ``pending → running`` (el execute) y
+        ``canceled`` (el cancel). ``done``/``failed`` se calculan de los estados de los jobs y
+        recién entonces se persisten, de forma **idempotente** —dos lectores concurrentes
+        derivan lo mismo—. Que cada worker consultara a sus hermanos para decidir "soy el
+        último" es una carrera, y aparece en cuanto ``COLLATION_CONVERSION_MAX_WORKERS`` deje
+        de ser 1 (su default es configuración, no invariante).
+        """
+        session = self._session()
+        try:
+            batch = session.get(CollationConversionBatch, batch_id)
+            if batch is None or batch.model_id != model_id:
+                raise AppHttpException(
+                    message="Lote de conversión no encontrado.",
+                    status_code=404,
+                    context={"batch_id": batch_id, "model_id": model_id},
+                )
+            jobs = (
+                session.query(CollationConversionJob)
+                .filter(CollationConversionJob.batch_id == batch_id)
+                .order_by(CollationConversionJob.batch_seq.asc())
+                .all()
+            )
+            items = [self._serialize_summary(j) for j in jobs]
+
+            counts = {
+                "total": len(jobs),
+                "queued": sum(1 for j in jobs if j.status == COLLATION_STATUS_PENDING),
+                "running": sum(1 for j in jobs if j.status == COLLATION_STATUS_RUNNING),
+                "done": sum(1 for j in jobs if j.status == COLLATION_STATUS_SUCCEEDED),
+                "failed": sum(
+                    1 for j in jobs
+                    if j.status in (COLLATION_STATUS_FAILED, COLLATION_STATUS_INTERRUPTED)
+                ),
+                "canceled": sum(1 for j in jobs if j.status == COLLATION_STATUS_CANCELED),
+            }
+            if batch.status == BATCH_STATUS_RUNNING and jobs and all(
+                j.status in self._TERMINAL_JOB_STATUSES for j in jobs
+            ):
+                batch.status = (
+                    BATCH_STATUS_DONE if counts["failed"] == 0 and counts["canceled"] == 0
+                    else BATCH_STATUS_FAILED
+                )
+                batch.finished_at = _utcnow()
+                session.commit()
+                session.refresh(batch)
+
+            summary = {
+                "batch_id": batch.id,
+                "model_id": batch.model_id,
+                "target_charset": batch.target_charset,
+                "target_collation": batch.target_collation,
+                "status": batch.status,
+                "error": batch.error,
+                "total": batch.total,
+                "max_databases": batch.max_databases,
+                "capped": batch.capped,
+                "blueprint_version_id": batch.blueprint_version_id,
+                "created_by_username": batch.created_by_username,
+                "expires_at": batch.expires_at,
+                "created_at": batch.created_at,
+                "started_at": batch.started_at,
+                "finished_at": batch.finished_at,
+                "runs_serially": True,
+                "counts": counts,
+            }
+        finally:
+            session.close()
+        return {"batch": summary, "jobs": items}
+
+    def cancel_batch(
+        self, model_id: int, batch_id: int, *, admin: dict | None = None
+    ) -> dict:
+        """
+        Frena el resto del lote. Cooperativo, igual que el cancel unitario.
+
+        Los jobs que todavía están EN COLA no llegan a tocar el motor: el reclamo de
+        ``run_job`` mira ``cancel_requested``. El que está corriendo termina su paso en curso y
+        corta en el próximo punto seguro — matar un ``ALTER TABLE`` a mitad dejaría la tabla a
+        medio reescribir, que es peor que dejarlo terminar.
+        """
+        session = self._session()
+        try:
+            batch = session.get(CollationConversionBatch, batch_id)
+            if batch is None or batch.model_id != model_id:
+                raise AppHttpException(
+                    message="Lote de conversión no encontrado.",
+                    status_code=404,
+                    context={"batch_id": batch_id, "model_id": model_id},
+                )
+            if batch.status not in (BATCH_STATUS_PENDING, BATCH_STATUS_RUNNING):
+                raise AppHttpException(
+                    message=f"El lote no se puede cancelar en estado '{batch.status}'.",
+                    status_code=409,
+                    public_context={"code": collation_catalog.CODE_BATCH_NOT_PENDING},
+                    context={"status": batch.status},
+                )
+            jobs = (
+                session.query(CollationConversionJob)
+                .filter(
+                    CollationConversionJob.batch_id == batch_id,
+                    CollationConversionJob.status.in_(
+                        (COLLATION_STATUS_PENDING, COLLATION_STATUS_RUNNING)
+                    ),
+                )
+                .all()
+            )
+            for job in jobs:
+                job.cancel_requested = True
+            batch.status = BATCH_STATUS_CANCELED
+            batch.finished_at = _utcnow()
+            marked = len(jobs)
+            session.commit()
+        finally:
+            session.close()
+
+        audit.record(
+            "collation_conversion.batch_cancel",
+            admin=admin,
+            target_type="database_model",
+            target_id=model_id,
+            touched_engine=False,
+            detail=f"lote {batch_id}: cancelación pedida sobre {marked} job(s) sin terminar",
+        )
+        return self.list_batch(model_id, batch_id)

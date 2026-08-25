@@ -42,8 +42,37 @@ from __future__ import annotations
 # consola SQL) ya cierran esto; este no lo hacía.
 CODE_SCOPE_NOT_ALLOWED = "collation.scope_not_allowed"
 
+# --------------------------------------------------------------------------- #
+# Lote por blueprint                                                           #
+# --------------------------------------------------------------------------- #
+
+# El conjunto de BDs que el cliente echó de vuelta no coincide con el previsualizado. Es
+# fail-closed a propósito: recortar en silencio convertiría bases que el operador no confirmó,
+# o dejaría afuera otras que sí. Molde de `apply_all`, que rechaza en vez de recortar.
+CODE_BATCH_DATABASE_SET_MISMATCH = "collation.batch_database_set_mismatch"
+
+# Falta el re-tipeo del nombre de una BD cuyo entorno bloquea migraciones destructivas. Un
+# lote reemplaza N re-tipeos por uno, y esto REPONE el control donde `TODO.md` declara que
+# vive: el doble factor por base.
+CODE_BATCH_CONFIRMATION_REQUIRED = "collation.batch_confirmation_required"
+
+# El lote no está en un estado que admita la operación pedida (ya ejecutado, ya cancelado…).
+CODE_BATCH_NOT_PENDING = "collation.batch_not_pending"
+
+# El blueprint no tiene ninguna BD elegible (`status=active` y del motor que aplica).
+CODE_BATCH_NO_ELIGIBLE_DATABASES = "collation.batch_no_eligible_databases"
+
+# Ítem del lote: la BD es de un motor al que el objetivo pedido no aplica (p. ej. un
+# `target_charset` contra PostgreSQL). No aborta el lote: sale como ítem con `ok:false`.
+CODE_ENGINE_NOT_APPLICABLE = "collation.engine_not_applicable"
+
 ALL_CODES: frozenset[str] = frozenset(
     {
         CODE_SCOPE_NOT_ALLOWED,
+        CODE_BATCH_DATABASE_SET_MISMATCH,
+        CODE_BATCH_CONFIRMATION_REQUIRED,
+        CODE_BATCH_NOT_PENDING,
+        CODE_BATCH_NO_ELIGIBLE_DATABASES,
+        CODE_ENGINE_NOT_APPLICABLE,
     }
 )
