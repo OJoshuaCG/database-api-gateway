@@ -1304,6 +1304,16 @@ class ModelMigrationController:
                             "'stamp?force=true' antes de editar."
                         ),
                         status_code=409,
+                        # ``incomplete_progress`` va también en public_context: es el dato
+                        # con el que la UI puede ofrecer el CTA correcto (reintentar el
+                        # apply sobre ESA BD), y en ``context`` solo existiría en
+                        # development. Sin él, en producción el operador lee "hay una
+                        # aplicación parcial" y no sabe en qué base.
+                        public_context={
+                            "code": freeze_codes.CODE_PARTIAL_APPLICATION,
+                            "version": version,
+                            "incomplete_progress": incomplete,
+                        },
                         context={
                             "model_id": model_id,
                             "version": version,
@@ -1372,6 +1382,11 @@ class ModelMigrationController:
                             f"(null) los overrides que quedarían obsoletos: {', '.join(stale)}."
                         ),
                         status_code=409,
+                        public_context={
+                            "code": freeze_codes.CODE_STALE_OVERRIDES,
+                            "version": version,
+                            "stale_overrides": stale,
+                        },
                         context={"model_id": model_id, "version": version, "stale_overrides": stale},
                     )
                 # Cascade: al corregir el SQL base se regenera el rollback SUGERIDO

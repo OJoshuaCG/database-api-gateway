@@ -84,8 +84,28 @@ BLOCKING_REASONS = frozenset(
 #: el mismo criterio que ``confirm_target_name`` en el borrado de una BD.
 CODE_EDIT_CONFIRM_MISMATCH = "model_migration.edit_confirm_mismatch"
 
+#: Se intentó cambiar el SQL con una aplicación PARCIAL sin resolver (checkpoint de
+#: sentencia incompleto). Trae ``incomplete_progress`` con la BD y cuántas sentencias
+#: alcanzó a commitear. Salida: reintentar ``apply`` (retoma solo) o limpiar con
+#: ``stamp?force=true``. NO es lo mismo que ``CODE_SQL_FROZEN`` y no lo abre el doble
+#: factor: acá el problema no es la divergencia, es que un resume interpretaría los
+#: índices del checkpoint contra un SQL distinto del que corrió.
+CODE_PARTIAL_APPLICATION = "model_migration.partial_application"
+
+#: Se cambió ``up_sql`` dejando overrides por motor que quedarían obsoletos. Trae
+#: ``stale_overrides`` con los nombres de campo. Salida: reenviarlos corregidos o
+#: limpiarlos con ``null`` en la MISMA llamada. Es evitable desde la UI, y debería serlo:
+#: el formulario ya sabe qué overrides existen.
+CODE_STALE_OVERRIDES = "model_migration.stale_overrides"
+
 ERROR_CODES = frozenset(
-    {CODE_SQL_FROZEN, CODE_STILL_APPLIED, CODE_EDIT_CONFIRM_MISMATCH}
+    {
+        CODE_SQL_FROZEN,
+        CODE_STILL_APPLIED,
+        CODE_EDIT_CONFIRM_MISMATCH,
+        CODE_PARTIAL_APPLICATION,
+        CODE_STALE_OVERRIDES,
+    }
 )
 
 #: Operación del ``confirm_token`` para esta vía. El token se ata al hash del SQL PROPUESTO
