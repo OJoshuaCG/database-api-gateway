@@ -21,6 +21,7 @@ from app.exceptions import AppHttpException
 from app.models.database_model import DatabaseModel
 from app.models.project import Project, ProjectDatabaseModel
 from app.services import audit
+from app.services import project_catalog as project_codes
 
 
 class ProjectController:
@@ -47,6 +48,7 @@ class ProjectController:
             raise AppHttpException(
                 message="Proyecto no encontrado.",
                 status_code=404,
+                public_context={"code": project_codes.CODE_NOT_FOUND},
                 context={"project_id": project_id},
             )
         return project
@@ -96,6 +98,14 @@ class ProjectController:
                     + ", ".join(str(m) for m in missing)
                 ),
                 status_code=422,
+                # ``missing_model_ids`` va en public_context y NO solo en context: es el
+                # dato que hace utilizable este 422. Sin él la UI dice "hay blueprints
+                # inexistentes" y no puede señalar ninguno, así que el operador tiene que
+                # invalidar la selección entera y adivinar de nuevo.
+                public_context={
+                    "code": project_codes.CODE_BLUEPRINTS_NOT_FOUND,
+                    "missing_model_ids": missing,
+                },
                 context={"missing_model_ids": missing},
             )
         return unique_ids
@@ -142,6 +152,7 @@ class ProjectController:
                 raise AppHttpException(
                     message="Ya existe un proyecto con ese nombre.",
                     status_code=409,
+                    public_context={"code": project_codes.CODE_NAME_TAKEN},
                     context={"name": data.get("name")},
                 ) from exc
             session.refresh(project)
@@ -186,6 +197,7 @@ class ProjectController:
                 raise AppHttpException(
                     message="Ya existe un proyecto con ese nombre.",
                     status_code=409,
+                    public_context={"code": project_codes.CODE_NAME_TAKEN},
                     context={"project_id": project_id},
                 ) from exc
             session.refresh(project)
@@ -277,6 +289,10 @@ class ProjectController:
                 raise AppHttpException(
                     message="Otro proceso vinculó estos blueprints al mismo tiempo; reintentá.",
                     status_code=409,
+                    # Código propio y no CODE_NAME_TAKEN aunque los dos sean 409: acá el CTA
+                    # es "reintentar", allá "elegí otro nombre". Un cliente que no pueda
+                    # distinguirlos ofrece lo equivocado en la mitad de los casos.
+                    public_context={"code": project_codes.CODE_LINK_CONFLICT},
                     context={"project_id": project_id},
                 ) from exc
             total = (
@@ -322,6 +338,7 @@ class ProjectController:
                 raise AppHttpException(
                     message="Ese blueprint no pertenece a este proyecto.",
                     status_code=404,
+                    public_context={"code": project_codes.CODE_BLUEPRINT_NOT_LINKED},
                     context={"project_id": project_id, "model_id": model_id},
                 )
             session.commit()
@@ -348,6 +365,7 @@ class ProjectController:
                 raise AppHttpException(
                     message="Blueprint no encontrado.",
                     status_code=404,
+                    public_context={"code": project_codes.CODE_BLUEPRINT_NOT_FOUND},
                     context={"model_id": model_id},
                 )
             rows = (

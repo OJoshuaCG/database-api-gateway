@@ -101,8 +101,6 @@ raise AppHttpException("Usuario no encontrado", 404, {"user_id": user_id})
 **Códigos de error nuevos van en `public_context["code"]`, NUNCA en `context`.** `context` solo
 se expone en `development`, así que en producción el operador recibiría el error sin saber cuál
 ni por qué. El vocabulario es cerrado y vive en los catálogos de `app/services/*_catalog.py`.
-**`ProjectController` tiene este defecto** (usa `context=` en sus seis excepciones): no lo
-copies como molde para errores.
 
 **Nunca volcar `str(exc)` del motor en una respuesta.** Puede llevar host, usuario o fragmentos
 de sentencia. El detalle va a `logger.exception` con el Request ID.
