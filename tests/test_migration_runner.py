@@ -350,7 +350,16 @@ def _capture_connection_flags(monkeypatch) -> list[dict]:
     Intercepta ``database_connection`` del runner y registra con qué flags se abre cada
     conexión. Devuelve la lista de llamadas; la conexión cedida es un doble inerte, así que
     estos tests miran SOLO los flags, no lo que se ejecuta.
+
+    Además neutraliza el checkpoint por sentencia. NO es adorno: ``_write_revision_files``
+    consulta ``migration_progress.get_progress`` para resolver desde dónde reanudar, y eso va a
+    la BD del GATEWAY. Sin este doble, ``apply``/``rollback_to``/``stamp`` mueren en
+    ``no such table: migration_statement_progress`` **antes** de abrir la conexión remota, y el
+    test pasa o falla según si alguien creó el esquema — que es una dependencia que este archivo
+    no declara y que los otros 17 tests no tienen (todos son autocontenidos, con su propio
+    SQLite). El sujeto de estos tres tests es el FLAG de la conexión, no el checkpoint.
     """
+    from app.services.db_admin import migration_progress as prog
     from app.services.db_admin import migrations as mig
 
     calls: list[dict] = []
@@ -362,6 +371,8 @@ def _capture_connection_flags(monkeypatch) -> list[dict]:
         yield  # pragma: no cover — inalcanzable, deja la función como generador
 
     monkeypatch.setattr(mig, "database_connection", fake_conn)
+    monkeypatch.setattr(prog, "get_progress", lambda *a, **k: None)
+    monkeypatch.setattr(mig.migration_progress, "get_progress", lambda *a, **k: None)
     return calls
 
 
@@ -404,7 +415,10 @@ def test_apply_and_rollback_use_the_bulk_timeout(monkeypatch):
         managed_db_id=_NO_MANAGED_DB, specs=specs, to_version=None,
     ))
 
-    assert calls, "no se llegó a abrir ninguna conexión"
+    # Se fija el CONTEO, no solo "alguna": con `assert calls` a secas, si `apply` dejara de
+    # abrir conexión (un return temprano nuevo) el test seguiría en verde por la de
+    # `rollback_to`, y justamente `apply` es el camino que el fix venía a arreglar.
+    assert len(calls) == 2, calls
     assert all(c["bulk"] is True for c in calls), calls
 
 
@@ -431,7 +445,7 @@ def test_stamp_keeps_the_interactive_timeout(monkeypatch):
         managed_db_id=_NO_MANAGED_DB, specs=specs, version="0001",
     ))
 
-    assert calls, "no se llegó a abrir ninguna conexión"
+    assert len(calls) == 1, calls
     assert all(c["bulk"] is False for c in calls), calls
 
 
@@ -448,5 +462,5 @@ def test_reading_the_current_version_keeps_the_interactive_timeout(monkeypatch):
 
     _run_and_swallow(lambda: runner.get_current_version(target, "db", "s"))
 
-    assert calls, "no se llegó a abrir ninguna conexión"
+    assert len(calls) == 1, calls
     assert all(c["bulk"] is False for c in calls), calls

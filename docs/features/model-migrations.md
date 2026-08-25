@@ -907,21 +907,27 @@ cuando la tabla crezca. Una marca por versión codificaría una propiedad que la
 **Por qué los 15 s no eran una protección.** El reflejo es que subir el timeout deja pasar una
 migración descontrolada. Con *ese* timeout no era así: en MySQL/MariaDB son
 `read_timeout`/`write_timeout` **de socket, del CLIENTE**, y **no cancelan nada en el motor**. Lo
-que hacían era romper la conexión mientras el servidor seguía ejecutando, así que:
+que hacían era romper la conexión mientras el servidor seguía ejecutando. El daño concreto es que
+**el checkpoint queda desincronizado del plano físico**: `record_statement` se emite DESPUÉS de
+cada `exec_driver_sql`, así que la sentencia que cortó no queda registrada pero el motor la
+completa igual.
 
-1. el checkpoint no registraba la sentencia,
-2. el motor la completaba igual,
-3. el próximo `apply` la reejecutaba,
-4. y volvía a cortar a los 15 s.
+**Qué pasa en el reintento depende de la sentencia**, y no hay un solo desenlace:
 
-Un **bucle que no termina**, con la contabilidad desincronizada del plano físico — el estado que
-todo este módulo está diseñado para evitar. No limitaba el daño: solo le hacía perder el rastro al
-gateway. En PostgreSQL sí es un `statement_timeout` de servidor (cancela limpio), y ahí el DDL
-transaccional hace que un fallo se deshaga solo.
+| La sentencia que cortó… | Reintento |
+|---|---|
+| es larga (que es por qué cortó) | vuelve a cortar a los 15 s y se repite |
+| no es idempotente y ya se aplicó | falla con un `already exists`/`duplicate` **espurio**, señalando la sentencia equivocada |
+| la migración **no es resumible** (`is_resumable`: `kind='data'`, `has_non_portable`, estado de sesión) | no hay checkpoint: arranca de cero y choca con todo lo ya aplicado |
+
+En los tres el timeout **no limitaba el daño**: solo le hacía perder el rastro al gateway, que es
+el estado que todo este módulo está diseñado para evitar. En PostgreSQL sí es un
+`statement_timeout` de servidor (cancela limpio), y ahí el DDL transaccional hace que un fallo se
+deshaga solo.
 
 **Consecuencia operativa que hay que aceptar:** `POST /migrations/apply` es síncrono, así que un
 apply largo sostiene la request y su hilo mientras dura. Es el mismo costo que ya asumió la
-conversión de collation, y la alternativa era el bucle.
+conversión de collation.
 
 ### El proxy sigue cortando a los 60 s, y eso es OTRO problema
 

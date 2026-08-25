@@ -774,12 +774,19 @@ class MigrationRunner:
         que subirlo deja pasar una migración descontrolada, y con ese timeout no era así: en
         MySQL/MariaDB son ``read_timeout``/``write_timeout`` **de socket, del CLIENTE**
         (``remote_engine._connect_args``), y **no cancelan nada en el motor**. Lo que hacía era
-        romper la conexión mientras el servidor seguía ejecutando: el checkpoint no registraba
-        la sentencia, el motor la completaba igual, y el próximo ``apply`` la reejecutaba — un
-        bucle que no termina nunca, con la contabilidad desincronizada del plano físico. O sea
-        que no limitaba el daño, solo le hacía perder el rastro al gateway. En PostgreSQL sí es
-        un ``statement_timeout`` de servidor (cancela limpio), y ahí el DDL transaccional hace
-        que un fallo se deshaga solo.
+        romper la conexión mientras el servidor seguía ejecutando, y el daño concreto es que
+        **el checkpoint queda desincronizado del plano físico**: ``record_statement`` se emite
+        DESPUÉS de cada ``exec_driver_sql``, así que la sentencia que cortó no queda registrada
+        pero el motor la completa igual.
+
+        Qué pasa en el reintento **depende de la sentencia**, y no conviene prometer un solo
+        desenlace: si es larga (que es por qué cortó) vuelve a cortar y se repite; si no es
+        idempotente y ya se aplicó, falla con un ``already exists``/``duplicate`` **espurio**
+        que señala la sentencia equivocada; y si la migración no es resumible (ver
+        ``migration_progress.is_resumable``) no hay checkpoint, el reintento arranca de cero y
+        choca con todo lo ya aplicado. En los tres casos el timeout no limitaba el daño: solo le
+        hacía perder el rastro al gateway. En PostgreSQL sí es un ``statement_timeout`` de
+        servidor (cancela limpio), y ahí el DDL transaccional hace que un fallo se deshaga solo.
 
         Consecuencia operativa que hay que aceptar: ``POST /migrations/apply`` es síncrono, así
         que un apply largo sostiene la request y su hilo mientras dura. Es el mismo costo que ya
