@@ -1,0 +1,34 @@
+# Barrera que no se puede saltear con --no-verify.
+#
+# El hook de .githooks/pre-push cubre el caso normal, pero no existe hasta que
+# alguien corre 'git config core.hooksPath .githooks' en su clon — y en la
+# práctica eso se olvida: al escribir este workflow, el clon de desarrollo
+# tenía core.hooksPath apuntando a un .git/hooks vacío, así que NINGÚN guard
+# del repo se había ejecutado nunca. Un chequeo del lado del servidor es lo
+# único que no depende de que cada clon esté bien configurado.
+#
+# Corre también en pull_request para que el archivo inflado se vea en la
+# revisión, cuando todavía es barato mover el contenido a docs/.
+name: Tamaño de CLAUDE.md
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check-claude-md:
+    name: Dentro del tope y sin fechas
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Sin dependencias a propósito: el guard usa solo la stdlib (re,
+      # pathlib), así que no puede fallar por una razón ajena a lo que
+      # verifica.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Verificar el contrato de CLAUDE.md
+        run: python scripts/check_claude_md_size.py
