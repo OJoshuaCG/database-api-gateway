@@ -131,7 +131,8 @@ reinicia, los jobs `running` quedan `interrupted` (barrido en el `lifespan`).
    apuntando a un default que no cambió, o sea el problema que la operación viene a resolver.
 2. **`ALTER TABLE db.t CONVERT TO CHARACTER SET x COLLATE y`** por cada tabla seleccionada,
    *best-effort*: un fallo se reporta en su ítem y **no aborta** las demás (abortar dejaría la
-   BD a mitad de camino, el estado más peligroso para este feature).
+   BD a mitad de camino, el estado más peligroso para este feature). Esta fase —y **solo**
+   esta— corre con los **chequeos de FK desactivados**; ver abajo.
 3. **`SET NAMES x COLLATE y` + `DROP {TIPO} IF EXISTS` + `CREATE` verbatim** por cada objeto
    seleccionado, en cualquier orden, también best-effort.
 
@@ -144,6 +145,79 @@ conexión**, y si ese `SET NAMES` falla no se recrea nada (corte al primer fallo
 remotos usan `NullPool`, así que el `SET` no se filtra a ninguna otra operación.
 
 ## Detalles que importan
+
+### La fase de tablas corre con `foreign_key_checks` DESACTIVADO
+
+No es una optimización ni defensa en profundidad: sin eso el motor **rechaza la operación**.
+La doc de MySQL, en `ALTER TABLE`:
+
+> *"When the `foreign_key_checks` system variable is enabled, which is the default setting,
+> **character set conversion is not permitted** on tables that include a character string
+> column used in a foreign key constraint. The workaround is to disable `foreign_key_checks`
+> before performing the character set conversion."*
+
+Y no es un caso de borde: lo dispara **cualquier** esquema con una FK sobre `varchar`.
+
+El flag va **solo** en la fase de tablas. El `ALTER DATABASE` no toca tablas, y un
+`DROP`+`CREATE` de rutina no está sujeto a esta restricción: extenderlo ahí solo ampliaría la
+ventana sin comprar nada.
+
+**Efecto sobre el aviso de conversión parcial**: con los chequeos desactivados el motor
+**acepta** el DDL, así que convertir unas tablas y no otras ya **no falla** con 3780/1832 — la
+incoherencia entre los dos lados de una FK aparece recién al **consultar**
+(`Illegal mix of collations`). El preview lo dice con ese matiz.
+
+*Pendiente de motor real*: si MariaDB 10.x/11.x impone la misma restricción. Su KB no devolvió
+la sección. El fix es inofensivo en cualquier caso.
+
+### Los pasos corren con el timeout de volcado, no con el interactivo
+
+Toda sentencia de la conversión va con `bulk=True`
+(`REMOTE_BULK_STATEMENT_TIMEOUT_MS`, 1 h por default) en lugar del interactivo de 15 s
+(`REMOTE_STATEMENT_TIMEOUT_MS`). Es lo que hace ejecutable el feature, no una mejora de
+rendimiento.
+
+El motivo tiene un matiz que importa: en MySQL/MariaDB ese timeout se traduce a
+`read_timeout`/`write_timeout` **de socket, del CLIENTE** (`remote_engine._connect_args`). Un
+`CONVERT TO CHARACTER SET` sobre cualquier tabla no trivial rompía la conexión a los 15 s
+**mientras el motor seguía reescribiendo la tabla**: el gateway registraba como fallida una
+sentencia que en realidad se iba a completar, y de paso dejaba la BD en cuarentena. O sea, el
+peor estado posible —conversión corriendo, inventario diciendo que falló— era el resultado
+*esperado* para cualquier tabla real. En PostgreSQL es `statement_timeout` de servidor
+(cancelación limpia), así que ahí el síntoma era distinto pero el techo el mismo.
+
+**Límite conocido que esto NO cubre**: el camino de Alembic (`_apply_one`/`_prepared`), que es
+el que aplica una migración de blueprint, **sigue** con el timeout interactivo. Subírselo a
+todas las migraciones es un cambio de comportamiento global y se decidió aparte (ítem en
+`TODO.md`).
+
+### No se puede convertir la propia BD de metadatos del gateway
+
+`ensure_not_reserved_database` cubre las BDs de sistema del motor, pero la base del gateway es
+para el motor una base de usuario común: si su servidor está dado de alta —el caso normal en un
+compose—, nada impedía apuntarle una conversión. `ALTER TABLE audit_log CONVERT TO …` reescribe
+la tabla completa **mientras el gateway escribe en ella**, y `audit_log` es el único control
+compensatorio que el sistema declara para todo lo demás; `servers` guarda
+`root_password_encrypted`.
+
+Se reusa el guard de la consola SQL (`query_policy.is_gateway_metadata_target`), que resuelve
+ambos hosts a IPs e intersecta —así que registrar el servidor por su IP en vez de por su nombre
+no lo evade— y es fail-closed si la resolución falla. **409** con
+`public_context.code = "collation.scope_not_allowed"`. Mismo guard que ya tenían el clon, el
+export y la consola SQL; este módulo era el único de la familia sin él.
+
+### El inventario se sincroniza al terminar
+
+Una conversión exitosa escribe el charset/collation nuevos en `ManagedDatabase.charset` /
+`.collation`. Sin esto la fila del inventario **mentía** después de cada conversión, y son
+justamente las columnas que cualquier detección de deriva contra el blueprint tiene que leer.
+
+Tres condiciones, y ninguna es opcional: solo en modo `universal` (en `columns` el objetivo es
+la collation de una *columna*, no el `LC_COLLATE` de la base); solo si la BD está en el
+inventario; y **solo si el `ALTER DATABASE` se ejecutó y salió `ok`**. Esa última importa: son
+el *default de la base*, y ese paso es opcional (`include_database_default`). Sincronizar
+incondicionalmente cambiaría una fila *stale* por una fila **falsa**, que es peor — la deriva
+la reportaría como al día.
 
 ### El `DEFINER` se preserva verbatim (a diferencia del clon)
 

@@ -132,14 +132,20 @@ class _FakeRunner:
 
     fail_substrings: list[str] = []
     executed: list[list[str]] = []
+    # Una entrada por llamada: (sentencias, disable_fk_checks, bulk). Permite afirmar sobre
+    # los FLAGS de conexión, no solo sobre el SQL — que es donde viven dos correcciones que
+    # de otro modo no serían observables desde el test.
+    calls: list[tuple[list[str], bool, bool]] = []
 
     @contextmanager
     def advisory_lock(self, target, *, engine, lock_key):
         yield  # no-op en test (sin motor real que lockear)
 
     def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
-                      already_locked=False, stop_on_error=True, disable_fk_checks=False):
+                      already_locked=False, stop_on_error=True, disable_fk_checks=False,
+                      bulk=False):
         type(self).executed.append(list(statements))
+        type(self).calls.append((list(statements), disable_fk_checks, bulk))
         out = []
         for i, stmt in enumerate(statements):
             bad = any(s in stmt for s in type(self).fail_substrings)
@@ -160,12 +166,33 @@ def _install(monkeypatch, inventory=None, *, adapter=None):
     fake = adapter or _FakeAdapter(inventory or _inventory())
     _FakeRunner.fail_substrings = []
     _FakeRunner.executed = []
+    _FakeRunner.calls = []
     monkeypatch.setattr(cc, "get_adapter", lambda target: fake)
     monkeypatch.setattr(cc, "MigrationRunner", _FakeRunner)
     monkeypatch.setattr(
         ccr, "enqueue", lambda job_id: cc.CollationConversionController().run_job(job_id)
     )
     return fake
+
+
+def _adopt_managed(admin_client, sid, name="app_db", *, charset=None, collation=None) -> int:
+    """
+    Registra la BD en el inventario SIN tocar el motor (``provision`` es False por default),
+    para poder afirmar sobre ``ManagedDatabase.charset``/``.collation`` tras la conversión.
+    """
+    owner = admin_client.post(
+        "/api/v1/server-users",
+        json={"server_id": sid, "username": f"own{sid}", "host": "%"},
+    )
+    assert owner.status_code == 201, owner.text
+    body = {"name": name, "server_id": sid, "owner_id": owner.json()["data"]["id"]}
+    if charset is not None:
+        body["charset"] = charset
+    if collation is not None:
+        body["collation"] = collation
+    r = admin_client.post("/api/v1/managed-databases", json=body)
+    assert r.status_code == 201, r.text
+    return r.json()["data"]["id"]
 
 
 def _create(admin_client, sid, database="app_db", charset=TARGET_CS, collation=TARGET_CO):
@@ -622,3 +649,133 @@ def test_execute_force_survives_drift_the_worker_would_otherwise_catch(
     assert final["status"] == "succeeded", (
         f"force=true no sobrevivió al drift: status={final['status']} error={final['error']}"
     )
+
+
+# =========================================================================== #
+# Fase A — saneamiento del módulo (T-260824-lz-collation-lote-y-version)      #
+# =========================================================================== #
+def test_table_phase_disables_fk_checks(admin_client, monkeypatch):
+    """
+    MySQL PROHÍBE `CONVERT TO CHARACTER SET` sobre una tabla con una columna de texto usada
+    en una FK mientras `foreign_key_checks` esté activo (doc oficial de ALTER TABLE), y el
+    workaround documentado es desactivarlo. No es un caso raro: lo dispara cualquier esquema
+    con una FK sobre `varchar`.
+
+    El flag va SOLO en la fase de tablas: el `ALTER DATABASE` no toca tablas y un DROP/CREATE
+    de rutina no está sujeto a esta restricción, así que extenderlo ahí solo ampliaría la
+    ventana sin comprar nada.
+    """
+    _install(monkeypatch)
+    sid = _server(admin_client, 3901)
+    job_id = _create(admin_client, sid).json()["data"]["id"]
+    token = _preview(
+        admin_client, job_id, tables=["users", "orders"],
+        objects=[{"object_type": "procedure", "name": "sp_x"}],
+    ).json()["data"]["confirm_token"]
+    assert _execute(admin_client, job_id, token).status_code == 200
+
+    por_sql = {stmts[-1]: fk for stmts, fk, _bulk in _FakeRunner.calls}
+    convert = [s for s in por_sql if s.startswith("ALTER TABLE")]
+    assert convert, _FakeRunner.calls
+    assert all(por_sql[s] is True for s in convert), "las tablas deben ir con FK checks off"
+
+    alter_db = [s for s in por_sql if s.startswith("ALTER DATABASE")]
+    assert alter_db and all(por_sql[s] is False for s in alter_db)
+    creates = [s for s in por_sql if s.startswith("CREATE ")]
+    assert creates and all(por_sql[s] is False for s in creates)
+
+
+def test_conversion_uses_bulk_timeout(admin_client, monkeypatch):
+    """
+    TODA sentencia de la conversión va con `bulk=True`.
+
+    El timeout interactivo (15 s) se traduce en MySQL/MariaDB a `read_timeout`/`write_timeout`
+    de socket DEL CLIENTE: cortaría la conexión de un `CONVERT TO` sobre cualquier tabla no
+    trivial **mientras el motor la sigue reescribiendo**, y el gateway registraría como
+    fallida una sentencia que en realidad se completa (dejando además la BD en cuarentena).
+    Esta feature es asíncrona justamente porque sus pasos tardan minutos u horas.
+    """
+    _install(monkeypatch)
+    sid = _server(admin_client, 3902)
+    job_id = _create(admin_client, sid).json()["data"]["id"]
+    token = _preview(
+        admin_client, job_id, tables=["users"],
+        objects=[{"object_type": "view", "name": "v_v"}],
+    ).json()["data"]["confirm_token"]
+    assert _execute(admin_client, job_id, token).status_code == 200
+
+    assert _FakeRunner.calls
+    assert all(bulk is True for _s, _fk, bulk in _FakeRunner.calls), _FakeRunner.calls
+
+
+def test_plan_rejects_gateway_metadata_database(admin_client, monkeypatch):
+    """
+    No se puede convertir la PROPIA base de metadatos del gateway.
+
+    `ensure_not_reserved_database` cubre las BDs de sistema del motor, pero la del gateway es
+    una base de usuario común: nada lo impedía. `ALTER TABLE audit_log CONVERT TO …` reescribe
+    la tabla completa mientras el gateway escribe en ella, y `audit_log` es el único control
+    compensatorio que el sistema declara para todo lo demás; `servers` guarda
+    `root_password_encrypted`. El clon, el export y la consola SQL ya cierran esto.
+    """
+    from app.core import environments as env
+
+    fake = _FakeAdapter(_inventory(database="gw_meta"), databases=("gw_meta",))
+    _install(monkeypatch, adapter=fake)
+    monkeypatch.setattr(cc, "DB_HOST", "10.0.0.5")
+    monkeypatch.setattr(cc, "DB_PORT", 3903)
+    monkeypatch.setattr(cc, "DB_NAME", "gw_meta")
+
+    sid = _server(admin_client, 3903)
+    r = _create(admin_client, sid, database="gw_meta")
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["public_context"]["code"] == "collation.scope_not_allowed"
+    assert env  # el guard usa las constantes del módulo, no un literal
+
+
+def test_inventory_charset_synced_when_alter_database_succeeded(admin_client, monkeypatch):
+    """
+    Tras convertir, la fila del inventario refleja el charset/collation nuevos.
+
+    Sin esto `ManagedDatabase.charset`/`.collation` quedan con el valor de cuando se creó la
+    BD y la fila MIENTE después de cada conversión — y son las columnas que cualquier
+    detección de deriva contra el blueprint tiene que leer.
+    """
+    _install(monkeypatch)
+    sid = _server(admin_client, 3904)
+    db_id = _adopt_managed(admin_client, sid, "app_db")
+
+    job_id = _create(admin_client, sid).json()["data"]["id"]
+    token = _preview(admin_client, job_id, tables=["users"]).json()["data"]["confirm_token"]
+    assert _execute(admin_client, job_id, token).status_code == 200
+
+    md = admin_client.get(f"/api/v1/managed-databases/{db_id}").json()["data"]
+    assert md["charset"] == TARGET_CS
+    assert md["collation"] == TARGET_CO
+
+
+def test_inventory_charset_not_synced_without_alter_database(admin_client, monkeypatch):
+    """
+    Con `include_database_default=False` la fila NO se toca.
+
+    Esas columnas son el DEFAULT DE LA BASE, y ese paso es opcional: una conversión que
+    convierte todas las tablas pero no toca el default deja la base con el default viejo.
+    Sincronizar igual cambiaría una fila STALE por una fila FALSA — peor, porque la deriva la
+    reportaría como al día.
+    """
+    _install(monkeypatch)
+    sid = _server(admin_client, 3905)
+    # Par DISTINTO del objetivo pero habilitado en el catálogo sembrado (el catálogo valida
+    # la combinación al registrar la BD, así que no sirve un charset inventado).
+    db_id = _adopt_managed(admin_client, sid, "app_db", charset=TARGET_CS,
+                           collation=OLD_CO)
+
+    job_id = _create(admin_client, sid).json()["data"]["id"]
+    token = _preview(
+        admin_client, job_id, tables=["users"], include_database_default=False
+    ).json()["data"]["confirm_token"]
+    assert _execute(admin_client, job_id, token).status_code == 200
+
+    md = admin_client.get(f"/api/v1/managed-databases/{db_id}").json()["data"]
+    assert md["charset"] == TARGET_CS
+    assert md["collation"] == OLD_CO, "el default de la BD no cambió: la fila no debe moverse"

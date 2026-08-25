@@ -1237,10 +1237,21 @@ class MigrationRunner:
         already_locked: bool = False,
         stop_on_error: bool = True,
         disable_fk_checks: bool = False,
+        bulk: bool = False,
     ) -> list[StatementResult]:
         """
         Ejecuta ``statements`` DDL directamente sobre la BD destino, UNA por una,
         deteniéndose en el primer fallo (igual que ``_apply_one``).
+
+        ``bulk=True``: usa ``REMOTE_BULK_STATEMENT_TIMEOUT_MS`` (1 h por default) en lugar
+        del interactivo de 15 s. NO es una optimización: es lo que hace ejecutable el DDL
+        que reescribe una tabla entera. En MySQL/MariaDB el timeout interactivo se traduce a
+        ``read_timeout``/``write_timeout`` **de socket, del CLIENTE**
+        (``remote_engine._connect_args``), así que un ``ALTER TABLE … CONVERT TO CHARACTER
+        SET`` sobre una tabla no trivial rompe la conexión a los 15 s **mientras el motor
+        sigue reescribiendo la tabla**: el gateway registra un fallo de una sentencia que en
+        realidad se va a completar. Mismo motivo por el que ``data_copy`` y
+        ``export_session`` ya piden ``bulk=True``.
 
         ``stop_on_error=False`` INTENTA todas las sentencias y devuelve un resultado por
         cada una (aplicada/fallida) sin cortar en el primer fallo. Lo usa el clon para
@@ -1279,7 +1290,7 @@ class MigrationRunner:
         """
         results: list[StatementResult] = []
         try:
-            with database_connection(target, db_name) as conn:
+            with database_connection(target, db_name, bulk=bulk) as conn:
                 conn = conn.execution_options(isolation_level="AUTOCOMMIT")
                 if not already_locked:
                     self._acquire_lock(conn, engine, lock_key)

@@ -19,6 +19,7 @@ from app.models.audit_log import AuditLog
 from app.models.base import Base, TimestampMixin
 from app.models.charset_collation_option import CharsetCollationOption
 from app.models.clone_job import CloneJob, CloneJobItem
+from app.models.collation_conversion_batch import CollationConversionBatch
 from app.models.collation_conversion_job import (
     CollationConversionJob,
     CollationConversionJobItem,
@@ -75,6 +76,7 @@ __all__ = [
     "SchemaComparisonItem",
     "CloneJob",
     "CloneJobItem",
+    "CollationConversionBatch",
     "CollationConversionJob",
     "CollationConversionJobItem",
     "ExportJob",
