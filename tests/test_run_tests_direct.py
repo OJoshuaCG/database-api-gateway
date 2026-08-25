@@ -18,12 +18,15 @@ Cada test de acá corresponde a un hueco concreto y **falla si el hueco se reint
 verificados por mutación, no solo por su verde.
 """
 
+import pathlib
 import sys
 import types
 
 import pytest
 
-sys.path.insert(0, "scripts")
+# Relativo al ARCHIVO, no al cwd: así el test corre desde cualquier directorio y no solo
+# desde la raíz del repo.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
 
 import run_tests_direct as arnes  # noqa: E402
 
@@ -182,7 +185,7 @@ def test_request_param_llega_a_la_fixture():
     def test_usa_motor(motor):
         vistos.append(motor)
 
-    mod = _modulo_sintetico("_arnes_req", motor=motor, test_usa_motor=test_usa_motor)
+    _modulo_sintetico("_arnes_req", motor=motor, test_usa_motor=test_usa_motor)
     assert arnes.run("_arnes_req", []) == 0
     # Se resuelve con el PRIMER param (límite declarado del arnés: no multiplica el test).
     assert vistos == ["mysql"]
@@ -207,7 +210,7 @@ def test_una_fixture_local_puede_pedir_una_builtin():
     def test_lee(archivo):
         leido.append(archivo.read_text())
 
-    mod = _modulo_sintetico("_arnes_tmp", archivo=archivo, test_lee=test_lee)
+    _modulo_sintetico("_arnes_tmp", archivo=archivo, test_lee=test_lee)
     assert arnes.run("_arnes_tmp", []) == 0
     assert leido == ["hola"]
 
@@ -224,7 +227,7 @@ def test_una_fixture_generadora_corre_su_teardown():
     def test_usa(recurso):
         eventos.append(f"test:{recurso}")
 
-    mod = _modulo_sintetico("_arnes_gen", recurso=recurso, test_usa=test_usa)
+    _modulo_sintetico("_arnes_gen", recurso=recurso, test_usa=test_usa)
     assert arnes.run("_arnes_gen", []) == 0
     assert eventos == ["setup", "test:r", "teardown"]
 
@@ -253,7 +256,7 @@ def test_un_skip_no_aborta_la_corrida():
     def test_despues_del_skip():
         pass
 
-    mod = _modulo_sintetico(
+    _modulo_sintetico(
         "_arnes_skip", test_salta=test_salta, test_despues_del_skip=test_despues_del_skip
     )
     try:
@@ -270,7 +273,7 @@ def test_una_excepcion_de_verdad_si_cuenta_como_falla():
     def test_rompe():
         raise AssertionError("esto es un bug")
 
-    mod = _modulo_sintetico("_arnes_falla", test_rompe=test_rompe)
+    _modulo_sintetico("_arnes_falla", test_rompe=test_rompe)
     assert arnes.run("_arnes_falla", []) == 1
 
 
@@ -287,7 +290,7 @@ def test_pedir_client_no_deja_sesion_iniciada():
     def test_sin_sesion(client):
         codigos.append(client.get("/api/v1/servers").status_code)
 
-    mod = _modulo_sintetico("_arnes_anon", test_sin_sesion=test_sin_sesion)
+    _modulo_sintetico("_arnes_anon", test_sin_sesion=test_sin_sesion)
     assert arnes.run("_arnes_anon", []) == 0
     assert codigos == [401], f"esperaba 401 sin login, salió {codigos}"
 
@@ -314,7 +317,7 @@ def test_una_fixture_local_que_pide_client_tampoco_recibe_sesion():
     def test_sin_sesion(anonimo):
         codigos.append(anonimo.get("/api/v1/servers").status_code)
 
-    mod = _modulo_sintetico(
+    _modulo_sintetico(
         "_arnes_anon_indirecto", anonimo=anonimo, test_sin_sesion=test_sin_sesion
     )
     assert arnes.run("_arnes_anon_indirecto", []) == 0
@@ -328,7 +331,7 @@ def test_admin_client_si_queda_autenticado():
     def test_con_sesion(admin_client):
         codigos.append(admin_client.get("/api/v1/servers").status_code)
 
-    mod = _modulo_sintetico("_arnes_admin", test_con_sesion=test_con_sesion)
+    _modulo_sintetico("_arnes_admin", test_con_sesion=test_con_sesion)
     assert arnes.run("_arnes_admin", []) == 0
     assert codigos == [200], f"esperaba 200 con admin_client, salió {codigos}"
 
@@ -357,6 +360,36 @@ def test_el_arnes_no_escribe_bytecode():
     )
 
 
+def test_hay_una_sola_instancia_de_conftest():
+    """
+    El arnés reutiliza el ``conftest`` ya cargado en vez de importar una segunda copia.
+
+    ``tests/`` no es un paquete (no tiene ``__init__.py``), así que pytest lo importa como
+    ``conftest`` mientras un ``import tests.conftest`` crea otra instancia **del mismo
+    archivo**. Y ese archivo tiene efectos al importarse: llama a ``tempfile.mkdtemp()`` y
+    escribe ``DB_NAME`` en el entorno. La segunda copia pisa la variable a mitad de la
+    sesión, cuando ``app/core/environments.py`` ya leyó la primera — o sea que quedan dos
+    módulos afirmando cosas distintas sobre dónde está la BD de metadatos.
+
+    Se dispara exactamente en este archivo corriendo BAJO pytest, que es como lo corre CI.
+    """
+    cargados = {
+        k: sys.modules[k]
+        for k in ("conftest", "tests.conftest")
+        if k in sys.modules
+    }
+    assert cargados, "no hay ningún conftest cargado, algo cambió de raíz"
+
+    distintos = {id(v) for v in cargados.values()}
+    assert len(distintos) == 1, (
+        f"hay {len(distintos)} instancias del conftest cargadas ({sorted(cargados)}): "
+        "cada una creó su propio tmpdir y pisó DB_NAME"
+    )
+    assert arnes.conftest is next(iter(cargados.values())), (
+        "el arnés está usando un conftest distinto del que cargó el runner"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Filtro por nombre                                                            #
 # --------------------------------------------------------------------------- #
@@ -369,6 +402,6 @@ def test_el_filtro_por_nombre_acota_la_corrida():
     def test_beta():
         corridos.append("beta")
 
-    mod = _modulo_sintetico("_arnes_filtro", test_alfa=test_alfa, test_beta=test_beta)
+    _modulo_sintetico("_arnes_filtro", test_alfa=test_alfa, test_beta=test_beta)
     assert arnes.run("_arnes_filtro", ["alfa"]) == 0
     assert corridos == ["alfa"]

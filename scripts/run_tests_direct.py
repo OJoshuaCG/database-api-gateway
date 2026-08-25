@@ -64,12 +64,15 @@ un scratchpad, que es cómo volvieron los huecos 3 y 4.
 import contextlib
 import importlib
 import inspect
-import os
+import pathlib
 import sys
 import tempfile
 import traceback
 
-sys.path.insert(0, os.getcwd())
+# La RAÍZ DEL REPO derivada de la ubicación de ESTE archivo, no de `os.getcwd()`. Hace falta
+# para importar `tests.conftest` y `app.*`, y con el cwd el script solo funcionaba invocado
+# desde la raíz: desde cualquier otro directorio moría con `No module named 'tests'`.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 # NO escribir `.pyc`. Cuesta ~7% de arranque (≈0,05 s por archivo) y cierra una trampa que ya
 # produjo una auditoría entera con resultados falsos.
@@ -90,7 +93,19 @@ sys.dont_write_bytecode = True
 
 # conftest.py fija el entorno al importarse (environments.py lo lee AL IMPORTAR), así que
 # importarlo primero es también la forma de heredar ESA configuración en vez de copiarla.
-import tests.conftest as conftest  # noqa: E402
+#
+# Se busca en `sys.modules` ANTES de importarlo, y eso no es microoptimización: es
+# corrección. `tests/` no es un paquete (no tiene `__init__.py`), así que pytest lo importa
+# como `conftest` mientras un `import tests.conftest` crea una SEGUNDA instancia del mismo
+# archivo — con su propio `tempfile.mkdtemp()`, que pisa `DB_NAME` en el entorno a mitad de
+# la sesión. `app/core/environments.py` ya leyó el valor viejo, así que el resultado es un
+# directorio temporal huérfano y dos módulos que dicen cosas distintas sobre dónde está la
+# BD. Pasa justo cuando `tests/test_run_tests_direct.py` corre BAJO pytest e importa este
+# arnés. Reutilizar el que ya está cargado lo evita, y sin pytest cae al import normal.
+conftest = sys.modules.get("conftest") or sys.modules.get("tests.conftest")
+if conftest is None:
+    import tests.conftest as conftest  # noqa: E402
+
 from _pytest.monkeypatch import MonkeyPatch  # noqa: E402
 from _pytest.outcomes import Skipped  # noqa: E402
 
