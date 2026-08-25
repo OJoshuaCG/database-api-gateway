@@ -26,6 +26,7 @@
 > | `v13` | La captura de `SELECT` pasa de tres llaves a dos |
 > | `v14` | Una versión de blueprint se descongela al revertirla |
 > | `v15` | Editar una versión de blueprint que ya está aplicada |
+> | `v16` | Proyectos: agrupación de blueprints |
 >
 > Si consolidás alguno acá, sacalo de esta tabla en el mismo cambio: una tabla que
 > miente sobre qué falta leer es peor que no tenerla.
