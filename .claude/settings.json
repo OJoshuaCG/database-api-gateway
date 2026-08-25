@@ -10,5 +10,13 @@
         ]
       }
     ]
+  },
+  "permissions": {
+    "deny": [
+      "Bash(pytest*)",
+      "Bash(uv run pytest*)",
+      "Bash(python -m pytest*)",
+      "Bash(uv run python -m pytest*)"
+    ]
   }
 }
