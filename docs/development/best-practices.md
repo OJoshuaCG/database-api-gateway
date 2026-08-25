@@ -478,11 +478,37 @@ arranque). Si mutás desde otro proceso, **limpiá la caché después de restaur
 find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 ```
 
-### Instalar Dependencias de Testing
+### Dónde está el gate: CI corre `pytest` de verdad
+
+El arnés es el loop **local**. El gate que impide que la suite se degrade es
+`.github/workflows/ci.yml`, y ahí corre **`pytest`**, no el arnés: un runner es descartable, no
+tiene el I/O de WSL2 y nadie espera frente a él, así que la razón de la política local no
+aplica. Además hace falta que sea pytest, porque el arnés no multiplica un test por los `params`
+de su fixture ni tiene fixtures de scope `module`/`session` — hay una clase de fallas que
+estructuralmente no puede ver.
+
+El workflow tiene cinco jobs: Ruff **bloqueante** (el set vive en `pyproject.toml`, así que
+`ruff check .` en local da lo mismo que el gate), Ruff **informativo** que anota el PR sin
+bloquear, `actionlint` sobre los propios workflows (uno mal escrito no falla: GitHub
+simplemente no lo corre, y el gate desaparece sin avisar), la suite completa, y
+`detect-secrets` contra `.secrets.baseline` —que **se versiona**, es el registro compartido de
+los 99 falsos positivos ya auditados—. Aparte,
+`migrations-apply.yml` aplica las migraciones contra MariaDB y PostgreSQL efímeros — eso es lo
+que `migration-graph.yml` **no** puede ver, porque lee el grafo con `ast` y no ejecuta el DDL.
+
+### Dependencias de desarrollo
+
+Están en `[dependency-groups] dev` de `pyproject.toml` (`pytest`, `httpx`, `ruff`) y se
+instalan con:
 
 ```bash
-uv add --group dev pytest pytest-asyncio httpx
+uv sync
 ```
+
+`uv sync` incluye el grupo `dev` por defecto, así que no hace falta pedirlo. CI corre
+`uv sync --locked`, que es lo mismo pero **falla** si `uv.lock` no coincide con
+`pyproject.toml`: si agregás una dependencia, corré `uv lock` y commiteá el lock, o el gate
+te lo va a marcar.
 
 ### Crear Tests
 

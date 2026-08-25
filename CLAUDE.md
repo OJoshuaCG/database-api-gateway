@@ -125,9 +125,16 @@ chequeo automático tras cada cambio genera carga real en la máquina del usuari
 pedido. Vale tanto para vos como para cualquier subagente que delegues: **no le agregues "y
 corré los tests" por las dudas.**
 
-Verificá por otros medios — lectura del diff, `ast.parse`, ejecución directa de las funciones
-puras — y **decí explícitamente qué quedó sin verificar**, para que el usuario decida si lo
-corre él.
+Para verificar hay herramienta: **`.venv/bin/python scripts/run_tests_direct.py tests.<modulo>`**
+(carga las fixtures reales de `conftest`, ver `docs/development/best-practices.md`). Sus límites
+están en su docstring. Y **decí explícitamente qué quedó sin verificar**, para que el usuario
+decida si corre la suite él.
+
+**El alcance de esta regla es LA MÁQUINA DE QUIEN TRABAJA, no CI.** `.github/workflows/ci.yml`
+corre `pytest` de verdad y eso **no** es una violación: un runner es descartable, no tiene el I/O
+de WSL2 y nadie espera frente a él. Si te parece una contradicción, el porqué completo está en la
+cabecera de ese workflow — **leelo antes de "arreglarlo" borrando el job**, que es el gate que
+evita que la suite se degrade en silencio.
 
 **Esto ya no es solo una instrucción: es un `permissions.deny` en `.claude/settings.json`.** Si
 te topás con el bloqueo, la regla está funcionando — **no lo rodees** (ni `sh -c`, ni un alias,
