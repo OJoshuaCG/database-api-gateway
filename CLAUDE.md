@@ -754,14 +754,62 @@ Comportamientos (actualizados): `version` al crear es **opcional** → autoasign
 pendientes hasta X (forward-only); `rollback` es **target-based** (`?confirm_version=` obligatorio
 + `?target_version=` opcional → revierte secuencialmente; valida `down_sql` de todo el camino);
 un baseline de snapshot exige aprobación (`reviewed`) antes de aplicar. **Editar/borrar migraciones**:
-`PATCH` puede corregir `up_sql`/overrides **solo si no hubo aplicación EXITOSA** (guard
-`_has_successful_application`, no `_has_history` — un intento fallido no congela el SQL); al cambiar
-`up_sql` hay que reenviar/limpiar los overrides en el mismo PATCH (409 si quedan obsoletos) y se
-regenera `down_sql_suggested`. `DELETE` solo borra la **última** versión (la punta) y sin historial.
-`stamp` además **saca la BD de cuarentena** (`error → active`). La respuesta de `apply`/
+lo que congela una versión es que alguna BD la tenga aplicada **HOY**, no que haya corrido alguna
+vez (ver el bloque siguiente); al cambiar `up_sql` hay que reenviar/limpiar los overrides en el
+mismo PATCH (409 si quedan obsoletos) y se regenera `down_sql_suggested`. `DELETE` sigue borrando
+solo la **última** versión (la punta). `stamp` además **saca la BD de cuarentena**
+(`error → active`). La respuesta de `apply`/
 `rollback` es tipada (`MigrationApplyOut`/`MigrationRollbackOut`, con `from_version`→`to_version`).
 Verificación e2e contra motores reales (`scripts/verify_migrations_e2e.py`, requiere Docker):
 **ejecutada — 153 checks / 0 fallos** (cubre Plan 02 + Plan 09 + UX).
+
+**El historial NO congela una versión; la versión ACTUAL de las BDs sí (fix, 2026-08-24)**:
+`_has_successful_application` decidía con una sola consulta —¿existe una fila `applied` en
+`database_migration_history` para esta migración?— y eso está mal porque esa tabla es un **LOG DE
+EVENTOS, no un estado**. `ManagedMigrationController._record_history` (`managed_migration_controller.py:2307`)
+se llama tanto desde el `apply` (línea 1091) como desde el `rollback` (línea 1472), y **ninguno deja
+rastro de la dirección**: ni `MigrationResult` (`services/db_admin/migrations.py:127`) ni la tabla
+tienen columna `direction`. O sea que la fila que dice "esta versión corrió con éxito acá" **no se
+revoca nunca**. Consecuencia: una versión **revertida CORRECTAMENTE en todas las BDs** quedaba
+congelada de por vida —ni editable ni borrable— y **sin ninguna salida**: no existe purga de
+historial, el `DELETE` de la ruta no acepta `force`, y el `CASCADE` que borraría esas filas cuelga
+del borrado de la migración, que es justo lo bloqueado. La única salida era fix-forward: acumular
+versiones correctivas para describir cambios que ya no existían en ningún motor.
+
+FIX: el historial pasa a ser el **PRIMER filtro** (barato: sin filas `applied` no se abre ni una
+conexión) y la decisión la da la **versión ACTUAL** de las BDs que registran la migración. Las
+migraciones son forward-only encadenadas —una BD en N tiene aplicadas todas las `<= N`—, así que
+"la versión V sigue vigente" es "alguna de las BDs que la aplicaron está hoy en V o posterior".
+El criterio es `>=` y no `==` a propósito: con igualdad, una base al día dejaría borrar todas las
+versiones intermedias que sí describen su esquema. Métodos nuevos en `ModelMigrationController`:
+`_applied_history_targets` (una query para todo el lote), `_reaches_version` (fail-closed: `None`
+es False —la BD está en base, genuinamente no la tiene—; un valor no numérico es True, porque
+`version_sort_key` hace `int()` y nada garantiza que la caché sea numérica),
+`_still_applied_cached` (usa la CACHÉ `ManagedDatabase.model_version`; lo consume `_policy_flags`,
+que corre por cada fila de cada página del listado y no puede abrir conexiones) y
+`_still_applied_live` (AUTORITATIVO, lee la versión DEL MOTOR con `MigrationRunner.get_current_version`;
+lo consumen `update_migration` y `delete_migration`, que autorizan algo irreversible). **La
+divergencia entre las dos lecturas es en la dirección segura**: una caché atrasada hace que el
+listado ofrezca un botón que el guard después rechaza con 409; al revés exigiría que la caché
+SOBREESTIME la versión, y eso solo congela de más.
+
+Códigos nuevos en `app/services/migration_freeze_catalog.py`, en `public_context["code"]` (nunca
+en `context`, que solo se ve en development): `model_migration.sql_frozen` (PATCH) y
+`model_migration.still_applied` (DELETE) — **dos y no uno** porque el remedio difiere. Ambos traen
+`version` y `blocking_databases[]` con `managed_database_id`/`reason`/`current_version`. Los cuatro
+`reason` son vocabulario cerrado: `still_applied`, `unreadable` (**fail-closed**: una BD que no se
+puede leer —motor caído, base sin aprovisionar, credenciales rotas— cuenta como bloqueante; tratar
+un fallo de lectura como "ya no la tiene" convertiría un corte de red en permiso para borrar),
+`unknown_database` y `unknown_blueprint`. `_describe_blocking` arma el `message` nombrando id de BD
+y motivo y **nunca** vuelca `str(exc)` del motor (criterio R4: puede llevar host, usuario o
+fragmentos de sentencia); el detalle va a `logger.exception` con el Request ID.
+
+**LÍMITE CONOCIDO Y ACEPTADO**: `stamp` mueve el puntero **sin ejecutar ni deshacer DDL**, así que
+una BD stampeada hacia atrás reporta una versión anterior mientras conserva FÍSICAMENTE los cambios
+de V. Desbloquear V ahí permite borrar la DESCRIPCIÓN de cambios que siguen en el motor. No es un
+descuido: `stamp` es la puerta trasera declarada de cualquier gate basado en la versión (el gate de
+entornos lo dice igual). Contrato frontend: `docs/api-reference-v14.md`; guía:
+`docs/features/model-migrations.md` (§ «Cuándo se puede editar o eliminar una versión»).
 
 **La contabilidad INTERNA del gateway NO es esquema del usuario (fix de producción,
 2026-07-27)**: `identifiers.GATEWAY_TABLE_PREFIXES = ("_gw_v_", "_gw_stg_")` +

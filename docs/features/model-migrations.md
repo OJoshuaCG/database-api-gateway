@@ -239,15 +239,18 @@ fiable:
   Si la fila fue alterada directamente en la BD del gateway → **409** (no aplica SQL no
   verificado).
 - **Editar `up_sql` (corrección)**: vía `PATCH` puedes corregir `up_sql` (y overrides)
-  **mientras la migración no se haya aplicado EXITOSAMENTE en ninguna BD**. Un intento que
-  solo *falló* no congela el SQL (ninguna BD depende de él) → sí se puede corregir. Si ya
-  hubo una aplicación exitosa → **409**: usa **fix-forward** (nueva migración correctiva).
+  **mientras ninguna BD tenga la versión aplicada HOY** (ver
+  [§ Cuándo se puede editar o eliminar una versión](#cuándo-se-puede-editar-o-eliminar-una-versión)).
+  Un intento que solo *falló* no congela el SQL, y una versión **revertida** en todas las BDs
+  vuelve a ser editable. Si alguna BD sigue en esa versión (o en una posterior) → **409**
+  `model_migration.sql_frozen`: usa **fix-forward** (nueva migración correctiva).
   Al cambiar `up_sql` se regenera el `down_sql_suggested`; si existen overrides por-motor
   debes **reenviarlos corregidos o limpiarlos (null)** en el mismo `PATCH` (409 si no), para
   que no quede SQL viejo aplicándose en silencio.
 - **Eliminar una versión**: `DELETE` solo permite borrar la **última** versión del blueprint
-  (la punta) y **sin historial** de aplicación (409 en otro caso). Borrar una intermedia
-  dejaría un hueco del que podría depender una versión posterior.
+  (la punta) y **mientras ninguna BD la tenga aplicada HOY** (409
+  `model_migration.still_applied` en otro caso). Borrar una intermedia dejaría un hueco del
+  que podría depender una versión posterior.
 - **Cuarentena (fallo parcial)**: como el DDL no es transaccional en MySQL/MariaDB (y el
   runner corre en AUTOCOMMIT), una migración multi-sentencia que falla a mitad puede dejar
   estado parcial. El gateway marca la BD con `status=error` + nota; el siguiente `apply`
@@ -286,6 +289,105 @@ fiable:
     checkpoint se graba SIEMPRE después del `op.execute`, nunca antes).
 - **Recomendación**: escribe migraciones **idempotentes** (`CREATE TABLE IF NOT EXISTS`,
   `ADD COLUMN IF NOT EXISTS`) para que un reintento sea seguro.
+
+## Cuándo se puede editar o eliminar una versión
+
+> Contrato para el frontend: [`docs/api-reference-v14.md`](../api-reference-v14.md).
+
+Editar el `up_sql` de una versión o borrarla **no ejecuta ni deshace nada en el motor**: solo
+cambia la descripción que el gateway guarda. Por eso hay un guard, y por eso el criterio del
+guard importa tanto.
+
+### La regla
+
+> Una versión está **congelada** mientras alguna BD gestionada la tenga aplicada **hoy**.
+
+Y "tenerla aplicada hoy" es: **la BD está en esa versión o en una posterior**. Las migraciones
+son forward-only encadenadas, así que una BD en `0007` tiene aplicadas todas las `<= 0007`; si
+el criterio fuera igualdad, una base al día dejaría borrar todas las versiones intermedias que
+sí describen su esquema.
+
+Lo que **no** congela: haber corrido alguna vez. Ver abajo por qué es la mitad importante.
+
+### Por qué el historial NO es el criterio
+
+`database_migration_history` es un **log de eventos**, no un estado. Su fila
+`status='applied'` significa "esta versión corrió con éxito sobre esta BD alguna vez", y **no
+se revoca nunca**: `ManagedMigrationController._record_history` se llama igual desde el camino
+`apply` que desde el `rollback`, y ninguno de los dos deja rastro de la **dirección** — ni la
+tabla ni `MigrationResult` tienen columna `direction`.
+
+Con el historial como criterio, una versión **revertida correctamente en todas las BDs** quedaba
+congelada **de por vida**, sin ninguna salida:
+
+- no existe purga de historial;
+- el `DELETE` no acepta `force`;
+- el `ondelete='CASCADE'` que se llevaría esas filas cuelga del borrado de la migración, que es
+  justo lo que el historial bloquea.
+
+La única salida era fix-forward: acumular versiones correctivas para describir cambios que ya no
+existían en ningún motor.
+
+Ahora el historial es solo el **primer filtro**, y es barato: si una versión no tiene ninguna
+fila `applied`, no se abre ni una conexión. Recién si la tiene se consulta la versión actual de
+esas BDs, que es lo que decide.
+
+### Dos lecturas distintas, a propósito
+
+| Camino | Fuente de la versión | Por qué |
+|---|---|---|
+| **Listado / detalle** (`sql_frozen`, `deletable`, `block_reason`) | Caché del inventario (`ManagedDatabase.model_version`) | Corre por cada fila de cada página: abrir una conexión por BD para pintar un botón no se sostiene. |
+| **`PATCH` / `DELETE`** (el 409) | **El motor**, vía `MigrationRunner.get_current_version` | Es el veredicto autoritativo: se está por autorizar algo irreversible, y la caché puede estar rancia. |
+
+La divergencia posible es en la dirección segura: si la caché quedó atrasada, el listado puede
+ofrecer un botón que después el guard rechaza con 409. Al revés no puede pasar sin que la caché
+**sobreestime** la versión, y eso solo congela de más.
+
+### Los dos códigos de error
+
+Viajan en `public_context.code` — **nunca** en `context`, que solo se expone en `development`:
+en producción el operador recibiría el mensaje sin poder clasificarlo ni elegir la salida.
+
+| HTTP | `public_context.code` | Cuándo | Salida |
+|---|---|---|---|
+| 409 | `model_migration.sql_frozen` | `PATCH` que cambia el SQL efectivo (`up_sql` u overrides) de una versión vigente. | Fix-forward con una versión nueva, **o** revertir en las BDs que la nombran. |
+| 409 | `model_migration.still_applied` | `DELETE` de una versión vigente. Borrarla dejaría esa BD con objetos que ninguna versión del blueprint describe. | Revertir primero, o crear una migración compensatoria. |
+
+Ambos traen `version` y `blocking_databases[]`, con un ítem por BD que bloquea:
+`managed_database_id`, `reason` y —cuando aplica— `current_version`.
+
+### Los cuatro `reason`
+
+Vocabulario cerrado en `app/services/migration_freeze_catalog.py`:
+
+| `reason` | Significa | Trae `current_version` |
+|---|---|---|
+| `still_applied` | El motor reporta que la BD está en esa versión o en una posterior. Es el caso normal. | Sí |
+| `unreadable` | No se pudo leer la versión de esa BD: motor caído, base sin aprovisionar, credenciales rotas. **Fail-closed**: cuenta como bloqueante. | No |
+| `unknown_database` | Hay historial contra una BD que ya no está en el inventario. No debería ocurrir (el `CASCADE` se lleva esas filas), pero no se puede probar lo contrario. | No |
+| `unknown_blueprint` | No se pudo resolver el blueprint de la migración, así que no hay `slug` con el que ubicar la tabla de versión `_gw_v_{slug}` dentro de cada BD. | No |
+
+**`unreadable` es fail-closed y no es negociable**: tratar un fallo de lectura como "esa BD ya
+no la tiene" convertiría un corte de red en autorización para destruir metadata.
+
+El `message` del 409 nombra la BD y el motivo, y **nunca** transcribe el error del motor
+(criterio R4): ese mensaje puede llevar host, usuario o fragmentos de sentencia. El detalle va
+al log, correlacionado por Request ID.
+
+### ⚠️ Límite conocido: `stamp` es la puerta trasera
+
+`stamp` mueve el puntero de versión **sin ejecutar ni deshacer una sola sentencia**. Una BD
+stampeada hacia atrás reporta una versión anterior mientras **conserva físicamente** los
+cambios de la versión que dejó de nombrar.
+
+Consecuencia directa: sobre esa BD, este guard deja **editar o borrar la descripción de cambios
+que siguen en el motor**. No es un descuido — es el mismo límite que tiene cualquier control
+basado en la versión (el gate de entornos lo declara igual), y `stamp` existe justamente para
+que un operador pueda declarar a mano un estado que el gateway no puede inferir.
+
+Si stampeás hacia atrás, la versión que "liberaste" describe cambios reales: no la borres sin
+haberlos revertido o adoptado en otra versión.
+
 
 ## PostgreSQL: el estado parcial no existe
 
