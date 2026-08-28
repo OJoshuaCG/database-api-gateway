@@ -94,13 +94,24 @@ _SQL_FROZEN_DESC = (
     "guardar."
 )
 _DELETABLE_DESC = (
-    "True = el DELETE de esta versión pasaría hoy: es la punta de la secuencia, ninguna BD la "
-    "aplicó con éxito y no hay aplicación parcial sin resolver."
+    "True = el DELETE de esta versión pasaría hoy: ninguna BD está PARADA exactamente en ella "
+    "y no hay aplicación parcial sin resolver. Ya no exige ser la punta: una versión "
+    "intermedia se puede eliminar, renumerando las posteriores. Y no coincide con "
+    "sql_frozen: una BD que está ADELANTE congela el SQL (describe lo que ya corrió allí) "
+    "pero no impide borrar, porque el borrado le mueve el puntero a la etiqueta nueva de su "
+    "misma migración."
 )
 _BLOCK_REASON_DESC = (
-    "Por qué está restringida, o null si no lo está: 'applied' (alguna BD depende de ella), "
-    "'partial' (aplicación a medias sin resolver) o 'not_tip' (hay versiones posteriores). "
-    "'not_tip' solo impide BORRARLA — editarla sigue permitido."
+    "Por qué NO se puede borrar, o null si se puede: 'in_use' (alguna BD está parada "
+    "exactamente en esta versión) o 'partial' (aplicación a medias sin resolver). El valor "
+    "'not_tip' ya no existe. Ojo: describe el BORRADO; para la edición del SQL mirá "
+    "sql_frozen, que tiene criterio propio."
+)
+_REQUIRES_STAMPS_DESC = (
+    "True = borrar esta versión implicaría mover el puntero de una o más BDs, o sea ESCRIBIR "
+    "en cada motor destino y no solo en el gateway. Sale de la caché del inventario: es una "
+    "pista para elegir el diálogo de confirmación, no un veredicto. El plan autoritativo es "
+    "GET /database-models/{model_id}/migrations/{version}/delete-plan."
 )
 
 
@@ -112,6 +123,7 @@ class ModelMigrationSummary(BaseModel):
     sql_frozen: bool = Field(False, description=_SQL_FROZEN_DESC)
     deletable: bool = Field(True, description=_DELETABLE_DESC)
     block_reason: str | None = Field(None, description=_BLOCK_REASON_DESC)
+    delete_requires_stamps: bool = Field(False, description=_REQUIRES_STAMPS_DESC)
 
     id: int
     model_id: int
@@ -143,6 +155,7 @@ class ModelMigrationOut(BaseModel):
     sql_frozen: bool = Field(False, description=_SQL_FROZEN_DESC)
     deletable: bool = Field(True, description=_DELETABLE_DESC)
     block_reason: str | None = Field(None, description=_BLOCK_REASON_DESC)
+    delete_requires_stamps: bool = Field(False, description=_REQUIRES_STAMPS_DESC)
 
     id: int
     model_id: int
@@ -737,3 +750,92 @@ class MigrationValidateOut(BaseModel):
         default_factory=list,
         description="COLLATE forzados que difieren del declarado por el blueprint.",
     )
+
+
+# --------------------------------------------------------------------------- #
+# Borrado de una versión con renumerado                                        #
+# --------------------------------------------------------------------------- #
+class MigrationRenumberItem(BaseModel):
+    """Una versión que cambia de etiqueta. El SQL no se toca: solo el número."""
+
+    from_version: str
+    to_version: str
+
+
+class MigrationStampItem(BaseModel):
+    """Una BD a la que hay que moverle el puntero.
+
+    ``from_version`` → ``to_version`` **no es un retroceso de esquema**: las dos etiquetas
+    nombran la MISMA migración, antes y después del renumerado. No se ejecuta ningún SQL del
+    blueprint; lo único que se escribe en el motor es la tabla de versión de Alembic.
+    """
+
+    managed_database_id: int
+    database_name: str
+    server_id: int
+    from_version: str
+    to_version: str
+
+
+class MigrationDeleteBlocker(BaseModel):
+    """Una BD que impide el borrado.
+
+    ``reason``: 'in_use' (está parada exactamente en esta versión — muévela con apply o
+    rollback y reintenta) o 'unreadable' (no se pudo leer su versión: fail-closed, porque
+    renumerar sin poder re-stampearla la dejaría apuntando a una revisión inexistente).
+    """
+
+    managed_database_id: int
+    reason: str
+    current_version: str | None = None
+
+
+class MigrationDeletePlanOut(BaseModel):
+    """Preview del borrado de una versión. No modifica nada."""
+
+    model_id: int
+    version: str
+    deletable: bool = Field(
+        description="True = el DELETE pasaría ahora mismo. Veredicto EN VIVO, no de la caché."
+    )
+    renumber: list[MigrationRenumberItem] = Field(
+        default_factory=list,
+        description="Versiones posteriores que bajan un escalón. Cada una baja UNO: los huecos previos se conservan.",
+    )
+    stamp_plan: list[MigrationStampItem] = Field(
+        default_factory=list,
+        description="BDs cuyo puntero se moverá. Cada entrada es una escritura REMOTA sobre ese motor.",
+    )
+    blockers: list[MigrationDeleteBlocker] = Field(default_factory=list)
+    unstampable: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "BDs que deberían quedar en una etiqueta inexistente porque el blueprint tiene "
+            "un hueco justo debajo de donde están paradas. Bloquean: el puntero se mueve "
+            "antes de renumerar, así que su destino tiene que existir ya."
+        ),
+    )
+    partial_applications: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "Aplicaciones a medias en alguna versión afectada. Bloquean: el renumerado cambia "
+            "el checksum de esas migraciones y el checkpoint dejaría de corresponder."
+        ),
+    )
+    requires_confirmation: bool = Field(
+        description="True = el DELETE exigirá 'confirm_token'. Solo ocurre si hay punteros que mover."
+    )
+    confirm_token: str | None = Field(
+        None, description="Token para el DELETE. Null si no hace falta o si el plan está bloqueado."
+    )
+    expires_at: datetime | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class MigrationDeleteOut(BaseModel):
+    """Resultado del borrado: qué se renumeró y qué punteros se movieron."""
+
+    model_id: int
+    version: str
+    renumbered: list[MigrationRenumberItem] = Field(default_factory=list)
+    stamped: list[MigrationStampItem] = Field(default_factory=list)

@@ -655,6 +655,33 @@ def purge_for_migration(model_migration_id: int, *, session=None) -> int:
             session.close()
 
 
+def rekey_checksum(session, model_migration_id: int, checksum: str) -> int:
+    """
+    Reapunta las capturas de una versión a un ``checksum`` nuevo, sin tocar su contenido.
+
+    Existe para UN caso y no debe usarse fuera de él: el **renumerado** que hace
+    ``ModelMigrationController._apply_renumber`` al eliminar una versión intermedia. Ahí
+    cambia el ``version`` de las migraciones posteriores y, como ``compute_checksum`` incluye
+    la versión, cambia también su checksum — pero el SQL es exactamente el mismo, así que las
+    capturas siguen describiendo lo que describían.
+
+    Sin esto, ``GET .../select-results`` las marcaría ``stale`` (compara el checksum guardado
+    contra el de la migración, ``managed_migration_controller`` § ``stale``) por un renombre
+    que no alteró ni una sentencia. Es lo OPUESTO a ``purge_for_migration``, que se usa cuando
+    el SQL sí cambió y la captura dejó de corresponder.
+
+    Exige una ``session`` externa a propósito: solo tiene sentido dentro de la misma
+    transacción que renumera, y con su propio commit podría quedar reapuntando capturas de un
+    renumerado que después revierte.
+    """
+    updated = (
+        session.query(MigrationSelectResult)
+        .filter(MigrationSelectResult.model_migration_id == model_migration_id)
+        .update({MigrationSelectResult.migration_checksum: checksum}, synchronize_session=False)
+    )
+    return int(updated or 0)
+
+
 def purge_expired(ttl_hours: int) -> int:
     """
     Borra las capturas más viejas que el TTL (retención de datos de negocio).

@@ -349,12 +349,12 @@ def test_delete_migration_applied_successfully_409(admin_client):
         r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0001")
     assert r.status_code == 409, r.text
     pc = r.json()["detail"]["public_context"]
-    assert pc["code"] == "model_migration.still_applied"
+    assert pc["code"] == "model_migration.version_in_use"
     assert pc["version"] == "0001"
     assert pc["blocking_databases"] == [
         {
             "managed_database_id": db_id,
-            "reason": "still_applied",
+            "reason": "in_use",
             "current_version": "0001",
         }
     ]
@@ -435,7 +435,18 @@ def test_delete_last_version_recomputes_current_version(admin_client):
     assert m["current_version"] == "0.0.0"
 
 
-def test_delete_intermediate_version_409(admin_client):
+def test_delete_intermediate_version_renumera(admin_client):
+    """Borrar una intermedia dejó de ser 409: ahora se renumera lo que sigue.
+
+    Reemplaza a ``test_delete_intermediate_version_409``. La regla "solo la punta" existía
+    porque un hueco en la cadena parecía irreconstruible; no lo es —``_write_revision_files``
+    encadena en un tempdir los specs que HAY, ordenados numéricamente—, y lo que sí importa
+    es que ninguna BD quede apuntando a una etiqueta que dejó de existir. Sin BDs no hay
+    puntero que mover, así que esto es una operación puramente local.
+
+    El detalle fino del renumerado con BDs vive en
+    ``tests/test_api_migration_delete_renumber.py``.
+    """
     model_id = _new_model(admin_client, slug="delmid", name="DelMid")
     _create_migration(admin_client, model_id, version="0001")
     _create_migration(
@@ -443,17 +454,22 @@ def test_delete_intermediate_version_409(admin_client):
         up_sql="ALTER TABLE users ADD COLUMN phone VARCHAR(20)",
     )
 
-    # 0001 es intermedia (existe 0002 posterior) → 409.
     r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0001")
-    assert r.status_code == 409, r.text
-    assert "última versión" in r.text.lower() or "solo se puede eliminar" in r.text.lower()
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["renumbered"] == [
+        {"from_version": "0002", "to_version": "0001"}
+    ]
 
-    # No se tocó nada.
-    assert admin_client.get(
+    # La 0002 bajó a 0001 llevándose su SQL; la punta del blueprint la sigue.
+    d = admin_client.get(
         f"/api/v1/database-models/{model_id}/migrations/0001"
-    ).status_code == 200
+    ).json()["data"]
+    assert "phone" in d["up_sql"]
+    assert admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations/0002"
+    ).status_code == 404
     m = admin_client.get(f"/api/v1/database-models/{model_id}").json()["data"]
-    assert m["current_version"] == "0002"
+    assert m["current_version"] == "0001"
 
 
 # --------------------------------------------------------------------------- #
@@ -602,7 +618,9 @@ def test_policy_flags_aplicada_congela_el_sql(admin_client):
     d = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0001").json()["data"]
     assert d["sql_frozen"] is True
     assert d["deletable"] is False
-    assert d["block_reason"] == "applied"
+    # 'in_use' y no 'applied': ``block_reason`` describe el BORRADO, cuyo criterio es la
+    # IGUALDAD. Para la edición está ``sql_frozen``, que sigue con criterio ``>=``.
+    assert d["block_reason"] == "in_use"
 
 
 def test_policy_flags_solo_fallida_sigue_editable_y_borrable(admin_client):
@@ -616,8 +634,13 @@ def test_policy_flags_solo_fallida_sigue_editable_y_borrable(admin_client):
     assert (d["sql_frozen"], d["deletable"], d["block_reason"]) == (False, True, None)
 
 
-def test_policy_flags_no_punta_bloquea_borrado_pero_no_edicion(admin_client):
-    """`not_tip` es la única razón que NO congela el SQL."""
+def test_policy_flags_no_ser_punta_ya_no_bloquea_el_borrado(admin_client):
+    """`not_tip` salió del vocabulario: sin BDs, una intermedia es tan borrable como la punta.
+
+    Reemplaza a ``test_policy_flags_no_punta_bloquea_borrado_pero_no_edicion``. Es el
+    contrato que la UI lee para habilitar el botón, así que el valor viejo no puede quedar
+    ni como sinónimo: un cliente que lo siga esperando debe romper de forma visible.
+    """
     model_id = _new_model(admin_client, slug="pol4", name="Pol4")
     _create_migration(admin_client, model_id, version="0001")
     _create_migration(
@@ -628,9 +651,12 @@ def test_policy_flags_no_punta_bloquea_borrado_pero_no_edicion(admin_client):
     items = admin_client.get(f"/api/v1/database-models/{model_id}/migrations").json()["data"]
     first, tip = items[0], items[1]
     assert (first["sql_frozen"], first["deletable"], first["block_reason"]) == (
-        False, False, "not_tip",
+        False, True, None,
     )
     assert (tip["sql_frozen"], tip["deletable"], tip["block_reason"]) == (False, True, None)
+    assert all(it["block_reason"] != "not_tip" for it in items)
+    # Sin BDs adelante no hay punteros que mover: el borrado no pedirá confirmación.
+    assert all(it["delete_requires_stamps"] is False for it in items)
 
 
 def test_policy_flags_aplicacion_parcial_congela_y_bloquea(admin_client):
@@ -733,17 +759,17 @@ def test_version_vigente_sigue_congelada(admin_client):
     )
 
     d = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0003").json()["data"]
-    assert (d["sql_frozen"], d["deletable"], d["block_reason"]) == (True, False, "applied")
+    assert (d["sql_frozen"], d["deletable"], d["block_reason"]) == (True, False, "in_use")
 
     with _engine_version("0003"):
         r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0003")
     assert r.status_code == 409, r.text
     pc = r.json()["detail"]["public_context"]
-    assert pc["code"] == "model_migration.still_applied"
+    assert pc["code"] == "model_migration.version_in_use"
     assert pc["blocking_databases"] == [
         {
             "managed_database_id": db_id,
-            "reason": "still_applied",
+            "reason": "in_use",
             "current_version": "0003",
         }
     ]
@@ -761,7 +787,12 @@ def test_version_posterior_tambien_congela(admin_client):
 
     d = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0001").json()["data"]
     assert d["sql_frozen"] is True
-    assert d["block_reason"] == "applied"
+    # Pero el BORRADO sí distingue: la BD está en 0003, no parada en 0001, así que el
+    # borrado le movería el puntero en vez de bloquearse. Los dos criterios divergen a
+    # propósito y por eso 'block_reason' ya no repite lo que dice 'sql_frozen'.
+    assert d["block_reason"] is None
+    assert d["deletable"] is True
+    assert d["delete_requires_stamps"] is True
 
     with _engine_version("0003"):
         r = _patch(admin_client, model_id, "0001", {"up_sql": "CREATE TABLE otra (id INT)"})
@@ -785,7 +816,7 @@ def test_motor_ilegible_es_fail_closed(admin_client):
         r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0003")
     assert r.status_code == 409, r.text
     pc = r.json()["detail"]["public_context"]
-    assert pc["code"] == "model_migration.still_applied"
+    assert pc["code"] == "model_migration.unreadable_databases"
     assert pc["blocking_databases"] == [
         {"managed_database_id": db_id, "reason": "unreadable"}
     ]
@@ -832,21 +863,32 @@ def test_version_cacheada_ilegible_sigue_congelada(admin_client):
         r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0003")
     assert r.status_code == 409, r.text
     pc = r.json()["detail"]["public_context"]
+    # Para el BORRADO un puntero no ordenable no se puede ubicar en la secuencia: no se
+    # puede decidir si está parada acá ni calcularle un destino de renumerado, así que cae
+    # en 'unreadable' (mismo fail-closed, motivo más preciso).
+    assert pc["code"] == "model_migration.unreadable_databases"
     assert pc["blocking_databases"] == [
-        {
-            "managed_database_id": db_id,
-            "reason": "still_applied",
-            "current_version": "v3-hotfix",
-        }
+        {"managed_database_id": db_id, "reason": "unreadable"}
     ]
 
 
 def test_solo_historial_fallido_no_lee_el_motor(admin_client):
-    """Anti-regresión: el historial sigue siendo el PRIMER filtro, y es barato.
+    """Anti-regresión: el historial sigue siendo el PRIMER filtro de la EDICIÓN, y es barato.
 
-    Una versión que solo falló no tiene ninguna fila `applied`, así que ni se llega a abrir
-    conexión: si se llegara, este test fallaría con 409 `unreadable` en vez de 200. Es lo
-    que evita que un PATCH de una versión nunca aplicada dependa de que el motor esté vivo.
+    Una versión que solo falló no tiene ninguna fila `applied`, así que el PATCH ni llega a
+    abrir conexión: si se llegara, fallaría con 409 `unreadable` en vez de 200. Es lo que
+    evita que editar una versión nunca aplicada dependa de que el motor esté vivo.
+
+    El BORRADO ya no comparte ese filtro, y no es un descuido. Su criterio pasó a ser la
+    POSICIÓN de cada BD, no el resultado de un intento: acá la caché dice que la BD está
+    parada en 0001, que es justo la versión que se quiere borrar, así que hay que leer el
+    motor para decidir — y con el motor mudo la respuesta segura es negarse. Con el filtro
+    viejo esta versión se borraba porque su historial decía "falló", sin mirar nunca dónde
+    está parada la BD.
+
+    Lo que el borrado SÍ conserva del filtro barato es el caso limpio: una BD que nunca fue
+    posicionada (sin caché y sin historial exitoso) no obliga a abrir conexión. Eso lo fija
+    ``test_una_bd_nunca_posicionada_no_obliga_a_leer_el_motor``.
     """
     model_id = _new_model(admin_client, slug="solofail", name="SoloFail")
     mig_id = _create_migration(admin_client, model_id).json()["data"]["id"]
@@ -857,7 +899,11 @@ def test_solo_historial_fallido_no_lee_el_motor(admin_client):
         r = _patch(admin_client, model_id, "0001", {"up_sql": "CREATE TABLE ok (id INT)"})
         assert r.status_code == 200, r.text
         r = admin_client.delete(f"/api/v1/database-models/{model_id}/migrations/0001")
-    assert r.status_code == 200, r.text
+    assert r.status_code == 409, r.text
+    assert (
+        r.json()["detail"]["public_context"]["code"]
+        == "model_migration.unreadable_databases"
+    )
 
 
 # --------------------------------------------------------------------------- #

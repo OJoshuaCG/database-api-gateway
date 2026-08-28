@@ -11,6 +11,8 @@ La aplicación sobre BDs gestionadas vive en ``ManagedDatabaseController`` (toca
 motor) usando ``MigrationRunner``.
 """
 
+import hashlib
+
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
@@ -30,6 +32,7 @@ from app.core.environments import (
     SNAPSHOT_MAX_SQL_PER_VERSION,
 )
 from app.core.logger import get_logger
+from app.core.remote_engine import UNKNOWN_DATABASE_CODES
 from app.exceptions import AppHttpException
 from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
@@ -37,7 +40,7 @@ from app.models.enums import EngineType, MigrationStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
-from app.services import audit
+from app.services import audit, confirm_token
 from app.services import migration_freeze_catalog as freeze_codes
 from app.services.db_admin import migration_facts, migration_progress, migration_results
 from app.services.db_admin.factory import get_adapter
@@ -56,6 +59,11 @@ _VERSION_ORDER_DESC = (
     func.length(ModelMigration.version).desc(),
     ModelMigration.version.desc(),
 )
+
+#: Operación del ``confirm_token`` del borrado con renumerado. El token se emite sobre
+#: ``(operación, model_id, "{slug}:{version}")`` con la huella del parque como ``subject``:
+#: no hay ``server_id``/``db_name`` porque la operación es del blueprint, no de una BD.
+_DELETE_OPERATION = "model_migration.delete_renumber"
 
 
 class ModelMigrationController:
@@ -391,9 +399,7 @@ class ModelMigrationController:
         return blocking
 
     @staticmethod
-    def _policy_flags(
-        session, migrations: list[ModelMigration], *, latest_version: str | None
-    ) -> dict[int, dict]:
+    def _policy_flags(session, migrations: list[ModelMigration]) -> dict[int, dict]:
         """
         Banderas de política por migración: ``sql_frozen``, ``deletable`` y ``block_reason``.
 
@@ -421,43 +427,93 @@ class ModelMigrationController:
         # BD dependa de la versión HOY. Ver el bloque de ``_still_applied_cached``.
         applied_ids = ModelMigrationController._still_applied_cached(session, migrations)
         partial_ids = migration_progress.migrations_with_incomplete_progress(ids, "up")
+        parque = ModelMigrationController._cached_versions_by_model(
+            session, {m.model_id for m in migrations}
+        )
 
         flags: dict[int, dict] = {}
         for m in migrations:
-            applied = m.id in applied_ids
             partial = m.id in partial_ids
-            is_tip = latest_version is None or m.version == latest_version
-            if applied:
-                reason = "applied"
+            others = parque.get(m.model_id, [])
+            in_use = any(ModelMigrationController._same_version(v, m.version) for v in others)
+            ahead = any(ModelMigrationController._is_ahead(v, m.version) for v in others)
+            if in_use:
+                reason = "in_use"
             elif partial:
                 reason = "partial"
-            elif not is_tip:
-                reason = "not_tip"
             else:
                 reason = None
             flags[m.id] = {
-                "sql_frozen": applied or partial,
+                # Criterio ``>=``: editar el SQL de una versión que alguna BD ya pasó dejaría
+                # la metadata describiendo algo que no fue lo que corrió allí.
+                "sql_frozen": m.id in applied_ids or partial,
+                # Criterio de IGUALDAD, y por eso no coincide con ``sql_frozen``: a las BDs
+                # que están adelante el borrado les mueve el puntero a la etiqueta nueva de su
+                # misma migración, así que no bloquean. Solo bloquea la que está PARADA acá,
+                # que no tendría a dónde apuntar.
                 "deletable": reason is None,
-                # 'not_tip' solo afecta al borrado: esa versión sí se puede editar.
                 "block_reason": reason,
+                # Aviso para la UI: borrar esta versión implicaría escribir en el motor de
+                # esas BDs (mover su puntero), no solo en el gateway. Sale de la CACHÉ, así
+                # que es una pista para elegir el diálogo de confirmación, no un veredicto:
+                # el plan autoritativo es ``GET .../{version}/delete-plan``.
+                "delete_requires_stamps": ahead,
             }
         return flags
 
-    def _policy_for(self, session, m: ModelMigration) -> dict:
-        """Banderas de política de UNA migración (atajo sobre ``_policy_flags``)."""
-        latest = self._latest_version(session, m.model_id)
-        return self._policy_flags(session, [m], latest_version=latest)[m.id]
+    @staticmethod
+    def _cached_versions_by_model(session, model_ids: set[int]) -> dict[int, list[str | None]]:
+        """``{model_id: [model_version, ...]}`` de las BDs del inventario, en UNA query.
+
+        Es la caché, no el motor: esto corre por cada página del listado de versiones y abrir
+        una conexión por BD para pintar un botón no se sostiene (mismo criterio que
+        ``_still_applied_cached``). La divergencia queda en la dirección segura: el listado
+        puede ofrecer un borrado que el guard después rechaza con 409.
+        """
+        if not model_ids:
+            return {}
+        out: dict[int, list[str | None]] = {}
+        rows = (
+            session.query(ManagedDatabase.model_id, ManagedDatabase.model_version)
+            .filter(ManagedDatabase.model_id.in_(model_ids))
+            .all()
+        )
+        for model_id, version in rows:
+            out.setdefault(model_id, []).append(version)
+        return out
 
     @staticmethod
-    def _latest_version(session, model_id: int) -> str | None:
-        """Versión punta del blueprint (orden numérico), para la bandera ``deletable``."""
-        row = (
-            session.query(ModelMigration.version)
-            .filter(ModelMigration.model_id == model_id)
-            .order_by(*_VERSION_ORDER_DESC)
-            .first()
-        )
-        return row[0] if row else None
+    def _same_version(current: str | None, version: str) -> bool:
+        """¿La BD está PARADA exactamente en ``version``? Fail-closed ante un valor ilegible.
+
+        Un puntero no numérico (stamp manual, dato legado) no se puede ubicar en la secuencia,
+        así que se cuenta como "sí" — mismo criterio que ``_reaches_version``: ante la duda la
+        versión no se borra.
+        """
+        if current is None:
+            return False
+        try:
+            return version_sort_key(current) == version_sort_key(version)
+        except (TypeError, ValueError):
+            return True
+
+    @staticmethod
+    def _is_ahead(current: str | None, version: str) -> bool:
+        """¿La BD está en una versión POSTERIOR a ``version``? Fail-closed hacia "sí".
+
+        Solo alimenta el aviso ``delete_requires_stamps``, así que el fail-closed acá no
+        bloquea nada: hace que la UI pida la confirmación más pesada ante un valor ilegible.
+        """
+        if current is None:
+            return False
+        try:
+            return version_sort_key(current) > version_sort_key(version)
+        except (TypeError, ValueError):
+            return True
+
+    def _policy_for(self, session, m: ModelMigration) -> dict:
+        """Banderas de política de UNA migración (atajo sobre ``_policy_flags``)."""
+        return self._policy_flags(session, [m])[m.id]
 
     @staticmethod
     def _failed_attempt_targets(session, migration_id: int) -> list[int]:
@@ -516,9 +572,7 @@ class ModelMigrationController:
             rows = q.order_by(*_VERSION_ORDER_ASC).limit(limit).offset(offset).all()
             # La punta se busca sobre TODAS las versiones, no sobre la página: con paginación,
             # la última fila de la página no tiene por qué ser la última del blueprint.
-            flags = self._policy_flags(
-                session, rows, latest_version=self._latest_version(session, model_id)
-            )
+            flags = self._policy_flags(session, rows)
             return [self._serialize_summary(r, flags[r.id]) for r in rows], total
         finally:
             session.close()
@@ -1260,95 +1314,572 @@ class ModelMigrationController:
             )
         return result
 
-    def delete_migration(self, model_id: int, version: str, *, admin: dict | None = None) -> None:
+    # ------------------------------------------------------------------ #
+    # Eliminación de una versión: preflight, plan y renumerado             #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _is_unknown_database(exc: AppHttpException) -> bool:
+        """¿El 404 del runner significa "la base no existe" (1049 / 3D000)?
+
+        Mismo criterio que ``ManagedMigrationController._is_unknown_database``, apoyado en
+        la MISMA constante (``UNKNOWN_DATABASE_CODES`` de ``app.core.remote_engine``) para
+        que el acoplamiento no se duplique. Mirar solo el status no alcanza: el errno 1008
+        ("can't drop database") también mapea a 404.
+        """
+        ctx = getattr(exc, "context", None)
+        return (
+            getattr(exc, "status_code", None) == 404
+            and isinstance(ctx, dict)
+            and str(ctx.get("remote_error_code") or "") in UNKNOWN_DATABASE_CODES
+        )
+
+    def _blueprint_database_states(self, session, model: DatabaseModel) -> list[dict]:
+        """Estado EN VIVO de TODAS las BDs del blueprint, leyendo la versión del motor.
+
+        Se enumera el inventario completo del blueprint y **no** las BDs que aparecen en
+        ``database_migration_history``, que es lo que hace ``_still_applied_live``. La
+        diferencia importa: una BD ``adopt``ada con ``model_version`` no aplicó nunca nada,
+        así que no tiene NI UNA fila de historial, y sin embargo puede estar adelante de la
+        versión que se borra — o sea, ser exactamente una de las que hay que re-stampear.
+        Decidir el renumerado con la vista del historial la dejaría afuera del plan y, tras
+        el renumerado, huérfana.
+
+        Tres estados posibles por BD, y los tres son distintos:
+          - ``readable=True, database_exists=True``  → ``current_version`` es el veredicto.
+          - ``readable=True, database_exists=False`` → la base no existe en el motor. No
+            está en ninguna versión y no hay nada que stampear: no bloquea.
+          - ``readable=False``                       → no se pudo leer. **Bloquea**
+            (fail-closed): no se puede probar que no esté parada en la versión a borrar, ni
+            se la puede re-stampear si está adelante.
+        """
+        rows = (
+            session.query(ManagedDatabase)
+            .filter(ManagedDatabase.model_id == model.id)
+            .order_by(ManagedDatabase.id)
+            .all()
+        )
+        if not rows:
+            return []
+        # Pre-filtro barato, y NO es una optimización cosmética: sin él, borrar una versión
+        # que nadie aplicó jamás pasaría a depender de que TODOS los motores del blueprint
+        # estén vivos, porque un motor mudo es fail-closed. El repo ya protege esa propiedad
+        # con un test anti-regresión ("el historial es el PRIMER filtro, y es barato").
+        #
+        # El filtro es SOUND: para estar en alguna versión, una BD tuvo que ser posicionada
+        # por el gateway, y los cuatro caminos que lo hacen —apply, rollback, stamp y el
+        # stamp-on-adopt— escriben la caché ``model_version``. Una BD sin caché y sin
+        # historial exitoso nunca fue posicionada: está en base, no puede estar parada en la
+        # versión que se borra ni adelante de ella.
+        #
+        # No alcanza con el historial solo, que es lo que mira ``_still_applied_live``: una
+        # BD ADOPTADA con ``model_version`` no aplicó nunca nada, así que no tiene ni una
+        # fila de historial y sin embargo puede estar adelante. Ese es justo el caso que
+        # dejaría huérfana al renumerar, y por eso la condición es la UNIÓN de los dos.
+        #
+        # Residual asumido: si alguien mueve la versión FUERA del gateway, la caché queda en
+        # ``None`` y esa BD se saltea. Es la misma confianza que el resto del módulo deposita
+        # en ``model_version``, y con la caché en None la BD ya se reporta mal en todos lados.
+        con_historial = {
+            db_id
+            for ids in self._applied_history_targets(
+                session,
+                [
+                    row[0]
+                    for row in session.query(ModelMigration.id)
+                    .filter(ModelMigration.model_id == model.id)
+                    .all()
+                ],
+            ).values()
+            for db_id in ids
+        }
+        runner = MigrationRunner()
+        states: list[dict] = []
+        for md in rows:
+            state = {
+                "managed_database_id": md.id,
+                "database_name": md.name,
+                "server_id": md.server_id,
+                "current_version": None,
+                "database_exists": True,
+                "readable": True,
+            }
+            if md.model_version is None and md.id not in con_historial:
+                # Queda con ``current_version=None``, que el planificador ya lee como "en
+                # base": ni bloquea ni entra en el plan de stamps. NO se toca
+                # ``database_exists``, que significa otra cosa (la base no está en el motor)
+                # y acá simplemente no se comprobó.
+                states.append(state)
+                continue
+            try:
+                server = get_server_or_404(session, md.server_id)
+                target = build_target(server)
+                try:
+                    state["current_version"] = runner.get_current_version(
+                        target, md.name, model.slug
+                    )
+                except AppHttpException as exc:
+                    # La base puede simplemente no existir todavía (fila ``pending``, o
+                    # creada con ``?register=false`` y luego borrada). Eso NO es un fallo de
+                    # lectura: es una BD que está en base. Se re-confirma con el catálogo
+                    # porque un 1049 con la base PRESENTE tiene otra causa (privilegios,
+                    # carrera con un drop) y ahí sí es ilegible.
+                    if not self._is_unknown_database(exc):
+                        raise
+                    if md.name in get_adapter(target).list_databases():
+                        raise
+                    state["database_exists"] = False
+            except Exception:
+                # No se distingue el motivo a propósito: el mensaje del motor puede llevar
+                # host, usuario o fragmentos de sentencia (criterio R4 del módulo). El
+                # detalle va al log con el Request ID.
+                logger.exception(
+                    "%s | no se pudo leer la versión de la BD %s del blueprint %s",
+                    current_http_identifier.get(),
+                    md.id,
+                    model.id,
+                )
+                state["readable"] = False
+            states.append(state)
+        return states
+
+    @staticmethod
+    def _shift_down_one(version: str) -> str:
+        """``'0016' -> '0015'``. El padding mínimo es de 4 dígitos, como ``_next_version``.
+
+        El renumerado baja UN escalón, no re-secuencia el blueprint entero. La diferencia
+        solo se nota cuando ya había huecos —``create_migration`` acepta una ``version``
+        explícita, así que existen—: re-secuenciar cerraría TODOS, y eso cambiaría también
+        el número de versiones ANTERIORES a la que se borra, que es justo lo que no puede
+        pasar (las BDs que están atrás no se tocan y su puntero quedaría mintiendo).
+        """
+        return f"{version_sort_key(version) - 1:04d}"
+
+    @classmethod
+    def _renumber_map(cls, versions: list[str], deleted: str) -> dict[str, str]:
+        """``{version_vieja: version_nueva}`` para todas las posteriores a ``deleted``.
+
+        Sin colisiones aunque los UPDATE se apliquen de a uno, siempre que se recorran en
+        orden ASCENDENTE: la primera posterior ocupa el hueco que dejó ``deleted``, y cada
+        siguiente el que acaba de liberar la anterior. Ver ``_apply_renumber``.
+        """
+        cut = version_sort_key(deleted)
+        return {
+            v: cls._shift_down_one(v)
+            for v in sorted(versions, key=version_sort_key)
+            if version_sort_key(v) > cut
+        }
+
+    @staticmethod
+    def _plan_fingerprint(model_id: int, version: str, states: list[dict]) -> str:
+        """Huella del estado del parque que el preview congeló.
+
+        Viaja como ``subject`` del ``confirm_token``, así que si entre el preview y la
+        ejecución alguna BD se movió de versión (un ``apply`` concurrente) el token deja de
+        verificar y la operación se rechaza en vez de ejecutar un plan que ya no describe la
+        realidad. Es la mitad barata de la defensa TOCTOU; la otra es la relectura en vivo
+        justo antes del commit.
+        """
+        parts = [str(model_id), version]
+        for st in sorted(states, key=lambda s: s["managed_database_id"]):
+            parts.append(
+                f"{st['managed_database_id']}:{st['current_version'] or ''}:"
+                f"{int(st['database_exists'])}:{int(st['readable'])}"
+            )
+        return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+    def _build_delete_plan(self, session, model: DatabaseModel, m: ModelMigration) -> dict:
+        """Preflight completo del borrado. NO escribe nada, ni en el gateway ni en el motor.
+
+        Devuelve el plan siempre: los bloqueos viajan en ``blockers`` en vez de lanzarse,
+        porque este mismo cálculo alimenta el preview (que tiene que poder EXPLICAR por qué
+        no se puede) y la ejecución (que sí lanza). El que lanza es ``_enforce_delete_plan``.
+        """
+        versions = [
+            row[0]
+            for row in session.query(ModelMigration.version)
+            .filter(ModelMigration.model_id == model.id)
+            .all()
+        ]
+        renumber = self._renumber_map(versions, m.version)
+        states = self._blueprint_database_states(session, model)
+
+        cut = version_sort_key(m.version)
+        blockers: list[dict] = []
+        stamp_plan: list[dict] = []
+        keeps_ddl: list[int] = []
+        unstampable: list[dict] = []
+
+        for st in states:
+            db_id = st["managed_database_id"]
+            if not st["readable"]:
+                blockers.append(
+                    {"managed_database_id": db_id, "reason": freeze_codes.REASON_UNREADABLE}
+                )
+                continue
+            current = st["current_version"]
+            if current is None:
+                continue  # en base: ni está parada acá, ni hay puntero que mover
+            try:
+                pos = version_sort_key(current)
+            except (TypeError, ValueError):
+                # Un puntero no numérico (stamp manual, dato legado) no se puede ubicar en
+                # la secuencia. Fail-closed: no se puede decidir si está parada en la
+                # versión a borrar ni calcularle un destino.
+                blockers.append(
+                    {"managed_database_id": db_id, "reason": freeze_codes.REASON_UNREADABLE}
+                )
+                continue
+            if pos == cut:
+                blockers.append(
+                    {
+                        "managed_database_id": db_id,
+                        "reason": freeze_codes.REASON_IN_USE,
+                        "current_version": current,
+                    }
+                )
+                continue
+            if pos < cut:
+                continue  # atrás: su número no cambia y sigue nombrando la misma migración
+            if current not in renumber:
+                # Está adelante pero su puntero no corresponde a ninguna versión del
+                # blueprint. Renumerar la dejaría huérfana y no hay destino que calcular.
+                blockers.append(
+                    {"managed_database_id": db_id, "reason": freeze_codes.REASON_UNREADABLE}
+                )
+                continue
+            destino = renumber[current]
+            if destino not in versions:
+                # El stamp corre ANTES del renumerado, así que su destino tiene que existir
+                # YA en la cadena vigente: ``command.stamp`` resuelve ambos extremos contra
+                # los archivos de revisión, que se generan de las versiones de HOY. Bajar un
+                # escalón cae en un hueco solo si el blueprint tiene uno justo debajo de
+                # donde está parada esta BD — posible porque ``create_migration`` acepta una
+                # ``version`` explícita. Se rechaza en el preview, antes de tocar nada.
+                unstampable.append(
+                    {
+                        "managed_database_id": db_id,
+                        "current_version": current,
+                        "missing_target": destino,
+                    }
+                )
+                continue
+            stamp_plan.append(
+                {
+                    "managed_database_id": db_id,
+                    "database_name": st["database_name"],
+                    "server_id": st["server_id"],
+                    "from_version": current,
+                    "to_version": destino,
+                }
+            )
+            keeps_ddl.append(db_id)
+
+        # El renumerado cambia ``version``, que entra en el ``checksum`` (``compute_checksum``).
+        # Un checkpoint de aplicación parcial queda atado al checksum viejo, así que
+        # ``_resolve_resume_offset`` abortaría con 409 fail-closed en el próximo intento. Se
+        # revisan TODAS las afectadas —la que se borra y cada renumerada—, no solo la primera.
+        affected_ids = [
+            row[0]
+            for row in session.query(ModelMigration.id)
+            .filter(
+                ModelMigration.model_id == model.id,
+                ModelMigration.version.in_([m.version, *renumber.keys()]),
+            )
+            .all()
+        ]
+        partial: list[dict] = []
+        for direction in ("up", "down"):
+            for mid in affected_ids:
+                for row in migration_progress.incomplete_progress_for_migration(
+                    mid, direction=direction
+                ):
+                    partial.append({**row, "direction": direction})
+
+        return {
+            "model_id": model.id,
+            "version": m.version,
+            "renumber": renumber,
+            "stamp_plan": stamp_plan,
+            "blockers": blockers,
+            "unstampable": unstampable,
+            "partial_applications": partial,
+            "databases_keeping_ddl": keeps_ddl,
+            "requires_confirmation": bool(stamp_plan),
+            "fingerprint": self._plan_fingerprint(model.id, m.version, states),
+        }
+
+    def _enforce_delete_plan(self, plan: dict) -> None:
+        """Convierte los bloqueos del plan en el 409 que corresponde. Sin efectos."""
+        version = plan["version"]
+        in_use = [b for b in plan["blockers"] if b["reason"] == freeze_codes.REASON_IN_USE]
+        if in_use:
+            raise AppHttpException(
+                message=(
+                    f"No se puede eliminar la versión {version}: "
+                    f"{self._describe_blocking(in_use)} Una BD parada exactamente en la "
+                    "versión que se elimina no tiene ninguna etiqueta nueva a la que "
+                    "apuntar. Muévela a otra versión (apply o rollback) y reintenta."
+                ),
+                status_code=409,
+                public_context={
+                    "code": freeze_codes.CODE_VERSION_IN_USE,
+                    "version": version,
+                    "blocking_databases": in_use,
+                },
+                context={"model_id": plan["model_id"], "version": version},
+            )
+        unreadable = [
+            b for b in plan["blockers"] if b["reason"] == freeze_codes.REASON_UNREADABLE
+        ]
+        if unreadable:
+            raise AppHttpException(
+                message=(
+                    f"No se puede eliminar la versión {version}: "
+                    f"{self._describe_blocking(unreadable)} Sin esa lectura no se puede "
+                    "descartar que la BD esté parada en esta versión, ni moverle el puntero "
+                    "si está adelante: renumerar la dejaría apuntando a una revisión "
+                    "inexistente."
+                ),
+                status_code=409,
+                public_context={
+                    "code": freeze_codes.CODE_UNREADABLE_DATABASES,
+                    "version": version,
+                    "blocking_databases": unreadable,
+                },
+                context={"model_id": plan["model_id"], "version": version},
+            )
+        if plan["unstampable"]:
+            detail = ", ".join(
+                f"BD {row['managed_database_id']} está en {row['current_version']} y "
+                f"debería quedar en {row['missing_target']}"
+                for row in plan["unstampable"]
+            )
+            raise AppHttpException(
+                message=(
+                    f"No se puede eliminar la versión {version}: el blueprint tiene un hueco "
+                    f"en la numeración y {detail}, una etiqueta que no existe. El puntero se "
+                    "mueve ANTES de renumerar, así que su destino tiene que existir ya. "
+                    "Rellena el hueco con una versión, o mueve esa BD antes."
+                ),
+                status_code=409,
+                public_context={
+                    "code": freeze_codes.CODE_RENUMBER_TARGET_MISSING,
+                    "version": version,
+                    "unstampable_databases": plan["unstampable"],
+                },
+                context={"model_id": plan["model_id"], "version": version},
+            )
+        if plan["partial_applications"]:
+            detail = ", ".join(
+                f"BD {row['managed_database_id']} "
+                f"({row['last_statement_index']}/{row['total_statements']} sentencias, "
+                f"dirección {row['direction']})"
+                for row in plan["partial_applications"]
+            )
+            raise AppHttpException(
+                message=(
+                    "No se puede eliminar: hay una aplicación PARCIAL sin resolver en "
+                    f"alguna de las versiones afectadas ({detail}). El renumerado cambia el "
+                    "checksum de esas migraciones y dejaría el checkpoint sin correspondencia. "
+                    "Reconcilie esa BD ('reconcile-partial') o complete el 'apply' antes."
+                ),
+                status_code=409,
+                public_context={
+                    "code": freeze_codes.CODE_AFFECTED_PARTIAL,
+                    "version": version,
+                    "partial_applications": plan["partial_applications"],
+                },
+                context={"model_id": plan["model_id"], "version": version},
+            )
+
+    def plan_delete(self, model_id: int, version: str) -> dict:
+        """Preview del borrado: qué se renumera, qué punteros se mueven y qué lo bloquea.
+
+        Solo lectura. Abre conexión a cada BD del blueprint para leer su versión en vivo,
+        pero no escribe en ninguna. Emite ``confirm_token`` únicamente si el plan implica
+        mover punteros (escritura remota); si no hay nada que stampear, el borrado sigue
+        siendo la operación local de siempre y no exige confirmación — así el cliente viejo,
+        que borra la punta sin token, no se rompe.
+        """
         session = self._session()
         try:
-            self._model_or_404(session, model_id)
+            model = self._model_or_404(session, model_id)
             m = self._migration_or_404(session, model_id, version)
-            # Mismo criterio que `update_migration`: lo que congela una versión es que
-            # ALGUNA BD ya dependa de ella, no que se haya intentado aplicar. Antes se usaba
-            # `_has_history`, que cuenta también los intentos fallidos: una versión que
-            # reventó en la primera sentencia (sin tocar ninguna BD) quedaba imborrable para
-            # siempre, porque no existe purga de historial. La única salida era editarla y
-            # dejarla inerte con un `SELECT ''`.
-            if self._has_successful_application(session, m.id):
-                # Mismo criterio que ``update_migration``: el historial es un log de eventos
-                # que nunca se revoca, así que solo sirve de primer filtro. El veredicto lo da
-                # la versión ACTUAL leída del motor.
-                blocking = self._still_applied_live(session, m)
-                if blocking:
+            slug = model.slug  # se lee ANTES del close: después la instancia está desprendida
+            plan = self._build_delete_plan(session, model, m)
+        finally:
+            session.close()
+
+        token = None
+        expires_at = None
+        if plan["requires_confirmation"] and not (
+            plan["blockers"] or plan["unstampable"] or plan["partial_applications"]
+        ):
+            token, expires_at = confirm_token.issue(
+                _DELETE_OPERATION,
+                model_id,
+                f"{slug}:{version}",
+                subject=plan["fingerprint"],
+            )
+        return {
+            "model_id": model_id,
+            "version": version,
+            "deletable": not (
+                plan["blockers"] or plan["unstampable"] or plan["partial_applications"]
+            ),
+            "renumber": [
+                {"from_version": old, "to_version": new}
+                for old, new in sorted(plan["renumber"].items(), key=lambda kv: version_sort_key(kv[0]))
+            ],
+            "stamp_plan": plan["stamp_plan"],
+            "blockers": plan["blockers"],
+            "unstampable": plan["unstampable"],
+            "partial_applications": plan["partial_applications"],
+            "requires_confirmation": plan["requires_confirmation"],
+            "confirm_token": token,
+            "expires_at": expires_at,
+            "warnings": self._delete_warnings(plan),
+        }
+
+    @staticmethod
+    def _delete_warnings(plan: dict) -> list[str]:
+        """Advertencias del preview. La primera no es opinable: es la consecuencia real."""
+        out: list[str] = []
+        if plan["databases_keeping_ddl"]:
+            ids = ", ".join(str(i) for i in plan["databases_keeping_ddl"])
+            out.append(
+                f"Las BDs {ids} conservan FÍSICAMENTE los objetos que creó la versión "
+                f"{plan['version']}: eliminarla no ejecuta ningún rollback. Tras el "
+                "renumerado, la cadena del blueprint ya no describe esos objetos."
+            )
+        if plan["stamp_plan"]:
+            out.append(
+                f"Se moverá el puntero de {len(plan['stamp_plan'])} BD(s): es una escritura "
+                "sobre cada motor destino (UPDATE de la tabla de versión de Alembic), no una "
+                "operación local del gateway."
+            )
+        return out
+
+    def delete_migration(
+        self,
+        model_id: int,
+        version: str,
+        *,
+        confirm_token_value: str | None = None,
+        admin: dict | None = None,
+    ) -> dict:
+        """
+        Elimina una versión del blueprint, renumerando las posteriores y moviendo el puntero
+        de las BDs que estén adelante.
+
+        **No ejecuta NADA del SQL del usuario**: ni el ``up_sql`` de la versión que se borra,
+        ni ningún ``down_sql``. No es un rollback. Lo único que se escribe en cada BD destino
+        es la tabla de versión de Alembic (``_gw_v_{slug}``), vía ``stamp``.
+
+        La regla: se puede eliminar **si y solo si ninguna BD está parada exactamente en esa
+        versión**. Que haya BDs adelante o atrás no bloquea.
+          - Atrás  → su número no cambia y sigue nombrando la misma migración.
+          - Adelante → su puntero pasa a la etiqueta NUEVA de la MISMA migración. No
+            retrocede de esquema: sigue el renombre.
+          - Exactamente en ella → bloquea, porque no hay etiqueta nueva a la que apuntar.
+
+        ORDEN, que no es negociable: **los stamps van ANTES del renumerado.** El ``revision``
+        de los archivos que genera el gateway es literalmente el string de versión, y
+        ``command.stamp`` necesita resolver el valor ACTUAL del puntero antes de moverlo. Si
+        se renumerara primero, cada BD adelantada quedaría nombrando una revisión inexistente
+        y Alembic la rechazaría con ``Can't locate revision identified by …``: sin apply, sin
+        rollback y sin stamp. Verificado empíricamente contra el mecanismo real.
+
+        Y con este orden **ninguna BD queda huérfana**: si la fase de stamps falla, se
+        compensa (se devuelven los punteros ya movidos a su valor original) y el blueprint no
+        se toca; si falla la fase local, es UNA transacción y revierte sola.
+        """
+        session = self._session()
+        try:
+            model = self._model_or_404(session, model_id)
+            m = self._migration_or_404(session, model_id, version)
+            slug, model_name = model.slug, model.name
+            migration_id = m.id
+            plan = self._build_delete_plan(session, model, m)
+            self._enforce_delete_plan(plan)
+
+            if plan["requires_confirmation"]:
+                if not confirm_token_value:
+                    # 409 propio y no el 422 genérico de ``confirm_token.verify``: el cliente
+                    # que borra la punta nunca necesitó token, así que lo que hace falta
+                    # decirle no es "token inválido" sino que ESTA versión tiene BDs adelante
+                    # y que el token se obtiene del preview.
                     raise AppHttpException(
                         message=(
-                            "No se puede eliminar la versión: "
-                            f"{self._describe_blocking(blocking)} Eliminarla no revierte "
-                            "nada en el motor: esas BDs quedarían con objetos que ninguna "
-                            "versión del blueprint describe. Revierta primero, o cree una "
-                            "migración compensatoria."
+                            f"Eliminar la versión {version} implica mover el puntero de "
+                            f"{len(plan['stamp_plan'])} BD(s) en sus motores. Pide el plan en "
+                            f"GET /database-models/{model_id}/migrations/{version}/delete-plan "
+                            "y reenvía su 'confirm_token'."
                         ),
                         status_code=409,
                         public_context={
-                            "code": freeze_codes.CODE_STILL_APPLIED,
+                            "code": freeze_codes.CODE_RENUMBER_CONFIRMATION_REQUIRED,
                             "version": version,
-                            "blocking_databases": blocking,
+                            "stamp_plan": plan["stamp_plan"],
                         },
                         context={"model_id": model_id, "version": version},
                     )
-            # Un intento fallido puede haber dejado sentencias commiteadas a medias. El
-            # checkpoint es la única evidencia de cuáles, y el CASCADE se lo llevaría en
-            # silencio: sin él, esa BD queda sucia y sin forma de reconciliarla. Es la misma
-            # barrera que `update_migration` ya impone antes de tocar el SQL.
-            incomplete = migration_progress.incomplete_progress_for_migration(
-                m.id, direction="up"
+                # El token ata la operación a la HUELLA del parque congelada en el preview:
+                # si alguna BD se movió de versión en el medio, deja de verificar y el plan
+                # no se ejecuta contra una realidad que ya no describe.
+                confirm_token.verify(
+                    confirm_token_value or "",
+                    _DELETE_OPERATION,
+                    model_id,
+                    f"{slug}:{version}",
+                    subject=plan["fingerprint"],
+                )
+
+            discarded = self._failed_attempt_targets(session, migration_id)
+            affected_dbs = sorted(
+                {
+                    db_id
+                    for ids in self._applied_history_targets(session, [migration_id]).values()
+                    for db_id in ids
+                }
             )
-            if incomplete:
-                detail = ", ".join(
-                    f"BD {row['managed_database_id']} "
-                    f"({row['last_statement_index']}/{row['total_statements']} sentencias)"
-                    for row in incomplete
+            targets = {}
+            for st in plan["stamp_plan"]:
+                server = get_server_or_404(session, st["server_id"])
+                targets[st["managed_database_id"]] = (
+                    build_target(server),
+                    engine_value(server),
                 )
-                raise AppHttpException(
-                    message=(
-                        "No se puede eliminar: hay una aplicación PARCIAL de esta versión "
-                        f"sin resolver ({detail}). Reconcilie esa BD "
-                        "('reconcile-partial') o complete el 'apply' antes de eliminarla."
-                    ),
-                    status_code=409,
-                    context={
-                        "model_id": model_id,
-                        "version": version,
-                        "incomplete_progress": incomplete,
-                    },
-                )
-            discarded = self._failed_attempt_targets(session, m.id)
-            # Solo se puede eliminar la ÚLTIMA versión (la punta de la secuencia). Borrar
-            # una intermedia dejaría un hueco y una versión posterior podría depender de
-            # ella (forward-only encadenado). Para tocar una intermedia: edita, o revierte
-            # hasta ahí y recréala.
-            latest = (
-                session.query(ModelMigration.version)
-                .filter(ModelMigration.model_id == model_id)
-                .order_by(*_VERSION_ORDER_DESC)
-                .first()
-            )
-            if latest and version_sort_key(latest[0]) > version_sort_key(m.version):
-                raise AppHttpException(
-                    message=(
-                        f"Solo se puede eliminar la última versión del blueprint "
-                        f"(actual: {latest[0]}). Existen versiones posteriores a {version} "
-                        "que podrían depender de ella."
-                    ),
-                    status_code=409,
-                    context={"model_id": model_id, "version": version, "latest": latest[0]},
-                )
-            session.delete(m)
-            session.flush()  # el borrado debe verse antes de recalcular current_version
-            self._bump_model_version(session, model_id)
-            session.commit()  # borrado + current_version en un único commit
+            specs = self._delete_stamp_specs(session, model_id)
         finally:
             session.close()
-        # El detalle lleva las BDs afectadas porque el CASCADE ya borró sus filas de
-        # historial: esta entrada es lo único que queda de que la versión falló ahí.
-        detail = f"migración {version} eliminada"
+
+        # --- Fase A: mover los punteros (escritura REMOTA, N veces) ------------------
+        stamped = self._run_stamp_phase(plan["stamp_plan"], targets, specs, slug)
+
+        # --- Fase B: gateway (una sola transacción local) ----------------------------
+        try:
+            self._apply_renumber(model_id, version, plan)
+        except Exception:
+            # El blueprint quedó intacto (la transacción revierte sola), así que los punteros
+            # ya movidos son ahora los únicos que no describen la realidad: se devuelven.
+            self._compensate_stamps(stamped, targets, specs, slug)
+            raise
+
+        detail = (
+            f"migración {version} eliminada de '{model_name}' con renumerado "
+            f"({len(plan['renumber'])} versión(es) renumeradas, "
+            f"{len(plan['stamp_plan'])} puntero(s) movidos)"
+        )
+        if plan["stamp_plan"]:
+            detail += " — " + ", ".join(
+                f"BD {s['managed_database_id']}: {s['from_version']}→{s['to_version']}"
+                for s in plan["stamp_plan"]
+            )
+        if affected_dbs:
+            # El CASCADE ya se llevó el historial de esta versión: esta entrada es lo único
+            # que queda de que corrió con éxito en esas BDs.
+            detail += f" (historial descartado de BDs {', '.join(str(i) for i in affected_dbs)})"
         if discarded:
             detail += (
                 f" (descartadas {len(discarded)} tentativa(s) fallida(s) en BDs "
@@ -1361,10 +1892,207 @@ class ModelMigrationController:
             target_id=model_id,
             detail=detail,
         )
+        return {
+            "model_id": model_id,
+            "version": version,
+            "renumbered": [
+                {"from_version": old, "to_version": new}
+                for old, new in sorted(
+                    plan["renumber"].items(), key=lambda kv: version_sort_key(kv[0])
+                )
+            ],
+            "stamped": plan["stamp_plan"],
+        }
 
-    # ------------------------------------------------------------------ #
-    # Validación estática del SQL (sin aplicar)                           #
-    # ------------------------------------------------------------------ #
+    def _delete_stamp_specs(self, session, model_id: int) -> list:
+        """Specs del blueprint tal como están HOY (numeración vieja), para la fase de stamps.
+
+        Tiene que ser la numeración vieja: el stamp corre antes del renumerado y Alembic
+        necesita resolver tanto el valor actual del puntero como el destino dentro de la
+        MISMA cadena. El destino (``to_version``) existe en ella porque el renumerado baja un
+        escalón y ese escalón ya está ocupado por una versión real (o por la que se borra).
+        """
+        # Import diferido: ``managed_migration_controller`` es la capa que TOCA el motor y
+        # este módulo es CRUD puro. A nivel de módulo la dependencia sería circular.
+        from app.controllers.managed_migration_controller import ManagedMigrationController
+
+        return ManagedMigrationController._load_specs(session, model_id)
+
+    def _run_stamp_phase(
+        self, stamp_plan: list[dict], targets: dict, specs: list, slug: str
+    ) -> list[dict]:
+        """Mueve el puntero de cada BD del plan. Si alguna falla, compensa y aborta.
+
+        Devuelve las BDs efectivamente stampeadas (para poder compensarlas si la fase local
+        falla después). Se recorre en orden de id para que el comportamiento sea determinista
+        y el reporte de un fallo parcial sea reproducible.
+        """
+        runner = MigrationRunner()
+        done: list[dict] = []
+        for item in sorted(stamp_plan, key=lambda s: s["managed_database_id"]):
+            target, engine = targets[item["managed_database_id"]]
+            try:
+                runner.stamp(
+                    target,
+                    db_name=item["database_name"],
+                    slug=slug,
+                    engine=engine,
+                    managed_db_id=item["managed_database_id"],
+                    specs=specs,
+                    version=item["to_version"],
+                )
+            except Exception as exc:
+                logger.exception(
+                    "%s | falló el re-stamp de la BD %s (%s→%s) al eliminar una versión",
+                    current_http_identifier.get(),
+                    item["managed_database_id"],
+                    item["from_version"],
+                    item["to_version"],
+                )
+                compensated = self._compensate_stamps(done, targets, specs, slug)
+                pending = [
+                    f"BD {d['managed_database_id']} quedó en {d['to_version']} "
+                    f"(su valor original era {d['from_version']})"
+                    for d in (() if compensated else done)
+                ]
+                raise AppHttpException(
+                    message=(
+                        f"No se pudo mover el puntero de la BD {item['managed_database_id']} "
+                        f"de {item['from_version']} a {item['to_version']}. El blueprint NO se "
+                        "modificó."
+                        + (
+                            " Los punteros ya movidos volvieron a su valor original."
+                            if compensated
+                            else " ATENCIÓN: no se pudieron devolver todos los punteros ya "
+                            "movidos: " + "; ".join(pending) + "."
+                        )
+                    ),
+                    status_code=409,
+                    public_context={
+                        "code": freeze_codes.CODE_RENUMBER_STAMP_FAILED,
+                        "managed_database_id": item["managed_database_id"],
+                        "from_version": item["from_version"],
+                        "to_version": item["to_version"],
+                        "compensated": compensated,
+                        "left_moved": [] if compensated else done,
+                    },
+                    context={"error": str(exc)},
+                ) from exc
+            done.append(item)
+        return done
+
+    def _compensate_stamps(
+        self, done: list[dict], targets: dict, specs: list, slug: str
+    ) -> bool:
+        """Devuelve los punteros ya movidos a su valor original. ``True`` si se logró en todos.
+
+        Es seguro porque el stamp no ejecuta DDL: mover el puntero de vuelta no deshace ni
+        rehace nada en el esquema. Se recorre en orden INVERSO al de aplicación por simetría
+        con el resto del módulo (los reversos siempre van al revés), aunque acá cada BD es
+        independiente de las demás.
+        """
+        runner = MigrationRunner()
+        ok = True
+        for item in reversed(done):
+            target, engine = targets[item["managed_database_id"]]
+            try:
+                runner.stamp(
+                    target,
+                    db_name=item["database_name"],
+                    slug=slug,
+                    engine=engine,
+                    managed_db_id=item["managed_database_id"],
+                    specs=specs,
+                    version=item["from_version"],
+                )
+            except Exception:
+                logger.exception(
+                    "%s | falló la compensación del puntero de la BD %s (volver a %s)",
+                    current_http_identifier.get(),
+                    item["managed_database_id"],
+                    item["from_version"],
+                )
+                ok = False
+        return ok
+
+    def _apply_renumber(self, model_id: int, version: str, plan: dict) -> None:
+        """Fase local: borra la versión y renumera las posteriores. UNA transacción.
+
+        Tres cosas que no se pueden omitir:
+
+        1. **Los UPDATE van de a uno y en orden ASCENDENTE.** El ``UniqueConstraint(model_id,
+           version)`` hace que un UPDATE masivo colisione consigo mismo; recorriendo de menor
+           a mayor, cada fila ocupa el hueco que acaba de liberar la anterior (y la primera,
+           el de la versión borrada).
+        2. **Hay que recalcular el ``checksum``.** ``compute_checksum`` incluye la ``version``,
+           y ``ManagedMigrationController._verify_integrity`` lo recomputa y compara en cada
+           apply, rollback, stamp y apply-all. Renumerar sin recalcularlo deja el blueprint
+           ENTERO respondiendo 409 "la migración X fue alterada".
+        3. **Las capturas de SELECT llevan el checksum viejo.** Sin actualizarlas, el endpoint
+           de lectura las marcaría ``stale`` sin que su SQL haya cambiado.
+        """
+        session = self._session()
+        try:
+            # Serializa dos borrados concurrentes sobre el mismo blueprint. SQLite lo ignora
+            # en silencio (ya documentado en environment_controller), así que en los tests no
+            # da exclusión: la defensa real ahí es la relectura de versiones de la fase 0.
+            session.query(DatabaseModel).filter(
+                DatabaseModel.id == model_id
+            ).with_for_update().first()
+
+            m = self._migration_or_404(session, model_id, version)
+            session.delete(m)
+            session.flush()  # libera el hueco antes de que la primera renumerada lo ocupe
+
+            for old in sorted(plan["renumber"], key=version_sort_key):
+                new = plan["renumber"][old]
+                row = (
+                    session.query(ModelMigration)
+                    .filter(
+                        ModelMigration.model_id == model_id,
+                        ModelMigration.version == old,
+                    )
+                    .first()
+                )
+                if row is None:  # desapareció entre el preflight y ahora
+                    raise AppHttpException(
+                        message=(
+                            f"La versión {old} dejó de existir durante el renumerado. "
+                            "No se modificó nada; vuelve a pedir el preview."
+                        ),
+                        status_code=409,
+                        public_context={
+                            "code": freeze_codes.CODE_RENUMBER_PLAN_STALE,
+                            "version": old,
+                        },
+                        context={"model_id": model_id},
+                    )
+                row.version = new
+                row.checksum = compute_checksum(
+                    row.up_sql, row.up_sql_mysql, row.up_sql_postgresql, row.down_sql, new
+                )
+                session.flush()
+                migration_results.rekey_checksum(session, row.id, row.checksum)
+
+            for item in plan["stamp_plan"]:
+                # La caché del inventario: apply/rollback/stamp la escriben releyendo el
+                # motor, y acá el motor ya se movió en la fase A.
+                md = (
+                    session.query(ManagedDatabase)
+                    .filter(ManagedDatabase.id == item["managed_database_id"])
+                    .first()
+                )
+                if md is not None:
+                    md.model_version = item["to_version"]
+
+            self._bump_model_version(session, model_id)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def validate_migration(self, model_id: int, data: dict, *, admin: dict | None = None) -> dict:
         """
         Analiza el SQL de una migración ANTES de aplicarla.

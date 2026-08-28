@@ -13,6 +13,8 @@ from app.core.auth import AdminDep
 from app.core.limiter import limiter
 from app.schemas.model_migration import (
     ApplyAllOut,
+    MigrationDeleteOut,
+    MigrationDeletePlanOut,
     MigrationValidateIn,
     MigrationValidateOut,
     ModelMigrationCreate,
@@ -21,7 +23,7 @@ from app.schemas.model_migration import (
     ModelMigrationSummary,
 )
 from app.utils.pagination import PaginationDep
-from app.utils.response import ApiResponse, empty, paginated, success
+from app.utils.response import ApiResponse, paginated, success
 
 router = APIRouter(prefix="/database-models", tags=["Model Migrations"])
 
@@ -168,10 +170,56 @@ def update_migration(
     return success(data=updated, message="Migración actualizada.")
 
 
+@router.get(
+    "/{model_id}/migrations/{version}/delete-plan",
+    response_model=ApiResponse[MigrationDeletePlanOut],
+)
+def plan_delete_migration(admin: AdminDep, model_id: int, version: str = _VERSION_PATH):
+    """
+    Preview del borrado: qué versiones se renumeran, qué punteros se mueven y qué lo bloquea.
+
+    Solo lectura, pero **no es gratis**: abre conexión a cada BD del blueprint para leer su
+    versión en vivo. Es lo que hace que el veredicto sea autoritativo y no la caché que pinta
+    el listado.
+
+    Emite ``confirm_token`` solo si el plan implica mover punteros. Si no hay nada que
+    stampear, el ``DELETE`` sigue sin exigir confirmación.
+    """
+    return success(data=ModelMigrationController().plan_delete(model_id, version))
+
+
 @router.delete(
     "/{model_id}/migrations/{version}",
-    response_model=ApiResponse[None],
+    response_model=ApiResponse[MigrationDeleteOut],
 )
-def delete_migration(admin: AdminDep, model_id: int, version: str = _VERSION_PATH):
-    ModelMigrationController().delete_migration(model_id, version, admin=admin)
-    return empty("Migración eliminada.")
+def delete_migration(
+    admin: AdminDep,
+    model_id: int,
+    version: str = _VERSION_PATH,
+    confirm_token: str | None = Query(
+        None,
+        description=(
+            "Token del preview 'delete-plan'. OBLIGATORIO solo si el borrado implica mover "
+            "el puntero de alguna BD (escritura remota). Sin BDs adelante no se pide."
+        ),
+    ),
+):
+    """
+    Elimina una versión, renumerando las posteriores y moviendo el puntero de las BDs que
+    estén adelante.
+
+    **No ejecuta ningún SQL del blueprint**: no es un rollback. Lo único que se escribe en
+    cada BD destino es su tabla de versión de Alembic.
+
+    Se puede eliminar si y solo si **ninguna BD está parada exactamente en esa versión**
+    (409 ``model_migration.version_in_use``). Las que están adelante siguen el renombre: su
+    puntero pasa a la etiqueta nueva de la MISMA migración. Las que están atrás no se tocan.
+
+    Una BD del blueprint cuya versión no se pueda leer bloquea la operación
+    (409 ``model_migration.unreadable_databases``): sin esa lectura no se puede descartar que
+    esté parada acá ni moverle el puntero, y renumerar la dejaría huérfana.
+    """
+    result = ModelMigrationController().delete_migration(
+        model_id, version, confirm_token_value=confirm_token, admin=admin
+    )
+    return success(data=result, message="Migración eliminada.")

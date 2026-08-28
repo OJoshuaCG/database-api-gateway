@@ -27,9 +27,61 @@ CODE_SQL_FROZEN = "model_migration.sql_frozen"
 
 #: Se intentó eliminar una versión que alguna BD tiene aplicada HOY. Borrarla no toca el motor:
 #: dejaría esa BD con objetos que ninguna versión del blueprint describe.
+#:
+#: HISTÓRICO: era el rechazo del criterio ``>=`` (la BD está en esta versión o en una
+#: posterior). El borrado pasó a criterio de IGUALDAD y usa ``CODE_VERSION_IN_USE``; este
+#: código sigue vigente para el resto de caminos que evalúan vigencia con ``>=``.
 CODE_STILL_APPLIED = "model_migration.still_applied"
 
-ERROR_CODES = frozenset({CODE_SQL_FROZEN, CODE_STILL_APPLIED})
+#: Se intentó eliminar una versión en la que alguna BD está PARADA exactamente. Es el único
+#: caso que el borrado con renumerado no puede resolver: a las BDs que están adelante se les
+#: mueve el puntero a la nueva etiqueta de su MISMA migración, pero una BD parada justo en la
+#: versión que desaparece no tiene ninguna etiqueta nueva a la que apuntar.
+CODE_VERSION_IN_USE = "model_migration.version_in_use"
+
+#: No se pudo leer la versión de alguna BD del blueprint. **Fail-closed**: sin esa lectura no
+#: se puede probar que la BD no esté parada en la versión a borrar, ni se la puede re-stampear
+#: si está adelante. Proceder la dejaría huérfana (puntero a una revisión inexistente).
+CODE_UNREADABLE_DATABASES = "model_migration.unreadable_databases"
+
+#: El borrado requiere mover el puntero de una o más BDs (escritura REMOTA sobre cada motor),
+#: y no llegó ``confirm_token``. Se obtiene del preview ``GET .../{version}/delete-plan``.
+CODE_RENUMBER_CONFIRMATION_REQUIRED = "model_migration.renumber_confirmation_required"
+
+#: El estado del parque cambió entre el preview y la ejecución (alguna BD se movió de versión).
+#: El plan congelado ya no describe la realidad: hay que volver a pedir el preview.
+CODE_RENUMBER_PLAN_STALE = "model_migration.renumber_plan_stale"
+
+#: Falló el re-stamp de alguna BD. No se tocó el blueprint. El campo ``compensated`` dice si
+#: las BDs ya movidas volvieron a su valor original; si es ``false``, quedaron a mitad y el
+#: mensaje nombra BD y versión exacta de cada una.
+CODE_RENUMBER_STAMP_FAILED = "model_migration.renumber_stamp_failed"
+
+#: Una BD adelantada tendría que quedar en una etiqueta que NO existe en la cadena vigente.
+#: Solo ocurre si el blueprint tiene un hueco justo debajo de la versión en la que está esa BD
+#: (los huecos existen porque ``create_migration`` acepta una ``version`` explícita). El stamp
+#: corre ANTES del renumerado —Alembic tiene que resolver el valor actual del puntero— así que
+#: su destino tiene que existir ya. Salida: rellenar el hueco, o mover esa BD antes.
+CODE_RENUMBER_TARGET_MISSING = "model_migration.renumber_target_missing"
+
+#: Alguna de las migraciones AFECTADAS por el renumerado (la que se borra o cualquiera
+#: posterior) tiene una aplicación parcial sin resolver. El renumerado cambia el ``version``,
+#: que entra en el ``checksum``, y eso invalidaría el checkpoint de esa aplicación a medias.
+CODE_AFFECTED_PARTIAL = "model_migration.affected_partial_application"
+
+ERROR_CODES = frozenset(
+    {
+        CODE_SQL_FROZEN,
+        CODE_STILL_APPLIED,
+        CODE_VERSION_IN_USE,
+        CODE_UNREADABLE_DATABASES,
+        CODE_RENUMBER_CONFIRMATION_REQUIRED,
+        CODE_RENUMBER_PLAN_STALE,
+        CODE_RENUMBER_STAMP_FAILED,
+        CODE_RENUMBER_TARGET_MISSING,
+        CODE_AFFECTED_PARTIAL,
+    }
+)
 
 # --------------------------------------------------------------------------- #
 # Motivos por BD bloqueante (campo ``reason`` de ``blocking_databases``)        #
@@ -51,11 +103,21 @@ REASON_UNKNOWN_DATABASE = "unknown_database"
 #: la tabla de versión ``_gw_v_{slug}`` dentro de cada BD.
 REASON_UNKNOWN_BLUEPRINT = "unknown_blueprint"
 
+#: El motor reporta que la BD está EXACTAMENTE en esta versión. Es el motivo del borrado con
+#: renumerado, que sí tolera las BDs adelante (``REASON_AHEAD``) pero no esta.
+REASON_IN_USE = "in_use"
+
+#: El motor reporta que la BD está en una versión POSTERIOR. No bloquea el borrado: se le
+#: mueve el puntero a la nueva etiqueta de la misma migración. Aparece en el plan del preview,
+#: no en la lista de bloqueantes.
+REASON_AHEAD = "ahead"
+
 BLOCKING_REASONS = frozenset(
     {
         REASON_STILL_APPLIED,
         REASON_UNREADABLE,
         REASON_UNKNOWN_DATABASE,
         REASON_UNKNOWN_BLUEPRINT,
+        REASON_IN_USE,
     }
 )
