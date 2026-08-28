@@ -756,8 +756,8 @@ pendientes hasta X (forward-only); `rollback` es **target-based** (`?confirm_ver
 un baseline de snapshot exige aprobación (`reviewed`) antes de aplicar. **Editar/borrar migraciones**:
 lo que congela una versión es que alguna BD la tenga aplicada **HOY**, no que haya corrido alguna
 vez (ver el bloque siguiente); al cambiar `up_sql` hay que reenviar/limpiar los overrides en el
-mismo PATCH (409 si quedan obsoletos) y se regenera `down_sql_suggested`. `DELETE` sigue borrando
-solo la **última** versión (la punta). `stamp` además **saca la BD de cuarentena**
+mismo PATCH (409 si quedan obsoletos) y se regenera `down_sql_suggested`. `DELETE` ya **no** exige la
+punta (ver el bloque del renumerado, más abajo). `stamp` además **saca la BD de cuarentena**
 (`error → active`). La respuesta de `apply`/
 `rollback` es tipada (`MigrationApplyOut`/`MigrationRollbackOut`, con `from_version`→`to_version`).
 Verificación e2e contra motores reales (`scripts/verify_migrations_e2e.py`, requiere Docker):
@@ -810,6 +810,58 @@ de V. Desbloquear V ahí permite borrar la DESCRIPCIÓN de cambios que siguen en
 descuido: `stamp` es la puerta trasera declarada de cualquier gate basado en la versión (el gate de
 entornos lo dice igual). Contrato frontend: `docs/api-reference-v14.md`; guía:
 `docs/features/model-migrations.md` (§ «Cuándo se puede editar o eliminar una versión»).
+
+**Borrar una versión INTERMEDIA con renumerado y re-stamp (2026-08-28)**: `DELETE` dejó de exigir
+la punta, y su criterio pasó de `>=` a **IGUALDAD**: se puede borrar cualquier versión mientras
+ninguna BD esté parada **exactamente** en ella. Las posteriores **bajan un escalón** y a las BDs
+que están adelante se les mueve el puntero a la etiqueta nueva de su MISMA migración. **No se
+ejecuta un solo SQL del blueprint: no es un rollback**, y las BDs que ya la aplicaron conservan
+FÍSICAMENTE sus objetos (el preview lo advierte nombrándolas). La edición NO cambia: `sql_frozen`
+sigue con `>=`, así que `deletable` y `sql_frozen` ahora **divergen** a propósito y `block_reason`
+dejó de repetir lo que dice `sql_frozen` (`not_tip` se eliminó del vocabulario). Contrato:
+`docs/api-reference-v15.md`.
+
+Cosas que NO se pueden tocar sin romperlo:
+
+- **Los stamps van ANTES del renumerado.** El `revision` de los archivos que genera el gateway es
+  LITERALMENTE el string de versión (`_render_revision`), y `command.stamp` necesita resolver el
+  valor ACTUAL del puntero antes de moverlo. Renumerar primero deja a cada BD adelantada nombrando
+  una revisión inexistente → `Can't locate revision identified by …`, o sea sin apply, sin rollback
+  y sin stamp. **Verificado empíricamente** contra el mecanismo real (cadena en tempdir +
+  `version_table` propia). Con este orden ninguna BD queda huérfana: si la fase de stamps falla se
+  compensa (los punteros vuelven) y el blueprint no se toca; la fase local es UNA transacción.
+- **El `checksum` se recalcula en cada renumerada.** `compute_checksum` incluye la `version` y
+  `_verify_integrity` lo recomputa en los CINCO call-sites de `managed_migration_controller`
+  (apply, rollback, stamp, apply-all). Sin recalcular, el blueprint ENTERO responde 409 «la
+  migración X fue alterada». Hay un test que lo fija.
+- **Los UPDATE del renumerado van de a uno y ASCENDENTES** (el UNIQUE `(model_id, version)` hace
+  colisionar un UPDATE masivo), y el renumerado baja UN escalón — no re-secuencia: cerrar todos los
+  huecos cambiaría también el número de versiones ANTERIORES, y las BDs que están atrás no se tocan.
+- **Pre-filtro barato antes de leer motores**: se saltean las BDs que nunca fueron posicionadas
+  (`model_version` nulo Y sin historial exitoso). Es sound —apply, rollback, stamp y stamp-on-adopt
+  escriben esa caché— y es lo que evita que un solo motor caído bloquee el borrado de cualquier
+  versión. **No alcanza el historial solo** (lo que mira `_still_applied_live`): una BD ADOPTADA con
+  `model_version` no tiene ni una fila de historial y puede estar adelante — es justo la que
+  quedaría huérfana al renumerar.
+- El plan se congela en `GET .../{version}/delete-plan` y viaja en el `subject` del `confirm_token`
+  como huella del parque: si alguna BD se movió entre el preview y el `DELETE`, el token deja de
+  verificar (422). El token se exige **solo** si hay punteros que mover, así que borrar la punta
+  sigue sin pedirlo y el cliente viejo no se rompe.
+- `MigrationRunner.stamp(..., purge=True)` (nuevo) es la ÚNICA salida para desatascar una BD
+  huérfana; antes no existía ninguna.
+- **Borde cerrado**: si el blueprint tiene un hueco justo debajo de donde está parada una BD
+  adelantada, su destino de stamp no existiría en la cadena vigente → 409
+  `model_migration.renumber_target_missing` en el preflight, sin mover nada.
+
+Códigos nuevos en `app/services/migration_freeze_catalog.py`: `version_in_use`,
+`unreadable_databases`, `renumber_confirmation_required`, `renumber_plan_stale`,
+`renumber_stamp_failed`, `renumber_target_missing`, `affected_partial_application`; `reason` nuevo
+`in_use`. **Sin migración Alembic** (no hay tabla ni columna nueva). Verificado por ejecución
+directa (sin `pytest`, política del repo): 15 checks en
+`tests/test_api_migration_delete_renumber.py` + 57 en `test_api_model_migrations.py` (9 de ellos
+reescritos porque codificaban el contrato viejo) + sin regresión en apply/rollback/stamp/plan09/
+runner/managed-databases/environments. **PENDIENTE**: nada contra motores reales — en particular el
+`UPDATE _gw_v_{slug}` con advisory lock en MySQL y PostgreSQL, y el `purge` a través del runner.
 
 **La contabilidad INTERNA del gateway NO es esquema del usuario (fix de producción,
 2026-07-27)**: `identifiers.GATEWAY_TABLE_PREFIXES = ("_gw_v_", "_gw_stg_")` +
@@ -2269,7 +2321,8 @@ reales (sin Docker en el entorno donde se implementó).
 
 - `docs/features/projects.md` — proyectos (agrupación N:M de blueprints)
 - `docs/` — documentación completa por feature (ver `docs/features/model-migrations.md`
-  para migraciones de blueprints; `docs/features/server-database-lifecycle.md` para
+  para migraciones de blueprints, y `docs/api-reference-v15.md` para el borrado de una
+  versión intermedia con renumerado; `docs/features/server-database-lifecycle.md` para
   crear/borrar BDs a nivel servidor y listar usuarios con permisos sobre una BD;
   `docs/features/database-export.md` + `docs/api-reference-v10.md` para la exportación de BDs)
 - `docs/docker-deployment.md` — despliegue Docker en VPS plano (`docker-compose.yml`, nginx + Certbot propios)

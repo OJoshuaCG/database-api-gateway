@@ -247,10 +247,14 @@ fiable:
   Al cambiar `up_sql` se regenera el `down_sql_suggested`; si existen overrides por-motor
   debes **reenviarlos corregidos o limpiarlos (null)** en el mismo `PATCH` (409 si no), para
   que no quede SQL viejo aplicándose en silencio.
-- **Eliminar una versión**: `DELETE` solo permite borrar la **última** versión del blueprint
-  (la punta) y **mientras ninguna BD la tenga aplicada HOY** (409
-  `model_migration.still_applied` en otro caso). Borrar una intermedia dejaría un hueco del
-  que podría depender una versión posterior.
+- **Eliminar una versión**: `DELETE` permite borrar **cualquier** versión —punta o
+  intermedia— **mientras ninguna BD esté parada exactamente en ella** (409
+  `model_migration.version_in_use` en otro caso). Al borrar una intermedia, las posteriores
+  **bajan un escalón** y a las BDs que estaban adelante se les mueve el puntero a la etiqueta
+  nueva de su misma migración; eso son escrituras remotas, así que ese caso exige el
+  `confirm_token` de `GET .../{version}/delete-plan`. **No se ejecuta ningún SQL: no es un
+  rollback**, y las BDs que ya la habían aplicado conservan sus objetos. Ver
+  [§ Cuándo se puede editar o eliminar una versión](#cuándo-se-puede-editar-o-eliminar-una-versión).
 - **Cuarentena (fallo parcial)**: como el DDL no es transaccional en MySQL/MariaDB (y el
   runner corre en AUTOCOMMIT), una migración multi-sentencia que falla a mitad puede dejar
   estado parcial. El gateway marca la BD con `status=error` + nota; el siguiente `apply`
@@ -292,22 +296,88 @@ fiable:
 
 ## Cuándo se puede editar o eliminar una versión
 
-> Contrato para el frontend: [`docs/api-reference-v14.md`](../api-reference-v14.md).
+> Contrato para el frontend: [`docs/api-reference-v15.md`](../api-reference-v15.md)
+> (el borrado con renumerado) y [`docs/api-reference-v14.md`](../api-reference-v14.md)
+> (el criterio de congelamiento del que parte).
 
 Editar el `up_sql` de una versión o borrarla **no ejecuta ni deshace nada en el motor**: solo
 cambia la descripción que el gateway guarda. Por eso hay un guard, y por eso el criterio del
 guard importa tanto.
 
-### La regla
+### Dos reglas, no una
 
-> Una versión está **congelada** mientras alguna BD gestionada la tenga aplicada **hoy**.
+La **edición** y el **borrado** dejaron de compartir criterio, y la diferencia es el punto
+entero de esta sección.
 
-Y "tenerla aplicada hoy" es: **la BD está en esa versión o en una posterior**. Las migraciones
-son forward-only encadenadas, así que una BD en `0007` tiene aplicadas todas las `<= 0007`; si
-el criterio fuera igualdad, una base al día dejaría borrar todas las versiones intermedias que
-sí describen su esquema.
+> **Editar** el SQL de una versión: congelada mientras alguna BD esté en esa versión **o en
+> una posterior** (criterio `>=`).
+>
+> **Borrar** una versión: bloqueado solo si alguna BD está parada **exactamente** en ella
+> (criterio `==`). Las que están adelante o atrás no bloquean.
 
-Lo que **no** congela: haber corrido alguna vez. Ver abajo por qué es la mitad importante.
+Por qué difieren:
+
+- Para **editar**, una BD en `0007` sí depende de la `0003`: las migraciones son forward-only
+  encadenadas, así que tiene aplicadas todas las `<= 0007`. Cambiar el `up_sql` de la `0003`
+  dejaría la metadata describiendo algo distinto de lo que realmente corrió allí.
+- Para **borrar**, esa misma BD **no** es un problema, porque el borrado **renumera** lo que
+  sigue y le mueve el puntero a la etiqueta nueva de su misma migración. Solo la BD parada
+  justo en la versión que desaparece se queda sin etiqueta a la que apuntar.
+
+Lo que **no** congela ninguno de los dos: haber corrido alguna vez. Ver abajo por qué es la
+mitad importante.
+
+### Borrar una versión intermedia: qué pasa exactamente
+
+Antes solo se podía borrar la **punta**. Ahora se puede borrar cualquier versión libre, y el
+gateway cierra el hueco:
+
+1. Las versiones posteriores **bajan un escalón** (`0016` → `0015`, `0017` → `0016`…). Las
+   anteriores no se tocan.
+2. A las BDs que están **adelante** se les mueve el puntero a la etiqueta nueva de la **misma**
+   migración (una BD en `0020` queda en `0019`, y `0019` es la migración que antes se llamaba
+   `0020`).
+3. **No se ejecuta ningún SQL del blueprint.** Ni el `up_sql` de la versión borrada, ni ningún
+   `down_sql`. **No es un rollback.**
+
+> ⚠️ **Consecuencia que hay que tener presente**: las BDs que ya habían aplicado esa versión
+> **conservan físicamente** sus objetos. Tras el renumerado, la cadena del blueprint ya no los
+> describe. El preview lo advierte nombrando esas BDs; el borrado no las repara.
+
+**El orden no es negociable: los stamps van ANTES del renumerado.** El `revision` de los
+archivos de revisión que genera el gateway es literalmente el string de versión
+(`_render_revision`), y `command.stamp` necesita resolver el valor **actual** del puntero antes
+de moverlo. Renumerar primero dejaría a cada BD adelantada nombrando una revisión inexistente,
+y Alembic la rechazaría con `Can't locate revision identified by …`: sin apply, sin rollback y
+sin stamp. Con este orden ninguna BD queda huérfana — si la fase de stamps falla, los punteros
+ya movidos se devuelven a su valor original y el blueprint no se toca; si falla la fase local,
+es una sola transacción y revierte sola.
+
+**El escape para una BD que sí quedó huérfana** (por una carrera, o por un renumerado hecho por
+otra vía) es `MigrationRunner.stamp(..., purge=True)`: vacía la tabla de versión antes de
+escribir, así que no necesita resolver el valor viejo. Es la única salida, y no debe usarse
+fuera de ese caso.
+
+### Es una escritura REMOTA, no una operación local
+
+Mover el puntero de una BD **escribe dentro de esa base**: `UPDATE _gw_v_{slug} SET
+version_num = …`, más la conexión y el advisory lock que la rodean. O sea que borrar una
+versión con BDs adelante son **N escrituras remotas** más una transacción local en el gateway,
+y los dos lados **no comparten transacción**.
+
+Por eso el borrado con punteros a mover exige un doble paso:
+
+```
+GET    /database-models/{model_id}/migrations/{version}/delete-plan   → plan + confirm_token
+DELETE /database-models/{model_id}/migrations/{version}?confirm_token=…
+```
+
+El `confirm_token` está atado a la **huella del parque** que congeló el preview: si alguna BD se
+movió de versión en el medio, deja de verificar y la operación se rechaza en vez de ejecutar un
+plan que ya no describe la realidad.
+
+**Si no hay punteros que mover, el token no se pide.** Borrar la punta de un blueprint sin BDs
+adelante sigue siendo la operación local de siempre, y el cliente que ya lo hacía no se rompe.
 
 ### Por qué el historial NO es el criterio
 
@@ -328,51 +398,79 @@ congelada **de por vida**, sin ninguna salida:
 La única salida era fix-forward: acumular versiones correctivas para describir cambios que ya no
 existían en ningún motor.
 
-Ahora el historial es solo el **primer filtro**, y es barato: si una versión no tiene ninguna
-fila `applied`, no se abre ni una conexión. Recién si la tiene se consulta la versión actual de
-esas BDs, que es lo que decide.
+Para la **edición**, el historial sigue siendo el primer filtro y es barato: sin ninguna fila
+`applied` no se abre ni una conexión.
+
+Para el **borrado** el filtro barato es otro, porque su criterio es la POSICIÓN de cada BD y no
+el resultado de un intento: se saltean las BDs que **nunca fueron posicionadas** (`model_version`
+nulo **y** sin historial exitoso). Es sound —los cuatro caminos que mueven una BD (apply,
+rollback, stamp y el stamp-on-adopt) escriben esa caché—, y es lo que evita que un solo motor
+caído en el blueprint bloquee el borrado de cualquier versión, incluidas las que nadie aplicó.
 
 ### Dos lecturas distintas, a propósito
 
 | Camino | Fuente de la versión | Por qué |
 |---|---|---|
-| **Listado / detalle** (`sql_frozen`, `deletable`, `block_reason`) | Caché del inventario (`ManagedDatabase.model_version`) | Corre por cada fila de cada página: abrir una conexión por BD para pintar un botón no se sostiene. |
-| **`PATCH` / `DELETE`** (el 409) | **El motor**, vía `MigrationRunner.get_current_version` | Es el veredicto autoritativo: se está por autorizar algo irreversible, y la caché puede estar rancia. |
+| **Listado / detalle** (`sql_frozen`, `deletable`, `block_reason`, `delete_requires_stamps`) | Caché del inventario (`ManagedDatabase.model_version`) | Corre por cada fila de cada página: abrir una conexión por BD para pintar un botón no se sostiene. |
+| **`delete-plan` / `PATCH` / `DELETE`** (el 409) | **El motor**, vía `MigrationRunner.get_current_version` | Es el veredicto autoritativo: se está por autorizar algo irreversible, y la caché puede estar rancia. |
 
 La divergencia posible es en la dirección segura: si la caché quedó atrasada, el listado puede
 ofrecer un botón que después el guard rechaza con 409. Al revés no puede pasar sin que la caché
 **sobreestime** la versión, y eso solo congela de más.
 
-### Los dos códigos de error
+### Los códigos de error
 
 Viajan en `public_context.code` — **nunca** en `context`, que solo se expone en `development`:
 en producción el operador recibiría el mensaje sin poder clasificarlo ni elegir la salida.
+Vocabulario cerrado en `app/services/migration_freeze_catalog.py`.
 
 | HTTP | `public_context.code` | Cuándo | Salida |
 |---|---|---|---|
-| 409 | `model_migration.sql_frozen` | `PATCH` que cambia el SQL efectivo (`up_sql` u overrides) de una versión vigente. | Fix-forward con una versión nueva, **o** revertir en las BDs que la nombran. |
-| 409 | `model_migration.still_applied` | `DELETE` de una versión vigente. Borrarla dejaría esa BD con objetos que ninguna versión del blueprint describe. | Revertir primero, o crear una migración compensatoria. |
+| 409 | `model_migration.sql_frozen` | `PATCH` que cambia el SQL efectivo de una versión que alguna BD tiene aplicada (criterio `>=`). | Fix-forward con una versión nueva, **o** revertir en las BDs que la nombran. |
+| 409 | `model_migration.version_in_use` | `DELETE` de una versión en la que alguna BD está parada exactamente. | Mover esa BD (apply o rollback) y reintentar. |
+| 409 | `model_migration.unreadable_databases` | No se pudo leer la versión de alguna BD del blueprint. **Fail-closed**. | Recuperar el acceso a esa BD. |
+| 409 | `model_migration.renumber_confirmation_required` | El borrado implica mover punteros y no llegó `confirm_token`. | Pedir `delete-plan` y reenviar su token. |
+| 422 / 410 | *(del `confirm_token`)* | Token que no corresponde al plan congelado, o vencido. | Volver a pedir `delete-plan`. |
+| 409 | `model_migration.renumber_stamp_failed` | Falló el re-stamp de una BD. El blueprint **no** se modificó; `compensated` dice si los punteros ya movidos volvieron. | Revisar esa BD y reintentar. |
+| 409 | `model_migration.renumber_target_missing` | Una BD adelantada quedaría en una etiqueta inexistente (hueco en la numeración justo debajo de donde está parada). | Rellenar el hueco con una versión, o mover esa BD antes. |
+| 409 | `model_migration.affected_partial_application` | Alguna versión afectada tiene una aplicación a medias. El renumerado cambia su `checksum` y el checkpoint dejaría de corresponder. | `reconcile-partial`, o completar el `apply`. |
+| 409 | `model_migration.still_applied` | Histórico del criterio `>=`. Sigue vigente en los caminos que lo usan. | Revertir primero. |
 
-Ambos traen `version` y `blocking_databases[]`, con un ítem por BD que bloquea:
+Los que nombran BDs traen `version` y `blocking_databases[]`, con un ítem por BD:
 `managed_database_id`, `reason` y —cuando aplica— `current_version`.
 
-### Los cuatro `reason`
-
-Vocabulario cerrado en `app/services/migration_freeze_catalog.py`:
+### Los `reason`
 
 | `reason` | Significa | Trae `current_version` |
 |---|---|---|
-| `still_applied` | El motor reporta que la BD está en esa versión o en una posterior. Es el caso normal. | Sí |
-| `unreadable` | No se pudo leer la versión de esa BD: motor caído, base sin aprovisionar, credenciales rotas. **Fail-closed**: cuenta como bloqueante. | No |
+| `in_use` | El motor reporta que la BD está **exactamente** en esa versión. Es el motivo del borrado. | Sí |
+| `still_applied` | El motor reporta que la BD está en esa versión o en una posterior. Es el motivo de la edición. | Sí |
+| `unreadable` | No se pudo leer la versión de esa BD: motor caído, base sin aprovisionar, credenciales rotas, o un puntero no numérico que no se puede ubicar en la secuencia. **Fail-closed**: cuenta como bloqueante. | No |
 | `unknown_database` | Hay historial contra una BD que ya no está en el inventario. No debería ocurrir (el `CASCADE` se lleva esas filas), pero no se puede probar lo contrario. | No |
 | `unknown_blueprint` | No se pudo resolver el blueprint de la migración, así que no hay `slug` con el que ubicar la tabla de versión `_gw_v_{slug}` dentro de cada BD. | No |
 
 **`unreadable` es fail-closed y no es negociable**: tratar un fallo de lectura como "esa BD ya
-no la tiene" convertiría un corte de red en autorización para destruir metadata.
+no la tiene" convertiría un corte de red en autorización para destruir metadata. Para el
+borrado es doblemente necesario: a una BD que no se puede leer tampoco se le puede mover el
+puntero, así que renumerar la dejaría huérfana.
 
 El `message` del 409 nombra la BD y el motivo, y **nunca** transcribe el error del motor
 (criterio R4): ese mensaje puede llevar host, usuario o fragmentos de sentencia. El detalle va
 al log, correlacionado por Request ID.
+
+### Lo que el renumerado toca por debajo
+
+Dos cosas que parecen internas y no lo son:
+
+- **El `checksum` se recalcula en cada versión renumerada.** `compute_checksum` incluye la
+  `version`, y `ManagedMigrationController._verify_integrity` lo recomputa y compara en cada
+  apply, rollback, stamp y apply-all. Renumerar sin recalcularlo dejaría el blueprint **entero**
+  respondiendo 409 *"la migración X fue alterada"*.
+- **Las capturas de `SELECT` se reapuntan** al checksum nuevo (`migration_results.rekey_checksum`).
+  Su SQL no cambió, así que marcarlas `stale` por un renombre sería mentir.
+
+Los `UPDATE` del renumerado van **de a uno y en orden ascendente**: el `UniqueConstraint(model_id,
+version)` hace que un UPDATE masivo colisione consigo mismo.
 
 ### ⚠️ Límite conocido: `stamp` es la puerta trasera
 
