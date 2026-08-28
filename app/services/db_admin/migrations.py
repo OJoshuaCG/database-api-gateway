@@ -1132,8 +1132,30 @@ class MigrationRunner:
         managed_db_id: int,
         specs: list[MigrationSpec],
         version: str,
+        purge: bool = False,
     ) -> None:
-        """Marca la BD destino en ``version`` SIN ejecutar SQL (BDs pre-existentes)."""
+        """Marca la BD destino en ``version`` SIN ejecutar SQL (BDs pre-existentes).
+
+        ``purge=True`` VACÍA la tabla de versión antes de escribir, en vez de hacer el
+        ``UPDATE … WHERE version_num = <actual>`` que emite el stamp normal. Existe para
+        UN caso, y no debe usarse fuera de él: **desatascar una BD huérfana**, o sea una
+        cuyo puntero nombra una revisión que ya no existe en el blueprint.
+
+        Por qué hace falta un modo aparte: el ``revision`` de los archivos que genera el
+        gateway es LITERALMENTE el string de versión (``_render_revision``), y ``command.
+        stamp`` necesita resolver el valor ACTUAL de la tabla antes de moverlo. Si ese
+        valor desapareció del blueprint —una versión eliminada con renumerado que no
+        alcanzó a re-stampear esta BD—, Alembic aborta con ``Can't locate revision
+        identified by '<v>'`` y la BD queda sin apply, sin rollback y sin stamp. El purge
+        no necesita resolverlo, así que es la única salida.
+
+        Verificado empíricamente contra el mecanismo real (cadena en tempdir +
+        ``version_table`` propia): sin purge la operación falla con ``CommandError``; con
+        purge deja el puntero en ``version``.
+
+        El destino sigue teniendo que existir en el blueprint: el purge levanta la
+        restricción sobre el valor de ORIGEN, nunca sobre el de destino.
+        """
         if not any(s.version == version for s in specs):
             raise AppHttpException(
                 message="La versión a marcar (stamp) no existe en el blueprint.",
@@ -1145,7 +1167,7 @@ class MigrationRunner:
             managed_db_id=managed_db_id, op="migration_stamp",
         ) as (_conn, cfg, _vt):
             with _ALEMBIC_LOCK:
-                command.stamp(cfg, version)
+                command.stamp(cfg, version, purge=purge)
 
     # ------------------------------------------------------------------ #
     # Ejecución AD-HOC (Opción B del diff estructural)                    #
