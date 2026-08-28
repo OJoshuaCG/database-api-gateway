@@ -1984,6 +1984,13 @@ class ModelMigrationController:
         Devuelve las BDs efectivamente stampeadas (para poder compensarlas si la fase local
         falla después). Se recorre en orden de id para que el comportamiento sea determinista
         y el reporte de un fallo parcial sea reproducible.
+
+        RESIDUAL CONOCIDO: la que falla no entra en ``done`` —se agrega recién tras el
+        ``stamp``—, así que no se compensa. Es lo correcto en el caso normal (el UPDATE no
+        ocurrió), pero si la conexión muere DESPUÉS de commitear el UPDATE, esa BD quedó
+        movida y el gateway cree que no. El 409 la nombra con su origen y destino para que se
+        verifique; la reparación es un ``stamp``, y si su puntero quedó fuera de la cadena,
+        ``stamp(..., purge=True)``.
         """
         runner = MigrationRunner()
         done: list[dict] = []
