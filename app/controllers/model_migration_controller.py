@@ -1972,7 +1972,9 @@ class ModelMigrationController:
         """
         # Import diferido: ``managed_migration_controller`` es la capa que TOCA el motor y
         # este módulo es CRUD puro. A nivel de módulo la dependencia sería circular.
-        from app.controllers.managed_migration_controller import ManagedMigrationController
+        from app.controllers.managed_migration_controller import (
+            ManagedMigrationController,
+        )
 
         return ManagedMigrationController._load_specs(session, model_id)
 
