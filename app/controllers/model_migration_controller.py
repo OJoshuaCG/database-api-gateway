@@ -2123,8 +2123,14 @@ class ModelMigrationController:
             for st in plan["stamp_plan"]:
                 server = get_server_or_404(session, st["server_id"])
                 targets[st["managed_database_id"]] = (
+                    # ``EngineType``, NO el string de ``engine_value``. El runner hace
+                    # ``engine.value`` al generar los archivos de revisión, así que un str
+                    # revienta con ``AttributeError`` — y como ``EngineType`` hereda de
+                    # ``str``, TODAS las comparaciones (``==``, ``in``) siguen andando con
+                    # un str y el error no aparece hasta ese acceso. Misma forma que
+                    # ``managed_migration_controller`` en su propio dict de targets.
                     build_target(server),
-                    engine_value(server),
+                    EngineType(engine_value(server)),
                 )
             specs = self._delete_stamp_specs(session, model_id)
         finally:
