@@ -10,5 +10,33 @@
         ]
       }
     ]
+  },
+  "permissions": {
+    "deny": [
+      "Bash(pytest*)",
+      "Bash(py.test*)",
+      "Bash(python -m pytest*)",
+      "Bash(python3 -m pytest*)",
+      "Bash(python3.13 -m pytest*)",
+      "Bash(uv run pytest*)",
+      "Bash(uv run py.test*)",
+      "Bash(uv run -m pytest*)",
+      "Bash(uv run --module pytest*)",
+      "Bash(uv run python -m pytest*)",
+      "Bash(uv run python3 -m pytest*)",
+      "Bash(uv run python3.13 -m pytest*)",
+      "Bash(uvx pytest*)",
+      "Bash(uv tool run pytest*)",
+      "Bash(.venv/bin/pytest*)",
+      "Bash(./.venv/bin/pytest*)",
+      "Bash(.venv/bin/py.test*)",
+      "Bash(./.venv/bin/py.test*)",
+      "Bash(.venv/bin/python -m pytest*)",
+      "Bash(./.venv/bin/python -m pytest*)",
+      "Bash(coverage run -m pytest*)",
+      "Bash(uv run coverage run -m pytest*)",
+      "Bash(tox*)",
+      "Bash(nox*)"
+    ]
   }
 }

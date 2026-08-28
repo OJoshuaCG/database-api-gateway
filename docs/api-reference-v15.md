@@ -1,221 +1,188 @@
-# API Reference v15 — Eliminar una versión intermedia de un blueprint
+# API Reference v15 — Editar una versión de blueprint que ya está aplicada
 
-Addendum al contrato consolidado (`api-reference.md`) para el módulo de migraciones de
-blueprints. Continúa [`api-reference-v14.md`](api-reference-v14.md), que fijó el criterio
-"aplicada hoy". Acá cambia **qué versiones se pueden borrar** y aparece un endpoint nuevo.
+Addendum al contrato consolidado (`api-reference.md`) y continuación directa de
+[`v14`](api-reference-v14.md), que definió cuándo una versión está congelada. Acá se agrega
+la **única vía para atravesar ese freeze**: un endpoint nuevo, dos campos nuevos en el `PATCH`,
+un código de error nuevo y una bandera nueva en el listado.
 
-Ataca un límite duro: **solo se podía borrar la punta**. Una versión intermedia que ya no
-describía nada útil no tenía forma de salir del blueprint.
-
----
-
-## 1. Lo que cambia, en una tabla
-
-| | Antes | Ahora |
-|---|---|---|
-| Qué versiones se pueden borrar | Solo la **punta** | **Cualquiera**, punta o intermedia |
-| Qué bloquea el borrado | Alguna BD está en esa versión **o en una posterior** (`>=`) | Alguna BD está **exactamente** en ella (`==`) |
-| Una BD **adelante** de la versión | Bloqueaba | **No bloquea**: se le mueve el puntero |
-| Qué pasa con las versiones posteriores | — | **Bajan un escalón** (`0016`→`0015`, `0017`→`0016`…) |
-| `block_reason: "not_tip"` | Existía | **Eliminado del vocabulario** |
-| Respuesta del `DELETE` | `data: null` | Objeto con `renumbered` y `stamped` |
-
-> **La edición no cambia.** `sql_frozen` y el 409 `model_migration.sql_frozen` conservan el
-> criterio `>=` de v14. Los dos criterios **divergen a propósito**, y por eso `block_reason` ya
-> no repite lo que dice `sql_frozen`: ver §6.
+> **⚠️ Corrige a v14.** Ese documento decía «**No hay `force`**» y «No ofrecer «Forzar»» para
+> los dos 409. Sigue siendo cierto para `model_migration.still_applied` (el `DELETE`), pero
+> **ya no** para `model_migration.sql_frozen` (el `PATCH`): ahora tiene una vía de excepción
+> con doble factor. Los checklists de v14 que dicen lo contrario quedan corregidos por éste.
 
 ---
 
-## 2. Qué hace exactamente el borrado
+## 1. Por qué existe la vía
 
-1. La versión desaparece del blueprint.
-2. Las posteriores **bajan un escalón**. Las anteriores no se tocan.
-3. A las BDs que están **adelante** se les mueve el puntero a la etiqueta nueva de la **misma**
-   migración. Una BD en `0020` queda en `0019`, y `0019` es la migración que antes se llamaba
-   `0020`: **no retrocede de esquema, sigue un renombre**.
+El freeze supone que la salida siempre es fix-forward, y para un cambio de comportamiento eso
+es cierto. Pero hay correcciones cuyo valor está en que las **BDs nuevas** no repitan el
+defecto. Caso testigo: un `COLLATE` hardcodeado en el DDL de las primeras versiones. Describir
+la corrección con una versión al final de la cadena obliga a toda base nueva a **crearse mal y
+convertirse después**.
 
-**No se ejecuta ningún SQL del blueprint. No es un rollback.**
+### Lo que se paga, y hay que decirlo en la UI
 
-> ⚠️ **Esto hay que decirlo en la UI.** Las BDs que ya habían aplicado esa versión **conservan
-> físicamente** sus objetos. Tras el renumerado la cadena del blueprint ya no los describe, y
-> el borrado no los revierte. El plan (§3) los nombra en `warnings`; mostralos.
+Editar `up_sql` **no re-ejecuta nada**. Las BDs que ya aplicaron la versión conservan
+**físicamente** lo que corrió, así que su puntero de versión pasa a nombrar un SQL que no es el
+que se les aplicó. La divergencia es **real e irreversible**.
 
-Mover el puntero **escribe dentro de cada base gestionada** (`UPDATE` de la tabla de versión de
-Alembic, con conexión y advisory lock). No es una operación local del gateway, y por eso ese
-caso exige confirmación.
+Corolario que la pantalla tiene que dejar claro: **las BDs viejas siguen necesitando la
+corrección por otra vía.** Para collation es el módulo de conversión de charset/collation, que
+además recrea rutinas, triggers y vistas —congelan la collation de la sesión que las creó— y
+evita el `Illegal mix of collations`.
 
 ---
 
-## 3. `GET /database-models/{model_id}/migrations/{version}/delete-plan` — NUEVO
+## 2. Endpoint nuevo — `POST /database-models/{id}/migrations/{version}/edit-preview`
 
-Preview. **No modifica nada**, pero abre conexión a cada BD del blueprint para leer su versión
-en vivo: es lo que hace que el veredicto sea autoritativo y no la caché del listado.
+Rate limit **20/min**. Auditado. Body: los **mismos campos de SQL** que va a llevar el `PATCH`
+(`up_sql`, `down_sql`, `up_sql_mysql`, `up_sql_postgresql`; los no enviados conservan su valor).
 
 ```jsonc
+// 200
 {
   "data": {
-    "model_id": 7,
-    "version": "0015",
-    "deletable": true,
-    "renumber": [
-      { "from_version": "0016", "to_version": "0015" },
-      { "from_version": "0017", "to_version": "0016" }
-    ],
-    "stamp_plan": [
-      {
-        "managed_database_id": 3,
-        "database_name": "clientes_prod",
-        "server_id": 1,
-        "from_version": "0017",
-        "to_version": "0016"
-      }
-    ],
-    "blockers": [],
-    "unstampable": [],
-    "partial_applications": [],
+    "model_id": 3,
+    "version": "0001",
     "requires_confirmation": true,
-    "confirm_token": "1772… .a91f…",
-    "expires_at": "2026-08-28T13:42:00Z",
-    "warnings": [
-      "Las BDs 3 conservan FÍSICAMENTE los objetos que creó la versión 0015: …",
-      "Se moverá el puntero de 1 BD(s): es una escritura sobre cada motor destino …"
-    ]
+    "blocking_databases": [
+      { "managed_database_id": 7, "reason": "still_applied", "current_version": "0005" }
+    ],
+    "resulting_checksum": "d6ee954f…",
+    "confirm_version": "0001",
+    "confirm_token": "1787620000.9f3c…",
+    "expires_at": "2026-08-24T23:59:00Z"
   }
 }
 ```
 
-| Campo | Para qué sirve en la UI |
-|---|---|
-| `deletable` | Habilitar o no el botón. Es el veredicto **en vivo**. |
-| `renumber` | Mostrar la re-etiquetación antes de confirmar. |
-| `stamp_plan` | Listar las BDs a las que se les va a escribir. Cada ítem es una escritura remota. |
-| `blockers` | Por qué no se puede (§5). |
-| `unstampable` | BDs que quedarían en una etiqueta inexistente por un hueco en la numeración. |
-| `partial_applications` | Aplicaciones a medias que bloquean. |
-| `requires_confirmation` | Si es `false`, el `DELETE` **no** pide token. |
-| `confirm_token` | Se reenvía al `DELETE`. `null` si no hace falta o si el plan está bloqueado. |
-| `warnings` | Texto listo para mostrar. El primero no es opinable. |
+- `requires_confirmation: false` ⇒ ninguna BD tiene la versión vigente, `confirm_token` viene
+  **`null`** y el `PATCH` común ya la edita. **No mandes los campos de confirmación en ese
+  caso.**
+- `blocking_databases[]` se lee **del motor**, no de la caché del inventario: es exactamente
+  el conjunto de bases que van a quedar divergentes, y es la información por la que existe
+  esta llamada. Mismos cuatro `reason` de v14 (incluido `unreadable`, que **cuenta como
+  bloqueante**: un motor caído no prueba que la base ya no tenga la versión).
 
 ---
 
-## 4. `DELETE /database-models/{model_id}/migrations/{version}`
+## 3. Campos nuevos en `PATCH /database-models/{id}/migrations/{version}`
 
-Gana el query param `confirm_token`, **obligatorio solo si el plan implica mover punteros**.
+| Campo | Tipo | Para qué |
+|---|---|---|
+| `confirm_version` | `string` | Debe ser **exactamente** la versión de la ruta. Obliga a identificar conscientemente qué se toca (molde de `confirm_target_name`). |
+| `confirm_token` | `string` | El emitido por `edit-preview`. TTL corto; atado al **SQL exacto** que se previsualizó. |
 
-```
-DELETE /database-models/7/migrations/0015?confirm_token=1772….a91f…
-```
+**Van los dos o no va ninguno.** Cubren cosas distintas: el primero, *qué* versión; el segundo,
+frescura, anti-replay y *qué SQL*. Sin el `subject` del token, `(operación, model_id, version)`
+sería igual para cualquier edición de esa versión, así que se podría previsualizar una
+corrección inocua —viendo un `blocking_databases` tranquilizador— y mandar otra en el `PATCH`.
 
-**Compatibilidad**: borrar la punta de un blueprint sin BDs adelante sigue funcionando sin
-token, igual que antes. Un cliente que no se actualice conserva ese caso.
-
-La respuesta dejó de ser vacía:
-
-```jsonc
-{
-  "data": {
-    "model_id": 7,
-    "version": "0015",
-    "renumbered": [
-      { "from_version": "0016", "to_version": "0015" },
-      { "from_version": "0017", "to_version": "0016" }
-    ],
-    "stamped": [
-      { "managed_database_id": 3, "database_name": "clientes_prod", "server_id": 1,
-        "from_version": "0017", "to_version": "0016" }
-    ]
-  },
-  "message": "Migración eliminada."
-}
-```
-
-Usala para refrescar la lista de versiones **y** las versiones que la SPA muestre de cada BD:
-las de `stamped` cambiaron de número.
-
-### El token está atado al estado del parque
-
-No es solo anti-replay: el `confirm_token` incluye una huella de la versión en la que estaba
-**cada BD** cuando se pidió el plan. Si alguna se movió en el medio (un `apply` concurrente),
-el token deja de verificar y el `DELETE` responde **422**. Es correcto: el plan congelado ya no
-describe la realidad. La UI debe volver a pedir `delete-plan`.
-
-TTL de 2 minutos → **410** si venció.
+Si el SQL del `PATCH` no es el que se previsualizó, el token **no valida** (422). Reenviar el
+preview es la salida.
 
 ---
 
-## 5. Códigos de error
+## 4. Errores
 
-Todos en `public_context.code`, que se envía en todos los entornos (a diferencia de `context`,
-visible solo en `development`).
+| HTTP | `public_context.code` | Cuándo |
+|---|---|---|
+| 409 | `model_migration.sql_frozen` | Se cambió el SQL de una versión vigente **sin** los dos factores. Trae además **`override_available: true`**. |
+| 422 | `model_migration.edit_confirm_mismatch` | `confirm_version` no coincide con la versión de la ruta. |
+| 409 | `model_migration.partial_application` | Hay una aplicación **a medias** sin resolver. Trae `incomplete_progress[]` con la BD y cuántas sentencias alcanzó. |
+| 409 | `model_migration.stale_overrides` | Se cambió `up_sql` dejando overrides por motor que quedarían obsoletos. Trae `stale_overrides[]` con los nombres de campo. |
+| 422 | *(sin code)* | El token no corresponde a esta versión/SQL, o está malformado. |
+| 410 | *(sin code)* | El token expiró. |
 
-| HTTP | `public_context.code` | Cuándo | Qué ofrecer |
-|---|---|---|---|
-| 409 | `model_migration.version_in_use` | Alguna BD está parada **exactamente** en esa versión. | Nombrar esas BDs (`blocking_databases`) y ofrecer moverlas con apply o rollback. |
-| 409 | `model_migration.unreadable_databases` | No se pudo leer la versión de alguna BD. **Fail-closed.** | «Reintentar». Es un problema de acceso a esa BD, no del blueprint. |
-| 409 | `model_migration.renumber_confirmation_required` | El borrado mueve punteros y no llegó `confirm_token`. | Pedir `delete-plan` y mostrar el diálogo de confirmación. Trae `stamp_plan`. |
-| 422 / 410 | *(del token)* | Token que no corresponde al plan congelado / vencido. | Volver a pedir `delete-plan` y rehacer la confirmación. |
-| 409 | `model_migration.renumber_stamp_failed` | Falló el re-stamp de una BD, **o** falló el renumerado local con punteros ya movidos. En los dos casos **el blueprint no se modificó**. | Mostrar `compensated`: si es `true`, todo volvió a su lugar y se puede reintentar. Si es `false`, `left_moved` lista **solo** las BDs que quedaron mal marcadas (con `from_version` y `to_version`) — esas requieren un `stamp` manual antes de reintentar. |
-| 409 | `model_migration.renumber_target_missing` | Una BD quedaría en una etiqueta inexistente (hueco en la numeración justo debajo de donde está parada). | Explicar el hueco: `unstampable_databases` trae `current_version` y `missing_target`. |
-| 409 | `model_migration.affected_partial_application` | Alguna versión afectada tiene una aplicación a medias. | Enlazar a `reconcile-partial` de esa BD. |
+Los dos últimos **no llevan `code`** porque salen del servicio de tokens, compartido con otros
+módulos del gateway. No hace falta: clasificá por **status**, y en los dos casos el CTA es el
+mismo — **volver a pedir el preview** (en el 410 porque venció, en el 422 porque el SQL cambió
+respecto del previsualizado). Nunca re-previsualices en silencio: el usuario tiene que volver a
+ver a quién deja divergente.
 
-Los que nombran BDs traen `version` y `blocking_databases[]` con `managed_database_id`,
-`reason` y —cuando aplica— `current_version`.
+### `model_migration.partial_application` NO se abre con el doble factor
 
-### `reason`
+Es un 409 distinto y hay que tratarlo distinto. Acá el problema no es la divergencia: es que un
+`resume` posterior interpretaría los índices del checkpoint contra un SQL que no es el que
+corrió. La salida es reintentar el `apply` sobre esa BD (retoma solo) o limpiarlo con
+`stamp?force=true`. **No ofrezcas «Editar igual» en este 409** — no existe override.
 
-| `reason` | Significa |
-|---|---|
-| `in_use` | Está **exactamente** en esa versión. Es el motivo del borrado. |
-| `still_applied` | Está en esa versión o en una posterior. Es el motivo de la **edición** (`sql_frozen`). |
-| `unreadable` | No se pudo leer su versión (motor caído, base sin aprovisionar, credencial rota, o un puntero no numérico). |
-| `unknown_database` | Historial contra una BD que ya no está en el inventario. |
-| `unknown_blueprint` | No se pudo resolver el blueprint. |
+### `model_migration.stale_overrides` debería ser imposible desde la UI
 
-El `message` **nunca** transcribe el error del motor (puede llevar host, usuario o fragmentos de
-sentencia). No intentes parsearlo: clasificá por `code` y `reason`.
-
----
-
-## 6. Banderas del listado y del detalle
-
-`GET /database-models/{id}/migrations` y `.../migrations/{version}`:
-
-| Campo | Cambio |
-|---|---|
-| `sql_frozen` | **Sin cambios** (criterio `>=`). |
-| `deletable` | Ya **no** exige ser la punta. Ahora es "ninguna BD parada exactamente acá y sin aplicación parcial". |
-| `block_reason` | `"not_tip"` **eliminado**. Valores: `"in_use"`, `"partial"`, `null`. |
-| `delete_requires_stamps` | **NUEVO**. `true` = borrarla implicaría escribir en el motor de alguna BD. |
-
-> **`deletable` y `sql_frozen` ya no se mueven juntos**, y no es un bug. Una versión con una BD
-> **adelante** tiene `sql_frozen: true` (describe lo que ya corrió allí) y `deletable: true` (el
-> borrado le mueve el puntero). Si la UI derivaba una de la otra, hay que separarlas.
-
-`delete_requires_stamps` sale de la **caché** del inventario: es una pista para elegir el
-diálogo de confirmación, **no un veredicto**. El autoritativo es `delete-plan`. Puede pasar que
-el listado ofrezca el botón y el plan después lo rechace — la divergencia es siempre en esa
-dirección, nunca al revés.
+Si el formulario ya sabe qué overrides por motor tiene la versión, puede exigir que se
+reenvíen corregidos o se limpien (`null`) en la misma llamada. Llegar a este 409 es un
+formulario incompleto, no un caso de negocio.
 
 ---
 
-## 7. Flujo recomendado para la SPA
+## 4.bis ⚠️ `down_sql` NO está congelado
 
-```
-1. El usuario pulsa «Eliminar» en una versión con deletable: true
-2. GET .../{version}/delete-plan
-   ├─ deletable: false        → mostrar blockers y salir
-   ├─ requires_confirmation: false → DELETE directo (sin token)
-   └─ requires_confirmation: true  → diálogo con renumber, stamp_plan y warnings
-3. DELETE .../{version}?confirm_token=…
-   ├─ 200 → refrescar versiones Y las versiones mostradas de las BDs de `stamped`
-   ├─ 422/410 → el parque cambió: volver al paso 2
-   └─ 409 → clasificar por public_context.code (§5)
-```
+El freeze mira **solo** `up_sql` y los overrides por motor. **`down_sql` se puede editar
+siempre**, incluso con `sql_frozen: true` y sin ningún factor de confirmación.
 
-> El intento queda **auditado antes** de que se toque un solo motor (`migration.delete` con
-> `touched_engine: true`), así que un renumerado que falla a mitad deja rastro de qué punteros
-> se iban a mover. El éxito escribe una segunda entrada con el resultado.
+No es un descuido: confirmar el rollback **después** de haber aplicado es un flujo soportado —
+el 409 de `rollback` pide exactamente eso. Si la UI deshabilita todo el formulario cuando
+`sql_frozen` es `true`, **cierra la única salida de ese otro 409** y deja la versión sin forma
+de revertirse nunca.
 
-El diálogo de confirmación **debe** mostrar los `warnings` del plan. El primero dice que las
-BDs conservan físicamente los objetos de la versión que se borra, y es la consecuencia que el
-operador tiene que entender antes de confirmar.
+**Regla para la UI:** con `sql_frozen: true`, deshabilitá `up_sql` y los overrides; dejá
+`down_sql` **habilitado**.
+
+Dos efectos de editar `down_sql` que conviene saber: purga las capturas de `SELECT` de
+dirección `down` (sus índices de sentencia dejarían de apuntar a lo mismo), y en una versión
+con `capture_selects` **revoca la aprobación** (`reviewed` vuelve a `false`), porque lo que se
+aprobó era una consulta concreta.
+
+`override_available` es el campo que permite distinguir **"no se puede"** de **"se puede
+confirmando"** sin interpretar la prosa del `message`. Cuando es `true`, el CTA correcto ya no
+es solo «Crear versión correctiva»: se suma «Editar igual (asumiendo divergencia)».
+
+---
+
+## 5. Bandera nueva — `sql_diverged`
+
+Presente en el listado (`ModelMigrationSummary`) y en el detalle (`ModelMigrationOut`).
+
+`true` = el SQL de esta versión **se editó después de que alguna BD la aplicara**, así que ya
+no describe el plano de todas sus bases.
+
+- **No restringe nada.** El SQL nuevo es el que se aplica de acá en más; la bandera es señal,
+  no bloqueo. No deshabilites controles por esto.
+- Es un **hecho persistido**, derivado del log de auditoría (acción
+  `migration.sql_edited_after_apply`), no un dato de la respuesta del `PATCH`: sobrevive a
+  recargas y a que las BDs divergentes se den de baja.
+- El detalle de **qué** bases divergieron, cuándo y con qué checksum previo está en la
+  auditoría, no en este campo.
+
+---
+
+## 6. El `DELETE` no cambia
+
+`model_migration.still_applied` **sigue sin override**. Borrar la descripción de cambios que
+están físicamente en una BD deja esa base con objetos que **ninguna** versión del blueprint
+describe, y eso no se arregla con un rastro. Todo lo que v14 dice del `DELETE` sigue vigente.
+
+---
+
+## 7. Checklist para la SPA
+
+- [ ] En el 409 `sql_frozen`, leer **`override_available`**. Si es `true`, ofrecer la segunda
+      salida además de «Crear versión correctiva».
+- [ ] Esa segunda salida **no** es un switch: es un flujo de dos pasos (preview → confirmar)
+      que muestra `blocking_databases[]` antes de pedir la confirmación. Un botón «Forzar» de
+      un click convierte en trámite lo que es una decisión irreversible.
+- [ ] En la pantalla de confirmación, decir explícitamente que **las BDs listadas conservan lo
+      que ya se les aplicó** y que necesitan corrección por otra vía. Es el malentendido más
+      probable de toda la feature.
+- [ ] Reenviar en el `PATCH` **el mismo SQL** que se mandó al preview. Si el usuario lo
+      retoca, volver a pedir preview (si no: 422).
+- [ ] Manejar 410 (token vencido) reabriendo el preview, sin perder lo que el usuario escribió.
+- [ ] Mostrar `sql_diverged` como insignia informativa en el listado y el detalle. **No**
+      deshabilitar acciones por ella.
+- [ ] Cuando `requires_confirmation` sea `false`, **no** mandar `confirm_version`/`confirm_token`.
+- [ ] Con `sql_frozen: true`, deshabilitar `up_sql` y los overrides pero **dejar `down_sql`
+      habilitado** (§4.bis). Deshabilitarlo entero cierra la salida del 409 de rollback.
+- [ ] No ofrecer «Editar igual» en `model_migration.partial_application`: ese 409 no tiene
+      override. Su CTA es reintentar el `apply` sobre la BD que `incomplete_progress` nombra.
+- [ ] Hacer imposible `model_migration.stale_overrides` desde el formulario: si la versión
+      tiene overrides, exigir reenviarlos o limpiarlos en la misma llamada.

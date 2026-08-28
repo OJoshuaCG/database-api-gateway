@@ -24,6 +24,7 @@ dependencies = [
 dev = [
     "httpx>=0.28.1",
     "pytest>=9.0.3",
+    "ruff>=0.16.4",
 ]
 
 [tool.pytest.ini_options]
@@ -32,3 +33,41 @@ testpaths = ["tests"]
 markers = [
     "integration: pruebas que requieren motores de BD reales (Docker). Se saltan si los engines no son alcanzables. Ejecutar con `-m integration`.",
 ]
+
+# ─── Ruff ──────────────────────────────────────────────────────────────────── #
+#
+# `select` es el GATE: lo que está acá bloquea el merge (.github/workflows/ci.yml).
+# Arranca en `F` (pyflakes) a propósito, no por timidez:
+#
+#   - Son errores REALES, no estilo: imports huérfanos, variables asignadas y nunca
+#     usadas, nombres indefinidos. Es como se esconde el código muerto.
+#   - Al configurarlo daba 20 hallazgos, todos arreglables de una sentada, así que el
+#     gate nace VERDE. Un gate que nace rojo se desactiva en la primera semana.
+#   - No obliga a reformatear nada, así que `git blame` sigue sirviendo.
+#
+# El set AMPLIO (477 hallazgos) corre en el job informativo del mismo workflow, que
+# anota el PR y NO bloquea. Ahí hay señal que vale triage —71 `# noqa` que ya no
+# suprimen nada, 40 `raise` sin `from` dentro de un `except`, 33 concatenaciones
+# implícitas de string en un literal de colección (el bug clásico de la coma que
+# falta), 27 de contraseña hardcodeada, 11 `datetime` sin tzinfo— y también cosas que
+# en este repo son DELIBERADAS: `blind-except` y `try-except-pass` suelen ser el
+# resultado de un incidente real de producción (ver docs/development/
+# decisiones-e-incidentes.md antes de "limpiarlos").
+#
+# Para subir el gate: mové códigos del job informativo a `select`, con su fix en el
+# mismo commit. Nunca al revés.
+[tool.ruff]
+# NO es un gate: `E501` no está en `select`, así que ninguna línea larga bloquea nada.
+# Está fijado porque `ruff format` usa este valor y su default (88) marcaría 6768
+# líneas del repo (7,45%): sin esto, un `ruff format` distraído reformatea casi todo
+# el árbol y arrasa con la localidad de `git blame`. El repo escribe hasta ~95.
+line-length = 100
+
+# `.claude/worktrees/` tiene CHECKOUTS COMPLETOS del repo. Está gitignored, así que en
+# CI no existe, pero `ruff check .` en local los recorrería y reportaría cada hallazgo
+# tantas veces como worktrees haya.
+extend-exclude = [".claude"]
+
+[tool.ruff.lint]
+select = ["F"]
+

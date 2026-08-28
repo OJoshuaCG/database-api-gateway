@@ -77,7 +77,7 @@ class _Exc(Exception):
     ],
 )
 def test_map_mysql_errno(code, expected):
-    exc = map = re.map_driver_error(_Exc(_Orig(code=code)), op="x", target=_target())
+    exc = re.map_driver_error(_Exc(_Orig(code=code)), op="x", target=_target())
     assert exc.status_code == expected
     assert exc.context["remote_error_code"] == str(code)
 

@@ -1,0 +1,172 @@
+# Lint, tests y gate de secretos.
+#
+# POR QUÉ ESTE WORKFLOW CORRE `pytest` SI CLAUDE.md DICE QUE NO SE CORRE
+# ---------------------------------------------------------------------
+# No es una contradicción, y conviene leerlo antes de "arreglarla" borrando el job.
+#
+# La regla de CLAUDE.md ("NO ejecutes pytest salvo pedido explícito") está justificada
+# por el costo en LA MÁQUINA DE QUIEN TRABAJA: la suite tarda varios minutos por el I/O
+# de WSL2 sobre /mnt/, y correrla como chequeo automático tras cada cambio genera carga
+# real sin que se haya pedido. El `permissions.deny` de .claude/settings.json que la
+# hace efectiva es un permiso de Claude Code, y no alcanza —ni tiene por qué— a un
+# runner de GitHub Actions.
+#
+# Un runner no paga ninguno de los dos costos: es una máquina descartable, sin WSL, y
+# nadie está esperando frente a ella. Así que el reparto es:
+#
+#     loop local  →  scripts/run_tests_direct.py   (rápido, sin pytest)
+#     gate        →  pytest de verdad, acá
+#
+# Y hace falta que sea pytest y no el arnés: el arnés NO multiplica un test por los
+# `params` de su fixture, no tiene fixtures de scope module/session, ni conftest por
+# directorio. O sea que hay una clase de fallas que estructuralmente no puede ver.
+#
+# POR QUÉ EXISTE ESTE GATE
+# ------------------------
+# Porque sin él la suite se degrada EN SILENCIO, y eso ya pasó: al versionar el arnés
+# de verificación aparecieron tres tests que llevaban tiempo sin cubrir lo que decían,
+# uno de ellos el guard del incidente del `DROP TABLE _gw_v_` en producción. Nadie
+# podía enterarse (ver T-260825-lz-sanear-verificacion).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Mínimo privilegio para el GITHUB_TOKEN. Sin esto corre con los permisos amplios por
+# defecto, y ninguno de estos jobs necesita escribir nada: solo leen el árbol. Importa
+# porque una acción de terceros comprometida hereda el token del workflow.
+permissions:
+  contents: read
+
+# Un push nuevo al mismo PR vuelve obsoleta la corrida anterior: se cancela para no
+# quemar minutos. En `main` NO se cancela: ahí cada corrida es el gate de un commit que
+# ya se desplegó, y perderla es perder la verificación.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ─── Lint BLOQUEANTE ────────────────────────────────────────────────────── #
+  #
+  # El set que bloquea vive en pyproject.toml (`[tool.ruff.lint] select`), no acá: así
+  # `ruff check .` en local da exactamente lo mismo que el gate. Un gate con reglas
+  # propias, invisibles desde el repo, es un gate que sorprende en el PR.
+  # `uv sync --locked` y no `--frozen`: los dos usan el lock tal cual, pero `--locked`
+  # además FALLA si `uv.lock` no coincide con `pyproject.toml`. Sin eso, alguien que
+  # agrega una dependencia y se olvida de `uv lock` obtiene un CI que instala algo
+  # distinto de lo que él tiene, y el gate deja de verificar lo que se va a desplegar.
+  lint:
+    name: Ruff (bloqueante)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check .
+
+  # ─── Lint INFORMATIVO ───────────────────────────────────────────────────── #
+  #
+  # `continue-on-error` a propósito: son 477 hallazgos y bloquear con eso volvería el
+  # gate inservible el primer día. Corre para que la deuda sea VISIBLE en el PR en vez
+  # de invisible, y para que subir el gate sea un movimiento medible: se pasa un código
+  # de acá a `select` en pyproject.toml, con su fix en el mismo commit.
+  #
+  # El set NO es "todo lo que Ruff sabe": eso da 6722 hallazgos, dominados por `S101`
+  # (los 3755 `assert` de los tests) y `PLR2004` (los `== 200`), que en una suite de
+  # tests son el idioma, no un defecto. Lo de acá es lo que tiene señal real.
+  #
+  # OJO al triagear: `BLE001` (blind-except) y `S110` (try-except-pass) en este repo
+  # suelen ser el resultado de un incidente de producción documentado. Antes de
+  # "limpiarlos", buscalos en docs/development/decisiones-e-incidentes.md.
+  lint-informativo:
+    name: Ruff (informativo, no bloquea)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Deuda de lint (no bloquea el merge)
+        run: |
+          uv run ruff check --output-format github \
+            --select RUF100,RUF012,I001,UP007,UP035,B904,B008,DTZ,ISC004 \
+            --select BLE001,S110,S105,S106,LOG,G,C408,PERF401,PERF402,RET501 \
+            --select SIM103,SIM114,SIM118,PLW,PLR1711,PLR1714,PLR1733,PLR0402 \
+            .
+
+  # ─── Los workflows mismos ───────────────────────────────────────────────── #
+  #
+  # Un workflow mal escrito no falla ruidosamente: GitHub simplemente no lo corre, o lo
+  # marca como inválido en una pantalla que nadie mira. O sea que el gate desaparece sin
+  # avisar, que es el modo de fallo exacto que este pipeline existe para evitar.
+  #
+  # Al escribir estos archivos se colaron un `steps` sin dos puntos y un chequeo VACUO
+  # (`alembic heads | grep -v '(head)'`, que filtra todo y siempre pasa). El primero lo
+  # atrapa actionlint; para el segundo no hay linter, pero da la idea del riesgo.
+  #
+  # Se lintean TODOS, no solo estos dos: si `migrations-apply.yml` se rompe, este job
+  # —que vive en otro archivo y sí corre— es lo único que lo va a decir.
+  workflows:
+    name: Workflows válidos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: actionlint
+        run: uvx --from actionlint-py==1.7.12.24 actionlint .github/workflows/*.yml
+
+  # ─── Tests ──────────────────────────────────────────────────────────────── #
+  #
+  # No hace falta ningún servicio ni .env: tests/conftest.py fija TODAS sus variables
+  # de entorno antes de importar la app y usa un SQLite temporal como BD de metadatos.
+  #
+  # Los tests marcados `integration` necesitan motores reales y se saltean solos cuando
+  # no son alcanzables (ver el marker en pyproject.toml), así que no se filtran acá: se
+  # dejan correr y reportan `skipped`. Un skip visible es información; excluirlos con
+  # `-m "not integration"` los volvería invisibles.
+  tests:
+    name: Suite completa
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest -q --durations=10
+
+  # ─── Secretos ───────────────────────────────────────────────────────────── #
+  #
+  # Se usa `detect-secrets-hook` y NO `detect-secrets scan --baseline`: el segundo
+  # REESCRIBE el baseline y actualiza los números de línea, así que mover código
+  # inocente lo ensucia y el chequeo se vuelve ruido. El hook solo falla con hallazgos
+  # que no están en el baseline, y no toca el archivo.
+  #
+  # Los 99 del baseline son falsos positivos verificados uno por patrón: los revision
+  # IDs de alembic/versions (que el plugin lee como hex de alta entropía), las
+  # contraseñas de fixtures de test, los ejemplos de la documentación, y un
+  # `password_mode="reused"` cuyo NOMBRE contiene "password". Si algún día hay que
+  # agregar algo al baseline, mirá el hallazgo antes: un baseline es para callar falsos
+  # positivos, no para tapar un secreto de verdad.
+  #
+  # Solo archivos versionados (`git ls-files`): con --all-files entran .venv/ y
+  # .claude/worktrees/, que suben el ruido de 99 a 592.
+  secretos:
+    name: Sin secretos nuevos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: detect-secrets contra el baseline
+        run: git ls-files -z | xargs -0 uv run detect-secrets-hook --baseline .secrets.baseline

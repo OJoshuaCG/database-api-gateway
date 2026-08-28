@@ -8,8 +8,28 @@
 > `api-reference-v5.md` y de las guías de feature específicas para frontend
 > (`docs/features/*-frontend-api.md`). Esos archivos siguen existiendo como historial
 > con más detalle narrativo (escenarios, mockups, diagramas de flujo), pero **este es
-> el documento a leer primero**: todo lo que necesitás para integrar el gateway hoy
-> está acá.
+> el documento a leer primero**.
+>
+> ⚠️ **Los addendums de v6 en adelante NO están consolidados acá.** Siguen sueltos, y
+> cada uno cubre una feature distinta — el número **no** indica antigüedad del contrato
+> ni "la versión vigente", solo el orden en que se escribieron. Buscalos por título:
+>
+> | | Feature |
+> |---|---|
+> | `v6` | Consola SQL (SQL ad-hoc con el usuario del motor que elijas) |
+> | `v7` | Catálogo de charsets/collations |
+> | `v8` | Conversión de collation de una BD completa |
+> | `v9` | Captura de resultados de `SELECT` dentro de una migración |
+> | `v10` | Exportación de bases de datos |
+> | `v11` | Validación de migraciones y collation de referencia del blueprint |
+> | `v12` | Re-aprovisionamiento de BDs gestionadas |
+> | `v13` | La captura de `SELECT` pasa de tres llaves a dos |
+> | `v14` | Una versión de blueprint se descongela al revertirla |
+> | `v15` | Editar una versión de blueprint que ya está aplicada |
+> | `v16` | Proyectos: agrupación de blueprints |
+>
+> Si consolidás alguno acá, sacalo de esta tabla en el mismo cambio: una tabla que
+> miente sobre qué falta leer es peor que no tenerla.
 
 **Versión de la API:** `v1` · **Base URL:** `https://<host>/api/v1` · **Estado:** Iteraciones 1 y 2 + migraciones de blueprints (Plan 02) + adopción/reconciliación/snapshot (Plan 09) + gestión agrupada de usuarios del motor + comparación de esquemas entre BDs (con cierre de dependencias y reconciliación de aplicaciones parciales) implementadas (ver [§15](#15-estado-del-proyecto)).
 

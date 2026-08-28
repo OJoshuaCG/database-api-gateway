@@ -63,12 +63,25 @@ def test_topo_sort_places_fk_parent_before_child():
 
 
 def test_order_statements_respects_class_order():
+    """
+    ``routine`` va ANTES de ``view``, no al revés.
+
+    El test afirmaba ``["table", "view", "routine"]``, que era el orden ANTERIOR a
+    ``ff42389`` ("ordenar el baseline por dependencia real en vez de alfabéticamente").
+    Ese commit reordenó ``_CLASS_ORDER`` a propósito —en PostgreSQL una vista que llama a
+    una función se VALIDA al crearse, así que emitirla antes de la función falla con
+    42883— y **no actualizó este test**, que quedó rojo sin que nadie lo viera porque la
+    política del repo es no correr ``pytest``.
+
+    O sea: el código está bien y la aserción estaba vieja. Se deja el motivo escrito para
+    que el próximo que lo vea rojo no "arregle" el orden de producción de vuelta.
+    """
     ordered = sl.order_statements([
         _obj("routine", "r"),
         _obj("view", "v"),
         _tbl("t"),
     ])
-    assert [s.object_type for s in ordered] == ["table", "view", "routine"]
+    assert [s.object_type for s in ordered] == ["table", "routine", "view"]
 
 
 # --------------------------------------------------------------------------- #

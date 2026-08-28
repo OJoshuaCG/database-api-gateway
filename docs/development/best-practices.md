@@ -429,11 +429,86 @@ async def get_user_stats(user_id: int):
 
 ## Testing
 
-### Instalar Dependencias de Testing
+### Cómo se corren los tests en este repo: `scripts/run_tests_direct.py`
+
+**`pytest` no se corre** como chequeo automático (ver "Ejecución de tests (pytest) — NO por
+defecto" en `CLAUDE.md`: la suite tarda varios minutos y correrla tras cada cambio genera carga
+real en la máquina de quien trabaja). La herramienta de verificación es un **ejecutor directo**:
 
 ```bash
-uv add --group dev pytest pytest-asyncio httpx
+.venv/bin/python scripts/run_tests_direct.py tests.test_api_servers
+.venv/bin/python scripts/run_tests_direct.py tests.test_health cors   # filtro por nombre
 ```
+
+Carga las fixtures REALES de `tests/conftest.py`, resuelve las locales del módulo, expande
+`@pytest.mark.parametrize`, construye el `TestClient` solo si la cadena de fixtures lo declara,
+y trata `pytest.skip` como skip. Sus límites están declarados en el docstring del script.
+
+**Por qué está versionado y no se escribe al vuelo:** antes vivía en un scratchpad y se
+reescribía por sesión, así que acumuló cinco huecos y dos de ellos volvieron después de haber
+sido corregidos. El más caro no fue un test que no corría sino uno que corría verificando otra
+cosa: el arnés fabricaba `server_payload` con valores distintos a los reales, y eso dejó **dos
+aserciones de seguridad sin poder fallar** (la que verifica que la contraseña no se filtre
+buscaba un string que el payload falso jamás enviaba; la del bloqueo de loopback usaba un host
+que no es loopback). Esa fixture la usan 56 tests en 12 archivos.
+
+Si un test nuevo necesita algo que el arnés no soporta, **agregalo al script y sumale un caso a
+`tests/test_run_tests_direct.py`** — no escribas un arnés propio, que es exactamente cómo
+volvieron los huecos.
+
+### Verificar por mutación, y la trampa del `.pyc`
+
+El verde de un test no prueba que cubra algo: hay que **romper a propósito** lo que dice cubrir
+y ver que se ponga rojo. Es lo único que distingue un test que verifica de uno que acompaña.
+
+Pero si la mutación es sobre un archivo de `app/`, hay una trampa que produce resultados falsos
+**después** de restaurar. Python valida el `.pyc` contra el par (mtime del fuente **en segundos
+enteros**, tamaño en bytes). Una mutación que intercambia dos líneas deja el tamaño idéntico, y
+un script que muta, corre y restaura lo hace dentro del mismo segundo: el par no cambia, Python
+**no recompila**, y todo proceso posterior carga el bytecode **mutado** desde un fuente que
+`git diff` reporta limpio. Es un peligro específico de scripts y agentes — a mano nadie muta y
+restaura en menos de un segundo.
+
+Ya costó una auditoría completa: dos tests rojos, uno de ellos sano, sobre código intacto.
+
+`scripts/run_tests_direct.py` se protege con `sys.dont_write_bytecode = True` (cuesta ~7% de
+arranque). Si mutás desde otro proceso, **limpiá la caché después de restaurar**:
+
+```bash
+find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
+```
+
+### Dónde está el gate: CI corre `pytest` de verdad
+
+El arnés es el loop **local**. El gate que impide que la suite se degrade es
+`.github/workflows/ci.yml`, y ahí corre **`pytest`**, no el arnés: un runner es descartable, no
+tiene el I/O de WSL2 y nadie espera frente a él, así que la razón de la política local no
+aplica. Además hace falta que sea pytest, porque el arnés no multiplica un test por los `params`
+de su fixture ni tiene fixtures de scope `module`/`session` — hay una clase de fallas que
+estructuralmente no puede ver.
+
+El workflow tiene cinco jobs: Ruff **bloqueante** (el set vive en `pyproject.toml`, así que
+`ruff check .` en local da lo mismo que el gate), Ruff **informativo** que anota el PR sin
+bloquear, `actionlint` sobre los propios workflows (uno mal escrito no falla: GitHub
+simplemente no lo corre, y el gate desaparece sin avisar), la suite completa, y
+`detect-secrets` contra `.secrets.baseline` —que **se versiona**, es el registro compartido de
+los 99 falsos positivos ya auditados—. Aparte,
+`migrations-apply.yml` aplica las migraciones contra MariaDB y PostgreSQL efímeros — eso es lo
+que `migration-graph.yml` **no** puede ver, porque lee el grafo con `ast` y no ejecuta el DDL.
+
+### Dependencias de desarrollo
+
+Están en `[dependency-groups] dev` de `pyproject.toml` (`pytest`, `httpx`, `ruff`) y se
+instalan con:
+
+```bash
+uv sync
+```
+
+`uv sync` incluye el grupo `dev` por defecto, así que no hace falta pedirlo. CI corre
+`uv sync --locked`, que es lo mismo pero **falla** si `uv.lock` no coincide con
+`pyproject.toml`: si agregás una dependencia, corré `uv lock` y commiteá el lock, o el gate
+te lo va a marcar.
 
 ### Crear Tests
 

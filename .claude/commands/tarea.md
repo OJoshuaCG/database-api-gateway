@@ -85,13 +85,16 @@ corresponda.
    - **No existe** → creála:
      ```
      clickup_create_task
-       name:    "P-XX — <título del ítem en TODO.md>"   ← ítem del backlog
-                "T-<YYMMDD>-<iniciales>-<slug>"          ← ítem NUEVO
+       name:      "P-XX — <título del ítem en TODO.md>"  ← ítem del backlog
+                  "T-<YYMMDD>-<iniciales>-<slug>"        ← ítem NUEVO
        # iniciales = parte local del email, 8 chars:
        # git config user.email | cut -d@ -f1 | tr -cd "a-z0-9" | cut -c1-8
-       list_id: "901716272178"
-       parent:  "86e2xzf9d"
+       list_id:   "901716272178"
+       parent:    "86e2xzf9d"
+       assignees: ["<ID ClickUp del creador>"]  ← del registro. NUNCA "me"
+       priority:  "normal"                      ← urgent/high/normal/low, ver criterio
      ```
+     **Sin fechas al crear.** `start_date` se pone al empezar; `due_date`, solo al cerrar.
      Para un ítem nuevo **NUNCA uses el siguiente `P-XX` libre**: es secuencial y dos personas
      simultáneas calculan el mismo.
 
@@ -107,7 +110,14 @@ corresponda.
      (`[86e2y1abc](https://app.clickup.com/t/86e2y1abc)`) en la columna
      `Subtarea` de `TODO.md`, y agregá el ítem a 🔴 Pendientes si era nuevo.
 5. Reclamala, **en este orden**:
-   - `clickup_update_task` → `status: "in progress"` (esto es lo que la reserva)
+   - `clickup_update_task` → `status: "in progress"` (esto es lo que la reserva), **en el mismo
+     llamado**:
+     ```
+     start_date: "<date +%F>"   ← SOLO si venía vacío. Si ya tenía, OMITILO (no se pisa)
+     assignees:  [<los que ya estaban>, <el ejecutor>]   ← UNIÓN, nunca solo el tuyo
+     due_date:   "none"         ← SOLO si venís de reabrir una tarea que estaba complete
+     ```
+     Leé la tarea antes (`clickup_get_task`): necesitás `start_date` y `assignees` actuales.
    - `clickup_create_comment` con el bloque `INICIO`, la identidad del ejecutor y el **rol**
      (`backend` o `frontend`) — obligatorio: `in progress` no dice por sí solo quién es
    - Mové el ítem a **🟡 En curso** en `TODO.md`, con ejecutor y fecha
@@ -161,7 +171,8 @@ Después:
 
 ## Modo CERRAR
 
-1. Resolvé la identidad del ejecutor: **`git config user.email`** (solo el email).
+1. Resolvé la identidad del ejecutor: **`git config user.email`** (solo el email), y su **ID de
+   ClickUp** en el registro de identidades de la skill `clickup-task-flow`.
 2. Buscá la subtarea por su ID (en `TODO.md`, o con `clickup_filter_tasks` +
    `include_closed: true`).
 3. Verificá que esté en `in progress`. Si está en otro estado, **decilo** en vez de forzar:
@@ -177,13 +188,15 @@ Después:
 
 ### 4a. NO requiere frontend
 
-- `clickup_update_task` → `status: "complete"`
+- `clickup_update_task` → `status: "complete"` **+ `due_date: "<date +%F>"`** — el único momento
+  en que se escribe la fecha de fin. Los `assignees` no se tocan: quedan todos los que trabajaron
 - `clickup_create_comment` → bloque `FIN`, con **`Sin verificar:`** completo y honesto
 - Mové el ítem a **🟢 Realizadas** en `TODO.md` con el detalle completo
 
 ### 4b. SÍ requiere frontend
 
-- `clickup_update_task` → `status: "update required"` (**no** `complete`)
+- `clickup_update_task` → `status: "update required"` (**no** `complete`) — **sin `due_date`**:
+  el backend terminó lo suyo, la tarea no. La fecha de fin la escribe el frontend al cerrarla
 - `clickup_create_comment` → bloque **`HANDOFF FRONTEND`**:
 
   ```
@@ -217,7 +230,7 @@ Si esta tarea ya tenía un `HANDOFF FRONTEND` previo (venías de invalidarlo), e
 repite el contrato entero: informa el **delta**. El frontend puede tener media implementación
 hecha y lo que necesita saber es qué cambió respecto de lo que ya tenía.
 
-- `clickup_update_task` → `status: "update required"`
+- `clickup_update_task` → `status: "update required"` (tampoco acá va `due_date`)
 - `clickup_create_comment`:
 
   ```
@@ -330,8 +343,9 @@ tres salidas honestas, y las dos últimas se saltean seguido:
 - **El contrato estaba mal escrito, pero el código está bien** → arreglá el **documento**, no el
   código. Devolvela a `update required` citando el hash nuevo.
 
-**2. Reclamala:** `clickup_update_task` → `status: "in progress"`, y comentario `INICIO` con
-**`Rol: backend`**.
+**2. Reclamala:** `clickup_update_task` → `status: "in progress"` **+ `priority: "urgent"`**
+(hay un frontend parado) **+ `assignees` con la unión**, y comentario `INICIO` con
+**`Rol: backend`**. `start_date` normalmente ya lo tiene de la primera vuelta: **no lo pises**.
 
 **3. Arreglá solo lo que desbloquea.** No es la oportunidad de mejorar el endpoint de paso: hay
 una implementación parada del otro lado y el campo **`Dónde quedé`** te dice qué no podés romper.
@@ -429,6 +443,20 @@ Paginá cada una hasta `has_more: false` y presentá:
 - **La identidad del ejecutor es el EMAIL** (`git config user.email`), no el nombre, y va DENTRO
   del texto del comentario. El campo "autor" de ClickUp
   siempre dice la cuenta del token, así que no sirve para detectar colisiones.
+- **Para ASIGNAR, el email de git no sirve: no es un usuario de ClickUp.** Se traduce con el
+  registro de identidades de la skill `clickup-task-flow`. Si el email no está en el registro,
+  **PARÁ y preguntá** — no lo adivines por parecido de nombre: el workspace tiene ~85 miembros de
+  tres empresas y la notificación le llega a un humano real.
+- **`"me"` está PROHIBIDO como assignee.** Resuelve siempre al dueño del token, no al ejecutor.
+- **`assignees` se manda como UNIÓN, leyendo los actuales primero.** Mandar solo el tuyo puede
+  desasignar en silencio a quien hizo la otra mitad. Nadie se saca al cerrar.
+- **`start_date` se escribe una sola vez**, al primer `in progress`, y no se pisa nunca más.
+- **`due_date` SOLO en `complete`.** Ni en `update required`, ni en `on hold`, ni en
+  `in progress`. Al **reabrir** algo cerrado se limpia con `due_date: "none"`.
+- **Las fechas van sin hora** (`date +%F`), y salen de bash, no de memoria.
+- **Ninguna tarea se crea sin `priority`.** `urgent` = producción/seguridad/datos o tarea devuelta
+  con `BLOQUEADO POR BACKEND`; `high` = bloquea a alguien; `normal` = default; `low` = docs y
+  refactors. Ante la duda, `normal`.
 - **Toda subtarea cuelga de `86e2xzf9d`.** Nunca una tarea suelta en la lista.
 - **La jerarquía es de DOS niveles.** El tercer nivel (sub-subtarea) existe para **un solo
   escenario de emergencia**: el backend necesita cambiar algo que el frontend está haciendo en ese

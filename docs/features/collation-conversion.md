@@ -423,6 +423,182 @@ distintos, y mezclarlas es justo lo que dispara el conflicto.
 - Los ítems del modo `columns` son de `object_type='table'` y la fase es `tables`: el polling
   del frontend no cambia. `objects` es siempre `[]`.
 
+## Lote por blueprint: convertir las N bases de una vez
+
+Guía de API: [`api-reference-v17.md`](../api-reference-v17.md).
+
+Un blueprint es un esquema que N bases replican. Convertir una sola no dejaba rastro y las otras
+quedaban como estaban: el módulo no miraba `model_id` ni una vez.
+
+**El lote son N conversiones REALES, no una migración.** Esa es la decisión de fondo y conviene
+dejarla escrita, porque "materializarlo como versión de blueprint y repartirlo con `apply`" es la
+respuesta intuitiva y va a volver a proponerse. No sirve: el SQL de una conversión promete un
+resultado que **depende del estado de cada destino**. Una versión estática no puede recrear los
+objetos con la collation congelada de la hermana —necesita su cuerpo, sus grants y su DEFINER, no
+los del origen—, así que aplicarla le convertiría las tablas y le dejaría las vistas y rutinas en
+la collation vieja: exactamente el `Illegal mix of collations` que este módulo existe para evitar,
+ahora sobre una BD cuyo operador nunca vio el asistente.
+
+Cuatro razones más, todas verificadas, por las que una versión con el `ALTER` de collation adentro
+no es viable:
+
+- **Un cambio de charset SÍ es destructivo**, y el propio repo ya lo decía en el otro camino:
+  `schema_diff` marca `destructive=True, data_conversion=True` con el comentario "re-encoding
+  físico: destructivo". `CONVERT TO` hacia un charset más angosto **reemplaza** los caracteres no
+  representables. Pasaba el guard de entornos solo porque sqlglot degrada esas sentencias a
+  `exp.Command` y el clasificador del AST no las veía. Eso ya está corregido.
+- **El motor prohíbe la operación** con `foreign_key_checks` activo sobre una tabla con columna de
+  texto en una FK. En el job es un ítem en error; en una versión **aborta el `upgrade()` entero**.
+- **El timeout del camino de Alembic** es de socket del cliente, así que corta la conexión
+  mientras el motor sigue reescribiendo: el checkpoint no registra la sentencia, el motor la
+  completa, y el próximo `apply` la reejecuta. Bucle.
+- **`CONVERT TO` cambia tipos de columna** (`TEXT`→`MEDIUMTEXT`, documentado en MySQL 8). Según el
+  estado de partida de cada destino, la operación que promete uniformar puede crear divergencia.
+
+### Flujo
+
+`POST /database-models/{id}/collation-conversions` (planifica: un job por BD activa, ya
+previsualizado) → `.../{batch_id}/execute` (confirma y encola) → `GET .../{batch_id}` (polling)
+→ `.../{batch_id}/cancel`.
+
+Solo entran las BDs **`status=active`**: una `pending` no existe en el motor, una `error` está en
+cuarentena, una `archived` fue retirada de uso.
+
+### La confirmación: un lote se lleva N re-tipeos y hay que reponerlos
+
+`TODO.md` declara que lo que protege este módulo es *"su propio doble factor (re-tipeo +
+`confirm_token`)"*. El `batch_token` lo genera el servidor, así que aporta **frescura**, no
+**intención** — es literalmente el argumento con el que este repo eliminó el consentimiento por
+corrida de la captura de SELECT. Por eso `execute` exige, junto:
+
+1. `confirm_model_slug` == el slug del blueprint.
+2. `database_ids` **echado de vuelta**, idéntico al previsualizado → 422 fail-closed. No se
+   recorta ni se amplía, y **`force` tampoco puede agregar** (si dejara, alguien lo usaría para
+   meter las bases que quedaron en cuarentena o fuera del tope).
+3. El **nombre re-tipeado de cada BD** cuyo entorno tenga `blocks_destructive_migrations=true`.
+   No inventa política nueva: repone el doble factor por base donde `TODO.md` dice que vive.
+4. El token recomputado server-side sobre el lote resuelto.
+5. Por cada job, el **mismo** camino de validación que una conversión suelta
+   (`_validate_job_execution`, extraído justamente para que los dos no puedan divergir).
+
+### Detalles que tienen motivo
+
+- **`capped` se PERSISTE**, no solo se devuelve al planear: si no, el polling no puede reportar
+  el recorte y el operador cree que se convirtió todo el blueprint.
+- **El desenlace del lote se DERIVA al leer** (idempotente), no lo escribe ningún worker. Que
+  cada uno consultara a sus hermanos para saber si es el último es una carrera, y aparece en
+  cuanto `COLLATION_CONVERSION_MAX_WORKERS` deje de ser 1 (su default es configuración, no
+  invariante).
+- **Los jobs corren EN SERIE** con el default de 1 worker, y el pool es único: un lote de 12
+  monopoliza el módulo por horas. De ahí `runs_serially` y `batch_seq` en el contrato — sin eso
+  la UI no puede distinguir "en cola" de "colgado".
+- **Se reusa `create_plan` + `preview` por BD** aunque cueste 2-3 lecturas de catálogo por base.
+  Un camino "optimizado" que no pase por esos métodos deja de heredar sus validaciones (catálogo
+  de charsets, existencia de la BD, guard de la BD de metadatos, TTL, fingerprint), y es así como
+  los dos caminos se separan. Si el costo molesta, lo correcto es cachear el inventario DENTRO de
+  la corrida, no saltear los métodos.
+- **El barrido de arranque cierra también los jobs EN COLA** de un lote `running`. La cola del
+  `ThreadPoolExecutor` no es durable: un reinicio dejaba un job `interrupted` y los demás
+  `pending` **para siempre**, con el lote colgado. Solo se tocan los que tienen `batch_id` — un
+  `pending` suelto es un plan legítimo sin ejecutar. **No se re-encolan**: el fingerprint pudo
+  cambiar y el token autorizaba un plan sobre un inventario que ya no es el actual.
+- **Cancelar un job en cola ya no ejecuta nada.** El reclamo del worker mira `cancel_requested`;
+  antes solo filtraba por `status`, así que un job cancelado entraba al pipeline y ejecutaba la
+  fase 1 completa —el `ALTER DATABASE`— porque los dos únicos cortes cooperativos están dentro de
+  los bucles de tablas y objetos.
+
+## La versión de contabilidad
+
+`POST /database-models/{id}/collation-conversions/{batch_id}/blueprint-version` registra un lote
+terminado como versión secuencial y la **stampea** en sus N bases.
+
+**Se crea y se marca; no se aplica nunca.** La conversión ya la hizo cada job. Esto solo evita
+que el ledger del blueprint mienta sobre lo que sus bases tienen físicamente.
+
+Es una llamada **explícita del operador** y no un hook del worker, y eso resuelve cuatro cosas de
+una:
+
+- el worker sostiene el advisory lock del motor durante todo su `_finish`, con la **misma clave**
+  que `stamp` pide en otra conexión: el `GET_LOCK` esperaría 30 s y devolvería **409, siempre**;
+- `run_job` envuelve el pipeline en un `except` que reetiquetaría como fallida una conversión ya
+  ocurrida e **irreversible**;
+- acá hay `admin` y Request ID reales, y el worker no los hereda (`ThreadPoolExecutor.submit` no
+  propaga ContextVars);
+- un fallo es un HTTP que el operador ve, no un estado que descubre horas después.
+
+### Ocho guards, y por qué cada uno
+
+| Guard | Por qué |
+|---|---|
+| lote completo | Versionar un lote que falló afirmaría en el ledger algo que el plano físico no tiene. |
+| sin bases de otro motor | Una hermana PostgreSQL queda con la cadena trabada **permanentemente**: no puede existir un `up_sql_postgresql` válido porque su `LC_COLLATE` es inmutable tras el `CREATE DATABASE`. |
+| ninguna activa fuera del lote | La que quedó afuera tendría la versión pendiente, y aplicarla le convertiría las tablas sin recrearle los objetos congelados. |
+| todas en el head | Dos motivos independientes: el SQL sale de un inventario que no refleja las versiones intermedias, y stampear `max+1` afirmaría que esas intermedias se aplicaron. |
+| mismos conjuntos de tablas | Si difieren hay deriva estructural que resolver antes de declarar una versión común. |
+| ninguna conversión parcial | Convertir parcialmente UNA base es una decisión informada; propagar esa incoherencia de FKs a N bases no es la misma decisión. |
+| ninguna en cuarentena | `stamp` limpia la cuarentena: stampearla borraría en silencio la marca de "revisá esta base". |
+| tope de tamaño | `SNAPSHOT_MAX_SQL_PER_VERSION` (4 MB), el que ya usan los llamadores internos — no el cap de 256 KB de la ruta HTTP. |
+
+### Cómo se construye el SQL
+
+- **Sin calificar** con el nombre de la base: la migración corre conectada al destino, y
+  `ALTER DATABASE` sin nombre aplica a la base por defecto de la conexión (documentado en MySQL 8
+  y en MariaDB). Con el nombre del origen adentro, aplicarla a una hermana convertiría la base
+  **equivocada**, en silencio.
+- **Incluye las tablas que en el origen ya estaban al día**: una hermana futura puede no estarlo.
+- El plan se **reconstruye** desde `selection` + un inventario fresco, no desde los ítems
+  persistidos. Las tablas que ya no existen quedan fuera solas (viven en `missing_tables`, que no
+  son pasos), mientras que en los ítems "ya no existe" y "ya estaba al día" son ambos `skipped` y
+  distinguirlos por el texto del error sería frágil.
+- El `up_sql` se une con el separador del manifiesto **resuelto al importar desde su única
+  fuente**. Si no coincide, `usable_manifest` **descarta el manifiesto** con un warning en el log
+  y se pierde `reconcile-partial` sin que nada falle.
+
+### Por qué nace `is_baseline=False, reviewed=True`
+
+No es DDL capturado del motor: son `ALTER TABLE` que construye el gateway con un charset y una
+collation ya canonizados por el catálogo. Con `is_baseline=True, reviewed=False` **congelaría
+`apply`/`apply_all` de todo el blueprint** hasta que alguien la aprobara, porque
+`_guard_reviewed_baseline` es un tripwire de blueprint entero.
+
+El control compensatorio es otro y ya está en pie: el guard de entornos ahora ve la conversión de
+charset como destructiva, así que la versión queda bloqueada en los entornos protegidos.
+
+### Sin `down_sql` ni `down_sql_suggested`
+
+`RollbackGenerator` devuelve `None` para este SQL, y eso **es la verdad**. Un reverso derivado de
+las collations previas del origen sería peor que no tener ninguno: el campo se publica, la doc del
+módulo empuja a promoverlo con `PATCH`, y ejecutarlo re-codifica hacia atrás —pérdida de
+caracteres irreversible— con collations que las hermanas nunca tuvieron.
+
+### Lo que la versión NO garantiza
+
+`CONVERT TO` puede cambiar `TEXT`→`MEDIUMTEXT` / `VARCHAR`→`MEDIUMTEXT`, así que un
+`schema-comparison` posterior puede mostrar diffs de **tipo** causados por esta conversión. Y una
+BD agregada al blueprint **después** del lote tendrá la versión pendiente: aplicarla le convierte
+las tablas pero **no** le recrea los objetos congelados. Para esa base el camino correcto es su
+propio job de conversión y después `stamp`.
+
+## Deriva contra la declaración del blueprint
+
+`GET /database-models/{id}/collation-drift`. **Cero conexiones al motor.**
+
+`DatabaseModel.charset`/`.collation` existían con un comentario diciendo que servían "para
+detectar BDs que se han desviado", y **nadie los leía**. Esto los vuelve una referencia usable: se
+comparan contra la copia del inventario, que la conversión ahora sincroniza al terminar.
+
+Por eso la respuesta declara `source: "cached"` y trae `source_note`: presentar una caché como
+verdad del motor sería mentir en una pantalla que se usa para decidir conversiones.
+
+Cinco estados, y **`unknown` no es `ok`** — pintarlos iguales le diría al operador que todo está
+bien sobre bases de las que no se sabe nada. `not_applicable` es PostgreSQL: allá el concepto es
+`encoding` + `lc_collate`, que no son equivalentes.
+
+Cada fila trae `source_of_truth`, y no es adorno: `charset`/`collation` siguen siendo escribibles
+a mano por `PATCH /managed-databases/{id}`, así que una fila puede decir `ok` porque alguien lo
+tipeó. Es el mismo defecto que el repo ya corrigió para `model_version`; mientras siga abierto, la
+UI necesita poder distinguir un dato leído del motor de una afirmación.
+
 ## Variables de entorno
 
 | Variable | Default | Descripción |
@@ -433,7 +609,13 @@ distintos, y mezclarlas es justo lo que dispara el conflicto.
 ## Limitaciones conocidas
 
 - **No es durable**: un reinicio del gateway deja el job en `interrupted`; hay que revisar los
-  ítems ya aplicados antes de crear un plan nuevo.
+  ítems ya aplicados antes de crear un plan nuevo. En un **lote**, además, los jobs que estaban
+  en cola se cierran como `interrupted` y el lote como `failed`: la cola del `ThreadPoolExecutor`
+  no sobrevive al proceso y **no se re-encolan** a propósito (el fingerprint pudo cambiar y el
+  token autorizaba un plan sobre un inventario que ya no es el actual). Se replanifica.
+- **El lote corre en SERIE.** `COLLATION_CONVERSION_MAX_WORKERS` es 1 por default y el pool es
+  único, así que un lote de 12 bases monopoliza el módulo por horas y bloquea cualquier
+  conversión suelta mientras dure.
 - **Cancelar no interrumpe un `ALTER TABLE` en curso**: es cooperativa y detiene los pasos que
   todavía no empezaron. Matar la sentencia dejaría la tabla a medio reescribir.
 - **Sin rollback automático**: convertir es una operación de una sola dirección. Volver atrás
@@ -455,6 +637,47 @@ distintos, y mezclarlas es justo lo que dispara el conflicto.
   porque ahí podría aplicarse una collation distinta de la esperada.
 - **No revalida FKs ni índices funcionales** después del cambio: solo avisa.
 
+### De la versión de contabilidad
+
+- **`CONVERT TO` puede cambiar el TIPO de una columna** (`TEXT`→`MEDIUMTEXT`,
+  `VARCHAR`→`MEDIUMTEXT`; documentado en MySQL 8, para que entre el texto re-codificado). Un
+  `schema-comparison` posterior puede mostrar diffs de **tipo** causados por esta conversión.
+- **Una BD agregada al blueprint DESPUÉS del lote tendrá la versión pendiente**, y aplicarla le
+  convierte las tablas pero **no** le recrea los objetos con la collation congelada. Para esa
+  base el camino correcto es su propio job de conversión y después `stamp`, no el `apply`.
+- **La versión queda bloqueada en entornos con `blocks_destructive_migrations`**, y eso es
+  deliberado: el guard de entornos ahora ve la conversión de charset como destructiva. Es el
+  control compensatorio que sustituye al gate de `reviewed` que la versión no lleva.
+
+## Cuatro defectos que aparecieron al construir esto
+
+Estaban en producción, ninguno se buscó, y ninguno se manifiesta contra datos de juguete — que
+es por lo que la feature figuraba como verificada.
+
+1. **El motor PROHIBÍA la operación.** MySQL no permite convertir el charset de una tabla con
+   una columna de texto usada en una FK mientras `foreign_key_checks` esté activo. No es un
+   borde: lo dispara cualquier esquema con una FK sobre `varchar`. La fase de tablas ahora corre
+   con los chequeos desactivados, que es el workaround que la propia doc nombra.
+2. **El timeout de 15 s era de socket DEL CLIENTE.** Cortaba la conexión de un `CONVERT TO`
+   **mientras el motor seguía reescribiendo la tabla**: el gateway registraba como fallida una
+   sentencia que en realidad se completaba, y encima dejaba la BD en cuarentena. El peor estado
+   posible era el resultado *esperado* para cualquier tabla real.
+3. **Cancelar un job EN COLA no lo detenía.** El reclamo del worker filtraba solo por `status` y
+   no miraba `cancel_requested`, así que el job entraba al pipeline y ejecutaba la fase 1
+   completa —el `ALTER DATABASE`— porque los dos únicos cortes cooperativos están DENTRO de los
+   bucles de tablas y objetos.
+4. **Nada impedía apuntar una conversión a la propia BD de metadatos del gateway**, o sea
+   reescribir `audit_log` —el único control compensatorio del sistema— y `servers`, que guarda
+   `root_password_encrypted`. El clon, el export y la consola SQL ya cerraban esto; este era el
+   único módulo de la familia sin el guard.
+
+Y una corrección que vale anotar porque la solución evidente rompía producción: el guard de
+entornos **no** puede basarse en `forced_charsets` de `MigrationFacts`. Esa lista matchea
+**cualquier mención** de `CHARACTER SET`/`CHARSET`, incluido el `DEFAULT CHARSET=utf8mb4` que
+lleva prácticamente todo `CREATE TABLE` de MySQL: habría marcado como destructiva casi toda
+migración del parque y bloqueado `apply`/`apply_all` de golpe. El detector es de **forma** (la
+conversión), no de mención, y hay un test dedicado a fijar esa distinción.
+
 ## Verificación
 
 - Modo `universal`: `tests/test_api_collation_conversions.py` (adapter y motor mockeados).
@@ -469,3 +692,23 @@ distintos, y mezclarlas es justo lo que dispara el conflicto.
   con `attcollation`, `pg_constraint` con el par `conkey`/`confkey`), que el `ALTER` múltiple
   no reescriba la tabla, el tiempo real de reconstrucción de índices, y el comportamiento
   exacto de 42P22/42P21 en una FK con collations mezcladas.
+- Lote, versión y deriva: `tests/test_api_collation_batches.py` (31 casos, worker síncrono).
+  Dos de ellos fijan invariantes que se rompen **en silencio** y por eso no alcanzan con una
+  aserción indirecta: uno invoca `MigrationRunner.usable_manifest` **de verdad** sobre el spec
+  cargado con `_load_specs` (si el separador del manifiesto dejara de coincidir, se descarta el
+  manifiesto con un warning en el log y se pierde `reconcile-partial` sin que nada falle), y
+  otro corre la deriva con un adapter que **explota si lo llaman**, para que la promesa de
+  `source: "cached"` no se degrade a una lectura del motor sin que nadie se entere.
+
+**Lo que NO está verificado, y hay que decirlo:**
+
+- **Nada contra motores reales.** Lo más importante a confirmar es si **MariaDB** impone la misma
+  restricción de `foreign_key_checks` que MySQL documenta — es la premisa del primer fix de arriba
+  y su KB no devolvió la sección —, y el ciclo completo lote → versión → `stamp` contra los tres
+  motores.
+- **El `ALTER DATABASE` sin nombre de base** está documentado en MySQL 8 y MariaDB, pero no se
+  ejecutó: es lo que hace replicable el SQL de la versión, así que un fallo ahí la invalida.
+- **Ruff no estaba instalado** en el entorno donde se implementó: el lint no se corrió. Solo se
+  comprobó a mano que ninguna línea agregada supere los 100 caracteres.
+- La migración `a6b7c8d9e0f1` **no se probó contra la BD del gateway real** (sí ciclo
+  upgrade/downgrade/upgrade en SQLite, `alembic check` sin drift nuevo y head único).

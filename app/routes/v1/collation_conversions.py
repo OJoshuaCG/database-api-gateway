@@ -137,6 +137,6 @@ def list_collation_conversion_items(
 )
 def cancel_collation_conversion(admin: AdminDep, job_id: int):
     return success(
-        data=CollationConversionController().cancel(job_id),
+        data=CollationConversionController().cancel(job_id, admin=admin),
         message="Cancelación solicitada.",
     )

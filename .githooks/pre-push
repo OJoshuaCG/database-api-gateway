@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Verifica el grafo de migraciones Alembic antes de dejar salir un push.
+# Guards que corren antes de dejar salir un push.
 #
 # Se instala una vez por clon (los hooks no viajan en el repo):
 #
@@ -8,11 +8,11 @@
 #
 # POR QUÉ EN pre-push Y NO EN pre-commit
 # --------------------------------------
-# Un commit intermedio puede dejar el grafo bifurcado de forma legítima y
-# transitoria mientras se acomoda una rama. Lo que no puede quedar bifurcado es
-# lo que se publica, porque en este proyecto se despliega directo desde main:
-# un push malo es un deploy malo. pre-push es el último momento en que el
-# arreglo todavía es local y cuesta una línea.
+# Un commit intermedio puede dejar el árbol en un estado transitorio legítimo
+# mientras se acomoda una rama. Lo que no puede quedar roto es lo que se
+# publica, porque en este proyecto se despliega directo desde main: un push
+# malo es un deploy malo. pre-push es el último momento en que el arreglo
+# todavía es local y cuesta una línea.
 #
 # Esto es una conveniencia, no la garantía: un hook se puede saltear con
 # --no-verify y no existe hasta que alguien corre el 'git config' de arriba. La
@@ -21,29 +21,91 @@
 set -uo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-GUARD="$REPO_ROOT/scripts/check_migration_graph.py"
 
-if [ ! -f "$GUARD" ]; then
-    # Rama vieja que todavía no tiene el guard: no es motivo para bloquear.
+# Los guards son solo stdlib (ast, re, pathlib): sirve cualquier Python 3, sin
+# venv activado ni sincronizado.
+#
+# El fallback a uv NO es adorno. En un clon de WSL sobre /mnt/ es habitual que
+# no haya ningún 'python3' ni 'python' en el PATH y que uv sea el único
+# intérprete disponible; sin esta rama el hook salía por 0 avisando que se
+# saltaba los chequeos, o sea que el guard existía y no guardaba nada. Va con
+# --no-project a propósito: los guards no importan nada del proyecto, así que
+# no hay por qué pagar una sincronización del venv (ni depender de la red)
+# antes de cada push.
+PY=()
+if command -v python3 >/dev/null 2>&1; then
+    PY=(python3)
+elif command -v python >/dev/null 2>&1; then
+    PY=(python)
+elif command -v uv >/dev/null 2>&1; then
+    PY=(uv run --no-project python)
+fi
+
+if [ "${#PY[@]}" -eq 0 ]; then
+    echo "pre-push: no se encontró ningún Python; se omiten los guards." >&2
     exit 0
 fi
 
-# Solo stdlib (ast, pathlib), así que sirve cualquier Python 3 del sistema: no
-# hace falta que el venv del proyecto esté activado ni sincronizado.
-for PY in python3 python; do
-    if command -v "$PY" >/dev/null 2>&1; then
-        if ! "$PY" "$GUARD"; then
-            echo ""
-            echo "pre-push ABORTADO: el grafo de migraciones no es aplicable."
-            echo "Si el árbol quedó con dos heads, el contenedor no va a arrancar"
-            echo "en el deploy. Arreglalo antes de publicar."
-            echo ""
-            echo "Para saltear esto a sabiendas: git push --no-verify"
-            exit 1
-        fi
-        exit 0
-    fi
-done
+FAILED=0
 
-echo "pre-push: no se encontró python3; se omite el chequeo del grafo de migraciones." >&2
+run_guard() {
+    local script="$1"
+    local explicacion="$2"
+
+    # Rama vieja que todavía no tiene el guard: no es motivo para bloquear.
+    [ -f "$REPO_ROOT/$script" ] || return 0
+
+    if ! "${PY[@]}" "$REPO_ROOT/$script"; then
+        echo ""
+        echo "$explicacion"
+        echo ""
+        FAILED=1
+    fi
+}
+
+run_guard "scripts/check_migration_graph.py" \
+"pre-push ABORTADO: el grafo de migraciones no es aplicable.
+Si el árbol quedó con dos heads, el contenedor no va a arrancar
+en el deploy. Arreglalo antes de publicar."
+
+run_guard "scripts/check_claude_md_size.py" \
+"pre-push ABORTADO: CLAUDE.md rompe su propio contrato.
+Ese archivo se carga completo en CADA sesión de agente, así que
+lo que le agregues lo paga todo el equipo en todas sus
+conversaciones. Mové el contenido a docs/ (las 7 reglas están al
+principio del propio CLAUDE.md)."
+
+# Ruff, el MISMO set que bloquea en CI.
+#
+# Va aparte de run_guard porque, a diferencia de los otros dos, NO es stdlib: necesita el
+# venv. Así que es best-effort y se SALTEA en silencio si ruff no está — el hook no puede
+# fallar por una razón ajena a lo que verifica, y `uv sync` puede no haberse corrido nunca en
+# este clon.
+#
+# No se pasa ningún `--select`: el set vive en `[tool.ruff.lint]` de pyproject.toml, así que
+# esto da exactamente lo mismo que el gate. Duplicar las reglas acá es garantizar que un día
+# digan cosas distintas.
+RUFF=""
+if [ -x "$REPO_ROOT/.venv/bin/ruff" ]; then
+    RUFF="$REPO_ROOT/.venv/bin/ruff"
+elif command -v ruff >/dev/null 2>&1; then
+    RUFF="ruff"
+fi
+
+if [ -n "$RUFF" ]; then
+    if ! (cd "$REPO_ROOT" && "$RUFF" check .); then
+        echo ""
+        echo "pre-push ABORTADO: ruff encontro hallazgos que BLOQUEAN el merge en CI."
+        echo "Son errores reales (imports huerfanos, variables sin usar, nombres"
+        echo "indefinidos), no estilo. Arreglalos ahora y te ahorras la vuelta del PR."
+        echo ""
+        FAILED=1
+    fi
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+    echo "Para saltear esto a sabiendas: git push --no-verify"
+    exit 1
+fi
+
 exit 0

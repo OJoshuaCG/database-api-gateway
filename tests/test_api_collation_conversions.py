@@ -779,3 +779,92 @@ def test_inventory_charset_not_synced_without_alter_database(admin_client, monke
     md = admin_client.get(f"/api/v1/managed-databases/{db_id}").json()["data"]
     assert md["charset"] == TARGET_CS
     assert md["collation"] == OLD_CO, "el default de la BD no cambió: la fila no debe moverse"
+
+
+# =========================================================================== #
+# Cancelación de un job EN COLA (fix preexistente)                            #
+# =========================================================================== #
+def test_canceled_pending_job_never_touches_the_engine(admin_client, monkeypatch):
+    """
+    Cancelar un job que todavía esperaba en la cola NO debe ejecutar nada.
+
+    El reclamo de `run_job` filtraba solo por `status == 'pending'`, así que un job cancelado
+    igual se reclamaba, entraba al pipeline y ejecutaba la fase 1 COMPLETA —el ALTER
+    DATABASE— porque los dos únicos puntos de corte cooperativo están DENTRO de los bucles de
+    tablas y de objetos. O sea: cancelar una conversión encolada le cambiaba igual el default
+    a la base. En un lote eso vacía de sentido el "frená el resto".
+
+    Es un defecto PREEXISTENTE del cancel unitario, no algo que introduzca el lote.
+    """
+    _install(monkeypatch)
+    sid = _server(admin_client, 3911)
+    job_id = _create(admin_client, sid).json()["data"]["id"]
+    token = _preview(admin_client, job_id, tables=["users"]).json()["data"]["confirm_token"]
+
+    # `enqueue` está monkeypatcheado a correr `run_job` inline, así que para simular
+    # "cancelado mientras esperaba en la cola" hay que marcarlo ANTES del execute.
+    assert admin_client.post(
+        f"/api/v1/collation-conversions/{job_id}/cancel"
+    ).status_code == 200
+    assert _execute(admin_client, job_id, token).status_code == 200
+
+    summary = admin_client.get(f"/api/v1/collation-conversions/{job_id}").json()["data"]
+    assert summary["status"] == "canceled", summary
+    # Lo que de verdad importa: el motor no recibió NADA.
+    assert _FakeRunner.calls == [], _FakeRunner.calls
+    assert _items(admin_client, job_id) == []
+
+
+def test_cancel_is_audited(admin_client, monkeypatch):
+    """
+    Cancelar deja rastro. El parámetro `admin` existía sin usarse y la ruta ni lo pasaba, así
+    que frenar una conversión en curso —que deja la BD a mitad de camino— no se auditaba.
+    """
+    _install(monkeypatch)
+    sid = _server(admin_client, 3912)
+    job_id = _create(admin_client, sid).json()["data"]["id"]
+    _preview(admin_client, job_id, tables=["users"])
+    assert admin_client.post(
+        f"/api/v1/collation-conversions/{job_id}/cancel"
+    ).status_code == 200
+
+    r = admin_client.get("/api/v1/audit-logs?size=50")
+    if r.status_code == 404:  # el recurso de auditoría no está expuesto por API
+        from app.core.database import Database
+        from app.models.audit_log import AuditLog
+
+        session = Database().get_declarative_base_session()
+        try:
+            acciones = [
+                a.action
+                for a in session.query(AuditLog).all()
+            ]
+        finally:
+            session.close()
+    else:
+        acciones = [a["action"] for a in r.json()["data"]]
+    assert "collation_conversion.cancel" in acciones, acciones
+
+
+def test_preview_freezes_totals_for_the_progress_bar(admin_client, monkeypatch):
+    """
+    El preview persiste los totales del plan confirmado.
+
+    `progress` solo cuenta lo HECHO y nunca el total, así que sin esto una barra de avance no
+    tiene denominador: hoy la SPA lo parchea con estado de React que se pierde al recargar,
+    justo en una operación que dura horas.
+    """
+    _install(monkeypatch)
+    sid = _server(admin_client, 3913)
+    job_id = _create(admin_client, sid).json()["data"]["id"]
+
+    antes = admin_client.get(f"/api/v1/collation-conversions/{job_id}").json()["data"]
+    assert antes["tables_total"] is None and antes["objects_total"] is None
+
+    _preview(
+        admin_client, job_id, tables=["users", "orders"],
+        objects=[{"object_type": "procedure", "name": "sp_x"}],
+    )
+    despues = admin_client.get(f"/api/v1/collation-conversions/{job_id}").json()["data"]
+    assert despues["tables_total"] == 2
+    assert despues["objects_total"] == 1

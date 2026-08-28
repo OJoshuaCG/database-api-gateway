@@ -15,6 +15,8 @@ from app.schemas.model_migration import (
     ApplyAllOut,
     MigrationDeleteOut,
     MigrationDeletePlanOut,
+    MigrationEditPreviewIn,
+    MigrationEditPreviewOut,
     MigrationValidateIn,
     MigrationValidateOut,
     ModelMigrationCreate,
@@ -152,6 +154,38 @@ def validate_migration(
 )
 def get_migration(admin: AdminDep, model_id: int, version: str = _VERSION_PATH):
     return success(data=ModelMigrationController().get_migration(model_id, version))
+
+
+@router.post(
+    "/{model_id}/migrations/{version}/edit-preview",
+    response_model=ApiResponse[MigrationEditPreviewOut],
+)
+@limiter.limit("20/minute")
+def preview_migration_edit(
+    request: Request,
+    admin: AdminDep,
+    model_id: int,
+    payload: MigrationEditPreviewIn,
+    version: str = _VERSION_PATH,
+):
+    """
+    Emite el ``confirm_token`` para editar el SQL de una versión YA APLICADA, y responde a
+    quién va a dejar divergente.
+
+    Editar una versión vigente **no re-ejecuta nada**: las BDs que ya la aplicaron conservan
+    físicamente lo que corrió, así que su puntero de versión pasa a nombrar un SQL que no es
+    el que se les aplicó. Esta llamada existe para que ese costo se vea ANTES de aceptarlo:
+    ``blocking_databases`` sale de leer la versión **del motor** de cada BD con historial, no
+    de la caché del inventario. Por eso tiene rate limit y por eso se audita.
+
+    Si ninguna BD tiene la versión vigente, responde ``requires_confirmation: false`` y sin
+    token: ese caso ya lo permite el PATCH común.
+    """
+    return success(
+        data=ModelMigrationController().preview_sql_edit(
+            model_id, version, payload.model_dump(exclude_unset=True), admin=admin
+        )
+    )
 
 
 @router.patch(

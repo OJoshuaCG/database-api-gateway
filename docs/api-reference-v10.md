@@ -683,6 +683,16 @@ Sin rate limit. Consultá cada 2–3 s mientras `status ∈ {pending, running}`.
 
 Paginado estándar (`paginated()`), en orden de emisión.
 
+> ⚠️ **Los ítems se escriben de una sola vez, al TERMINAR el job** — no van apareciendo
+> mientras corre. El backend los persiste en un lote después de cerrar la transacción de
+> lectura contra el origen, así que durante `pending` y `running` este endpoint devuelve
+> **lista vacía** (`total: 0`).
+>
+> Consecuencia para la UI: **no armes una tabla de incidencias "en vivo" en la pantalla de
+> monitoreo.** Mostraría "0 incidencias" durante toda la exportación, que es lo contrario de la
+> verdad. El reporte por objeto pertenece a la pantalla de resultado, una vez que `status` es
+> terminal. Para el progreso en vivo usá el objeto `progress` de §3.7.
+
 ```jsonc
 { "data": [
     { "id": 1, "job_id": 12, "seq": 1, "object_type": "table", "object_name": "clientes",
@@ -742,6 +752,16 @@ sería una segunda divulgación.
     "part_count": 1,
     "created_at": "…", "expires_at": "…" } }
 ```
+
+> ⚠️ **`complete: false` NO significa "parcial" por sí solo.** El endpoint responde también
+> sobre un job que todavía no terminó (`pending`/`running`), y ahí `complete` es `false`
+> simplemente porque aún no hay nada completo. La regla correcta para la UI es:
+>
+> **"artefacto parcial" ⇔ `status` es terminal **Y** `complete === false`.**
+>
+> A cambio, este endpoint tiene una propiedad valiosa: **sobrevive a `consumed` y a `purged`**.
+> Aunque el artefacto ya se haya descargado o purgado, "¿qué me llevé?" se sigue pudiendo
+> responder sin abrir el archivo.
 
 `sha256` es el mismo valor que viaja en el `ETag` y en la cabecera `X-Export-Sha256` de la
 descarga: ofrecé un botón "copiar checksum" para que el operador pueda verificar el archivo que
@@ -934,12 +954,25 @@ de entrega a "archivo" y explicá por qué.
 ### 5.7 Módulo apagado
 
 ```
-cualquier endpoint → 409 { "public_context": { "code": "export.disabled" } }
+endpoints 1–6, 11 y 12 → 409 { "public_context": { "code": "export.disabled" } }
+endpoints 7, 8, 9 y 10  → responden normalmente
 ```
 
 `EXPORT_ENABLED=False` es el kill switch. Mostrá un estado vacío explicativo ("la exportación
 está deshabilitada en este gateway") y **ocultá el punto de entrada** en la navegación, no un
 error por cada clic.
+
+**El alcance NO es "cualquier endpoint", y la diferencia importa para la UI.** El guard cubre
+los 8 endpoints que crean trabajo o entregan bytes (capacidades, crear plan, catálogo,
+resolver selección, preview, ejecutar, descargar y contenido en línea). Quedan **fuera a
+propósito** los 4 de observación y freno: `GET /database-exports/{id}` (7),
+`GET .../items` (8), `POST .../cancel` (9) y `GET .../manifest` (10).
+
+El motivo: si se apaga el módulo mientras hay un job corriendo, el operador tiene que poder
+**verlo y detenerlo**. Bloquear la cancelación sería lo contrario de lo que el kill switch
+persigue. Consecuencia práctica: con el módulo apagado, una vista de monitor abierta sobre un
+job en curso **sigue funcionando** — no la desmontes al recibir un `export.disabled` en otra
+llamada.
 
 ---
 
@@ -983,7 +1016,7 @@ No están en `capabilities.error_codes` pero los vas a recibir:
 
 | Código | HTTP | Cuándo |
 |---|---|---|
-| `export.disabled` | 409 | kill switch `EXPORT_ENABLED=False` — en **cualquier** endpoint |
+| `export.disabled` | 409 | kill switch `EXPORT_ENABLED=False` — en los endpoints **1–6, 11 y 12**. Los de observación y freno (7, 8, 9, 10) siguen respondiendo a propósito: ver y cancelar un job en curso tiene que seguir siendo posible con el módulo apagado (§5.7) |
 | `export.already_executed` | 409 | `execute` **o `preview`** sobre un plan que ya no está `pending` (trae `status`). Un job es de un solo uso: re-previsualizar uno ya ejecutado reescribiría la selección congelada y el `manifest` dejaría de describir el artefacto entregado. Creá un plan nuevo |
 | `export.not_previewed` | 409 | `execute` sin haber previsualizado |
 | `export.not_ready` | 409 | `download`/`content` con el job en `pending`/`running` (trae `status`) |

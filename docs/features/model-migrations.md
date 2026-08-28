@@ -296,7 +296,7 @@ fiable:
 
 ## Cuándo se puede editar o eliminar una versión
 
-> Contrato para el frontend: [`docs/api-reference-v15.md`](../api-reference-v15.md)
+> Contrato para el frontend: [`docs/api-reference-v18.md`](../api-reference-v18.md)
 > (el borrado con renumerado) y [`docs/api-reference-v14.md`](../api-reference-v14.md)
 > (el criterio de congelamiento del que parte).
 
@@ -440,11 +440,93 @@ Vocabulario cerrado en `app/services/migration_freeze_catalog.py`.
 | 409 | `model_migration.renumber_target_missing` | Una BD adelantada quedaría en una etiqueta inexistente (hueco en la numeración justo debajo de donde está parada). | Rellenar el hueco con una versión, o mover esa BD antes. |
 | 409 | `model_migration.affected_partial_application` | Alguna versión afectada tiene una aplicación a medias. El renumerado cambia su `checksum` y el checkpoint dejaría de corresponder. | `reconcile-partial`, o completar el `apply`. |
 | 409 | `model_migration.still_applied` | Histórico del criterio `>=`. Sigue vigente en los caminos que lo usan. | Revertir primero. |
+| 409 | `model_migration.sql_frozen` | `PATCH` que cambia el SQL efectivo (`up_sql` u overrides) de una versión vigente. | Fix-forward con una versión nueva, revertir en las BDs que la nombran, **o** editar igual asumiendo la divergencia (ver abajo). |
+| 409 | `model_migration.still_applied` | `DELETE` de una versión vigente. Borrarla dejaría esa BD con objetos que ninguna versión del blueprint describe. | Revertir primero, o crear una migración compensatoria. |
+| 422 | `model_migration.edit_confirm_mismatch` | `PATCH` con `confirm_version` distinto de la versión de la ruta. | Reenviar con la versión exacta. |
+
+El 409 de `sql_frozen` trae además `override_available: true`, para que la UI pueda distinguir
+"no se puede" de "se puede confirmando" sin tener que interpretar la prosa del mensaje.
 
 Los que nombran BDs traen `version` y `blocking_databases[]`, con un ítem por BD:
 `managed_database_id`, `reason` y —cuando aplica— `current_version`.
 
+### Editar igual una versión vigente (y qué se paga por hacerlo)
+
+El freeze supone que la salida siempre es fix-forward, y para un cambio de comportamiento eso
+es cierto. Pero hay correcciones cuyo valor está justamente en que las **BDs nuevas** no
+repitan el defecto. El caso testigo es un `COLLATE` hardcodeado en el DDL de las primeras
+versiones: describir la corrección con una versión al final de la cadena obliga a toda base
+nueva a **crearse mal y convertirse después**.
+
+Para eso existe la vía de excepción. **No abre el freeze: lo atraviesa, con dos factores y
+dejando rastro.**
+
+#### Lo que se paga, dicho sin vueltas
+
+Editar `up_sql` **no re-ejecuta nada**. Las BDs que ya aplicaron la versión conservan
+**físicamente** lo que corrió, así que su `_gw_v_{slug}` pasa a afirmar una versión cuyo texto
+ya no es el que se les aplicó. Esa divergencia es **real e irreversible**; lo único que se
+puede evitar es que quede en **silencio**, y de eso se ocupa el rastro.
+
+Consecuencia práctica que conviene tener presente: las BDs viejas **siguen necesitando la
+corrección por otra vía**. Para collation, esa vía es la
+[conversión de charset/collation](collation-conversion.md), que además recrea rutinas,
+triggers y vistas —que congelan la collation de la sesión que las creó— y evita el
+`Illegal mix of collations`. Un `CONVERT TO CHARACTER SET` metido a mano en una versión de
+blueprint **no** hace eso.
+
+#### El recorrido
+
+1. **`POST /database-models/{id}/migrations/{version}/edit-preview`** con los mismos campos de
+   SQL que va a llevar el `PATCH`. Responde:
+   - `requires_confirmation` — `false` si ninguna BD tiene la versión vigente (ahí el `PATCH`
+     común ya la edita, y **no se emite token**: uno que no hace falta entrena a mandarlo
+     siempre);
+   - `blocking_databases[]` — **quiénes van a quedar divergentes**, leído del **motor**;
+   - `confirm_token` + `expires_at` y `resulting_checksum`.
+2. **`PATCH .../migrations/{version}`** con el mismo SQL más `confirm_version` y
+   `confirm_token`.
+
+#### Por qué dos factores y no uno
+
+Cubren cosas distintas, y por eso no se puede quitar ninguno:
+
+- **`confirm_version`** obliga a identificar conscientemente **qué versión** se toca. Es el
+  molde de `confirm_target_name` al borrar una BD.
+- **`confirm_token`** da frescura y anti-replay, y —vía su `subject`— ata la autorización al
+  **SQL exacto** que se previsualizó. Sin eso, `(operación, model_id, version)` es igual para
+  cualquier edición de esa versión: se podría pedir el preview de una corrección inocua,
+  mirar un `blocking_databases` tranquilizador, y mandar otra cosa en el `PATCH`.
+
+#### El rastro, y por qué es fail-closed
+
+La edición se registra en `audit_log` con la acción **`migration.sql_edited_after_apply`**,
+anclada al id de la **migración** (`target_type='model_migration'`), con las BDs divergentes y
+el checksum previo en el `detail`.
+
+La entrada de intención se escribe **antes** de tocar nada y es **fail-closed**: si no se puede
+persistir, la operación aborta con 500 y la edición **no ocurre**. Es deliberado — el valor
+entero de esta vía está en que la divergencia quede registrada, así que perder el registro
+tiene que costar la operación. Mismo criterio que revelar una contraseña o descargar un export.
+
+De ahí se deriva la bandera **`sql_diverged`** del listado y del detalle: `true` = esta versión
+se editó después de que alguna BD la aplicara, así que ya no describe el plano de todas sus
+BDs. **No restringe nada** (el SQL nuevo es el que se aplica de acá en más); es señal para la
+UI. Se cuenta también la entrada `attempt`, no solo la `success`: si el proceso muere entre las
+dos, la versión igual pudo quedar divergente, y marcar de menos es precisamente la mentira
+silenciosa que todo esto viene a evitar.
+
+#### Lo que esta vía NO toca
+
+El `DELETE` **no** se destraba por acá: editar una versión no la vuelve borrable, ni al revés.
+Son dos freezes con criterios distintos a propósito — la edición usa `>=` (cualquier BD que ya
+pasó por la versión), el borrado usa **igualdad** (solo la que está parada exactamente en
+ella). Un borrado que igual haga falta va por su propio camino, con su propio doble factor:
+ver «[Borrar una versión intermedia](../api-reference-v18.md)».
+
 ### Los `reason`
+
+Vocabulario cerrado en `app/services/migration_freeze_catalog.py`:
 
 | `reason` | Significa | Trae `current_version` |
 |---|---|---|
@@ -917,6 +999,67 @@ compartido con la consola SQL), `app/models/migration_select_result.py`, migraci
 `_guard_stamp_unreviewed_capture`) / `routes/v1/managed_databases.py`, revocación de la
 aprobación al editar el SQL en `model_migration_controller.py::update_migration`, y la tarea
 periódica de purga en `main.py::_purge_captures_periodically`.
+
+## El timeout de sentencia va por OPERACIÓN, no por versión
+
+`apply`, `rollback` y `reconcile-partial` ejecutan **DDL del usuario**, así que corren con el
+timeout de volcado (`REMOTE_BULK_STATEMENT_TIMEOUT_MS`, 1 h por default; `0` = sin límite).
+`stamp` y la lectura de la versión actual **no**: se quedan con el interactivo de 15 s, porque no
+ejecutan SQL del usuario y una escritura de metadatos que tarda una hora tiene que fallar rápido.
+
+**El eje es la operación, y no la versión.** Lo natural es pensar al revés —"esta migración tiene
+DDL pesado, marquémosla"— y no funciona: cuánto tarda un `ALTER TABLE` depende del **volumen de
+datos de la BD destino**, no del texto de la sentencia. La misma versión es instantánea en una
+hermana chica y tarda minutos en una grande, y una que hoy tarda dos segundos va a tardar cinco
+cuando la tabla crezca. Una marca por versión codificaría una propiedad que la versión no tiene.
+
+**Por qué los 15 s no eran una protección.** El reflejo es que subir el timeout deja pasar una
+migración descontrolada. Con *ese* timeout no era así: en MySQL/MariaDB son
+`read_timeout`/`write_timeout` **de socket, del CLIENTE**, y **no cancelan nada en el motor**. Lo
+que hacían era romper la conexión mientras el servidor seguía ejecutando. El daño concreto es que
+**el checkpoint queda desincronizado del plano físico**: `record_statement` se emite DESPUÉS de
+cada `exec_driver_sql`, así que la sentencia que cortó no queda registrada pero el motor la
+completa igual.
+
+**Qué pasa en el reintento depende de la sentencia**, y no hay un solo desenlace:
+
+| La sentencia que cortó… | Reintento |
+|---|---|
+| es larga (que es por qué cortó) | vuelve a cortar a los 15 s y se repite |
+| no es idempotente y ya se aplicó | falla con un `already exists`/`duplicate` **espurio**, señalando la sentencia equivocada |
+| la migración **no es resumible** (`is_resumable`: `kind='data'`, `has_non_portable`, estado de sesión) | no hay checkpoint: arranca de cero y choca con todo lo ya aplicado |
+
+En los tres el timeout **no limitaba el daño**: solo le hacía perder el rastro al gateway, que es
+el estado que todo este módulo está diseñado para evitar. En PostgreSQL sí es un
+`statement_timeout` de servidor (cancela limpio), y ahí el DDL transaccional hace que un fallo se
+deshaga solo.
+
+**Consecuencia operativa que hay que aceptar:** `POST /migrations/apply` es síncrono, así que un
+apply largo sostiene la request y su hilo mientras dura. Es el mismo costo que ya asumió la
+conversión de collation.
+
+### El proxy sigue cortando a los 60 s, y eso es OTRO problema
+
+`docker/nginx/conf.d/app.conf` tiene `proxy_read_timeout 60s`, así que un apply que tarde más
+devuelve un **504 al cliente** aunque el servidor siga trabajando. **No se subió ese valor acá a
+propósito**: es un timeout de *todos* los endpoints, y dejarlo sin límite convierte cualquier
+request en una que puede colgarse. Merece su propia decisión (probablemente un `location` con
+timeout propio para las rutas de apply, no un default nuevo).
+
+Lo importante es que **ya no es el mismo problema**, y la diferencia es la que hace que este fix
+sirva igual:
+
+| | Antes | Ahora |
+|---|---|---|
+| Conexión a la BD | la mataba el gateway a los 15 s | se sostiene |
+| Checkpoint | **no** registraba la sentencia | la registra |
+| Próximo `apply` | **la reejecutaba ⇒ bucle** | retoma donde iba |
+| Respuesta HTTP | error a los 15 s | 504 del proxy a los 60 s |
+
+El handler es `def` y no `async def`, así que FastAPI lo corre en un hilo del pool y **no lo puede
+cancelar**: cuando nginx deja de esperar, la migración sigue y termina. El estado del servidor
+queda **correcto** — lo que falta es que el operador lo vea, y para eso está
+`GET /managed-databases/{id}/migrations/status`, que informa la versión real y el progreso parcial.
 
 ## Límites y consideraciones
 

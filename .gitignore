@@ -79,7 +79,16 @@ uploads/*
 .DS_Store
 Thumbs.db
 
-.secrets.baseline
+# `.secrets.baseline` NO va acá: se VERSIONA a propósito.
+#
+# Estaba ignorado, suelto bajo "OS Generated" y sin motivo escrito. Pero un baseline de
+# detect-secrets es justamente el conocimiento COMPARTIDO de qué hallazgos ya se auditaron
+# y son falsos positivos; ignorarlo vuelve imposible el gate de secretos de CI, porque el
+# runner no tendría contra qué comparar y cada corrida trataría los 99 falsos positivos
+# como hallazgos nuevos.
+#
+# Es seguro commitearlo: guarda `hashed_secret` (SHA1), nombre de archivo, línea y tipo.
+# Ningún valor en claro — verificado antes de versionarlo.
 
 # Claude Code — solo archivos personales/locales (no ignorar toda la carpeta)
 .claude/settings.local.json

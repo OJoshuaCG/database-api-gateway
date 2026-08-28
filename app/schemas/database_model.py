@@ -226,3 +226,60 @@ class ModelDatabaseStatusOut(ManagedDatabaseOut):
             "refleja — Alembic solo registra la versión cuando el upgrade TERMINA."
         ),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Deriva de charset/collation contra la declaración del blueprint              #
+# --------------------------------------------------------------------------- #
+class CollationDriftRowOut(BaseModel):
+    """
+    Una BD del blueprint frente al charset/collation declarado.
+
+    Trae `server_name`, `engine` y `environment_slug` porque sin ellos el panel es un callejón
+    sin salida: no se puede enlazar a "convertir esta base" ni decidir con qué urgencia.
+    """
+
+    managed_database_id: int
+    database_name: str
+    server_id: int
+    server_name: str
+    engine: str
+    environment_slug: str | None = None
+    charset: str | None = None
+    collation: str | None = None
+    status: Literal["ok", "drifted", "unknown", "undeclared", "not_applicable"] = Field(
+        ...,
+        description=(
+            "undeclared: el blueprint no declaró objetivo. not_applicable: la BD es "
+            "PostgreSQL (allá el concepto es encoding + lc_collate, que no son "
+            "equivalentes). unknown: la fila no tiene el dato — NO es 'al día', y la UI no "
+            "puede pintarlo igual que ok. drifted / ok: hay dato y difiere, o coincide."
+        ),
+    )
+    source_of_truth: Literal["adopted", "provisioned", "unknown"] = Field(
+        ...,
+        description=(
+            "De dónde sale el dato de esta fila. Importa porque charset/collation son "
+            "escribibles a mano por PATCH /managed-databases/{id}: una fila puede decir 'ok' "
+            "porque alguien lo tipeó, sin que nadie haya leído el motor."
+        ),
+    )
+
+
+class CollationDriftOut(BaseModel):
+    """
+    Deriva de collation del blueprint. **Cero conexiones al motor.**
+
+    Se compara contra la copia que el gateway mantiene en el inventario, así que `source` es
+    siempre "cached": presentar una caché como verdad del motor sería mentir en una pantalla
+    que se va a usar para decidir conversiones. Mostrar `source_note` tal cual.
+    """
+
+    model_id: int
+    model_slug: str
+    declared: dict | None = Field(
+        None, description="{charset, collation} declarados en el blueprint, o null."
+    )
+    source: Literal["cached"] = "cached"
+    source_note: str
+    databases: list[CollationDriftRowOut] = Field(default_factory=list)

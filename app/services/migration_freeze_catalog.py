@@ -121,3 +121,75 @@ BLOCKING_REASONS = frozenset(
         REASON_IN_USE,
     }
 )
+
+
+# --------------------------------------------------------------------------- #
+# Edición de una versión que YA está aplicada (levantamiento del freeze)        #
+# --------------------------------------------------------------------------- #
+# ``CODE_SQL_FROZEN`` sigue siendo la respuesta por defecto: el freeze no se abre solo. Lo
+# que sigue describe la ÚNICA vía para atravesarlo, con doble factor y rastro permanente.
+#
+# Por qué existe la vía: el freeze supone que la salida siempre es fix-forward, y para un
+# cambio de comportamiento eso es cierto. Pero hay correcciones cuyo valor está justamente
+# en que las BDs NUEVAS no repitan el defecto — el caso testigo es un ``COLLATE`` hardcodeado
+# en el DDL de las primeras versiones: describirlo con una versión correctiva al final de la
+# cadena obliga a toda base nueva a crearse mal y convertirse después.
+#
+# Lo que la vía NO hace, y por eso el rastro es obligatorio: editar ``up_sql`` **no
+# re-ejecuta nada**. Las BDs que ya aplicaron la versión conservan FÍSICAMENTE lo que corrió,
+# así que su ``_gw_v_{slug}`` pasa a afirmar una versión cuyo texto ya no es el que se les
+# aplicó. Esa divergencia es real y no se puede deshacer; lo único que se puede evitar es que
+# quede en SILENCIO.
+
+#: Se pidió editar el SQL de una versión aplicada con un ``confirm_version`` que no coincide
+#: con la versión de la ruta (422). Es el factor de "identificar CONSCIENTEMENTE qué se toca":
+#: el mismo criterio que ``confirm_target_name`` en el borrado de una BD.
+CODE_EDIT_CONFIRM_MISMATCH = "model_migration.edit_confirm_mismatch"
+
+#: Se intentó cambiar el SQL con una aplicación PARCIAL sin resolver (checkpoint de
+#: sentencia incompleto). Trae ``incomplete_progress`` con la BD y cuántas sentencias
+#: alcanzó a commitear. Salida: reintentar ``apply`` (retoma solo) o limpiar con
+#: ``stamp?force=true``. NO es lo mismo que ``CODE_SQL_FROZEN`` y no lo abre el doble
+#: factor: acá el problema no es la divergencia, es que un resume interpretaría los
+#: índices del checkpoint contra un SQL distinto del que corrió.
+CODE_PARTIAL_APPLICATION = "model_migration.partial_application"
+
+#: Se cambió ``up_sql`` dejando overrides por motor que quedarían obsoletos. Trae
+#: ``stale_overrides`` con los nombres de campo. Salida: reenviarlos corregidos o
+#: limpiarlos con ``null`` en la MISMA llamada. Es evitable desde la UI, y debería serlo:
+#: el formulario ya sabe qué overrides existen.
+CODE_STALE_OVERRIDES = "model_migration.stale_overrides"
+
+ERROR_CODES = frozenset(
+    {
+        CODE_SQL_FROZEN,
+        CODE_STILL_APPLIED,
+        CODE_EDIT_CONFIRM_MISMATCH,
+        CODE_PARTIAL_APPLICATION,
+        CODE_STALE_OVERRIDES,
+    }
+)
+
+#: Operación del ``confirm_token`` para esta vía. El token se ata al hash del SQL PROPUESTO
+#: (parámetro ``subject``), no solo a la versión: sin eso se podría pedir el preview de una
+#: corrección inocua y mandar otra cosa en el PATCH, que es exactamente lo que la
+#: confirmación debe impedir (mismo razonamiento que la consola SQL).
+CONFIRM_OPERATION = "model_migration.edit_applied"
+
+#: Acción de auditoría que deja constancia PERMANENTE de la divergencia. Se registra con
+#: ``target_type=AUDIT_TARGET_TYPE`` y ``target_id`` = id de la MIGRACIÓN (no del blueprint),
+#: que es lo que permite derivar la bandera por versión con una sola query en lote.
+#:
+#: Vive en ``audit_log`` y no en una columna nueva por dos motivos, en este orden: (1) es un
+#: HECHO histórico —"esta versión se editó después de haberse aplicado"— y los hechos no se
+#: revocan, así que un log es el lugar correcto (a diferencia de
+#: ``database_migration_history``, que se usaba mal como si fuera un estado); (2) ``audit_log``
+#: no cuelga de ``managed_databases``, así que el rastro sobrevive a que se den de baja las
+#: BDs divergentes — una columna en ``model_migrations`` también, pero exigiría una migración
+#: Alembic, y el head se comparte con trabajo en curso.
+AUDIT_ACTION_EDITED_AFTER_APPLY = "migration.sql_edited_after_apply"
+
+#: ``target_type`` de esa entrada. Se separa de ``"database_model"`` (el que usa
+#: ``migration.update``) justamente para poder filtrar por migración sin arrastrar el resto
+#: de las acciones del blueprint.
+AUDIT_TARGET_TYPE = "model_migration"
