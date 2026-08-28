@@ -154,7 +154,7 @@ visible solo en `development`).
 | 409 | `model_migration.unreadable_databases` | No se pudo leer la versión de alguna BD. **Fail-closed.** | «Reintentar». Es un problema de acceso a esa BD, no del blueprint. |
 | 409 | `model_migration.renumber_confirmation_required` | El borrado mueve punteros y no llegó `confirm_token`. | Pedir `delete-plan` y mostrar el diálogo de confirmación. Trae `stamp_plan`. |
 | 422 / 410 | *(del token)* | Token que no corresponde al plan congelado / vencido. | Volver a pedir `delete-plan` y rehacer la confirmación. |
-| 409 | `model_migration.renumber_stamp_failed` | Falló el re-stamp de una BD. **El blueprint no se modificó.** | Mostrar `compensated`: si es `true`, todo volvió a su lugar y se puede reintentar. Si es `false`, `left_moved` lista las BDs que quedaron movidas — eso requiere intervención. |
+| 409 | `model_migration.renumber_stamp_failed` | Falló el re-stamp de una BD, **o** falló el renumerado local con punteros ya movidos. En los dos casos **el blueprint no se modificó**. | Mostrar `compensated`: si es `true`, todo volvió a su lugar y se puede reintentar. Si es `false`, `left_moved` lista **solo** las BDs que quedaron mal marcadas (con `from_version` y `to_version`) — esas requieren un `stamp` manual antes de reintentar. |
 | 409 | `model_migration.renumber_target_missing` | Una BD quedaría en una etiqueta inexistente (hueco en la numeración justo debajo de donde está parada). | Explicar el hueco: `unstampable_databases` trae `current_version` y `missing_target`. |
 | 409 | `model_migration.affected_partial_application` | Alguna versión afectada tiene una aplicación a medias. | Enlazar a `reconcile-partial` de esa BD. |
 
@@ -211,6 +211,10 @@ dirección, nunca al revés.
    ├─ 422/410 → el parque cambió: volver al paso 2
    └─ 409 → clasificar por public_context.code (§5)
 ```
+
+> El intento queda **auditado antes** de que se toque un solo motor (`migration.delete` con
+> `touched_engine: true`), así que un renumerado que falla a mitad deja rastro de qué punteros
+> se iban a mover. El éxito escribe una segunda entrada con el resultado.
 
 El diálogo de confirmación **debe** mostrar los `warnings` del plan. El primero dice que las
 BDs conservan físicamente los objetos de la versión que se borra, y es la consecuencia que el

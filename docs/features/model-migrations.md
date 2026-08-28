@@ -376,6 +376,11 @@ El `confirm_token` está atado a la **huella del parque** que congeló el previe
 movió de versión en el medio, deja de verificar y la operación se rechaza en vez de ejecutar un
 plan que ya no describe la realidad.
 
+El **intento** se audita antes de tocar un solo motor (`migration.delete`,
+`touched_engine=True`, fail-closed), nombrando cada puntero que se va a mover. Es el criterio
+del módulo para todo lo que escribe en una BD de terceros, y sin él un renumerado que falla a
+mitad no dejaría ningún rastro de lo que se intentó. El éxito escribe una segunda entrada.
+
 **Si no hay punteros que mover, el token no se pide.** Borrar la punta de un blueprint sin BDs
 adelante sigue siendo la operación local de siempre, y el cliente que ya lo hacía no se rompe.
 

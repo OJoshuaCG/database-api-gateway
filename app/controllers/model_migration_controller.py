@@ -1476,8 +1476,15 @@ class ModelMigrationController:
         Viaja como ``subject`` del ``confirm_token``, así que si entre el preview y la
         ejecución alguna BD se movió de versión (un ``apply`` concurrente) el token deja de
         verificar y la operación se rechaza en vez de ejecutar un plan que ya no describe la
-        realidad. Es la mitad barata de la defensa TOCTOU; la otra es la relectura en vivo
-        justo antes del commit.
+        realidad.
+
+        Es la mitad barata de la defensa TOCTOU. La otra es que ``delete_migration`` recalcula
+        el plan DESDE CERO —con lectura en vivo de cada BD— en vez de confiar en el que el
+        preview congeló: el token no transporta el plan, solo prueba que el estado no cambió.
+        Deliberadamente NO se re-lee dentro de ``_apply_renumber``: eso mantendría la
+        transacción local abierta a través de N round-trips de red. Queda una ventana entre la
+        fase de stamps y el commit; el escape para lo que caiga ahí es
+        ``MigrationRunner.stamp(..., purge=True)``.
         """
         parts = [str(model_id), version]
         for st in sorted(states, key=lambda s: s["managed_database_id"]):
@@ -1589,7 +1596,12 @@ class ModelMigrationController:
         ]
         partial: list[dict] = []
         for direction in ("up", "down"):
-            for mid in affected_ids:
+            # Lote primero (UNA query para todas las afectadas) y recién sobre las que
+            # marcan se pide el detalle por BD, que es lo que el 409 necesita nombrar. Al
+            # revés serían 2·N consultas para un caso que casi siempre da vacío.
+            for mid in migration_progress.migrations_with_incomplete_progress(
+                affected_ids, direction
+            ):
                 for row in migration_progress.incomplete_progress_for_migration(
                     mid, direction=direction
                 ):
@@ -1855,16 +1867,62 @@ class ModelMigrationController:
             session.close()
 
         # --- Fase A: mover los punteros (escritura REMOTA, N veces) ------------------
+        if plan["stamp_plan"]:
+            # Auditoría de INTENTO, fail-closed y ANTES de tocar un solo motor: es el criterio
+            # del módulo para todo lo que escribe en una BD de terceros (``record_intent`` en
+            # el export, en ``reveal_password``, en el apply). Sin esto, un renumerado que
+            # falla a mitad no deja ni rastro de que se intentó mover N punteros — y es justo
+            # el escenario en el que alguien va a preguntar qué pasó.
+            audit.record_intent(
+                "migration.delete",
+                admin=admin,
+                target_type="database_model",
+                target_id=model_id,
+                touched_engine=True,
+                detail=(
+                    f"intento de eliminar la migración {version} de '{model_name}' con "
+                    f"renumerado: se moverán {len(plan['stamp_plan'])} puntero(s) — "
+                    + ", ".join(
+                        f"BD {s['managed_database_id']}: {s['from_version']}→{s['to_version']}"
+                        for s in plan["stamp_plan"]
+                    )
+                ),
+            )
         stamped = self._run_stamp_phase(plan["stamp_plan"], targets, specs, slug)
 
         # --- Fase B: gateway (una sola transacción local) ----------------------------
         try:
             self._apply_renumber(model_id, version, plan)
-        except Exception:
+        except Exception as exc:
             # El blueprint quedó intacto (la transacción revierte sola), así que los punteros
             # ya movidos son ahora los únicos que no describen la realidad: se devuelven.
-            self._compensate_stamps(stamped, targets, specs, slug)
-            raise
+            left = self._compensate_stamps(stamped, targets, specs, slug)
+            if not left:
+                raise
+            # Si la compensación TAMPOCO pudo, propagar el error original a secas escondería
+            # lo único que hay que atender: hay BDs apuntando a una versión que no es la suya
+            # y nadie lo va a saber. El error de origen viaja en ``context`` para el log.
+            raise AppHttpException(
+                message=(
+                    f"El renumerado de {version} falló y NO se pudieron devolver todos los "
+                    "punteros ya movidos. El blueprint quedó intacto, pero estas BDs quedaron "
+                    "mal marcadas: "
+                    + "; ".join(
+                        f"BD {d['managed_database_id']} está en {d['to_version']} y debería "
+                        f"estar en {d['from_version']}"
+                        for d in left
+                    )
+                    + ". Corrígelas con un 'stamp' antes de reintentar."
+                ),
+                status_code=409,
+                public_context={
+                    "code": freeze_codes.CODE_RENUMBER_STAMP_FAILED,
+                    "version": version,
+                    "compensated": False,
+                    "left_moved": left,
+                },
+                context={"model_id": model_id, "error": str(exc)},
+            ) from exc
 
         detail = (
             f"migración {version} eliminada de '{model_name}' con renumerado "
@@ -1949,11 +2007,12 @@ class ModelMigrationController:
                     item["from_version"],
                     item["to_version"],
                 )
-                compensated = self._compensate_stamps(done, targets, specs, slug)
+                left = self._compensate_stamps(done, targets, specs, slug)
+                compensated = not left
                 pending = [
                     f"BD {d['managed_database_id']} quedó en {d['to_version']} "
                     f"(su valor original era {d['from_version']})"
-                    for d in (() if compensated else done)
+                    for d in left
                 ]
                 raise AppHttpException(
                     message=(
@@ -1974,7 +2033,7 @@ class ModelMigrationController:
                         "from_version": item["from_version"],
                         "to_version": item["to_version"],
                         "compensated": compensated,
-                        "left_moved": [] if compensated else done,
+                        "left_moved": left,
                     },
                     context={"error": str(exc)},
                 ) from exc
@@ -1983,8 +2042,13 @@ class ModelMigrationController:
 
     def _compensate_stamps(
         self, done: list[dict], targets: dict, specs: list, slug: str
-    ) -> bool:
-        """Devuelve los punteros ya movidos a su valor original. ``True`` si se logró en todos.
+    ) -> list[dict]:
+        """Devuelve los punteros ya movidos a su valor original.
+
+        Retorna los que NO se pudieron devolver (lista vacía ⇒ se compensó todo). Devolver la
+        lista y no un booleano importa: es lo que el operador necesita para reparar a mano, y
+        un ``False`` global obligaría a reportar como "quedó movida" también a cada BD que sí
+        volvió a su lugar.
 
         Es seguro porque el stamp no ejecuta DDL: mover el puntero de vuelta no deshace ni
         rehace nada en el esquema. Se recorre en orden INVERSO al de aplicación por simetría
@@ -1992,7 +2056,7 @@ class ModelMigrationController:
         independiente de las demás.
         """
         runner = MigrationRunner()
-        ok = True
+        left: list[dict] = []
         for item in reversed(done):
             target, engine = targets[item["managed_database_id"]]
             try:
@@ -2012,8 +2076,8 @@ class ModelMigrationController:
                     item["managed_database_id"],
                     item["from_version"],
                 )
-                ok = False
-        return ok
+                left.append(item)
+        return left
 
     def _apply_renumber(self, model_id: int, version: str, plan: dict) -> None:
         """Fase local: borra la versión y renumera las posteriores. UNA transacción.

@@ -37,12 +37,12 @@ class _StampLog:
         self.fail_compensation = False
 
     def record(self, db_name, version):
-        if self.fail_on is not None and db_name == self.fail_on:
-            # El fallo es solo para el AVANCE; si no, la compensación de ese mismo
-            # nombre también fallaría y no se podría probar el camino feliz de la
-            # compensación por separado.
-            if not any(c[0] == db_name for c in self.calls):
-                raise RuntimeError("boom: el motor rechazó el stamp")
+        # ``fail_on`` corta solo el AVANCE (la primera vez que se toca esa BD). Si cortara
+        # también la vuelta, la compensación de esa misma BD fallaría siempre y no se
+        # podría probar su camino feliz por separado; para eso está ``fail_compensation``.
+        primer_toque = not any(c[0] == db_name for c in self.calls)
+        if db_name == self.fail_on and primer_toque:
+            raise RuntimeError("boom: el motor rechazó el stamp")
         if self.fail_compensation and self.calls and self.calls[-1][0] == db_name:
             raise RuntimeError("boom: la compensación también falló")
         self.calls.append((db_name, version))
@@ -499,3 +499,78 @@ def test_hueco_en_la_numeracion_bloquea_antes_de_tocar_nada(admin_client):
     )
     assert log.calls == []
     assert _versions(admin_client, model_id) == ["0001", "0005", "0007"]
+
+
+def _audit(action):
+    from app.core.database import Database
+    from app.models.audit_log import AuditLog
+
+    s = Database().get_declarative_base_session()
+    try:
+        return [
+            r.detail or ""
+            for r in s.query(AuditLog).filter(AuditLog.action == action).all()
+        ]
+    finally:
+        s.close()
+
+
+def test_el_intento_se_audita_antes_de_tocar_ningun_motor(admin_client):
+    """Fail-closed: si el renumerado falla a mitad, tiene que quedar rastro de que se intentó.
+
+    Es el criterio del módulo para todo lo que escribe en una BD de terceros (``record_intent``
+    en el export, en ``reveal_password``, en el apply). Sin la auditoría de intento, un
+    renumerado que revienta moviendo punteros no deja NADA — y es justo el escenario en el que
+    alguien va a preguntar qué pasó.
+    """
+    model_id = _blueprint(admin_client, "del-audit", ["0001", "0002", "0003"])
+    _managed_db(admin_client, model_id, 5614, "db_a", cached="0003")
+
+    log = _StampLog()
+    log.fail_on = "db_a"
+    with _engine({"db_a": "0003"}, log):
+        plan = admin_client.get(
+            f"/api/v1/database-models/{model_id}/migrations/0002/delete-plan"
+        ).json()["data"]
+        r = admin_client.delete(
+            f"/api/v1/database-models/{model_id}/migrations/0002",
+            params={"confirm_token": plan["confirm_token"]},
+        )
+    assert r.status_code == 409, r.text
+
+    detalles = _audit("migration.delete")
+    assert any("intento de eliminar" in d and "0003→0002" in d for d in detalles), detalles
+    # El borrado NO ocurrió, así que no hay auditoría de éxito.
+    assert not any("eliminada de" in d for d in detalles), detalles
+
+
+def test_left_moved_nombra_solo_lo_que_quedo_realmente_movido(admin_client):
+    """Un reporte que sobre-declara manda a reparar BDs que están bien.
+
+    ``_compensate_stamps`` devuelve la lista de las que NO pudo devolver, no un booleano: con
+    un booleano global, una compensación parcial reportaría como "quedó movida" también a cada
+    BD que sí volvió a su lugar, y el operador tocaría a mano lo que ya estaba correcto.
+    """
+    model_id = _blueprint(admin_client, "del-left", ["0001", "0002", "0003", "0004"])
+    _managed_db(admin_client, model_id, 5615, "db_a", cached="0003")
+    _managed_db(admin_client, model_id, 5616, "db_b", cached="0004")
+
+    estado = {"db_a": "0003", "db_b": "0004"}
+    log = _StampLog()
+    log.fail_on = "db_b"          # falla al avanzar la segunda…
+    log.fail_compensation = True  # …y tampoco se puede devolver la primera
+    with _engine(estado, log):
+        plan = admin_client.get(
+            f"/api/v1/database-models/{model_id}/migrations/0002/delete-plan"
+        ).json()["data"]
+        r = admin_client.delete(
+            f"/api/v1/database-models/{model_id}/migrations/0002",
+            params={"confirm_token": plan["confirm_token"]},
+        )
+    assert r.status_code == 409, r.text
+    pc = r.json()["detail"]["public_context"]
+    assert pc["compensated"] is False
+    # db_a se movió y no volvió; db_b nunca llegó a moverse y NO debe aparecer.
+    assert [d["managed_database_id"] for d in pc["left_moved"]] == [1]
+    assert pc["left_moved"][0]["from_version"] == "0003"
+    assert _versions(admin_client, model_id) == ["0001", "0002", "0003", "0004"]

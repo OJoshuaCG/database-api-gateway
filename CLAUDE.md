@@ -849,6 +849,12 @@ Cosas que NO se pueden tocar sin romperlo:
   sigue sin pedirlo y el cliente viejo no se rompe.
 - `MigrationRunner.stamp(..., purge=True)` (nuevo) es la ÚNICA salida para desatascar una BD
   huérfana; antes no existía ninguna.
+- **`record_intent` ANTES de la fase de stamps** (`touched_engine=True`, fail-closed): sin él un
+  renumerado que muere moviendo punteros no deja rastro de lo que intentó, que es justo cuando
+  alguien pregunta qué pasó. `_compensate_stamps` devuelve la LISTA de las que no pudo devolver
+  (no un booleano) y, si la fase local falla y la compensación tampoco puede, se lanza un 409
+  que las nombra en vez de propagar el error original a secas — un booleano global mandaría a
+  reparar a mano BDs que ya estaban bien.
 - **Borde cerrado**: si el blueprint tiene un hueco justo debajo de donde está parada una BD
   adelantada, su destino de stamp no existiría en la cadena vigente → 409
   `model_migration.renumber_target_missing` en el preflight, sin mover nada.
