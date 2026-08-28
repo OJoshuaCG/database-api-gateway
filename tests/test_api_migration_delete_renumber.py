@@ -70,6 +70,17 @@ def _engine(versions: dict[str, object], log: _StampLog | None = None):
 
         def stamp(self, target, *, db_name, slug, engine, managed_db_id, specs, version,
                   purge=False):
+            # El runner real hace ``engine.value`` al generar los archivos de revisión,
+            # así que un str lo rompe con ``AttributeError``. La comprobación va contra
+            # ``EngineType`` y NO contra ``str``: el enum hereda de ``str``, así que
+            # ``isinstance(engine, str)`` daría True para los dos y no probaría nada. Este
+            # doble es la ÚNICA barrera del archivo sobre el contrato de tipo con el
+            # runner; sin ella, pasar el string de ``engine_value`` compila y pasa todos
+            # los casos de acá, y falla recién contra un motor real.
+            assert isinstance(engine, EngineType), (
+                f"el controller pasó {type(engine).__name__} ({engine!r}); el runner "
+                "necesita un EngineType porque lee su '.value'"
+            )
             assert any(s.version == version for s in specs), (
                 f"stamp a {version!r}, que no está en la cadena vigente: "
                 f"{[s.version for s in specs]}"
