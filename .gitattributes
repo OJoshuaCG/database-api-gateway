@@ -12,8 +12,7 @@
 #    así que un clon en Windows entrega los `.sh` con CRLF. Y `docker/scripts/entrypoint.sh`
 #    es el `ENTRYPOINT` del Dockerfile: con CRLF el kernel falla al resolver el shebang
 #    ("bad interpreter: /bin/sh^M") y la imagen no levanta. Lo mismo aplica a
-#    `docker/init/mariadb/01-gateway-admin.sh` y al hook
-#    `.claude/hooks/recordar-protocolo.sh`.
+#    `docker/init/mariadb/01-gateway-admin.sh`.
 #
 # Este repo NO versiona binarios (todo es py/md/sql/sh/yml/toml), así que la regla general
 # puede ser agresiva sin riesgo de corromper nada.

@@ -44,21 +44,6 @@ agrega 2000 líneas de una vez.**
 
 ---
 
-## Antes de trabajar: reclamá la tarea
-
-Invocá la skill **`clickup-task-flow`** (o `/tarea P-XX`) antes de implementar, arreglar,
-verificar o refactorizar. El protocolo completo está en la skill; no se repite acá.
-
-- El **detalle** de cada tarea vive en `TODO.md`. El **estado** y **quién trabaja** viven en
-  ClickUp. Ante discrepancia de estado, **gana ClickUp**.
-- Si una tarea está `in progress`, **se interrumpe** y se informa quién la tiene.
-- Al arrancar el día, `/tarea bloqueos`: son las que el frontend devolvió en `on hold` y no
-  aparecen en ningún otro filtro, con una implementación parada del otro lado.
-
-Responder preguntas, leer código o explicar cosas **no** requiere reclamar tarea.
-
----
-
 ## Dónde buscar el porqué
 
 Tres destinos, por tipo de pregunta. No hay índice: la convención de nombres alcanza.
