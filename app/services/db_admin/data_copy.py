@@ -35,7 +35,6 @@ un orden parcial no rompe el resto). Cancelación cooperativa entre lotes.
 
 from __future__ import annotations
 
-import itertools
 import json
 import os
 import tempfile
@@ -895,88 +894,6 @@ def _load_data_via_fifo(
 
 
 # --------------------------------------------------------------------------- #
-# Despacho por tamaño: tablas chicas por INSERT extendido                       #
-# --------------------------------------------------------------------------- #
-# Tope de bytes del buffer. Existe para garantizar UNA sola sentencia: pymysql parte el
-# executemany al pasarse de ``max_stmt_length`` (1 MB) y, en AUTOCOMMIT, cada trozo commitea
-# por su cuenta — una tabla a medio insertar. Con staging la tabla es hoy todo-o-nada, y ese
-# contrato no se puede perder por una optimización.
-_PEEK_MAX_BYTES = 512 * 1024
-
-
-def _peek_rows(
-    rows_iter: Iterator[tuple], max_rows: int, max_bytes: int
-) -> tuple[list[tuple], bool]:
-    """
-    Lee hasta ``max_rows`` filas SIN escribir nada al destino.
-
-    Devuelve ``(buffer, se_agoto)``. ``se_agoto=True`` significa que la tabla ENTERA entró en
-    memoria y se puede volcar con una sola sentencia.
-
-    **Por qué se mide acá y no se le pregunta al catálogo.** El plan ya trae un
-    ``row_estimate`` de ``information_schema.TABLE_ROWS``, pero es un estimador de InnoDB con
-    hasta 50 % de error y es NULL en tablas nunca analizadas — y el llamador se traga la
-    excepción de ``list_table_stats``, así que puede ser None para todas. Un umbral sobre ese
-    dato obliga a escribir lógica de rescate para "me pasé", y esa lógica es la parte
-    peligrosa: retomar una carga a medias exige un prefijo ordenado y estable que no existe
-    (sin PK no hay ``ORDER BY``, y en READ COMMITTED sobre una producción viva el prefijo puede
-    mutar entre lotes). Sería el único diseño capaz de duplicar o perder filas en silencio.
-
-    Preguntándole al cursor, en el punto de decisión **no se escribió una sola fila al
-    destino**: no hay nada que retomar ni que reconciliar. El invariante es estructural.
-    """
-    buffer: list[tuple] = []
-    bytes_aprox = 0
-    for row in rows_iter:
-        buffer.append(row)
-        # Estimación barata y conservadora del tamaño serializado: no hace falta exactitud,
-        # solo no pasarse. Se sobreestima a propósito.
-        bytes_aprox += sum(
-            len(v) if isinstance(v, (bytes, bytearray, str)) else 24 for v in row
-        ) + len(row)
-        if len(buffer) >= max_rows or bytes_aprox >= max_bytes:
-            return buffer, False
-    return buffer, True
-
-
-def _despachar(
-    writer: _Writer,
-    rows_iter: Iterator[tuple],
-    *,
-    batch_rows: int,
-    dest_engine: str,
-) -> tuple[_Writer, Iterator[tuple]]:
-    """
-    Elige el writer real de ESTA tabla, mirando cuántas filas tiene de verdad.
-
-    El camino bulk de MySQL está dimensionado para CAUDAL: por tabla monta un FIFO, arranca un
-    hilo, crea una staging ``LIKE final`` (con todos sus índices), abre un ``LOAD DATA``, hace
-    un ``INSERT ... SELECT`` y tira la staging. Para una tabla de 7 filas —o de cero— eso es
-    pura orquesta: cinco round-trips y trabajo de servidor para mover nada. En una medición
-    real, una tabla VACÍA costaba 389 ms.
-
-    Si la tabla entera entra en un lote, se vuelca con ``_copy_writer_insert``: pymysql colapsa
-    el ``executemany`` a UN INSERT extendido, o sea **un** round-trip, y sin staging.
-
-    Efecto lateral que conviene tener presente: el camino legacy NO tiene el ``IGNORE``
-    implícito de ``LOAD DATA LOCAL``, así que con ``upsert=False`` aborta con ER_DUP_ENTRY.
-    Mueve las tablas chicas del camino que imita el fallo al camino imitado.
-
-    Solo aplica al writer bulk de MySQL. En PostgreSQL el ``COPY FROM STDIN`` va por la
-    conexión que ya está abierta y su staging es solo-si-upsert: no hay orquesta que evitar. Y
-    si el writer resuelto YA es el legacy (kill switch, sqlite, ``local_infile`` apagado), el
-    peek sería trabajo al pepe.
-    """
-    if writer is not _copy_writer_mysql:
-        return writer, rows_iter
-    buffer, agotado = _peek_rows(rows_iter, batch_rows, _PEEK_MAX_BYTES)
-    if agotado:
-        return _copy_writer_insert, iter(buffer)
-    # No entró: se devuelve lo leído por delante del resto y sigue el camino de siempre.
-    return writer, itertools.chain(buffer, rows_iter)
-
-
-# --------------------------------------------------------------------------- #
 # Copia de una tabla                                                           #
 # --------------------------------------------------------------------------- #
 def _copy_one_table(
@@ -1021,14 +938,11 @@ def _copy_one_table(
         pooled=pooled_source,
     )
     try:
-        writer_efectivo, filas = _despachar(
-            writer, rows_iter, batch_rows=batch_rows, dest_engine=dest_engine
-        )
-        writer_efectivo(
+        writer(
             dest_conn,
             dest_engine,
             spec,
-            filas,
+            rows_iter,
             batch_rows,
             progress_cb,
             cancel_cb,

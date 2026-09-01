@@ -99,14 +99,20 @@ spec = TableCopySpec(table="valores",
     columns=["id","t3","t6","tneg","cuerpo","txt","monto","estado"],
     primary_key=["id"])
 
+import app.services.db_admin.data_copy as dc
+
+_resolve_original = dc._resolve_writer
+
 fallos = []
-for nombre, extra in [("camino LEGACY (tabla chica -> INSERT unico)", 0),
-                      ("camino BULK/FIFO (tabla grande -> LOAD DATA)", 2000)]:
-    preparar(extra)
+for nombre, writer in [("camino LEGACY (INSERT parametrizado)", dc._copy_writer_insert),
+                       ("camino BULK/FIFO (LOAD DATA LOCAL)", dc._copy_writer_mysql)]:
+    dc._resolve_writer = lambda conn, _w=writer: _w
+    preparar(0)
     origen = leer(SRC)
     res = copy_tables(source_target=t, source_db=SRC, source_engine="mysql",
                       dest_target=t, dest_db=DST, dest_engine="mysql",
                       specs=[spec], batch_rows=1000)
+    dc._resolve_writer = _resolve_original
     destino = leer(DST)
     ok_status = res[0].status == "applied"
     ok_filas = origen == destino
