@@ -1491,31 +1491,58 @@ class MySQLAdapter(ServerAdapter):
             ),
             {"db": database, "t": table},
         ).fetchall()
-        for name, coll, cs, extra, column_type, gen_expr, col_comment in rows:
-            on_update = None
-            if extra and "on update" in str(extra).lower():
-                on_update = "CURRENT_TIMESTAMP"
-            out[name] = {
-                "collation": coll,
-                "charset": cs,
-                "on_update": on_update,
-                "column_type": str(column_type) if column_type else None,
-                # Expresión CANÓNICA de la columna generada, tomada de
-                # ``GENERATION_EXPRESSION`` (sin los paréntesis externos de ``AS (...)``,
-                # que el render agrega). Es la fuente correcta frente a la reflexión de
-                # ``SHOW CREATE TABLE`` de SQLAlchemy, cuyo parser cuenta paréntesis sin
-                # entender los literales de string: un ``COMMENT '...( )...'`` en una
-                # columna generada le hace capturar de más (se traga ``VIRTUAL``/``STORED``
-                # y el propio COMMENT) → DDL inválido. En columnas no generadas es ``''``.
-                "generation_expression": (str(gen_expr) if gen_expr else None),
-                # ``COLUMN_COMMENT`` es autoritativo: recupera el comentario que la misma
-                # captura contaminada de SQLAlchemy perdía en las columnas generadas.
-                "comment": (str(col_comment) if col_comment else None),
-            }
+        for name, *resto in rows:
+            out[name] = self._column_extra_from_row(name, *resto)
         return out
 
-    def _table_storage_options(self, conn, database, table, schema) -> dict[str, str]:
+    @staticmethod
+    def _column_extra_from_row(
+        name, coll, cs, extra, column_type, gen_expr, col_comment
+    ) -> dict:
+        """
+        Fila de ``information_schema.COLUMNS`` → el dict de extras de UNA columna.
+
+        Vive aparte porque hay dos caminos que la construyen —el hook por tabla y el prefetch
+        de toda la base— y **tienen que producir exactamente lo mismo**. Si la lógica estuviera
+        duplicada, una divergencia silenciosa cambiaría el snapshot según por dónde se entró, y
+        eso se manifestaría como un diff fantasma o un DDL corrupto, no como un error.
+
+        ``name`` no se usa: se acepta para que la firma calce con la fila tal como viene.
+        """
+        del name
+        on_update = None
+        if extra and "on update" in str(extra).lower():
+            on_update = "CURRENT_TIMESTAMP"
+        return {
+            "collation": coll,
+            "charset": cs,
+            "on_update": on_update,
+            "column_type": str(column_type) if column_type else None,
+            # Expresión CANÓNICA de la columna generada, tomada de
+            # ``GENERATION_EXPRESSION`` (sin los paréntesis externos de ``AS (...)``,
+            # que el render agrega). Es la fuente correcta frente a la reflexión de
+            # ``SHOW CREATE TABLE`` de SQLAlchemy, cuyo parser cuenta paréntesis sin
+            # entender los literales de string: un ``COMMENT '...( )...'`` en una
+            # columna generada le hace capturar de más (se traga ``VIRTUAL``/``STORED``
+            # y el propio COMMENT) → DDL inválido. En columnas no generadas es ``''``.
+            "generation_expression": (str(gen_expr) if gen_expr else None),
+            # ``COLUMN_COMMENT`` es autoritativo: recupera el comentario que la misma
+            # captura contaminada de SQLAlchemy perdía en las columnas generadas.
+            "comment": (str(col_comment) if col_comment else None),
+        }
+
+    @staticmethod
+    def _storage_from_row(engine_name, table_collation) -> dict[str, str]:
+        """Fila de ``information_schema.TABLES`` → opciones de almacenamiento de la tabla."""
         opts: dict[str, str] = {}
+        if engine_name:
+            opts["engine"] = str(engine_name)
+        if table_collation:
+            opts["collation"] = str(table_collation)
+            opts["charset"] = str(table_collation).split("_", 1)[0]
+        return opts
+
+    def _table_storage_options(self, conn, database, table, schema) -> dict[str, str]:
         row = conn.execute(
             text(
                 "SELECT ENGINE, TABLE_COLLATION FROM information_schema.TABLES "
@@ -1523,25 +1550,81 @@ class MySQLAdapter(ServerAdapter):
             ),
             {"db": database, "t": table},
         ).fetchone()
-        if row:
-            if row[0]:
-                opts["engine"] = str(row[0])
-            if row[1]:
-                opts["collation"] = str(row[1])
-                opts["charset"] = str(row[1]).split("_", 1)[0]
-        db_row = conn.execute(
+        opts = self._storage_from_row(row[0], row[1]) if row else {}
+        opts.update(self._db_charset_options(conn, database))
+        return opts
+
+    def _db_charset_options(self, conn, database: str) -> dict[str, str]:
+        """
+        ``db_charset``/``db_collation`` de la base, para la herencia de la tabla.
+
+        Es un dato de nivel BASE e invariante dentro de un snapshot. Antes se consultaba dentro
+        de ``_table_storage_options``, o sea **una vez por tabla**, trayendo siempre la misma
+        fila: en una base de 80 tablas eran 79 consultas idénticas de puro desperdicio.
+        """
+        row = conn.execute(
             text(
                 "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME "
                 "FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = :db"
             ),
             {"db": database},
         ).fetchone()
-        if db_row:
-            if db_row[0]:
-                opts["db_charset"] = str(db_row[0])
-            if db_row[1]:
-                opts["db_collation"] = str(db_row[1])
+        if not row:
+            return {}
+        opts: dict[str, str] = {}
+        if row[0]:
+            opts["db_charset"] = str(row[0])
+        if row[1]:
+            opts["db_collation"] = str(row[1])
         return opts
+
+    def _prefetch_column_extras(
+        self, conn, database, schema, tables
+    ) -> dict[str, dict[str, dict]] | None:
+        """
+        Los extras de columna de TODAS las tablas en una consulta.
+
+        Misma consulta que ``_column_extras`` sin el filtro por ``TABLE_NAME``, agrupada en
+        memoria. Se filtra por las tablas pedidas para no arrastrar la contabilidad interna del
+        gateway (``_gw_v_*``/``_gw_stg_*``), que el llamador ya excluyó.
+        """
+        if not tables:
+            return {}
+        out: dict[str, dict[str, dict]] = {t: {} for t in tables}
+        pedidas = set(tables)
+        rows = conn.execute(
+            text(
+                "SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME, CHARACTER_SET_NAME, EXTRA, "
+                "COLUMN_TYPE, GENERATION_EXPRESSION, COLUMN_COMMENT "
+                "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = :db"
+            ),
+            {"db": database},
+        ).fetchall()
+        for table, *resto in rows:
+            if table in pedidas:
+                out[table][resto[0]] = self._column_extra_from_row(*resto)
+        return out
+
+    def _prefetch_table_storage_options(
+        self, conn, database, schema, tables
+    ) -> dict[str, dict[str, str]] | None:
+        """Engine y collation de TODAS las tablas, más el default de la base, en dos consultas."""
+        if not tables:
+            return {}
+        db_opts = self._db_charset_options(conn, database)
+        pedidas = set(tables)
+        out: dict[str, dict[str, str]] = {t: dict(db_opts) for t in tables}
+        rows = conn.execute(
+            text(
+                "SELECT TABLE_NAME, ENGINE, TABLE_COLLATION FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = :db"
+            ),
+            {"db": database},
+        ).fetchall()
+        for table, engine_name, table_collation in rows:
+            if table in pedidas:
+                out[table].update(self._storage_from_row(engine_name, table_collation))
+        return out
 
     def _database_defaults(self, conn, database, schema) -> dict[str, str | None]:
         """Default de charset/collation de la BD desde ``information_schema.SCHEMATA``."""

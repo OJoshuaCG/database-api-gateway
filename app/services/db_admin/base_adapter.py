@@ -612,13 +612,21 @@ class ServerAdapter(ABC):
         )
 
     def _build_table_schema(
-        self, insp, conn, database: str, table: str, schema: str
+        self, insp, conn, database: str, table: str, schema: str,
+        *,
+        extras: dict[str, dict] | None = None,
+        storage: dict[str, str] | None = None,
     ) -> TableSchema:
         """
         Construye un ``TableSchema`` COMPLETO reutilizando lo que el Inspector ya expone
         (columnas + computed/identity, FKs + options, índices + dialect_options, checks,
         uniques, comment) más los hooks por adapter (collation/charset/on_update de
         columna y storage_options de tabla) para lo que el Inspector no expone fiable.
+
+        ``extras``/``storage`` permiten inyectar lo que normalmente se consultaría por tabla,
+        cuando el llamador ya lo trajo para TODAS de una sola vez (ver
+        ``_prefetch_column_extras``). Pasar ``None`` mantiene el camino por tabla, que es el
+        correcto cuando se reflexiona una sola tabla y batear no ahorraría nada.
         """
         columns_raw = insp.get_columns(table, schema=schema)
         pk = insp.get_pk_constraint(table, schema=schema)
@@ -639,8 +647,10 @@ class ServerAdapter(ABC):
         except (NotImplementedError, SQLAlchemyError):
             comment = None
 
-        extras = self._column_extras(conn, database, table, schema)
-        storage = self._table_storage_options(conn, database, table, schema)
+        if extras is None:
+            extras = self._column_extras(conn, database, table, schema)
+        if storage is None:
+            storage = self._table_storage_options(conn, database, table, schema)
 
         pk_set = set(pk_cols)
         columns: list[ColumnInfo] = []
@@ -1079,11 +1089,26 @@ class ServerAdapter(ABC):
                 # ``identifiers.GATEWAY_TABLE_PREFIXES`` — sin este filtro el diff
                 # generaba ``DROP TABLE _gw_v_{slug}`` contra la propia tabla de versión
                 # de Alembic y la migración moría al registrar la versión nueva.
+                nombres = exclude_gateway_internal_tables(
+                    sorted(insp.get_table_names(schema=schema))
+                )
+                # Dos consultas para toda la base en vez de dos POR TABLA. Un adapter que no
+                # las implemente devuelve None y cada tabla vuelve a consultar lo suyo.
+                extras_por_tabla = self._prefetch_column_extras(conn, database, schema, nombres)
+                storage_por_tabla = self._prefetch_table_storage_options(
+                    conn, database, schema, nombres
+                )
                 tables = [
-                    self._build_table_schema(insp, conn, database, t, schema)
-                    for t in exclude_gateway_internal_tables(
-                        sorted(insp.get_table_names(schema=schema))
+                    self._build_table_schema(
+                        insp, conn, database, t, schema,
+                        # Una tabla sin filas en el prefetch existe pero no tiene nada que
+                        # aportar: va ``{}``, no ``None``, para no re-consultarla por tabla.
+                        extras=None if extras_por_tabla is None else extras_por_tabla.get(t, {}),
+                        storage=(
+                            None if storage_por_tabla is None else storage_por_tabla.get(t, {})
+                        ),
                     )
+                    for t in nombres
                 ]
                 n_tablas = len(tables)
                 t_tablas = time.perf_counter()
@@ -1132,6 +1157,30 @@ class ServerAdapter(ABC):
     def _column_extras(self, conn, database: str, table: str, schema: str) -> dict[str, dict]:
         """{col: {collation, charset, on_update}} — lo que el Inspector no expone fiable."""
         return {}
+
+    # ---- Prefetch: lo mismo que los hooks de arriba, pero para TODAS las tablas ---- #
+    #
+    # ``_column_extras`` y ``_table_storage_options`` consultan ``information_schema`` UNA VEZ
+    # POR TABLA. En una base de ~80 tablas eso son ~240 consultas secuenciales contra un motor
+    # remoto, y el snapshot corre varias veces por clon. Como esas vistas se filtran por
+    # ``TABLE_SCHEMA`` y ``TABLE_NAME``, quitar el segundo filtro trae lo mismo para la base
+    # entera en UNA consulta, y agrupar por tabla se hace en memoria.
+    #
+    # Devuelven ``None`` —no ``{}``— para decir «este adapter no batea»: ``{}`` es
+    # indistinguible de «bateé y no hay nada», y en ese caso el llamador tiene que caer al hook
+    # por tabla en vez de creer que la base no tiene columnas.
+
+    def _prefetch_column_extras(
+        self, conn, database: str, schema: str, tables: list[str]
+    ) -> dict[str, dict[str, dict]] | None:
+        """``{tabla: {col: {...}}}`` para todas las tablas. ``None`` = sin batch."""
+        return None
+
+    def _prefetch_table_storage_options(
+        self, conn, database: str, schema: str, tables: list[str]
+    ) -> dict[str, dict[str, str]] | None:
+        """``{tabla: {engine, charset, …}}`` para todas las tablas. ``None`` = sin batch."""
+        return None
 
     def _database_defaults(self, conn, database: str, schema: str) -> dict[str, str | None]:
         """
