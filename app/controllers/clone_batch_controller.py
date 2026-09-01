@@ -50,7 +50,7 @@ from app.controllers.common import build_target, get_server_or_404
 from app.core.context import current_http_identifier
 from app.core.database import Database
 from app.core.environments import (
-    CLONE_BATCH_MAX_ROWS,
+    CLONE_BATCH_MAX_DATABASES,
     CLONE_TTL_HOURS,
     DB_HOST,
     DB_NAME,
@@ -250,16 +250,16 @@ class CloneBatchController:
                 status_code=422,
                 public_context={"code": cspec.CODE_BATCH_EMPTY},
             )
-        if len(rows_in) > CLONE_BATCH_MAX_ROWS:
+        if len(rows_in) > CLONE_BATCH_MAX_DATABASES:
             raise AppHttpException(
                 message=(
-                    f"El lote tiene {len(rows_in)} bases y el tope es {CLONE_BATCH_MAX_ROWS}. "
+                    f"El lote tiene {len(rows_in)} bases y el tope es {CLONE_BATCH_MAX_DATABASES}. "
                     f"Dividilo en lotes más chicos."
                 ),
                 status_code=422,
                 public_context={
                     "code": cspec.CODE_BATCH_TOO_LARGE,
-                    "max_rows": CLONE_BATCH_MAX_ROWS,
+                    "max_databases": CLONE_BATCH_MAX_DATABASES,
                     "requested": len(rows_in),
                 },
             )

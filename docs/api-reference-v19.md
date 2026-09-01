@@ -100,7 +100,7 @@ Todos bajo `AdminDep`, envueltos en `ApiResponse[T]`.
 - `overrides` (opcional, por fila): objeto con lo que esta fila le pisa al perfil global
   (`copy_intent`, `structure`, `data`, `data_on_existing`, `target_charset`, `target_collation`).
   **`clean_mode` dentro de `overrides` da 422**, igual que en el perfil.
-- Tope de filas: `CLONE_BATCH_MAX_ROWS` (default 25).
+- Tope de bases por lote: `CLONE_BATCH_MAX_DATABASES` (default 25).
 
 ### 3.1 Lo que rebota el lote entero (422) vs. lo que bloquea UNA fila
 
@@ -266,7 +266,7 @@ comparten el namespace `clone.*` porque el lote es la orquestación del mismo m�
 | `clone.batch_target_exists` | Esa base ya existe en el destino. Cambiá el nombre, o usá la existente y copiá solo datos. |
 | `clone.batch_target_missing` | Esa base no existe en el destino. |
 | `clone.batch_empty` | Ninguna de las bases seleccionadas se puede clonar con esta configuración. |
-| `clone.batch_too_large` | El lote supera el tope de bases. Dividilo. (`max_rows`, `requested`) |
+| `clone.batch_too_large` | El lote supera el tope de bases. Dividilo. (`max_databases`, `requested`) |
 | `clone.batch_set_mismatch` | El conjunto de bases cambió. Volvé a armar el lote. |
 | `clone.batch_not_pending` | El lote ya no está pendiente. |
 | `clone.batch_expired` | El plan del lote expiró. |

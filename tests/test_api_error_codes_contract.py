@@ -224,8 +224,8 @@ def test_el_lote_emite_su_codigo_en_public_context(admin_client):
     assert srv.status_code == 201, srv.text
     sid = srv.json()["data"]["id"]
 
-    original = cbc.CLONE_BATCH_MAX_ROWS
-    cbc.CLONE_BATCH_MAX_ROWS = 1
+    original = cbc.CLONE_BATCH_MAX_DATABASES
+    cbc.CLONE_BATCH_MAX_DATABASES = 1
     try:
         r = admin_client.post(
             "/api/v1/database-clone-batches",
@@ -239,10 +239,10 @@ def test_el_lote_emite_su_codigo_en_public_context(admin_client):
             },
         )
     finally:
-        cbc.CLONE_BATCH_MAX_ROWS = original
+        cbc.CLONE_BATCH_MAX_DATABASES = original
 
     assert r.status_code == 422, r.text
     pc = _pc(r)
     assert pc["code"] == "clone.batch_too_large"
     # Campos estructurados: el cliente arma el mensaje con ellos, no parseando la prosa.
-    assert pc["max_rows"] == 1 and pc["requested"] == 2
+    assert pc["max_databases"] == 1 and pc["requested"] == 2

@@ -142,9 +142,11 @@ CLONE_BULK_COPY_ENABLED = os.getenv("CLONE_BULK_COPY_ENABLED", "True").lower() =
 # error y la carga sobre el servidor destino sin un beneficio medido. Executor PROPIO, no el
 # de CLONE_MAX_WORKERS, para que un lote largo no deje sin turno a los clones sueltos.
 CLONE_BATCH_MAX_WORKERS = int(os.getenv("CLONE_BATCH_MAX_WORKERS", "1"))
-# Tope de bases por lote. Es un límite de prudencia, no técnico: un lote es una sola
-# confirmación que autoriza N operaciones sobre bases de terceros.
-CLONE_BATCH_MAX_ROWS = int(os.getenv("CLONE_BATCH_MAX_ROWS", "25"))
+# Cuántas BASES DE DATOS puede pedir un lote. Es un límite de prudencia, no técnico: el costo
+# de planear no crece con este número (la lista de bases se consulta una vez por servidor, no
+# por fila), así que lo que acota es cuánto puede autorizar UNA sola confirmación sobre bases
+# de terceros. No confundir con CLONE_DATA_BATCH_ROWS, que sí cuenta filas de datos.
+CLONE_BATCH_MAX_DATABASES = int(os.getenv("CLONE_BATCH_MAX_DATABASES", "25"))
 
 # ======= Conversión de charset/collation (collation conversions) ======= #
 # Vida útil (horas) de un plan de conversión. Tras expirar, execute exige replanear.

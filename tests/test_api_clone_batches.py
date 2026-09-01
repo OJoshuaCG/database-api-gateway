@@ -264,7 +264,7 @@ def test_plan_rechaza_destinos_duplicados(admin_client, monkeypatch):
 def test_plan_rechaza_lote_por_encima_del_tope(admin_client, monkeypatch):
     src, dst = _server(admin_client, 3306), _server(admin_client, 3307)
     _install(monkeypatch, source_server_id=src, target_server_id=dst, sources=("db_a",))
-    monkeypatch.setattr(cbc, "CLONE_BATCH_MAX_ROWS", 2)
+    monkeypatch.setattr(cbc, "CLONE_BATCH_MAX_DATABASES", 2)
     rows = [
         {"source_database_name": "db_a", "target_database_name": f"c{i}"} for i in range(3)
     ]
