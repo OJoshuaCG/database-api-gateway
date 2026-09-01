@@ -79,8 +79,11 @@ class _FakeAdapter:
         self.existing = set(existing)
         self.created: list[str] = []
         self.dropped: list[str] = []
+        # Cuántas veces se fotografió cada base. Es lo que mide el costo fijo del lote.
+        self.snapshot_calls: list[str] = []
 
     def structural_snapshot(self, database):
+        self.snapshot_calls.append(database)
         return self.snaps.get(database, SchemaSnapshot(database=database, source_engine="mysql"))
 
     def list_databases(self):
@@ -784,3 +787,51 @@ def test_el_historial_lista_los_lotes_del_mas_nuevo_al_mas_viejo(admin_client, m
     ids = [b["id"] for b in r.json()["data"]]
     assert ids[:2] == [segundo["id"], primero["id"]]
     assert r.json()["pagination"]["total"] == 2
+
+
+def test_el_lote_fotografia_el_origen_dos_veces_por_base_no_cuatro(admin_client, monkeypatch):
+    """
+    Armar el plan de una fila snapshoteaba el MISMO origen tres veces en el mismo segundo
+    —``create_plan`` para el fingerprint, ``_apply_spec`` para resolver la selección
+    declarativa y ``_snapshots_for`` para rendear el plan—, más la del worker: cuatro fotos
+    completas por base. Cada una es una conexión nueva más varias consultas a
+    ``information_schema``, y en una medición real eran ~25 s por base de costo FIJO, idéntico
+    entre dos corridas con trabajo muy distinto.
+
+    Ahora las tres del armado comparten una caché acotada a la fila. La del worker NO se cachea
+    y por eso el número es DOS y no UNA: ésa se toma bajo el advisory lock y se compara contra
+    el fingerprint para abortar si el origen cambió. Si este test bajara a 1, el guard
+    anti-TOCTOU estaría apagado.
+    """
+    src, dst = _server(admin_client, 3306), _server(admin_client, 3307)
+    origen, _ = _install(
+        monkeypatch, source_server_id=src, target_server_id=dst, sources=("db_a",)
+    )
+    batch = _plan(admin_client, src, dst, [{"source_database_name": "db_a"}]).json()["data"]
+    assert _execute(admin_client, batch, _server_name(admin_client, dst)).status_code == 200
+
+    assert origen.snapshot_calls.count("db_a") == 2, (
+        f"fotos del origen: {origen.snapshot_calls}"
+    )
+
+
+def test_la_cache_del_lote_no_cruza_entre_bases(admin_client, monkeypatch):
+    """
+    Dos bases distintas → dos entradas de caché, no una compartida.
+
+    La caché se indexa por (servidor, base). Si se indexara solo por servidor, la segunda fila
+    del lote clonaría la ESTRUCTURA DE LA PRIMERA —silenciosamente, sin un solo error— y es el
+    peor fallo posible de este cambio.
+    """
+    src, dst = _server(admin_client, 3306), _server(admin_client, 3307)
+    origen, _ = _install(
+        monkeypatch, source_server_id=src, target_server_id=dst, sources=("db_a", "db_b")
+    )
+    batch = _plan(
+        admin_client, src, dst,
+        [{"source_database_name": "db_a"}, {"source_database_name": "db_b"}],
+    ).json()["data"]
+    assert _execute(admin_client, batch, _server_name(admin_client, dst)).status_code == 200
+
+    assert origen.snapshot_calls.count("db_a") == 2, origen.snapshot_calls
+    assert origen.snapshot_calls.count("db_b") == 2, origen.snapshot_calls

@@ -879,7 +879,17 @@ class CloneBatchController:
         finally:
             session.close()
 
-        controller = CloneController()
+        # Caché del snapshot del origen ENCENDIDA, y solo acá. Armar el plan de una fila
+        # snapshotea el mismo origen hasta tres veces en el mismo segundo —``create_plan``,
+        # ``_apply_spec`` al resolver la selección declarativa y ``_snapshots_for`` al rendear—
+        # y cada una es una conexión nueva más varias consultas a ``information_schema``. En una
+        # medición real eso era ~25 s por base, idénticos entre dos corridas con trabajo muy
+        # distinto: costo fijo, no proporcional a lo que se copia.
+        #
+        # En el asistente de a una NO se enciende: ahí las llamadas las dispara el operador y
+        # pueden mediar minutos, así que re-snapshotear es lo correcto. El controller es de esta
+        # fila y muere con ella, de modo que la caché nunca cruza a otra base.
+        controller = CloneController(cache_source_snapshot=True)
 
         # 1) El job, con el snapshot del origen tomado AHORA.
         create_payload = {
@@ -948,6 +958,13 @@ class CloneBatchController:
 
         # 3) Ejecutar. ``run_job`` reclama el job, sostiene el advisory lock del motor durante
         #    todas las fases y nunca lanza: deja el desenlace escrito en el propio job.
+        #
+        #    Se tira la caché ANTES: el worker vuelve a fotografiar el origen bajo el lock y
+        #    compara contra el fingerprint para abortar si cambió desde que se armó el plan. Ese
+        #    guard solo sirve con una foto FRESCA. Hoy ``_pipeline`` llama al adapter directo y
+        #    no pasa por la caché, así que esto es redundante — pero la invariante es de
+        #    corrección y no puede depender de que nadie enrute una llamada nueva por ahí.
+        controller.forget_snapshots()
         controller.run_job(job_id)
         self._stamp_item_finished(item_id)
 

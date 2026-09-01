@@ -90,8 +90,11 @@ class _FakeAdapter:
         self.row_estimates: dict[str, int] = {}
         self.unknown_estimates: set[str] = set()
         self.charset_supported: bool | None = True
+        # Para fijar que el asistente de a una NO cachea el snapshot del origen.
+        self.snapshot_calls: list[str] = []
 
     def structural_snapshot(self, database):
+        self.snapshot_calls.append(database)
         return self.snaps.get(database, SchemaSnapshot(database=database, source_engine="mysql"))
 
     def list_databases(self):
@@ -660,3 +663,31 @@ def test_history_reports_batch_membership(admin_client, monkeypatch):
     ).json()["data"]
     assert [j["id"] for j in solo_del_lote] == [job_id]
 
+
+
+def test_el_asistente_de_a_una_NO_cachea_el_snapshot_del_origen(admin_client, monkeypatch):
+    """
+    La caché de snapshots que acelera el LOTE tiene que quedar apagada acá.
+
+    En el lote, ``create_plan``, ``preview`` y el rendeo del plan ocurren dentro de la misma
+    función y en el mismo segundo, así que compartir la foto del origen es correcto y ahorra el
+    costo dominante. En el asistente de a una las dispara el operador desde el navegador y
+    pueden mediar minutos: si se cachearan, el plan que confirma podría describir un origen que
+    ya cambió, y el operador estaría aprobando algo que no es lo que va a pasar.
+
+    Se cuenta que ``preview`` vuelva a fotografiar después de ``create_plan``. Es una invariante
+    de CORRECCIÓN, no de rendimiento: un cambio que "optimice" esto rompe la revalidación.
+    """
+    fake = _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+
+    job_id = _plan(admin_client, sid, tid)
+    tras_el_plan = fake.snapshot_calls.count("src_db")
+    assert tras_el_plan >= 1, "create_plan tiene que fotografiar el origen"
+
+    fake.snapshot_calls.clear()
+    pr = admin_client.post(f"/api/v1/database-clones/{job_id}/preview", json={})
+    assert pr.status_code == 200, pr.text
+    assert fake.snapshot_calls.count("src_db") >= 1, (
+        "preview volvió a usar una foto vieja: la caché del lote se filtró al asistente de a una"
+    )

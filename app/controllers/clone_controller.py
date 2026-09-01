@@ -191,11 +191,56 @@ class _ResolvedSide:
 
 
 class CloneController:
-    def __init__(self):
+    def __init__(self, *, cache_source_snapshot: bool = False):
         self.db = Database(DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
+        # Caché del snapshot del ORIGEN, apagada por default. Ver ``_source_snapshot``.
+        self._snap_cache: dict[tuple[int, str], SchemaSnapshot] | None = (
+            {} if cache_source_snapshot else None
+        )
 
     def _session(self):
         return self.db.get_declarative_base_session()
+
+    def _source_snapshot(self, src_target: ServerTarget, database: str) -> SchemaSnapshot:
+        """
+        Snapshot del origen, opcionalmente cacheado por la vida de este controller.
+
+        Armar un plan snapshotea el origen hasta TRES veces seguidas contra el mismo servidor:
+        una en ``create_plan`` (para el fingerprint anti-TOCTOU), otra en ``_apply_spec`` si la
+        spec trae ``structure`` o ``data`` (para resolver la selección declarativa contra el
+        catálogo) y otra en ``_snapshots_for`` (para rendear el plan). Las tres calculan lo
+        mismo, con segundos de diferencia, y cada una es una conexión nueva más ~3 consultas a
+        ``information_schema`` — el costo dominante de un clon de una base chica.
+
+        **La caché está APAGADA por default y solo la enciende el LOTE.** En el asistente de a
+        una, ``create_plan`` y ``preview`` los dispara el operador desde el navegador y pueden
+        estar separados por minutos de navegación: ahí re-snapshotear es lo correcto, porque el
+        origen pudo cambiar y el operador tiene que ver el plan de lo que hay AHORA. En el lote
+        las tres llamadas ocurren dentro de la misma función y en el mismo segundo.
+
+        Lo que NUNCA se cachea es el snapshot que el worker toma bajo el advisory lock
+        (``_pipeline``): ése es la garantía anti-TOCTOU real —compara contra el fingerprint y
+        aborta si el origen cambió— y llama al adapter directo, sin pasar por acá.
+        """
+        if self._snap_cache is None:
+            return get_adapter(src_target).structural_snapshot(database)
+        clave = (src_target.server_id, database)
+        if clave not in self._snap_cache:
+            self._snap_cache[clave] = get_adapter(src_target).structural_snapshot(database)
+        return self._snap_cache[clave]
+
+    def forget_snapshots(self) -> None:
+        """
+        Vacía la caché de snapshots, si está encendida.
+
+        El lote la llama antes de ejecutar. Hoy ``_pipeline`` no pasa por ``_source_snapshot``,
+        así que sería redundante — pero la invariante «el worker nunca ve un snapshot cacheado»
+        es de CORRECTITUD, no de rendimiento, y no puede depender de que nadie enrute una
+        llamada nueva por acá sin darse cuenta. Si eso pasara, el clon validaría el fingerprint
+        contra una foto vieja y el guard anti-TOCTOU quedaría apagado en silencio.
+        """
+        if self._snap_cache is not None:
+            self._snap_cache.clear()
 
     # ------------------------------------------------------------------ #
     # Carga / resolución                                                  #
@@ -566,7 +611,7 @@ class CloneController:
                 vsession.close()
 
         # Snapshot del origen (solo lectura) + fingerprint anti-TOCTOU.
-        source_snap = src_adapter.structural_snapshot(src.database_name)
+        source_snap = self._source_snapshot(src.target, src.database_name)
         src_fp = _snapshot_fingerprint(source_snap)
 
         expires = _utcnow() + timedelta(hours=CLONE_TTL_HOURS)
@@ -1277,7 +1322,7 @@ class CloneController:
         self, job: CloneJob, src_target: ServerTarget, tgt_target: ServerTarget
     ) -> tuple[SchemaSnapshot, SchemaSnapshot | None]:
         """Snapshot del origen (siempre) y del destino (si el plan depende de él)."""
-        source_snap = get_adapter(src_target).structural_snapshot(job.source_database_name)
+        source_snap = self._source_snapshot(src_target, job.source_database_name)
         target_snap = None
         if self._needs_target_snapshot(job):
             target_snap = get_adapter(tgt_target).structural_snapshot(job.target_database_name)
@@ -1357,9 +1402,10 @@ class CloneController:
             job.is_full_clone = sel is None
         elif "structure" in sent and spec.get("structure") is not None:
             st = spec["structure"]
-            source_snap = get_adapter(
-                build_target(get_server_or_404(session, job.source_server_id))
-            ).structural_snapshot(job.source_database_name)
+            source_snap = self._source_snapshot(
+                build_target(get_server_or_404(session, job.source_server_id)),
+                job.source_database_name,
+            )
             catalog = [
                 espec.CatalogObject(object_type=ot, name=name)
                 for ot, name in self._iter_objects(source_snap)
@@ -1398,9 +1444,10 @@ class CloneController:
                 job.data_on_existing = None
             else:
                 if source_snap is None:
-                    source_snap = get_adapter(
-                        build_target(get_server_or_404(session, job.source_server_id))
-                    ).structural_snapshot(job.source_database_name)
+                    source_snap = self._source_snapshot(
+                        build_target(get_server_or_404(session, job.source_server_id)),
+                        job.source_database_name,
+                    )
                 tables = espec.resolve_selection(
                     [
                         espec.CatalogObject(object_type="table", name=t.table)
