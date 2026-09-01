@@ -41,6 +41,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Callable, Iterator
@@ -51,7 +52,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.context import current_http_identifier
-from app.core.environments import CLONE_BULK_COPY_ENABLED
+from app.core.environments import CLONE_BULK_COPY_ENABLED, CLONE_CONSISTENT_SNAPSHOT
 from app.core.logger import get_logger
 from app.core.remote_engine import (
     ServerTarget,
@@ -404,6 +405,23 @@ def _restore_sql_mode(conn, original: str | None) -> None:
 # --------------------------------------------------------------------------- #
 # Lectura del origen (único punto de lectura del cursor)                        #
 # --------------------------------------------------------------------------- #
+@contextmanager
+def _source_conn_ctx(source_target, source_db, source_engine, src_conn):
+    """
+    Conexión de lectura del origen: la prestada por ``copy_tables``, o una propia.
+
+    Cuando es prestada NO se cierra acá —es del llamador, y cerrarla tiraría el snapshot y las
+    tablas que faltan— y tampoco se re-fija el aislamiento: el scope ya lo dejó como
+    corresponde, y un ``SET SESSION`` a mitad de una transacción abierta es error.
+    """
+    if src_conn is not None:
+        yield src_conn
+        return
+    with database_connection(source_target, source_db, bulk=True) as own:
+        _set_read_committed(own, source_engine)
+        yield own
+
+
 def _iter_source_rows(
     *,
     source_target: ServerTarget,
@@ -412,7 +430,7 @@ def _iter_source_rows(
     select_sql: str,
     ncols: int,
     batch_rows: int,
-    pooled: bool = False,
+    src_conn=None,
 ) -> Iterator[tuple]:
     """
     Generador: rinde TUPLAS de valores ya adaptados (``_adapt_value``) desde el ORIGEN en
@@ -429,12 +447,11 @@ def _iter_source_rows(
     hilo que lo itera. ``close()`` es idempotente (un segundo ``close()`` no toca la
     conexión).
     """
-    # ``pooled=True`` (fase de datos del clon): hace checkout de la conexión que
-    # ``pooled_source_scope`` mantiene viva, en vez de discar de cero por tabla. El ``with``
-    # sigue siendo por tabla y en ESTE hilo: no cambia la propiedad de la conexión ni el
-    # momento en que se devuelve, solo deja de pagar el handshake 103 veces.
-    with database_connection(source_target, source_db, bulk=True, pooled=pooled) as src:
-        _set_read_committed(src, source_engine)
+    # ``src_conn``: la conexión que ``pooled_source_scope`` sostiene para toda la fase (la usa
+    # el clon). Evita 103 handshakes y —cuando lleva snapshot consistente— hace que todas las
+    # tablas salgan de la misma foto del origen. ``None`` = abrir una propia, que es el camino
+    # de cualquier otro llamador y el de los tests.
+    with _source_conn_ctx(source_target, source_db, source_engine, src_conn) as src:
         result = src.execution_options(
             stream_results=True, yield_per=batch_rows
         ).execute(text(select_sql))
@@ -444,7 +461,11 @@ def _iter_source_rows(
                 yield tuple(_adapt_value(row[i]) for i in range(ncols))
             agotado = True
         finally:
-            if agotado or not pooled:
+            if agotado or src_conn is not None:
+                # Con la conexión COMPARTIDA hay que drenar aunque no se haya agotado:
+                # invalidarla mataría el snapshot de las tablas que faltan. Drenar cuesta red en
+                # el camino de fallo o cancelación, que es raro; leer filas sobrantes en la
+                # tabla siguiente costaría datos mal, que no es negociable.
                 result.close()
             else:
                 # Salimos SIN drenar el cursor (cancelación, error del writer, o el consumidor
@@ -960,7 +981,7 @@ def _copy_one_table(
     batch_rows: int,
     progress_cb: Callable[[str, int], None] | None,
     cancel_cb: Callable[[], bool] | None,
-    pooled_source: bool = False,
+    src_conn=None,
 ) -> TableCopyResult:
     table = spec.table
     try:
@@ -987,7 +1008,7 @@ def _copy_one_table(
         select_sql=select_sql,
         ncols=len(spec.columns),
         batch_rows=batch_rows,
-        pooled=pooled_source,
+        src_conn=src_conn,
     )
     try:
         writer(
@@ -1105,7 +1126,10 @@ def copy_tables(
     # de la copia por encima de los datos en sí. El ``dispose()` del scope garantiza que no
     # quede una conexión ``sleep`` cuando el clon termina.
     with (
-        pooled_source_scope(source_target, source_db, bulk=True),
+        pooled_source_scope(
+            source_target, source_db, bulk=True,
+            consistent=CLONE_CONSISTENT_SNAPSHOT,
+        ) as src_conn,
         database_connection(
             dest_target, dest_db, bulk=True, mysql_local_infile=True
         ) as dest_conn,
@@ -1139,7 +1163,7 @@ def copy_tables(
                     batch_rows=batch_rows,
                     progress_cb=progress_cb,
                     cancel_cb=cancel_cb,
-                    pooled_source=True,
+                    src_conn=src_conn,
                 )
                 results.append(res)
 

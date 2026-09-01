@@ -243,11 +243,16 @@ def _setup_sqlite_env(monkeypatch, tmp_path, source_rows, *, create_dest_rows=No
         finally:
             conn.close()
 
+    # La firma sigue a la REAL, ``consistent`` incluido, y devuelve una CONEXIÓN sostenida
+    # (no el engine): es lo que `copy_tables` le presta a cada tabla para que todas lean de la
+    # misma foto del origen.
     @contextmanager
-    def fake_pool(target, database, *, bulk=False):
-        # No hay pool que sostener sobre SQLite; lo que importa del scope es que exista un
-        # objeto con ``dispose()`` para el camino de fallo.
-        yield engines[database]
+    def fake_pool(target, database, *, bulk=False, consistent=False):
+        conn = engines[database].connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     monkeypatch.setattr(dc, "database_connection", fake_conn)
     monkeypatch.setattr(dc, "pooled_source_scope", fake_pool)

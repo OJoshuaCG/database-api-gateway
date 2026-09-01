@@ -11,12 +11,12 @@ de 0 filas, 389 ms.
 es justamente lo que NINGÚN test unitario puede: los tests de ``test_data_copy`` corren sobre
 SQLite, donde no hay pool de red, ni handshake, ni ``PROCESSLIST``.
 
-Las cuatro propiedades que importan:
-  1. Sin pool, cada ``with`` estrena conexión (el comportamiento de hoy, como línea de base).
-  2. Con pool, N tablas reusan UNA sola conexión.
-  3. ``dispose()`` a mitad estrena una nueva — es el camino de fallo, y sin él una tabla
-     cancelada dejaría un cursor a medio drenar envenenando a la siguiente.
-  4. Al salir del scope NO queda ninguna conexión ``sleep`` en el servidor ajeno, que es la
+Las tres propiedades que importan:
+  1. Sin el scope, cada ``database_connection`` estrena conexión (la línea de base: es lo que
+     hacía la fase de datos, una por tabla).
+  2. Dentro del scope hay UNA sola conexión, y todas las lecturas van por ella — incluidas las
+     que ocurren en el hilo escritor del FIFO.
+  3. Al salir del scope NO queda ninguna conexión ``sleep`` en el servidor ajeno, que es la
      condición que hace aceptable la excepción al ``NullPool`` de todo el módulo.
 
 NO es un test de pytest (requiere Docker; se ejecuta a mano).
@@ -30,6 +30,7 @@ Uso:
 import os
 import sys
 import tempfile
+import threading
 import time
 
 _TMP = tempfile.mkdtemp(prefix="e2e_gw_pool_")
@@ -72,26 +73,32 @@ def main() -> int:
         admin_user="root", admin_password="rootpw", ssl_mode="disable",
     )
 
-    def conn_id(*, pooled: bool) -> int:
-        with database_connection(target, "mysql", bulk=True, pooled=pooled) as c:
+    def conn_id_propia() -> int:
+        with database_connection(target, "mysql", bulk=True) as c:
             return c.execute(text("SELECT CONNECTION_ID()")).scalar()
 
-    print("\n== Línea de base: sin pool, cada tabla estrena conexión ==")
-    ids = [conn_id(pooled=False) for _ in range(4)]
+    print("\n== Línea de base: sin el scope, cada lectura estrena conexión ==")
+    ids = [conn_id_propia() for _ in range(4)]
     check("4 aperturas -> 4 conexiones distintas", len(set(ids)) == 4, str(ids))
 
-    print("\n== Con pool: las tablas comparten UNA conexión ==")
-    with pooled_source_scope(target, "mysql", bulk=True) as pool:
-        ids = [conn_id(pooled=True) for _ in range(4)]
-        check("4 aperturas -> 1 sola conexión", len(set(ids)) == 1, str(set(ids)))
+    print("\n== Dentro del scope: UNA sola conexión para todas las tablas ==")
+    with pooled_source_scope(target, "mysql", bulk=True) as src:
+        vistos = {src.execute(text("SELECT CONNECTION_ID()")).scalar() for _ in range(4)}
+        check("4 lecturas -> 1 sola conexión", len(vistos) == 1, str(vistos))
 
-        print("\n== Camino de fallo: dispose() tira la conexión sucia ==")
-        antes = conn_id(pooled=True)
-        pool.dispose()
-        despues = conn_id(pooled=True)
-        check("tras dispose() la siguiente tabla estrena conexión", antes != despues,
-              f"{antes} == {despues}")
-        viva = despues
+        # El writer de MySQL lee el origen desde el hilo del FIFO: se comprueba que la conexión
+        # prestada funcione ahí, que es la propiedad de la que depende todo el diseño.
+        desde_hilo: list[int] = []
+
+        def leer_en_hilo():
+            desde_hilo.append(src.execute(text("SELECT CONNECTION_ID()")).scalar())
+
+        h = threading.Thread(target=leer_en_hilo)
+        h.start()
+        h.join()
+        check("la misma conexión sirve desde el hilo escritor",
+              desde_hilo == list(vistos), f"{desde_hilo} vs {vistos}")
+        viva = vistos.pop()
 
     print("\n== Al salir del scope no queda una conexión sleep en el servidor ajeno ==")
     time.sleep(0.5)
@@ -100,23 +107,21 @@ def main() -> int:
             text("SELECT ID FROM information_schema.PROCESSLIST WHERE ID = :i"),
             {"i": viva},
         ).fetchall()
-    check("la conexión del pool está cerrada", not sigue, f"sigue viva: {viva}")
+    check("la conexión del scope está cerrada", not sigue, f"sigue viva: {viva}")
 
     print(f"\n== Costo del handshake, {TABLAS} tablas ==")
-
-    def corrida(pooled: bool) -> float:
+    t0 = time.perf_counter()
+    for _ in range(TABLAS):
+        conn_id_propia()
+    sin = (time.perf_counter() - t0) * 1000
+    with pooled_source_scope(target, "mysql", bulk=True) as src:
         t0 = time.perf_counter()
         for _ in range(TABLAS):
-            with database_connection(target, "mysql", bulk=True, pooled=pooled) as c:
-                c.execute(text("SELECT 1"))
-        return (time.perf_counter() - t0) * 1000
-
-    sin = corrida(False)
-    with pooled_source_scope(target, "mysql", bulk=True):
-        con = corrida(True)
-    print(f"  sin pool: {sin:7.0f} ms  ({sin / TABLAS:.1f} ms/tabla)")
-    print(f"  con pool: {con:7.0f} ms  ({con / TABLAS:.1f} ms/tabla)")
-    check("el pool es más barato", con < sin, f"{con:.0f} vs {sin:.0f}")
+            src.execute(text("SELECT 1"))
+        con = (time.perf_counter() - t0) * 1000
+    print(f"  una conexión por tabla: {sin:7.0f} ms  ({sin / TABLAS:.1f} ms/tabla)")
+    print(f"  conexión sostenida    : {con:7.0f} ms  ({con / TABLAS:.1f} ms/tabla)")
+    check("sostener la conexión es más barato", con < sin, f"{con:.0f} vs {sin:.0f}")
     print(
         "  (contra localhost el RTT es ~0 y no hay DNS: sobre un enlace remoto con\n"
         "   getaddrinfo sin caché, el ahorro por tabla es de otro orden)"

@@ -339,7 +339,6 @@ def database_connection(
     bulk: bool = False,
     mysql_local_infile: bool = False,
     statement_timeout_ms: int | None = None,
-    pooled: bool = False,
 ):
     """Conexión a una BD CONCRETA (introspección/migraciones). Revalida el host (anti-SSRF, R2).
     ``bulk=True`` usa timeouts de volcado masivo (copia de datos del clon).
@@ -353,7 +352,6 @@ def database_connection(
         bulk=bulk,
         mysql_local_infile=mysql_local_infile,
         statement_timeout_ms=statement_timeout_ms,
-        pooled=pooled,
     )
     conn = engine.connect()
     try:
@@ -364,39 +362,54 @@ def database_connection(
 
 @contextmanager
 def pooled_source_scope(
-    target: ServerTarget, database: str, *, bulk: bool = False
+    target: ServerTarget, database: str, *, bulk: bool = False, consistent: bool = False
 ):
     """
-    Mantiene UNA conexión viva a ``database`` mientras dura el bloque, y la tira al salir.
+    Sostiene UNA conexión de LECTURA a ``database`` mientras dura el bloque, y la tira al salir.
 
-    Es la única forma legítima de encender ``pooled``. Dentro del bloque, cada
-    ``database_connection(..., pooled=True)`` hace *checkout* de esa conexión en vez de discar:
-    desaparecen el ``getaddrinfo`` sin caché, el handshake TCP, la autenticación y los dos
-    ``SET NAMES`` que pymysql y SQLAlchemy mandan cada uno por su lado.
+    Resuelve dos problemas distintos, y conviene no confundirlos:
 
-    **Por qué un pool y no una conexión compartida a mano.** Compartir el objeto ``Connection``
-    entre tablas obligaba a cruzar una frontera de hilos con un ``SSCursor`` a medio drenar:
-    pymysql, ante un result set incompleto, drena lo que quedó antes de la próxima sentencia, y
-    si eso sale mal la tabla siguiente lee filas sobrantes de la anterior. No da error: da datos
-    mal. Con el pool, cada tabla sigue haciendo su ``with database_connection(...)``, abierto y
-    cerrado en el mismo hilo, con la misma contención de fallos que hoy.
+    **1. El handshake por tabla.** Antes cada tabla abría su propia conexión (``NullPool``): con
+    103 tablas eran 103 ``getaddrinfo`` sin caché, 103 handshakes TCP y 103 autenticaciones
+    contra la base de producción de un tercero. Acá se abre una y se reusa.
 
-    **Y preserva los metadata locks.** El ``rollback`` que SQLAlchemy emite al devolver la
-    conexión al pool cierra la transacción de cada tabla, así que NO sostenemos MDL compartido
-    sobre todas las tablas durante la fase entera. Sin eso, cualquier ``ALTER TABLE`` en la base
-    de producción del cliente quedaría bloqueado detrás nuestro — un incidente en la base de un
-    tercero causado por una optimización nuestra.
+    **2. La coherencia referencial**, con ``consistent=True``. Leyendo cada tabla en
+    ``READ COMMITTED`` con su propio read view, el clon toma N fotos distintas del origen: si
+    entre que se copia ``padre`` y se copia ``hijo`` alguien inserta las dos filas, el destino
+    queda con un hijo huérfano — y como el clon apaga las FKs del destino y nunca las revalida,
+    lo reporta ``applied``. Reproducido contra MySQL 8.0. Un único
+    ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` hace que las N tablas salgan de la misma foto.
 
-    El ``dispose()`` del ``finally`` es la condición que hace aceptable la excepción al
-    NullPool: la conexión vive lo que dura el clon, no queda ``sleep`` en el servidor ajeno.
+    **El precio de ``consistent``, que hay que decir en voz alta:** sostener un read view durante
+    toda la fase impide el purge del undo log en el ORIGEN y retiene MDL compartido sobre las
+    tablas leídas, o sea que bloquea el DDL del cliente mientras dura. Es exactamente lo que hace
+    ``mysqldump --single-transaction`` y es aceptable para un clon de segundos o minutos; sobre
+    un origen muy escrito y un clon de horas, el tablespace crece. Por eso es configurable.
+
+    Nota de hilos: el ``Connection`` que se devuelve lo usan el hilo principal y el hilo escritor
+    del FIFO, **nunca a la vez** — el principal está bloqueado en el ``LOAD DATA`` mientras el
+    escritor lee del origen, y hace ``join()`` antes de seguir. Verificado que un snapshot
+    consistente se lee correctamente desde otro hilo.
     """
     engine = get_engine(target, database, bulk=bulk, pooled=True)
+    conn = engine.connect()
     try:
-        yield engine
+        if consistent:
+            # REPEATABLE READ es la condición para que el snapshot signifique algo: en READ
+            # COMMITTED cada sentencia estrena read view y el ``START TRANSACTION`` no sirve.
+            conn.exec_driver_sql(
+                "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+            )
+            conn.exec_driver_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+        yield conn
     finally:
-        # El engine queda en el caché (es reusable y volverá a conectar cuando haga falta),
-        # pero sin conexiones vivas. Nunca dejar esto en un ``except``: si el bloque revienta,
-        # tirar la conexión es MÁS importante, no menos.
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        # El engine queda en el caché (es reusable y volverá a conectar cuando haga falta), pero
+        # sin conexiones vivas. Nunca dejar esto en un ``except``: si el bloque revienta, tirar
+        # la conexión es MÁS importante, no menos.
         try:
             engine.dispose()
         except Exception:  # noqa: BLE001 — tirar una conexión nunca rompe la operación
