@@ -18,6 +18,7 @@ Ejemplo:
 from app.models.audit_log import AuditLog
 from app.models.base import Base, TimestampMixin
 from app.models.charset_collation_option import CharsetCollationOption
+from app.models.clone_batch import CloneBatch, CloneBatchItem
 from app.models.clone_job import CloneJob, CloneJobItem
 from app.models.collation_conversion_batch import CollationConversionBatch
 from app.models.collation_conversion_job import (
@@ -74,6 +75,8 @@ __all__ = [
     "ProjectDatabaseModel",
     "SchemaComparison",
     "SchemaComparisonItem",
+    "CloneBatch",
+    "CloneBatchItem",
     "CloneJob",
     "CloneJobItem",
     "CollationConversionBatch",
