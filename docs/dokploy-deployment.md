@@ -171,9 +171,22 @@ alembic history            # ver historial completo
 varias réplicas del servicio `api` desde Dokploy — no rompe la consistencia del rate limiting.
 
 El worker de clonado de bases de datos (`app/services/clone_runner.py`) corre in-process
-(`ThreadPoolExecutor`) dentro de cada réplica de `api`; no requiere ningún servicio adicional. Si
-escalas a varias réplicas, la serialización por BD destino la da un advisory lock a nivel de motor
-(no el pool de hilos en sí), así que es seguro tener varias réplicas activas simultáneamente.
+(`ThreadPoolExecutor`) dentro de cada réplica de `api`; no requiere ningún servicio adicional. La
+serialización por BD destino la da un advisory lock a nivel de motor (no el pool de hilos), así que
+**dos réplicas no pueden pisarse escribiendo la misma base**.
+
+> ⚠️ **Pero `WORKERS=1` y una sola réplica siguen siendo el requisito**, y por otro motivo que este
+> documento afirmaba mal: el **barrido de arranque** (`sweep_interrupted`, en el `lifespan`) marca
+> como `interrupted` **todo** job que encuentre en `running`, sin distinguir de qué proceso es. Con
+> dos procesos, arrancar o reiniciar uno le mata en la contabilidad el job **vivo** del otro — el
+> job sigue corriendo contra el motor, pero el operador lo ve fallado.
+>
+> El **lote de clonación** (`app/services/clone_batch_runner.py`) agranda muchísimo esa ventana:
+> corre durante horas, así que la probabilidad de que un despliegue lo atraviese es alta. Mientras
+> el lote esté en uso, no subas `WORKERS` ni escales réplicas de `api`.
+>
+> La solución de fondo es una cola durable con identidad de proceso (`P-24` en `TODO.md`); hasta
+> entonces, esto es una restricción de operación, no un detalle.
 
 ## 8. Backups
 
