@@ -61,6 +61,43 @@ _TARGET = ServerTarget(
 # --------------------------------------------------------------------------- #
 # Dataclasses                                                                  #
 # --------------------------------------------------------------------------- #
+# ── Staging: la condición es "PK o UNIQUE", no solo PK ───────────────────────────
+# Una tabla SIN PK pero CON un índice UNIQUE secundario sí puede conflictuar. Cargándola
+# directo a la tabla final, el IGNORE implícito de LOAD DATA LOCAL descartaba la fila en
+# silencio; el INSERT legacy, en cambio, falla con 1062. Era una divergencia entre los dos
+# writers del mismo módulo, no solo una optimización de más.
+
+
+def test_spec_has_unique_key_defaults_to_false():
+    spec = TableCopySpec(table="t", columns=["a"], primary_key=[])
+    assert spec.has_unique_key is False
+
+
+def test_staging_condition_covers_unique_without_pk():
+    # Réplica de la condición de `_copy_writer_mysql`: sin PK pero con UNIQUE => staging.
+    sin_claves = TableCopySpec(table="t", columns=["a"], primary_key=[])
+    solo_pk = TableCopySpec(table="t", columns=["a"], primary_key=["a"])
+    solo_unique = TableCopySpec(
+        table="t", columns=["a"], primary_key=[], has_unique_key=True
+    )
+    assert (bool(sin_claves.primary_key) or sin_claves.has_unique_key) is False
+    assert (bool(solo_pk.primary_key) or solo_pk.has_unique_key) is True
+    assert (bool(solo_unique.primary_key) or solo_unique.has_unique_key) is True
+
+
+def test_insert_from_staging_without_pk_is_plain_and_therefore_fail_closed():
+    # Sin PK, `_compose_insert` degrada a INSERT plano incluso con upsert=True. Eso es lo
+    # que hace que el conflicto contra filas preexistentes ABORTE (1062) en vez de saltearse:
+    # el statement final es la red de seguridad que la carga directa no tenía.
+    spec = TableCopySpec(
+        table="t", columns=["a", "b"], primary_key=[], upsert=True, has_unique_key=True
+    )
+    sql = _build_insert_from_staging("mysql", spec, "stg_x")
+    assert sql.startswith("INSERT INTO `t` (`a`, `b`) SELECT")
+    assert "ON DUPLICATE KEY UPDATE" not in sql
+    assert "IGNORE" not in sql
+
+
 def test_spec_defaults():
     s = TableCopySpec(table="t", columns=["a"], primary_key=[])
     assert s.upsert is False

@@ -140,6 +140,15 @@ class TableCopySpec:
     columns: list[str]  # nombres de columna a copiar, en orden
     primary_key: list[str]  # [] si la tabla no tiene PK
     upsert: bool = False  # True => ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE
+    # ¿La tabla tiene AL MENOS UNA clave única (índice UNIQUE o constraint)? El PK puede o
+    # no estar reportado entre ellas y no importa: la decisión de staging es un ``or`` con
+    # ``primary_key``, así que el caso "el único unique ES el PK" ya está cubierto.
+    #
+    # Existe porque sin ella una tabla SIN PK pero CON UNIQUE se cargaba directo a la tabla
+    # final, donde el IGNORE implícito de ``LOAD DATA LOCAL`` descarta el conflicto EN
+    # SILENCIO. Si algún día se quiere un upsert real sobre una clave única sin PK, va a
+    # hacer falta la lista de columnas, no este booleano.
+    has_unique_key: bool = False
 
 
 @dataclass
@@ -610,13 +619,16 @@ def _copy_writer_mysql(
       * upsert=False -> ``INSERT INTO final SELECT … FROM staging`` PLANO -> aborta con
         ER_DUP_ENTRY ante PK existente (idéntico al INSERT legacy).
       * upsert=True  -> ``… ON DUPLICATE KEY UPDATE``.
-    Sin PK NO hay concepto de conflicto (ni con LOAD DATA ni con INSERT) -> carga directo a
-    la final, sin staging. (En PostgreSQL, en cambio, COPY directo ya aborta atómicamente
+    Sin NINGUNA clave única (ni PK ni UNIQUE) no hay concepto de conflicto -> carga directo
+    a la final, sin staging. Ojo que la condición es "PK **o** UNIQUE", no solo PK: una tabla
+    sin PK pero con un índice UNIQUE secundario SÍ puede conflictuar, y cargarla directo
+    dejaba que el IGNORE implícito de LOCAL descartara la fila en silencio (el INSERT legacy,
+    en cambio, falla con 1062 — era una divergencia entre los dos writers). (En PostgreSQL, en cambio, COPY directo ya aborta atómicamente
     ante conflicto, así que allí staging sigue siendo solo-si-upsert.)
     """
     final_q = _q(spec.table, dest_engine)
     cols_q = ", ".join(_q(c, dest_engine) for c in spec.columns)
-    use_staging = bool(spec.primary_key)
+    use_staging = bool(spec.primary_key) or spec.has_unique_key
 
     staging_name: str | None = None
     if use_staging:

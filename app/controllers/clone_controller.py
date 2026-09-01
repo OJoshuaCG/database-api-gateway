@@ -115,6 +115,10 @@ class _DataSpec:
     # entre el preview y el execute invalidaría el token sin que el plan haya cambiado.
     row_estimate_known: bool = True
     has_primary_key: bool | None = None
+    # ¿La tabla tiene alguna clave única? Decide si la copia bulk pasa por una tabla de
+    # staging: sin ella, una tabla SIN PK pero CON UNIQUE se cargaba directo a la final y
+    # el IGNORE implícito de LOAD DATA LOCAL descartaba el conflicto en silencio.
+    has_unique_key: bool = False
 
 
 @dataclass(frozen=True)
@@ -836,6 +840,12 @@ class CloneController:
                     row_estimate_known=st.estimated_rows_known if st is not None else True,
                     has_primary_key=(
                         st.has_primary_key if st is not None else bool(t.primary_key)
+                    ),
+                    # No se filtra el PK de esta cuenta a propósito: la decisión de staging
+                    # es un ``or`` con la PK, así que "el único unique ES el PK" ya está
+                    # cubierto y filtrarlo solo agregaría una comparación de conjuntos.
+                    has_unique_key=(
+                        any(ix.unique for ix in t.indexes) or bool(t.unique_constraints)
                     ),
                 ))
 
@@ -2297,7 +2307,10 @@ class CloneController:
                     self._set_progress(_jid, _p)
 
             specs = [
-                TableCopySpec(table=d.table, columns=d.columns, primary_key=d.primary_key, upsert=d.upsert)
+                TableCopySpec(
+                    table=d.table, columns=d.columns, primary_key=d.primary_key,
+                    upsert=d.upsert, has_unique_key=d.has_unique_key,
+                )
                 for d in plan.data_specs
             ]
             results = copy_tables(
