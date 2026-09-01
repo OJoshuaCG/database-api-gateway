@@ -76,7 +76,7 @@ class _FakeRunner:
         return name.strip(), deps
 
     def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
-                      already_locked=False, stop_on_error=True):
+                      already_locked=False, stop_on_error=True, bulk=False):
         self.passes += 1
         out = []
         for i, sql in enumerate(statements):

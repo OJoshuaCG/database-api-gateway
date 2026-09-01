@@ -146,6 +146,7 @@ class _FakeRunner:
         already_locked=False,
         stop_on_error=True,
         disable_fk_checks=False,
+        bulk=False,
     ):
         return [
             StatementResult(

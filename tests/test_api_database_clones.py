@@ -148,12 +148,30 @@ class _FakeRunner:
         yield  # no-op en test (sin motor real que lockear)
 
     def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
-                      already_locked=False, stop_on_error=True, disable_fk_checks=False):
+                      already_locked=False, stop_on_error=True, disable_fk_checks=False,
+                      bulk=False):
         return [
             StatementResult(index=i, status="applied", error=None, execution_ms=1,
                             executed_at=datetime.now(timezone.utc))
             for i in range(len(statements))
         ]
+
+
+class _RecordingRunner(_FakeRunner):
+    """Registra los kwargs de cada execute_adhoc, para afirmar el timeout que se pidió."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
+                      already_locked=False, stop_on_error=True, disable_fk_checks=False,
+                      bulk=False):
+        self.calls.append({"bulk": bulk, "statements": len(statements)})
+        return super().execute_adhoc(
+            target, db_name=db_name, engine=engine, lock_key=lock_key,
+            statements=statements, already_locked=already_locked,
+            stop_on_error=stop_on_error, disable_fk_checks=disable_fk_checks, bulk=bulk,
+        )
 
 
 def _fake_copy_tables(*, specs, **kwargs):
@@ -333,7 +351,8 @@ def test_clean_mode_objects_disables_fk_checks_only_during_cleanup(admin_client,
 
     class _RecordingRunner(_FakeRunner):
         def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
-                          already_locked=False, stop_on_error=True, disable_fk_checks=False):
+                          already_locked=False, stop_on_error=True, disable_fk_checks=False,
+                      bulk=False):
             calls.append(("clean" if disable_fk_checks else "other", disable_fk_checks))
             return super().execute_adhoc(
                 target, db_name=db_name, engine=engine, lock_key=lock_key,
@@ -446,7 +465,8 @@ def test_structure_failure_marks_job_failed(admin_client, monkeypatch):
 
     class _FailingRunner(_FakeRunner):
         def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
-                          already_locked=False, stop_on_error=True, disable_fk_checks=False):
+                          already_locked=False, stop_on_error=True, disable_fk_checks=False,
+                      bulk=False):
             return [StatementResult(index=0, status="failed", error="boom",
                                     execution_ms=1, executed_at=datetime.now(timezone.utc))]
 
@@ -476,3 +496,42 @@ def test_adopt_target_requires_owner(admin_client, monkeypatch):
         "adopt_target": True,
     })
     assert r.status_code == 422, r.text
+
+
+# --------------------------------------------------------------------------- #
+# Timeout de las fases de DDL                                                  #
+# --------------------------------------------------------------------------- #
+def test_ddl_phases_ask_for_the_bulk_timeout(admin_client, monkeypatch):
+    """
+    Limpieza y estructura tienen que pedir ``bulk=True``.
+
+    Con el default (``bulk=False``) esas fases corren con el timeout INTERACTIVO de 15 s,
+    que en MySQL es un ``read_timeout`` de SOCKET del cliente: al expirar, la conexión se
+    rompe MIENTRAS EL MOTOR SIGUE TRABAJANDO. El gateway registra un fallo de una sentencia
+    que en realidad se va a completar y, con ``stop_on_error=True``, el clon entero muere.
+    Un ``DROP TABLE`` de una tabla grande en ``clean_mode='objects'`` lo excede sin esfuerzo.
+    """
+    _install(monkeypatch)
+    runner = _RecordingRunner()
+    monkeypatch.setattr(cc, "MigrationRunner", lambda: runner)
+
+    sid = _server(admin_client, 3306)
+    tid = _server(admin_client, 3307)
+    oid = _owner(admin_client, sid)
+    _managed(admin_client, sid, oid, "src_db")
+
+    r = admin_client.post(
+        "/api/v1/database-clones",
+        json={
+            "source_server_id": sid, "source_database_name": "src_db",
+            "target_server_id": tid, "target_database_name": "dst_db",
+            "target_mode": "new", "include_data": False,
+        },
+    )
+    assert r.status_code == 201, r.text
+    _preview_and_execute(admin_client, r.json()["data"]["id"])
+
+    assert runner.calls, "no se ejecutó ninguna fase de DDL"
+    sin_bulk = [c for c in runner.calls if not c["bulk"]]
+    assert not sin_bulk, f"{len(sin_bulk)} llamada(s) de DDL con el timeout interactivo de 15 s"
+

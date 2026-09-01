@@ -2425,9 +2425,16 @@ class CloneController:
         """Ejecuta una lista de _StructStmt vía execute_adhoc y registra el resultado por ítem.
         ``already_locked=True``: el pipeline ya sostiene el advisory lock (no re-adquirir)."""
         sqls = [s.sql for s in statements]
+        # ``bulk=True``: estas fases emiten DDL que puede tardar MINUTOS sobre un destino
+        # con datos —un DROP TABLE de una tabla enorme en clean_mode='objects', un CREATE
+        # INDEX— y el default es el timeout INTERACTIVO de 15 s. En MySQL ese valor es un
+        # read_timeout de SOCKET del cliente: al expirar, la conexión se rompe MIENTRAS EL
+        # MOTOR SIGUE TRABAJANDO, el gateway registra un fallo de una sentencia que en
+        # realidad se va a completar, y con stop_on_error=True el clon entero muere. El clon
+        # ya es asíncrono y sostiene el advisory lock, así que la espera larga es correcta.
         results = runner.execute_adhoc(
             tgt_target, db_name=db_name, engine=engine, lock_key=lock_key, statements=sqls,
-            already_locked=True, disable_fk_checks=disable_fk_checks,
+            already_locked=True, disable_fk_checks=disable_fk_checks, bulk=True,
         )
         by_index = {r.index: r for r in results}
         rows = []
@@ -2464,7 +2471,7 @@ class CloneController:
             res = runner.execute_adhoc(
                 tgt_target, db_name=db_name, engine=engine, lock_key=lock_key,
                 statements=[st.sql for _, st in remaining],
-                already_locked=True, stop_on_error=False,
+                already_locked=True, stop_on_error=False, bulk=True,
             )
             by_pos = {r.index: r for r in res}
             still: list = []
