@@ -680,7 +680,7 @@ def _copy_writer_mysql(
         load_target = final_q
 
     try:
-        _load_data_via_fifo(
+        cargadas = _load_data_via_fifo(
             dest_conn=dest_conn,
             load_target=load_target,
             cols_q=cols_q,
@@ -691,9 +691,28 @@ def _copy_writer_mysql(
             cancel_cb=cancel_cb,
             counter=counter,
         )
+        # El LOAD DATA ya terminó: acá se sabe si el motor se quedó con todas las filas.
+        _verificar_filas_cargadas(spec.table, enviadas=counter[0], cargadas=cargadas)
         if use_staging:
-            dest_conn.exec_driver_sql(
-                _build_insert_from_staging(dest_engine, spec, staging_name)
+            # Con staging, la tabla FINAL sigue vacía hasta que esta sentencia termine bien.
+            # Si revienta, ``counter`` —que cuenta filas escritas al FIFO— pasa a ser mentira:
+            # el reporte decía "55.000 filas copiadas" con cero filas en el destino. Se pone en
+            # cero ANTES de propagar, que es lo que de verdad quedó.
+            try:
+                resultado = dest_conn.exec_driver_sql(
+                    _build_insert_from_staging(dest_engine, spec, staging_name)
+                )
+            except BaseException:
+                counter[0] = 0
+                raise
+            # El viaje staging -> final es el segundo lugar donde se pueden perder filas, y
+            # con ``upsert`` el motor cuenta 2 por fila actualizada: solo se exige "no menos".
+            _verificar_filas_cargadas(
+                spec.table,
+                enviadas=counter[0],
+                cargadas=getattr(resultado, "rowcount", None),
+                etapa="staging->final",
+                solo_minimo=spec.upsert,
             )
         if progress_cb is not None:
             progress_cb(spec.table, counter[0])
@@ -707,6 +726,54 @@ def _copy_writer_mysql(
                 pass  # best-effort
 
 
+class _FilasPerdidas(Exception):
+    """Faltan filas en el destino. Se traduce a ``failed`` con el conteo en el mensaje."""
+
+
+def _verificar_filas_cargadas(
+    table: str,
+    *,
+    enviadas: int,
+    cargadas: int | None,
+    etapa: str = "LOAD DATA",
+    solo_minimo: bool = False,
+) -> None:
+    """
+    ¿El motor se quedó con todas las filas que le mandamos?
+
+    **Por qué hace falta.** El resultado del ``LOAD DATA`` se descartaba sin mirarlo, y
+    ``rows_copied`` cuenta filas escritas al FIFO, no filas insertadas. Con ``LOAD DATA LOCAL``
+    comportándose SIEMPRE como ``IGNORE`` y con ``STRICT_TRANS_TABLES`` relajado durante toda
+    la fase, un truncado de string, un DECIMAL redondeado, un ENUM que el destino no tiene o
+    una colisión de clave única se convierten en warnings o filas descartadas **sin error**: el
+    job reportaba éxito con datos perdidos.
+
+    **El caso que nadie había visto**, y que motiva que esto valga también con staging: la
+    staging se crea ``LIKE final``, así que hereda la collation del DESTINO. Si el índice único
+    del destino es case-insensitive y el del origen case-sensitive, dos filas legítimas del
+    origen (``'A'`` y ``'a'``) colisionan **dentro de la staging** y el IGNORE implícito
+    descarta una. El docstring de ``_copy_writer_mysql`` afirma que "las filas del ORIGEN ya son
+    únicas entre sí", y eso no es cierto cuando el destino angosta la collation.
+
+    ``solo_minimo`` para el viaje staging→final con ``upsert``: MySQL cuenta **2** por fila
+    actualizada con ``ON DUPLICATE KEY UPDATE``, así que exigir igualdad daría falsos
+    positivos; ahí solo se exige que no falten.
+
+    ``cargadas is None`` (el driver no expone ``rowcount``) no se trata como error: se prefiere
+    no verificar antes que fallar una copia buena por una limitación del driver.
+    """
+    if cargadas is None:
+        return
+    suficiente = cargadas >= enviadas if solo_minimo else cargadas == enviadas
+    if suficiente:
+        return
+    raise _FilasPerdidas(
+        f"{etapa}: se enviaron {enviadas} filas de {table} y el motor registró {cargadas}. "
+        "Faltan filas: probablemente descartadas en silencio por una clave única del destino "
+        "o por una conversión de tipo."
+    )
+
+
 def _load_data_via_fifo(
     *,
     dest_conn,
@@ -718,7 +785,14 @@ def _load_data_via_fifo(
     progress_cb: Callable[[str, int], None] | None,
     cancel_cb: Callable[[], bool] | None,
     counter: list[int],
-) -> None:
+) -> int | None:
+    """
+    Vuelca ``rows_iter`` al destino vía FIFO + ``LOAD DATA LOCAL``.
+
+    Devuelve las filas que el motor dice haber cargado (``rowcount`` del paquete OK), o
+    ``None`` si el driver no lo expone. Quien llama lo compara contra ``counter[0]``: ver
+    ``_verificar_filas_cargadas``.
+    """
     fifo_path = os.path.join(_fifo_dir(), f"gw_clone_{uuid.uuid4().hex}.tsv")
     os.mkfifo(fifo_path, 0o600)
 
@@ -772,10 +846,15 @@ def _load_data_via_fifo(
     # justo antes basta. Fuera de esta ventana ``expected is None`` => cualquier solicitud
     # LOAD LOCAL se rechaza. Se limpia SIEMPRE en el finally (fail-closed).
     _expected_local_infile_path.path = fifo_path
+    cargadas: list[int | None] = [None]
     try:
         thread.start()
         # Dispara el protocolo LOAD LOCAL: pymysql abre el FIFO para lectura y consume.
-        dest_conn.exec_driver_sql(load_sql)
+        resultado = dest_conn.exec_driver_sql(load_sql)
+        # ``rowcount`` del paquete OK del LOAD DATA = Records - Skipped. Es lo ÚNICO que
+        # distingue "se insertaron las filas" de "el IGNORE implícito descartó algunas".
+        # Se lee acá y se compara afuera, para no confundir un fallo del motor con un faltante.
+        cargadas[0] = getattr(resultado, "rowcount", None)
     except BaseException as exc:  # noqa: BLE001 - error del motor => tabla failed
         main_exc = exc
     finally:
@@ -802,6 +881,7 @@ def _load_data_via_fifo(
         raise writer_exc[0]
     if canceled_flag[0]:
         raise _Canceled()
+    return cargadas[0]
 
 
 # --------------------------------------------------------------------------- #

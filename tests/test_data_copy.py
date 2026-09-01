@@ -31,7 +31,9 @@ from app.services.db_admin.data_copy import (
     _build_select,
     _escape_mysql_field,
     _render_mysql_field,
+    _FilasPerdidas,
     _staging_name,
+    _verificar_filas_cargadas,
     copy_tables,
     render_time_for_reinsert,
 )
@@ -1003,3 +1005,42 @@ def test_adapt_value_normaliza_timedelta_para_los_DOS_writers():
     assert _render_mysql_field(adaptado) == b"01:02:03.123456", "y el FIFO lo pasa tal cual"
     # Y por el camino directo (defensa si alguien llama al render sin adaptar) da lo mismo.
     assert _render_mysql_field(td) == b"01:02:03.123456"
+
+
+# ── Contabilidad de filas: que una tabla que pierde filas no diga `applied` ────────
+def test_verificar_filas_acepta_el_conteo_exacto():
+    _verificar_filas_cargadas("t", enviadas=10, cargadas=10)
+
+
+def test_verificar_filas_falla_si_el_motor_registro_menos():
+    """
+    El caso real: `LOAD DATA LOCAL` se comporta SIEMPRE como IGNORE y la fase relaja
+    STRICT_TRANS_TABLES, así que un truncado o una colisión de clave única descartan filas
+    sin error. Antes esto se reportaba `applied`.
+    """
+    with pytest.raises(_FilasPerdidas) as exc:
+        _verificar_filas_cargadas("clientes", enviadas=100, cargadas=98)
+    assert "100" in str(exc.value) and "98" in str(exc.value) and "clientes" in str(exc.value)
+
+
+def test_verificar_filas_con_upsert_solo_exige_que_no_falten():
+    """
+    Con `ON DUPLICATE KEY UPDATE` MySQL cuenta 2 por fila actualizada, así que exigir
+    igualdad daría falsos positivos y fallaría copias buenas.
+    """
+    _verificar_filas_cargadas("t", enviadas=10, cargadas=20, solo_minimo=True)
+    with pytest.raises(_FilasPerdidas):
+        _verificar_filas_cargadas("t", enviadas=10, cargadas=9, solo_minimo=True)
+
+
+def test_verificar_filas_sin_rowcount_no_falla():
+    """
+    Si el driver no expone `rowcount` se prefiere no verificar antes que fallar una copia
+    buena por una limitación del driver. `None` no es cero.
+    """
+    _verificar_filas_cargadas("t", enviadas=10, cargadas=None)
+
+
+def test_verificar_filas_cero_enviadas_cero_cargadas():
+    """Una tabla vacía es un caso legítimo, no un faltante."""
+    _verificar_filas_cargadas("t", enviadas=0, cargadas=0)
