@@ -56,7 +56,6 @@ from app.core.logger import get_logger
 from app.core.remote_engine import ServerTarget, database_connection
 from app.exceptions import AppHttpException
 from app.services.db_admin.identifiers import quote_identifier, validate_identifier
-from app.services.db_admin.value_json import format_timedelta
 
 logger = get_logger(__name__)
 
@@ -206,6 +205,17 @@ def _adapt_value(value):
         return json.dumps(value, ensure_ascii=False, default=str)
     if isinstance(value, (bytearray, memoryview)):
         return bytes(value)
+    if isinstance(value, timedelta):
+        # El TIME de MySQL/MariaDB llega como ``timedelta`` y NINGÚN driver lo serializa bien:
+        # ``pymysql.escape_timedelta`` aplica el signo solo a las HORAS, así que un
+        # ``TIME '-01:30:00'`` se reinserta como ``-2:30:00`` y un ``-00:00:01`` como
+        # ``-1:59:59``. Valores válidos, silenciosos, y distintos del original.
+        #
+        # Se normaliza acá —en el adaptador común a los dos writers— y no en cada uno, para que
+        # el camino parametrizado y el de texto no puedan divergir: el destino recibe un str que
+        # ambos drivers pasan tal cual. Es la única forma de que despachar una tabla a un writer
+        # o al otro no cambie lo que queda escrito.
+        return render_time_for_reinsert(value)
     return value
 
 
@@ -562,6 +572,37 @@ def _escape_mysql_field(raw: bytes) -> bytes:
     return raw
 
 
+def render_time_for_reinsert(value: timedelta) -> str:
+    """
+    ``timedelta`` -> literal ``TIME`` **sin pérdida**: ``[-]HH:MM:SS[.ffffff]``.
+
+    Es distinto de ``value_json.format_timedelta`` a propósito, y la diferencia importa. Aquel
+    es el criterio de **presentación** del proyecto —consola SQL, resultados de migración,
+    render de literales— y hace ``int(total_seconds())``, o sea **tira los microsegundos**. Para
+    mostrarle un TIME a un humano eso es defendible; para COPIAR una columna ``TIME(3)`` o
+    ``TIME(6)`` de una base a otra, no: ``01:02:03.123456`` se escribía como ``01:02:03`` y, peor,
+    ``-00:00:00.500000`` se escribía como ``00:00:00``, perdiendo el valor **y el signo**. Como la
+    fase de datos relaja ``STRICT_TRANS_TABLES`` a propósito, el motor lo aceptaba y la tabla se
+    reportaba ``applied``.
+
+    No se arregló ``format_timedelta`` porque tiene otros tres consumidores de presentación a los
+    que cambiarles la salida sería una regresión visible en pantalla.
+
+    El signo se aplica al TOTAL, nunca a las horas por separado — ése es justamente el defecto de
+    ``pymysql.escape_timedelta``, que rendea ``-01:30:00`` como ``-2:30:00``. Y las horas NO se
+    normalizan a 24: ``838:00:00`` es un valor legal del tipo.
+    """
+    negativo = value < timedelta(0)
+    total = abs(value)
+    horas, resto = divmod(total.seconds, 3600)
+    horas += total.days * 24
+    minutos, segundos = divmod(resto, 60)
+    signo = "-" if negativo else ""
+    base = f"{signo}{horas:02d}:{minutos:02d}:{segundos:02d}"
+    # La fracción solo se emite si existe: un TIME(0) no debe salir con `.000000` de más.
+    return f"{base}.{total.microseconds:06d}" if total.microseconds else base
+
+
 def _render_mysql_field(value) -> bytes:
     """
     Serializa un valor Python (ya adaptado por ``_adapt_value``) al formato de campo de
@@ -578,16 +619,7 @@ def _render_mysql_field(value) -> bytes:
     if isinstance(value, str):
         return _escape_mysql_field(value.encode("utf-8"))
     if isinstance(value, timedelta):
-        # El TIME de MySQL/MariaDB llega al driver como ``timedelta``, y ``str()`` lo rendea
-        # como ``1 day, 2:00:00`` (o ``-1 day, 22:00:00`` para un TIME negativo): NO es un
-        # literal TIME válido. Y como la fase de datos relaja STRICT_TRANS_TABLES a
-        # propósito, el motor lo coercionaba EN SILENCIO y la tabla se reportaba `applied`.
-        #
-        # Se usa el criterio ÚNICO del proyecto (``value_json.format_timedelta``), que además
-        # no normaliza las horas a 24 porque ``838:00:00`` es un valor legal del tipo. El
-        # camino legacy no tenía el defecto (pymysql trae ``escape_timedelta``), así que esto
-        # cierra una divergencia entre los dos writers, no solo un bug de formato.
-        return format_timedelta(value).encode("ascii")
+        return render_time_for_reinsert(value).encode("ascii")
     # int/float/Decimal/datetime/date/time y demás escalares: repr textual canónico.
     return _escape_mysql_field(str(value).encode("utf-8"))
 

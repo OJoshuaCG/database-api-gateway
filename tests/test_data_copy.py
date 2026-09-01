@@ -33,6 +33,7 @@ from app.services.db_admin.data_copy import (
     _render_mysql_field,
     _staging_name,
     copy_tables,
+    render_time_for_reinsert,
 )
 
 
@@ -564,12 +565,23 @@ def test_render_mysql_field_bytearray_and_memoryview_escaped():
     assert _render_mysql_field(memoryview(b"a\nb")) == b"a\\nb"
 
 
-# ── TIME (timedelta): el defecto que el camino bulk tenía y el legacy no ──────────
-# El TIME de MySQL/MariaDB llega al driver como ``timedelta``. Con ``str()`` sale
-# "1 day, 2:00:00" / "-1 day, 23:00:00", que NO son literales TIME válidos — y como la fase
-# de datos relaja STRICT_TRANS_TABLES a propósito, el motor los coercionaba EN SILENCIO y la
-# tabla se reportaba `applied`. El camino legacy nunca lo tuvo (pymysql trae
-# ``escape_timedelta``), así que esto era además una divergencia entre los dos writers.
+# ── TIME (timedelta): NINGÚN driver lo serializa bien, y son dos defectos distintos ──
+# El TIME de MySQL/MariaDB llega al driver como ``timedelta`` y admite negativos y valores
+# mayores a 24 h. Con ``str()`` sale "1 day, 2:00:00" / "-1 day, 23:00:00", que NO son
+# literales TIME válidos — y como la fase de datos relaja STRICT_TRANS_TABLES a propósito, el
+# motor los coercionaba EN SILENCIO y la tabla se reportaba `applied`.
+#
+# El primer arreglo pasó a ``format_timedelta``, y quedó CORTO: esa función hace
+# ``int(total_seconds())``, o sea que tiraba los microsegundos. Cualquier columna TIME(3) o
+# TIME(6) se copiaba truncada, y ``-00:00:00.500000`` se copiaba como ``00:00:00``, perdiendo
+# el valor Y el signo. Por eso existe ``render_time_for_reinsert``, que es de REINSERCIÓN y no
+# de presentación como ``format_timedelta`` (que sigue truncando a propósito para la consola
+# SQL y los otros dos consumidores de pantalla).
+#
+# Y el camino legacy tampoco estaba sano: ``pymysql.escape_timedelta`` aplica el signo solo a
+# las HORAS, así que reinserta ``-01:30:00`` como ``-2:30:00``. Por eso ``_adapt_value``
+# normaliza el ``timedelta`` a str ANTES de bifurcar hacia cualquiera de los dos writers: es la
+# única forma de que despachar una tabla a uno o al otro no cambie lo que queda escrito.
 
 
 def test_render_mysql_field_time_under_24h():
@@ -937,3 +949,57 @@ def test_copy_reports_duration_even_when_the_table_fails(monkeypatch, tmp_path):
     assert isinstance(results[0].duration_ms, int)
     assert results[0].duration_ms >= 0
 
+
+
+# ── TIME con fracción de segundo: el defecto que el primer arreglo dejó pasar ──────
+def test_render_time_preserva_la_fraccion_de_segundo():
+    """
+    ``TIME(3)``/``TIME(6)`` tienen microsegundos y hay que copiarlos.
+
+    ``format_timedelta`` —el criterio de PRESENTACIÓN del proyecto— hace
+    ``int(total_seconds())`` y los tira. Usarlo para reinsertar convertía ``01:02:03.123456``
+    en ``01:02:03`` sin que nada fallara, porque la fase relaja el sql_mode estricto.
+    """
+    assert render_time_for_reinsert(
+        timedelta(hours=1, minutes=2, seconds=3, microseconds=123456)
+    ) == "01:02:03.123456"
+
+
+def test_render_time_negativo_con_fraccion_conserva_valor_y_signo():
+    """El peor caso del truncado: ``-00:00:00.5`` se volvía ``00:00:00``, sin valor ni signo."""
+    assert render_time_for_reinsert(timedelta(microseconds=-500000)) == "-00:00:00.500000"
+
+
+def test_render_time_sin_fraccion_no_agrega_ceros():
+    """Un TIME(0) no debe salir con ``.000000`` de más: sería ruido en el destino."""
+    assert render_time_for_reinsert(timedelta(hours=2)) == "02:00:00"
+    assert "." not in render_time_for_reinsert(timedelta(hours=838))
+
+
+def test_render_time_aplica_el_signo_al_TOTAL_no_a_las_horas():
+    """
+    Es exactamente el defecto de ``pymysql.escape_timedelta``, que rendea ``-01:30:00`` como
+    ``-2:30:00`` y ``-00:00:01`` como ``-1:59:59``. Valores válidos, silenciosos y distintos
+    del original.
+    """
+    assert render_time_for_reinsert(timedelta(hours=-1, minutes=-30)) == "-01:30:00"
+    assert render_time_for_reinsert(timedelta(seconds=-1)) == "-00:00:01"
+    assert render_time_for_reinsert(
+        -(timedelta(hours=838, minutes=59, seconds=59))
+    ) == "-838:59:59"
+
+
+def test_adapt_value_normaliza_timedelta_para_los_DOS_writers():
+    """
+    La normalización vive en ``_adapt_value`` y no en cada writer.
+
+    Si cada camino serializara por su cuenta, despachar una tabla al writer bulk o al legacy
+    cambiaría lo que queda escrito en el destino — que es justamente la clase de divergencia
+    silenciosa que ya nos costó dos bugs en este mismo tipo.
+    """
+    td = timedelta(hours=1, minutes=2, seconds=3, microseconds=123456)
+    adaptado = _adapt_value(td)
+    assert adaptado == "01:02:03.123456", "el legacy recibe el str ya normalizado"
+    assert _render_mysql_field(adaptado) == b"01:02:03.123456", "y el FIFO lo pasa tal cual"
+    # Y por el camino directo (defensa si alguien llama al render sin adaptar) da lo mismo.
+    assert _render_mysql_field(td) == b"01:02:03.123456"
