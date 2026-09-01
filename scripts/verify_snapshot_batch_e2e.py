@@ -117,6 +117,14 @@ DDL = [
          KEY fk_tipo (tipo_id),
          CONSTRAINT fk_hija_tipo FOREIGN KEY (tipo_id) REFERENCES tipos (id) ON DELETE CASCADE
        ) ENGINE=InnoDB""",
+    # SIN clave primaria: es lo que decide si la copia de datos usa tabla de staging, y el
+    # prefetch de PKs tiene que reportarlo bien o una tabla se cargaría por el camino
+    # equivocado.
+    """CREATE TABLE sin_pk (
+         id INT NOT NULL,
+         v VARCHAR(20) NULL,
+         KEY idx_v (v)
+       ) ENGINE=InnoDB""",
     "CREATE VIEW v_altas AS SELECT id, estado FROM tipos WHERE estado = 'alta'",
     "CREATE VIEW v_encadenada AS SELECT id FROM v_altas",
     """CREATE PROCEDURE p_contar(IN limite INT, OUT total INT)
@@ -192,6 +200,8 @@ def main() -> int:
     adapter_n1 = MySQLAdapter(target)
     adapter_n1._prefetch_column_extras = lambda *a, **k: None
     adapter_n1._prefetch_table_storage_options = lambda *a, **k: None
+    adapter_n1._prefetch_row_estimates = lambda *a, **k: None
+    adapter_n1._prefetch_primary_keys = lambda *a, **k: None
 
     h_n1 = contar(consultas_n1)
     event.listen(eng, "before_cursor_execute", h_n1)
@@ -222,7 +232,7 @@ def main() -> int:
     por_nombre = {t.table: t for t in snap_batch.tables}
     check("excluye la contabilidad del gateway", "_gw_v_algo" not in por_nombre,
           f"tablas: {sorted(por_nombre)}")
-    check("5 tablas de usuario", len(por_nombre) == 5, f"encontradas {sorted(por_nombre)}")
+    check("6 tablas de usuario", len(por_nombre) == 6, f"encontradas {sorted(por_nombre)}")
 
     tipos = por_nombre.get("tipos")
     if tipos:
@@ -272,6 +282,37 @@ def main() -> int:
     check("las vistas se leen", len(snap_batch.views) == 2, f"{len(snap_batch.views)}")
     check("las rutinas se leen", len(snap_batch.routines) == 2, f"{len(snap_batch.routines)}")
     check("los triggers se leen", len(snap_batch.triggers) == 1, f"{len(snap_batch.triggers)}")
+
+    print("\n== list_table_stats: el bateado tiene que dar EXACTAMENTE lo mismo ==")
+    stats_batch = adapter.list_table_stats(DB)
+    stats_n1 = adapter_n1.list_table_stats(DB)
+    check("las estadísticas por tabla son idénticas",
+          normalizar(stats_batch) == normalizar(stats_n1))
+    por_tabla = {t.table: t for t in stats_batch}
+    check("una tabla SIN PK se reporta sin PK",
+          por_tabla["sin_pk"].has_primary_key is False if "sin_pk" in por_tabla else False,
+          f"tablas: {sorted(por_tabla)}")
+    check("una tabla CON PK se reporta con PK",
+          por_tabla["tipos"].has_primary_key is True if "tipos" in por_tabla else False)
+    # `estimated_rows_known` es la distinción que se rompe si alguien confunde None con 0: una
+    # tabla que el catálogo no supo estimar se informaría como vacía.
+    check("ninguna estimación None se convirtió en 0 silenciosamente",
+          all(s.estimated_rows_known or s.estimated_rows == 0 for s in stats_batch))
+
+    q_stats_batch: list[str] = []
+    q_stats_n1: list[str] = []
+    h1 = contar(q_stats_batch)
+    event.listen(eng, "before_cursor_execute", h1)
+    adapter.list_table_stats(DB)
+    event.remove(eng, "before_cursor_execute", h1)
+    h2 = contar(q_stats_n1)
+    event.listen(eng, "before_cursor_execute", h2)
+    adapter_n1.list_table_stats(DB)
+    event.remove(eng, "before_cursor_execute", h2)
+    print(f"  consultas de list_table_stats: {len(q_stats_n1)} -> {len(q_stats_batch)}")
+    check("list_table_stats dejó de escalar con la cantidad de tablas",
+          len(q_stats_batch) < len(q_stats_n1),
+          f"{len(q_stats_batch)} vs {len(q_stats_n1)}")
 
     print("\n== Costo: además de igual, más barato ==")
     n = len(snap_batch.tables)

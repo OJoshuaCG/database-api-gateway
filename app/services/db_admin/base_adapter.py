@@ -1182,6 +1182,25 @@ class ServerAdapter(ABC):
         """``{tabla: {engine, charset, …}}`` para todas las tablas. ``None`` = sin batch."""
         return None
 
+    def _prefetch_row_estimates(
+        self, conn, database: str, schema: str, tables: list[str]
+    ) -> dict[str, int | None] | None:
+        """
+        ``{tabla: filas_estimadas_o_None}`` para todas. ``None`` (el retorno) = sin batch.
+
+        Ojo con los dos ``None`` de esta firma, que significan cosas distintas: el del RETORNO
+        es "este adapter no batea"; el de un VALOR es "el catálogo no sabe cuántas filas tiene
+        esa tabla", que no es cero — devolver cero haría que una tabla de millones se informara
+        como vacía, y por eso existe ``estimated_rows_known``.
+        """
+        return None
+
+    def _prefetch_primary_keys(
+        self, conn, database: str, schema: str, tables: list[str]
+    ) -> dict[str, bool] | None:
+        """``{tabla: tiene_pk}`` para todas las tablas. ``None`` = sin batch."""
+        return None
+
     def _database_defaults(self, conn, database: str, schema: str) -> dict[str, str | None]:
         """
         Default de charset/collation A NIVEL BD → ``{"db_charset", "db_collation"}``.
@@ -1759,20 +1778,37 @@ class ServerAdapter(ABC):
                 insp = inspect(conn)
                 out: list[TableStat] = []
                 # Sin la contabilidad interna del gateway: nunca es candidata a sembrarse.
-                for t in exclude_gateway_internal_tables(
+                nombres = exclude_gateway_internal_tables(
                     sorted(insp.get_table_names(schema=schema))
-                ):
-                    pk = (
-                        insp.get_pk_constraint(t, schema=schema).get("constrained_columns")
-                        or []
-                    )
-                    estimate = self._estimate_rows(conn, t, schema)
+                )
+                # Dos consultas para toda la base en vez de dos POR TABLA. Un adapter que no
+                # las implemente devuelve None y cada tabla vuelve a consultar lo suyo.
+                filas = self._prefetch_row_estimates(conn, database, schema, nombres)
+                pks = self._prefetch_primary_keys(conn, database, schema, nombres)
+                for t in nombres:
+                    if pks is None:
+                        tiene_pk = bool(
+                            insp.get_pk_constraint(t, schema=schema).get(
+                                "constrained_columns"
+                            )
+                            or []
+                        )
+                    else:
+                        tiene_pk = pks.get(t, False)
+                    if filas is None:
+                        estimate = self._estimate_rows(conn, t, schema)
+                    else:
+                        # ``.get`` con default None y NO 0: "el catálogo no lo sabe" es distinto
+                        # de "tiene cero filas", y confundirlos hace que una tabla de millones se
+                        # informe como vacía. Una tabla ausente del prefetch (la dropearon entre
+                        # una consulta y otra) cae en el mismo caso, que es el correcto.
+                        estimate = filas.get(t)
                     out.append(
                         TableStat(
                             table=t,
                             estimated_rows=estimate if estimate is not None else 0,
                             estimated_rows_known=estimate is not None,
-                            has_primary_key=bool(pk),
+                            has_primary_key=tiene_pk,
                         )
                     )
                 return out

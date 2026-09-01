@@ -1578,6 +1578,50 @@ class MySQLAdapter(ServerAdapter):
             opts["db_collation"] = str(row[1])
         return opts
 
+    def _prefetch_row_estimates(
+        self, conn, database, schema, tables
+    ) -> dict[str, int | None] | None:
+        """Las filas estimadas de TODAS las tablas en una consulta, en vez de una por tabla."""
+        if not tables:
+            return {}
+        pedidas = set(tables)
+        out: dict[str, int | None] = {}
+        rows = conn.execute(
+            text(
+                "SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = :db"
+            ),
+            {"db": database},
+        ).fetchall()
+        for table, table_rows in rows:
+            if table in pedidas:
+                # NULL se conserva como None: es "el catálogo no lo sabe", no "cero filas".
+                out[table] = int(table_rows) if table_rows is not None else None
+        return out
+
+    def _prefetch_primary_keys(self, conn, database, schema, tables) -> dict[str, bool] | None:
+        """
+        Qué tablas tienen PK, en una consulta.
+
+        Antes salía de ``insp.get_pk_constraint`` por tabla, que en MySQL dispara la reflexión
+        completa (``SHOW CREATE TABLE``) para leer un booleano. ``information_schema.STATISTICS``
+        lo dice directo: el índice de la PK siempre se llama ``PRIMARY``.
+        """
+        if not tables:
+            return {}
+        pedidas = set(tables)
+        con_pk = {
+            r[0]
+            for r in conn.execute(
+                text(
+                    "SELECT DISTINCT TABLE_NAME FROM information_schema.STATISTICS "
+                    "WHERE TABLE_SCHEMA = :db AND INDEX_NAME = 'PRIMARY'"
+                ),
+                {"db": database},
+            ).fetchall()
+        }
+        return {t: t in con_pk for t in pedidas}
+
     def _prefetch_column_extras(
         self, conn, database, schema, tables
     ) -> dict[str, dict[str, dict]] | None:
