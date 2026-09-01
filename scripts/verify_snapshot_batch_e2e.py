@@ -203,6 +203,79 @@ def main() -> int:
     adapter_n1._prefetch_row_estimates = lambda *a, **k: None
     adapter_n1._prefetch_primary_keys = lambda *a, **k: None
 
+    # El bateo de vistas y rutinas vive DENTRO de sus hooks, no en un prefetch conmutable, así
+    # que el brazo de control es una reimplementación explícita del N+1 que había antes. Si el
+    # bateado y éste divergen, es que el agrupado en memoria perdió u ordenó mal algo.
+    def _views_n1(conn, database, schema):
+        from app.services.db_admin.dtos import ViewInfo
+        out = []
+        for name, vdef, check_option, security in conn.execute(
+            text(
+                "SELECT TABLE_NAME, VIEW_DEFINITION, CHECK_OPTION, SECURITY_TYPE "
+                "FROM information_schema.VIEWS WHERE TABLE_SCHEMA = :db ORDER BY TABLE_NAME"
+            ),
+            {"db": database},
+        ).fetchall():
+            cols = [
+                r[0]
+                for r in conn.execute(
+                    text(
+                        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA = :db AND TABLE_NAME = :t ORDER BY ORDINAL_POSITION"
+                    ),
+                    {"db": database, "t": name},
+                ).fetchall()
+            ]
+            out.append(ViewInfo(
+                name=name, is_materialized=False, definition=str(vdef or ""), columns=cols,
+                check_option=None if not check_option or check_option == "NONE" else str(check_option),
+                security_definer=str(security or "").upper() == "DEFINER",
+            ))
+        return out
+
+    def _routines_n1(conn, database, schema):
+        from app.services.db_admin.dtos import RoutineInfo, RoutineParam
+        from app.services.db_admin.identifiers import quote_identifier, validate_identifier
+        out = []
+        for name, rtype, return_type, deterministic, security in conn.execute(
+            text(
+                "SELECT ROUTINE_NAME, ROUTINE_TYPE, DTD_IDENTIFIER, IS_DETERMINISTIC, "
+                "SECURITY_TYPE FROM information_schema.ROUTINES "
+                "WHERE ROUTINE_SCHEMA = :db ORDER BY ROUTINE_TYPE, ROUTINE_NAME"
+            ),
+            {"db": database},
+        ).fetchall():
+            kind = "PROCEDURE" if str(rtype).upper() == "PROCEDURE" else "FUNCTION"
+            q = quote_identifier(
+                validate_identifier(name, "mysql", "rutina", allow_existing=True), "mysql"
+            )
+            crow = conn.execute(text(f"SHOW CREATE {kind} {q}")).fetchone()
+            body = adapter_n1._strip_definer_clause(
+                adapter_n1._show_create_value(crow, (f"Create {kind.capitalize()}",), 2)
+            )
+            params = []
+            for pname, pmode, dtd, ordinal in conn.execute(
+                text(
+                    "SELECT PARAMETER_NAME, PARAMETER_MODE, DTD_IDENTIFIER, ORDINAL_POSITION "
+                    "FROM information_schema.PARAMETERS "
+                    "WHERE SPECIFIC_SCHEMA = :db AND SPECIFIC_NAME = :n ORDER BY ORDINAL_POSITION"
+                ),
+                {"db": database, "n": name},
+            ).fetchall():
+                if ordinal == 0:
+                    continue
+                params.append(RoutineParam(name=pname, mode=pmode, type=str(dtd or "")))
+            out.append(RoutineInfo(
+                name=name, kind=kind, parameters=params,
+                return_type=str(return_type) if return_type else None, language="SQL",
+                deterministic=str(deterministic or "").upper() == "YES",
+                security_definer=str(security or "").upper() == "DEFINER", body=body,
+            ))
+        return out
+
+    adapter_n1._snapshot_views = _views_n1
+    adapter_n1._snapshot_routines = _routines_n1
+
     h_n1 = contar(consultas_n1)
     event.listen(eng, "before_cursor_execute", h_n1)
     t0 = time.perf_counter()
@@ -283,6 +356,26 @@ def main() -> int:
     check("las rutinas se leen", len(snap_batch.routines) == 2, f"{len(snap_batch.routines)}")
     check("los triggers se leen", len(snap_batch.triggers) == 1, f"{len(snap_batch.triggers)}")
 
+    print("\n== Objetos con cuerpo: vistas y rutinas ==")
+    v_por_nombre = {v.name: v for v in snap_batch.views}
+    check("la vista trae sus columnas, en orden",
+          v_por_nombre["v_altas"].columns == ["id", "estado"]
+          if "v_altas" in v_por_nombre else False,
+          str(v_por_nombre.get("v_altas")))
+    check("una vista encadenada también",
+          v_por_nombre["v_encadenada"].columns == ["id"]
+          if "v_encadenada" in v_por_nombre else False)
+    r_por_nombre = {r.name: r for r in snap_batch.routines}
+    proc = r_por_nombre.get("p_contar")
+    check("los parámetros de una rutina conservan orden y modo",
+          proc is not None
+          and [(p.name, p.mode) for p in proc.parameters] == [("limite", "IN"), ("total", "OUT")],
+          str([(p.name, p.mode) for p in proc.parameters]) if proc else "sin p_contar")
+    fn = r_por_nombre.get("f_doble")
+    check("una FUNCTION no cuenta su tipo de retorno como parámetro",
+          fn is not None and [p.name for p in fn.parameters] == ["x"],
+          str([p.name for p in fn.parameters]) if fn else "sin f_doble")
+
     print("\n== list_table_stats: el bateado tiene que dar EXACTAMENTE lo mismo ==")
     stats_batch = adapter.list_table_stats(DB)
     stats_n1 = adapter_n1.list_table_stats(DB)
@@ -323,13 +416,17 @@ def main() -> int:
     # ~0 y el ruido de la primera conexión domina. Lo que se verifica es el CONTEO, que es
     # lo que se multiplica por el RTT en un servidor remoto — que es el caso real.
 
-    # El camino viejo hacía 3 consultas por tabla (COLUMNS + TABLES + SCHEMATA); el nuevo
-    # hace esas 3 UNA vez para toda la base. Así que la diferencia tiene que ser exactamente
-    # 3*(n-1). Fijarlo así, y no como «menos consultas», es lo que detecta que vuelva a
-    # colarse un N+1: con «menos» alcanzaba con ahorrar una sola.
-    esperado = 3 * (n - 1)
+    # Fijar el número EXACTO, y no «menos consultas», es lo que detecta que vuelva a colarse un
+    # N+1: con «menos» alcanzaría con ahorrar una sola. Se ahorra, por cada eje bateado:
+    #   tablas:  3 consultas por tabla (COLUMNS + TABLES + SCHEMATA) -> 3 para toda la base
+    #   vistas:  1 consulta de columnas por vista  -> 1 para todas
+    #   rutinas: 1 consulta de parámetros por rutina -> 1 para todas
+    n_vistas = len(snap_batch.views)
+    n_rutinas = len(snap_batch.routines)
+    esperado = 3 * (n - 1) + (n_vistas - 1) + (n_rutinas - 1)
     real = len(consultas_n1) - len(consultas_batch)
-    check(f"el N+1 desapareció: {esperado} consultas menos, no una menos", real == esperado,
+    check(f"los N+1 desaparecieron: {esperado} consultas menos ({3 * (n - 1)} de tablas, {n_vistas - 1} de vistas, {n_rutinas - 1} de rutinas)",
+          real == esperado,
           f"esperaba {esperado}, hubo {real}")
     check("una sola consulta a SCHEMATA en todo el snapshot",
           sum(1 for q in consultas_batch if "SCHEMATA" in q) == 2,

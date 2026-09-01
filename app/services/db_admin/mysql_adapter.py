@@ -1697,17 +1697,25 @@ class MySQLAdapter(ServerAdapter):
             ),
             {"db": database},
         ).fetchall()
+        # Las columnas de TODAS las vistas en una consulta, en vez de una por vista. El log de
+        # producción mostró que estos hooks pesan MÁS que el recorrido de tablas: en una base de
+        # 15 tablas con muchos objetos, 1,9 s de 2,9 s del snapshot.
+        #
+        # ``information_schema.COLUMNS`` de un esquema trae también las columnas de las TABLAS;
+        # no molesta porque solo se consulta por nombre de vista, y filtrar de más costaría otra
+        # condición para nada.
+        cols_por_vista: dict[str, list[str]] = {}
+        for tname, cname in conn.execute(
+            text(
+                "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = :db ORDER BY TABLE_NAME, ORDINAL_POSITION"
+            ),
+            {"db": database},
+        ).fetchall():
+            cols_por_vista.setdefault(tname, []).append(cname)
+
         for name, vdef, check_option, security in rows:
-            cols = [
-                r[0]
-                for r in conn.execute(
-                    text(
-                        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
-                        "WHERE TABLE_SCHEMA = :db AND TABLE_NAME = :t ORDER BY ORDINAL_POSITION"
-                    ),
-                    {"db": database, "t": name},
-                ).fetchall()
-            ]
+            cols = cols_por_vista.get(name, [])
             out.append(
                 ViewInfo(
                     name=name,
@@ -1730,6 +1738,30 @@ class MySQLAdapter(ServerAdapter):
             ),
             {"db": database},
         ).fetchall()
+        # Los parámetros de TODAS las rutinas en una consulta. El ``SHOW CREATE`` de abajo NO se
+        # puede batear —no hay equivalente masivo— pero esta segunda consulta por rutina sí.
+        #
+        # Se indexa por nombre A SECAS, igual que la consulta por rutina que reemplaza, para que
+        # la salida sea idéntica. OJO: eso arrastra una ambigüedad que ya existía — MySQL admite
+        # un PROCEDURE y una FUNCTION con el MISMO nombre en el mismo esquema, y ahí los
+        # parámetros de una se mezclarían con los de la otra. Se conserva el comportamiento a
+        # propósito: arreglarlo es un cambio de semántica y merece su propio commit con su test,
+        # no venir de contrabando en una optimización.
+        params_por_rutina: dict[str, list[RoutineParam]] = {}
+        for sname, pname, pmode, dtd, ordinal in conn.execute(
+            text(
+                "SELECT SPECIFIC_NAME, PARAMETER_NAME, PARAMETER_MODE, DTD_IDENTIFIER, "
+                "ORDINAL_POSITION FROM information_schema.PARAMETERS "
+                "WHERE SPECIFIC_SCHEMA = :db ORDER BY SPECIFIC_NAME, ORDINAL_POSITION"
+            ),
+            {"db": database},
+        ).fetchall():
+            if ordinal == 0:  # posición 0 = tipo de retorno de una FUNCTION
+                continue
+            params_por_rutina.setdefault(sname, []).append(
+                RoutineParam(name=pname, mode=pmode, type=str(dtd or ""))
+            )
+
         for name, rtype, return_type, deterministic, security in rows:
             kind = "PROCEDURE" if str(rtype).upper() == "PROCEDURE" else "FUNCTION"
             q = quote_identifier(
@@ -1740,18 +1772,7 @@ class MySQLAdapter(ServerAdapter):
             body = self._strip_definer_clause(
                 self._show_create_value(crow, (f"Create {kind.capitalize()}",), 2)
             )
-            params: list[RoutineParam] = []
-            for pname, pmode, dtd, ordinal in conn.execute(
-                text(
-                    "SELECT PARAMETER_NAME, PARAMETER_MODE, DTD_IDENTIFIER, ORDINAL_POSITION "
-                    "FROM information_schema.PARAMETERS "
-                    "WHERE SPECIFIC_SCHEMA = :db AND SPECIFIC_NAME = :n ORDER BY ORDINAL_POSITION"
-                ),
-                {"db": database, "n": name},
-            ).fetchall():
-                if ordinal == 0:  # posición 0 = tipo de retorno de una FUNCTION
-                    continue
-                params.append(RoutineParam(name=pname, mode=pmode, type=str(dtd or "")))
+            params = params_por_rutina.get(name, [])
             out.append(
                 RoutineInfo(
                     name=name,
