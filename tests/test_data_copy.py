@@ -32,6 +32,8 @@ from app.services.db_admin.data_copy import (
     _escape_mysql_field,
     _render_mysql_field,
     _FilasPerdidas,
+    _despachar,
+    _peek_rows,
     _staging_name,
     _verificar_filas_cargadas,
     copy_tables,
@@ -1097,3 +1099,74 @@ def test_una_tabla_fallida_tira_el_pool_de_origen_y_las_siguientes_se_copian(
     assert disposes == ["srcdb"], "la tabla fallida tiene que tirar el pool, y solo ella"
     # Copió de verdad: si la conexión hubiera quedado envenenada, esto fallaría.
     assert results[1].rows_copied == 2
+
+
+# ── Despacho por tamaño: la frontera es donde se pierden filas si está mal ─────────
+def test_peek_tabla_entera_entra_marca_agotado():
+    filas = [(1, "a"), (2, "b")]
+    buffer, agotado = _peek_rows(iter(filas), 10, 1_000_000)
+    assert buffer == filas and agotado is True
+
+
+def test_peek_en_el_tope_exacto_NO_marca_agotado():
+    """
+    El caso que más fácil se rompe. Con exactamente `max_rows` filas leídas no se sabe si la
+    tabla terminó ahí o si hay una más: marcar `agotado` sería adivinar, y adivinar mal manda
+    la tabla al INSERT único dejando el resto de las filas sin copiar.
+    """
+    buffer, agotado = _peek_rows(iter([(1,), (2,), (3,)]), 3, 1_000_000)
+    assert len(buffer) == 3 and agotado is False
+
+
+def test_peek_tope_mas_uno_no_agotado():
+    buffer, agotado = _peek_rows(iter([(1,), (2,), (3,), (4,)]), 3, 1_000_000)
+    assert len(buffer) == 3 and agotado is False
+
+
+def test_peek_tabla_vacia_agotada():
+    buffer, agotado = _peek_rows(iter([]), 10, 1_000_000)
+    assert buffer == [] and agotado is True
+
+
+def test_peek_corta_por_bytes_aunque_sobren_filas():
+    """
+    El tope de bytes garantiza UNA sola sentencia: pymysql parte el executemany al pasarse de
+    `max_stmt_length` y en AUTOCOMMIT cada trozo commitea, lo que dejaría una tabla a medio
+    insertar donde hoy es todo-o-nada.
+    """
+    grandes = [("x" * 1000,) for _ in range(100)]
+    buffer, agotado = _peek_rows(iter(grandes), 1000, 5000)
+    assert agotado is False and len(buffer) < 100
+
+
+def test_despacho_devuelve_el_legacy_si_la_tabla_entra():
+    writer, filas = _despachar(
+        dc._copy_writer_mysql, iter([(1,), (2,)]), batch_rows=10, dest_engine="mysql"
+    )
+    assert writer is dc._copy_writer_insert
+    assert list(filas) == [(1,), (2,)]
+
+
+def test_despacho_encadena_SIN_perder_ni_reordenar_lo_ya_leido():
+    """
+    La propiedad que no se puede romper: lo que el peek consumió tiene que volver al frente del
+    iterador, en orden. Si se perdiera, la copia quedaría incompleta y `applied`.
+    """
+    todas = [(i,) for i in range(10)]
+    writer, filas = _despachar(
+        dc._copy_writer_mysql, iter(todas), batch_rows=3, dest_engine="mysql"
+    )
+    assert writer is dc._copy_writer_mysql
+    assert list(filas) == todas
+
+
+def test_despacho_no_toca_los_writers_que_no_son_el_bulk_de_mysql():
+    """
+    En PostgreSQL el COPY va por la conexión ya abierta y su staging es solo-si-upsert: no hay
+    orquesta que evitar. Y si el writer YA es el legacy, el peek sería trabajo al pepe.
+    """
+    for w in (dc._copy_writer_postgres, dc._copy_writer_insert):
+        original = iter([(1,), (2,)])
+        writer, filas = _despachar(w, original, batch_rows=10, dest_engine="postgresql")
+        assert writer is w
+        assert filas is original, "no debe consumir ni envolver el iterador"
