@@ -106,6 +106,7 @@ async def lifespan(app: FastAPI):
     # Barrido: jobs asíncronos que quedaron 'running' por un reinicio → 'interrupted'.
     # Cada worker in-process tiene su propio barrido (los pools son independientes).
     from app.services import (
+        clone_batch_runner,
         clone_runner,
         collation_conversion_runner,
         export_runner,
@@ -113,6 +114,11 @@ async def lifespan(app: FastAPI):
     )
 
     clone_runner.sweep_interrupted()
+    # DESPUÉS de clone_runner, y el orden importa: el estado de una fila de lote se lee de su
+    # CloneJob, así que el barrido de jobs tiene que haber pasado los colgados a 'interrupted'
+    # antes de que el del lote cuente el desenlace. Al revés, el lote se cerraría mirando
+    # filas que todavía figuran 'running'.
+    clone_batch_runner.sweep_interrupted()
     collation_conversion_runner.sweep_interrupted()
     export_runner.sweep_interrupted()
     # Artefactos de exportación: primero se purgan los vencidos y después se barren los

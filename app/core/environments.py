@@ -137,6 +137,14 @@ CLONE_DATA_BATCH_ROWS = int(os.getenv("CLONE_DATA_BATCH_ROWS", "1000"))
 # INFILE en MySQL/MariaDB). True (default) usa el protocolo bulk del motor; False vuelve
 # al INSERT parametrizado por lotes (executemany) sin necesidad de re-desplegar código.
 CLONE_BULK_COPY_ENABLED = os.getenv("CLONE_BULK_COPY_ENABLED", "True").lower() == "true"
+# Cuántos LOTES de clonación corren a la vez. Las filas DENTRO de un lote van siempre en
+# serie, y eso no es configurable: el paralelismo entre bases multiplicaría el daño de un
+# error y la carga sobre el servidor destino sin un beneficio medido. Executor PROPIO, no el
+# de CLONE_MAX_WORKERS, para que un lote largo no deje sin turno a los clones sueltos.
+CLONE_BATCH_MAX_WORKERS = int(os.getenv("CLONE_BATCH_MAX_WORKERS", "1"))
+# Tope de bases por lote. Es un límite de prudencia, no técnico: un lote es una sola
+# confirmación que autoriza N operaciones sobre bases de terceros.
+CLONE_BATCH_MAX_ROWS = int(os.getenv("CLONE_BATCH_MAX_ROWS", "25"))
 
 # ======= Conversión de charset/collation (collation conversions) ======= #
 # Vida útil (horas) de un plan de conversión. Tras expirar, execute exige replanear.
