@@ -75,6 +75,38 @@ CODE_TARGET_ALREADY_EXISTS = "clone.target_already_exists"
 CODE_SAME_DATABASE = "clone.same_database"
 CODE_ROW_COUNT_MISMATCH = "clone.row_count_mismatch"
 
+# ---- Lote (clonar N bases de un servidor a otro) ------------------------------------- #
+# Comparten el namespace ``clone.*`` a propósito: el lote no es otro módulo, es la
+# orquestación del mismo. Un vocabulario aparte obligaría al cliente a mantener dos
+# diccionarios para errores que puede recibir en el mismo recorrido.
+#
+# El lote PROHÍBE las filas destructivas. No es una restricción de la UI: un `clean_mode`
+# que borra sobre un destino existente, multiplicado por N y confirmado con un solo gesto,
+# es exactamente el tipo de operación que tiene que seguir siendo de a una y con su propio
+# re-tipeo del nombre.
+CODE_BATCH_DESTRUCTIVE_NOT_ALLOWED = "clone.batch_destructive_not_allowed"
+# Con destino EXISTENTE la única intención admitida es ``data_only``: con
+# ``structure_and_data`` los CREATE TABLE chocarían contra las tablas que ya están.
+CODE_BATCH_EXISTING_REQUIRES_DATA_ONLY = "clone.batch_existing_requires_data_only"
+CODE_BATCH_DUPLICATE_TARGET = "clone.batch_duplicate_target"
+CODE_BATCH_TARGET_EXISTS = "clone.batch_target_exists"
+CODE_BATCH_TARGET_MISSING = "clone.batch_target_missing"
+CODE_BATCH_EMPTY = "clone.batch_empty"
+CODE_BATCH_TOO_LARGE = "clone.batch_too_large"
+# El conjunto confirmado no es el que se está por ejecutar: el token ata la lista ORDENADA
+# de pares origen→destino, así que agregar, quitar o editar una fila lo invalida.
+CODE_BATCH_SET_MISMATCH = "clone.batch_set_mismatch"
+CODE_BATCH_NOT_PENDING = "clone.batch_not_pending"
+CODE_BATCH_EXPIRED = "clone.batch_expired"
+CODE_BATCH_TOKEN_MISMATCH = "clone.batch_token_mismatch"
+CODE_BATCH_CONFIRM_SERVER_MISMATCH = "clone.batch_confirm_server_mismatch"
+# Motivo por el que UNA fila quedó bloqueada durante la corrida: el lote sigue con el resto.
+CODE_BATCH_ROW_BLOCKED = "clone.batch_row_blocked"
+# El reintento solo admite filas cuyo destino quedó INTACTO. Una fila que alcanzó a escribir
+# datos dejó filas parciales commiteadas (la copia no es reanudable), y el lote no puede
+# limpiar porque los modos destructivos están prohibidos.
+CODE_BATCH_RETRY_NOT_ELIGIBLE = "clone.batch_retry_not_eligible"
+
 # Avisos (no bloquean; viajan en ``warnings`` con su código).
 WARN_TARGET_TRIGGERS_WILL_FIRE = "clone.target_triggers_will_fire"
 WARN_UPSERT_WITHOUT_PRIMARY_KEY = "clone.upsert_without_primary_key"
@@ -115,6 +147,20 @@ ERROR_CODES: frozenset[str] = frozenset(
         CODE_TARGET_ALREADY_EXISTS,
         CODE_SAME_DATABASE,
         CODE_ROW_COUNT_MISMATCH,
+        CODE_BATCH_DESTRUCTIVE_NOT_ALLOWED,
+        CODE_BATCH_EXISTING_REQUIRES_DATA_ONLY,
+        CODE_BATCH_DUPLICATE_TARGET,
+        CODE_BATCH_TARGET_EXISTS,
+        CODE_BATCH_TARGET_MISSING,
+        CODE_BATCH_EMPTY,
+        CODE_BATCH_TOO_LARGE,
+        CODE_BATCH_SET_MISMATCH,
+        CODE_BATCH_NOT_PENDING,
+        CODE_BATCH_EXPIRED,
+        CODE_BATCH_TOKEN_MISMATCH,
+        CODE_BATCH_CONFIRM_SERVER_MISMATCH,
+        CODE_BATCH_ROW_BLOCKED,
+        CODE_BATCH_RETRY_NOT_ELIGIBLE,
     }
 )
 
