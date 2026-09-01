@@ -39,6 +39,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
@@ -157,6 +158,11 @@ class TableCopyResult:
     status: str  # 'applied' | 'failed' | 'skipped' | 'canceled'
     rows_copied: int = 0
     error: str | None = None
+    # Duración de la copia de ESTA tabla. Nunca se había calculado: los ítems de la fase de
+    # datos llegaban al historial con ``execution_ms`` en NULL, así que el reporte podía decir
+    # cuánto tardó cada sentencia de DDL pero no cuánto tardó copiar una tabla — justo el dato
+    # que hace falta para responder «¿por qué tardó?».
+    duration_ms: int = 0
 
 
 class _Canceled(Exception):
@@ -791,6 +797,14 @@ def _copy_one_table(
         # Identificador anómalo => tabla fallida (fail-closed), no aborta el lote.
         return TableCopyResult(table=table, status="failed", error=_clean_error(exc))
 
+    # Cronómetro de la tabla. Arranca acá y no antes: la validación de identificadores de
+    # arriba no toca ningún motor, así que lo que se mide es el trabajo real (abrir la
+    # conexión al origen, leer, serializar y escribir al destino).
+    t_inicio = time.perf_counter()
+
+    def _ms() -> int:
+        return int((time.perf_counter() - t_inicio) * 1000)
+
     counter = [0]  # filas volcadas al destino (lo actualiza el writer)
     rows_iter = _iter_source_rows(
         source_target=source_target,
@@ -812,10 +826,16 @@ def _copy_one_table(
             counter,
         )
     except _Canceled:
-        return TableCopyResult(table=table, status="canceled", rows_copied=counter[0])
-    except Exception as exc:  # noqa: BLE001 - best-effort: aislar el fallo por tabla
         return TableCopyResult(
-            table=table, status="failed", rows_copied=counter[0], error=_clean_error(exc)
+            table=table, status="canceled", rows_copied=counter[0], duration_ms=_ms()
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort: aislar el fallo por tabla
+        # La duración se reporta TAMBIÉN cuando la tabla falla o se cancela: una tabla que
+        # tardó tres minutos antes de reventar es un dato de diagnóstico, y descartarlo dejaría
+        # el reporte ciego justo en el caso que más se investiga.
+        return TableCopyResult(
+            table=table, status="failed", rows_copied=counter[0],
+            error=_clean_error(exc), duration_ms=_ms(),
         )
     finally:
         # Cierra el cursor/conexión origen. Idempotente: si el writer de MySQL ya lo cerró
@@ -825,7 +845,9 @@ def _copy_one_table(
         except Exception:  # noqa: BLE001
             pass
 
-    return TableCopyResult(table=table, status="applied", rows_copied=counter[0])
+    return TableCopyResult(
+        table=table, status="applied", rows_copied=counter[0], duration_ms=_ms()
+    )
 
 
 # --------------------------------------------------------------------------- #

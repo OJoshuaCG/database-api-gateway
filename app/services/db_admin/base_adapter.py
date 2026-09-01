@@ -12,6 +12,7 @@ Iteración 1 (solo se usarán a partir de la Iteración 2).
 """
 
 import re
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ from app.core.remote_engine import (
     map_driver_error,
     server_connection,
 )
+from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.services.db_admin import snapshot_data
 from app.services.db_admin.dtos import (
@@ -72,6 +74,8 @@ from app.services.db_admin.schema_diff import (
     SchemaDiff,
 )
 from app.services.db_admin.sql_dialect import body_delimiter_wrapper
+
+logger = get_logger(__name__)
 
 
 class ServerAdapter(ABC):
@@ -1051,6 +1055,22 @@ class ServerAdapter(ABC):
         """
         validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         schema = self._inspect_schema(database)
+        # Instrumentación del snapshot, separando el costo POR TABLA del resto.
+        #
+        # Está acá porque este método es el sospechoso principal de un hallazgo concreto: un
+        # clon de una base de 17 MB con menos de 100 tablas tardó 2 m 18 s, de los cuales solo
+        # ~11 s eran ejecución de DDL y ~2 s la copia de datos. Los ~125 s restantes no estaban
+        # medidos en ninguna parte, y este método corre CUATRO veces por clon haciendo varias
+        # consultas a ``information_schema`` **por cada tabla** — donde esas vistas no son
+        # tablas reales y el servidor las materializa abriendo definiciones.
+        #
+        # Los dos tramos van separados a propósito: si el tiempo está en ``tables_ms`` el
+        # problema es el N+1 por tabla (y la salida es batear la introspección); si está en
+        # ``otros_ms``, hay que buscar en los hooks de vistas/rutinas/triggers. Un único número
+        # total no distingue esos dos casos, que llevan a trabajos distintos.
+        t_inicio = time.perf_counter()
+        t_tablas = t_inicio
+        n_tablas = 0
         try:
             with self._conn_ctx(database, conn) as conn:
                 insp = inspect(conn)
@@ -1065,6 +1085,8 @@ class ServerAdapter(ABC):
                         sorted(insp.get_table_names(schema=schema))
                     )
                 ]
+                n_tablas = len(tables)
+                t_tablas = time.perf_counter()
                 views = self._snapshot_views(conn, database, schema)
                 routines = self._snapshot_routines(conn, database, schema)
                 triggers = self._snapshot_triggers(conn, database, schema)
@@ -1078,6 +1100,19 @@ class ServerAdapter(ABC):
                 exc, op="structural_snapshot", target=self.target,
                 extra={"database": database},
             )
+        t_fin = time.perf_counter()
+        tablas_ms = int((t_tablas - t_inicio) * 1000)
+        total_ms = int((t_fin - t_inicio) * 1000)
+        logger.info(
+            "snapshot %s.%s: %d tablas en %d ms (tablas %d ms, resto %d ms, %s ms/tabla)",
+            self.target.server_id,
+            database,
+            n_tablas,
+            total_ms,
+            tablas_ms,
+            total_ms - tablas_ms,
+            f"{tablas_ms / n_tablas:.1f}" if n_tablas else "n/a",
+        )
         return SchemaSnapshot(
             database=database,
             source_engine=self.dialect,

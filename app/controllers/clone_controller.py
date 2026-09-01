@@ -2433,9 +2433,14 @@ class CloneController:
                     error = "Fallo al copiar datos de la tabla (ver logs del gateway)."
                     logger.warning("Clon %s: fallo de datos en tabla %s: %s",
                                    job_id, res.table, res.error)
+                # ``execution_ms`` en los pasos de DATOS: la columna existía en el modelo y en
+                # el contrato desde siempre, pero las fases de limpieza y estructura eran las
+                # únicas que la llenaban. El reporte podía decir cuánto tardó cada CREATE TABLE
+                # y no cuánto tardó copiar una tabla — que es la pregunta que se hace.
                 item_rows.append(dict(seq=seq, kind=CLONE_ITEM_DATA, object_type="table",
                                       object_name=res.table, status=status, error=error,
-                                      rows_copied=res.rows_copied, executed_at=_utcnow()))
+                                      rows_copied=res.rows_copied,
+                                      execution_ms=res.duration_ms, executed_at=_utcnow()))
                 seq += 1
             self._record_items(job_id, item_rows)
             if any(r.status == "canceled" for r in results):

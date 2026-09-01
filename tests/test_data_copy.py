@@ -108,6 +108,7 @@ def test_result_defaults():
     r = TableCopyResult(table="t", status="applied")
     assert r.rows_copied == 0
     assert r.error is None
+    assert r.duration_ms == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -898,3 +899,34 @@ def test_mysql_writer_no_pk_skips_staging_entirely():
 
     assert sorted(conn.tables["widget"]) == [("1", "a"), ("2", "b")]
     assert not any(name.startswith("_gw_stg_") for name in conn.tables)
+
+
+# --------------------------------------------------------------------------- #
+# Duración por tabla                                                           #
+# --------------------------------------------------------------------------- #
+# Nunca se había calculado: los ítems de la fase de datos llegaban al historial con
+# `execution_ms` en NULL, así que el reporte sabía cuánto tardó cada CREATE TABLE y no cuánto
+# tardó copiar una tabla — que es la pregunta que el operador realmente se hace.
+
+
+def test_copy_reports_duration_for_applied_table(monkeypatch, tmp_path):
+    _setup_sqlite_env(monkeypatch, tmp_path, [(1, "a"), (2, "b")])
+    results = _copy(specs=[_spec()])
+    assert results[0].status == "applied"
+    assert isinstance(results[0].duration_ms, int)
+    assert results[0].duration_ms >= 0
+
+
+def test_copy_reports_duration_even_when_the_table_fails(monkeypatch, tmp_path):
+    """
+    Una tabla que tardó tres minutos ANTES de reventar es un dato de diagnóstico. Descartar la
+    duración en el camino de fallo dejaría el reporte ciego justo en el caso que más se
+    investiga.
+    """
+    # Una fila que choca contra la PK del destino => INSERT plano => la tabla falla.
+    _setup_sqlite_env(monkeypatch, tmp_path, [(1, "a")], create_dest_rows=[(1, "ya estaba")])
+    results = _copy(specs=[_spec()])
+    assert results[0].status == "failed"
+    assert isinstance(results[0].duration_ms, int)
+    assert results[0].duration_ms >= 0
+
