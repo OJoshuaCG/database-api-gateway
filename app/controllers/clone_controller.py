@@ -1941,6 +1941,66 @@ class CloneController:
         orig = getattr(exc, "orig", None)
         return str(orig if orig is not None else exc)[:500]
 
+    def abort_pending_job(self, job_id: int, *, reason: str) -> bool:
+        """
+        Cierra como ``failed`` un job que quedó en ``pending`` y que NUNCA se va a ejecutar.
+
+        Existe para el LOTE, y por eso es público: cuando el preview de una fila devuelve
+        ``blocking_issues``, el job ya está creado pero no puede correr, y dejarlo ``pending``
+        para siempre ensucia el barrido de arranque (que solo mira ``running``) y el historial.
+        La alternativa era que el orquestador llamara a ``_set_status``, o sea que otro módulo
+        dependiera de un detalle interno de éste.
+
+        Solo actúa sobre ``pending``, con ``UPDATE`` condicional: si un worker ya lo reclamó
+        —imposible por construcción hoy, pero no algo que este método deba asumir— no le pisa
+        el estado. Devuelve si efectivamente lo cerró.
+        """
+        session = self._session()
+        try:
+            closed = (
+                session.query(CloneJob)
+                .filter(CloneJob.id == job_id, CloneJob.status == CLONE_STATUS_PENDING)
+                .update(
+                    {
+                        CloneJob.status: CLONE_STATUS_FAILED,
+                        CloneJob.error: reason,
+                        CloneJob.finished_at: _utcnow(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            session.commit()
+            return bool(closed)
+        finally:
+            session.close()
+
+    def request_cancel(self, job_id: int) -> bool:
+        """
+        Pide la cancelación COOPERATIVA de un job sin pasar por la ruta HTTP.
+
+        La usa el lote: cancelar el lote mientras una fila está copiando tiene que detener
+        TAMBIÉN esa copia, y el chequeo entre filas del orquestador no alcanza — el worker de
+        la fila puede estar horas dentro de una tabla grande. Sin esto, "cancelar" dejaba
+        correr hasta el final la base en curso.
+
+        No valida el estado ni audita: eso es responsabilidad de ``cancel_clone`` (la ruta),
+        que además tiene el admin de la request. Devuelve si marcó algo.
+        """
+        session = self._session()
+        try:
+            marked = (
+                session.query(CloneJob)
+                .filter(
+                    CloneJob.id == job_id,
+                    CloneJob.status.in_([CLONE_STATUS_PENDING, CLONE_STATUS_RUNNING]),
+                )
+                .update({CloneJob.cancel_requested: True}, synchronize_session=False)
+            )
+            session.commit()
+            return bool(marked)
+        finally:
+            session.close()
+
     def _set_status(self, job_id, status, *, phase=None, error=None, finished=False):
         session = self._session()
         try:
