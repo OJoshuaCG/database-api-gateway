@@ -672,6 +672,13 @@ def test_load_data_via_fifo_engine_error_propagates_and_cleans_up_fifo(tmp_path)
         def exec_driver_sql(self, sql):
             raise RuntimeError("1146: Table 'x.does_not_exist' doesn't exist")
 
+    # Se fotografía el directorio ANTES: la aserción tiene que ser sobre el FIFO de ESTE test,
+    # no sobre el estado global de /dev/shm. La versión original comparaba contra la lista
+    # vacía, así que un FIFO filtrado por CUALQUIER otra cosa —una corrida anterior que el
+    # sistema mató antes del `finally`, por ejemplo— hacía fallar este test para siempre y
+    # apuntaba al código equivocado. Costó un rato de depuración averiguarlo.
+    previos = {p for p in os.listdir(dc._fifo_dir()) if p.startswith("gw_clone_")}
+
     with pytest.raises(RuntimeError, match="does_not_exist"):
         dc._load_data_via_fifo(
             dest_conn=_FailingConn(),
@@ -686,8 +693,8 @@ def test_load_data_via_fifo_engine_error_propagates_and_cleans_up_fifo(tmp_path)
         )
     # El escritor bloqueado en open('wb') se desbloquea y el FIFO se limpia (no queda
     # huérfano en /dev/shm ni en el tmpdir).
-    leftover = [p for p in os.listdir(dc._fifo_dir()) if p.startswith("gw_clone_")]
-    assert leftover == []
+    ahora = {p for p in os.listdir(dc._fifo_dir()) if p.startswith("gw_clone_")}
+    assert ahora - previos == set()
 
 
 # --------------------------------------------------------------------------- #
