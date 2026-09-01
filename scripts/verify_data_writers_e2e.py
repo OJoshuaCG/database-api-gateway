@@ -54,15 +54,16 @@ DDL = """CREATE TABLE valores (
   tneg TIME NULL,
   cuerpo VARBINARY(64) NULL,
   txt VARCHAR(80) NULL,
+  acentos VARCHAR(80) NULL,
   monto DECIMAL(12,4) NULL,
   estado ENUM('a','b') NULL,
   PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
 
 FILAS = [
-    (1, "01:02:03.123", "01:02:03.123456", "-01:30:00", b"\x00\ttab\nnl\\bs", "hola\ttab", "12.3456", "a"),
-    (2, "-00:00:00.500", "-00:00:00.500000", "-00:00:01", b"\x01\x02", "\\N literal", "-0.0001", "b"),
-    (3, None, None, "838:00:00", None, None, None, None),
+    (1, "01:02:03.123", "01:02:03.123456", "-01:30:00", b"\x00\ttab\nnl\\bs", "hola\ttab", "canción ñandú", "12.3456", "a"),
+    (2, "-00:00:00.500", "-00:00:00.500000", "-00:00:01", b"\x01\x02", "\\N literal", "über añejo", "-0.0001", "b"),
+    (3, None, None, "838:00:00", None, None, None, None, None),
 ]
 
 def preparar(n_filas_extra=0):
@@ -70,7 +71,10 @@ def preparar(n_filas_extra=0):
     with e.connect() as c:
         for db in (SRC, DST):
             c.execute(text(f"DROP DATABASE IF EXISTS {db}"))
-            c.execute(text(f"CREATE DATABASE {db} CHARACTER SET utf8mb4"))
+            # El DESTINO se crea latin1 A PROPÓSITO: es el caso en que LOAD DATA, sin cláusula
+            # CHARACTER SET, reinterpretaba nuestros bytes UTF-8 y guardaba mojibake.
+            cs = "latin1" if db == DST else "utf8mb4"
+            c.execute(text(f"CREATE DATABASE {db} CHARACTER SET {cs}"))
     e.dispose()
     es = create_engine(f"{URL}/{SRC}", isolation_level="AUTOCOMMIT")
     ed = create_engine(f"{URL}/{DST}", isolation_level="AUTOCOMMIT")
@@ -80,9 +84,9 @@ def preparar(n_filas_extra=0):
     with es.connect() as c:
         for f in FILAS:
             c.execute(text(
-                "INSERT INTO valores (id,t3,t6,tneg,cuerpo,txt,monto,estado) "
-                "VALUES (:a,:b,:c,:d,:e,:f,:g,:h)"),
-                dict(zip("abcdefgh", f)))
+                "INSERT INTO valores (id,t3,t6,tneg,cuerpo,txt,acentos,monto,estado) "
+                "VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i)"),
+                dict(zip("abcdefghi", f)))
         for i in range(n_filas_extra):
             c.execute(text("INSERT INTO valores (id,txt) VALUES (:a,:b)"),
                       {"a": 100+i, "b": f"r{i}"})
@@ -91,12 +95,12 @@ def preparar(n_filas_extra=0):
 def leer(db):
     e = create_engine(f"{URL}/{db}")
     with e.connect() as c:
-        r = c.execute(text("SELECT id,t3,t6,tneg,cuerpo,txt,monto,estado FROM valores ORDER BY id")).fetchall()
+        r = c.execute(text("SELECT id,t3,t6,tneg,cuerpo,txt,acentos,monto,estado FROM valores ORDER BY id")).fetchall()
     e.dispose()
     return [tuple(x) for x in r]
 
 spec = TableCopySpec(table="valores",
-    columns=["id","t3","t6","tneg","cuerpo","txt","monto","estado"],
+    columns=["id","t3","t6","tneg","cuerpo","txt","acentos","monto","estado"],
     primary_key=["id"])
 
 import app.services.db_admin.data_copy as dc

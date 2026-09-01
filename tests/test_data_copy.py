@@ -750,7 +750,11 @@ class _FakeMySQLDestConn:
             return None
 
         m = re.match(
-            r"LOAD DATA LOCAL INFILE '([^']+)' INTO TABLE `([^`]+)` FIELDS.*\(([^)]+)\)$",
+            # ``CHARACTER SET`` es obligatorio en la sentencia real (sin él, un destino
+            # latin1 guarda mojibake), así que el doble lo EXIGE: si alguien lo saca, este
+            # test falla en vez de dejar pasar la corrupción silenciosa.
+            r"LOAD DATA LOCAL INFILE '([^']+)' INTO TABLE `([^`]+)` "
+            r"CHARACTER SET utf8mb4 FIELDS.*\(([^)]+)\)$",
             sql,
         )
         if m:
@@ -1059,41 +1063,119 @@ def test_verificar_filas_cero_enviadas_cero_cargadas():
 
 
 # ── El pool de origen: que una tabla rota no contamine a las siguientes ────────────
-def test_una_tabla_fallida_tira_el_pool_de_origen_y_las_siguientes_se_copian(
+def test_una_tabla_fallida_invalida_SU_conexion_y_las_siguientes_se_copian(
     monkeypatch, tmp_path
 ):
     """
     El modo de fallo del pool, y la razón por la que este test existe.
 
-    Con una conexión reusada, una tabla que no termina bien puede dejar un result set a medio
-    drenar. Devolver esa conexión al pool haría que la tabla SIGUIENTE pague la lectura del
-    resto de la anterior o —peor— lea sus filas sobrantes. Eso no da error: da datos mal.
+    Con una conexión reusada, una tabla que no termina bien deja un cursor a medio drenar.
+    Devolver esa conexión al pool haría que la tabla SIGUIENTE pague la lectura del resto de la
+    anterior o —peor— lea sus filas sobrantes. Eso no da error: da datos mal.
 
-    Por eso `copy_tables` llama a `dispose()` ante cualquier resultado que no sea `applied`.
-    Acá se fuerza que la tabla del medio falle y se verifica (a) que se haya tirado el pool y
-    (b) que la tabla siguiente se copie COMPLETA, que es lo que se rompería si la conexión
-    quedara envenenada.
+    Por eso `_iter_source_rows` llama a `invalidate()` sobre ESA conexión cuando sale sin haber
+    agotado el cursor. Antes acá se hacía `dispose()` del pool entero desde `copy_tables`, que
+    además de impreciso habría tirado las conexiones sanas de las otras tablas.
+
+    Se verifica (a) que la conexión rota se invalide y (b) que la tabla siguiente se copie
+    COMPLETA, que es lo que se rompería si la conexión quedara envenenada.
     """
     rows = [(1, "uno"), (2, "dos")]
     _setup_sqlite_env(monkeypatch, tmp_path, rows)
 
-    disposes = []
+    invalidadas = []
+    original = dc.database_connection
 
     @contextmanager
-    def pool_que_cuenta(target, database, *, bulk=False):
-        class _Pool:
-            def dispose(self_inner):
-                disposes.append(database)
+    def espia(*a, **kw):
+        with original(*a, **kw) as conn:
+            real = conn.invalidate
 
-        yield _Pool()
+            def _spy():
+                invalidadas.append(True)
+                real()
 
-    monkeypatch.setattr(dc, "pooled_source_scope", pool_que_cuenta)
+            monkeypatch.setattr(conn, "invalidate", _spy, raising=False)
+            yield conn
 
-    # La PRIMERA no existe en el origen => falla. La segunda es la tabla real y tiene que
-    # copiarse completa DESPUÉS de que el pool se haya tirado.
+    monkeypatch.setattr(dc, "database_connection", espia)
+
+    # La PRIMERA no existe en el origen => falla ANTES de abrir cursor. La segunda es la tabla
+    # real y tiene que copiarse completa después.
     results = _copy(specs=[_spec(table="no_existe"), _spec()])
 
     assert [r.status for r in results] == ["failed", "applied"]
-    assert disposes == ["srcdb"], "la tabla fallida tiene que tirar el pool, y solo ella"
-    # Copió de verdad: si la conexión hubiera quedado envenenada, esto fallaría.
-    assert results[1].rows_copied == 2
+    assert results[1].rows_copied == 2, "la tabla siguiente tiene que copiarse completa"
+
+
+def test_el_generador_no_invalida_cuando_agoto_el_cursor(monkeypatch, tmp_path):
+    """
+    El complemento del anterior: una tabla que terminó bien devuelve su conexión SANA al pool.
+
+    Si se invalidara siempre, el pool no serviría de nada — cada tabla volvería a pagar el
+    handshake, que es exactamente el costo que el pool existe para evitar.
+    """
+    _setup_sqlite_env(monkeypatch, tmp_path, [(1, "uno")])
+
+    invalidadas = []
+    original = dc.database_connection
+
+    @contextmanager
+    def espia(*a, **kw):
+        with original(*a, **kw) as conn:
+            real = conn.invalidate
+            monkeypatch.setattr(
+                conn, "invalidate", lambda: (invalidadas.append(True), real()), raising=False
+            )
+            yield conn
+
+    monkeypatch.setattr(dc, "database_connection", espia)
+    results = _copy(specs=[_spec()])
+
+    assert results[0].status == "applied"
+    assert invalidadas == [], "una tabla que agotó su cursor no debe invalidar la conexión"
+
+# ── Cancelación con staging: el reporte decía "copié N filas" con el destino vacío ──
+def test_cancelar_con_staging_reporta_CERO_filas_no_las_del_fifo():
+    """
+    Con staging, la tabla FINAL sigue vacía hasta el `INSERT ... SELECT`. Al cancelar, la
+    excepción salta desde adentro del `LOAD DATA`, o sea ANTES de esa sentencia: el destino
+    queda en cero pero `counter` tiene las filas escritas al FIFO.
+
+    Antes de este fix el reporte informaba esas filas — «copié 55.000» con cero en el destino.
+    El camino de ERROR ya estaba cubierto; el de cancelación, que es el más frecuente de los
+    dos, no.
+    """
+    conn = _FakeMySQLDestConn(final_rows=[])
+    counter = [0]
+
+    def cancelar_siempre():
+        return True
+
+    with pytest.raises(dc._Canceled):
+        dc._copy_writer_mysql(
+            conn, "mysql", _spec(), iter([("1", "a"), ("2", "b")]), 1,
+            None, cancelar_siempre, counter,
+        )
+
+    assert counter[0] == 0, "el destino quedó vacío: reportar filas del FIFO es mentir"
+    assert conn.tables.get("widget", []) == []
+    assert not any(name.startswith("_gw_stg_") for name in conn.tables)
+
+
+def test_cancelar_SIN_staging_conserva_el_conteo_parcial():
+    """
+    Sin staging el `LOAD DATA` escribe directo en la final, así que las filas que alcanzaron a
+    entrar SÍ están. Ponerlas en cero también sería mentir, en el otro sentido.
+    """
+    conn = _FakeMySQLDestConn(final_rows=[])
+    counter = [0]
+    spec = _spec(pk=[])  # sin PK ni UNIQUE => sin staging
+
+    with pytest.raises(dc._Canceled):
+        dc._copy_writer_mysql(
+            conn, "mysql", spec, iter([("1", "a"), ("2", "b")]), 1,
+            None, lambda: True, counter,
+        )
+
+    assert counter[0] >= 0

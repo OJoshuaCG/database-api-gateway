@@ -438,11 +438,27 @@ def _iter_source_rows(
         result = src.execution_options(
             stream_results=True, yield_per=batch_rows
         ).execute(text(select_sql))
+        agotado = False
         try:
             for row in result:
                 yield tuple(_adapt_value(row[i]) for i in range(ncols))
+            agotado = True
         finally:
-            result.close()
+            if agotado or not pooled:
+                result.close()
+            else:
+                # Salimos SIN drenar el cursor (cancelación, error del writer, o el consumidor
+                # cortó). Con ``stream_results`` el driver deja filas pendientes en el socket y
+                # ``result.close()`` las LEE Y DESCARTA: sobre una tabla grande es arrastrar
+                # megabytes por la red para nada, y sobre una conexión que vuelve al pool es
+                # peor — si el drenaje sale mal, la próxima tabla lee filas sobrantes de ésta.
+                # No da error: da datos mal.
+                #
+                # ``invalidate()`` tira ESA conexión sin diálogo de protocolo, que es lo que el
+                # ``NullPool`` regalaba al cerrar el socket. Antes esto se hacía con un
+                # ``dispose()`` del pool ENTERO desde ``copy_tables``: impreciso, y con más de
+                # una conexión habría tirado también las sanas de las otras tablas.
+                src.invalidate()
 
 
 # --------------------------------------------------------------------------- #
@@ -524,6 +540,9 @@ def _copy_writer_postgres(
     else:
         load_target = final_q
 
+    # ¿Llegaron las filas a la tabla FINAL? Con staging no basta con que el COPY haya
+    # terminado: hasta el ``INSERT ... SELECT`` la final sigue vacía.
+    volcado_a_final = not use_staging
     try:
         # Cursor psycopg CRUDO (no el de SQLAlchemy): la API COPY es del driver. En
         # AUTOCOMMIT el COPY es su propia transacción y no interfiere con los
@@ -544,11 +563,29 @@ def _copy_writer_postgres(
                         progress_cb(spec.table, n)
 
         if use_staging:
-            dest_conn.exec_driver_sql(
+            resultado = dest_conn.exec_driver_sql(
                 _build_insert_from_staging(dest_engine, spec, staging_name)
+            )
+            volcado_a_final = True
+            # Segundo lugar donde se pueden perder filas. Con ``upsert`` el motor cuenta 2 por
+            # fila actualizada, así que ahí solo se exige "no menos".
+            _verificar_filas_cargadas(
+                spec.table,
+                enviadas=counter[0],
+                cargadas=getattr(resultado, "rowcount", None),
+                etapa="staging->final",
+                solo_minimo=spec.upsert,
             )
         if progress_cb is not None:
             progress_cb(spec.table, counter[0])
+    except BaseException:
+        # Con staging, la tabla FINAL sigue VACÍA hasta que el ``INSERT ... SELECT`` termina.
+        # Si salimos antes —por error del motor o por CANCELACIÓN, que salta desde adentro
+        # del COPY— ``counter`` conserva las filas enviadas, y reportarlas es mentir: el
+        # destino tiene cero.
+        if use_staging and not volcado_a_final:
+            counter[0] = 0
+        raise
     finally:
         if staging_name is not None:
             try:
@@ -688,6 +725,7 @@ def _copy_writer_mysql(
     else:
         load_target = final_q
 
+    volcado_a_final = not use_staging
     try:
         cargadas = _load_data_via_fifo(
             dest_conn=dest_conn,
@@ -703,17 +741,10 @@ def _copy_writer_mysql(
         # El LOAD DATA ya terminó: acá se sabe si el motor se quedó con todas las filas.
         _verificar_filas_cargadas(spec.table, enviadas=counter[0], cargadas=cargadas)
         if use_staging:
-            # Con staging, la tabla FINAL sigue vacía hasta que esta sentencia termine bien.
-            # Si revienta, ``counter`` —que cuenta filas escritas al FIFO— pasa a ser mentira:
-            # el reporte decía "55.000 filas copiadas" con cero filas en el destino. Se pone en
-            # cero ANTES de propagar, que es lo que de verdad quedó.
-            try:
-                resultado = dest_conn.exec_driver_sql(
-                    _build_insert_from_staging(dest_engine, spec, staging_name)
-                )
-            except BaseException:
-                counter[0] = 0
-                raise
+            resultado = dest_conn.exec_driver_sql(
+                _build_insert_from_staging(dest_engine, spec, staging_name)
+            )
+            volcado_a_final = True
             # El viaje staging -> final es el segundo lugar donde se pueden perder filas, y
             # con ``upsert`` el motor cuenta 2 por fila actualizada: solo se exige "no menos".
             _verificar_filas_cargadas(
@@ -725,6 +756,15 @@ def _copy_writer_mysql(
             )
         if progress_cb is not None:
             progress_cb(spec.table, counter[0])
+    except BaseException:
+        # Con staging, la tabla FINAL sigue VACÍA hasta que el ``INSERT ... SELECT`` termina.
+        # Si salimos antes —por error del motor o por CANCELACIÓN, que salta desde adentro del
+        # LOAD DATA— ``counter`` conserva las filas escritas al FIFO, y reportarlas es mentir:
+        # el destino tiene cero. El camino de ERROR ya estaba cubierto; el de CANCELACIÓN no,
+        # y es el más frecuente de los dos.
+        if use_staging and not volcado_a_final:
+            counter[0] = 0
+        raise
     finally:
         if staging_name is not None:
             try:
@@ -808,8 +848,20 @@ def _load_data_via_fifo(
     # El path es controlado por el gateway (uuid), no input de usuario; aun así lo pasamos
     # como literal escapado. El escape/terminadores son explícitos (no confiar en defaults):
     # campo=TAB, escape=backslash, línea=LF; deben coincidir con _render_mysql_field.
+    # ``CHARACTER SET utf8mb4`` NO es decorativo y NO se puede omitir. ``LOAD DATA`` ignora el
+    # charset de la CONEXIÓN (el ``SET NAMES`` de pymysql) e interpreta el archivo con
+    # ``character_set_database``, o sea el default de la BASE destino. ``_render_mysql_field``
+    # siempre emite UTF-8, así que contra una base creada ``latin1`` —y el gateway deja elegir
+    # ``target_charset`` al crearla— el servidor reinterpretaba nuestros bytes y guardaba
+    # mojibake: sin error, sin warning y con los conteos de filas cuadrando, o sea invisible
+    # también para ``_verificar_filas_cargadas``.
+    #
+    # Reproducido contra MySQL 8.0 y MariaDB 11 con destino latin1: 'canción ñandú' quedaba
+    # como 'canciÃ³n Ã±andÃº'. Lo cubre ``scripts/verify_data_writers_e2e.py``, cuyo destino se
+    # crea latin1 a propósito.
     load_sql = (
         f"LOAD DATA LOCAL INFILE '{fifo_path}' INTO TABLE {load_target} "
+        f"CHARACTER SET utf8mb4 "
         f"FIELDS TERMINATED BY '\\t' ESCAPED BY '\\\\' "
         f"LINES TERMINATED BY '\\n' ({cols_q})"
     )
@@ -1053,7 +1105,7 @@ def copy_tables(
     # de la copia por encima de los datos en sí. El ``dispose()` del scope garantiza que no
     # quede una conexión ``sleep`` cuando el clon termina.
     with (
-        pooled_source_scope(source_target, source_db, bulk=True) as source_pool,
+        pooled_source_scope(source_target, source_db, bulk=True),
         database_connection(
             dest_target, dest_db, bulk=True, mysql_local_infile=True
         ) as dest_conn,
@@ -1091,14 +1143,6 @@ def copy_tables(
                 )
                 results.append(res)
 
-                if res.status != "applied":
-                    # La conexión de origen puede haber quedado con un result set a medio
-                    # drenar (cancelación a mitad de tabla, o un error del writer). Devolverla
-                    # al pool haría que la tabla SIGUIENTE pague la lectura del resto de ésta
-                    # —o, peor, lea sus filas sobrantes—, y eso no da error: da datos mal.
-                    # ``dispose()`` tira el socket sin drenarlo, que es exactamente lo que hoy
-                    # regala el NullPool. Se paga un handshake solo en el camino de fallo.
-                    source_pool.dispose()
 
                 if res.status == "canceled":
                     # Cancelado a mitad de esta tabla: marca las RESTANTES como canceladas.
