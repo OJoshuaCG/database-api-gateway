@@ -201,8 +201,23 @@ class CloneBatchController:
             ),
             "error": (job.error if job is not None else item.error),
             "error_code": item.error_code,
-            "started_at": job.started_at if job is not None else item.started_at,
-            "finished_at": job.finished_at if job is not None else item.finished_at,
+            # Los DOS relojes, separados, porque miden cosas distintas y confundirlos ya costó
+            # un diagnóstico equivocado.
+            #
+            # ``started_at``/``finished_at`` son los de la FILA: la fila arranca antes de
+            # ``create_plan`` y termina después de que el job cerró. Antes acá se devolvía el
+            # reloj del JOB en cuanto la fila tenía uno, y el reporte del frontend —que resta
+            # estos dos campos para dibujar «cuánto tardó cada base»— dejaba afuera todo el
+            # trabajo previo al job: el snapshot del origen de ``create_plan``, el de ``preview``
+            # y una consulta de estadísticas por tabla. Eso aparecía como un bloque «sin
+            # atribuir» de ~25 s por base que parecía tiempo de cola y no lo era.
+            #
+            # ``job_*`` son los del job: de cuando el worker lo reclama a cuando cierra. La
+            # diferencia entre ambos pares ES la preparación, y ahora se puede mostrar.
+            "started_at": item.started_at,
+            "finished_at": item.finished_at,
+            "job_started_at": job.started_at if job is not None else None,
+            "job_finished_at": job.finished_at if job is not None else None,
         }
 
     def _counts(self, session, batch_id: int) -> dict[str, int]:

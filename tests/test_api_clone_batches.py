@@ -544,6 +544,48 @@ def test_el_estado_de_la_fila_sale_de_una_sola_fuente(admin_client, monkeypatch)
     assert items[0]["status"] == "succeeded"
 
 
+def test_la_fila_expone_su_reloj_y_el_del_job_por_separado(admin_client, monkeypatch):
+    """
+    Los DOS relojes, y ``started_at`` es el de la FILA.
+
+    Antes el serializer devolvía el reloj del JOB en ``started_at``/``finished_at`` en cuanto la
+    fila tenía uno. El reporte del frontend resta ese par para dibujar «cuánto tardó cada base»,
+    así que todo lo previo al job —el snapshot del origen de ``create_plan``, el de ``preview`` y
+    una consulta de estadísticas por tabla— quedaba fuera de la barra y aparecía como un bloque
+    «sin atribuir» de ~25 s por base que parecía tiempo de cola y no lo era.
+
+    La fila tiene que ENVOLVER al job: arranca antes (``create_plan``) y cierra después.
+    """
+    src, dst = _server(admin_client, 3306), _server(admin_client, 3307)
+    _install(monkeypatch, source_server_id=src, target_server_id=dst, sources=("db_a",))
+    batch = _plan(admin_client, src, dst, [{"source_database_name": "db_a"}]).json()["data"]
+    assert _execute(admin_client, batch, _server_name(admin_client, dst)).status_code == 200
+
+    fila = admin_client.get(f"{BASE}/{batch['id']}/items").json()["data"][0]
+
+    for campo in ("started_at", "finished_at", "job_started_at", "job_finished_at"):
+        assert fila[campo] is not None, f"{campo} tendría que venir en una fila terminada"
+
+    assert fila["started_at"] <= fila["job_started_at"], (
+        "la fila arranca ANTES que su job: si no, se perdió la preparación"
+    )
+    assert fila["job_finished_at"] <= fila["finished_at"], (
+        "la fila cierra DESPUÉS que su job"
+    )
+
+
+def test_una_fila_sin_job_no_reporta_relojes_de_job(admin_client, monkeypatch):
+    """Sin job no hay ``job_started_at``: null es «no arrancó», que no es lo mismo que cero."""
+    src, dst = _server(admin_client, 3306), _server(admin_client, 3307)
+    _install(monkeypatch, source_server_id=src, target_server_id=dst, sources=("db_a",))
+    batch = _plan(admin_client, src, dst, [{"source_database_name": "db_a"}]).json()["data"]
+
+    fila = admin_client.get(f"{BASE}/{batch['id']}/items").json()["data"][0]
+    assert fila["clone_job_id"] is None
+    assert fila["job_started_at"] is None
+    assert fila["job_finished_at"] is None
+
+
 # --------------------------------------------------------------------------- #
 # Cancelación                                                                  #
 # --------------------------------------------------------------------------- #

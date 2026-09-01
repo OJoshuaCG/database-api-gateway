@@ -194,8 +194,22 @@ class CloneBatchItemOut(BaseModel):
             "automáticamente."
         ),
     )
-    started_at: datetime | None = None
+    started_at: datetime | None = Field(
+        None,
+        description=(
+            "Arranque de la FILA, que es antes de que exista el job: incluye la preparación "
+            "(plan y vista previa). Restar este par da la base completa."
+        ),
+    )
     finished_at: datetime | None = None
+    job_started_at: datetime | None = Field(
+        None,
+        description=(
+            "Arranque del JOB: cuando el worker lo reclama. La diferencia contra 'started_at' "
+            "es el costo de la preparación, que no emite ningún paso y por eso no se veía."
+        ),
+    )
+    job_finished_at: datetime | None = None
 
 
 class CloneBatchRetryOut(BaseModel):
