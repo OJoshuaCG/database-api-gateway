@@ -535,3 +535,128 @@ def test_ddl_phases_ask_for_the_bulk_timeout(admin_client, monkeypatch):
     sin_bulk = [c for c in runner.calls if not c["bulk"]]
     assert not sin_bulk, f"{len(sin_bulk)} llamada(s) de DDL con el timeout interactivo de 15 s"
 
+
+# --------------------------------------------------------------------------- #
+# Historial (GET /database-clones) — el endpoint sin el cual un clon queda     #
+# INALCANZABLE: el id solo vivía en la memoria del navegador.                  #
+# --------------------------------------------------------------------------- #
+def _plan(admin_client, sid, tid, source="src_db", target="dst_db"):
+    r = admin_client.post(
+        "/api/v1/database-clones",
+        json={
+            "source_server_id": sid, "source_database_name": source,
+            "target_server_id": tid, "target_database_name": target,
+            "target_mode": "new", "include_data": False,
+        },
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["data"]["id"]
+
+
+def test_history_lists_newest_first(admin_client, monkeypatch):
+    _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+    primero = _plan(admin_client, sid, tid, target="c1")
+    segundo = _plan(admin_client, sid, tid, target="c2")
+
+    r = admin_client.get("/api/v1/database-clones")
+    assert r.status_code == 200, r.text
+    assert [j["id"] for j in r.json()["data"]][:2] == [segundo, primero]
+    assert r.json()["pagination"]["total"] == 2
+
+
+def test_history_exposes_copy_intent_not_only_include_data(admin_client, monkeypatch):
+    """`include_data` no distingue `data_only` de `structure_only`: el historial necesita el real."""
+    _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+    _plan(admin_client, sid, tid)
+    fila = admin_client.get("/api/v1/database-clones").json()["data"][0]
+    assert fila["copy_intent"] == "structure_only"
+    assert fila["include_data"] is False
+
+
+def test_history_filters_by_status(admin_client, monkeypatch):
+    _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+    _plan(admin_client, sid, tid)
+    assert len(admin_client.get("/api/v1/database-clones?status=pending").json()["data"]) == 1
+    assert admin_client.get("/api/v1/database-clones?status=succeeded").json()["data"] == []
+
+
+def test_history_search_matches_either_side(admin_client, monkeypatch):
+    """Un solo campo de búsqueda: el operador no sabe de qué lado estaba el nombre que recuerda."""
+    _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+    _plan(admin_client, sid, tid, target="ventas_copia")
+
+    por_destino = admin_client.get("/api/v1/database-clones?search=ventas").json()["data"]
+    por_origen = admin_client.get("/api/v1/database-clones?search=src").json()["data"]
+    assert len(por_destino) == 1 and len(por_origen) == 1
+    assert admin_client.get("/api/v1/database-clones?search=nada").json()["data"] == []
+
+
+def test_history_duration_is_null_until_finished_and_set_after(admin_client, monkeypatch):
+    _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+    oid = _owner(admin_client, sid)
+    _managed(admin_client, sid, oid, "src_db")
+    job_id = _plan(admin_client, sid, tid)
+
+    sin_ejecutar = admin_client.get("/api/v1/database-clones").json()["data"][0]
+    assert sin_ejecutar["duration_ms"] is None
+
+    _preview_and_execute(admin_client, job_id)
+    ejecutado = admin_client.get("/api/v1/database-clones").json()["data"][0]
+    assert ejecutado["status"] == "succeeded"
+    assert isinstance(ejecutado["duration_ms"], int) and ejecutado["duration_ms"] >= 0
+
+
+def test_history_reports_batch_membership(admin_client, monkeypatch):
+    """
+    `batch_id`/`batch_seq` salen de un LEFT JOIN contra `clone_batch_items`, porque la
+    relación vive de ese lado. Sin ese dato, los N hijos de un lote son N filas
+    indistinguibles de clones sueltos y entierran el historial.
+    """
+    from app.controllers.clone_batch_controller import CloneBatchController
+    from app.models.clone_batch import CloneBatchItem
+
+    _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+    job_id = _plan(admin_client, sid, tid)
+
+    # Se ata el job a un lote a mano: acá se prueba el JOIN del listado, no el recorrido.
+    controller = CloneBatchController()
+    session = controller._session()
+    try:
+        from datetime import datetime, timedelta, timezone
+        from app.models.clone_batch import CloneBatch
+
+        batch = CloneBatch(
+            source_server_id=sid, target_server_id=tid, copy_intent="structure_only",
+            total=1, expires_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            + timedelta(hours=1),
+        )
+        session.add(batch)
+        session.flush()
+        session.add(CloneBatchItem(
+            batch_id=batch.id, seq=3, source_database_name="src_db",
+            target_database_name="dst_db", target_mode="new", clone_job_id=job_id,
+        ))
+        session.commit()
+        batch_id = batch.id
+    finally:
+        session.close()
+
+    fila = admin_client.get("/api/v1/database-clones").json()["data"][0]
+    assert fila["batch_id"] == batch_id and fila["batch_seq"] == 3
+
+    # Y se pueden excluir, que es el default de la UI.
+    solo_sueltos = admin_client.get(
+        "/api/v1/database-clones?include_batch_children=false"
+    ).json()["data"]
+    assert solo_sueltos == []
+    solo_del_lote = admin_client.get(
+        f"/api/v1/database-clones?batch_id={batch_id}"
+    ).json()["data"]
+    assert [j["id"] for j in solo_del_lote] == [job_id]
+

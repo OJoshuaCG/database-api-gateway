@@ -2,6 +2,7 @@
 Endpoints de clonación de bases de datos entre servidores.
 
 - POST /database-clones                       — crea un PLAN (snapshotea el origen, persiste).
+- GET  /database-clones                       — HISTORIAL paginado (el punto de reentrada).
 - GET  /database-clones/{id}                  — resumen + estado del job (polling).
 - GET  /database-clones/{id}/objects          — inventario del origen + portabilidad + grafo.
 - POST /database-clones/{id}/resolve-selection — cierre de dependencias (auto-select de la UI).
@@ -14,6 +15,8 @@ Todo detrás de ``AdminDep``. Crear toca el motor (snapshot del origen) → 10/m
 execute es la operación más sensible → 3/min. El resto es solo lectura.
 """
 
+from typing import Annotated
+
 from fastapi import APIRouter, Query, Request
 
 from app.controllers.clone_controller import CloneController
@@ -25,6 +28,7 @@ from app.schemas.clone import (
     CloneExecuteIn,
     CloneInventoryOut,
     CloneItemOut,
+    CloneListItemOut,
     ClonePreviewIn,
     ClonePreviewOut,
     CloneResolveSelectionIn,
@@ -41,6 +45,49 @@ router = APIRouter(prefix="/database-clones", tags=["Database Clones"])
 def create_clone_plan(request: Request, admin: AdminDep, payload: CloneCreate):
     result = CloneController().create_plan(payload.model_dump(), admin=admin)
     return success(data=result, message="Plan de clonación creado.")
+
+
+@router.get("", response_model=ApiResponse[list[CloneListItemOut]])
+def list_clones(
+    admin: AdminDep,
+    pagination: PaginationDep,
+    status: Annotated[list[str] | None, Query(description="Filtro por estado, repetible.")] = None,
+    source_server_id: Annotated[int | None, Query(ge=1)] = None,
+    target_server_id: Annotated[int | None, Query(ge=1)] = None,
+    search: Annotated[
+        str | None,
+        Query(max_length=64, description="Coincidencia parcial sobre los DOS nombres de base."),
+    ] = None,
+    batch_id: Annotated[int | None, Query(ge=1)] = None,
+    include_batch_children: Annotated[
+        bool, Query(description="False = solo clones sueltos, sin los hijos de un lote.")
+    ] = True,
+    order_by: Annotated[str, Query(pattern="^(created_at|duration_ms)$")] = "created_at",
+    order: Annotated[str, Query(pattern="^(asc|desc)$")] = "desc",
+):
+    """
+    Historial de clonaciones, del más nuevo al más viejo.
+
+    **Sin este endpoint un clon quedaba INALCANZABLE**: el id del job solo vivía en la
+    memoria del navegador, así que perderlo era perder el acceso a la operación — la fila y
+    sus ítems seguían en la BD, sin ningún camino hacia ellos.
+
+    Sin rate limit a propósito: es lectura de la BD del gateway (no toca ningún motor
+    remoto) y el historial se auto-refresca mientras haya operaciones en curso.
+    """
+    items, total = CloneController().list_clones(
+        offset=pagination.offset,
+        limit=pagination.size,
+        statuses=status,
+        source_server_id=source_server_id,
+        target_server_id=target_server_id,
+        search=search,
+        batch_id=batch_id,
+        include_batch_children=include_batch_children,
+        order_by=order_by,
+        order=order,
+    )
+    return paginated(items, total=total, pagination=pagination)
 
 
 @router.get("/{job_id}", response_model=ApiResponse[CloneSummaryOut])

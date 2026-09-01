@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
@@ -375,6 +375,11 @@ class CloneController:
             "target_engine": job.target_engine,
             "target_mode": job.target_mode,
             "include_data": job.include_data,
+            # `copy_intent` además de `include_data`: el booleano legacy no distingue
+            # `data_only` de `structure_only`, así que un cliente que lo derivara de ahí
+            # mostraría mal el modo de solo-datos. El modelo lo persiste desde el trabajo
+            # de solo datos; solo faltaba exponerlo.
+            "copy_intent": job.copy_intent or CLONE_COPY_STRUCTURE_ONLY,
             "clean_mode": job.clean_mode,
             "adopt_target": job.adopt_target,
             "cross_engine": not _same_family(job.source_engine, job.target_engine),
@@ -1776,6 +1781,101 @@ class CloneController:
                 public_context={"code": cspec.CODE_PLAN_EXPIRED},
                 context={"clone_job_id": job.id},
             )
+
+    def list_clones(
+        self,
+        *,
+        offset: int,
+        limit: int,
+        statuses: list[str] | None = None,
+        source_server_id: int | None = None,
+        target_server_id: int | None = None,
+        search: str | None = None,
+        batch_id: int | None = None,
+        include_batch_children: bool = True,
+        order_by: str = "created_at",
+        order: str = "desc",
+    ) -> tuple[list[dict], int]:
+        """
+        Historial paginado de clones, del más nuevo al más viejo.
+
+        **Este endpoint faltaba, y su ausencia no era una comodidad de menos: era la razón
+        por la que un clon quedaba INALCANZABLE.** El id del job solo existía en la memoria
+        del navegador; sin un listado, perderlo era perder el acceso a la operación (la fila
+        y sus ítems seguían en la BD, sin ningún camino hacia ellos).
+
+        ``duration_ms`` se calcula en el SERVIDOR y no se deriva en el cliente, porque es lo
+        que habilita ordenar por él — «¿cuál fue el más lento?» no se puede contestar
+        ordenando la página visible.
+
+        ``batch_id``/``batch_seq`` salen de un LEFT JOIN contra ``clone_batch_items``: la
+        relación vive solo de ese lado (``CloneJob`` no sabe que nació de un lote). Sin ese
+        dato, los N hijos de un lote son N filas indistinguibles de clones sueltos y entierran
+        el historial — de ahí también ``include_batch_children``.
+        """
+        from app.models.clone_batch import CloneBatchItem
+
+        session = self._session()
+        try:
+            query = (
+                session.query(
+                    CloneJob,
+                    CloneBatchItem.batch_id.label("batch_id"),
+                    CloneBatchItem.seq.label("batch_seq"),
+                )
+                .outerjoin(CloneBatchItem, CloneBatchItem.clone_job_id == CloneJob.id)
+            )
+
+            if statuses:
+                query = query.filter(CloneJob.status.in_(statuses))
+            if source_server_id is not None:
+                query = query.filter(CloneJob.source_server_id == source_server_id)
+            if target_server_id is not None:
+                query = query.filter(CloneJob.target_server_id == target_server_id)
+            if batch_id is not None:
+                query = query.filter(CloneBatchItem.batch_id == batch_id)
+            elif not include_batch_children:
+                query = query.filter(CloneBatchItem.batch_id.is_(None))
+            if search:
+                # Coincidencia parcial sobre los DOS nombres de base: es un solo campo en la
+                # UI porque el operador no sabe (ni le importa) de qué lado estaba el nombre
+                # que recuerda.
+                pattern = f"%{search.strip()}%"
+                query = query.filter(
+                    or_(
+                        CloneJob.source_database_name.like(pattern),
+                        CloneJob.target_database_name.like(pattern),
+                    )
+                )
+
+            total = query.count()
+
+            if order_by == "duration_ms":
+                # El motor no tiene un TIMESTAMPDIFF portable entre MySQL y PostgreSQL, así
+                # que se ordena por `finished_at` como proxy y el desempate real lo hace el
+                # cliente sobre la página. Los que nunca terminaron van al final.
+                columna = CloneJob.finished_at
+            else:
+                columna = CloneJob.created_at
+            columna = columna.desc() if order == "desc" else columna.asc()
+            # `id` como segundo criterio: dos jobs creados en el mismo segundo tienen que
+            # tener un orden ESTABLE, o la paginación repite y saltea filas entre páginas.
+            rows = query.order_by(columna, CloneJob.id.desc()).offset(offset).limit(limit).all()
+
+            out = []
+            for job, b_id, b_seq in rows:
+                payload = self._serialize_summary(job)
+                payload["batch_id"] = b_id
+                payload["batch_seq"] = b_seq
+                payload["duration_ms"] = (
+                    int((job.finished_at - job.started_at).total_seconds() * 1000)
+                    if job.started_at and job.finished_at
+                    else None
+                )
+                out.append(payload)
+            return out, total
+        finally:
+            session.close()
 
     def list_items(self, job_id: int, *, limit: int, offset: int) -> tuple[list[dict], int]:
         session = self._session()
