@@ -14,7 +14,7 @@ Convención de estilo: funciones pytest planas, sin clases (igual que test_schem
 import os
 import re
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -524,6 +524,47 @@ def test_render_mysql_field_bytes_raw_passthrough_when_no_special_chars():
 def test_render_mysql_field_bytearray_and_memoryview_escaped():
     assert _render_mysql_field(bytearray(b"a\tb")) == b"a\\tb"
     assert _render_mysql_field(memoryview(b"a\nb")) == b"a\\nb"
+
+
+# ── TIME (timedelta): el defecto que el camino bulk tenía y el legacy no ──────────
+# El TIME de MySQL/MariaDB llega al driver como ``timedelta``. Con ``str()`` sale
+# "1 day, 2:00:00" / "-1 day, 23:00:00", que NO son literales TIME válidos — y como la fase
+# de datos relaja STRICT_TRANS_TABLES a propósito, el motor los coercionaba EN SILENCIO y la
+# tabla se reportaba `applied`. El camino legacy nunca lo tuvo (pymysql trae
+# ``escape_timedelta``), así que esto era además una divergencia entre los dos writers.
+
+
+def test_render_mysql_field_time_under_24h():
+    assert _render_mysql_field(timedelta(hours=2)) == b"02:00:00"
+    assert _render_mysql_field(timedelta(hours=1, minutes=2, seconds=3)) == b"01:02:03"
+
+
+def test_render_mysql_field_time_over_24h_does_not_say_day():
+    # str(timedelta(days=1, hours=2)) == "1 day, 2:00:00" — inválido como literal TIME.
+    assert _render_mysql_field(timedelta(days=1, hours=2)) == b"26:00:00"
+
+
+def test_render_mysql_field_time_negative_keeps_sign():
+    # str(timedelta(hours=-1)) == "-1 day, 23:00:00": el signo se perdía y el valor cambiaba.
+    assert _render_mysql_field(timedelta(hours=-1)) == b"-01:00:00"
+
+
+def test_render_mysql_field_time_does_not_normalize_to_24h():
+    # 838:00:00 es el máximo LEGAL del tipo TIME: no se puede normalizar a días.
+    assert _render_mysql_field(timedelta(hours=838)) == b"838:00:00"
+
+
+def test_render_mysql_field_time_zero():
+    assert _render_mysql_field(timedelta(0)) == b"00:00:00"
+
+
+def test_render_mysql_field_time_never_needs_escaping():
+    # El formato es [-]HH:MM:SS — solo dígitos, dos puntos y un signo. Ninguno de los cuatro
+    # caracteres que LOAD DATA escapa puede aparecer, así que el valor sale tal cual.
+    for value in (timedelta(hours=5), timedelta(hours=-5), timedelta(hours=900)):
+        rendered = _render_mysql_field(value)
+        assert b"\\" not in rendered
+        assert rendered == rendered.replace(b"\\", b"")
 
 
 def test_escape_mysql_field_order_backslash_before_tab():

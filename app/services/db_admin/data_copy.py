@@ -41,6 +41,7 @@ import tempfile
 import threading
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Callable, Iterator
 
 import pymysql.connections as _pymysql_conn
@@ -54,6 +55,7 @@ from app.core.logger import get_logger
 from app.core.remote_engine import ServerTarget, database_connection
 from app.exceptions import AppHttpException
 from app.services.db_admin.identifiers import quote_identifier, validate_identifier
+from app.services.db_admin.value_json import format_timedelta
 
 logger = get_logger(__name__)
 
@@ -560,6 +562,17 @@ def _render_mysql_field(value) -> bytes:
         return b"1" if value else b"0"
     if isinstance(value, str):
         return _escape_mysql_field(value.encode("utf-8"))
+    if isinstance(value, timedelta):
+        # El TIME de MySQL/MariaDB llega al driver como ``timedelta``, y ``str()`` lo rendea
+        # como ``1 day, 2:00:00`` (o ``-1 day, 22:00:00`` para un TIME negativo): NO es un
+        # literal TIME válido. Y como la fase de datos relaja STRICT_TRANS_TABLES a
+        # propósito, el motor lo coercionaba EN SILENCIO y la tabla se reportaba `applied`.
+        #
+        # Se usa el criterio ÚNICO del proyecto (``value_json.format_timedelta``), que además
+        # no normaliza las horas a 24 porque ``838:00:00`` es un valor legal del tipo. El
+        # camino legacy no tenía el defecto (pymysql trae ``escape_timedelta``), así que esto
+        # cierra una divergencia entre los dos writers, no solo un bug de formato.
+        return format_timedelta(value).encode("ascii")
     # int/float/Decimal/datetime/date/time y demás escalares: repr textual canónico.
     return _escape_mysql_field(str(value).encode("utf-8"))
 
