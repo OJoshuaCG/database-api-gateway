@@ -53,7 +53,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.core.context import current_http_identifier
 from app.core.environments import CLONE_BULK_COPY_ENABLED
 from app.core.logger import get_logger
-from app.core.remote_engine import ServerTarget, database_connection
+from app.core.remote_engine import (
+    ServerTarget,
+    database_connection,
+    pooled_source_scope,
+)
 from app.exceptions import AppHttpException
 from app.services.db_admin.identifiers import quote_identifier, validate_identifier
 
@@ -408,6 +412,7 @@ def _iter_source_rows(
     select_sql: str,
     ncols: int,
     batch_rows: int,
+    pooled: bool = False,
 ) -> Iterator[tuple]:
     """
     Generador: rinde TUPLAS de valores ya adaptados (``_adapt_value``) desde el ORIGEN en
@@ -424,7 +429,11 @@ def _iter_source_rows(
     hilo que lo itera. ``close()`` es idempotente (un segundo ``close()`` no toca la
     conexión).
     """
-    with database_connection(source_target, source_db, bulk=True) as src:
+    # ``pooled=True`` (fase de datos del clon): hace checkout de la conexión que
+    # ``pooled_source_scope`` mantiene viva, en vez de discar de cero por tabla. El ``with``
+    # sigue siendo por tabla y en ESTE hilo: no cambia la propiedad de la conexión ni el
+    # momento en que se devuelve, solo deja de pagar el handshake 103 veces.
+    with database_connection(source_target, source_db, bulk=True, pooled=pooled) as src:
         _set_read_committed(src, source_engine)
         result = src.execution_options(
             stream_results=True, yield_per=batch_rows
@@ -899,6 +908,7 @@ def _copy_one_table(
     batch_rows: int,
     progress_cb: Callable[[str, int], None] | None,
     cancel_cb: Callable[[], bool] | None,
+    pooled_source: bool = False,
 ) -> TableCopyResult:
     table = spec.table
     try:
@@ -925,6 +935,7 @@ def _copy_one_table(
         select_sql=select_sql,
         ncols=len(spec.columns),
         batch_rows=batch_rows,
+        pooled=pooled_source,
     )
     try:
         writer(
@@ -1036,9 +1047,17 @@ def copy_tables(
     # INFILE. La de LECTURA del origen (``_iter_source_rows``) queda sin el flag para no ampliar
     # la superficie del ataque "rogue server" a los SELECT del origen (B1). En PostgreSQL el
     # flag es inerte (``_connect_args`` solo lo aplica en la rama mysql/mariadb).
-    with database_connection(
-        dest_target, dest_db, bulk=True, mysql_local_infile=True
-    ) as dest_conn:
+    # UNA conexión de ORIGEN para toda la fase, vía pool acotado a este bloque. Antes se abría
+    # una por tabla: con 103 tablas eso eran 103 handshakes completos —DNS sin caché incluido—
+    # contra la base de producción de un tercero, y el costo fijo por tabla dominaba el tiempo
+    # de la copia por encima de los datos en sí. El ``dispose()` del scope garantiza que no
+    # quede una conexión ``sleep`` cuando el clon termina.
+    with (
+        pooled_source_scope(source_target, source_db, bulk=True) as source_pool,
+        database_connection(
+            dest_target, dest_db, bulk=True, mysql_local_infile=True
+        ) as dest_conn,
+    ):
         dest_conn = dest_conn.execution_options(isolation_level="AUTOCOMMIT")
         # El writer se resuelve UNA vez por job (el probe de local_infile es a nivel de
         # conexión, no por tabla) y se pasa hacia abajo ya resuelto.
@@ -1068,8 +1087,18 @@ def copy_tables(
                     batch_rows=batch_rows,
                     progress_cb=progress_cb,
                     cancel_cb=cancel_cb,
+                    pooled_source=True,
                 )
                 results.append(res)
+
+                if res.status != "applied":
+                    # La conexión de origen puede haber quedado con un result set a medio
+                    # drenar (cancelación a mitad de tabla, o un error del writer). Devolverla
+                    # al pool haría que la tabla SIGUIENTE pague la lectura del resto de ésta
+                    # —o, peor, lea sus filas sobrantes—, y eso no da error: da datos mal.
+                    # ``dispose()`` tira el socket sin drenarlo, que es exactamente lo que hoy
+                    # regala el NullPool. Se paga un handshake solo en el camino de fallo.
+                    source_pool.dispose()
 
                 if res.status == "canceled":
                     # Cancelado a mitad de esta tabla: marca las RESTANTES como canceladas.

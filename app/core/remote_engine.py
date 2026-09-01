@@ -218,6 +218,7 @@ def _build_engine(
     bulk: bool = False,
     mysql_local_infile: bool = False,
     statement_timeout_ms: int | None = None,
+    pooled: bool = False,
 ) -> Engine:
     driver = _require_driver(target.dialect)
     url = URL.create(
@@ -228,9 +229,23 @@ def _build_engine(
         port=target.port,
         database=effective_db,
     )
+    # ``pooled`` es la EXCEPCIÓN acotada al NullPool de todo el módulo: mantiene UNA conexión
+    # viva mientras dura un bloque explícito. Existe para la fase de datos del clon, que abría
+    # una conexión nueva POR TABLA —handshake, DNS y todo— y pagaba eso 103 veces para copiar
+    # una base de 17 MB. Ver ``pooled_source_scope``, que es el único que debería encenderlo:
+    # fuera de un bloque con dispose garantizado, esto deja conexiones ``sleep`` en la BD de un
+    # tercero, que es justo lo que el NullPool evita.
+    #
+    # ``max_overflow=0`` para que sea exactamente UNA: si algún camino intentara usar dos a la
+    # vez, preferimos que espere (y se note) antes que multiplicar conexiones en silencio.
+    pool_kwargs: dict = (
+        {"pool_size": 1, "max_overflow": 0, "pool_pre_ping": True}
+        if pooled
+        else {"poolclass": NullPool}
+    )
     return create_engine(
         url,
-        poolclass=NullPool,
+        **pool_kwargs,
         connect_args=_connect_args(
             target.dialect,
             target.ssl_mode,
@@ -248,6 +263,7 @@ def get_engine(
     bulk: bool = False,
     mysql_local_infile: bool = False,
     statement_timeout_ms: int | None = None,
+    pooled: bool = False,
 ) -> Engine:
     """
     Devuelve un engine cacheado por (server_id, usuario, BD efectiva, bulk,
@@ -269,6 +285,9 @@ def get_engine(
         bulk,
         mysql_local_infile,
         timeout,
+        # ``pooled`` entra en la clave por la misma razón que los otros dos: un engine que
+        # sostiene una conexión viva NO puede reusarse donde se pidió una descartable.
+        pooled,
     )
     with _lock:
         engine = _engines.get(key)
@@ -279,6 +298,7 @@ def get_engine(
                 bulk=bulk,
                 mysql_local_infile=mysql_local_infile,
                 statement_timeout_ms=timeout if statement_timeout_ms is not None else None,
+                pooled=pooled,
             )
             # Desalojo FIFO al llegar al techo (ver ``_MAX_ENGINES``).
             while len(_engines) >= _MAX_ENGINES:
@@ -319,6 +339,7 @@ def database_connection(
     bulk: bool = False,
     mysql_local_infile: bool = False,
     statement_timeout_ms: int | None = None,
+    pooled: bool = False,
 ):
     """Conexión a una BD CONCRETA (introspección/migraciones). Revalida el host (anti-SSRF, R2).
     ``bulk=True`` usa timeouts de volcado masivo (copia de datos del clon).
@@ -332,12 +353,54 @@ def database_connection(
         bulk=bulk,
         mysql_local_infile=mysql_local_infile,
         statement_timeout_ms=statement_timeout_ms,
+        pooled=pooled,
     )
     conn = engine.connect()
     try:
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def pooled_source_scope(
+    target: ServerTarget, database: str, *, bulk: bool = False
+):
+    """
+    Mantiene UNA conexión viva a ``database`` mientras dura el bloque, y la tira al salir.
+
+    Es la única forma legítima de encender ``pooled``. Dentro del bloque, cada
+    ``database_connection(..., pooled=True)`` hace *checkout* de esa conexión en vez de discar:
+    desaparecen el ``getaddrinfo`` sin caché, el handshake TCP, la autenticación y los dos
+    ``SET NAMES`` que pymysql y SQLAlchemy mandan cada uno por su lado.
+
+    **Por qué un pool y no una conexión compartida a mano.** Compartir el objeto ``Connection``
+    entre tablas obligaba a cruzar una frontera de hilos con un ``SSCursor`` a medio drenar:
+    pymysql, ante un result set incompleto, drena lo que quedó antes de la próxima sentencia, y
+    si eso sale mal la tabla siguiente lee filas sobrantes de la anterior. No da error: da datos
+    mal. Con el pool, cada tabla sigue haciendo su ``with database_connection(...)``, abierto y
+    cerrado en el mismo hilo, con la misma contención de fallos que hoy.
+
+    **Y preserva los metadata locks.** El ``rollback`` que SQLAlchemy emite al devolver la
+    conexión al pool cierra la transacción de cada tabla, así que NO sostenemos MDL compartido
+    sobre todas las tablas durante la fase entera. Sin eso, cualquier ``ALTER TABLE`` en la base
+    de producción del cliente quedaría bloqueado detrás nuestro — un incidente en la base de un
+    tercero causado por una optimización nuestra.
+
+    El ``dispose()`` del ``finally`` es la condición que hace aceptable la excepción al
+    NullPool: la conexión vive lo que dura el clon, no queda ``sleep`` en el servidor ajeno.
+    """
+    engine = get_engine(target, database, bulk=bulk, pooled=True)
+    try:
+        yield engine
+    finally:
+        # El engine queda en el caché (es reusable y volverá a conectar cuando haga falta),
+        # pero sin conexiones vivas. Nunca dejar esto en un ``except``: si el bloque revienta,
+        # tirar la conexión es MÁS importante, no menos.
+        try:
+            engine.dispose()
+        except Exception:  # noqa: BLE001 — tirar una conexión nunca rompe la operación
+            pass
 
 
 def invalidate_server(server_id: int) -> None:

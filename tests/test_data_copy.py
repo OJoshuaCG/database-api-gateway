@@ -230,15 +230,27 @@ def _setup_sqlite_env(monkeypatch, tmp_path, source_rows, *, create_dest_rows=No
 
     engines = {"srcdb": src_engine, "dstdb": dst_engine}
 
+    # La firma del doble sigue a la REAL, ``pooled`` incluido: un doble que acepte menos
+    # parámetros que la función que reemplaza convierte un cambio de firma en un fallo de test
+    # que apunta al lugar equivocado.
     @contextmanager
-    def fake_conn(target, database, *, bulk=False, mysql_local_infile=False):
+    def fake_conn(
+        target, database, *, bulk=False, mysql_local_infile=False, pooled=False
+    ):
         conn = engines[database].connect()
         try:
             yield conn
         finally:
             conn.close()
 
+    @contextmanager
+    def fake_pool(target, database, *, bulk=False):
+        # No hay pool que sostener sobre SQLite; lo que importa del scope es que exista un
+        # objeto con ``dispose()`` para el camino de fallo.
+        yield engines[database]
+
     monkeypatch.setattr(dc, "database_connection", fake_conn)
+    monkeypatch.setattr(dc, "pooled_source_scope", fake_pool)
     return engines
 
 
@@ -1044,3 +1056,44 @@ def test_verificar_filas_sin_rowcount_no_falla():
 def test_verificar_filas_cero_enviadas_cero_cargadas():
     """Una tabla vacía es un caso legítimo, no un faltante."""
     _verificar_filas_cargadas("t", enviadas=0, cargadas=0)
+
+
+# ── El pool de origen: que una tabla rota no contamine a las siguientes ────────────
+def test_una_tabla_fallida_tira_el_pool_de_origen_y_las_siguientes_se_copian(
+    monkeypatch, tmp_path
+):
+    """
+    El modo de fallo del pool, y la razón por la que este test existe.
+
+    Con una conexión reusada, una tabla que no termina bien puede dejar un result set a medio
+    drenar. Devolver esa conexión al pool haría que la tabla SIGUIENTE pague la lectura del
+    resto de la anterior o —peor— lea sus filas sobrantes. Eso no da error: da datos mal.
+
+    Por eso `copy_tables` llama a `dispose()` ante cualquier resultado que no sea `applied`.
+    Acá se fuerza que la tabla del medio falle y se verifica (a) que se haya tirado el pool y
+    (b) que la tabla siguiente se copie COMPLETA, que es lo que se rompería si la conexión
+    quedara envenenada.
+    """
+    rows = [(1, "uno"), (2, "dos")]
+    _setup_sqlite_env(monkeypatch, tmp_path, rows)
+
+    disposes = []
+
+    @contextmanager
+    def pool_que_cuenta(target, database, *, bulk=False):
+        class _Pool:
+            def dispose(self_inner):
+                disposes.append(database)
+
+        yield _Pool()
+
+    monkeypatch.setattr(dc, "pooled_source_scope", pool_que_cuenta)
+
+    # La PRIMERA no existe en el origen => falla. La segunda es la tabla real y tiene que
+    # copiarse completa DESPUÉS de que el pool se haya tirado.
+    results = _copy(specs=[_spec(table="no_existe"), _spec()])
+
+    assert [r.status for r in results] == ["failed", "applied"]
+    assert disposes == ["srcdb"], "la tabla fallida tiene que tirar el pool, y solo ella"
+    # Copió de verdad: si la conexión hubiera quedado envenenada, esto fallaría.
+    assert results[1].rows_copied == 2
