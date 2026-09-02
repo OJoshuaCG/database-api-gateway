@@ -359,3 +359,73 @@ def test_provision_failure_writes_error_audit(admin_client, monkeypatch):
         assert rows and all(rw.touched_engine for rw in rows)
     finally:
         s.close()
+
+
+# ── `model_version` en el alta: se rechaza, y por qué ─────────────────────────────
+def test_el_alta_rechaza_model_version(admin_client):
+    """
+    Declararla escribía la caché del inventario SIN tocar el motor: la base quedaba vacía
+    diciendo estar en la versión N. Y esa caché no es decorativa — `_policy_flags` la lee para
+    decidir si una versión del blueprint es borrable, así que declararla congelaba esa versión
+    como `in_use` sin que ninguna base la tuviera aplicada.
+
+    Se rechaza en vez de ignorarse: quien la mandaba creía estar fijando el estado inicial, y
+    tragárselo en silencio lo dejaría creyendo lo mismo.
+    """
+    sid = _server(admin_client, 5480)
+    oid = _owner(admin_client, sid, "own_mv")
+    r = admin_client.post(
+        "/api/v1/managed-databases",
+        json={"server_id": sid, "owner_id": oid, "name": "mv_db", "model_version": "0003"},
+    )
+    assert r.status_code == 422, r.text
+    detalle = r.json()["detail"]
+    assert detalle["public_context"]["code"] == "managed_database.model_version_not_writable"
+    # El mensaje tiene que nombrar los DOS reemplazos, o el operador no sabe adónde ir.
+    assert "apply_migrations" in detalle["msg"]
+    assert "adopt" in detalle["msg"]
+
+
+def test_apply_migrations_exige_provision_y_blueprint(admin_client):
+    """No se puede migrar lo que no existe en el motor, ni sin un blueprint de dónde sacarlas."""
+    sid = _server(admin_client, 5481)
+    oid = _owner(admin_client, sid, "own_am")
+    # Sin provision: la BD no existiría en el motor.
+    r = admin_client.post(
+        "/api/v1/managed-databases",
+        json={"server_id": sid, "owner_id": oid, "name": "am_db", "apply_migrations": True},
+    )
+    assert r.status_code == 422, r.text
+    assert (
+        r.json()["detail"]["public_context"]["code"]
+        == "managed_database.apply_requires_provision"
+    )
+
+
+def test_target_version_sin_apply_migrations_es_422(admin_client):
+    """Pedir una versión objetivo sin pedir migrar es una contradicción, no un default."""
+    sid = _server(admin_client, 5482)
+    oid = _owner(admin_client, sid, "own_tv")
+    r = admin_client.post(
+        "/api/v1/managed-databases",
+        json={"server_id": sid, "owner_id": oid, "name": "tv_db", "target_version": "0002"},
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_el_alta_sin_blueprint_sigue_funcionando_igual(admin_client):
+    """
+    El caso simple no puede haberse vuelto más pesado: sin blueprint y sin los campos nuevos,
+    el alta es exactamente la de antes.
+    """
+    sid = _server(admin_client, 5483)
+    oid = _owner(admin_client, sid, "own_simple")
+    r = admin_client.post(
+        "/api/v1/managed-databases",
+        json={"server_id": sid, "owner_id": oid, "name": "simple_db"},
+    )
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    assert data["status"] == "pending"
+    assert data["model_version"] is None
+    assert data.get("migration") is None, "sin apply_migrations no debe venir el desenlace"

@@ -45,3 +45,15 @@ ERROR_CODES = frozenset(
         CODE_NOT_PROVISIONED,
     }
 )
+
+#: ``model_version`` ya no se acepta en el ALTA. Declararla escribía la caché del inventario sin
+#: tocar el motor, así que la base quedaba vacía diciendo estar migrada — y esa caché alimenta
+#: ``_policy_flags``, o sea que además congelaba la versión del blueprint como ``in_use`` sin que
+#: ninguna base la tuviera aplicada. Es el mismo agujero que el ``PATCH`` ya había cerrado.
+#: Reemplazos: ``apply_migrations``/``target_version`` para migrar de verdad al crear, y
+#: ``POST /managed-databases/adopt`` para una base que YA está físicamente en esa versión.
+CODE_MODEL_VERSION_NOT_WRITABLE = "managed_database.model_version_not_writable"
+
+#: ``apply_migrations`` sin las condiciones que lo hacen posible: exige ``provision=true`` (no se
+#: migra lo que no existe en el motor) y ``model_id`` (no hay migraciones sin blueprint).
+CODE_APPLY_REQUIRES_PROVISION = "managed_database.apply_requires_provision"

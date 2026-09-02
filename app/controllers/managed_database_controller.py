@@ -260,41 +260,71 @@ class ManagedDatabaseController:
                 engine_value(server), data.get("charset"), data.get("collation")
             )
 
-            # ``model_version`` en el alta se valida contra el blueprint, con el MISMO
-            # criterio que ``adopt_database`` unas líneas más abajo. Antes se persistía el
-            # string crudo del cliente: ``max_length=50`` no exige que sea numérico y
-            # ``version_sort_key`` hace ``int(version)``, así que un "v3-hotfix" reventaba toda
-            # comparación de versiones posterior. Es el mismo agujero que se cerró en el PATCH.
-            declared_version = data.get("model_version")
-            if declared_version is not None:
-                if data.get("model_id") is None:
-                    raise AppHttpException(
-                        message=(
-                            "'model_version' requiere 'model_id' (la versión pertenece a un "
-                            "blueprint)."
-                        ),
-                        status_code=422,
-                        context={"model_version": declared_version},
-                    )
-                if (
-                    session.query(ModelMigration.id)
-                    .filter(
-                        ModelMigration.model_id == data["model_id"],
-                        ModelMigration.version == declared_version,
-                    )
-                    .first()
-                    is None
-                ):
-                    raise AppHttpException(
-                        message=(
-                            f"La versión {declared_version} no existe en el blueprint indicado."
-                        ),
-                        status_code=422,
-                        context={
-                            "model_id": data["model_id"],
-                            "model_version": declared_version,
-                        },
-                    )
+            # ``model_version`` NO se acepta en el alta. Se escribía en la fila del
+            # inventario sin tocar el motor, así que la base quedaba vacía declarando estar en
+            # la versión N — y esa columna alimenta ``_policy_flags``, que decide si una versión
+            # del blueprint es borrable: declararla la congelaba como ``in_use`` sin que
+            # ninguna base la tuviera aplicada. Es el mismo agujero que el ``PATCH`` ya cerró
+            # (ver el comentario en ``ManagedDatabaseUpdate``).
+            #
+            # Se RECHAZA en vez de ignorarse: un cliente que la mandaba creía estar fijando el
+            # estado inicial, y tragárselo en silencio lo dejaría creyendo lo mismo.
+            if data.get("model_version") is not None:
+                raise AppHttpException(
+                    message=(
+                        "'model_version' ya no se acepta al crear: declararla no migraba nada "
+                        "y dejaba el inventario mintiendo. Para crear la BD ya migrada usá "
+                        "'apply_migrations' (con 'target_version' si querés una versión "
+                        "concreta); para registrar una que YA está en esa versión, "
+                        "'POST /managed-databases/adopt'."
+                    ),
+                    status_code=422,
+                    public_context={"code": pcodes.CODE_MODEL_VERSION_NOT_WRITABLE},
+                    context={"model_version": data["model_version"]},
+                )
+
+            # ``apply_migrations``: se valida TODO antes de tocar el motor. Crear la base y
+            # recién entonces descubrir que la versión objetivo no existe deja una base a medio
+            # camino que el operador no pidió.
+            apply_migrations = bool(data.get("apply_migrations"))
+            target_version = data.get("target_version")
+            if apply_migrations and (not provision or data.get("model_id") is None):
+                raise AppHttpException(
+                    message=(
+                        "'apply_migrations' exige 'provision=true' y 'model_id': no se puede "
+                        "migrar una BD que no existe en el motor ni sin un blueprint del cual "
+                        "sacar las migraciones."
+                    ),
+                    status_code=422,
+                    public_context={"code": pcodes.CODE_APPLY_REQUIRES_PROVISION},
+                    context={"provision": provision, "model_id": data.get("model_id")},
+                )
+            if target_version is not None and not apply_migrations:
+                raise AppHttpException(
+                    message="'target_version' solo tiene sentido con 'apply_migrations=true'.",
+                    status_code=422,
+                    public_context={"code": pcodes.CODE_APPLY_REQUIRES_PROVISION},
+                    context={"target_version": target_version},
+                )
+            if target_version is not None and (
+                session.query(ModelMigration.id)
+                .filter(
+                    ModelMigration.model_id == data["model_id"],
+                    ModelMigration.version == target_version,
+                )
+                .first()
+                is None
+            ):
+                raise AppHttpException(
+                    message=(
+                        f"La versión {target_version} no existe en el blueprint indicado."
+                    ),
+                    status_code=422,
+                    context={
+                        "model_id": data["model_id"],
+                        "target_version": target_version,
+                    },
+                )
 
             # Entorno: valida que exista y esté activo, o resuelve el marcado ``is_default``
             # cuando no se manda. OJO con la semántica del POST: la ruta usa ``model_dump()``
@@ -309,7 +339,8 @@ class ManagedDatabaseController:
                 server_id=server.id,
                 owner_id=owner.id,
                 model_id=data.get("model_id"),
-                model_version=data.get("model_version"),
+                # Sin ``model_version``: es DERIVADA. La escriben ``apply``/``rollback``/
+                # ``stamp`` releyendo el motor, nunca el cliente.
                 environment_id=env_id,
                 charset=req_charset,
                 collation=req_collation,
@@ -365,6 +396,37 @@ class ManagedDatabaseController:
                 raise
             self._set_status(db_id, ProvisionStatus.active)
             result["status"] = ProvisionStatus.active
+
+            # Migrar, si se pidió. VA DESPUÉS del CREATE y con la fila ya en ``active``, y ese
+            # orden es obligatorio: ``_run_apply`` exige que la BD exista en el motor, y en
+            # MySQL el advisory lock se toma sobre una conexión A ESA BD. Tampoco se envuelve
+            # todo en un solo lock: ``runner.apply`` no acepta ``already_locked``, y no hace
+            # falta — la clave del lock es el ``managed_db_id``, que acaba de nacer y no se
+            # disputa con nadie.
+            #
+            # El desenlace de la migración NO cambia el código HTTP: hay una BD real creada en
+            # el servidor de un tercero, y devolver 4xx sugeriría que no quedó nada. Va en el
+            # cuerpo, y el que falló queda en cuarentena con la maquinaria de siempre.
+            if apply_migrations:
+                from app.controllers.managed_migration_controller import (
+                    ManagedMigrationController,
+                )
+
+                try:
+                    applied = ManagedMigrationController().apply(
+                        db_id, up_to_version=target_version, admin=admin
+                    )
+                    result["migration"] = {"ok": True, **applied}
+                except AppHttpException as exc:
+                    # La BD existe: el alta fue exitosa aunque la migración no. Se informa el
+                    # código para que el operador sepa a qué endpoint volver (apply con force,
+                    # o reconcile-partial) en vez de recrear la base.
+                    result["migration"] = {
+                        "ok": False,
+                        "error": exc.message,
+                        "error_code": (exc.public_context or {}).get("code"),
+                    }
+                    result["status"] = self._serialize_by_id(db_id).get("status")
 
         audit.record(
             "managed_database.create",

@@ -22,12 +22,39 @@ class ManagedDatabaseCreate(BaseModel):
     server_id: int = Field(..., ge=1)
     owner_id: int = Field(..., ge=1, description="ServerUser propietario, del mismo servidor")
     model_id: int | None = Field(None, ge=1)
+    # ``model_version`` sigue declarado para poder RECHAZARLO con un mensaje que nombre su
+    # reemplazo. Si se borrara del schema, Pydantic lo ignoraría en silencio y el cliente
+    # seguiría creyendo que declara el estado inicial.
+    #
+    # Por qué dejó de aceptarse: se escribía en la fila del inventario SIN tocar el motor, así
+    # que la base quedaba vacía declarando estar en la versión N. Y esa columna no es
+    # decorativa: ``_policy_flags`` la lee para decidir si una versión del blueprint es
+    # borrable, de modo que declararla congelaba esa versión como ``in_use`` sin que ninguna
+    # base la tuviera aplicada. Es literalmente el agujero que el ``PATCH`` de acá abajo ya
+    # había cerrado, con el mismo argumento.
     model_version: str | None = Field(
         None,
         max_length=50,
+        deprecated=True,
         description=(
-            "Versión de partida declarada. Requiere 'model_id' y tiene que EXISTIR en ese "
-            "blueprint (422 si no): el gateway la compara numéricamente más adelante."
+            "YA NO SE ACEPTA (422). Para crear la base ya migrada usá "
+            "'apply_migrations'/'target_version'; para registrar una que YA está físicamente "
+            "en esa versión, 'POST /managed-databases/adopt'."
+        ),
+    )
+    apply_migrations: bool = Field(
+        False,
+        description=(
+            "Aplica las migraciones del blueprint inmediatamente después de crear la BD, en la "
+            "misma llamada. Exige 'provision=true' y 'model_id'."
+        ),
+    )
+    target_version: str | None = Field(
+        None,
+        pattern=r"^\d{4,10}$",
+        description=(
+            "Versión objetivo (inclusive) para 'apply_migrations'. Omitirla aplica hasta la "
+            "última. Mismo criterio que el '?version=' de la ruta de apply."
         ),
     )
     environment_id: int | None = Field(
@@ -109,6 +136,29 @@ class AdoptDatabaseIn(BaseModel):
     notes: str | None = None
 
 
+class MigrationOutcomeOut(BaseModel):
+    """
+    Desenlace de la migración encadenada al alta.
+
+    Va en el cuerpo y NO en el código HTTP a propósito: si la BD se creó y la migración falló,
+    la petición no fracasó — hay una base real en el servidor de un tercero, y un 4xx sugeriría
+    que no quedó nada. El operador necesita saber las dos cosas por separado.
+    """
+
+    ok: bool
+    from_version: str | None = None
+    to_version: str | None = None
+    applied: list[str] = Field(default_factory=list)
+    error: str | None = None
+    error_code: str | None = Field(
+        None,
+        description=(
+            "Código estable del motivo. Es lo que distingue 'volvé con apply?force=true' de "
+            "'la BD ni siquiera se creó', que exigen endpoints distintos."
+        ),
+    )
+
+
 class ManagedDatabaseOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -128,6 +178,14 @@ class ManagedDatabaseOut(BaseModel):
     origin: str = "provisioned"
     created_at: datetime
     updated_at: datetime
+    migration: MigrationOutcomeOut | None = Field(
+        None,
+        description=(
+            "Solo en el alta con 'apply_migrations'. Su ausencia significa que no se pidió "
+            "migrar; ok=false significa que la BD SÍ se creó y la migración falló — la fila "
+            "queda en cuarentena y el 'error_code' dice a qué endpoint volver."
+        ),
+    )
 
 
 class ManagedDatabaseProvisionOut(BaseModel):

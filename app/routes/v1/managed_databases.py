@@ -76,9 +76,16 @@ def list_databases(
     return paginated(items, total=total, pagination=pagination)
 
 
+# Mismo cubo que ``/provision``, y por la misma razón: emite el mismo ``CREATE DATABASE``.
+# Faltaba, y con ``apply_migrations`` el alta pasa además a ejecutar migraciones — o sea que
+# sería la puerta SIN límite a una operación que sí lo tiene (``apply`` está en 10/min).
 @router.post("", response_model=ApiResponse[ManagedDatabaseOut], status_code=201)
+@limiter.limit("10/minute")
 def create_database(
-    admin: AdminDep, payload: ManagedDatabaseCreate, provision: bool = Query(False)
+    request: Request,
+    admin: AdminDep,
+    payload: ManagedDatabaseCreate,
+    provision: bool = Query(False),
 ):
     created = ManagedDatabaseController().create_database(
         payload.model_dump(), provision=provision, admin=admin
