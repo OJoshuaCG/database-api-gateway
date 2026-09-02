@@ -247,12 +247,28 @@ class PartialApplicationOut(BaseModel):
     reconcilable: bool = Field(
         False,
         description=(
-            "True si el gateway puede deshacer automáticamente lo aplicado "
+            "True si el gateway puede deshacer automáticamente TODO lo aplicado "
             "(POST /migrations/reconcile-partial). Requiere manifiesto de sentencias."
         ),
     )
+    reconcilable_with_force: bool = Field(
+        False,
+        description=(
+            "True si la reconciliación es posible pero EXIGE force=true: hay reversos "
+            "para parte de lo aplicado y alguna sentencia no tiene ninguno, así que esos "
+            "cambios quedarán en la BD. Excluyente con 'reconcilable'. Con esto en true "
+            "hay que ofrecer la reconciliación igual (con aceptación explícita de force): "
+            "el endpoint la acepta. Con AMBOS en false no hay salida automática y la única "
+            "vía es arreglar el esquema a mano y declararlo con POST /migrations/stamp"
+            "?force=true — mirá 'reason' para saber por qué."
+        ),
+    )
     reason: str | None = Field(
-        None, description="Por qué NO es reconciliable automáticamente, si aplica."
+        None,
+        description=(
+            "Por qué la vía normal no está disponible. Presente siempre que "
+            "'reconcilable' sea false, incluido el caso reconciliable-con-force."
+        ),
     )
     statements_to_undo: int = Field(0, description="Reversos que se ejecutarían.")
 

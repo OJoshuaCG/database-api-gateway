@@ -200,6 +200,84 @@ def test_reconcile_plan_reports_unreversible_statements_but_offers_the_rest():
     assert plan["reconcilable"] is False
     assert [u["seq"] for u in plan["unreversible"]] == [2]
     assert [seq for seq, _ in plan["inverses"]] == [3, 1]
+    # Es el estado del MEDIO: no se puede deshacer todo, pero ``force`` sí procede. Si
+    # esto colapsa en "no reconciliable", la SPA esconde la única salida automática.
+    assert plan["reconcilable_with_force"] is True
+    assert plan["reason"]
+
+
+def test_reconcile_plan_has_no_automatic_way_out_when_nothing_is_reversible():
+    """
+    Si NINGUNA de las sentencias aplicadas tiene reverso no hay nada que ejecutar: los
+    dos flags en false y un motivo que lo diga. ``force`` no inventa reversos.
+
+    Antes este camino devolvía ``reason=None``, y el 409 de ``reconcile_partial`` lo
+    interpolaba: el operador recibía un mensaje terminado en "None.".
+    """
+    statements = [
+        ("ALTER TABLE a DROP COLUMN uno", None),
+        ("ALTER TABLE a DROP COLUMN dos", None),
+        ("CREATE TABLE b (id INT)", "DROP TABLE `b`"),
+    ]
+    up_sql = ";\n".join(up for up, _ in statements)
+    spec = _spec(
+        up_sql=up_sql,
+        up_sql_mysql=up_sql,
+        manifest=tuple(
+            ManifestStatement(seq=i, up_sql=up, down_sql=down)
+            for i, (up, down) in enumerate(statements, start=1)
+        ),
+    )
+    # Aplicadas 1 y 2 (las dos irreversibles); la 3, que sí tiene reverso, nunca corrió.
+    plan = ManagedMigrationController._reconcile_plan(
+        spec, EngineType.mysql, _progress(applied=2, total=3)
+    )
+    assert plan["reconcilable"] is False
+    assert plan["reconcilable_with_force"] is False
+    assert plan["inverses"] == []
+    assert "no hay reversos que ejecutar" in plan["reason"]
+
+
+def test_partial_entry_exposes_the_force_only_way_out():
+    """
+    El estado del medio tiene que llegar al frontend como tal: es lo que decide si se
+    ofrece el botón de reconciliar (con aceptación explícita de force) o si se manda al
+    operador a la salida manual.
+    """
+    statements = [
+        ("CREATE TABLE a (id INT)", "DROP TABLE `a`"),
+        ("ALTER TABLE a DROP COLUMN old", None),
+    ]
+    up_sql = ";\n".join(up for up, _ in statements)
+    spec = _spec(
+        up_sql=up_sql,
+        up_sql_mysql=up_sql,
+        manifest=tuple(
+            ManifestStatement(seq=i, up_sql=up, down_sql=down)
+            for i, (up, down) in enumerate(statements, start=1)
+        ),
+    )
+    entry = ManagedMigrationController._partial_entry(
+        spec, EngineType.mysql, _progress(applied=2, total=2)
+    )
+    assert entry["reconcilable"] is False
+    assert entry["reconcilable_with_force"] is True
+    assert entry["reason"]
+    assert entry["statements_to_undo"] == 1
+
+
+def test_partial_entry_without_a_manifest_has_no_automatic_way_out():
+    """
+    El caso real que dejó una BD sin salida visible: migración sin manifiesto para el
+    motor destino. Ambos flags en false → la SPA debe habilitar ``stamp?force=true``.
+    """
+    entry = ManagedMigrationController._partial_entry(
+        _spec(manifest=(), source_engine=None), EngineType.mysql, _progress(applied=18, total=20)
+    )
+    assert entry["reconcilable"] is False
+    assert entry["reconcilable_with_force"] is False
+    assert "no tiene manifiesto" in entry["reason"]
+    assert entry["statements_to_undo"] == 0
 
 
 def test_reconcile_plan_flags_reverses_that_are_not_demonstrably_safe():

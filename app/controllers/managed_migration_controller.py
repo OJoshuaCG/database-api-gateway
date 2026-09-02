@@ -307,6 +307,11 @@ class ManagedMigrationController:
         El frontend necesita saberlo ANTES de ofrecer el botón: sin manifiesto de
         sentencias la reconciliación automática no es posible y la salida es
         ``stamp?force=true`` tras reconciliar a mano.
+
+        Los DOS flags no son redundantes y son excluyentes entre sí (ver
+        ``_reconcile_plan``). Con ``reconcilable_with_force`` la SPA tiene que ofrecer el
+        botón igual: el endpoint acepta esa reconciliación con ``force=true``. Mirar solo
+        ``reconcilable`` escondía la única salida automática que había.
         """
         plan = cls._reconcile_plan(spec, engine, row) if spec is not None else None
         return {
@@ -315,6 +320,7 @@ class ManagedMigrationController:
             "applied_statements": row["last_statement_index"],
             "total_statements": row["total_statements"],
             "reconcilable": bool(plan and plan["reconcilable"]),
+            "reconcilable_with_force": bool(plan and plan["reconcilable_with_force"]),
             "reason": (
                 None
                 if plan and plan["reconcilable"]
@@ -1758,6 +1764,21 @@ class ManagedMigrationController:
         ``k`` — el ``down_sql`` es una secuencia INDEPENDIENTE, con otra cantidad de
         sentencias (los cambios sin reverso simplemente no aparecen). Sin manifiesto se
         devuelve ``reconcilable=False`` con el motivo, en vez de adivinar.
+
+        TRES estados, no dos, porque ``force`` es una salida real y confundirla con
+        "imposible" deja al admin sin ninguna:
+
+        - ``reconcilable``: se puede deshacer TODO lo aplicado. Vía normal.
+        - ``reconcilable_with_force``: hay reversos, pero alguna sentencia aplicada no
+          tiene ninguno. ``reconcile_partial(force=True)`` deshace el resto y reporta lo
+          que queda — es exactamente el escape que documenta su docstring.
+        - ninguno de los dos: no hay NADA que ejecutar (sin manifiesto, desalineado, o
+          ni una sola sentencia aplicada tiene reverso). La única salida es manual +
+          ``stamp?force=true``.
+
+        ``reason`` se puebla SIEMPRE que no sea ``reconcilable``, incluido el estado del
+        medio: viaja al frontend en ``partial_application[]`` y es lo único que le dice al
+        operador por qué la vía normal no está disponible.
         """
         runner = MigrationRunner()
         manifest = runner.usable_manifest(spec, engine)
@@ -1766,21 +1787,23 @@ class ManagedMigrationController:
         if not manifest:
             return {
                 "reconcilable": False,
+                "reconcilable_with_force": False,
                 "reason": (
                     "esta versión no tiene manifiesto de sentencias para el motor destino "
                     "(migración escrita a mano o SQL editado): no se puede saber qué "
                     "reverso corresponde a cada sentencia aplicada"
                 ),
-                "count": 0, "unreversible": [], "inverses": [],
+                "count": 0, "unreversible": [], "unconfirmed": [], "inverses": [],
             }
         if len(manifest) != total:
             return {
                 "reconcilable": False,
+                "reconcilable_with_force": False,
                 "reason": (
                     f"el checkpoint habla de {total} sentencias y el manifiesto tiene "
                     f"{len(manifest)}: no coinciden, no se reconcilia a ciegas"
                 ),
-                "count": 0, "unreversible": [], "inverses": [],
+                "count": 0, "unreversible": [], "unconfirmed": [], "inverses": [],
             }
         # Sentencias efectivamente aplicadas (1..applied), en orden INVERSO.
         pending = [m for m in manifest if m.seq <= applied]
@@ -1812,7 +1835,23 @@ class ManagedMigrationController:
                 inverses.append((m.seq, sql))
         return {
             "reconcilable": not unreversible,
-            "reason": None,
+            # Estado del medio: hay algo que deshacer, pero no todo. ``force`` procede.
+            "reconcilable_with_force": bool(unreversible) and bool(inverses),
+            "reason": (
+                None
+                if not unreversible
+                else (
+                    f"{len(unreversible)} de las {len(pending)} sentencias aplicadas no "
+                    "tienen reverso conocido"
+                    + (
+                        ": con force=true se deshacen las demás y esos cambios quedan "
+                        "aplicados en la BD"
+                        if inverses
+                        else ", y ninguna de las aplicadas lo tiene: no hay reversos que "
+                        "ejecutar"
+                    )
+                )
+            ),
             "count": len(inverses),
             "unreversible": unreversible,
             "unconfirmed": unconfirmed,
