@@ -907,6 +907,89 @@ destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
   clonados y re-calificados al destino). `scripts/verify_clone_e2e.py` cubre tablas/datos;
   cross-engine MySQL→PostgreSQL pendiente de corrida.
 
+## Lote de Clonación (clonar N bases de un servidor a otro)
+
+Capa de ORQUESTACIÓN sobre el módulo de clonado, no un motor nuevo: cada fila termina siendo un
+`CloneJob` real. Guía de uso: `docs/features/database-clone.md` § «Clonar VARIAS bases en un
+lote». Contrato: `docs/api-reference-v19.md`.
+
+- **Archivos**: `app/models/clone_batch.py` (`CloneBatch`/`CloneBatchItem`);
+  `app/controllers/clone_batch_controller.py` (`create_batch_plan`/`execute_batch`/`run_batch`/
+  `retry_candidates`/`sweep_interrupted`); `app/services/clone_batch_runner.py` (executor propio);
+  `app/routes/v1/clone_batches.py`; `app/schemas/clone_batch.py`. Migración `b7c8d9e0f1a2`.
+- **El plan de cada fila se arma al ejecutarla, no al planear el lote.** Tres motivos:
+  `CloneJob.source_fingerprint` es NOT NULL y exigiría fotografiar N bases antes de que el
+  operador confirme; un lote de horas dejaría vencer a las últimas filas por `CLONE_TTL_HOURS`;
+  y el DDL congelado seis horas antes ya no describe el origen. **Lo que se confirma es la
+  intención** (el conjunto de pares origen→destino), que a esa escala es lo único honestamente
+  confirmable. De ahí sale `clone_batch_items`: el ítem declara la intención y el job se
+  materializa después.
+- **Filas destructivas PROHIBIDAS** (`clean_mode` distinto de `none` → 422). Un modo que borra,
+  multiplicado por N y autorizado con un solo gesto, es la operación que tiene que seguir siendo
+  de a una. Se comprueba en el perfil **y** en cada `overrides`, y se vuelve a fijar en el
+  payload que arma el worker, para que un override malformado no lo cuele por atrás. Consecuencia
+  que hay que decir en la UI: con destino existente la única intención admitida es `data_only`, y
+  como `truncate` no existe, no hay "vaciar y recargar".
+- **Una sola fuente de verdad por fila**: `CloneBatchItem` NO espeja el estado de su job. Mientras
+  `clone_job_id` es NULL manda `outcome`; en cuanto hay job manda el job y `outcome` queda NULL
+  para siempre. La lectura resuelve `COALESCE(job.status, item.outcome)` (`_row_status_expr`). Sin
+  copia no hay desincronización posible.
+- **El desenlace del lote lo ESCRIBE el worker**, a diferencia de `CollationConversionBatch` que
+  lo deriva en cada lectura. La carrera del "¿soy el último?" que obligó a derivarlo allá no
+  existe acá: un lote lo recorre un único hilo de principio a fin, así que hay exactamente un
+  escritor. Lo que sí se deriva siempre son los `counts`, que son el estado vivo.
+- **Serie, y por control del daño — no por rendimiento.** No está medido que una sola copia sature
+  el destino; con lotes de 1000 filas y un hilo por tabla es plausible que el cuello sea la
+  latencia. La serie se eligió porque acota el daño y es explicable: un destino escribiéndose a la
+  vez, cancelación con semántica clara. `CLONE_BATCH_MAX_WORKERS` gobierna cuántos LOTES corren a
+  la vez, no filas dentro de un lote. **Executor propio**: encolar los hijos en el pool de
+  `clone_runner` los correría de a dos (rompiendo la serie) y un lote de horas monopolizaría el
+  pool, dejando sin turno a los clones sueltos.
+- **`run_job` se llama SINCRÓNICAMENTE dentro del hilo del lote**, no se re-encola. Es lo que
+  garantiza la serie sin tocar `CLONE_MAX_WORKERS`. Fue viable porque `CloneController` abre sus
+  propias sesiones y acepta `admin=None`: nada de su pipeline depende del ciclo de request.
+- **Dos costuras públicas nuevas en `CloneController`**, para que el orquestador no dependa de
+  internos ajenos: `abort_pending_job` (cierra como `failed` un job que el preview dejó
+  inejecutable por `blocking_issues`, y que si no quedaría `pending` para siempre) y
+  `request_cancel` (cancelar el lote tiene que detener TAMBIÉN la copia en curso; el chequeo entre
+  filas no alcanza porque el worker de una fila puede estar horas dentro de una tabla).
+- **Confirmación agregada**: se re-tipea el nombre del SERVIDOR destino, una vez. Doce re-tipeos
+  se vuelven copiar y pegar sin leer y protegen el eje equivocado — en un lote el error
+  catastrófico es que la lista entera apunte al servidor que no era. El otro eje lo cierra el
+  token: sha256 del conjunto **ordenado** de `(origen, destino, target_mode)`, recomputado
+  server-side sobre las filas persistidas. Se usa sha256 persistido y no el HMAC stateless de
+  `confirm_token.py` por el mismo criterio que el resto del repo: acá hay una fila donde anclar el
+  plan y su TTL.
+- **422 del lote vs. fila `blocked`**: lo que el operador corrige en el formulario rebota la
+  petición (vacío, tope, nombres repetidos, `clean_mode`); lo que depende del estado del servidor
+  marca esa fila y deja crear el lote. Rebotar por el primer problema obliga a corregir 12 bases
+  de a una. Si NINGUNA fila queda ejecutable, sí es 422.
+- **El reintento NO limpia, y de ahí salen dos grupos.** La regla es el destino: solo es
+  reintentable la fila cuyo destino quedó intacto. Requieren intervención manual (a) las que
+  copiaron filas —la copia commitea por lote en AUTOCOMMIT y no es reanudable, así que reintentar
+  duplicaría— y (b) **las que alcanzaron a crear la base antes de fallar**, que es el caso que
+  descubrió el test: un `target_mode='new'` fallido deja la base creada, y el reintento se
+  bloquearía por "el destino ya existe". El chequeo (b) consulta el estado ACTUAL del servidor
+  destino, si no `retry-candidates` y `create_batch_plan` contestarían distinto a la misma
+  pregunta.
+- **Barrido**: `clone_batch_runner.sweep_interrupted()` corre en el `lifespan` **después** de
+  `clone_runner.sweep_interrupted()`, y el orden importa — el estado de una fila se lee de su job,
+  así que al revés el lote se cerraría contando filas que todavía figuran `running`. No se
+  re-encola nada (mismo criterio que collation: el fingerprint pudo cambiar y el token autorizaba
+  otro conjunto). **Requisito operativo**: con el lote en juego, `WORKERS=1` deja de ser un
+  default cómodo — el barrido marca `interrupted` todo lo `running` sin distinguir el proceso, y
+  un lote de horas agranda muchísimo esa ventana.
+- **`P-23` sigue abierto y ahora son CUATRO copias del runner** (clon, collation, export, lote).
+  No se unificó a propósito: atar una feature nueva a un refactor de tres módulos en producción
+  cambia el perfil de riesgo del cambio. Queda anotado en el docstring del runner nuevo.
+- **Deuda que este trabajo NO tomó**: el guard de entornos sigue sin cubrir el clon (ni el suelto
+  ni el lote). Se evaluó y se descartó: `blocks_destructive_migrations` mira el DESTINO, y el caso
+  de uso real es producción → staging, así que nunca se dispararía; y estirar ese flag para
+  bloquear escrituras sería darle un significado que no tiene. Si hace falta, va un flag propio.
+- Verificación: 22 casos HTTP del lote (`tests/test_api_clone_batches.py`, TestClient + SQLite +
+  adapter falso, con los dos workers en modo síncrono), más el contrato de códigos. **Sin e2e
+  contra motores reales.**
+
 ## Módulo de Usuarios del Motor (vista agrupada + CRUD por identidad)
 
 Mejora la LECTURA y la GESTIÓN de los usuarios de un servidor. Guía de uso:

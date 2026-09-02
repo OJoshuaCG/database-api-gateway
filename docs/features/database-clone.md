@@ -560,6 +560,80 @@ endpoints de lectura que tocan el motor, y **no se persiste el error crudo del d
 de datos** (podría filtrar valores de filas; se guarda un motivo genérico y el detalle va solo a
 los logs).
 
+## Clonar VARIAS bases en un lote
+
+Contrato completo en [`api-reference-v19.md`](../api-reference-v19.md). Acá va lo operativo.
+
+`POST /database-clone-batches` arma un lote: dos servidores, un perfil común y N filas
+(origen → destino). Una sola confirmación lo ejecuta, y **cada fila termina siendo un `CloneJob`
+real** — con su snapshot, su fingerprint, su advisory lock y su pantalla de detalle de siempre.
+El lote no es un motor nuevo, es la capa de orquestación.
+
+### Tres restricciones que no son temporales
+
+**1. El lote no borra el destino.** `clean_mode` no existe en su contrato. Un modo destructivo
+multiplicado por N y autorizado con un solo gesto es exactamente lo que tiene que seguir siendo
+de a una, con el re-tipeo del nombre de esa base.
+
+Consecuencia práctica: sobre un destino **existente** la única intención admitida es `data_only`
+(con `structure_and_data` los `CREATE TABLE` chocarían contra las tablas que ya están). Y como
+`data.on_existing='truncate'` no existe, **no hay "vaciar y recargar"**. Para bajar producción a
+staging por completo: borrar las bases destino desde la pantalla de ciclo de vida del servidor
+—que tiene su propia confirmación— y correr el lote con `target_mode='new'`.
+
+**2. Las filas van en serie.** Una base por vez. `CLONE_BATCH_MAX_WORKERS` (default 1) controla
+cuántos *lotes* corren a la vez, no cuántas filas dentro de un lote: eso no es configurable. La
+serie no se eligió por rendimiento —no está medido que una copia sature el destino— sino por
+control del daño: un solo destino escribiéndose a la vez, cancelación con semántica clara, y un
+lote que no puede monopolizar el pool de `CLONE_MAX_WORKERS` y dejar sin turno a los clones
+sueltos (el lote tiene executor propio).
+
+**3. El plan de cada base se arma cuando le toca el turno.** Al planear el lote solo se valida
+lo barato (identificadores, alcance, existencia del destino, coherencia del modo), sin
+fotografiar ninguna base. Así se evitan N snapshots antes de confirmar, se evita que las últimas
+filas venzan por `CLONE_TTL_HOURS` en un lote de horas, y se evita ejecutar un DDL calculado seis
+horas antes. Lo que el operador confirma es la **intención**, no el DDL.
+
+### Confirmación: una sola, sobre el servidor
+
+Se re-tipea el nombre del **servidor destino**, una vez. Con doce bases, doce re-tipeos se
+vuelven copiar y pegar sin leer, y además protegen el eje equivocado: en un lote el error
+catastrófico no es escribir mal un nombre, es que la lista entera apunte al servidor que no era.
+El otro eje lo cierra `confirm_token` (sha256 del conjunto ORDENADO de pares origen→destino):
+agregar, quitar o editar una fila lo invalida.
+
+### Filas bloqueadas vs. lote rechazado
+
+Lo que el operador corrige en el formulario da **422 del lote entero** (vacío, tope excedido,
+nombres destino repetidos, `clean_mode` destructivo). Lo que depende del estado del servidor y
+varía por base marca **esa fila** como `blocked` con su código, y el lote se crea igual: rebotar
+la petición por el primer problema obliga a corregir un lote de 12 bases de a una.
+
+### Reintento: dos grupos, y por qué
+
+Al terminar, `GET .../retry-candidates` parte las filas no exitosas según si el destino quedó
+**intacto** — que es lo único que el lote sabe manejar, porque no puede limpiar:
+
+- **Reintentables**: las que nunca llegaron a tener job (bloqueadas, salteadas, canceladas antes
+  de arrancar). Es el caso que importa después de un reinicio. `POST .../retry-failed` arma un
+  lote **nuevo** con ellas, que hay que volver a confirmar.
+- **Requieren intervención manual**, por dos motivos distintos: (a) la fila alcanzó a copiar
+  filas, así que el destino tiene **datos parciales** commiteados y reintentar duplicaría; (b) la
+  fila creaba el destino y el intento anterior alcanzó a crearlo antes de fallar. Las dos se
+  resuelven con el asistente de a una, que sí ofrece `drop_database` con su re-tipeo.
+
+### Durabilidad, y un requisito operativo
+
+El worker es in-process, como el resto de la familia: **un reinicio deja el lote `interrupted`**
+y no se reanuda solo (el fingerprint del origen pudo cambiar y el token autorizaba otro
+conjunto). El barrido de arranque lo cierra y marca `skipped` lo que no llegó a correr.
+
+**Mientras exista el lote, `WORKERS=1` deja de ser un default cómodo y pasa a ser un
+requisito.** `sweep_interrupted` marca `interrupted` todo lo que esté `running` sin distinguir de
+qué proceso es, y un lote de horas agranda muchísimo la ventana en que dos procesos se pisan.
+
+---
+
 ## Limitaciones conocidas (v1)
 
 - **Durabilidad**: los jobs no sobreviven un reinicio del proceso (quedan `interrupted`). En

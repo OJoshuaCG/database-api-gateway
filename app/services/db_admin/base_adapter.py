@@ -12,6 +12,7 @@ Iteración 1 (solo se usarán a partir de la Iteración 2).
 """
 
 import re
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ from app.core.remote_engine import (
     map_driver_error,
     server_connection,
 )
+from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.services.db_admin import snapshot_data
 from app.services.db_admin.dtos import (
@@ -72,6 +74,8 @@ from app.services.db_admin.schema_diff import (
     SchemaDiff,
 )
 from app.services.db_admin.sql_dialect import body_delimiter_wrapper
+
+logger = get_logger(__name__)
 
 
 class ServerAdapter(ABC):
@@ -608,13 +612,21 @@ class ServerAdapter(ABC):
         )
 
     def _build_table_schema(
-        self, insp, conn, database: str, table: str, schema: str
+        self, insp, conn, database: str, table: str, schema: str,
+        *,
+        extras: dict[str, dict] | None = None,
+        storage: dict[str, str] | None = None,
     ) -> TableSchema:
         """
         Construye un ``TableSchema`` COMPLETO reutilizando lo que el Inspector ya expone
         (columnas + computed/identity, FKs + options, índices + dialect_options, checks,
         uniques, comment) más los hooks por adapter (collation/charset/on_update de
         columna y storage_options de tabla) para lo que el Inspector no expone fiable.
+
+        ``extras``/``storage`` permiten inyectar lo que normalmente se consultaría por tabla,
+        cuando el llamador ya lo trajo para TODAS de una sola vez (ver
+        ``_prefetch_column_extras``). Pasar ``None`` mantiene el camino por tabla, que es el
+        correcto cuando se reflexiona una sola tabla y batear no ahorraría nada.
         """
         columns_raw = insp.get_columns(table, schema=schema)
         pk = insp.get_pk_constraint(table, schema=schema)
@@ -635,8 +647,10 @@ class ServerAdapter(ABC):
         except (NotImplementedError, SQLAlchemyError):
             comment = None
 
-        extras = self._column_extras(conn, database, table, schema)
-        storage = self._table_storage_options(conn, database, table, schema)
+        if extras is None:
+            extras = self._column_extras(conn, database, table, schema)
+        if storage is None:
+            storage = self._table_storage_options(conn, database, table, schema)
 
         pk_set = set(pk_cols)
         columns: list[ColumnInfo] = []
@@ -1051,6 +1065,22 @@ class ServerAdapter(ABC):
         """
         validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         schema = self._inspect_schema(database)
+        # Instrumentación del snapshot, separando el costo POR TABLA del resto.
+        #
+        # Está acá porque este método es el sospechoso principal de un hallazgo concreto: un
+        # clon de una base de 17 MB con menos de 100 tablas tardó 2 m 18 s, de los cuales solo
+        # ~11 s eran ejecución de DDL y ~2 s la copia de datos. Los ~125 s restantes no estaban
+        # medidos en ninguna parte, y este método corre CUATRO veces por clon haciendo varias
+        # consultas a ``information_schema`` **por cada tabla** — donde esas vistas no son
+        # tablas reales y el servidor las materializa abriendo definiciones.
+        #
+        # Los dos tramos van separados a propósito: si el tiempo está en ``tables_ms`` el
+        # problema es el N+1 por tabla (y la salida es batear la introspección); si está en
+        # ``otros_ms``, hay que buscar en los hooks de vistas/rutinas/triggers. Un único número
+        # total no distingue esos dos casos, que llevan a trabajos distintos.
+        t_inicio = time.perf_counter()
+        t_tablas = t_inicio
+        n_tablas = 0
         try:
             with self._conn_ctx(database, conn) as conn:
                 insp = inspect(conn)
@@ -1059,12 +1089,29 @@ class ServerAdapter(ABC):
                 # ``identifiers.GATEWAY_TABLE_PREFIXES`` — sin este filtro el diff
                 # generaba ``DROP TABLE _gw_v_{slug}`` contra la propia tabla de versión
                 # de Alembic y la migración moría al registrar la versión nueva.
+                nombres = exclude_gateway_internal_tables(
+                    sorted(insp.get_table_names(schema=schema))
+                )
+                # Dos consultas para toda la base en vez de dos POR TABLA. Un adapter que no
+                # las implemente devuelve None y cada tabla vuelve a consultar lo suyo.
+                extras_por_tabla = self._prefetch_column_extras(conn, database, schema, nombres)
+                storage_por_tabla = self._prefetch_table_storage_options(
+                    conn, database, schema, nombres
+                )
                 tables = [
-                    self._build_table_schema(insp, conn, database, t, schema)
-                    for t in exclude_gateway_internal_tables(
-                        sorted(insp.get_table_names(schema=schema))
+                    self._build_table_schema(
+                        insp, conn, database, t, schema,
+                        # Una tabla sin filas en el prefetch existe pero no tiene nada que
+                        # aportar: va ``{}``, no ``None``, para no re-consultarla por tabla.
+                        extras=None if extras_por_tabla is None else extras_por_tabla.get(t, {}),
+                        storage=(
+                            None if storage_por_tabla is None else storage_por_tabla.get(t, {})
+                        ),
                     )
+                    for t in nombres
                 ]
+                n_tablas = len(tables)
+                t_tablas = time.perf_counter()
                 views = self._snapshot_views(conn, database, schema)
                 routines = self._snapshot_routines(conn, database, schema)
                 triggers = self._snapshot_triggers(conn, database, schema)
@@ -1078,6 +1125,19 @@ class ServerAdapter(ABC):
                 exc, op="structural_snapshot", target=self.target,
                 extra={"database": database},
             )
+        t_fin = time.perf_counter()
+        tablas_ms = int((t_tablas - t_inicio) * 1000)
+        total_ms = int((t_fin - t_inicio) * 1000)
+        logger.info(
+            "snapshot %s.%s: %d tablas en %d ms (tablas %d ms, resto %d ms, %s ms/tabla)",
+            self.target.server_id,
+            database,
+            n_tablas,
+            total_ms,
+            tablas_ms,
+            total_ms - tablas_ms,
+            f"{tablas_ms / n_tablas:.1f}" if n_tablas else "n/a",
+        )
         return SchemaSnapshot(
             database=database,
             source_engine=self.dialect,
@@ -1097,6 +1157,49 @@ class ServerAdapter(ABC):
     def _column_extras(self, conn, database: str, table: str, schema: str) -> dict[str, dict]:
         """{col: {collation, charset, on_update}} — lo que el Inspector no expone fiable."""
         return {}
+
+    # ---- Prefetch: lo mismo que los hooks de arriba, pero para TODAS las tablas ---- #
+    #
+    # ``_column_extras`` y ``_table_storage_options`` consultan ``information_schema`` UNA VEZ
+    # POR TABLA. En una base de ~80 tablas eso son ~240 consultas secuenciales contra un motor
+    # remoto, y el snapshot corre varias veces por clon. Como esas vistas se filtran por
+    # ``TABLE_SCHEMA`` y ``TABLE_NAME``, quitar el segundo filtro trae lo mismo para la base
+    # entera en UNA consulta, y agrupar por tabla se hace en memoria.
+    #
+    # Devuelven ``None`` —no ``{}``— para decir «este adapter no batea»: ``{}`` es
+    # indistinguible de «bateé y no hay nada», y en ese caso el llamador tiene que caer al hook
+    # por tabla en vez de creer que la base no tiene columnas.
+
+    def _prefetch_column_extras(
+        self, conn, database: str, schema: str, tables: list[str]
+    ) -> dict[str, dict[str, dict]] | None:
+        """``{tabla: {col: {...}}}`` para todas las tablas. ``None`` = sin batch."""
+        return None
+
+    def _prefetch_table_storage_options(
+        self, conn, database: str, schema: str, tables: list[str]
+    ) -> dict[str, dict[str, str]] | None:
+        """``{tabla: {engine, charset, …}}`` para todas las tablas. ``None`` = sin batch."""
+        return None
+
+    def _prefetch_row_estimates(
+        self, conn, database: str, schema: str, tables: list[str]
+    ) -> dict[str, int | None] | None:
+        """
+        ``{tabla: filas_estimadas_o_None}`` para todas. ``None`` (el retorno) = sin batch.
+
+        Ojo con los dos ``None`` de esta firma, que significan cosas distintas: el del RETORNO
+        es "este adapter no batea"; el de un VALOR es "el catálogo no sabe cuántas filas tiene
+        esa tabla", que no es cero — devolver cero haría que una tabla de millones se informara
+        como vacía, y por eso existe ``estimated_rows_known``.
+        """
+        return None
+
+    def _prefetch_primary_keys(
+        self, conn, database: str, schema: str, tables: list[str]
+    ) -> dict[str, bool] | None:
+        """``{tabla: tiene_pk}`` para todas las tablas. ``None`` = sin batch."""
+        return None
 
     def _database_defaults(self, conn, database: str, schema: str) -> dict[str, str | None]:
         """
@@ -1675,20 +1778,37 @@ class ServerAdapter(ABC):
                 insp = inspect(conn)
                 out: list[TableStat] = []
                 # Sin la contabilidad interna del gateway: nunca es candidata a sembrarse.
-                for t in exclude_gateway_internal_tables(
+                nombres = exclude_gateway_internal_tables(
                     sorted(insp.get_table_names(schema=schema))
-                ):
-                    pk = (
-                        insp.get_pk_constraint(t, schema=schema).get("constrained_columns")
-                        or []
-                    )
-                    estimate = self._estimate_rows(conn, t, schema)
+                )
+                # Dos consultas para toda la base en vez de dos POR TABLA. Un adapter que no
+                # las implemente devuelve None y cada tabla vuelve a consultar lo suyo.
+                filas = self._prefetch_row_estimates(conn, database, schema, nombres)
+                pks = self._prefetch_primary_keys(conn, database, schema, nombres)
+                for t in nombres:
+                    if pks is None:
+                        tiene_pk = bool(
+                            insp.get_pk_constraint(t, schema=schema).get(
+                                "constrained_columns"
+                            )
+                            or []
+                        )
+                    else:
+                        tiene_pk = pks.get(t, False)
+                    if filas is None:
+                        estimate = self._estimate_rows(conn, t, schema)
+                    else:
+                        # ``.get`` con default None y NO 0: "el catálogo no lo sabe" es distinto
+                        # de "tiene cero filas", y confundirlos hace que una tabla de millones se
+                        # informe como vacía. Una tabla ausente del prefetch (la dropearon entre
+                        # una consulta y otra) cae en el mismo caso, que es el correcto.
+                        estimate = filas.get(t)
                     out.append(
                         TableStat(
                             table=t,
                             estimated_rows=estimate if estimate is not None else 0,
                             estimated_rows_known=estimate is not None,
-                            has_primary_key=bool(pk),
+                            has_primary_key=tiene_pk,
                         )
                     )
                 return out

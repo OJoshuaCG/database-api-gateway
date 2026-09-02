@@ -218,6 +218,7 @@ def _build_engine(
     bulk: bool = False,
     mysql_local_infile: bool = False,
     statement_timeout_ms: int | None = None,
+    pooled: bool = False,
 ) -> Engine:
     driver = _require_driver(target.dialect)
     url = URL.create(
@@ -228,9 +229,23 @@ def _build_engine(
         port=target.port,
         database=effective_db,
     )
+    # ``pooled`` es la EXCEPCIÓN acotada al NullPool de todo el módulo: mantiene UNA conexión
+    # viva mientras dura un bloque explícito. Existe para la fase de datos del clon, que abría
+    # una conexión nueva POR TABLA —handshake, DNS y todo— y pagaba eso 103 veces para copiar
+    # una base de 17 MB. Ver ``pooled_source_scope``, que es el único que debería encenderlo:
+    # fuera de un bloque con dispose garantizado, esto deja conexiones ``sleep`` en la BD de un
+    # tercero, que es justo lo que el NullPool evita.
+    #
+    # ``max_overflow=0`` para que sea exactamente UNA: si algún camino intentara usar dos a la
+    # vez, preferimos que espere (y se note) antes que multiplicar conexiones en silencio.
+    pool_kwargs: dict = (
+        {"pool_size": 1, "max_overflow": 0, "pool_pre_ping": True}
+        if pooled
+        else {"poolclass": NullPool}
+    )
     return create_engine(
         url,
-        poolclass=NullPool,
+        **pool_kwargs,
         connect_args=_connect_args(
             target.dialect,
             target.ssl_mode,
@@ -248,6 +263,7 @@ def get_engine(
     bulk: bool = False,
     mysql_local_infile: bool = False,
     statement_timeout_ms: int | None = None,
+    pooled: bool = False,
 ) -> Engine:
     """
     Devuelve un engine cacheado por (server_id, usuario, BD efectiva, bulk,
@@ -269,6 +285,9 @@ def get_engine(
         bulk,
         mysql_local_infile,
         timeout,
+        # ``pooled`` entra en la clave por la misma razón que los otros dos: un engine que
+        # sostiene una conexión viva NO puede reusarse donde se pidió una descartable.
+        pooled,
     )
     with _lock:
         engine = _engines.get(key)
@@ -279,6 +298,7 @@ def get_engine(
                 bulk=bulk,
                 mysql_local_infile=mysql_local_infile,
                 statement_timeout_ms=timeout if statement_timeout_ms is not None else None,
+                pooled=pooled,
             )
             # Desalojo FIFO al llegar al techo (ver ``_MAX_ENGINES``).
             while len(_engines) >= _MAX_ENGINES:
@@ -338,6 +358,62 @@ def database_connection(
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def pooled_source_scope(
+    target: ServerTarget, database: str, *, bulk: bool = False, consistent: bool = False
+):
+    """
+    Sostiene UNA conexión de LECTURA a ``database`` mientras dura el bloque, y la tira al salir.
+
+    Resuelve dos problemas distintos, y conviene no confundirlos:
+
+    **1. El handshake por tabla.** Antes cada tabla abría su propia conexión (``NullPool``): con
+    103 tablas eran 103 ``getaddrinfo`` sin caché, 103 handshakes TCP y 103 autenticaciones
+    contra la base de producción de un tercero. Acá se abre una y se reusa.
+
+    **2. La coherencia referencial**, con ``consistent=True``. Leyendo cada tabla en
+    ``READ COMMITTED`` con su propio read view, el clon toma N fotos distintas del origen: si
+    entre que se copia ``padre`` y se copia ``hijo`` alguien inserta las dos filas, el destino
+    queda con un hijo huérfano — y como el clon apaga las FKs del destino y nunca las revalida,
+    lo reporta ``applied``. Reproducido contra MySQL 8.0. Un único
+    ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` hace que las N tablas salgan de la misma foto.
+
+    **El precio de ``consistent``, que hay que decir en voz alta:** sostener un read view durante
+    toda la fase impide el purge del undo log en el ORIGEN y retiene MDL compartido sobre las
+    tablas leídas, o sea que bloquea el DDL del cliente mientras dura. Es exactamente lo que hace
+    ``mysqldump --single-transaction`` y es aceptable para un clon de segundos o minutos; sobre
+    un origen muy escrito y un clon de horas, el tablespace crece. Por eso es configurable.
+
+    Nota de hilos: el ``Connection`` que se devuelve lo usan el hilo principal y el hilo escritor
+    del FIFO, **nunca a la vez** — el principal está bloqueado en el ``LOAD DATA`` mientras el
+    escritor lee del origen, y hace ``join()`` antes de seguir. Verificado que un snapshot
+    consistente se lee correctamente desde otro hilo.
+    """
+    engine = get_engine(target, database, bulk=bulk, pooled=True)
+    conn = engine.connect()
+    try:
+        if consistent:
+            # REPEATABLE READ es la condición para que el snapshot signifique algo: en READ
+            # COMMITTED cada sentencia estrena read view y el ``START TRANSACTION`` no sirve.
+            conn.exec_driver_sql(
+                "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+            )
+            conn.exec_driver_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        # El engine queda en el caché (es reusable y volverá a conectar cuando haga falta), pero
+        # sin conexiones vivas. Nunca dejar esto en un ``except``: si el bloque revienta, tirar
+        # la conexión es MÁS importante, no menos.
+        try:
+            engine.dispose()
+        except Exception:  # noqa: BLE001 — tirar una conexión nunca rompe la operación
+            pass
 
 
 def invalidate_server(server_id: int) -> None:

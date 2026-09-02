@@ -39,8 +39,11 @@ import json
 import os
 import tempfile
 import threading
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Callable, Iterator
 
 import pymysql.connections as _pymysql_conn
@@ -49,9 +52,13 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.context import current_http_identifier
-from app.core.environments import CLONE_BULK_COPY_ENABLED
+from app.core.environments import CLONE_BULK_COPY_ENABLED, CLONE_CONSISTENT_SNAPSHOT
 from app.core.logger import get_logger
-from app.core.remote_engine import ServerTarget, database_connection
+from app.core.remote_engine import (
+    ServerTarget,
+    database_connection,
+    pooled_source_scope,
+)
 from app.exceptions import AppHttpException
 from app.services.db_admin.identifiers import quote_identifier, validate_identifier
 
@@ -138,6 +145,15 @@ class TableCopySpec:
     columns: list[str]  # nombres de columna a copiar, en orden
     primary_key: list[str]  # [] si la tabla no tiene PK
     upsert: bool = False  # True => ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE
+    # ¿La tabla tiene AL MENOS UNA clave única (índice UNIQUE o constraint)? El PK puede o
+    # no estar reportado entre ellas y no importa: la decisión de staging es un ``or`` con
+    # ``primary_key``, así que el caso "el único unique ES el PK" ya está cubierto.
+    #
+    # Existe porque sin ella una tabla SIN PK pero CON UNIQUE se cargaba directo a la tabla
+    # final, donde el IGNORE implícito de ``LOAD DATA LOCAL`` descarta el conflicto EN
+    # SILENCIO. Si algún día se quiere un upsert real sobre una clave única sin PK, va a
+    # hacer falta la lista de columnas, no este booleano.
+    has_unique_key: bool = False
 
 
 @dataclass
@@ -146,6 +162,11 @@ class TableCopyResult:
     status: str  # 'applied' | 'failed' | 'skipped' | 'canceled'
     rows_copied: int = 0
     error: str | None = None
+    # Duración de la copia de ESTA tabla. Nunca se había calculado: los ítems de la fase de
+    # datos llegaban al historial con ``execution_ms`` en NULL, así que el reporte podía decir
+    # cuánto tardó cada sentencia de DDL pero no cuánto tardó copiar una tabla — justo el dato
+    # que hace falta para responder «¿por qué tardó?».
+    duration_ms: int = 0
 
 
 class _Canceled(Exception):
@@ -189,6 +210,17 @@ def _adapt_value(value):
         return json.dumps(value, ensure_ascii=False, default=str)
     if isinstance(value, (bytearray, memoryview)):
         return bytes(value)
+    if isinstance(value, timedelta):
+        # El TIME de MySQL/MariaDB llega como ``timedelta`` y NINGÚN driver lo serializa bien:
+        # ``pymysql.escape_timedelta`` aplica el signo solo a las HORAS, así que un
+        # ``TIME '-01:30:00'`` se reinserta como ``-2:30:00`` y un ``-00:00:01`` como
+        # ``-1:59:59``. Valores válidos, silenciosos, y distintos del original.
+        #
+        # Se normaliza acá —en el adaptador común a los dos writers— y no en cada uno, para que
+        # el camino parametrizado y el de texto no puedan divergir: el destino recibe un str que
+        # ambos drivers pasan tal cual. Es la única forma de que despachar una tabla a un writer
+        # o al otro no cambie lo que queda escrito.
+        return render_time_for_reinsert(value)
     return value
 
 
@@ -373,6 +405,23 @@ def _restore_sql_mode(conn, original: str | None) -> None:
 # --------------------------------------------------------------------------- #
 # Lectura del origen (único punto de lectura del cursor)                        #
 # --------------------------------------------------------------------------- #
+@contextmanager
+def _source_conn_ctx(source_target, source_db, source_engine, src_conn):
+    """
+    Conexión de lectura del origen: la prestada por ``copy_tables``, o una propia.
+
+    Cuando es prestada NO se cierra acá —es del llamador, y cerrarla tiraría el snapshot y las
+    tablas que faltan— y tampoco se re-fija el aislamiento: el scope ya lo dejó como
+    corresponde, y un ``SET SESSION`` a mitad de una transacción abierta es error.
+    """
+    if src_conn is not None:
+        yield src_conn
+        return
+    with database_connection(source_target, source_db, bulk=True) as own:
+        _set_read_committed(own, source_engine)
+        yield own
+
+
 def _iter_source_rows(
     *,
     source_target: ServerTarget,
@@ -381,6 +430,7 @@ def _iter_source_rows(
     select_sql: str,
     ncols: int,
     batch_rows: int,
+    src_conn=None,
 ) -> Iterator[tuple]:
     """
     Generador: rinde TUPLAS de valores ya adaptados (``_adapt_value``) desde el ORIGEN en
@@ -397,16 +447,39 @@ def _iter_source_rows(
     hilo que lo itera. ``close()`` es idempotente (un segundo ``close()`` no toca la
     conexión).
     """
-    with database_connection(source_target, source_db, bulk=True) as src:
-        _set_read_committed(src, source_engine)
+    # ``src_conn``: la conexión que ``pooled_source_scope`` sostiene para toda la fase (la usa
+    # el clon). Evita 103 handshakes y —cuando lleva snapshot consistente— hace que todas las
+    # tablas salgan de la misma foto del origen. ``None`` = abrir una propia, que es el camino
+    # de cualquier otro llamador y el de los tests.
+    with _source_conn_ctx(source_target, source_db, source_engine, src_conn) as src:
         result = src.execution_options(
             stream_results=True, yield_per=batch_rows
         ).execute(text(select_sql))
+        agotado = False
         try:
             for row in result:
                 yield tuple(_adapt_value(row[i]) for i in range(ncols))
+            agotado = True
         finally:
-            result.close()
+            if agotado or src_conn is not None:
+                # Con la conexión COMPARTIDA hay que drenar aunque no se haya agotado:
+                # invalidarla mataría el snapshot de las tablas que faltan. Drenar cuesta red en
+                # el camino de fallo o cancelación, que es raro; leer filas sobrantes en la
+                # tabla siguiente costaría datos mal, que no es negociable.
+                result.close()
+            else:
+                # Salimos SIN drenar el cursor (cancelación, error del writer, o el consumidor
+                # cortó). Con ``stream_results`` el driver deja filas pendientes en el socket y
+                # ``result.close()`` las LEE Y DESCARTA: sobre una tabla grande es arrastrar
+                # megabytes por la red para nada, y sobre una conexión que vuelve al pool es
+                # peor — si el drenaje sale mal, la próxima tabla lee filas sobrantes de ésta.
+                # No da error: da datos mal.
+                #
+                # ``invalidate()`` tira ESA conexión sin diálogo de protocolo, que es lo que el
+                # ``NullPool`` regalaba al cerrar el socket. Antes esto se hacía con un
+                # ``dispose()`` del pool ENTERO desde ``copy_tables``: impreciso, y con más de
+                # una conexión habría tirado también las sanas de las otras tablas.
+                src.invalidate()
 
 
 # --------------------------------------------------------------------------- #
@@ -488,6 +561,9 @@ def _copy_writer_postgres(
     else:
         load_target = final_q
 
+    # ¿Llegaron las filas a la tabla FINAL? Con staging no basta con que el COPY haya
+    # terminado: hasta el ``INSERT ... SELECT`` la final sigue vacía.
+    volcado_a_final = not use_staging
     try:
         # Cursor psycopg CRUDO (no el de SQLAlchemy): la API COPY es del driver. En
         # AUTOCOMMIT el COPY es su propia transacción y no interfiere con los
@@ -508,11 +584,29 @@ def _copy_writer_postgres(
                         progress_cb(spec.table, n)
 
         if use_staging:
-            dest_conn.exec_driver_sql(
+            resultado = dest_conn.exec_driver_sql(
                 _build_insert_from_staging(dest_engine, spec, staging_name)
+            )
+            volcado_a_final = True
+            # Segundo lugar donde se pueden perder filas. Con ``upsert`` el motor cuenta 2 por
+            # fila actualizada, así que ahí solo se exige "no menos".
+            _verificar_filas_cargadas(
+                spec.table,
+                enviadas=counter[0],
+                cargadas=getattr(resultado, "rowcount", None),
+                etapa="staging->final",
+                solo_minimo=spec.upsert,
             )
         if progress_cb is not None:
             progress_cb(spec.table, counter[0])
+    except BaseException:
+        # Con staging, la tabla FINAL sigue VACÍA hasta que el ``INSERT ... SELECT`` termina.
+        # Si salimos antes —por error del motor o por CANCELACIÓN, que salta desde adentro
+        # del COPY— ``counter`` conserva las filas enviadas, y reportarlas es mentir: el
+        # destino tiene cero.
+        if use_staging and not volcado_a_final:
+            counter[0] = 0
+        raise
     finally:
         if staging_name is not None:
             try:
@@ -545,6 +639,37 @@ def _escape_mysql_field(raw: bytes) -> bytes:
     return raw
 
 
+def render_time_for_reinsert(value: timedelta) -> str:
+    """
+    ``timedelta`` -> literal ``TIME`` **sin pérdida**: ``[-]HH:MM:SS[.ffffff]``.
+
+    Es distinto de ``value_json.format_timedelta`` a propósito, y la diferencia importa. Aquel
+    es el criterio de **presentación** del proyecto —consola SQL, resultados de migración,
+    render de literales— y hace ``int(total_seconds())``, o sea **tira los microsegundos**. Para
+    mostrarle un TIME a un humano eso es defendible; para COPIAR una columna ``TIME(3)`` o
+    ``TIME(6)`` de una base a otra, no: ``01:02:03.123456`` se escribía como ``01:02:03`` y, peor,
+    ``-00:00:00.500000`` se escribía como ``00:00:00``, perdiendo el valor **y el signo**. Como la
+    fase de datos relaja ``STRICT_TRANS_TABLES`` a propósito, el motor lo aceptaba y la tabla se
+    reportaba ``applied``.
+
+    No se arregló ``format_timedelta`` porque tiene otros tres consumidores de presentación a los
+    que cambiarles la salida sería una regresión visible en pantalla.
+
+    El signo se aplica al TOTAL, nunca a las horas por separado — ése es justamente el defecto de
+    ``pymysql.escape_timedelta``, que rendea ``-01:30:00`` como ``-2:30:00``. Y las horas NO se
+    normalizan a 24: ``838:00:00`` es un valor legal del tipo.
+    """
+    negativo = value < timedelta(0)
+    total = abs(value)
+    horas, resto = divmod(total.seconds, 3600)
+    horas += total.days * 24
+    minutos, segundos = divmod(resto, 60)
+    signo = "-" if negativo else ""
+    base = f"{signo}{horas:02d}:{minutos:02d}:{segundos:02d}"
+    # La fracción solo se emite si existe: un TIME(0) no debe salir con `.000000` de más.
+    return f"{base}.{total.microseconds:06d}" if total.microseconds else base
+
+
 def _render_mysql_field(value) -> bytes:
     """
     Serializa un valor Python (ya adaptado por ``_adapt_value``) al formato de campo de
@@ -560,6 +685,8 @@ def _render_mysql_field(value) -> bytes:
         return b"1" if value else b"0"
     if isinstance(value, str):
         return _escape_mysql_field(value.encode("utf-8"))
+    if isinstance(value, timedelta):
+        return render_time_for_reinsert(value).encode("ascii")
     # int/float/Decimal/datetime/date/time y demás escalares: repr textual canónico.
     return _escape_mysql_field(str(value).encode("utf-8"))
 
@@ -597,13 +724,16 @@ def _copy_writer_mysql(
       * upsert=False -> ``INSERT INTO final SELECT … FROM staging`` PLANO -> aborta con
         ER_DUP_ENTRY ante PK existente (idéntico al INSERT legacy).
       * upsert=True  -> ``… ON DUPLICATE KEY UPDATE``.
-    Sin PK NO hay concepto de conflicto (ni con LOAD DATA ni con INSERT) -> carga directo a
-    la final, sin staging. (En PostgreSQL, en cambio, COPY directo ya aborta atómicamente
+    Sin NINGUNA clave única (ni PK ni UNIQUE) no hay concepto de conflicto -> carga directo
+    a la final, sin staging. Ojo que la condición es "PK **o** UNIQUE", no solo PK: una tabla
+    sin PK pero con un índice UNIQUE secundario SÍ puede conflictuar, y cargarla directo
+    dejaba que el IGNORE implícito de LOCAL descartara la fila en silencio (el INSERT legacy,
+    en cambio, falla con 1062 — era una divergencia entre los dos writers). (En PostgreSQL, en cambio, COPY directo ya aborta atómicamente
     ante conflicto, así que allí staging sigue siendo solo-si-upsert.)
     """
     final_q = _q(spec.table, dest_engine)
     cols_q = ", ".join(_q(c, dest_engine) for c in spec.columns)
-    use_staging = bool(spec.primary_key)
+    use_staging = bool(spec.primary_key) or spec.has_unique_key
 
     staging_name: str | None = None
     if use_staging:
@@ -616,8 +746,9 @@ def _copy_writer_mysql(
     else:
         load_target = final_q
 
+    volcado_a_final = not use_staging
     try:
-        _load_data_via_fifo(
+        cargadas = _load_data_via_fifo(
             dest_conn=dest_conn,
             load_target=load_target,
             cols_q=cols_q,
@@ -628,12 +759,33 @@ def _copy_writer_mysql(
             cancel_cb=cancel_cb,
             counter=counter,
         )
+        # El LOAD DATA ya terminó: acá se sabe si el motor se quedó con todas las filas.
+        _verificar_filas_cargadas(spec.table, enviadas=counter[0], cargadas=cargadas)
         if use_staging:
-            dest_conn.exec_driver_sql(
+            resultado = dest_conn.exec_driver_sql(
                 _build_insert_from_staging(dest_engine, spec, staging_name)
+            )
+            volcado_a_final = True
+            # El viaje staging -> final es el segundo lugar donde se pueden perder filas, y
+            # con ``upsert`` el motor cuenta 2 por fila actualizada: solo se exige "no menos".
+            _verificar_filas_cargadas(
+                spec.table,
+                enviadas=counter[0],
+                cargadas=getattr(resultado, "rowcount", None),
+                etapa="staging->final",
+                solo_minimo=spec.upsert,
             )
         if progress_cb is not None:
             progress_cb(spec.table, counter[0])
+    except BaseException:
+        # Con staging, la tabla FINAL sigue VACÍA hasta que el ``INSERT ... SELECT`` termina.
+        # Si salimos antes —por error del motor o por CANCELACIÓN, que salta desde adentro del
+        # LOAD DATA— ``counter`` conserva las filas escritas al FIFO, y reportarlas es mentir:
+        # el destino tiene cero. El camino de ERROR ya estaba cubierto; el de CANCELACIÓN no,
+        # y es el más frecuente de los dos.
+        if use_staging and not volcado_a_final:
+            counter[0] = 0
+        raise
     finally:
         if staging_name is not None:
             try:
@@ -642,6 +794,54 @@ def _copy_writer_mysql(
                 )
             except SQLAlchemyError:
                 pass  # best-effort
+
+
+class _FilasPerdidas(Exception):
+    """Faltan filas en el destino. Se traduce a ``failed`` con el conteo en el mensaje."""
+
+
+def _verificar_filas_cargadas(
+    table: str,
+    *,
+    enviadas: int,
+    cargadas: int | None,
+    etapa: str = "LOAD DATA",
+    solo_minimo: bool = False,
+) -> None:
+    """
+    ¿El motor se quedó con todas las filas que le mandamos?
+
+    **Por qué hace falta.** El resultado del ``LOAD DATA`` se descartaba sin mirarlo, y
+    ``rows_copied`` cuenta filas escritas al FIFO, no filas insertadas. Con ``LOAD DATA LOCAL``
+    comportándose SIEMPRE como ``IGNORE`` y con ``STRICT_TRANS_TABLES`` relajado durante toda
+    la fase, un truncado de string, un DECIMAL redondeado, un ENUM que el destino no tiene o
+    una colisión de clave única se convierten en warnings o filas descartadas **sin error**: el
+    job reportaba éxito con datos perdidos.
+
+    **El caso que nadie había visto**, y que motiva que esto valga también con staging: la
+    staging se crea ``LIKE final``, así que hereda la collation del DESTINO. Si el índice único
+    del destino es case-insensitive y el del origen case-sensitive, dos filas legítimas del
+    origen (``'A'`` y ``'a'``) colisionan **dentro de la staging** y el IGNORE implícito
+    descarta una. El docstring de ``_copy_writer_mysql`` afirma que "las filas del ORIGEN ya son
+    únicas entre sí", y eso no es cierto cuando el destino angosta la collation.
+
+    ``solo_minimo`` para el viaje staging→final con ``upsert``: MySQL cuenta **2** por fila
+    actualizada con ``ON DUPLICATE KEY UPDATE``, así que exigir igualdad daría falsos
+    positivos; ahí solo se exige que no falten.
+
+    ``cargadas is None`` (el driver no expone ``rowcount``) no se trata como error: se prefiere
+    no verificar antes que fallar una copia buena por una limitación del driver.
+    """
+    if cargadas is None:
+        return
+    suficiente = cargadas >= enviadas if solo_minimo else cargadas == enviadas
+    if suficiente:
+        return
+    raise _FilasPerdidas(
+        f"{etapa}: se enviaron {enviadas} filas de {table} y el motor registró {cargadas}. "
+        "Faltan filas: probablemente descartadas en silencio por una clave única del destino "
+        "o por una conversión de tipo."
+    )
 
 
 def _load_data_via_fifo(
@@ -655,15 +855,34 @@ def _load_data_via_fifo(
     progress_cb: Callable[[str, int], None] | None,
     cancel_cb: Callable[[], bool] | None,
     counter: list[int],
-) -> None:
+) -> int | None:
+    """
+    Vuelca ``rows_iter`` al destino vía FIFO + ``LOAD DATA LOCAL``.
+
+    Devuelve las filas que el motor dice haber cargado (``rowcount`` del paquete OK), o
+    ``None`` si el driver no lo expone. Quien llama lo compara contra ``counter[0]``: ver
+    ``_verificar_filas_cargadas``.
+    """
     fifo_path = os.path.join(_fifo_dir(), f"gw_clone_{uuid.uuid4().hex}.tsv")
     os.mkfifo(fifo_path, 0o600)
 
     # El path es controlado por el gateway (uuid), no input de usuario; aun así lo pasamos
     # como literal escapado. El escape/terminadores son explícitos (no confiar en defaults):
     # campo=TAB, escape=backslash, línea=LF; deben coincidir con _render_mysql_field.
+    # ``CHARACTER SET utf8mb4`` NO es decorativo y NO se puede omitir. ``LOAD DATA`` ignora el
+    # charset de la CONEXIÓN (el ``SET NAMES`` de pymysql) e interpreta el archivo con
+    # ``character_set_database``, o sea el default de la BASE destino. ``_render_mysql_field``
+    # siempre emite UTF-8, así que contra una base creada ``latin1`` —y el gateway deja elegir
+    # ``target_charset`` al crearla— el servidor reinterpretaba nuestros bytes y guardaba
+    # mojibake: sin error, sin warning y con los conteos de filas cuadrando, o sea invisible
+    # también para ``_verificar_filas_cargadas``.
+    #
+    # Reproducido contra MySQL 8.0 y MariaDB 11 con destino latin1: 'canción ñandú' quedaba
+    # como 'canciÃ³n Ã±andÃº'. Lo cubre ``scripts/verify_data_writers_e2e.py``, cuyo destino se
+    # crea latin1 a propósito.
     load_sql = (
         f"LOAD DATA LOCAL INFILE '{fifo_path}' INTO TABLE {load_target} "
+        f"CHARACTER SET utf8mb4 "
         f"FIELDS TERMINATED BY '\\t' ESCAPED BY '\\\\' "
         f"LINES TERMINATED BY '\\n' ({cols_q})"
     )
@@ -709,10 +928,15 @@ def _load_data_via_fifo(
     # justo antes basta. Fuera de esta ventana ``expected is None`` => cualquier solicitud
     # LOAD LOCAL se rechaza. Se limpia SIEMPRE en el finally (fail-closed).
     _expected_local_infile_path.path = fifo_path
+    cargadas: list[int | None] = [None]
     try:
         thread.start()
         # Dispara el protocolo LOAD LOCAL: pymysql abre el FIFO para lectura y consume.
-        dest_conn.exec_driver_sql(load_sql)
+        resultado = dest_conn.exec_driver_sql(load_sql)
+        # ``rowcount`` del paquete OK del LOAD DATA = Records - Skipped. Es lo ÚNICO que
+        # distingue "se insertaron las filas" de "el IGNORE implícito descartó algunas".
+        # Se lee acá y se compara afuera, para no confundir un fallo del motor con un faltante.
+        cargadas[0] = getattr(resultado, "rowcount", None)
     except BaseException as exc:  # noqa: BLE001 - error del motor => tabla failed
         main_exc = exc
     finally:
@@ -739,6 +963,7 @@ def _load_data_via_fifo(
         raise writer_exc[0]
     if canceled_flag[0]:
         raise _Canceled()
+    return cargadas[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -756,6 +981,7 @@ def _copy_one_table(
     batch_rows: int,
     progress_cb: Callable[[str, int], None] | None,
     cancel_cb: Callable[[], bool] | None,
+    src_conn=None,
 ) -> TableCopyResult:
     table = spec.table
     try:
@@ -766,6 +992,14 @@ def _copy_one_table(
         # Identificador anómalo => tabla fallida (fail-closed), no aborta el lote.
         return TableCopyResult(table=table, status="failed", error=_clean_error(exc))
 
+    # Cronómetro de la tabla. Arranca acá y no antes: la validación de identificadores de
+    # arriba no toca ningún motor, así que lo que se mide es el trabajo real (abrir la
+    # conexión al origen, leer, serializar y escribir al destino).
+    t_inicio = time.perf_counter()
+
+    def _ms() -> int:
+        return int((time.perf_counter() - t_inicio) * 1000)
+
     counter = [0]  # filas volcadas al destino (lo actualiza el writer)
     rows_iter = _iter_source_rows(
         source_target=source_target,
@@ -774,6 +1008,7 @@ def _copy_one_table(
         select_sql=select_sql,
         ncols=len(spec.columns),
         batch_rows=batch_rows,
+        src_conn=src_conn,
     )
     try:
         writer(
@@ -787,10 +1022,16 @@ def _copy_one_table(
             counter,
         )
     except _Canceled:
-        return TableCopyResult(table=table, status="canceled", rows_copied=counter[0])
-    except Exception as exc:  # noqa: BLE001 - best-effort: aislar el fallo por tabla
         return TableCopyResult(
-            table=table, status="failed", rows_copied=counter[0], error=_clean_error(exc)
+            table=table, status="canceled", rows_copied=counter[0], duration_ms=_ms()
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort: aislar el fallo por tabla
+        # La duración se reporta TAMBIÉN cuando la tabla falla o se cancela: una tabla que
+        # tardó tres minutos antes de reventar es un dato de diagnóstico, y descartarlo dejaría
+        # el reporte ciego justo en el caso que más se investiga.
+        return TableCopyResult(
+            table=table, status="failed", rows_copied=counter[0],
+            error=_clean_error(exc), duration_ms=_ms(),
         )
     finally:
         # Cierra el cursor/conexión origen. Idempotente: si el writer de MySQL ya lo cerró
@@ -800,7 +1041,9 @@ def _copy_one_table(
         except Exception:  # noqa: BLE001
             pass
 
-    return TableCopyResult(table=table, status="applied", rows_copied=counter[0])
+    return TableCopyResult(
+        table=table, status="applied", rows_copied=counter[0], duration_ms=_ms()
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -877,9 +1120,20 @@ def copy_tables(
     # INFILE. La de LECTURA del origen (``_iter_source_rows``) queda sin el flag para no ampliar
     # la superficie del ataque "rogue server" a los SELECT del origen (B1). En PostgreSQL el
     # flag es inerte (``_connect_args`` solo lo aplica en la rama mysql/mariadb).
-    with database_connection(
-        dest_target, dest_db, bulk=True, mysql_local_infile=True
-    ) as dest_conn:
+    # UNA conexión de ORIGEN para toda la fase, vía pool acotado a este bloque. Antes se abría
+    # una por tabla: con 103 tablas eso eran 103 handshakes completos —DNS sin caché incluido—
+    # contra la base de producción de un tercero, y el costo fijo por tabla dominaba el tiempo
+    # de la copia por encima de los datos en sí. El ``dispose()` del scope garantiza que no
+    # quede una conexión ``sleep`` cuando el clon termina.
+    with (
+        pooled_source_scope(
+            source_target, source_db, bulk=True,
+            consistent=CLONE_CONSISTENT_SNAPSHOT,
+        ) as src_conn,
+        database_connection(
+            dest_target, dest_db, bulk=True, mysql_local_infile=True
+        ) as dest_conn,
+    ):
         dest_conn = dest_conn.execution_options(isolation_level="AUTOCOMMIT")
         # El writer se resuelve UNA vez por job (el probe de local_infile es a nivel de
         # conexión, no por tabla) y se pasa hacia abajo ya resuelto.
@@ -909,8 +1163,10 @@ def copy_tables(
                     batch_rows=batch_rows,
                     progress_cb=progress_cb,
                     cancel_cb=cancel_cb,
+                    src_conn=src_conn,
                 )
                 results.append(res)
+
 
                 if res.status == "canceled":
                     # Cancelado a mitad de esta tabla: marca las RESTANTES como canceladas.

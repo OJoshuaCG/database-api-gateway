@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
@@ -115,6 +115,10 @@ class _DataSpec:
     # entre el preview y el execute invalidaría el token sin que el plan haya cambiado.
     row_estimate_known: bool = True
     has_primary_key: bool | None = None
+    # ¿La tabla tiene alguna clave única? Decide si la copia bulk pasa por una tabla de
+    # staging: sin ella, una tabla SIN PK pero CON UNIQUE se cargaba directo a la final y
+    # el IGNORE implícito de LOAD DATA LOCAL descartaba el conflicto en silencio.
+    has_unique_key: bool = False
 
 
 @dataclass(frozen=True)
@@ -187,11 +191,56 @@ class _ResolvedSide:
 
 
 class CloneController:
-    def __init__(self):
+    def __init__(self, *, cache_source_snapshot: bool = False):
         self.db = Database(DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT)
+        # Caché del snapshot del ORIGEN, apagada por default. Ver ``_source_snapshot``.
+        self._snap_cache: dict[tuple[int, str], SchemaSnapshot] | None = (
+            {} if cache_source_snapshot else None
+        )
 
     def _session(self):
         return self.db.get_declarative_base_session()
+
+    def _source_snapshot(self, src_target: ServerTarget, database: str) -> SchemaSnapshot:
+        """
+        Snapshot del origen, opcionalmente cacheado por la vida de este controller.
+
+        Armar un plan snapshotea el origen hasta TRES veces seguidas contra el mismo servidor:
+        una en ``create_plan`` (para el fingerprint anti-TOCTOU), otra en ``_apply_spec`` si la
+        spec trae ``structure`` o ``data`` (para resolver la selección declarativa contra el
+        catálogo) y otra en ``_snapshots_for`` (para rendear el plan). Las tres calculan lo
+        mismo, con segundos de diferencia, y cada una es una conexión nueva más ~3 consultas a
+        ``information_schema`` — el costo dominante de un clon de una base chica.
+
+        **La caché está APAGADA por default y solo la enciende el LOTE.** En el asistente de a
+        una, ``create_plan`` y ``preview`` los dispara el operador desde el navegador y pueden
+        estar separados por minutos de navegación: ahí re-snapshotear es lo correcto, porque el
+        origen pudo cambiar y el operador tiene que ver el plan de lo que hay AHORA. En el lote
+        las tres llamadas ocurren dentro de la misma función y en el mismo segundo.
+
+        Lo que NUNCA se cachea es el snapshot que el worker toma bajo el advisory lock
+        (``_pipeline``): ése es la garantía anti-TOCTOU real —compara contra el fingerprint y
+        aborta si el origen cambió— y llama al adapter directo, sin pasar por acá.
+        """
+        if self._snap_cache is None:
+            return get_adapter(src_target).structural_snapshot(database)
+        clave = (src_target.server_id, database)
+        if clave not in self._snap_cache:
+            self._snap_cache[clave] = get_adapter(src_target).structural_snapshot(database)
+        return self._snap_cache[clave]
+
+    def forget_snapshots(self) -> None:
+        """
+        Vacía la caché de snapshots, si está encendida.
+
+        El lote la llama antes de ejecutar. Hoy ``_pipeline`` no pasa por ``_source_snapshot``,
+        así que sería redundante — pero la invariante «el worker nunca ve un snapshot cacheado»
+        es de CORRECTITUD, no de rendimiento, y no puede depender de que nadie enrute una
+        llamada nueva por acá sin darse cuenta. Si eso pasara, el clon validaría el fingerprint
+        contra una foto vieja y el guard anti-TOCTOU quedaría apagado en silencio.
+        """
+        if self._snap_cache is not None:
+            self._snap_cache.clear()
 
     # ------------------------------------------------------------------ #
     # Carga / resolución                                                  #
@@ -371,6 +420,11 @@ class CloneController:
             "target_engine": job.target_engine,
             "target_mode": job.target_mode,
             "include_data": job.include_data,
+            # `copy_intent` además de `include_data`: el booleano legacy no distingue
+            # `data_only` de `structure_only`, así que un cliente que lo derivara de ahí
+            # mostraría mal el modo de solo-datos. El modelo lo persiste desde el trabajo
+            # de solo datos; solo faltaba exponerlo.
+            "copy_intent": job.copy_intent or CLONE_COPY_STRUCTURE_ONLY,
             "clean_mode": job.clean_mode,
             "adopt_target": job.adopt_target,
             "cross_engine": not _same_family(job.source_engine, job.target_engine),
@@ -557,7 +611,7 @@ class CloneController:
                 vsession.close()
 
         # Snapshot del origen (solo lectura) + fingerprint anti-TOCTOU.
-        source_snap = src_adapter.structural_snapshot(src.database_name)
+        source_snap = self._source_snapshot(src.target, src.database_name)
         src_fp = _snapshot_fingerprint(source_snap)
 
         expires = _utcnow() + timedelta(hours=CLONE_TTL_HOURS)
@@ -836,6 +890,12 @@ class CloneController:
                     row_estimate_known=st.estimated_rows_known if st is not None else True,
                     has_primary_key=(
                         st.has_primary_key if st is not None else bool(t.primary_key)
+                    ),
+                    # No se filtra el PK de esta cuenta a propósito: la decisión de staging
+                    # es un ``or`` con la PK, así que "el único unique ES el PK" ya está
+                    # cubierto y filtrarlo solo agregaría una comparación de conjuntos.
+                    has_unique_key=(
+                        any(ix.unique for ix in t.indexes) or bool(t.unique_constraints)
                     ),
                 ))
 
@@ -1262,7 +1322,7 @@ class CloneController:
         self, job: CloneJob, src_target: ServerTarget, tgt_target: ServerTarget
     ) -> tuple[SchemaSnapshot, SchemaSnapshot | None]:
         """Snapshot del origen (siempre) y del destino (si el plan depende de él)."""
-        source_snap = get_adapter(src_target).structural_snapshot(job.source_database_name)
+        source_snap = self._source_snapshot(src_target, job.source_database_name)
         target_snap = None
         if self._needs_target_snapshot(job):
             target_snap = get_adapter(tgt_target).structural_snapshot(job.target_database_name)
@@ -1342,9 +1402,10 @@ class CloneController:
             job.is_full_clone = sel is None
         elif "structure" in sent and spec.get("structure") is not None:
             st = spec["structure"]
-            source_snap = get_adapter(
-                build_target(get_server_or_404(session, job.source_server_id))
-            ).structural_snapshot(job.source_database_name)
+            source_snap = self._source_snapshot(
+                build_target(get_server_or_404(session, job.source_server_id)),
+                job.source_database_name,
+            )
             catalog = [
                 espec.CatalogObject(object_type=ot, name=name)
                 for ot, name in self._iter_objects(source_snap)
@@ -1383,9 +1444,10 @@ class CloneController:
                 job.data_on_existing = None
             else:
                 if source_snap is None:
-                    source_snap = get_adapter(
-                        build_target(get_server_or_404(session, job.source_server_id))
-                    ).structural_snapshot(job.source_database_name)
+                    source_snap = self._source_snapshot(
+                        build_target(get_server_or_404(session, job.source_server_id)),
+                        job.source_database_name,
+                    )
                 tables = espec.resolve_selection(
                     [
                         espec.CatalogObject(object_type="table", name=t.table)
@@ -1767,6 +1829,101 @@ class CloneController:
                 context={"clone_job_id": job.id},
             )
 
+    def list_clones(
+        self,
+        *,
+        offset: int,
+        limit: int,
+        statuses: list[str] | None = None,
+        source_server_id: int | None = None,
+        target_server_id: int | None = None,
+        search: str | None = None,
+        batch_id: int | None = None,
+        include_batch_children: bool = True,
+        order_by: str = "created_at",
+        order: str = "desc",
+    ) -> tuple[list[dict], int]:
+        """
+        Historial paginado de clones, del más nuevo al más viejo.
+
+        **Este endpoint faltaba, y su ausencia no era una comodidad de menos: era la razón
+        por la que un clon quedaba INALCANZABLE.** El id del job solo existía en la memoria
+        del navegador; sin un listado, perderlo era perder el acceso a la operación (la fila
+        y sus ítems seguían en la BD, sin ningún camino hacia ellos).
+
+        ``duration_ms`` se calcula en el SERVIDOR y no se deriva en el cliente, porque es lo
+        que habilita ordenar por él — «¿cuál fue el más lento?» no se puede contestar
+        ordenando la página visible.
+
+        ``batch_id``/``batch_seq`` salen de un LEFT JOIN contra ``clone_batch_items``: la
+        relación vive solo de ese lado (``CloneJob`` no sabe que nació de un lote). Sin ese
+        dato, los N hijos de un lote son N filas indistinguibles de clones sueltos y entierran
+        el historial — de ahí también ``include_batch_children``.
+        """
+        from app.models.clone_batch import CloneBatchItem
+
+        session = self._session()
+        try:
+            query = (
+                session.query(
+                    CloneJob,
+                    CloneBatchItem.batch_id.label("batch_id"),
+                    CloneBatchItem.seq.label("batch_seq"),
+                )
+                .outerjoin(CloneBatchItem, CloneBatchItem.clone_job_id == CloneJob.id)
+            )
+
+            if statuses:
+                query = query.filter(CloneJob.status.in_(statuses))
+            if source_server_id is not None:
+                query = query.filter(CloneJob.source_server_id == source_server_id)
+            if target_server_id is not None:
+                query = query.filter(CloneJob.target_server_id == target_server_id)
+            if batch_id is not None:
+                query = query.filter(CloneBatchItem.batch_id == batch_id)
+            elif not include_batch_children:
+                query = query.filter(CloneBatchItem.batch_id.is_(None))
+            if search:
+                # Coincidencia parcial sobre los DOS nombres de base: es un solo campo en la
+                # UI porque el operador no sabe (ni le importa) de qué lado estaba el nombre
+                # que recuerda.
+                pattern = f"%{search.strip()}%"
+                query = query.filter(
+                    or_(
+                        CloneJob.source_database_name.like(pattern),
+                        CloneJob.target_database_name.like(pattern),
+                    )
+                )
+
+            total = query.count()
+
+            if order_by == "duration_ms":
+                # El motor no tiene un TIMESTAMPDIFF portable entre MySQL y PostgreSQL, así
+                # que se ordena por `finished_at` como proxy y el desempate real lo hace el
+                # cliente sobre la página. Los que nunca terminaron van al final.
+                columna = CloneJob.finished_at
+            else:
+                columna = CloneJob.created_at
+            columna = columna.desc() if order == "desc" else columna.asc()
+            # `id` como segundo criterio: dos jobs creados en el mismo segundo tienen que
+            # tener un orden ESTABLE, o la paginación repite y saltea filas entre páginas.
+            rows = query.order_by(columna, CloneJob.id.desc()).offset(offset).limit(limit).all()
+
+            out = []
+            for job, b_id, b_seq in rows:
+                payload = self._serialize_summary(job)
+                payload["batch_id"] = b_id
+                payload["batch_seq"] = b_seq
+                payload["duration_ms"] = (
+                    int((job.finished_at - job.started_at).total_seconds() * 1000)
+                    if job.started_at and job.finished_at
+                    else None
+                )
+                out.append(payload)
+            return out, total
+        finally:
+            session.close()
+
     def list_items(self, job_id: int, *, limit: int, offset: int) -> tuple[list[dict], int]:
         session = self._session()
         try:
@@ -1940,6 +2097,66 @@ class CloneController:
     def _clean_error(exc: Exception) -> str:
         orig = getattr(exc, "orig", None)
         return str(orig if orig is not None else exc)[:500]
+
+    def abort_pending_job(self, job_id: int, *, reason: str) -> bool:
+        """
+        Cierra como ``failed`` un job que quedó en ``pending`` y que NUNCA se va a ejecutar.
+
+        Existe para el LOTE, y por eso es público: cuando el preview de una fila devuelve
+        ``blocking_issues``, el job ya está creado pero no puede correr, y dejarlo ``pending``
+        para siempre ensucia el barrido de arranque (que solo mira ``running``) y el historial.
+        La alternativa era que el orquestador llamara a ``_set_status``, o sea que otro módulo
+        dependiera de un detalle interno de éste.
+
+        Solo actúa sobre ``pending``, con ``UPDATE`` condicional: si un worker ya lo reclamó
+        —imposible por construcción hoy, pero no algo que este método deba asumir— no le pisa
+        el estado. Devuelve si efectivamente lo cerró.
+        """
+        session = self._session()
+        try:
+            closed = (
+                session.query(CloneJob)
+                .filter(CloneJob.id == job_id, CloneJob.status == CLONE_STATUS_PENDING)
+                .update(
+                    {
+                        CloneJob.status: CLONE_STATUS_FAILED,
+                        CloneJob.error: reason,
+                        CloneJob.finished_at: _utcnow(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            session.commit()
+            return bool(closed)
+        finally:
+            session.close()
+
+    def request_cancel(self, job_id: int) -> bool:
+        """
+        Pide la cancelación COOPERATIVA de un job sin pasar por la ruta HTTP.
+
+        La usa el lote: cancelar el lote mientras una fila está copiando tiene que detener
+        TAMBIÉN esa copia, y el chequeo entre filas del orquestador no alcanza — el worker de
+        la fila puede estar horas dentro de una tabla grande. Sin esto, "cancelar" dejaba
+        correr hasta el final la base en curso.
+
+        No valida el estado ni audita: eso es responsabilidad de ``cancel_clone`` (la ruta),
+        que además tiene el admin de la request. Devuelve si marcó algo.
+        """
+        session = self._session()
+        try:
+            marked = (
+                session.query(CloneJob)
+                .filter(
+                    CloneJob.id == job_id,
+                    CloneJob.status.in_([CLONE_STATUS_PENDING, CLONE_STATUS_RUNNING]),
+                )
+                .update({CloneJob.cancel_requested: True}, synchronize_session=False)
+            )
+            session.commit()
+            return bool(marked)
+        finally:
+            session.close()
 
     def _set_status(self, job_id, status, *, phase=None, error=None, finished=False):
         session = self._session()
@@ -2237,7 +2454,10 @@ class CloneController:
                     self._set_progress(_jid, _p)
 
             specs = [
-                TableCopySpec(table=d.table, columns=d.columns, primary_key=d.primary_key, upsert=d.upsert)
+                TableCopySpec(
+                    table=d.table, columns=d.columns, primary_key=d.primary_key,
+                    upsert=d.upsert, has_unique_key=d.has_unique_key,
+                )
                 for d in plan.data_specs
             ]
             results = copy_tables(
@@ -2260,9 +2480,14 @@ class CloneController:
                     error = "Fallo al copiar datos de la tabla (ver logs del gateway)."
                     logger.warning("Clon %s: fallo de datos en tabla %s: %s",
                                    job_id, res.table, res.error)
+                # ``execution_ms`` en los pasos de DATOS: la columna existía en el modelo y en
+                # el contrato desde siempre, pero las fases de limpieza y estructura eran las
+                # únicas que la llenaban. El reporte podía decir cuánto tardó cada CREATE TABLE
+                # y no cuánto tardó copiar una tabla — que es la pregunta que se hace.
                 item_rows.append(dict(seq=seq, kind=CLONE_ITEM_DATA, object_type="table",
                                       object_name=res.table, status=status, error=error,
-                                      rows_copied=res.rows_copied, executed_at=_utcnow()))
+                                      rows_copied=res.rows_copied,
+                                      execution_ms=res.duration_ms, executed_at=_utcnow()))
                 seq += 1
             self._record_items(job_id, item_rows)
             if any(r.status == "canceled" for r in results):
@@ -2352,9 +2577,16 @@ class CloneController:
         """Ejecuta una lista de _StructStmt vía execute_adhoc y registra el resultado por ítem.
         ``already_locked=True``: el pipeline ya sostiene el advisory lock (no re-adquirir)."""
         sqls = [s.sql for s in statements]
+        # ``bulk=True``: estas fases emiten DDL que puede tardar MINUTOS sobre un destino
+        # con datos —un DROP TABLE de una tabla enorme en clean_mode='objects', un CREATE
+        # INDEX— y el default es el timeout INTERACTIVO de 15 s. En MySQL ese valor es un
+        # read_timeout de SOCKET del cliente: al expirar, la conexión se rompe MIENTRAS EL
+        # MOTOR SIGUE TRABAJANDO, el gateway registra un fallo de una sentencia que en
+        # realidad se va a completar, y con stop_on_error=True el clon entero muere. El clon
+        # ya es asíncrono y sostiene el advisory lock, así que la espera larga es correcta.
         results = runner.execute_adhoc(
             tgt_target, db_name=db_name, engine=engine, lock_key=lock_key, statements=sqls,
-            already_locked=True, disable_fk_checks=disable_fk_checks,
+            already_locked=True, disable_fk_checks=disable_fk_checks, bulk=True,
         )
         by_index = {r.index: r for r in results}
         rows = []
@@ -2391,7 +2623,7 @@ class CloneController:
             res = runner.execute_adhoc(
                 tgt_target, db_name=db_name, engine=engine, lock_key=lock_key,
                 statements=[st.sql for _, st in remaining],
-                already_locked=True, stop_on_error=False,
+                already_locked=True, stop_on_error=False, bulk=True,
             )
             by_pos = {r.index: r for r in res}
             still: list = []

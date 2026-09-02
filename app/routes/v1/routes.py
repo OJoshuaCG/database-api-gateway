@@ -6,6 +6,7 @@ from app.routes.v1 import (
     collation_batches,
     collation_conversions,
     crypto,
+    clone_batches,
     database_clones,
     database_exports,
     database_models,
@@ -31,6 +32,7 @@ router.include_router(model_migrations.router)
 router.include_router(managed_databases.router)
 router.include_router(schema_comparisons.router)
 router.include_router(database_clones.router)
+router.include_router(clone_batches.router)
 router.include_router(collation_conversions.router)
 router.include_router(collation_batches.router)
 router.include_router(database_exports.router)

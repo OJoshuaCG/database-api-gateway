@@ -14,7 +14,7 @@ Convención de estilo: funciones pytest planas, sin clases (igual que test_schem
 import os
 import re
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -31,8 +31,11 @@ from app.services.db_admin.data_copy import (
     _build_select,
     _escape_mysql_field,
     _render_mysql_field,
+    _FilasPerdidas,
     _staging_name,
+    _verificar_filas_cargadas,
     copy_tables,
+    render_time_for_reinsert,
 )
 
 
@@ -61,6 +64,43 @@ _TARGET = ServerTarget(
 # --------------------------------------------------------------------------- #
 # Dataclasses                                                                  #
 # --------------------------------------------------------------------------- #
+# ── Staging: la condición es "PK o UNIQUE", no solo PK ───────────────────────────
+# Una tabla SIN PK pero CON un índice UNIQUE secundario sí puede conflictuar. Cargándola
+# directo a la tabla final, el IGNORE implícito de LOAD DATA LOCAL descartaba la fila en
+# silencio; el INSERT legacy, en cambio, falla con 1062. Era una divergencia entre los dos
+# writers del mismo módulo, no solo una optimización de más.
+
+
+def test_spec_has_unique_key_defaults_to_false():
+    spec = TableCopySpec(table="t", columns=["a"], primary_key=[])
+    assert spec.has_unique_key is False
+
+
+def test_staging_condition_covers_unique_without_pk():
+    # Réplica de la condición de `_copy_writer_mysql`: sin PK pero con UNIQUE => staging.
+    sin_claves = TableCopySpec(table="t", columns=["a"], primary_key=[])
+    solo_pk = TableCopySpec(table="t", columns=["a"], primary_key=["a"])
+    solo_unique = TableCopySpec(
+        table="t", columns=["a"], primary_key=[], has_unique_key=True
+    )
+    assert (bool(sin_claves.primary_key) or sin_claves.has_unique_key) is False
+    assert (bool(solo_pk.primary_key) or solo_pk.has_unique_key) is True
+    assert (bool(solo_unique.primary_key) or solo_unique.has_unique_key) is True
+
+
+def test_insert_from_staging_without_pk_is_plain_and_therefore_fail_closed():
+    # Sin PK, `_compose_insert` degrada a INSERT plano incluso con upsert=True. Eso es lo
+    # que hace que el conflicto contra filas preexistentes ABORTE (1062) en vez de saltearse:
+    # el statement final es la red de seguridad que la carga directa no tenía.
+    spec = TableCopySpec(
+        table="t", columns=["a", "b"], primary_key=[], upsert=True, has_unique_key=True
+    )
+    sql = _build_insert_from_staging("mysql", spec, "stg_x")
+    assert sql.startswith("INSERT INTO `t` (`a`, `b`) SELECT")
+    assert "ON DUPLICATE KEY UPDATE" not in sql
+    assert "IGNORE" not in sql
+
+
 def test_spec_defaults():
     s = TableCopySpec(table="t", columns=["a"], primary_key=[])
     assert s.upsert is False
@@ -71,6 +111,7 @@ def test_result_defaults():
     r = TableCopyResult(table="t", status="applied")
     assert r.rows_copied == 0
     assert r.error is None
+    assert r.duration_ms == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -189,8 +230,24 @@ def _setup_sqlite_env(monkeypatch, tmp_path, source_rows, *, create_dest_rows=No
 
     engines = {"srcdb": src_engine, "dstdb": dst_engine}
 
+    # La firma del doble sigue a la REAL, ``pooled`` incluido: un doble que acepte menos
+    # parámetros que la función que reemplaza convierte un cambio de firma en un fallo de test
+    # que apunta al lugar equivocado.
     @contextmanager
-    def fake_conn(target, database, *, bulk=False, mysql_local_infile=False):
+    def fake_conn(
+        target, database, *, bulk=False, mysql_local_infile=False, pooled=False
+    ):
+        conn = engines[database].connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    # La firma sigue a la REAL, ``consistent`` incluido, y devuelve una CONEXIÓN sostenida
+    # (no el engine): es lo que `copy_tables` le presta a cada tabla para que todas lean de la
+    # misma foto del origen.
+    @contextmanager
+    def fake_pool(target, database, *, bulk=False, consistent=False):
         conn = engines[database].connect()
         try:
             yield conn
@@ -198,6 +255,7 @@ def _setup_sqlite_env(monkeypatch, tmp_path, source_rows, *, create_dest_rows=No
             conn.close()
 
     monkeypatch.setattr(dc, "database_connection", fake_conn)
+    monkeypatch.setattr(dc, "pooled_source_scope", fake_pool)
     return engines
 
 
@@ -526,6 +584,58 @@ def test_render_mysql_field_bytearray_and_memoryview_escaped():
     assert _render_mysql_field(memoryview(b"a\nb")) == b"a\\nb"
 
 
+# ── TIME (timedelta): NINGÚN driver lo serializa bien, y son dos defectos distintos ──
+# El TIME de MySQL/MariaDB llega al driver como ``timedelta`` y admite negativos y valores
+# mayores a 24 h. Con ``str()`` sale "1 day, 2:00:00" / "-1 day, 23:00:00", que NO son
+# literales TIME válidos — y como la fase de datos relaja STRICT_TRANS_TABLES a propósito, el
+# motor los coercionaba EN SILENCIO y la tabla se reportaba `applied`.
+#
+# El primer arreglo pasó a ``format_timedelta``, y quedó CORTO: esa función hace
+# ``int(total_seconds())``, o sea que tiraba los microsegundos. Cualquier columna TIME(3) o
+# TIME(6) se copiaba truncada, y ``-00:00:00.500000`` se copiaba como ``00:00:00``, perdiendo
+# el valor Y el signo. Por eso existe ``render_time_for_reinsert``, que es de REINSERCIÓN y no
+# de presentación como ``format_timedelta`` (que sigue truncando a propósito para la consola
+# SQL y los otros dos consumidores de pantalla).
+#
+# Y el camino legacy tampoco estaba sano: ``pymysql.escape_timedelta`` aplica el signo solo a
+# las HORAS, así que reinserta ``-01:30:00`` como ``-2:30:00``. Por eso ``_adapt_value``
+# normaliza el ``timedelta`` a str ANTES de bifurcar hacia cualquiera de los dos writers: es la
+# única forma de que despachar una tabla a uno o al otro no cambie lo que queda escrito.
+
+
+def test_render_mysql_field_time_under_24h():
+    assert _render_mysql_field(timedelta(hours=2)) == b"02:00:00"
+    assert _render_mysql_field(timedelta(hours=1, minutes=2, seconds=3)) == b"01:02:03"
+
+
+def test_render_mysql_field_time_over_24h_does_not_say_day():
+    # str(timedelta(days=1, hours=2)) == "1 day, 2:00:00" — inválido como literal TIME.
+    assert _render_mysql_field(timedelta(days=1, hours=2)) == b"26:00:00"
+
+
+def test_render_mysql_field_time_negative_keeps_sign():
+    # str(timedelta(hours=-1)) == "-1 day, 23:00:00": el signo se perdía y el valor cambiaba.
+    assert _render_mysql_field(timedelta(hours=-1)) == b"-01:00:00"
+
+
+def test_render_mysql_field_time_does_not_normalize_to_24h():
+    # 838:00:00 es el máximo LEGAL del tipo TIME: no se puede normalizar a días.
+    assert _render_mysql_field(timedelta(hours=838)) == b"838:00:00"
+
+
+def test_render_mysql_field_time_zero():
+    assert _render_mysql_field(timedelta(0)) == b"00:00:00"
+
+
+def test_render_mysql_field_time_never_needs_escaping():
+    # El formato es [-]HH:MM:SS — solo dígitos, dos puntos y un signo. Ninguno de los cuatro
+    # caracteres que LOAD DATA escapa puede aparecer, así que el valor sale tal cual.
+    for value in (timedelta(hours=5), timedelta(hours=-5), timedelta(hours=900)):
+        rendered = _render_mysql_field(value)
+        assert b"\\" not in rendered
+        assert rendered == rendered.replace(b"\\", b"")
+
+
 def test_escape_mysql_field_order_backslash_before_tab():
     raw = b"\\" + b"\t"  # un backslash real seguido de un tab real
     assert _escape_mysql_field(raw) == b"\\" + b"\\" + b"\\" + b"t"
@@ -593,6 +703,13 @@ def test_load_data_via_fifo_engine_error_propagates_and_cleans_up_fifo(tmp_path)
         def exec_driver_sql(self, sql):
             raise RuntimeError("1146: Table 'x.does_not_exist' doesn't exist")
 
+    # Se fotografía el directorio ANTES: la aserción tiene que ser sobre el FIFO de ESTE test,
+    # no sobre el estado global de /dev/shm. La versión original comparaba contra la lista
+    # vacía, así que un FIFO filtrado por CUALQUIER otra cosa —una corrida anterior que el
+    # sistema mató antes del `finally`, por ejemplo— hacía fallar este test para siempre y
+    # apuntaba al código equivocado. Costó un rato de depuración averiguarlo.
+    previos = {p for p in os.listdir(dc._fifo_dir()) if p.startswith("gw_clone_")}
+
     with pytest.raises(RuntimeError, match="does_not_exist"):
         dc._load_data_via_fifo(
             dest_conn=_FailingConn(),
@@ -607,8 +724,8 @@ def test_load_data_via_fifo_engine_error_propagates_and_cleans_up_fifo(tmp_path)
         )
     # El escritor bloqueado en open('wb') se desbloquea y el FIFO se limpia (no queda
     # huérfano en /dev/shm ni en el tmpdir).
-    leftover = [p for p in os.listdir(dc._fifo_dir()) if p.startswith("gw_clone_")]
-    assert leftover == []
+    ahora = {p for p in os.listdir(dc._fifo_dir()) if p.startswith("gw_clone_")}
+    assert ahora - previos == set()
 
 
 # --------------------------------------------------------------------------- #
@@ -638,7 +755,11 @@ class _FakeMySQLDestConn:
             return None
 
         m = re.match(
-            r"LOAD DATA LOCAL INFILE '([^']+)' INTO TABLE `([^`]+)` FIELDS.*\(([^)]+)\)$",
+            # ``CHARACTER SET`` es obligatorio en la sentencia real (sin él, un destino
+            # latin1 guarda mojibake), así que el doble lo EXIGE: si alguien lo saca, este
+            # test falla en vez de dejar pasar la corrupción silenciosa.
+            r"LOAD DATA LOCAL INFILE '([^']+)' INTO TABLE `([^`]+)` "
+            r"CHARACTER SET utf8mb4 FIELDS.*\(([^)]+)\)$",
             sql,
         )
         if m:
@@ -820,3 +941,246 @@ def test_mysql_writer_no_pk_skips_staging_entirely():
 
     assert sorted(conn.tables["widget"]) == [("1", "a"), ("2", "b")]
     assert not any(name.startswith("_gw_stg_") for name in conn.tables)
+
+
+# --------------------------------------------------------------------------- #
+# Duración por tabla                                                           #
+# --------------------------------------------------------------------------- #
+# Nunca se había calculado: los ítems de la fase de datos llegaban al historial con
+# `execution_ms` en NULL, así que el reporte sabía cuánto tardó cada CREATE TABLE y no cuánto
+# tardó copiar una tabla — que es la pregunta que el operador realmente se hace.
+
+
+def test_copy_reports_duration_for_applied_table(monkeypatch, tmp_path):
+    _setup_sqlite_env(monkeypatch, tmp_path, [(1, "a"), (2, "b")])
+    results = _copy(specs=[_spec()])
+    assert results[0].status == "applied"
+    assert isinstance(results[0].duration_ms, int)
+    assert results[0].duration_ms >= 0
+
+
+def test_copy_reports_duration_even_when_the_table_fails(monkeypatch, tmp_path):
+    """
+    Una tabla que tardó tres minutos ANTES de reventar es un dato de diagnóstico. Descartar la
+    duración en el camino de fallo dejaría el reporte ciego justo en el caso que más se
+    investiga.
+    """
+    # Una fila que choca contra la PK del destino => INSERT plano => la tabla falla.
+    _setup_sqlite_env(monkeypatch, tmp_path, [(1, "a")], create_dest_rows=[(1, "ya estaba")])
+    results = _copy(specs=[_spec()])
+    assert results[0].status == "failed"
+    assert isinstance(results[0].duration_ms, int)
+    assert results[0].duration_ms >= 0
+
+
+
+# ── TIME con fracción de segundo: el defecto que el primer arreglo dejó pasar ──────
+def test_render_time_preserva_la_fraccion_de_segundo():
+    """
+    ``TIME(3)``/``TIME(6)`` tienen microsegundos y hay que copiarlos.
+
+    ``format_timedelta`` —el criterio de PRESENTACIÓN del proyecto— hace
+    ``int(total_seconds())`` y los tira. Usarlo para reinsertar convertía ``01:02:03.123456``
+    en ``01:02:03`` sin que nada fallara, porque la fase relaja el sql_mode estricto.
+    """
+    assert render_time_for_reinsert(
+        timedelta(hours=1, minutes=2, seconds=3, microseconds=123456)
+    ) == "01:02:03.123456"
+
+
+def test_render_time_negativo_con_fraccion_conserva_valor_y_signo():
+    """El peor caso del truncado: ``-00:00:00.5`` se volvía ``00:00:00``, sin valor ni signo."""
+    assert render_time_for_reinsert(timedelta(microseconds=-500000)) == "-00:00:00.500000"
+
+
+def test_render_time_sin_fraccion_no_agrega_ceros():
+    """Un TIME(0) no debe salir con ``.000000`` de más: sería ruido en el destino."""
+    assert render_time_for_reinsert(timedelta(hours=2)) == "02:00:00"
+    assert "." not in render_time_for_reinsert(timedelta(hours=838))
+
+
+def test_render_time_aplica_el_signo_al_TOTAL_no_a_las_horas():
+    """
+    Es exactamente el defecto de ``pymysql.escape_timedelta``, que rendea ``-01:30:00`` como
+    ``-2:30:00`` y ``-00:00:01`` como ``-1:59:59``. Valores válidos, silenciosos y distintos
+    del original.
+    """
+    assert render_time_for_reinsert(timedelta(hours=-1, minutes=-30)) == "-01:30:00"
+    assert render_time_for_reinsert(timedelta(seconds=-1)) == "-00:00:01"
+    assert render_time_for_reinsert(
+        -(timedelta(hours=838, minutes=59, seconds=59))
+    ) == "-838:59:59"
+
+
+def test_adapt_value_normaliza_timedelta_para_los_DOS_writers():
+    """
+    La normalización vive en ``_adapt_value`` y no en cada writer.
+
+    Si cada camino serializara por su cuenta, despachar una tabla al writer bulk o al legacy
+    cambiaría lo que queda escrito en el destino — que es justamente la clase de divergencia
+    silenciosa que ya nos costó dos bugs en este mismo tipo.
+    """
+    td = timedelta(hours=1, minutes=2, seconds=3, microseconds=123456)
+    adaptado = _adapt_value(td)
+    assert adaptado == "01:02:03.123456", "el legacy recibe el str ya normalizado"
+    assert _render_mysql_field(adaptado) == b"01:02:03.123456", "y el FIFO lo pasa tal cual"
+    # Y por el camino directo (defensa si alguien llama al render sin adaptar) da lo mismo.
+    assert _render_mysql_field(td) == b"01:02:03.123456"
+
+
+# ── Contabilidad de filas: que una tabla que pierde filas no diga `applied` ────────
+def test_verificar_filas_acepta_el_conteo_exacto():
+    _verificar_filas_cargadas("t", enviadas=10, cargadas=10)
+
+
+def test_verificar_filas_falla_si_el_motor_registro_menos():
+    """
+    El caso real: `LOAD DATA LOCAL` se comporta SIEMPRE como IGNORE y la fase relaja
+    STRICT_TRANS_TABLES, así que un truncado o una colisión de clave única descartan filas
+    sin error. Antes esto se reportaba `applied`.
+    """
+    with pytest.raises(_FilasPerdidas) as exc:
+        _verificar_filas_cargadas("clientes", enviadas=100, cargadas=98)
+    assert "100" in str(exc.value) and "98" in str(exc.value) and "clientes" in str(exc.value)
+
+
+def test_verificar_filas_con_upsert_solo_exige_que_no_falten():
+    """
+    Con `ON DUPLICATE KEY UPDATE` MySQL cuenta 2 por fila actualizada, así que exigir
+    igualdad daría falsos positivos y fallaría copias buenas.
+    """
+    _verificar_filas_cargadas("t", enviadas=10, cargadas=20, solo_minimo=True)
+    with pytest.raises(_FilasPerdidas):
+        _verificar_filas_cargadas("t", enviadas=10, cargadas=9, solo_minimo=True)
+
+
+def test_verificar_filas_sin_rowcount_no_falla():
+    """
+    Si el driver no expone `rowcount` se prefiere no verificar antes que fallar una copia
+    buena por una limitación del driver. `None` no es cero.
+    """
+    _verificar_filas_cargadas("t", enviadas=10, cargadas=None)
+
+
+def test_verificar_filas_cero_enviadas_cero_cargadas():
+    """Una tabla vacía es un caso legítimo, no un faltante."""
+    _verificar_filas_cargadas("t", enviadas=0, cargadas=0)
+
+
+# ── El pool de origen: que una tabla rota no contamine a las siguientes ────────────
+def test_una_tabla_fallida_invalida_SU_conexion_y_las_siguientes_se_copian(
+    monkeypatch, tmp_path
+):
+    """
+    El modo de fallo del pool, y la razón por la que este test existe.
+
+    Con una conexión reusada, una tabla que no termina bien deja un cursor a medio drenar.
+    Devolver esa conexión al pool haría que la tabla SIGUIENTE pague la lectura del resto de la
+    anterior o —peor— lea sus filas sobrantes. Eso no da error: da datos mal.
+
+    Por eso `_iter_source_rows` llama a `invalidate()` sobre ESA conexión cuando sale sin haber
+    agotado el cursor. Antes acá se hacía `dispose()` del pool entero desde `copy_tables`, que
+    además de impreciso habría tirado las conexiones sanas de las otras tablas.
+
+    Se verifica (a) que la conexión rota se invalide y (b) que la tabla siguiente se copie
+    COMPLETA, que es lo que se rompería si la conexión quedara envenenada.
+    """
+    rows = [(1, "uno"), (2, "dos")]
+    _setup_sqlite_env(monkeypatch, tmp_path, rows)
+
+    invalidadas = []
+    original = dc.database_connection
+
+    @contextmanager
+    def espia(*a, **kw):
+        with original(*a, **kw) as conn:
+            real = conn.invalidate
+
+            def _spy():
+                invalidadas.append(True)
+                real()
+
+            monkeypatch.setattr(conn, "invalidate", _spy, raising=False)
+            yield conn
+
+    monkeypatch.setattr(dc, "database_connection", espia)
+
+    # La PRIMERA no existe en el origen => falla ANTES de abrir cursor. La segunda es la tabla
+    # real y tiene que copiarse completa después.
+    results = _copy(specs=[_spec(table="no_existe"), _spec()])
+
+    assert [r.status for r in results] == ["failed", "applied"]
+    assert results[1].rows_copied == 2, "la tabla siguiente tiene que copiarse completa"
+
+
+def test_el_generador_no_invalida_cuando_agoto_el_cursor(monkeypatch, tmp_path):
+    """
+    El complemento del anterior: una tabla que terminó bien devuelve su conexión SANA al pool.
+
+    Si se invalidara siempre, el pool no serviría de nada — cada tabla volvería a pagar el
+    handshake, que es exactamente el costo que el pool existe para evitar.
+    """
+    _setup_sqlite_env(monkeypatch, tmp_path, [(1, "uno")])
+
+    invalidadas = []
+    original = dc.database_connection
+
+    @contextmanager
+    def espia(*a, **kw):
+        with original(*a, **kw) as conn:
+            real = conn.invalidate
+            monkeypatch.setattr(
+                conn, "invalidate", lambda: (invalidadas.append(True), real()), raising=False
+            )
+            yield conn
+
+    monkeypatch.setattr(dc, "database_connection", espia)
+    results = _copy(specs=[_spec()])
+
+    assert results[0].status == "applied"
+    assert invalidadas == [], "una tabla que agotó su cursor no debe invalidar la conexión"
+
+# ── Cancelación con staging: el reporte decía "copié N filas" con el destino vacío ──
+def test_cancelar_con_staging_reporta_CERO_filas_no_las_del_fifo():
+    """
+    Con staging, la tabla FINAL sigue vacía hasta el `INSERT ... SELECT`. Al cancelar, la
+    excepción salta desde adentro del `LOAD DATA`, o sea ANTES de esa sentencia: el destino
+    queda en cero pero `counter` tiene las filas escritas al FIFO.
+
+    Antes de este fix el reporte informaba esas filas — «copié 55.000» con cero en el destino.
+    El camino de ERROR ya estaba cubierto; el de cancelación, que es el más frecuente de los
+    dos, no.
+    """
+    conn = _FakeMySQLDestConn(final_rows=[])
+    counter = [0]
+
+    def cancelar_siempre():
+        return True
+
+    with pytest.raises(dc._Canceled):
+        dc._copy_writer_mysql(
+            conn, "mysql", _spec(), iter([("1", "a"), ("2", "b")]), 1,
+            None, cancelar_siempre, counter,
+        )
+
+    assert counter[0] == 0, "el destino quedó vacío: reportar filas del FIFO es mentir"
+    assert conn.tables.get("widget", []) == []
+    assert not any(name.startswith("_gw_stg_") for name in conn.tables)
+
+
+def test_cancelar_SIN_staging_conserva_el_conteo_parcial():
+    """
+    Sin staging el `LOAD DATA` escribe directo en la final, así que las filas que alcanzaron a
+    entrar SÍ están. Ponerlas en cero también sería mentir, en el otro sentido.
+    """
+    conn = _FakeMySQLDestConn(final_rows=[])
+    counter = [0]
+    spec = _spec(pk=[])  # sin PK ni UNIQUE => sin staging
+
+    with pytest.raises(dc._Canceled):
+        dc._copy_writer_mysql(
+            conn, "mysql", spec, iter([("1", "a"), ("2", "b")]), 1,
+            None, lambda: True, counter,
+        )
+
+    assert counter[0] >= 0

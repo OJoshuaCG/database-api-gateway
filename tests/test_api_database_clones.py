@@ -90,8 +90,11 @@ class _FakeAdapter:
         self.row_estimates: dict[str, int] = {}
         self.unknown_estimates: set[str] = set()
         self.charset_supported: bool | None = True
+        # Para fijar que el asistente de a una NO cachea el snapshot del origen.
+        self.snapshot_calls: list[str] = []
 
     def structural_snapshot(self, database):
+        self.snapshot_calls.append(database)
         return self.snaps.get(database, SchemaSnapshot(database=database, source_engine="mysql"))
 
     def list_databases(self):
@@ -148,12 +151,30 @@ class _FakeRunner:
         yield  # no-op en test (sin motor real que lockear)
 
     def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
-                      already_locked=False, stop_on_error=True, disable_fk_checks=False):
+                      already_locked=False, stop_on_error=True, disable_fk_checks=False,
+                      bulk=False):
         return [
             StatementResult(index=i, status="applied", error=None, execution_ms=1,
                             executed_at=datetime.now(timezone.utc))
             for i in range(len(statements))
         ]
+
+
+class _RecordingRunner(_FakeRunner):
+    """Registra los kwargs de cada execute_adhoc, para afirmar el timeout que se pidió."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
+                      already_locked=False, stop_on_error=True, disable_fk_checks=False,
+                      bulk=False):
+        self.calls.append({"bulk": bulk, "statements": len(statements)})
+        return super().execute_adhoc(
+            target, db_name=db_name, engine=engine, lock_key=lock_key,
+            statements=statements, already_locked=already_locked,
+            stop_on_error=stop_on_error, disable_fk_checks=disable_fk_checks, bulk=bulk,
+        )
 
 
 def _fake_copy_tables(*, specs, **kwargs):
@@ -333,7 +354,8 @@ def test_clean_mode_objects_disables_fk_checks_only_during_cleanup(admin_client,
 
     class _RecordingRunner(_FakeRunner):
         def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
-                          already_locked=False, stop_on_error=True, disable_fk_checks=False):
+                          already_locked=False, stop_on_error=True, disable_fk_checks=False,
+                      bulk=False):
             calls.append(("clean" if disable_fk_checks else "other", disable_fk_checks))
             return super().execute_adhoc(
                 target, db_name=db_name, engine=engine, lock_key=lock_key,
@@ -446,7 +468,8 @@ def test_structure_failure_marks_job_failed(admin_client, monkeypatch):
 
     class _FailingRunner(_FakeRunner):
         def execute_adhoc(self, target, *, db_name, engine, lock_key, statements,
-                          already_locked=False, stop_on_error=True, disable_fk_checks=False):
+                          already_locked=False, stop_on_error=True, disable_fk_checks=False,
+                      bulk=False):
             return [StatementResult(index=0, status="failed", error="boom",
                                     execution_ms=1, executed_at=datetime.now(timezone.utc))]
 
@@ -476,3 +499,195 @@ def test_adopt_target_requires_owner(admin_client, monkeypatch):
         "adopt_target": True,
     })
     assert r.status_code == 422, r.text
+
+
+# --------------------------------------------------------------------------- #
+# Timeout de las fases de DDL                                                  #
+# --------------------------------------------------------------------------- #
+def test_ddl_phases_ask_for_the_bulk_timeout(admin_client, monkeypatch):
+    """
+    Limpieza y estructura tienen que pedir ``bulk=True``.
+
+    Con el default (``bulk=False``) esas fases corren con el timeout INTERACTIVO de 15 s,
+    que en MySQL es un ``read_timeout`` de SOCKET del cliente: al expirar, la conexión se
+    rompe MIENTRAS EL MOTOR SIGUE TRABAJANDO. El gateway registra un fallo de una sentencia
+    que en realidad se va a completar y, con ``stop_on_error=True``, el clon entero muere.
+    Un ``DROP TABLE`` de una tabla grande en ``clean_mode='objects'`` lo excede sin esfuerzo.
+    """
+    _install(monkeypatch)
+    runner = _RecordingRunner()
+    monkeypatch.setattr(cc, "MigrationRunner", lambda: runner)
+
+    sid = _server(admin_client, 3306)
+    tid = _server(admin_client, 3307)
+    oid = _owner(admin_client, sid)
+    _managed(admin_client, sid, oid, "src_db")
+
+    r = admin_client.post(
+        "/api/v1/database-clones",
+        json={
+            "source_server_id": sid, "source_database_name": "src_db",
+            "target_server_id": tid, "target_database_name": "dst_db",
+            "target_mode": "new", "include_data": False,
+        },
+    )
+    assert r.status_code == 201, r.text
+    _preview_and_execute(admin_client, r.json()["data"]["id"])
+
+    assert runner.calls, "no se ejecutó ninguna fase de DDL"
+    sin_bulk = [c for c in runner.calls if not c["bulk"]]
+    assert not sin_bulk, f"{len(sin_bulk)} llamada(s) de DDL con el timeout interactivo de 15 s"
+
+
+# --------------------------------------------------------------------------- #
+# Historial (GET /database-clones) — el endpoint sin el cual un clon queda     #
+# INALCANZABLE: el id solo vivía en la memoria del navegador.                  #
+# --------------------------------------------------------------------------- #
+def _plan(admin_client, sid, tid, source="src_db", target="dst_db"):
+    r = admin_client.post(
+        "/api/v1/database-clones",
+        json={
+            "source_server_id": sid, "source_database_name": source,
+            "target_server_id": tid, "target_database_name": target,
+            "target_mode": "new", "include_data": False,
+        },
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["data"]["id"]
+
+
+def test_history_lists_newest_first(admin_client, monkeypatch):
+    _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+    primero = _plan(admin_client, sid, tid, target="c1")
+    segundo = _plan(admin_client, sid, tid, target="c2")
+
+    r = admin_client.get("/api/v1/database-clones")
+    assert r.status_code == 200, r.text
+    assert [j["id"] for j in r.json()["data"]][:2] == [segundo, primero]
+    assert r.json()["pagination"]["total"] == 2
+
+
+def test_history_exposes_copy_intent_not_only_include_data(admin_client, monkeypatch):
+    """`include_data` no distingue `data_only` de `structure_only`: el historial necesita el real."""
+    _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+    _plan(admin_client, sid, tid)
+    fila = admin_client.get("/api/v1/database-clones").json()["data"][0]
+    assert fila["copy_intent"] == "structure_only"
+    assert fila["include_data"] is False
+
+
+def test_history_filters_by_status(admin_client, monkeypatch):
+    _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+    _plan(admin_client, sid, tid)
+    assert len(admin_client.get("/api/v1/database-clones?status=pending").json()["data"]) == 1
+    assert admin_client.get("/api/v1/database-clones?status=succeeded").json()["data"] == []
+
+
+def test_history_search_matches_either_side(admin_client, monkeypatch):
+    """Un solo campo de búsqueda: el operador no sabe de qué lado estaba el nombre que recuerda."""
+    _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+    _plan(admin_client, sid, tid, target="ventas_copia")
+
+    por_destino = admin_client.get("/api/v1/database-clones?search=ventas").json()["data"]
+    por_origen = admin_client.get("/api/v1/database-clones?search=src").json()["data"]
+    assert len(por_destino) == 1 and len(por_origen) == 1
+    assert admin_client.get("/api/v1/database-clones?search=nada").json()["data"] == []
+
+
+def test_history_duration_is_null_until_finished_and_set_after(admin_client, monkeypatch):
+    _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+    oid = _owner(admin_client, sid)
+    _managed(admin_client, sid, oid, "src_db")
+    job_id = _plan(admin_client, sid, tid)
+
+    sin_ejecutar = admin_client.get("/api/v1/database-clones").json()["data"][0]
+    assert sin_ejecutar["duration_ms"] is None
+
+    _preview_and_execute(admin_client, job_id)
+    ejecutado = admin_client.get("/api/v1/database-clones").json()["data"][0]
+    assert ejecutado["status"] == "succeeded"
+    assert isinstance(ejecutado["duration_ms"], int) and ejecutado["duration_ms"] >= 0
+
+
+def test_history_reports_batch_membership(admin_client, monkeypatch):
+    """
+    `batch_id`/`batch_seq` salen de un LEFT JOIN contra `clone_batch_items`, porque la
+    relación vive de ese lado. Sin ese dato, los N hijos de un lote son N filas
+    indistinguibles de clones sueltos y entierran el historial.
+    """
+    from app.controllers.clone_batch_controller import CloneBatchController
+    from app.models.clone_batch import CloneBatchItem
+
+    _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+    job_id = _plan(admin_client, sid, tid)
+
+    # Se ata el job a un lote a mano: acá se prueba el JOIN del listado, no el recorrido.
+    controller = CloneBatchController()
+    session = controller._session()
+    try:
+        from datetime import datetime, timedelta, timezone
+        from app.models.clone_batch import CloneBatch
+
+        batch = CloneBatch(
+            source_server_id=sid, target_server_id=tid, copy_intent="structure_only",
+            total=1, expires_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            + timedelta(hours=1),
+        )
+        session.add(batch)
+        session.flush()
+        session.add(CloneBatchItem(
+            batch_id=batch.id, seq=3, source_database_name="src_db",
+            target_database_name="dst_db", target_mode="new", clone_job_id=job_id,
+        ))
+        session.commit()
+        batch_id = batch.id
+    finally:
+        session.close()
+
+    fila = admin_client.get("/api/v1/database-clones").json()["data"][0]
+    assert fila["batch_id"] == batch_id and fila["batch_seq"] == 3
+
+    # Y se pueden excluir, que es el default de la UI.
+    solo_sueltos = admin_client.get(
+        "/api/v1/database-clones?include_batch_children=false"
+    ).json()["data"]
+    assert solo_sueltos == []
+    solo_del_lote = admin_client.get(
+        f"/api/v1/database-clones?batch_id={batch_id}"
+    ).json()["data"]
+    assert [j["id"] for j in solo_del_lote] == [job_id]
+
+
+
+def test_el_asistente_de_a_una_NO_cachea_el_snapshot_del_origen(admin_client, monkeypatch):
+    """
+    La caché de snapshots que acelera el LOTE tiene que quedar apagada acá.
+
+    En el lote, ``create_plan``, ``preview`` y el rendeo del plan ocurren dentro de la misma
+    función y en el mismo segundo, así que compartir la foto del origen es correcto y ahorra el
+    costo dominante. En el asistente de a una las dispara el operador desde el navegador y
+    pueden mediar minutos: si se cachearan, el plan que confirma podría describir un origen que
+    ya cambió, y el operador estaría aprobando algo que no es lo que va a pasar.
+
+    Se cuenta que ``preview`` vuelva a fotografiar después de ``create_plan``. Es una invariante
+    de CORRECCIÓN, no de rendimiento: un cambio que "optimice" esto rompe la revalidación.
+    """
+    fake = _install(monkeypatch)
+    sid, tid = _server(admin_client, 3306), _server(admin_client, 3307)
+
+    job_id = _plan(admin_client, sid, tid)
+    tras_el_plan = fake.snapshot_calls.count("src_db")
+    assert tras_el_plan >= 1, "create_plan tiene que fotografiar el origen"
+
+    fake.snapshot_calls.clear()
+    pr = admin_client.post(f"/api/v1/database-clones/{job_id}/preview", json={})
+    assert pr.status_code == 200, pr.text
+    assert fake.snapshot_calls.count("src_db") >= 1, (
+        "preview volvió a usar una foto vieja: la caché del lote se filtró al asistente de a una"
+    )

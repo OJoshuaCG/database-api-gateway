@@ -182,3 +182,67 @@ def test_los_codigos_llevan_prefijo_de_recurso(catalogo):
         recurso, _, motivo = code.partition(".")
         assert recurso and motivo, code
         assert code == code.lower(), code
+
+
+# --------------------------------------------------------------------------- #
+# Lote de clonación                                                            #
+# --------------------------------------------------------------------------- #
+def test_los_codigos_del_lote_de_clon_estan_en_el_vocabulario_cerrado():
+    """
+    Todo ``CODE_BATCH_*`` tiene que estar en ``ERROR_CODES``. Sin esta afirmación, un código
+    nuevo puede emitirse sin entrar al vocabulario, y el cliente —que mapea por código— lo
+    recibe como desconocido y cae a un mensaje genérico justo cuando el error es específico.
+    """
+    from app.services.db_admin import clone_spec as cspec
+
+    batch_codes = {v for k, v in vars(cspec).items() if k.startswith("CODE_BATCH_")}
+    assert batch_codes, "no se encontró ningún código de lote"
+    assert batch_codes <= cspec.ERROR_CODES
+    # Comparten el namespace del módulo a propósito: el lote es la orquestación del clon, no
+    # otro módulo, y un vocabulario aparte obligaría al cliente a mantener dos diccionarios.
+    assert all(code.startswith("clone.") for code in batch_codes)
+
+
+def test_el_lote_emite_su_codigo_en_public_context(admin_client):
+    """
+    El código viaja en ``public_context`` (visible SIEMPRE), no en ``context`` (solo en
+    development). Se comprueba sobre un error que no necesita motor: el tope de filas.
+    """
+    import app.controllers.clone_batch_controller as cbc
+
+    srv = admin_client.post(
+        "/api/v1/servers",
+        json={
+            "name": "srv-lote",
+            "host": "10.0.0.5",
+            "port": 3306,
+            "engine": "mysql",
+            "root_username": "root",
+            "root_password": "pw",
+        },
+    )
+    assert srv.status_code == 201, srv.text
+    sid = srv.json()["data"]["id"]
+
+    original = cbc.CLONE_BATCH_MAX_DATABASES
+    cbc.CLONE_BATCH_MAX_DATABASES = 1
+    try:
+        r = admin_client.post(
+            "/api/v1/database-clone-batches",
+            json={
+                "source_server_id": sid,
+                "target_server_id": sid,
+                "rows": [
+                    {"source_database_name": "a", "target_database_name": "x"},
+                    {"source_database_name": "b", "target_database_name": "y"},
+                ],
+            },
+        )
+    finally:
+        cbc.CLONE_BATCH_MAX_DATABASES = original
+
+    assert r.status_code == 422, r.text
+    pc = _pc(r)
+    assert pc["code"] == "clone.batch_too_large"
+    # Campos estructurados: el cliente arma el mensaje con ellos, no parseando la prosa.
+    assert pc["max_databases"] == 1 and pc["requested"] == 2

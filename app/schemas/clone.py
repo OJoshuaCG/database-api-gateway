@@ -380,6 +380,14 @@ class CloneSummaryOut(BaseModel):
     target_engine: str
     target_mode: str
     include_data: bool
+    copy_intent: str = Field(
+        CopyIntent.structure_only.value,
+        description=(
+            "La intención EFECTIVA del plan. Se expone además de `include_data` porque ese "
+            "booleano legacy no distingue 'data_only' de 'structure_only': un cliente que "
+            "derivara el modo de ahí mostraría mal la copia de solo datos."
+        ),
+    )
     clean_mode: str
     adopt_target: bool
     cross_engine: bool = False
@@ -392,6 +400,31 @@ class CloneSummaryOut(BaseModel):
     expires_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
+
+
+class CloneListItemOut(CloneSummaryOut):
+    """
+    Una fila del historial. Extiende el resumen con lo que solo tiene sentido en un listado.
+
+    ``batch_id``/``batch_seq`` salen de un LEFT JOIN contra ``clone_batch_items``, porque la
+    relación vive de ese lado: ``CloneJob`` no sabe que nació de un lote. Sin ese dato, los N
+    hijos de un lote son N filas indistinguibles de clones sueltos.
+    """
+
+    batch_id: int | None = Field(
+        None, description="Lote del que salió este clon. NULL = clon suelto."
+    )
+    batch_seq: int | None = Field(
+        None, description="Posición dentro del lote (1..N), para decir «fila 3 del lote #7»."
+    )
+    duration_ms: int | None = Field(
+        None,
+        description=(
+            "Duración total del job. Se calcula en el SERVIDOR y no se deriva en el cliente "
+            "porque es lo que habilita ordenar por él: «¿cuál fue el más lento?» no se "
+            "contesta ordenando la página visible. NULL si el job nunca arrancó o no terminó."
+        ),
+    )
 
 
 class CloneItemOut(BaseModel):

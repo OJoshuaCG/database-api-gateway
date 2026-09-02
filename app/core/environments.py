@@ -133,10 +133,34 @@ CLONE_TTL_HOURS = int(os.getenv("CLONE_TTL_HOURS", "24"))
 CLONE_MAX_WORKERS = int(os.getenv("CLONE_MAX_WORKERS", "2"))
 # Filas por lote en la copia de datos por streaming (lectura yield_per + escritura executemany).
 CLONE_DATA_BATCH_ROWS = int(os.getenv("CLONE_DATA_BATCH_ROWS", "1000"))
+
+# ¿La fase de datos del clon lee las N tablas de UNA sola foto del origen?
+#
+# Sin esto cada tabla abre su propio read view, o sea N fotos distintas: si el origen inserta un
+# padre y su hijo entre que se copia `padre` y se copia `hijo`, el destino queda con un huérfano
+# —y como el clon apaga las FKs del destino y nunca las revalida, lo reporta como exitoso.
+# Reproducido contra MySQL 8.0.
+#
+# El costo, que hay que conocer antes de apagarlo o dejarlo: sostener el read view impide el
+# purge del undo log en el ORIGEN —producción de un tercero— y retiene MDL compartido sobre las
+# tablas leídas, o sea bloquea su DDL mientras dura el clon. Es lo mismo que hace
+# `mysqldump --single-transaction`. Para clones de segundos o minutos no se nota; sobre un origen
+# muy escrito y un clon de horas, el tablespace del cliente crece.
+CLONE_CONSISTENT_SNAPSHOT = os.getenv("CLONE_CONSISTENT_SNAPSHOT", "True").lower() != "false"
 # Kill switch de la copia BULK NATIVA (COPY FROM STDIN en PostgreSQL, LOAD DATA LOCAL
 # INFILE en MySQL/MariaDB). True (default) usa el protocolo bulk del motor; False vuelve
 # al INSERT parametrizado por lotes (executemany) sin necesidad de re-desplegar código.
 CLONE_BULK_COPY_ENABLED = os.getenv("CLONE_BULK_COPY_ENABLED", "True").lower() == "true"
+# Cuántos LOTES de clonación corren a la vez. Las filas DENTRO de un lote van siempre en
+# serie, y eso no es configurable: el paralelismo entre bases multiplicaría el daño de un
+# error y la carga sobre el servidor destino sin un beneficio medido. Executor PROPIO, no el
+# de CLONE_MAX_WORKERS, para que un lote largo no deje sin turno a los clones sueltos.
+CLONE_BATCH_MAX_WORKERS = int(os.getenv("CLONE_BATCH_MAX_WORKERS", "1"))
+# Cuántas BASES DE DATOS puede pedir un lote. Es un límite de prudencia, no técnico: el costo
+# de planear no crece con este número (la lista de bases se consulta una vez por servidor, no
+# por fila), así que lo que acota es cuánto puede autorizar UNA sola confirmación sobre bases
+# de terceros. No confundir con CLONE_DATA_BATCH_ROWS, que sí cuenta filas de datos.
+CLONE_BATCH_MAX_DATABASES = int(os.getenv("CLONE_BATCH_MAX_DATABASES", "25"))
 
 # ======= Conversión de charset/collation (collation conversions) ======= #
 # Vida útil (horas) de un plan de conversión. Tras expirar, execute exige replanear.
