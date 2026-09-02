@@ -14,7 +14,11 @@ from app.controllers.server_database_controller import ServerDatabaseController
 from app.controllers.server_user_controller import ServerUserController
 from app.core.auth import AdminDep
 from app.core.limiter import limiter
-from app.schemas.grant import GrantableRequest, GrantableResult
+from app.schemas.grant import (
+    EngineUserGrantsOut,
+    GrantableRequest,
+    GrantableResult,
+)
 from app.schemas.query_console import (
     QueryExecuteIn,
     QueryExecuteOut,
@@ -244,6 +248,38 @@ def add_engine_user_host(admin: AdminDep, server_id: int, payload: AddHostIn):
     result = ServerUserController().add_host(server_id, payload.model_dump(), admin=admin)
     return success(
         data=result, message=f"Host '{payload.new_host}' agregado a '{payload.username}'."
+    )
+
+
+@router.get(
+    "/{server_id}/users/grants", response_model=ApiResponse[EngineUserGrantsOut]
+)
+def list_engine_user_grants(
+    admin: AdminDep,
+    server_id: int,
+    username: str = Query(..., description="Username del usuario en el motor."),
+    host: str = Query("%", description="Host de la identidad (ignorado en PostgreSQL)."),
+    database: str | None = Query(
+        None,
+        description=(
+            "Obligatorio en PostgreSQL: base de datos donde se consultan los grants de "
+            "objeto (tablas/columnas/secuencias/rutinas). En MySQL/MariaDB se IGNORA y "
+            "la respuesta trae los grants de todo el servidor: filtre por el campo "
+            "'object' de cada grant."
+        ),
+    ),
+):
+    """
+    Permisos de un usuario del motor por IDENTIDAD, esté o no adoptado. Read-only.
+
+    Devuelve un grant por objeto (nivel + objeto + privilegios), a diferencia de
+    ``GET /servers/{id}/databases/{db}/users``, que agrega todos los niveles en una sola
+    lista por usuario. 404 si la identidad no existe en el motor.
+    """
+    return success(
+        data=GrantController().list_grants_by_identity(
+            server_id, username, host, database
+        )
     )
 
 

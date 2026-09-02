@@ -28,6 +28,7 @@ from app.schemas.grant import (
     ApplyProfileBulkResult,
     ApplyProfileRequest,
     ApplyProfileResult,
+    EngineUserGrantsOut,
     GrantableRequest,
     GrantRequest,
     RevokeRequest,
@@ -36,6 +37,7 @@ from app.services import audit
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.dtos import EngineUserInfo, GrantInfo, GrantLevel, ObjectRef
 from app.services.db_admin.factory import get_adapter
+from app.services.db_admin.identifiers import validate_host, validate_identifier
 
 logger = get_logger(__name__)
 
@@ -105,6 +107,72 @@ class GrantController:
         finally:
             session.close()
         return adapter.list_grants(grantee, database=database)
+
+    def list_grants_by_identity(
+        self,
+        server_id: int,
+        username: str,
+        host: str | None = None,
+        database: str | None = None,
+    ) -> EngineUserGrantsOut:
+        """
+        Grants de un usuario por IDENTIDAD, sin fila de inventario.
+
+        ``list_grants`` (por ``user_id``) sirve solo para usuarios adoptados: el 404 sale
+        del inventario, no del motor. Pero el gateway administra servidores de terceros
+        donde la mayoría de las cuentas nunca pasaron por acá, y auditar los permisos de
+        una cuenta ajena no debería obligar a adoptarla primero (adoptar es un efecto de
+        escritura sobre el inventario para responder una pregunta de solo lectura).
+
+        Se valida la existencia REAL en el motor antes de introspeccionar: un typo en el
+        ``username`` devolvería una lista vacía, indistinguible de "existe y no tiene
+        ningún privilegio" — que es justo la conclusión peligrosa en una auditoría de
+        permisos. Cuesta un ``list_users()`` extra y lo vale.
+        """
+        session = self._session()
+        try:
+            server = get_server_or_404(session, server_id)
+            dialect = engine_value(server)
+            is_pg = dialect == "postgresql"
+            target = build_target(server)
+            effective_host = None if is_pg else (host or "%")
+
+            validate_identifier(username, dialect, "usuario", allow_existing=True)
+            if effective_host is not None:
+                validate_host(effective_host)
+
+            query = session.query(ServerUser).filter(
+                ServerUser.server_id == server_id,
+                ServerUser.username == username,
+            )
+            if not is_pg:
+                query = query.filter(ServerUser.host == effective_host)
+            row = query.first()
+            server_user_id = row.id if row else None
+        finally:
+            session.close()
+
+        adapter = get_adapter(target)
+        live = adapter.list_users()
+        if not any(
+            u.username == username and (is_pg or (u.host or "%") == effective_host)
+            for u in live
+        ):
+            raise AppHttpException(
+                message="El usuario no existe en el motor.",
+                status_code=404,
+                context={"username": username, "host": effective_host},
+            )
+
+        grantee = EngineUserInfo(username=username, host=effective_host)
+        grants = adapter.list_grants(grantee, database=database)
+        return EngineUserGrantsOut(
+            username=username,
+            host=effective_host,
+            status="adopted" if server_user_id is not None else "unmanaged",
+            server_user_id=server_user_id,
+            grants=grants,
+        )
 
     # ------------------------------------------------------------------ #
     # Grant                                                                #

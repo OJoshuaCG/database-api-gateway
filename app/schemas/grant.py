@@ -131,9 +131,29 @@ class ApplyProfileBulkResult(BaseModel):
     results: list[ApplyProfileBulkItemOut]
 
 
+# ─── Grants por IDENTIDAD (usuario adoptado o no) ───────────────────────────── #
+
+class EngineUserGrantsOut(BaseModel):
+    """
+    Grants de un usuario del motor consultados por IDENTIDAD (server_id + username +
+    host), sin exigir que esté adoptado en el inventario.
+
+    ``status`` cruza contra el inventario para que el frontend sepa si puede ofrecer las
+    acciones que sí requieren fila (``/server-users/{id}/...``) o si primero hay que
+    adoptar. No es un dato del motor: es del gateway.
+    """
+
+    username: str
+    host: str | None = None  # None en PostgreSQL (no tiene hosts)
+    status: str  # adopted | unmanaged
+    server_user_id: int | None = None
+    grants: list[GrantInfo] = Field(default_factory=list)
+
+
 # Re-export GrantInfo as the list-grants output type.
 __all__ = [
     "GrantRequest", "RevokeRequest", "GrantableRequest", "GrantableResult",
     "GrantInfo", "LevelObjectMapping", "ApplyProfileRequest", "ApplyProfileResult",
     "ApplyProfileBulkRequest", "ApplyProfileBulkItemOut", "ApplyProfileBulkResult",
+    "EngineUserGrantsOut",
 ]
