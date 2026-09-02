@@ -718,8 +718,13 @@ Tres barreras fail-closed antes de confiar en un manifiesto:
   ROB2). El mensaje ofrece las dos salidas reales: completar con `apply` (que retoma desde
   el checkpoint) o reconciliar.
 - **`GET /migrations/status`** informa `has_partial_application` y, por versión,
-  `applied_statements`/`total_statements`, si es `reconcilable` y `statements_to_undo`. El
-  frontend puede ofrecer el botón solo cuando sirve.
+  `applied_statements`/`total_statements`, `statements_to_undo` y **dos** flags:
+  `reconcilable` (se deshace todo) y `reconcilable_with_force` (hay reversos para parte de
+  lo aplicado, pero alguna sentencia no tiene ninguno: el endpoint lo acepta con
+  `force=true`). Son excluyentes, y el frontend tiene que ofrecer el botón con **cualquiera
+  de los dos** — mirando solo `reconcilable` esconde una salida que existe. Con ambos en
+  `false` no hay vía automática: ahí `reason` explica por qué y la UI debe habilitar el
+  `force` del `stamp`, que es lo único que queda.
 - **`POST /managed-databases/{id}/migrations/reconcile-partial`** deshace las sentencias que
   **sí** se aplicaron: ejecuta el reverso exacto de las k primeras, **en orden inverso**,
   hasta que el plano físico vuelve a coincidir con el ledger.
@@ -737,6 +742,26 @@ Tres barreras fail-closed antes de confiar en un manifiesto:
     override, una sola sentencia irreversible dejaría al admin sin salida automática.
   - Sin manifiesto responde **409 con el motivo**, nunca reconcilia a ciegas. La salida ahí
     sigue siendo reconciliar a mano + `stamp?force=true`.
+
+**La salida manual no es un caso de borde.** El manifiesto solo lo escribe la adopción por
+diff estructural y el `PATCH` que toca el SQL lo borra sin regenerarlo, así que **toda**
+migración escrita a mano o editada después de crearse queda permanentemente fuera de
+`reconcile-partial`. Para esas versiones —que son la mayoría de las escritas a mano— un
+apply que falla a mitad se resuelve así, y no hay atajo:
+
+1. `GET /migrations/status` para ver `applied_statements` de `total_statements`, y el
+   historial para saber **por qué** murió esa sentencia.
+2. Numerar las sentencias con el mismo criterio que el runner
+   (`MigrationRunner.statement_lists`, que sin manifiesto parte el blob con
+   `split_sql_statements`) — **contar `;` a ojo no sirve**: errar el corte significa
+   ejecutar a mano la sentencia equivocada.
+3. Completar hacia adelante las que faltan, y `stamp?version=<la parcial>&force=true`; o
+   deshacer a mano las aplicadas y `stamp?version=<la anterior>&force=true`, que en ese
+   caso solo sirve para limpiar el checkpoint y la cuarentena.
+
+Ojo con el orden: **el `stamp` va después de tocar el motor, nunca antes** — stampear la
+versión parcial sin haber completado sus sentencias es exactamente el anti-patrón de más
+abajo.
 
 ### Efecto secundario bueno: cuerpos procedurales resumibles
 

@@ -394,6 +394,11 @@ La UI del panel de migraciones debe:
 - Por cada entrada de `partial_application`, si `reconcilable: true`, ofrecer el botón
   "Reconciliar" → §10. Si `reconcilable: false`, mostrar `reason` (texto explicando por qué
   no se puede automáticamente) y sugerir reintentar `apply` o resolución manual.
+  > **Corregido después:** esta regla de dos estados dejaba a la SPA sin salida cuando la
+  > parcial no era reconciliable (escondía el botón Y deshabilitaba el `stamp force`).
+  > Hoy son TRES estados y el flag `reconcilable_with_force` decide el del medio —
+  > **la regla vigente es la tabla de `api-reference.md`** (sección de aplicación parcial),
+  > que es el consolidado que absorbió este addendum. No implementes desde acá.
 - **Bloquear/advertir sobre `rollback` mientras `has_partial_application: true`** — el
   backend ya lo rechaza con 409, pero es mejor UX deshabilitar el botón con un tooltip que
   explique por qué, en vez de dejar que el usuario lo intente y reciba el error.

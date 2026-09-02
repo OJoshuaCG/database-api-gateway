@@ -1543,7 +1543,8 @@ reconciliación parcial. La única forma confiable de distinguirlos es consultar
   "partial_application": [
     { "version": "0008", "model_migration_id": 20,
       "applied_statements": 6, "total_statements": 12,
-      "reconcilable": true, "reason": null, "statements_to_undo": 6 }
+      "reconcilable": true, "reconcilable_with_force": false,
+      "reason": null, "statements_to_undo": 6 }
   ] }
 ```
 
@@ -1551,6 +1552,23 @@ Puede haber **más de una entrada** en `partial_application[]` (migraciones dist
 que quedaron a medias en momentos distintos). `reconcile-partial` solo resuelve **la de
 versión más alta** por llamada — si hay varias, hace falta iterar de la más alta a la
 más baja.
+
+**Son TRES estados, no dos.** Tratarlos como dos deja al operador sin salida visible:
+
+| `reconcilable` | `reconcilable_with_force` | Qué ofrecer |
+|---|---|---|
+| `true` | `false` | «Reconciliar» normal: se deshace todo lo aplicado. |
+| `false` | `true` | «Reconciliar» **exigiendo `force`**: hay reversos para parte de lo aplicado y alguna sentencia no tiene ninguno, así que esos cambios quedan en la BD. El endpoint lo acepta con `force=true` — la UI **tiene** que ofrecerlo. |
+| `false` | `false` | **No hay vía automática.** Mostrar `reason` y mandar a las dos salidas reales: reintentar `apply` (retoma del checkpoint) o arreglar el esquema a mano y declarar la versión con `stamp?force=true`. |
+
+`reason` viene poblado siempre que `reconcilable` sea `false`, **incluido el caso del
+medio**: es lo único que explica por qué la vía normal no está disponible y qué va a
+quedar sin deshacer.
+
+⚠️ **Con los dos flags en `false`, el `force` del `stamp` NO se puede deshabilitar en la
+UI**: es la única salida que queda. Deshabilitarlo "porque hay una aplicación parcial"
+—y a la vez sugerir «Reconciliar», que en ese estado no existe— cierra el círculo y deja
+la BD sin forma de salir del estado desde la interfaz.
 
 #### `POST .../migrations/reconcile-partial` — deshacer a mano una aplicación parcial
 
@@ -1596,9 +1614,16 @@ estado que el ledger ya afirma.
 
 **Requiere que la versión tenga manifiesto de sentencias** (lo tienen las versiones
 adoptadas desde un diff estructural — [§10](#10-comparación-de-esquemas-entre-bds-schema-comparisons)).
-Sin él, `reconcilable: false` con un `reason` explicando por qué, y la salida es
-reintentar `apply` (retoma del checkpoint) o `stamp?force=true` tras reconciliar a
-mano.
+Sin él, `reconcilable: false` **y** `reconcilable_with_force: false`, con un `reason`
+explicando por qué, y este endpoint responde `409`: no hay ningún reverso que ejecutar.
+Las salidas son reintentar `apply` (retoma del checkpoint) o `stamp?force=true` tras
+reconciliar a mano.
+
+El manifiesto no se puede regenerar: solo lo escribe la adopción por diff estructural, y
+un `PATCH` que cambie el SQL lo **borra** a propósito (un manifiesto desalineado haría
+que la reconciliación deshiciera la sentencia equivocada). Así que una migración escrita
+a mano, o editada después de crearse, **nunca** va a ser reconciliable automáticamente —
+para esas versiones la salida manual no es un caso de borde, es el camino normal.
 
 #### ⚠️ El anti-patrón que la UI nunca debe sugerir
 
