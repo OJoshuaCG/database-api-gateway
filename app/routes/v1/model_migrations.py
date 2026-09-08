@@ -5,6 +5,8 @@ CRUD de migraciones sobre el inventario del gateway (NO toca motores) y el apply
 masivo (síncrono, acotado) sobre todas las BDs del blueprint.
 """
 
+from typing import Literal
+
 from fastapi import APIRouter, Path, Query, Request
 
 from app.controllers.managed_migration_controller import ManagedMigrationController
@@ -36,9 +38,20 @@ _VERSION_PATH = Path(..., pattern=r"^\d{4,10}$", description="Versión: 0001, 00
     "/{model_id}/migrations",
     response_model=ApiResponse[list[ModelMigrationSummary]],
 )
-def list_migrations(admin: AdminDep, model_id: int, pagination: PaginationDep):
+def list_migrations(
+    admin: AdminDep,
+    model_id: int,
+    pagination: PaginationDep,
+    order: Literal["asc", "desc"] = Query(
+        "asc",
+        description=(
+            "Orden por número de versión. 'desc' pone la PUNTA en la primera página, para "
+            "abrir un catálogo largo sobre las versiones recientes sin conocer 'pages'."
+        ),
+    ),
+):
     items, total = ModelMigrationController().list_migrations(
-        model_id, limit=pagination.size, offset=pagination.offset
+        model_id, limit=pagination.size, offset=pagination.offset, order=order
     )
     return paginated(items, total=total, pagination=pagination)
 

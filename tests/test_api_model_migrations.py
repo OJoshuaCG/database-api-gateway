@@ -166,6 +166,74 @@ def test_list_and_get(admin_client):
     assert detail.json()["data"]["up_sql"].startswith("ALTER TABLE")
 
 
+def test_list_default_order_is_ascending(admin_client):
+    """El default NO cambia: 'asc' es el sentido en que apply recorre la secuencia."""
+    model_id = _new_model(admin_client, slug="orderasc", name="OrderAsc")
+    for v in ("0001", "0002", "0003"):
+        _create_migration(admin_client, model_id, version=v, name=f"m{v}")
+
+    items = admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations"
+    ).json()["data"]
+    assert [i["version"] for i in items] == ["0001", "0002", "0003"]
+
+
+def test_list_order_desc_puts_tip_on_first_page(admin_client):
+    """El motivo de existir de ?order=desc: la punta cae en la página 1 sin conocer 'pages'."""
+    model_id = _new_model(admin_client, slug="orderdesc", name="OrderDesc")
+    for v in ("0001", "0002", "0003"):
+        _create_migration(admin_client, model_id, version=v, name=f"m{v}")
+
+    body = admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations?order=desc&page=1&size=2"
+    ).json()
+    assert [i["version"] for i in body["data"]] == ["0003", "0002"]
+    assert body["pagination"]["total"] == 3
+    # La punta viaja en la primera página, que es justo lo que el orden ascendente impedía.
+    assert body["data"][0]["is_latest"] is True
+
+
+def test_list_rejects_unknown_order(admin_client):
+    model_id = _new_model(admin_client, slug="orderbad", name="OrderBad")
+    assert admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations?order=random"
+    ).status_code == 422
+
+
+def test_is_latest_marks_the_tip_on_any_page(admin_client):
+    """is_latest se resuelve sobre TODO el catálogo, no sobre la página que tocó."""
+    model_id = _new_model(admin_client, slug="tipflag", name="TipFlag")
+    for v in ("0001", "0002", "0003"):
+        _create_migration(admin_client, model_id, version=v, name=f"m{v}")
+
+    # Página que NO contiene la punta: ningún ítem puede afirmar serlo.
+    page1 = admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations?page=1&size=2"
+    ).json()["data"]
+    assert [i["version"] for i in page1] == ["0001", "0002"]
+    assert [i["is_latest"] for i in page1] == [False, False]
+
+    # Última página: la punta se identifica aunque sea el único ítem de la página.
+    page2 = admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations?page=2&size=2"
+    ).json()["data"]
+    assert [i["version"] for i in page2] == ["0003"]
+    assert page2[0]["is_latest"] is True
+
+
+def test_is_latest_uses_numeric_order_not_lexicographic(admin_client):
+    """'0010' es posterior a '0009' aunque ordene antes como texto (§8)."""
+    model_id = _new_model(admin_client, slug="tipnum", name="TipNum")
+    for v in ("0009", "0010"):
+        _create_migration(admin_client, model_id, version=v, name=f"m{v}")
+
+    items = admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations"
+    ).json()["data"]
+    latest = [i["version"] for i in items if i["is_latest"]]
+    assert latest == ["0010"]
+
+
 def test_get_missing_version_404(admin_client):
     model_id = _new_model(admin_client, slug="missing", name="Missing")
     assert admin_client.get(

@@ -134,9 +134,10 @@ class ModelMigrationController:
         }
 
     @staticmethod
-    def _serialize_summary(m: ModelMigration, policy: dict) -> dict:
+    def _serialize_summary(m: ModelMigration, policy: dict, *, is_latest: bool = False) -> dict:
         return {
             **policy,
+            "is_latest": is_latest,
             "id": m.id,
             "model_id": m.model_id,
             "version": m.version,
@@ -757,18 +758,43 @@ class ModelMigrationController:
     # Lectura                                                             #
     # ------------------------------------------------------------------ #
     def list_migrations(
-        self, model_id: int, *, limit: int, offset: int
+        self, model_id: int, *, limit: int, offset: int, order: str = "asc"
     ) -> tuple[list[dict], int]:
+        """
+        Página del catálogo de versiones, con ``is_latest`` resuelto sobre TODO el blueprint.
+
+        ``order="desc"`` existe para que un cliente pueda pedir la punta sin saber cuántas
+        páginas hay: con el orden ascendente —el default, que es el que respeta el sentido en
+        que ``apply`` recorre la secuencia— un blueprint de 53 versiones deja las 3 más nuevas
+        fuera de la primera página, que son justamente con las que se trabaja.
+
+        ``is_latest`` NO se deriva del ``ahead`` de ``_policy_flags``, aunque se le parezca:
+        aquel mira ``_cached_versions_by_model``, o sea las versiones donde están PARADAS las
+        BDs gestionadas, no las versiones del blueprint. ``not ahead`` significa "ninguna BD
+        está más adelante", que no es lo mismo que ser la punta. Se resuelve con una query
+        propia sobre ``q`` antes del ``limit/offset``: una sola, sin N+1, y válida en cualquier
+        página, así que el cliente deja de tener que inferir la punta del último ítem cargado.
+        """
         session = self._session()
         try:
             self._model_or_404(session, model_id)
             q = session.query(ModelMigration).filter(ModelMigration.model_id == model_id)
             total = q.count()
-            rows = q.order_by(*_VERSION_ORDER_ASC).limit(limit).offset(offset).all()
+            tip = q.order_by(*_VERSION_ORDER_DESC).first()
+            tip_version = tip.version if tip else None
+            sort = _VERSION_ORDER_DESC if order == "desc" else _VERSION_ORDER_ASC
+            rows = q.order_by(*sort).limit(limit).offset(offset).all()
             # La punta se busca sobre TODAS las versiones, no sobre la página: con paginación,
             # la última fila de la página no tiene por qué ser la última del blueprint.
             flags = self._policy_flags(session, rows)
-            return [self._serialize_summary(r, flags[r.id]) for r in rows], total
+            # Igualdad exacta y no ``_same_version``: aquel es fail-closed hacia "sí" ante un
+            # valor ilegible —criterio correcto para no borrar de más, pero acá marcaría como
+            # punta a una versión cualquiera, que es justo la afirmación falsa que esto viene a
+            # eliminar. Ambos valores salen de la misma columna, así que comparar alcanza.
+            return [
+                self._serialize_summary(r, flags[r.id], is_latest=r.version == tip_version)
+                for r in rows
+            ], total
         finally:
             session.close()
 

@@ -144,6 +144,13 @@ _REQUIRES_STAMPS_DESC = (
     "pista para elegir el diálogo de confirmación, no un veredicto. El plan autoritativo es "
     "GET /database-models/{model_id}/migrations/{version}/delete-plan."
 )
+_IS_LATEST_DESC = (
+    "True = es la PUNTA del blueprint, la versión de mayor número. Se resuelve sobre todo el "
+    "catálogo y no sobre la página, así que es válido en cualquier página y con cualquier "
+    "'order': el cliente NO debe inferir la punta del último ítem que recibió. No lo hagas "
+    "equivalente a delete_requires_stamps invertido, que mira dónde están paradas las BDs "
+    "gestionadas y no el catálogo de versiones."
+)
 
 
 class ModelMigrationSummary(BaseModel):
@@ -156,6 +163,7 @@ class ModelMigrationSummary(BaseModel):
     block_reason: str | None = Field(None, description=_BLOCK_REASON_DESC)
     delete_requires_stamps: bool = Field(False, description=_REQUIRES_STAMPS_DESC)
     sql_diverged: bool = Field(False, description=_SQL_DIVERGED_DESC)
+    is_latest: bool = Field(False, description=_IS_LATEST_DESC)
 
     id: int
     model_id: int
