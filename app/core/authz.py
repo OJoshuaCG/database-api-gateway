@@ -87,10 +87,15 @@ def get_current_actor(request: Request) -> Actor:
     except ValueError:
         base = GatewayRole.VIEWER
 
-    overrides: dict[int, GatewayRole] = {}
-    for scope_id, role in (ctx["overrides"] or {}).items():
+    grants: list[tuple[str, int, GatewayRole]] = []
+    for scope_type, scope_id, role in ctx["grants"] or []:
+        # Un alcance de tipo desconocido se DESCARTA, no se degrada a otro tipo: si mañana
+        # aparece un `scope_type` que este código no conoce, tratarlo como entorno sería
+        # aplicar una restricción —o un permiso— sobre un objeto equivocado.
+        if scope_type not in ("environment", "server"):
+            continue
         try:
-            overrides[int(scope_id)] = GatewayRole(role)
+            grants.append((scope_type, int(scope_id), GatewayRole(role)))
         except (TypeError, ValueError):
             continue
 
@@ -105,7 +110,7 @@ def get_current_actor(request: Request) -> Actor:
         user_id=user["id"],
         username=user["username"],
         role=base,
-        overrides=overrides,
+        grants=grants,
         globals_=frozenset(globals_),
     )
 

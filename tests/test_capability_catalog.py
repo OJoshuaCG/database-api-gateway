@@ -273,10 +273,31 @@ def test_admin_actor_capabilities_come_from_the_union_role():
         user_id=1,
         username="ana",
         role=GatewayRole.VIEWER,
-        overrides={3: GatewayRole.OPERATOR},
+        grants=[("environment", 3, GatewayRole.OPERATOR)],
     )
     assert actor.role is GatewayRole.OPERATOR
     assert actor.capabilities == ROLE_CAPABILITIES[GatewayRole.OPERATOR]
+
+
+def test_admin_actor_keeps_the_scope_type_of_each_grant():
+    """
+    El ``scope_type`` tiene que SOBREVIVIR al acuñado del actor. La versión anterior recibía un
+    dict ``{scope_id: role}`` y lo perdía, así que un grant de servidor se leía como uno de
+    entorno — y el entorno 3 y el servidor 3 son cosas distintas. Para la unión daba igual
+    (solo mira los roles), pero la capa 2 resuelve por destino y ahí el tipo ES la pregunta.
+    """
+    actor = admin_actor(
+        user_id=1,
+        username="ana",
+        role=GatewayRole.VIEWER,
+        grants=[
+            ("environment", 3, GatewayRole.OPERATOR),
+            ("server", 3, GatewayRole.OWNER),
+        ],
+    )
+    assert ("environment", 3, GatewayRole.OPERATOR) in actor.scope_roles
+    assert ("server", 3, GatewayRole.OWNER) in actor.scope_roles
+    assert len(actor.scope_roles) == 2, "los dos alcances colapsaron en uno"
 
 
 def test_global_capabilities_add_on_top_of_the_role():

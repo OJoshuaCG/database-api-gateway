@@ -239,8 +239,14 @@ class UserModel:
         revocar, porque el ``SessionMiddleware`` re-firma en cada respuesta y una sesión activa
         no expira nunca.
 
-        Devuelve ``{"role": str, "overrides": {scope_id: role}, "globals": [str]}``. Un usuario
-        sin filas devuelve overrides y globals vacíos, que es el lado seguro: el rol base manda.
+        Devuelve ``{"role": str, "grants": [(scope_type, scope_id, role)], "globals": [str]}``.
+        Un usuario sin filas devuelve listas vacías, que es el lado seguro: el rol base manda.
+
+        **``grants`` conserva el ``scope_type``, y eso no es un detalle.** La versión anterior
+        devolvía un dict ``{scope_id: role}`` y perdía el tipo, así que un grant con alcance de
+        SERVIDOR se leía como si fuera de entorno: el entorno 3 y el servidor 3 son cosas
+        distintas y colisionaban en silencio. Para la capa 1 era inocuo —solo mira los valores—
+        pero la capa 2 resuelve por destino y ahí el tipo ES la pregunta.
 
         Los dos ``SELECT`` de lista pasan ``fetchone=False`` EXPLÍCITO y no lo omiten: el
         contrato de ``execute_query`` devuelve ``lastrowid``/``rowcount`` —o sea un ``int``—
@@ -271,7 +277,7 @@ class UserModel:
         )
         return {
             "role": (row or {}).get("gateway_role") or "viewer",
-            "overrides": {g["scope_id"]: g["role"] for g in grants},
+            "grants": [(g["scope_type"], g["scope_id"], g["role"]) for g in grants],
             "globals": [g["capability"] for g in globals_],
         }
     def count(self, is_active: bool | None = None) -> int:

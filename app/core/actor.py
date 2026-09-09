@@ -78,7 +78,8 @@ class Actor:
     global_capabilities: frozenset[GlobalCapability] = field(default_factory=frozenset)
     token_id: str | None = None
     project_id: int | None = None
-    #: Rol por alcance (``{scope_id: role}``). La capa 2 lo usa para resolver el destino.
+    #: Grants por alcance, TIPADOS: ``(scope_type, scope_id, role)``. La capa 2 los usa para
+    #: resolver el destino, y ahí el tipo importa — el entorno 3 y el servidor 3 son distintos.
     scope_roles: frozenset[tuple[str, int, GatewayRole]] = field(default_factory=frozenset)
 
     def has(self, capability: Capability) -> bool:
@@ -95,18 +96,23 @@ def admin_actor(
     user_id: int,
     username: str,
     role: GatewayRole,
-    overrides: dict[int, GatewayRole] | None = None,
+    grants: "list[tuple[str, int, GatewayRole]] | None" = None,
     globals_: frozenset[GlobalCapability] = frozenset(),
 ) -> Actor:
     """
     Actor de un administrador humano.
 
-    ``capabilities`` sale del rol UNIÓN (el máximo sobre el rol base y los overrides por
-    alcance) más lo que aporten las capacidades globales. La unión responde "¿podría, en algún
+    ``capabilities`` sale del rol UNIÓN (el máximo sobre el rol base y los grants por alcance)
+    más lo que aporten las capacidades globales. La unión responde "¿podría, en algún
     alcance?"; el alcance concreto lo decide la capa 2, en el resolvedor de destino.
+
+    ``grants`` llega TIPADO —``(scope_type, scope_id, role)``— y no como un dict por id. La
+    versión anterior perdía el ``scope_type`` y con eso un grant de servidor se leía como uno
+    de entorno: el entorno 3 y el servidor 3 son cosas distintas. Para la unión da igual
+    (solo mira los roles), pero la capa 2 resuelve por destino y ahí el tipo ES la pregunta.
     """
-    ov = overrides or {}
-    effective = union_role(role, ov)
+    gr = list(grants or [])
+    effective = union_role(role, {i: r for i, (_, _, r) in enumerate(gr)})
     caps = set(role_capabilities(effective))
     from app.services.capability_catalog import GLOBAL_CAPABILITIES
 
@@ -119,7 +125,7 @@ def admin_actor(
         capabilities=frozenset(caps),
         role=effective,
         global_capabilities=frozenset(globals_),
-        scope_roles=frozenset(("environment", k, v) for k, v in ov.items()),
+        scope_roles=frozenset(gr),
     )
 
 
