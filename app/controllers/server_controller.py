@@ -29,6 +29,7 @@ from app.models.enums import EngineType, ServerStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.server import Server
 from app.models.server_user import ServerUser
+from app.services import audit
 from app.services.db_admin.dtos import (
     ConnectionInfo,
     EngineUserInfo,
@@ -124,7 +125,20 @@ class ServerController:
         finally:
             session.close()
 
-    def create_server(self, data: dict) -> dict:
+    def create_server(self, data: dict, *, admin: dict | None = None) -> dict:
+        """
+        Registra un servidor en el inventario, con su credencial pseudo-root cifrada.
+
+        AUDITADO, y no es un detalle: registrar un servidor es aportarle al gateway una
+        credencial pseudo-root y un host, así que es la operación de mayor privilegio del
+        plano de control. Este controller no auditaba NADA — era el único camino del repo que
+        combinaba máximo privilegio con cero rastro. Nunca se registra la contraseña ni su
+        cifrado: solo que la operación ocurrió y sobre qué fila.
+
+        ``touched_engine=False`` a propósito: ``validate_remote_host`` resuelve DNS para el
+        guard anti-SSRF pero no abre ninguna conexión al motor. El flag significa "contactó el
+        motor", y acá no se contacta.
+        """
         # Anti-SSRF: validar el destino ANTES de persistir/conectar.
         validate_remote_host(data["host"])
         session = self._session()
@@ -145,36 +159,80 @@ class ServerController:
                 session.commit()
             except IntegrityError as exc:
                 session.rollback()
+                audit.record(
+                    "server.create",
+                    status="error",
+                    admin=admin,
+                    target_type="server",
+                    detail="nombre o host:puerto duplicado",
+                )
                 raise AppHttpException(
                     message="Ya existe un servidor con ese nombre o host:puerto.",
                     status_code=409,
                     context={"name": data.get("name")},
                 ) from exc
             session.refresh(server)
-            return self._serialize(server)
+            result = self._serialize(server)
+            audit.record(
+                "server.create",
+                admin=admin,
+                target_type="server",
+                target_id=server.id,
+                server_id=server.id,
+                detail=f"alta de servidor '{server.name}' ({server.engine.value})",
+            )
+            return result
         finally:
             session.close()
 
-    def update_server(self, server_id: int, data: dict) -> dict:
+    def update_server(self, server_id: int, data: dict, *, admin: dict | None = None) -> dict:
+        """
+        Edita un servidor del inventario.
+
+        AUDITADO con la lista de campos que cambiaron, porque **editar un servidor puede
+        re-apuntar un ``server_id`` existente a un host que el editor controla**: desde ese
+        momento toda operación futura sobre ese id se ejecuta contra su máquina. El guard
+        anti-SSRF limita a DÓNDE se puede apuntar, no QUIÉN puede hacerlo, así que el rastro
+        de qué cambió es el único control que queda hasta que exista autorización por
+        capacidad (ver ``docs/plans/13-usuarios-y-autorizacion-del-gateway.md`` §4.6).
+
+        El ``detail`` lista NOMBRES de campo, nunca valores: ``root_password`` aparece como
+        "credencial rotada" y jamás su contenido.
+        """
         # Anti-SSRF: si cambia el host, validar el nuevo destino.
         if data.get("host") is not None:
             validate_remote_host(data["host"])
         session = self._session()
         try:
             server = self._get_or_404(session, server_id)
+            changed: list[str] = []
             for field in ("name", "host", "port", "notes", "is_active", "root_username", "ssl_mode"):
                 if field in data:
+                    if getattr(server, field) != data[field]:
+                        changed.append(field)
                     setattr(server, field, data[field])
             if data.get("engine") is not None:
+                if server.engine != EngineType(data["engine"]):
+                    changed.append("engine")
                 server.engine = EngineType(data["engine"])
             if data.get("root_password"):
                 server.root_password_encrypted = self._encrypt_password(
                     data["root_password"]
                 )
+                changed.append("credencial rotada")
             try:
                 session.commit()
             except IntegrityError as exc:
                 session.rollback()
+                audit.record(
+                    "server.update",
+                    status="error",
+                    admin=admin,
+                    target_type="server",
+                    target_id=server_id,
+                    server_id=server_id,
+                    detail="nombre o host:puerto duplicado",
+                )
                 raise AppHttpException(
                     message="Ya existe un servidor con ese nombre o host:puerto.",
                     status_code=409,
@@ -184,18 +242,43 @@ class ServerController:
             result = self._serialize(server)
         finally:
             session.close()
+        audit.record(
+            "server.update",
+            admin=admin,
+            target_type="server",
+            target_id=server_id,
+            server_id=server_id,
+            detail=("cambió: " + ", ".join(changed)) if changed else "sin cambios efectivos",
+        )
         # Datos de conexión pudieron cambiar: descartar engines remotos cacheados.
         remote_engine.invalidate_server(server_id)
         return result
 
-    def delete_server(self, server_id: int) -> None:
+    def delete_server(self, server_id: int, *, admin: dict | None = None) -> None:
+        """
+        Borra un servidor del inventario. NO toca el motor.
+
+        AUDITADO: el borrado se lleva con él la credencial pseudo-root cifrada y, por
+        ``CASCADE``, el inventario de BDs y usuarios que colgaban de ese servidor. Se registra
+        el nombre antes de borrar, porque después de la operación la fila ya no existe y el
+        ``target_id`` suelto no le dice nada a quien lea el log.
+        """
         session = self._session()
         try:
             server = self._get_or_404(session, server_id)
+            name = server.name
             session.delete(server)
             session.commit()
         finally:
             session.close()
+        audit.record(
+            "server.delete",
+            admin=admin,
+            target_type="server",
+            target_id=server_id,
+            server_id=server_id,
+            detail=f"baja de servidor '{name}' del inventario",
+        )
         remote_engine.invalidate_server(server_id)
 
     # ------------------------------------------------------------------ #

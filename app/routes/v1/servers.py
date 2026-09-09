@@ -74,7 +74,7 @@ def list_servers(admin: AdminDep, pagination: PaginationDep):
 
 @router.post("", response_model=ApiResponse[ServerOut], status_code=201)
 def create_server(admin: AdminDep, payload: ServerCreate):
-    created = ServerController().create_server(payload.model_dump())
+    created = ServerController().create_server(payload.model_dump(), admin=admin)
     return success(data=created, message="Servidor registrado exitosamente.")
 
 
@@ -86,14 +86,14 @@ def get_server(admin: AdminDep, server_id: int):
 @router.patch("/{server_id}", response_model=ApiResponse[ServerOut])
 def update_server(admin: AdminDep, server_id: int, payload: ServerUpdate):
     updated = ServerController().update_server(
-        server_id, payload.model_dump(exclude_unset=True)
+        server_id, payload.model_dump(exclude_unset=True), admin=admin
     )
     return success(data=updated, message="Servidor actualizado.")
 
 
 @router.delete("/{server_id}", response_model=ApiResponse[None])
 def delete_server(admin: AdminDep, server_id: int):
-    ServerController().delete_server(server_id)
+    ServerController().delete_server(server_id, admin=admin)
     return empty("Servidor eliminado.")
 
 
