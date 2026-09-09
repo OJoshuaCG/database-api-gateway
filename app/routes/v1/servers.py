@@ -12,7 +12,19 @@ from app.controllers.query_console_controller import QueryConsoleController
 from app.controllers.server_controller import ServerController
 from app.controllers.server_database_controller import ServerDatabaseController
 from app.controllers.server_user_controller import ServerUserController
-from app.core.auth import AdminDep
+from app.core.authz import (
+    DatabasesDrop,
+    DatabasesRead,
+    DatabasesWrite,
+    EngineUsersDrop,
+    EngineUsersRead,
+    EngineUsersSecrets,
+    EngineUsersWrite,
+    ServersAdmin,
+    ServersRead,
+    SqlConsoleExecute,
+    SqlConsoleHistory,
+)
 from app.core.limiter import limiter
 from app.schemas.grant import (
     EngineUserGrantsOut,
@@ -65,7 +77,7 @@ router = APIRouter(prefix="/servers", tags=["Servers"])
 
 # ----------------------------- CRUD (gateway) ----------------------------- #
 @router.get("", response_model=ApiResponse[list[ServerOut]])
-def list_servers(admin: AdminDep, pagination: PaginationDep):
+def list_servers(actor: ServersRead, pagination: PaginationDep):
     items, total = ServerController().list_servers(
         limit=pagination.size, offset=pagination.offset
     )
@@ -73,43 +85,43 @@ def list_servers(admin: AdminDep, pagination: PaginationDep):
 
 
 @router.post("", response_model=ApiResponse[ServerOut], status_code=201)
-def create_server(admin: AdminDep, payload: ServerCreate):
-    created = ServerController().create_server(payload.model_dump(), admin=admin)
+def create_server(actor: ServersAdmin, payload: ServerCreate):
+    created = ServerController().create_server(payload.model_dump(), admin=actor)
     return success(data=created, message="Servidor registrado exitosamente.")
 
 
 @router.get("/{server_id}", response_model=ApiResponse[ServerOut])
-def get_server(admin: AdminDep, server_id: int):
+def get_server(actor: ServersRead, server_id: int):
     return success(data=ServerController().get_server(server_id))
 
 
 @router.patch("/{server_id}", response_model=ApiResponse[ServerOut])
-def update_server(admin: AdminDep, server_id: int, payload: ServerUpdate):
+def update_server(actor: ServersAdmin, server_id: int, payload: ServerUpdate):
     updated = ServerController().update_server(
-        server_id, payload.model_dump(exclude_unset=True), admin=admin
+        server_id, payload.model_dump(exclude_unset=True), admin=actor
     )
     return success(data=updated, message="Servidor actualizado.")
 
 
 @router.delete("/{server_id}", response_model=ApiResponse[None])
-def delete_server(admin: AdminDep, server_id: int):
-    ServerController().delete_server(server_id, admin=admin)
+def delete_server(actor: ServersAdmin, server_id: int):
+    ServerController().delete_server(server_id, admin=actor)
     return empty("Servidor eliminado.")
 
 
 # ----------------------- Operaciones en el destino ------------------------ #
 @router.post("/{server_id}/test-connection", response_model=ApiResponse[ConnectionInfo])
-def test_connection(admin: AdminDep, server_id: int):
+def test_connection(actor: ServersRead, server_id: int):
     return success(data=ServerController().test_connection(server_id))
 
 
 @router.get("/{server_id}/databases", response_model=ApiResponse[list[str]])
-def list_databases(admin: AdminDep, server_id: int):
+def list_databases(actor: DatabasesRead, server_id: int):
     return success(data=ServerController().list_databases(server_id))
 
 
 @router.get("/{server_id}/users", response_model=ApiResponse[list[EngineUserInfo]])
-def list_users(admin: AdminDep, server_id: int):
+def list_users(actor: EngineUsersRead, server_id: int):
     return success(data=ServerController().list_users(server_id))
 
 
@@ -119,7 +131,7 @@ def list_users(admin: AdminDep, server_id: int):
 @router.get(
     "/{server_id}/users/grouped", response_model=ApiResponse[GroupedEngineUsersOut]
 )
-def list_users_grouped(admin: AdminDep, server_id: int):
+def list_users_grouped(actor: EngineUsersRead, server_id: int):
     """
     Usuarios del motor AGRUPADOS por username (sin repetir el nombre por cada host) y
     cruzados con el inventario: cada host se marca adopted | unmanaged | orphan. En
@@ -133,14 +145,14 @@ def list_users_grouped(admin: AdminDep, server_id: int):
     response_model=ApiResponse[BatchAdoptOut],
     status_code=201,
 )
-def adopt_engine_user_all_hosts(admin: AdminDep, server_id: int, payload: AdoptAllHostsIn):
+def adopt_engine_user_all_hosts(actor: EngineUsersWrite, server_id: int, payload: AdoptAllHostsIn):
     """
     Adopta TODAS las identidades en vivo de un username en una sola operación (nunca
     ejecuta CREATE USER). Con ``known_password`` opcional, la guarda cifrada en todas
     las filas adoptadas para habilitar reveal-password (tampoco ejecuta ALTER USER).
     """
     result = ServerUserController().adopt_user_all_hosts(
-        server_id, payload.model_dump(), admin=admin
+        server_id, payload.model_dump(), admin=actor
     )
     return success(
         data=result, message=f"{result.adopted}/{result.total_hosts} hosts adoptados."
@@ -152,10 +164,10 @@ def adopt_engine_user_all_hosts(admin: AdminDep, server_id: int, payload: AdoptA
     response_model=ApiResponse[EngineUserActionOut],
     status_code=201,
 )
-def create_engine_user(admin: AdminDep, server_id: int, payload: EngineUserCreateIn):
+def create_engine_user(actor: EngineUsersWrite, server_id: int, payload: EngineUserCreateIn):
     """Crea un usuario en el motor (CREATE USER). Con ``adopt=true`` lo registra además en el inventario."""
     created = ServerUserController().create_user_by_identity(
-        server_id, payload.model_dump(), admin=admin
+        server_id, payload.model_dump(), admin=actor
     )
     return success(data=created, message="Usuario creado en el motor.")
 
@@ -164,11 +176,11 @@ def create_engine_user(admin: AdminDep, server_id: int, payload: EngineUserCreat
     "/{server_id}/users/password", response_model=ApiResponse[EngineUserActionOut]
 )
 def change_engine_user_password(
-    admin: AdminDep, server_id: int, payload: EnginePasswordChangeIn
+    actor: EngineUsersWrite, server_id: int, payload: EnginePasswordChangeIn
 ):
     """Cambia la contraseña de un usuario en el motor (esté o no adoptado). Si hay fila de inventario, se sincroniza."""
     updated = ServerUserController().set_password_by_identity(
-        server_id, payload.model_dump(), admin=admin
+        server_id, payload.model_dump(), admin=actor
     )
     return success(data=updated, message="Contraseña actualizada en el motor.")
 
@@ -178,7 +190,7 @@ def change_engine_user_password(
     response_model=ApiResponse[PasswordChangeBatchOut],
 )
 def change_engine_user_password_all_hosts(
-    admin: AdminDep, server_id: int, payload: EnginePasswordChangeAllHostsIn
+    actor: EngineUsersWrite, server_id: int, payload: EnginePasswordChangeAllHostsIn
 ):
     """
     Rota la contraseña REAL (ALTER USER/ROLE) en TODOS los hosts en vivo de un
@@ -187,7 +199,7 @@ def change_engine_user_password_all_hosts(
     un fallo en uno no aborta el resto (ver ``results`` para el detalle por host).
     """
     result = ServerUserController().set_password_by_identity_all_hosts(
-        server_id, payload.model_dump(), admin=admin
+        server_id, payload.model_dump(), admin=actor
     )
     return success(
         data=result, message=f"{result.updated}/{result.total_hosts} hosts rotados."
@@ -201,7 +213,7 @@ def change_engine_user_password_all_hosts(
 @limiter.limit("3/minute")
 def reveal_engine_user_password(
     request: Request,
-    admin: AdminDep,
+    actor: EngineUsersSecrets,
     server_id: int,
     payload: EngineRevealPasswordIn,
 ):
@@ -216,7 +228,7 @@ def reveal_engine_user_password(
     auditoría fail-closed que ya tenía registra el saqueo sin poder frenarlo.
     """
     revealed = ServerUserController().reveal_password(
-        server_id, payload.username, payload.host, admin=admin
+        server_id, payload.username, payload.host, admin=actor
     )
     return success(data=revealed)
 
@@ -226,7 +238,7 @@ def reveal_engine_user_password(
     response_model=ApiResponse[KnownPasswordSetOut],
 )
 def define_engine_user_known_password(
-    admin: AdminDep, server_id: int, payload: DefineKnownPasswordIn
+    actor: EngineUsersWrite, server_id: int, payload: DefineKnownPasswordIn
 ):
     """
     Registra una contraseña YA conocida por el admin humano SIN ejecutar ALTER USER —
@@ -236,7 +248,7 @@ def define_engine_user_known_password(
     ``overwrite=true`` es obligatorio para reemplazar una contraseña ya conocida.
     """
     result = ServerUserController().set_known_password(
-        server_id, payload.model_dump(), admin=admin
+        server_id, payload.model_dump(), admin=actor
     )
     return success(
         data=result, message=f"Contraseña definida en {result.updated} identidad(es)."
@@ -248,13 +260,13 @@ def define_engine_user_known_password(
     response_model=ApiResponse[AddHostOut],
     status_code=201,
 )
-def add_engine_user_host(admin: AdminDep, server_id: int, payload: AddHostIn):
+def add_engine_user_host(actor: EngineUsersWrite, server_id: int, payload: AddHostIn):
     """
     Agrega un host a un usuario (clona la cuenta a ``new_host``). Solo MySQL/MariaDB
     (422 en PostgreSQL). ``reuse_password=true`` copia el hash de la cuenta origen;
     ``false`` exige ``new_password``. Con ``copy_grants=true`` replica sus permisos.
     """
-    result = ServerUserController().add_host(server_id, payload.model_dump(), admin=admin)
+    result = ServerUserController().add_host(server_id, payload.model_dump(), admin=actor)
     return success(
         data=result, message=f"Host '{payload.new_host}' agregado a '{payload.username}'."
     )
@@ -264,7 +276,7 @@ def add_engine_user_host(admin: AdminDep, server_id: int, payload: AddHostIn):
     "/{server_id}/users/grants", response_model=ApiResponse[EngineUserGrantsOut]
 )
 def list_engine_user_grants(
-    admin: AdminDep,
+    actor: EngineUsersRead,
     server_id: int,
     username: str = Query(..., description="Username del usuario en el motor."),
     host: str = Query("%", description="Host de la identidad (ignorado en PostgreSQL)."),
@@ -294,7 +306,7 @@ def list_engine_user_grants(
 
 @router.delete("/{server_id}/users", response_model=ApiResponse[None])
 def drop_engine_user(
-    admin: AdminDep,
+    actor: EngineUsersDrop,
     server_id: int,
     username: str = Query(..., description="Username del usuario a eliminar del motor."),
     host: str = Query("%", description="Host de la identidad (ignorado en PostgreSQL)."),
@@ -305,13 +317,13 @@ def drop_engine_user(
 ):
     """Elimina un usuario del motor (DROP USER) por identidad. Si hay fila de inventario, se borra también."""
     ServerUserController().drop_user_by_identity(
-        server_id, username, host, confirm_username=confirm_username, admin=admin
+        server_id, username, host, confirm_username=confirm_username, admin=actor
     )
     return empty("Usuario eliminado del motor.")
 
 
 @router.get("/{server_id}/reconcile", response_model=ApiResponse[ReconcileResult])
-def reconcile(admin: AdminDep, server_id: int):
+def reconcile(actor: EngineUsersRead, server_id: int):
     """
     Cruza el plano EN VIVO (motor) con el INVENTARIO (gateway): marca cada BD/usuario
     como managed | unmanaged (adoptable) | orphan (borrado por fuera). Read-only.
@@ -324,7 +336,7 @@ def reconcile(admin: AdminDep, server_id: int):
     response_model=ApiResponse[StructureDump],
 )
 def snapshot_database(
-    admin: AdminDep, server_id: int, database: str, include_data_stats: bool = False
+    actor: DatabasesRead, server_id: int, database: str, include_data_stats: bool = False
 ):
     """
     Snapshot estructural EN VIVO de una BD (tablas, vistas, rutinas, triggers, etc.).
@@ -346,7 +358,7 @@ def snapshot_database(
     "/{server_id}/databases/{database}/tables",
     response_model=ApiResponse[list[str]],
 )
-def list_tables(admin: AdminDep, server_id: int, database: str):
+def list_tables(actor: DatabasesRead, server_id: int, database: str):
     return success(data=ServerController().list_tables(server_id, database))
 
 
@@ -354,7 +366,7 @@ def list_tables(admin: AdminDep, server_id: int, database: str):
     "/{server_id}/databases/{database}/tables/{table}/schema",
     response_model=ApiResponse[TableSchema],
 )
-def get_table_schema(admin: AdminDep, server_id: int, database: str, table: str):
+def get_table_schema(actor: DatabasesRead, server_id: int, database: str, table: str):
     return success(data=ServerController().get_table_schema(server_id, database, table))
 
 
@@ -368,7 +380,7 @@ def get_table_schema(admin: AdminDep, server_id: int, database: str, table: str)
 )
 @limiter.limit("10/minute")
 def create_database(
-    request: Request, admin: AdminDep, server_id: int, payload: DatabaseCreateIn
+    request: Request, actor: DatabasesWrite, server_id: int, payload: DatabaseCreateIn
 ):
     """Crea una BD en el servidor. Con ``register=true`` (requiere ``owner_id``) además la registra."""
     result = ServerDatabaseController().create_database(
@@ -380,7 +392,7 @@ def create_database(
         register=payload.register_inventory,
         owner_id=payload.owner_id,
         notes=payload.notes,
-        admin=admin,
+        admin=actor,
     )
     return success(data=result, message="Base de datos creada.")
 
@@ -391,14 +403,14 @@ def create_database(
 )
 @limiter.limit("10/minute")
 def drop_database_preview(
-    request: Request, admin: AdminDep, server_id: int, database: str
+    request: Request, actor: DatabasesDrop, server_id: int, database: str
 ):
     """
     Paso 1 del borrado: valida la BD, corre guards y devuelve un ``confirm_token`` firmado
     (TTL 2 min), el conteo de conexiones activas y si está en el inventario. NO borra nada.
     """
     return success(
-        data=ServerDatabaseController().drop_preview(server_id, database, admin=admin)
+        data=ServerDatabaseController().drop_preview(server_id, database, admin=actor)
     )
 
 
@@ -408,7 +420,7 @@ def drop_database_preview(
 )
 @limiter.limit("3/minute")
 def drop_database(
-    request: Request, admin: AdminDep, server_id: int, database: str, payload: DatabaseDropIn
+    request: Request, actor: DatabasesDrop, server_id: int, database: str, payload: DatabaseDropIn
 ):
     """
     Paso 2 del borrado (IRREVERSIBLE): exige ``confirm_target_name`` == nombre real +
@@ -420,7 +432,7 @@ def drop_database(
         confirm_target_name=payload.confirm_target_name,
         confirm_token_value=payload.confirm_token,
         force_disconnect=payload.force_disconnect,
-        admin=admin,
+        admin=actor,
     )
     return success(data=result, message="Base de datos eliminada.")
 
@@ -431,18 +443,18 @@ def drop_database(
 )
 @limiter.limit("30/minute")
 def list_database_users(
-    request: Request, admin: AdminDep, server_id: int, database: str
+    request: Request, actor: EngineUsersRead, server_id: int, database: str
 ):
     """Usuarios/roles con algún privilegio sobre la BD, cruzados con el inventario."""
     return success(
         data=ServerDatabaseController().list_database_grantees(
-            server_id, database, admin=admin
+            server_id, database, admin=actor
         )
     )
 
 
 @router.post("/{server_id}/grantable", response_model=ApiResponse[GrantableResult])
-def check_grantable(admin: AdminDep, server_id: int, payload: GrantableRequest):
+def check_grantable(actor: EngineUsersRead, server_id: int, payload: GrantableRequest):
     """Verifica si la credencial admin del servidor puede delegar los privilegios indicados."""
     can = GrantController().check_grantable(server_id, payload)
     result = GrantableResult(
@@ -464,7 +476,7 @@ def check_grantable(admin: AdminDep, server_id: int, payload: GrantableRequest):
 )
 @limiter.limit("30/minute")
 def preview_query(
-    request: Request, admin: AdminDep, server_id: int, payload: QueryPreviewIn
+    request: Request, actor: SqlConsoleExecute, server_id: int, payload: QueryPreviewIn
 ):
     """
     Paso 1: clasifica el SQL (lectura / escritura / DDL / prohibido), estima cuántas filas
@@ -478,7 +490,7 @@ def preview_query(
             sql=payload.sql,
             connection=payload.connection,
             estimate_impact=payload.estimate_impact,
-            admin=admin,
+            admin=actor,
         )
     )
 
@@ -489,7 +501,7 @@ def preview_query(
 )
 @limiter.limit("30/minute")
 def execute_query(
-    request: Request, admin: AdminDep, server_id: int, payload: QueryExecuteIn
+    request: Request, actor: SqlConsoleExecute, server_id: int, payload: QueryExecuteIn
 ):
     """
     Paso 2: ejecuta el lote. Una consulta de solo lectura corre directo (dentro de una
@@ -510,7 +522,7 @@ def execute_query(
         dry_run=payload.dry_run,
         max_rows=payload.max_rows,
         timeout_ms=payload.timeout_ms,
-        admin=admin,
+        admin=actor,
     )
     return success(data=result)
 
@@ -522,7 +534,7 @@ def execute_query(
 @limiter.limit("60/minute")
 def list_query_history(
     request: Request,
-    admin: AdminDep,
+    actor: SqlConsoleHistory,
     server_id: int,
     pagination: PaginationDep,
     database: str | None = Query(default=None, description="Filtra por base de datos."),

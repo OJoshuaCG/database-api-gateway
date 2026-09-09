@@ -13,6 +13,8 @@ Compatibilidad cross-engine: toda la lógica de motor vive en el adapter (MySQL/
 PostgreSQL); este controller solo orquesta.
 """
 
+from typing import TYPE_CHECKING
+
 from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.controllers.managed_database_controller import ManagedDatabaseController
 from app.core.database import Database
@@ -33,6 +35,10 @@ from app.services.db_admin.identifiers import (
     ensure_not_reserved_database,
     validate_identifier,
 )
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
+
 
 _DROP_OP = "drop-db"
 
@@ -58,7 +64,7 @@ class ServerDatabaseController:
         register: bool = False,
         owner_id: int | None = None,
         notes: str | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> DatabaseCreateOut:
         session = self._session()
         try:
@@ -155,7 +161,7 @@ class ServerDatabaseController:
         return dialect, target, managed_id
 
     def drop_preview(
-        self, server_id: int, database: str, *, admin: dict | None = None
+        self, server_id: int, database: str, *, admin: "dict | Actor | None" = None
     ) -> DropPreviewOut:
         dialect, target, managed_id = self._load_context(server_id, database)
         validate_identifier(database, dialect, "base de datos", allow_existing=True)
@@ -201,7 +207,7 @@ class ServerDatabaseController:
         confirm_target_name: str,
         confirm_token_value: str,
         force_disconnect: bool = False,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> DatabaseDropOut:
         dialect, target, managed_id = self._load_context(server_id, database)
         validate_identifier(database, dialect, "base de datos", allow_existing=True)
@@ -263,7 +269,7 @@ class ServerDatabaseController:
     # Usuarios/roles con permisos sobre la BD                             #
     # ------------------------------------------------------------------ #
     def list_database_grantees(
-        self, server_id: int, database: str, *, admin: dict | None = None
+        self, server_id: int, database: str, *, admin: "dict | Actor | None" = None
     ) -> DatabaseGranteesOut:
         session = self._session()
         try:

@@ -9,6 +9,8 @@ Controller de Servers.
 La credencial descifrada NUNCA se persiste, se serializa ni se loguea.
 """
 
+from typing import TYPE_CHECKING
+
 from sqlalchemy.exc import IntegrityError
 
 from app.core.crypto import CryptoConfigError, CryptoError, decrypt, encrypt
@@ -39,6 +41,10 @@ from app.services.db_admin.dtos import (
     TableStat,
 )
 from app.services.db_admin.factory import get_adapter
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
+
 
 
 class ServerController:
@@ -125,7 +131,7 @@ class ServerController:
         finally:
             session.close()
 
-    def create_server(self, data: dict, *, admin: dict | None = None) -> dict:
+    def create_server(self, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         """
         Registra un servidor en el inventario, con su credencial pseudo-root cifrada.
 
@@ -185,7 +191,7 @@ class ServerController:
         finally:
             session.close()
 
-    def update_server(self, server_id: int, data: dict, *, admin: dict | None = None) -> dict:
+    def update_server(self, server_id: int, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         """
         Edita un servidor del inventario.
 
@@ -254,7 +260,7 @@ class ServerController:
         remote_engine.invalidate_server(server_id)
         return result
 
-    def delete_server(self, server_id: int, *, admin: dict | None = None) -> None:
+    def delete_server(self, server_id: int, *, admin: "dict | Actor | None" = None) -> None:
         """
         Borra un servidor del inventario. NO toca el motor.
 
