@@ -161,7 +161,7 @@ módulo M".
 | Módulo | Niveles | Cubre |
 |---|---|---|
 | `servers` | `read` · `admin` | CRUD de `/servers` + `test-connection`. **Sin nivel intermedio a propósito** |
-| `engine-users` | `read` · `write` · `secrets` | `/server-users/*` + `/servers/{sid}/users/*`, incl. GRANT/REVOKE y perfiles |
+| `engine-users` | `read` · `write` · `drop` · `secrets` | `/server-users/*` + `/servers/{sid}/users/*`, incl. GRANT/REVOKE y perfiles |
 | `databases` | `read` · `write` · `drop` | `/managed-databases` (menos migraciones) + `/servers/{sid}/databases*` |
 | `blueprints` | `read` · `write` · `apply` · `captures` | `/database-models`, `/…/migrations/*`, `/projects/*`; `select-results` en `captures` |
 | `schema-diff` | `read` · `execute` | `/schema-comparisons/*` (`adopt` y `execute` en `execute`) |
@@ -218,6 +218,12 @@ endpoints, ese conjunto es **una** capacidad.
 - **`servers`**: `read` ya expone `host`, `port` y `root_username` de todo el parque — es
   reconocimiento de la infraestructura del cliente. Y `admin` es la llave maestra. Son poderes tan
   distintos que un nivel intermedio solo daría falsa sensación de gradualidad.
+- **`engine-users`: `drop` aparte de `write`.** Esta tabla salió con tres niveles y sin `drop`,
+  y eso dejaba `DROP USER` dentro de `engine_users.write` —que tiene `operator`—, mientras borrar
+  la BD que ese usuario posee pedía `owner`. La asimetría no la justificaba el riesgo: la produjo
+  no mirar que un endpoint del módulo ejecuta un DROP. Y contradecía lo que `operator` declara de
+  sí mismo en el catálogo ("no incluye `*.drop`"). Igual que `databases`, el nivel vive en `owner`
+  y pide step-up.
 - **`engine-users`: `write` ≠ `secrets`.** Rotar una contraseña es rutina; **leerla en claro** es
   divulgación, y quien opera no la necesita. Hoy `PATCH …/password` y `POST …/reveal-password` son
   el mismo permiso y no tienen nada que ver.

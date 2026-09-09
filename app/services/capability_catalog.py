@@ -138,6 +138,7 @@ class Capability(StrEnum):
     # -- Usuarios del MOTOR ------------------------------------------------- #
     ENGINE_USERS_READ = "engine_users.read"
     ENGINE_USERS_WRITE = "engine_users.write"
+    ENGINE_USERS_DROP = "engine_users.drop"
     ENGINE_USERS_SECRETS = "engine_users.secrets"
 
     # -- Bases de datos ----------------------------------------------------- #
@@ -255,6 +256,17 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
     ),
     # `secrets` NO implica `write`: rotar una contraseña es rutina, LEERLA en claro es
     # divulgación y quien opera no la necesita. Son riesgos incomparables.
+    # Existe por SIMETRÍA con `databases.drop`, y porque su ausencia contradecía el criterio
+    # que `operator` declara en su propio comentario ("no incluye `*.drop`"): sin este nivel,
+    # DROP USER caía en `engine_users.write` y un operator podía dejar sin acceso a la
+    # aplicación de un tercero, mientras borrar la BD que ese usuario posee pedía `owner`.
+    _spec(
+        Capability.ENGINE_USERS_DROP,
+        "Borrar usuarios del motor",
+        mutates=True,
+        step_up=True,
+        axis="server",
+    ),
     _spec(
         Capability.ENGINE_USERS_SECRETS,
         "Revelar contraseñas de usuarios del motor",
@@ -393,6 +405,7 @@ _OPERATOR: frozenset[Capability] = _VIEWER | {
 # exactamente para lo que ese test existe.
 _OWNER: frozenset[Capability] = _OPERATOR | {
     Capability.CLONES_EXECUTE,
+    Capability.ENGINE_USERS_DROP,
     Capability.ENGINE_USERS_SECRETS,
     Capability.DATABASES_DROP,
     Capability.BLUEPRINTS_APPLY,

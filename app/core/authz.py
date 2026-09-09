@@ -176,6 +176,7 @@ ServersAdmin = Annotated[Actor, Depends(require(Capability.SERVERS_ADMIN))]
 
 EngineUsersRead = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_READ))]
 EngineUsersWrite = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_WRITE))]
+EngineUsersDrop = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_DROP))]
 EngineUsersSecrets = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_SECRETS))]
 
 DatabasesRead = Annotated[Actor, Depends(require(Capability.DATABASES_READ))]
