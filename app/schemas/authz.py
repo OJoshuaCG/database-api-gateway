@@ -6,6 +6,8 @@ otros schemas (`app/schemas/privilege.py`, `app/schemas/permission_profile.py`) 
 vocabulario. Ver el docstring de ``app/services/capability_catalog.py``.
 """
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
@@ -53,6 +55,18 @@ class MeOut(BaseModel):
             "que la UI pida la contraseña ANTES de mandar la operación, en vez de descubrirlo "
             "por un error. El mecanismo todavía no está implementado."
         ),
+    )
+    previous_login_at: datetime | None = Field(
+        None,
+        description=(
+            "Login exitoso ANTERIOR al actual (UTC). Es el anterior y no el último a propósito: "
+            "cuando la SPA pide esto, el último YA es el login en curso. Sirve para que el "
+            "usuario note un acceso que no hizo, y es la única detección que no depende de que "
+            "alguien lea el audit_log"
+        ),
+    )
+    last_failed_at: datetime | None = Field(
+        None, description="Último intento fallido sobre esta cuenta (UTC)"
     )
     catalog_version: str = Field(
         ..., description="sha256 corto del catálogo, para invalidar caché del cliente"

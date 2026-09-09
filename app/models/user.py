@@ -9,7 +9,9 @@ Este modelo demuestra las mejores prácticas para definir modelos con:
 - Comentarios descriptivos
 """
 
-from sqlalchemy import Boolean, String, Text
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -82,6 +84,26 @@ class User(Base, TimestampMixin):
         server_default="viewer",
         index=True,
         comment="Rol base del usuario en el gateway: viewer | operator | owner",
+    )
+
+    # Traza de autenticación. Entra CON su lector: `/auth/me` las publica y el login las
+    # escribe, en la misma entrega — un timestamp que nadie muestra no le sirve a nadie.
+    # El valor está del lado del usuario legítimo: es cómo se entera de un acceso que no hizo,
+    # que para una herramienta con pseudo-root sobre la producción de terceros es la única
+    # detección que no depende de que alguien lea el `audit_log`.
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, comment="Último login EXITOSO (UTC)"
+    )
+
+    # El ANTERIOR al actual, y existe porque sin ella la pantalla no sirve para lo que existe:
+    # cuando el usuario abre la app, `last_login_at` ya es el login que acaba de hacer. Lo que
+    # necesita ver para detectar un acceso ajeno es el de antes.
+    previous_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, comment="Login exitoso ANTERIOR al último (UTC)"
+    )
+
+    last_failed_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, comment="Último intento de login FALLIDO (UTC)"
     )
 
     def __repr__(self) -> str:

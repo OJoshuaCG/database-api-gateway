@@ -9,6 +9,7 @@ from app.core.limiter import limiter
 from app.controllers.authz_controller import AuthzController
 from app.schemas.auth import AdminOut, LoginIn
 from app.schemas.authz import MeOut
+from app.services import audit
 from app.utils.response import ApiResponse, empty, success
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -24,6 +25,21 @@ def login(request: Request, credentials: LoginIn):
 
 @router.post("/logout", response_model=ApiResponse[None])
 def logout(request: Request, actor: SelfRead):
+    """
+    Cierra la sesión.
+
+    **Hoy borra la cookie del cliente y nada más**: mientras la sesión viva en una cookie
+    firmada, quien tenga una copia sigue autenticado. Eso lo arregla la sesión server-side, no
+    este endpoint. Se audita igual —y desde ahora, porque no había ninguna acción ``auth.*``—
+    para que el registro tenga los dos extremos de cada sesión y no solo el inicio.
+    """
+    audit.record(
+        "auth.logout",
+        admin=actor,
+        target_type="user",
+        target_id=actor.id,
+        touched_engine=False,
+    )
     logout_session(request)
     return empty("Sesión cerrada.")
 

@@ -7,8 +7,15 @@ Es llamado desde el UserController siguiendo el patrón MVC.
 Patrón: Routes → Controllers → Models → Database
 """
 
+from datetime import UTC, datetime
+
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+
+
+def _utcnow() -> datetime:
+    """Ahora en UTC, naive — la convención de las columnas ``DateTime`` de este repo."""
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class UserModel:
@@ -46,6 +53,42 @@ class UserModel:
             "SELECT * FROM users WHERE username = :username",
             {"username": username},
             fetchone=True,
+        )
+
+    def mark_login_success(self, user_id: int) -> None:
+        """
+        Sella el login exitoso. Un UPDATE, sin leer primero.
+
+        Es best-effort por diseño: si esto falla, el login **igual procede**. Sellar la traza no
+        puede ser condición para entrar — sería dejar afuera a todo el mundo por un problema de
+        la BD de metadatos, justo cuando hay una incidencia. El rastro que sí es obligatorio es
+        el ``audit_log``, y ese lo escribe el controller aparte.
+        """
+        # OJO CON EL ORDEN de las dos asignaciones, y es una diferencia real entre motores:
+        # MySQL/MariaDB evalúan el SET de IZQUIERDA A DERECHA y las asignaciones posteriores ven
+        # los valores ya escritos, mientras PostgreSQL y SQLite evalúan todas contra la fila
+        # ORIGINAL. Con `previous_login_at` primero el resultado es el mismo en los tres; al
+        # revés, MySQL copiaría el timestamp NUEVO y `previous_login_at` sería igual a
+        # `last_login_at` para siempre, sin que nada falle.
+        self.db.execute_query(
+            "UPDATE users SET previous_login_at = last_login_at, last_login_at = :ahora "
+            "WHERE id = :id",
+            {"ahora": _utcnow(), "id": user_id},
+            commit=True,
+        )
+
+    def mark_login_failure(self, user_id: int) -> None:
+        """
+        Sella el intento fallido. Mismo criterio best-effort que ``mark_login_success``.
+
+        Solo se llama cuando la fila EXISTE: un username inexistente no tiene dónde sellarse, y
+        crear una fila para registrarlo sería regalarle al atacante la confirmación de que su
+        intento quedó anotado en algún lado.
+        """
+        self.db.execute_query(
+            "UPDATE users SET last_failed_at = :ahora WHERE id = :id",
+            {"ahora": _utcnow(), "id": user_id},
+            commit=True,
         )
 
     def find_by_email(self, email: str) -> dict | None:

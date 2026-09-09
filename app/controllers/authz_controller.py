@@ -10,6 +10,7 @@ import hashlib
 import json
 
 from app.core.actor import Actor
+from app.models.user_model import UserModel
 from app.services.capability_catalog import Capability, capability_matrix, spec
 
 
@@ -34,6 +35,11 @@ class AuthzController:
         consumidores.
         """
         effective = [c for c in Capability if actor.has(c)]
+        # Una consulta extra sobre `users`, y solo acá: la traza de autenticación NO vive en el
+        # `Actor`. Ponerla ahí obligaría a leerla en CADA request para servirla en uno, y el
+        # `Actor` es identidad y capacidades — dos timestamps de diagnóstico no son ninguna de
+        # las dos. `/auth/me` lo llama la SPA al cargar, no por request.
+        fila = UserModel().find_by_id(actor.id) or {}
         return {
             "id": actor.id,
             "username": actor.username,
@@ -47,6 +53,8 @@ class AuthzController:
             "step_up_capabilities": sorted(
                 c.value for c in effective if spec(c).requires_step_up
             ),
+            "previous_login_at": fila.get("previous_login_at"),
+            "last_failed_at": fila.get("last_failed_at"),
             "catalog_version": _catalog_version(),
         }
 
