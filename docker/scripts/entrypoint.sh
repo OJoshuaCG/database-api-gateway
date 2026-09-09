@@ -95,17 +95,24 @@ run_migrations() {
 # Función: iniciar la aplicación FastAPI con Uvicorn
 # WORKERS=1 por defecto. Con múltiples workers, configurar Redis para rate limiting.
 # Ver: docs/features/rate-limiting.md
+#
+# TRUSTED_PROXY_IPS reemplaza al `--forwarded-allow-ips "*"` que estaba hardcodeado acá.
+# Confiar en `X-Forwarded-For` de CUALQUIER origen deja que el cliente elija su propia clave
+# de rate limit y la rote: los 5/min del login y los 3/min del DROP DATABASE se evadían con
+# un header. El default (`127.0.0.1`) solo confía en localhost; en producción la app exige
+# que se fije la IP o el CIDR del proxy reverso.
 # ─────────────────────────────────────────────────────────────────────────────
 start_app() {
     local workers="${WORKERS:-1}"
-    echo "[entrypoint] Iniciando FastAPI con $workers worker(s)..."
+    local trusted_proxies="${TRUSTED_PROXY_IPS:-127.0.0.1}"
+    echo "[entrypoint] Iniciando FastAPI con $workers worker(s); proxies confiables: $trusted_proxies"
     exec uvicorn main:app \
         --host 0.0.0.0 \
         --port 8000 \
         --workers "$workers" \
         --no-access-log \
         --proxy-headers \
-        --forwarded-allow-ips "*"
+        --forwarded-allow-ips "$trusted_proxies"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

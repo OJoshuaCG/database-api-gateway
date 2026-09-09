@@ -50,6 +50,15 @@ RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "100/minute")
 RATE_LIMIT_REDIS_ENABLED = os.getenv("RATE_LIMIT_REDIS_ENABLED", "False").lower() == "true"
 RATE_LIMIT_REDIS_URL = os.getenv("RATE_LIMIT_REDIS_URL", "redis://localhost:6379")
 
+# IPs o CIDRs del proxy reverso en los que se CONFÍA para leer `X-Forwarded-For`.
+#
+# El entrypoint pasaba `--forwarded-allow-ips "*"`, o sea confiaba en la cabecera de
+# CUALQUIER origen: con eso `X-Forwarded-For` es spoofeable por request y el rate limit por IP
+# —incluidos los 5/min del login y los 3/min del DROP DATABASE— es **evadible rotando un
+# header**. El default es el de uvicorn (`127.0.0.1`), que solo confía en localhost; en
+# producción hay que fijar la IP o el CIDR del proxy, y el guard de abajo lo exige.
+TRUSTED_PROXY_IPS = os.getenv("TRUSTED_PROXY_IPS", "127.0.0.1")
+
 # ======= Pagination variables ======= #
 # Máximo de elementos por página. Hardcap en código: 200.
 # Si PAGINATION_MAX_SIZE supera 200, se ignora y se usa 200.
@@ -409,6 +418,27 @@ if APP_ENV == "production" and not os.getenv("SESSION_SECRET"):
 # La autenticación es por cookie de sesión (allow_credentials=True). Con CORS_ORIGINS="*"
 # el navegador rechaza enviar credenciales y reflejar el origin sería inseguro (CSRF
 # asistido por CORS). En producción EXIGIMOS orígenes explícitos.
+
+# El rate limit por IP es la única barrera contra la fuerza bruta del login (5/min) y contra
+# el abuso de las operaciones destructivas (3/min). Dos configuraciones lo vuelven FICTICIO, y
+# las dos se veían "bien" en un despliegue normal:
+#
+#   1. Confiar en `X-Forwarded-For` de cualquier origen. El cliente elige su propia clave de
+#      rate limit y rota el header. Es la deuda que `docs/plans/08-production-readiness.md`
+#      declaraba como P1.
+#   2. Varios workers con el almacenamiento en memoria de SlowAPI. Cada proceso lleva su
+#      propio contador, así que el límite efectivo es N × el configurado — y nadie se entera,
+#      porque cada worker cree estar cumpliendo. Ya está documentado en
+#      `docs/features/rate-limiting.md`; acá pasa de documentado a exigible.
+#
+# Un límite que la gente cree global y no lo es, es peor que ninguno: se planifica alrededor
+# de una protección que no existe.
+if APP_ENV == "production" and TRUSTED_PROXY_IPS.strip() == "*":
+    raise ValueError(
+        "TRUSTED_PROXY_IPS no puede ser '*' en producción: confiar en 'X-Forwarded-For' de "
+        "cualquier origen hace que el rate limit por IP sea evadible rotando un header. "
+        "Fijá la IP o el CIDR del proxy reverso (p. ej. TRUSTED_PROXY_IPS=10.0.0.0/24)."
+    )
 if APP_ENV == "production" and "*" in CORS_ORIGINS:
     raise ValueError(
         "CORS_ORIGINS no puede ser '*' en producción: la auth por cookie requiere una "

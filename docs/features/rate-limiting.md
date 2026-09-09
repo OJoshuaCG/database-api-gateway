@@ -227,6 +227,27 @@ limiter = Limiter(
 )
 ```
 
+## En quién se confía para leer `X-Forwarded-For`
+
+Detrás de un proxy reverso, la IP que ve uvicorn es la del proxy, así que la clave del rate
+limit sale de `X-Forwarded-For`. **Y esa cabecera la manda el cliente.**
+
+El entrypoint pasaba `--forwarded-allow-ips "*"`, o sea confiaba en la cabecera de cualquier
+origen: con eso el cliente **elige su propia clave de rate limit y la rota por request**. Los
+5/min del login y los 3/min del `DROP DATABASE` se evadían con un header.
+
+```env
+# Solo localhost (default) — el default de uvicorn, no spoofeable
+TRUSTED_PROXY_IPS=127.0.0.1
+
+# Detrás de nginx en otro contenedor: la IP o el CIDR del proxy
+TRUSTED_PROXY_IPS=10.0.0.0/24
+```
+
+En **producción la app se niega a arrancar con `*`**. Y ojo con el otro extremo: si el proxy no
+está declarado, `X-Forwarded-For` se ignora y **todos los clientes comparten la clave del
+proxy** — más restrictivo, no spoofeable, pero un solo usuario puede agotar la cuota de todos.
+Declarar el CIDR real es lo correcto; el default solo es el lado seguro de no haberlo hecho.
 Para usar Redis en producción:
 
 ```bash
