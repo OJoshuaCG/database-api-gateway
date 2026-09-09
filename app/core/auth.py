@@ -46,10 +46,21 @@ def logout_session(request: Request) -> None:
     request.session.clear()
 
 
-def get_current_admin(request: Request) -> dict:
+def authenticated_user(request: Request) -> dict:
     """
-    Dependencia que exige una sesión válida. Verifica que el usuario siga existiendo
-    y activo. Devuelve {id, username}. Lanza 401 si no hay sesión válida.
+    La fila COMPLETA del usuario de la sesión, o 401. Es la única resolución de sesión.
+
+    Existe extraída y no duplicada porque de acá cuelgan DOS dependencias —``get_current_admin``
+    y ``get_current_actor`` de ``app/core/authz.py``— y dos chequeos de sesión paralelos son
+    exactamente cómo se termina con dos políticas que divergen en silencio. El riesgo está
+    anotado en el plan 11 §9; esto lo cierra por construcción.
+
+    Relee la BD en CADA request, a propósito: es lo que hace que desactivar a alguien surta
+    efecto de inmediato, y lo mismo va a valer para el rol.
+
+    OJO: devuelve la fila entera, que incluye ``hashed_password``. Quien la consuma tiene que
+    ESTRECHARLA — ``get_current_admin`` a ``{id, username}``, ``get_current_actor`` a los campos
+    del ``Actor``. Ninguno de los dos propaga el hash.
     """
     admin_id = request.session.get(SESSION_USER_ID)
     if not admin_id:
@@ -61,6 +72,18 @@ def get_current_admin(request: Request) -> dict:
         raise AppHttpException(
             message="Sesión inválida o usuario inactivo.", status_code=401
         )
+    return user
+
+
+def get_current_admin(request: Request) -> dict:
+    """
+    Dependencia LEGADA que exige sesión válida y devuelve ``{id, username}``.
+
+    Sigue en pie porque las 153 rutas la usan y el swap a ``Actor`` es la fase 1. Se retira
+    entera ahí, no se deprecia: un endpoint nuevo copiado de uno viejo tiene que fallar al
+    importar.
+    """
+    user = authenticated_user(request)
     return {"id": user["id"], "username": user["username"]}
 
 
