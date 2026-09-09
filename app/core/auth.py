@@ -21,6 +21,7 @@ from app.exceptions import AppHttpException
 from app.services.capability_catalog import GatewayRole, GlobalCapability
 from app.core import session_store
 from app.models.user_model import UserModel
+from app.services import audit
 from app.utils.security import hash_password
 
 logger = get_logger(__name__)
@@ -126,19 +127,35 @@ def authenticated_user(request: Request) -> dict:
 
 def bootstrap_admin() -> None:
     """
-    Siembra el administrador único desde ADMIN_USERNAME/ADMIN_PASSWORD si aún no
-    existe. Idempotente. Se llama en el lifespan de arranque.
+    Garantiza que exista **al menos un administrador de accesos activo**. Idempotente.
 
-    El rol y las capacidades globales se fijan EXPLÍCITAMENTE y no se heredan del default de
-    la columna: ``users.gateway_role`` tiene ``server_default='viewer'`` a propósito —para que
-    ninguna fila nazca con privilegio— así que un despliegue nuevo sin este bloque sembraría
-    un administrador que no puede administrar. Y ``owner`` no alcanza solo: ``servers.admin``,
-    ``catalogs.write`` y ``gateway.admin`` viven **únicamente** en las capacidades globales, así
-    que sin las dos filas de ``user_global_capabilities`` el admin recién sembrado no podría dar
-    de alta un servidor ni rotar la clave de datos.
+    ANCLADO AL INVARIANTE, NO AL USERNAME
+    -------------------------------------
+    La versión anterior hacía ``if find_by_username(ADMIN_USERNAME): return``, y con eso **no
+    reparaba nada** en el caso que importa: si al administrador se lo renombra o se lo
+    desactiva, la fila con ese username ya no existe o no sirve, pero el seed encuentra *algo*
+    —o no encuentra nada y siembra un duplicado— en vez de mirar la condición que hace
+    funcionar al sistema.
 
-    Es también el escritor que hace que esas dos tablas no nazcan inertes: el lector es el
-    resolvedor de ``Actor``.
+    El criterio nuevo es la condición misma: **si hay CERO usuarios activos con
+    ``access_admin``**, sembrar o reparar. Misma idempotencia, keyed en lo que importa.
+
+    LO QUE NUNCA HACE, Y ES LO QUE LO SEPARA DE UN BYPASS
+    ----------------------------------------------------
+    **Nunca toca la password ni el rol de un administrador existente.** Ésa es la línea entre
+    una reparación y "la variable de entorno siempre gana", que es lo que este diseño rechaza:
+    si el arranque re-afirmara rol y password, **desactivar a alguien sería reversible por
+    reinicio** — y el reinicio es la operación más común del mundo. El control dejaría de
+    existir y nadie se daría cuenta.
+
+    Por eso hay dos caminos y no uno: si el usuario de ``ADMIN_USERNAME`` **no existe**, se
+    siembra completo; si existe pero el invariante está roto, se **reactiva y se le devuelven
+    las globales**, sin tocar su credencial. Quien tenga la password sigue siendo quien la
+    tenía.
+
+    Y se audita como ``access.bootstrap_recovery`` cuando repara —no cuando siembra un
+    despliegue nuevo, que no es una recuperación—, porque una reparación de privilegio hecha
+    por el arranque es exactamente el evento que alguien tiene que poder ver después.
     """
     if not ADMIN_PASSWORD:
         logger.warning(
@@ -147,9 +164,44 @@ def bootstrap_admin() -> None:
         return
 
     user_model = UserModel()
-    if user_model.find_by_username(ADMIN_USERNAME):
+    if user_model.count_active_access_admins() > 0:
+        # El invariante se cumple: no hay nada que hacer, ni siquiera si el username de la
+        # variable de entorno no coincide con nadie. Que el administrador se llame distinto de
+        # `ADMIN_USERNAME` es una situación NORMAL, no algo que el arranque deba "corregir".
         return
 
+    existente = user_model.find_by_username(ADMIN_USERNAME)
+    globales = [
+        GlobalCapability.ACCESS_ADMIN.value,
+        GlobalCapability.SECURITY_OFFICER.value,
+    ]
+
+    if existente:
+        # Reparación: se reactiva y se le devuelven las globales. La password NO se toca.
+        user_model.update(existente["id"], {"is_active": True})
+        user_model.grant_global_capabilities(ADMIN_USERNAME, globales)
+        audit.record(
+            "access.bootstrap_recovery",
+            admin=None,
+            target_type="user",
+            target_id=existente["id"],
+            touched_engine=False,
+            detail=(
+                f"invariante roto (0 access_admin activos): se reactivó '{ADMIN_USERNAME}' y "
+                "se le restauraron las capacidades globales. La contraseña NO se modificó"
+            ),
+        )
+        logger.warning(
+            "Recuperación de arranque: no había ningún access_admin activo; se reparó '%s'.",
+            ADMIN_USERNAME,
+        )
+        return
+
+    # Despliegue nuevo. El rol y las globales se fijan EXPLÍCITAMENTE y no se heredan del
+    # default de la columna: `users.gateway_role` tiene `server_default='viewer'` a propósito
+    # —para que ninguna fila nazca con privilegio— así que sin este bloque se sembraría un
+    # administrador que no puede administrar. Y `owner` no alcanza solo: `servers.admin`,
+    # `catalogs.write` y `gateway.admin` viven ÚNICAMENTE en las capacidades globales.
     user_model.create(
         {
             "username": ADMIN_USERNAME,
@@ -161,8 +213,5 @@ def bootstrap_admin() -> None:
             "gateway_role": GatewayRole.OWNER.value,
         }
     )
-    user_model.grant_global_capabilities(
-        ADMIN_USERNAME,
-        [GlobalCapability.ACCESS_ADMIN.value, GlobalCapability.SECURITY_OFFICER.value],
-    )
+    user_model.grant_global_capabilities(ADMIN_USERNAME, globales)
     logger.info("Administrador '%s' sembrado.", ADMIN_USERNAME)
