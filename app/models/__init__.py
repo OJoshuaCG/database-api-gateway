@@ -16,6 +16,7 @@ Ejemplo:
 """
 
 from app.models.access_grant import AccessGrant, UserGlobalCapability
+from app.models.gateway_session import GatewaySession
 from app.models.audit_log import AuditLog
 from app.models.base import Base, TimestampMixin
 from app.models.charset_collation_option import CharsetCollationOption
@@ -56,6 +57,7 @@ __all__ = [
     "Base",
     "TimestampMixin",
     "AccessGrant",
+    "GatewaySession",
     "UserGlobalCapability",
     "User",
     "Server",

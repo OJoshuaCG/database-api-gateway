@@ -19,33 +19,67 @@ from app.core.environments import ADMIN_PASSWORD, ADMIN_USERNAME
 from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.services.capability_catalog import GatewayRole, GlobalCapability
+from app.core import session_store
 from app.models.user_model import UserModel
 from app.utils.security import hash_password
 
 logger = get_logger(__name__)
 
-# Claves bajo las que se guarda la sesión en la cookie.
-SESSION_USER_ID = "admin_id"
-SESSION_USERNAME = "admin_username"
+#: Mensaje por motivo de rechazo. Distingue "se venció" de "no estás autenticado" porque son
+#: acciones distintas para quien lo recibe: volver a entrar vs. entender que lo echaron. Ninguno
+#: revela si el `sid` existió: `unknown` y `missing` comparten texto a propósito.
+_MENSAJE_401 = {
+    "missing": "No autenticado.",
+    "unknown": "No autenticado.",
+    session_store.REASON_ABSOLUTE: "La sesión alcanzó su duración máxima. Volvé a iniciar sesión.",
+    session_store.REASON_IDLE: "La sesión expiró por inactividad. Volvé a iniciar sesión.",
+    session_store.REASON_LOGOUT: "La sesión se cerró. Volvé a iniciar sesión.",
+    session_store.REASON_PASSWORD_CHANGE: "La contraseña cambió: las sesiones se cerraron.",
+    session_store.REASON_ROLE_CHANGE: "Tus permisos cambiaron: volvé a iniciar sesión.",
+    session_store.REASON_ADMIN_REVOKED: "La sesión fue revocada.",
+}
+
+#: La ÚNICA clave que viaja en la cookie. El resto —id, username, rol, capacidades— se resuelve
+#: server-side contra `gateway_sessions` y `users`.
+#:
+#: Que sea una sola no es minimalismo: un rol en la cookie es un rol que **no se puede
+#: revocar**, y la cookie se re-firma en cada respuesta. `tests/test_session_lifecycle.py`
+#: decodifica el payload sin la firma y afirma que las claves son exactamente estas.
+SESSION_SID = "sid"
 
 
 def login_session(request: Request, user: dict) -> None:
     """
-    Marca la sesión como autenticada para el usuario dado.
+    Abre una sesión server-side y deja su ``sid`` —y nada más— en la cookie.
 
-    El ``clear()`` va PRIMERO y no es cosmético: sin él, cualquier clave que ya estuviera en
-    la sesión sobrevive al login. Hoy es inocuo porque acá solo viven dos claves y el login
-    las sobreescribe — pero deja de serlo en cuanto la sesión guarde algo más (un marcador de
-    reautenticación, un flag de "2FA pendiente"), porque ahí un valor plantado por el dueño
-    anterior de la sesión pasa al dueño nuevo. ``logout_session`` y ``get_current_admin`` ya
-    limpiaban; el login era el único de los tres que no.
+    El ``clear()`` va PRIMERO y no es cosmético: sin él, cualquier clave que ya estuviera en la
+    sesión sobrevive al login. Con la cookie llevando solo el ``sid`` el riesgo se achica, pero
+    el orden se mantiene porque acá van a vivir el marcador de reautenticación y el flag de 2FA
+    pendiente, y ahí un valor plantado por el dueño anterior pasaría al dueño nuevo.
+
+    **Cada login crea una fila nueva**, o sea que el ``sid`` ROTA: un identificador fijado por
+    un atacante antes del login (session fixation) deja de servir en el instante en que la
+    víctima se autentica.
     """
     request.session.clear()
-    request.session[SESSION_USER_ID] = user["id"]
-    request.session[SESSION_USERNAME] = user["username"]
+    request.session[SESSION_SID] = session_store.create(
+        user["id"],
+        ip=(request.client.host if request.client else None),
+        user_agent=request.headers.get("user-agent"),
+    )
 
 
 def logout_session(request: Request) -> None:
+    """
+    Cierra la sesión **de verdad**: tacha la fila y después borra la cookie.
+
+    El orden importa. Si se borrara la cookie primero y la revocación fallara, el usuario
+    quedaría "deslogueado" en su navegador con una sesión que sigue viva del lado del servidor —
+    o sea el modo de fallo exacto que la sesión server-side vino a cerrar, disfrazado de éxito.
+    """
+    sid = request.session.get(SESSION_SID)
+    if sid:
+        session_store.revoke(sid, session_store.REASON_LOGOUT)
     request.session.clear()
 
 
@@ -65,12 +99,24 @@ def authenticated_user(request: Request) -> dict:
     ESTRECHARLA: ``get_current_actor`` la reduce a los campos del ``Actor``, que no propaga el
     hash.
     """
-    admin_id = request.session.get(SESSION_USER_ID)
-    if not admin_id:
-        raise AppHttpException(message="No autenticado.", status_code=401)
+    sid = request.session.get(SESSION_SID)
+    user_id, motivo = session_store.resolve(sid or "")
+    if user_id is None:
+        # La cookie se limpia SIEMPRE, incluso cuando la sesión ya estaba tachada: dejarla
+        # puesta hace que el navegador reintente con un `sid` muerto en cada request y que el
+        # usuario vea 401 sin entender por qué.
+        request.session.clear()
+        raise AppHttpException(
+            message=_MENSAJE_401.get(motivo, "No autenticado."),
+            status_code=401,
+            public_context={"code": f"auth.session_{motivo}"} if motivo else None,
+        )
 
-    user = UserModel().find_by_id(admin_id)
+    user = UserModel().find_by_id(user_id)
     if not user or not user.get("is_active"):
+        # `is_active` se relee por request y ese es el kill switch que ya funcionaba. Ahora
+        # además se tacha la sesión, para que el corte quede con motivo en vez de repetirse.
+        session_store.revoke(sid, session_store.REASON_ADMIN_REVOKED)
         request.session.clear()
         raise AppHttpException(
             message="Sesión inválida o usuario inactivo.", status_code=401

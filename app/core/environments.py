@@ -379,8 +379,19 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 # Secreto para firmar la cookie de sesión. Si está vacío, se deriva de SECRET_KEY.
 SESSION_SECRET = os.getenv("SESSION_SECRET") or SECRET_KEY or "insecure-dev-session-secret"
-# Duración de la sesión en segundos (default 8 horas).
+# Vida máxima de la COOKIE, en segundos. Es el `max_age` que firma Starlette y sigue siendo
+# solo el techo del transporte: los dos vencimientos que rigen de verdad son los de abajo, que
+# se evalúan contra la fila de `gateway_sessions`. Se deja alto a propósito para que el corte lo
+# decida el servidor y no el navegador — si la cookie muriera antes, el 401 llegaría sin motivo
+# registrado y sin la fila tachada.
 SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE", "28800"))
+# Vida ABSOLUTA de la sesión, contra `created_at`. Es lo único que la actividad continua no
+# puede estirar: antes de la sesión server-side no existía, porque el middleware re-firmaba la
+# cookie en cada respuesta.
+SESSION_ABSOLUTE_MAX_HOURS = int(os.getenv("SESSION_ABSOLUTE_MAX_HOURS", "12"))
+# Timeout de INACTIVIDAD, contra `last_seen_at`. 60 min y no las 8 h históricas: es una
+# herramienta con credenciales pseudo-root sobre bases de terceros y se usa a ráfagas.
+SESSION_IDLE_MINUTES = int(os.getenv("SESSION_IDLE_MINUTES", "60"))
 # Flag `Secure` de la cookie de sesión. Por defecto sigue a APP_ENV=="production"
 # (comportamiento histórico). Se puede fijar explícitamente (True/False) para
 # desacoplarlo de APP_ENV, p. ej. mientras se termina de configurar TLS delante del

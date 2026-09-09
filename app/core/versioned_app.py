@@ -178,12 +178,20 @@ def create_versioned_app(
         RequestSizeMiddleware,
         excluded_paths=excluded_request_size_paths or [],
     )
-    # SessionMiddleware: cookie de sesión firmada (httpOnly) para la autenticación
-    # del admin. Se añade al final para quedar como capa más externa.
+    # SessionMiddleware: cookie firmada (httpOnly) que transporta el `sid` y NADA MÁS. La
+    # sesión en sí vive en `gateway_sessions`; acá solo se firma el identificador. Se añade al
+    # final para quedar como capa más externa.
+    #
+    # El nombre depende de `Secure` a propósito. Con TLS, el prefijo `__Host-` hace que el
+    # navegador RECHACE la cookie si no viene con `Secure`, `Path=/` y sin `Domain` — las tres
+    # ya se cumplen— y con eso ata la cookie al host EXACTO: un subdominio hermano
+    # (`otro.midominio.com`) no puede sobrescribirla en el dominio padre, que es el ataque de
+    # cookie tossing. Sin `Secure` el prefijo es inválido y el navegador descartaría la cookie,
+    # así que en desarrollo sobre HTTP tiene que ser el nombre pelado.
     versioned.add_middleware(
         SessionMiddleware,
         secret_key=SESSION_SECRET,
-        session_cookie="gw_session",
+        session_cookie="__Host-gw_session" if SESSION_COOKIE_SECURE else "gw_session",
         max_age=SESSION_MAX_AGE,
         same_site="lax",
         https_only=SESSION_COOKIE_SECURE,

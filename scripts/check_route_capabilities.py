@@ -98,7 +98,7 @@ PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
 NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset()
 
 #: Cuántas rutas declaran capacidad. **Solo puede SUBIR.** Ver "EL TRINQUETE".
-MIN_MIGRATED_ROUTES = 154
+MIN_MIGRATED_ROUTES = 156
 
 
 def _iter_routes(app, prefix: str = ""):
