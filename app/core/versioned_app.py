@@ -30,6 +30,7 @@ from app.exceptions import (
     validation_exception_handler,
 )
 from app.middleware.ContextMiddleware import ContextMiddleware
+from app.middleware.CsrfCookieMiddleware import CsrfCookieMiddleware
 from app.middleware.LoggerMiddleware import LoggerMiddleware
 from app.middleware.RequestSizeMiddleware import RequestSizeMiddleware
 
@@ -178,6 +179,10 @@ def create_versioned_app(
         RequestSizeMiddleware,
         excluded_paths=excluded_request_size_paths or [],
     )
+    # CsrfCookieMiddleware ANTES del SessionMiddleware en el código = POR DENTRO en la
+    # ejecución (el último agregado es el más externo), que es lo que le da acceso a
+    # `request.session`. Al revés no vería la sesión y no tendría `sid` del que derivar el token.
+    versioned.add_middleware(CsrfCookieMiddleware)
     # SessionMiddleware: cookie firmada (httpOnly) que transporta el `sid` y NADA MÁS. La
     # sesión en sí vive en `gateway_sessions`; acá solo se firma el identificador. Se añade al
     # final para quedar como capa más externa.

@@ -51,6 +51,7 @@ from typing import Annotated, Callable
 
 from fastapi import Depends, Request
 
+from app.core import csrf
 from app.core.actor import Actor, admin_actor
 from app.exceptions import AppHttpException
 from app.models.user_model import UserModel
@@ -142,6 +143,14 @@ def require(capability: Capability) -> Callable[[Request], Actor]:
 
     def _dependency(request: Request) -> Actor:
         actor = get_current_actor(request)
+        # CSRF ANTES de la capacidad, y solo para el actor de tipo `admin` (el que se autentica
+        # con una cookie que el navegador adjunta solo). Antes de la capacidad porque un
+        # cross-site detectado no debería recibir un 403 distinto según si tiene o no la
+        # capacidad: eso sería un oráculo sobre la superficie a través de un origen ajeno.
+        if actor.kind == "admin":
+            from app.core.auth import SESSION_SID
+
+            csrf.enforce(request, request.session.get(SESSION_SID) or "")
         assert_capability(actor, capability)
         return actor
 
