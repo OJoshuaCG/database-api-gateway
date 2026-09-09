@@ -268,7 +268,7 @@ def export_manifest(admin: AdminDep, job_id: int):
     Permite comprobar integridad y auditar **sin abrir el archivo** — mirar el contenido para
     saber qué se llevó sería una segunda divulgación.
     """
-    return success(data=ExportController().manifest(job_id))
+    return success(data=ExportController().manifest(job_id, admin=admin))
 
 
 def _range_covers_whole_file(

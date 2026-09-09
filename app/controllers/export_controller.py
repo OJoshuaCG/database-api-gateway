@@ -2280,17 +2280,25 @@ class ExportController:
     # ------------------------------------------------------------------ #
     # 10) Manifiesto (§10.4)                                              #
     # ------------------------------------------------------------------ #
-    def manifest(self, job_id: int) -> dict:
+    def manifest(self, job_id: int, *, admin: dict | None) -> dict:
         """
         Inventario verificable del artefacto: qué salió, cuánto pesa y con qué checksum.
 
         Permite comprobar integridad y auditar **sin abrir el archivo**, que es justo lo que
         se quiere de una exportación de datos: mirar el contenido para saber qué se llevó
         sería una segunda divulgación.
+
+        ``admin`` es OBLIGATORIO (keyword, sin default) porque este camino pasa por
+        ``_guard_owner`` igual que las dos entregas. Faltaba, y la asimetría no era
+        defendible: el manifiesto expone checksum, lista de objetos y conteo de filas del
+        export de otra persona — no es el archivo, pero sí es su inventario. Sin default para
+        que un llamador nuevo no pueda saltear el guard en silencio, con el criterio de
+        ``_validate_scope``.
         """
         session = self._session()
         try:
             job = self._job_or_404(session, job_id)
+            self._guard_owner(job, admin)
             spec = json.loads(job.spec) if job.spec else {}
             progress = json.loads(job.progress) if job.progress else {}
             items = (
