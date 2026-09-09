@@ -150,3 +150,74 @@ En los tres primeros, **apagar** la captura no pide nada extra: solo encenderla.
 - **Step-up.** Ver §1.
 - **Administración de usuarios.** `/gateway-users` y `/api-tokens` no existen aún; el único usuario
   es el administrador sembrado. Su rol se cambia hoy en la BD.
+
+---
+
+## 7. Cambios de autenticación que la SPA tiene que absorber
+
+Entregados junto con lo de arriba. **Tres rompen el cliente actual si no se adaptan.**
+
+### 7.1 CSRF: header obligatorio en todo método no seguro 🔴
+
+```jsonc
+// 403 si falta o no valida
+{ "detail": { "msg": "…", "public_context": { "code": "auth.csrf_missing" } } }
+{ "detail": { "msg": "…", "public_context": { "code": "auth.csrf_invalid" } } }
+{ "detail": { "msg": "…", "public_context": { "code": "auth.origin_rejected" } } }
+```
+
+Qué hacer: leer la cookie **`__Host-gw_csrf`** (o `gw_csrf` sin TLS) y mandarla en el header
+**`X-CSRF-Token`** en todo `POST`/`PATCH`/`DELETE`. La cookie **no** es httpOnly justamente para
+eso.
+
+Dos cosas que no son obvias:
+
+- **El token ROTA con la sesión.** Se deriva del identificador de sesión, y ese identificador
+  cambia en cada login. Un token cacheado en memoria de un login anterior da `auth.csrf_invalid`:
+  hay que releer la cookie después de cada login.
+- **No es double-submit.** El servidor lo recomputa; plantar la cookie no sirve. No intentes
+  "arreglar" un 403 seteando la cookie desde el JS.
+
+### 7.2 La descarga de exportaciones es de DOS pasos 🔴
+
+`GET /database-exports/{id}/download` ahora exige `?ticket=`:
+
+```
+POST /api/v1/database-exports/{id}/download-ticket   → { ticket, expires_at, filename }
+GET  /api/v1/database-exports/{id}/download?ticket=…
+```
+
+El ticket **vence en 60 segundos**, así que se pide en el momento del click y no al cargar la
+pantalla. El POST corre los mismos guards que la descarga, o sea que un 409/410 llega ahí y no en
+el GET.
+
+Y `GET /database-exports/{id}/content` —la entrega en línea para el portapapeles— **exige el
+header `X-CSRF-Token` aunque sea un GET**. Los dos endpoints consumen el artefacto, y una
+navegación GET lleva la cookie: sin esto, un `<img>` en cualquier página destruía el export.
+
+### 7.3 La sesión ahora vence de verdad 🔴
+
+Dos vencimientos nuevos, y el 401 dice cuál fue:
+
+| `public_context.code` | Qué pasó | Qué mostrar |
+|---|---|---|
+| `auth.session_absolute` | 12 h desde el login, **haya habido actividad o no** | "la sesión alcanzó su duración máxima" |
+| `auth.session_idle` | 60 min sin requests | "expiró por inactividad" |
+| `auth.session_logout` | se cerró en otra pestaña | "la sesión se cerró" |
+| `auth.session_password_change` · `auth.session_role_change` · `auth.session_admin_revoked` | revocada | el motivo correspondiente |
+| `auth.session_unknown` · `auth.session_missing` | no hay sesión | login normal |
+
+**El absoluto es el que va a sorprender**: antes la sesión no expiraba nunca mientras hubiera
+actividad. Una SPA que asuma "si el usuario está usando la app, la sesión sigue viva" va a tirar
+al login a mitad de una operación. Conviene avisar antes de que llegue.
+
+### 7.4 Aditivo, sin romper nada
+
+- `GET /auth/sessions` — las sesiones vivas del propio usuario (`sid_prefix`, `current`,
+  `created_at`, `last_seen_at`, `ip`). **Nunca el identificador completo**: es la credencial de
+  sesión.
+- `POST /auth/sessions/revoke-others` — cierra las demás y conserva la actual.
+- `/auth/me` gana `previous_login_at` y `last_failed_at`. Es el **anterior** al actual a
+  propósito: cuando la SPA pide `/auth/me`, el último ya es el login en curso.
+- El límite de tasa pasa a contarse **por sesión** y no por IP, así que varias personas detrás de
+  la misma salida NAT ya no comparten cupo. El login sigue por IP: todavía no hay sesión.
