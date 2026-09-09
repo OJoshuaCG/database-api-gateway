@@ -227,6 +227,14 @@ limiter = Limiter(
 )
 ```
 
+
+> **Con más de un worker, la app se NIEGA a arrancar si el backend es memoria.** Antes esto era
+> un aviso en esta página y nada más, y el modo de fallo era silencioso: cada worker cumple su
+> propio límite, así que nadie ve nada raro mientras el límite efectivo es N veces el
+> configurado. Un límite que la gente cree global y no lo es es peor que ninguno, porque se
+> planifica alrededor de una protección que no existe. El guard vive en
+> `app/core/environments.py` y lee `WORKERS` (la misma variable que usa el entrypoint).
+
 ## En quién se confía para leer `X-Forwarded-For`
 
 Detrás de un proxy reverso, la IP que ve uvicorn es la del proxy, así que la clave del rate

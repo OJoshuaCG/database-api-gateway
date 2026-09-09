@@ -107,3 +107,35 @@ def test_trusted_proxy_defaults_to_localhost_only(monkeypatch):
     monkeypatch.delenv("TRUSTED_PROXY_IPS", raising=False)
     mod = _reload(monkeypatch, APP_ENV="development")
     assert mod.TRUSTED_PROXY_IPS == "127.0.0.1"
+
+
+# --------------------------------------------------------------------------- #
+# Multi-worker sin backend compartido                                         #
+# --------------------------------------------------------------------------- #
+def test_multiworker_without_shared_rate_limit_storage_refuses_to_start(monkeypatch):
+    """
+    Con N workers y el contador en memoria, el límite real es N veces el configurado.
+
+    Y nadie se entera, porque cada worker cree estar cumpliendo. Un límite que la gente cree
+    global y no lo es, es peor que ninguno: se planifica alrededor de una protección que no
+    existe.
+    """
+    with pytest.raises(ValueError, match="WORKERS=4"):
+        _reload(monkeypatch, WORKERS="4", RATE_LIMIT_REDIS_ENABLED="False")
+
+
+def test_multiworker_with_shared_storage_is_allowed(monkeypatch):
+    mod = _reload(
+        monkeypatch,
+        WORKERS="4",
+        RATE_LIMIT_REDIS_ENABLED="True",
+        RATE_LIMIT_REDIS_URL="redis://valkey:6379",
+    )
+    assert mod.UVICORN_WORKERS == 4
+    assert mod.RATE_LIMIT_REDIS_ENABLED is True
+
+
+def test_single_worker_in_memory_is_allowed(monkeypatch):
+    """El caso por default: un worker, contador en memoria, sin fricción."""
+    mod = _reload(monkeypatch, WORKERS="1", RATE_LIMIT_REDIS_ENABLED="False")
+    assert mod.UVICORN_WORKERS == 1

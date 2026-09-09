@@ -93,7 +93,11 @@ run_migrations() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Función: iniciar la aplicación FastAPI con Uvicorn
-# WORKERS=1 por defecto. Con múltiples workers, configurar Redis para rate limiting.
+#
+# WORKERS=1 por defecto. Con más de uno hace falta RATE_LIMIT_REDIS_ENABLED=True, y la app se
+# NIEGA a arrancar sin él (guard en app/core/environments.py): con el almacenamiento en
+# memoria de SlowAPI cada worker lleva su propio contador, así que el límite real sería N
+# veces el configurado — y nadie se entera, porque cada worker cree estar cumpliendo.
 # Ver: docs/features/rate-limiting.md
 #
 # TRUSTED_PROXY_IPS reemplaza al `--forwarded-allow-ips "*"` que estaba hardcodeado acá.

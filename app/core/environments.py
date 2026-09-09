@@ -59,6 +59,10 @@ RATE_LIMIT_REDIS_URL = os.getenv("RATE_LIMIT_REDIS_URL", "redis://localhost:6379
 # producción hay que fijar la IP o el CIDR del proxy, y el guard de abajo lo exige.
 TRUSTED_PROXY_IPS = os.getenv("TRUSTED_PROXY_IPS", "127.0.0.1")
 
+# Cantidad de workers de uvicorn. La fija el entrypoint, pero se lee acá porque el guard de
+# abajo la necesita: SlowAPI con almacenamiento en memoria mantiene un contador POR PROCESO.
+UVICORN_WORKERS = int(os.getenv("WORKERS", "1"))
+
 # ======= Pagination variables ======= #
 # Máximo de elementos por página. Hardcap en código: 200.
 # Si PAGINATION_MAX_SIZE supera 200, se ignora y se usa 200.
@@ -438,6 +442,14 @@ if APP_ENV == "production" and TRUSTED_PROXY_IPS.strip() == "*":
         "TRUSTED_PROXY_IPS no puede ser '*' en producción: confiar en 'X-Forwarded-For' de "
         "cualquier origen hace que el rate limit por IP sea evadible rotando un header. "
         "Fijá la IP o el CIDR del proxy reverso (p. ej. TRUSTED_PROXY_IPS=10.0.0.0/24)."
+    )
+
+if UVICORN_WORKERS > 1 and not RATE_LIMIT_REDIS_ENABLED:
+    raise ValueError(
+        f"WORKERS={UVICORN_WORKERS} con el rate limit en memoria: cada worker mantiene su "
+        "propio contador, así que el límite real sería "
+        f"{UVICORN_WORKERS}x el configurado. Activá el backend compartido "
+        "(RATE_LIMIT_REDIS_ENABLED=True + RATE_LIMIT_REDIS_URL) o volvé a WORKERS=1."
     )
 if APP_ENV == "production" and "*" in CORS_ORIGINS:
     raise ValueError(
