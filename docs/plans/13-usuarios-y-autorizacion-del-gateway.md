@@ -1149,7 +1149,7 @@ replayable hasta el `exp`) y sirve además para invalidar los códigos de recupe
 
 ```
 1. add_column(gateway_role, String(16), nullable=True)                       # sin default
-2. UPDATE users SET gateway_role = CASE WHEN is_superuser THEN 'admin' ELSE 'viewer' END
+2. UPDATE users SET gateway_role = CASE WHEN is_superuser THEN 'owner' ELSE 'viewer' END
 3. alter_column(gateway_role, nullable=False, server_default="viewer")        # un solo alter
 4. drop_column(is_superuser)
 ```
