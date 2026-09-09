@@ -138,6 +138,46 @@ def assert_capability(actor: Actor, capability: Capability) -> None:
         )
 
 
+CODE_LAST_ADMIN = "access.last_admin_protected"
+
+
+def assert_not_last_access_admin(user_id: int, *, action: str) -> None:
+    """
+    Impide dejar al gateway **sin ningún administrador de accesos activo**.
+
+    EL ESCENARIO QUE CUBRE, Y NO ES HIPOTÉTICO
+    ------------------------------------------
+    Dos administradores. A le revoca el ``access_admin`` a B "para ordenar", y después se
+    desactiva a sí mismo por error. Resultado sin este guard: **bloqueo total**, y la única
+    salida es SQL a mano contra la BD de metadatos — hecho en plena incidencia, por alguien con
+    credenciales pseudo-root y **sin ninguna auditoría**.
+
+    Este invariante elimina la mayoría de los caminos al bloqueo *antes* de que haga falta un
+    mecanismo de recuperación, que es mucho mejor que tener un buen mecanismo de recuperación.
+
+    POR QUÉ ``access_admin`` Y NO EL ROL ``owner``
+    ----------------------------------------------
+    ``owner`` es el rol OPERATIVO y explícitamente no administra accesos. Quedarse sin ningún
+    ``owner`` es un problema de operación —molesto, reparable por quien administra accesos—;
+    quedarse sin ningún ``access_admin`` es **no poder repararlo**.
+
+    ``action`` va al mensaje para que el 409 diga qué se estaba intentando: "no se puede
+    desactivar" y "no se puede revocar" mandan a la persona a lugares distintos.
+    """
+    from app.models.user_model import UserModel
+
+    if UserModel().count_active_access_admins(exclude_user_id=user_id) > 0:
+        return
+    raise AppHttpException(
+        message=(
+            f"No se puede {action}: es el último administrador de accesos activo. "
+            "Otorgale 'access_admin' a otro usuario activo primero."
+        ),
+        status_code=409,
+        public_context={"code": CODE_LAST_ADMIN},
+    )
+
+
 def require(capability: Capability) -> Callable[[Request], Actor]:
     """
     Fábrica de la dependencia que exige una capacidad. Devuelve el ``Actor`` resuelto.

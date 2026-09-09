@@ -55,6 +55,38 @@ class UserModel:
             fetchone=True,
         )
 
+    def count_active_access_admins(self, *, exclude_user_id: int | None = None) -> int:
+        """
+        Usuarios ACTIVOS con la capacidad global ``access_admin``.
+
+        Es la consulta del invariante que evita el bloqueo total: *siempre debe existir al menos
+        uno*. ``exclude_user_id`` responde la pregunta que importa —"¿quedaría alguno si saco a
+        éste?"— en una sola consulta, en vez de contar y restar en Python, que es donde una
+        carrera mete el error.
+
+        Cuenta ``access_admin`` y no el rol ``owner`` a propósito: `owner` es el rol OPERATIVO y
+        no administra accesos. Quedarse sin ningún `owner` es un problema de operación;
+        quedarse sin ningún `access_admin` es no poder arreglarlo.
+        """
+        # `hashed_password <> ''` NO es una redundancia: una invitación pendiente nace ACTIVA y
+        # sin credencial, así que sin este filtro un usuario que todavía no aceptó la invitación
+        # **satisfaría el invariante siendo incapaz de entrar**. El bloqueo total quedaría
+        # disfrazado de "hay un administrador".
+        query = """
+            SELECT COUNT(*) AS total
+            FROM user_global_capabilities g
+            JOIN users u ON u.id = g.user_id
+            WHERE g.capability = 'access_admin'
+              AND u.is_active = 1
+              AND u.hashed_password <> ''
+        """
+        params: dict = {}
+        if exclude_user_id is not None:
+            query += " AND u.id <> :excluido"
+            params["excluido"] = exclude_user_id
+        fila = self.db.execute_query(query, params, fetchone=True)
+        return (fila or {}).get("total") or 0
+
     def mark_login_success(self, user_id: int) -> None:
         """
         Sella el login exitoso. Un UPDATE, sin leer primero.
