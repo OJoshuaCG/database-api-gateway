@@ -1,12 +1,16 @@
 """
-Los dos opt-ins que hacen que el gateway PERSISTA DATOS DE NEGOCIO exigen
-``blueprints.captures``, no ``blueprints.write``.
+Los guards que dependen del PAYLOAD: cuando un parámetro sube el requisito de la ruta.
 
 POR QUÉ ESTE ARCHIVO EXISTE
 ---------------------------
-El plan 13 mapeó ``captures`` a *leer* los resultados capturados, pero **no dijo nada del
-opt-in que los genera**. Sin esta regla, ``blueprints.write`` —que ``operator`` tiene— alcanzaba
-para dos cosas:
+Una ruta declara UNA capacidad en su firma (§6.3 punto 1), pero hay endpoints donde **un
+parámetro cambia la naturaleza de la operación**. Los tres que se encontraron migrando: pedir
+datos-semilla en un snapshot, encender la captura de SELECT, y los dos ``drop_remote``. En los
+tres, el piso va en la firma y el extra en ``assert_capability``.
+
+El caso de ``captures`` salió de un hueco del plan: mapeó ``captures`` a *leer* los resultados
+capturados y **no dijo nada del opt-in que los genera**. Sin esa regla, ``blueprints.write``
+—que ``operator`` tiene— alcanzaba para dos cosas:
 
 1. ``POST /database-models/from-snapshot`` con ``data_tables``: EXTRAE FILAS de la BD de origen
    y las deja como datos-semilla dentro de una migración del blueprint, o sea dentro de algo
@@ -253,5 +257,67 @@ def test_owner_is_not_blocked_by_the_drop_guard(admin_client):
     db_id = _managed_db(admin_client)
     r = admin_client.delete(
         f"/api/v1/managed-databases/{db_id}?drop_remote=true&confirm_name=app_db"
+    )
+    assert r.status_code != 403, r.text
+
+
+# --------------------------------------------------------------------------- #
+# drop_remote del usuario del motor: el nivel que el catálogo no tenía        #
+# --------------------------------------------------------------------------- #
+
+
+def _server_user(client) -> int:
+    """
+    Siembra el usuario directo en el inventario, por el mismo motivo que ``_managed_db``:
+    ``/server-users/adopt`` y el POST con ``provision`` necesitan un motor real, y lo que se
+    mide acá es la autorización.
+    """
+    from app.core.database import Database
+    from app.models.server_user import ServerUser
+
+    srv = client.post("/api/v1/servers", json={
+        "name": "srv-usr", "host": "127.0.0.1", "port": 3399, "engine": "mysql",
+        "root_username": "root", "root_password": "supersecret",
+    })
+    assert srv.status_code == 201, srv.text
+
+    session = Database().get_declarative_base_session()
+    try:
+        usr = ServerUser(
+            username="app_user", host="%", server_id=srv.json()["data"]["id"],
+        )
+        session.add(usr)
+        session.commit()
+        return usr.id
+    finally:
+        session.close()
+
+
+def test_operator_cannot_drop_the_engine_user(operator_client):
+    """
+    ``engine_users.drop`` no existía: DROP USER caía en ``engine_users.write``, que ``operator``
+    tiene. O sea que dropear la BASE pedía ``owner`` y dropear al USUARIO que la posee pedía
+    ``operator`` — y el comentario de ``operator`` en el catálogo dice de sí mismo que no
+    incluye ``*.drop``.
+    """
+    user_id = _server_user(operator_client)
+    r = operator_client.delete(
+        f"/api/v1/server-users/{user_id}?drop_remote=true&confirm_username=app_user"
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["public_context"]["code"] == "access.forbidden"
+
+
+def test_operator_can_forget_an_engine_user_from_the_inventory(operator_client):
+    """Sin ``drop_remote`` sigue siendo ``write``."""
+    user_id = _server_user(operator_client)
+    r = operator_client.delete(f"/api/v1/server-users/{user_id}")
+    assert r.status_code == 200, r.text
+
+
+def test_owner_is_not_blocked_by_the_user_drop_guard(admin_client):
+    user_id = _server_user(admin_client)
+    r = admin_client.delete(
+        f"/api/v1/server-users/{user_id}?drop_remote=true&confirm_username=app_user"
     )
     assert r.status_code != 403, r.text
