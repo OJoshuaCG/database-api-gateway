@@ -98,12 +98,25 @@ PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
+#: Rutas autenticadas por BEARER cuya autorización es por TOOL y no por endpoint: el servidor
+#: MCP. No van en `PUBLIC_ROUTES` porque **no son públicas** —exigen un token válido— y no
+#: declaran capacidad porque el scope lo verifica el registro de tools, endpoint por endpoint
+#: sería una segunda copia del vocabulario.
+#:
+#: El chequeo 5 verifica que cada una tenga de verdad la dependencia de autenticación de
+#: agentes: sin eso, esta lista sería un agujero con nombre elegante.
+AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("POST", "/mcp/"),
+    }
+)
+
 #: Capacidades que existen para consumidores que NO son rutas (tools del MCP, workers). Sin
 #: esta lista, el chequeo 4 reportaría como vocabulario muerto algo que sí tiene consumidor.
 NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset()
 
 #: Cuántas rutas declaran capacidad. **Solo puede SUBIR.** Ver "EL TRINQUETE".
-MIN_MIGRATED_ROUTES = 164
+MIN_MIGRATED_ROUTES = 167
 
 
 def _iter_routes(app, prefix: str = ""):
@@ -136,11 +149,27 @@ def _capability_of(route: APIRoute) -> str | None:
     return walk(route.dependant)
 
 
+def _uses_agent_auth(route: APIRoute) -> bool:
+    """``True`` si la ruta cuelga de ``authenticate_agent``. Se detecta por el callable."""
+    from app.core.mcp_auth import authenticate_agent
+    from app.mcp.app_factory import _agente
+
+    objetivos = {authenticate_agent, _agente}
+
+    def walk(dependant) -> bool:
+        if getattr(dependant, "call", None) in objetivos:
+            return True
+        return any(walk(s) for s in (getattr(dependant, "dependencies", []) or []))
+
+    return walk(route.dependant)
+
+
 def main() -> int:
     from main import app
 
     errores: list[str] = []
     sin_guard: list[str] = []
+    agente: list[str] = []
     migradas: list[str] = []
     usadas: set[str] = set()
     validas = {c.value for c in Capability}
@@ -163,12 +192,23 @@ def main() -> int:
             if clave in PUBLIC_ROUTES:
                 continue
 
+            if clave in AGENT_ROUTES:
+                agente.append(f"{method} {path}")
+                # Chequeo 5: una ruta de agente TIENE que exigir el bearer. Sin esto, la lista
+                # de arriba sería una forma de declarar "sin guard" que suena bien.
+                if not _uses_agent_auth(route):
+                    errores.append(
+                        f"{method} {path} está en AGENT_ROUTES y NO exige la autenticación "
+                        "de agentes (app.core.mcp_auth.authenticate_agent)."
+                    )
+                continue
+
             # Chequeo 1: ni capacidad ni pública. Nace abierta.
             sin_guard.append(f"{method} {path}")
 
     if sin_guard:
         errores.append(
-            "Rutas SIN capacidad declarada y fuera de PUBLIC_ROUTES:\n  "
+            "Rutas SIN capacidad declarada y fuera de PUBLIC_ROUTES/AGENT_ROUTES:\n  "
             + "\n  ".join(sorted(sin_guard))
         )
 
@@ -179,10 +219,10 @@ def main() -> int:
         for path, route in _iter_routes(app)
         for m in route.methods - {"HEAD", "OPTIONS"}
     }
-    fantasmas = PUBLIC_ROUTES - vivas
+    fantasmas = (PUBLIC_ROUTES | AGENT_ROUTES) - vivas
     if fantasmas:
         errores.append(
-            "Entradas de PUBLIC_ROUTES que ya no corresponden a ninguna ruta: "
+            "Entradas de PUBLIC_ROUTES/AGENT_ROUTES que ya no corresponden a ninguna ruta: "
             + ", ".join(f"{m} {p}" for m, p in sorted(fantasmas))
         )
 
@@ -217,7 +257,8 @@ def main() -> int:
 
     print(
         f"OK: cobertura de autorización sana — {len(migradas)} ruta(s) con capacidad, "
-        f"{len(PUBLIC_ROUTES)} públicas declaradas, 0 sin guard, 0 capacidad muerta."
+        f"{len(PUBLIC_ROUTES)} públicas declaradas, {len(agente)} de agente, "
+        "0 sin guard, 0 capacidad muerta."
     )
     return 0
 

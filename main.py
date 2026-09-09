@@ -18,6 +18,7 @@ from app.core.versioned_app import (
     create_versioned_app,
 )
 from app.routes.health import router as health_router
+from app.mcp.app_factory import create_mcp_app
 from app.routes.v1.routes import router as v1_router
 from app.services.charset_catalog import seed_charset_options
 from app.services.db_admin import migration_results
@@ -209,6 +210,15 @@ app.include_router(health_router)
 v1_app = create_versioned_app("v1")
 v1_app.include_router(v1_router)
 app.mount("/api/v1", v1_app)
+
+# === Servidor MCP
+# Se monta SIEMPRE y el kill switch decide adentro (`MCP_ENABLED`, evaluado en `mcp_auth`).
+# Montarlo condicionalmente parece más seguro y es peor: el conjunto de rutas pasaría a
+# depender de una variable de entorno, y entonces el guard de cobertura de autorización
+# —que corre con la config del runner— dejaría de ver esta superficie. Apagado, todo request
+# recibe 503 desde el choke point único.
+mcp_app = create_mcp_app()
+app.mount("/mcp", mcp_app)
 
 # === API v2 (ejemplo — descomentar cuando sea necesario)
 # from app.routes.v2.routes import router as v2_router
