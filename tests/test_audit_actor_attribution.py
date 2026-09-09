@@ -80,6 +80,54 @@ def test_charset_option_update_attributes_the_actor(admin_client):
     assert rows[0].admin_username == "admin"
 
 
+def test_environment_create_attributes_the_actor(admin_client):
+    """``POST /environments`` ya usa ``GatewayAdmin``."""
+    resp = admin_client.post("/api/v1/environments", json={"name": "Preprod", "slug": "preprod"})
+    assert resp.status_code in (200, 201), resp.text
+
+    rows = _rows("environment.create")
+    assert rows, "la operación no dejó fila de auditoría"
+    assert rows[0].admin_id == 1
+    assert rows[0].admin_username == "admin"
+
+
+def test_weakening_an_environment_attributes_the_actor(admin_client):
+    """
+    El caso de más valor del módulo: ``environment.weaken`` se registra con ``record_intent``,
+    que es **fail-closed** — si el rastro no se puede persistir, el aflojamiento de política no
+    se ejecuta. Un rastro que se persiste pero sin atribución es peor que no tenerlo: dice que
+    alguien abrió la barrera de producción y no dice quién.
+
+    Camino distinto al de ``record``, así que la normalización de identidades hay que
+    verificarla también acá y no alcanza con el ``environment.create`` de arriba.
+    """
+    listado = admin_client.get("/api/v1/environments?size=50")
+    assert listado.status_code == 200, listado.text
+    prod = next(e for e in listado.json()["data"] if e["slug"] == "production")
+
+    resp = admin_client.patch(
+        f"/api/v1/environments/{prod['id']}?confirm_slug=production",
+        json={"blocks_destructive_migrations": False},
+    )
+    assert resp.status_code == 200, resp.text
+
+    rows = _rows("environment.weaken")
+    assert rows, "el aflojamiento de política no dejó rastro"
+    assert rows[0].admin_id == 1, f"admin_id quedó en {rows[0].admin_id!r}"
+    assert rows[0].admin_username == "admin"
+
+
+def test_project_create_attributes_the_actor(admin_client):
+    """``POST /projects`` ya usa ``BlueprintsWrite`` (``projects`` vive dentro de ese módulo)."""
+    resp = admin_client.post("/api/v1/projects", json={"name": "Omnicanal"})
+    assert resp.status_code in (200, 201), resp.text
+
+    rows = _rows("project.create")
+    assert rows, "la operación no dejó fila de auditoría"
+    assert rows[0].admin_id == 1
+    assert rows[0].admin_username == "admin"
+
+
 # --------------------------------------------------------------------------- #
 # Rutas TODAVÍA con el guard legado                                           #
 # --------------------------------------------------------------------------- #
