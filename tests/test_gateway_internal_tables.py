@@ -23,6 +23,8 @@ diff emitiría ``CREATE TABLE _gw_v_{slug_del_origen}`` sobre el destino, inyect
 tabla de versión ajena con la versión de otro blueprint.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.exceptions import AppHttpException
@@ -151,15 +153,31 @@ def test_structural_snapshot_excludes_the_version_table(monkeypatch):
     # ejercitar la ruta que usa producción.
     class _FakeAdapter:
         dialect = "mysql"
-        target = None
+        # `target` NO puede ser None: `structural_snapshot` loguea `self.target.server_id` al
+        # cerrar (instrumentación de tiempos) y `map_driver_error` lo recibe. Un stub con solo
+        # el atributo que se lee alcanza y deja el fallo visible si mañana se lee otro.
+        target = SimpleNamespace(server_id=1)
 
         _conn_ctx = ba.ServerAdapter._conn_ctx
         _database_defaults = ba.ServerAdapter._database_defaults
+        # Y volvió a pasar: `_prefetch_column_extras` se agregó después y el doble no lo
+        # tenía, así que este test moría con AttributeError otra vez. Se prestan los TRES
+        # hooks de prefetch —no solo el que rompió— porque los tres devuelven None en la
+        # base ("este adapter no batea") y prestarlos cierra la clase entera de fallo en vez
+        # de su instancia de hoy.
+        _prefetch_column_extras = ba.ServerAdapter._prefetch_column_extras
+        _prefetch_table_storage_options = ba.ServerAdapter._prefetch_table_storage_options
+        _prefetch_row_estimates = ba.ServerAdapter._prefetch_row_estimates
 
         def _inspect_schema(self, database):
             return database
 
-        def _build_table_schema(self, insp, conn, database, table, schema):
+        def _build_table_schema(
+            self, insp, conn, database, table, schema, *, extras=None, storage=None
+        ):
+            # `*args`/`**kwargs` sería más tolerante pero peor: absorbería en silencio un
+            # kwarg NUEVO y el test volvería a pasar sin ejercitar el contrato real. La firma
+            # se declara explícita a propósito, para que un cambio de contrato ROMPA acá.
             from app.services.db_admin.dtos import ColumnInfo, TableSchema
 
             return TableSchema(
