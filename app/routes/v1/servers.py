@@ -198,13 +198,22 @@ def change_engine_user_password_all_hosts(
     "/{server_id}/users/reveal-password",
     response_model=ApiResponse[RevealedPasswordOut],
 )
+@limiter.limit("3/minute")
 def reveal_engine_user_password(
-    admin: AdminDep, server_id: int, payload: EngineRevealPasswordIn
+    request: Request,
+    admin: AdminDep,
+    server_id: int,
+    payload: EngineRevealPasswordIn,
 ):
     """
     Revela la contraseña de un usuario — SOLO posible si el gateway la fijó y la guarda
     cifrada (create/rotación por el gateway). Una contraseña que el gateway nunca conoció
     es irrecuperable (el motor solo guarda un hash): 409. Acción auditada.
+
+    3/min, el escalón de DIVULGACIÓN del repo (el mismo de `export.download`) y no el de
+    lectura: cada llamada entrega una credencial en claro de un usuario del motor de un
+    tercero. Sin límite, el default de 100/min alcanzaba para vaciar el llavero entero, y la
+    auditoría fail-closed que ya tenía registra el saqueo sin poder frenarlo.
     """
     revealed = ServerUserController().reveal_password(
         server_id, payload.username, payload.host, admin=admin
