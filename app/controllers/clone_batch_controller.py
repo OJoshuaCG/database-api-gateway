@@ -48,7 +48,7 @@ from sqlalchemy import func
 from app.controllers.clone_controller import CloneController
 from app.controllers.common import build_target, get_server_or_404
 from app.core.context import current_http_identifier
-from app.core.actor import identity_of
+from app.core.actor import Actor, identity_of
 from app.core.database import Database
 from app.core.environments import (
     CLONE_BATCH_MAX_DATABASES,
@@ -238,7 +238,7 @@ class CloneBatchController:
     # ------------------------------------------------------------------ #
     # Crear plan del lote                                                 #
     # ------------------------------------------------------------------ #
-    def create_batch_plan(self, data: dict, *, admin: dict | None = None) -> dict:
+    def create_batch_plan(self, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         """
         Valida lo BARATO y persiste el lote en ``pending`` con su ``confirm_token``.
 
@@ -602,7 +602,7 @@ class CloneBatchController:
         *,
         confirm_server_name: str,
         confirm_token: str,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         """
         Valida la confirmación agregada y ENCOLA el recorrido del lote.
@@ -726,7 +726,7 @@ class CloneBatchController:
         clone_batch_runner.enqueue(batch_id)
         return self.get_batch(batch_id)
 
-    def cancel_batch(self, batch_id: int, *, admin: dict | None = None) -> dict:
+    def cancel_batch(self, batch_id: int, *, admin: "dict | Actor | None" = None) -> dict:
         """
         Cancelación COOPERATIVA del lote.
 
@@ -1234,7 +1234,7 @@ class CloneBatchController:
         finally:
             session.close()
 
-    def retry_failed(self, batch_id: int, *, admin: dict | None = None) -> dict:
+    def retry_failed(self, batch_id: int, *, admin: "dict | Actor | None" = None) -> dict:
         """
         Arma un lote NUEVO con las filas reintentables. Nunca reanuda el viejo.
 

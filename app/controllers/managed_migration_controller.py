@@ -1183,7 +1183,7 @@ class ManagedMigrationController:
         db_id: int,
         results: list[MigrationResult],
         *,
-        admin: dict | None,
+        admin: "dict | Actor | None",
         server_id: int | None,
     ) -> tuple[int, list[str]]:
         """

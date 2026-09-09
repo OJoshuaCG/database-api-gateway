@@ -25,6 +25,8 @@ Seguridad transversal:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import hashlib
 import json
 from dataclasses import dataclass
@@ -67,6 +69,10 @@ from app.services.db_admin.sql_dialect import (
     body_delimiter_wrapper,
     requalify_body_schema,
 )
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
+
 
 # Motores de la misma familia SQL (comparables entre sí). PostgreSQL solo consigo mismo.
 _MYSQL_FAMILY = frozenset({"mysql", "mariadb"})
@@ -409,7 +415,7 @@ class SchemaComparisonController:
         target_database_id: int | None = None,
         target_server_id: int | None = None,
         target_database_name: str | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         # 1) Resolver ambos lados DENTRO de la sesión (la credencial se descifra mientras
         #    la sesión sigue abierta). Cada lado acepta id de inventario o (server+nombre)
@@ -645,7 +651,7 @@ class SchemaComparisonController:
         object_type: str | None = None,
         change_type: str | None = None,
         include_rollback: bool = False,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> tuple[str, str]:
         """
         Ensambla el DDL del diff como un único texto ``.sql`` descargable y devuelve
@@ -1103,7 +1109,7 @@ class SchemaComparisonController:
         execute_immediately: bool = False,
         auto_resolve_dependencies: bool = False,
         confirm_target_name: str | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         session = self._session()
         try:
@@ -1532,7 +1538,7 @@ class SchemaComparisonController:
         confirm_target_name: str,
         confirm_token: str,
         force: bool = False,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         session = self._session()
         try:

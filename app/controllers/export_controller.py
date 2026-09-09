@@ -32,7 +32,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.controllers.clone_controller import _snapshot_fingerprint
 from app.controllers.common import build_target, engine_value, get_server_or_404
-from app.core.actor import identity_of
+from app.core.actor import Actor, identity_of
 from app.core.database import Database
 from app.core.environments import (
     DB_HOST,
@@ -742,7 +742,7 @@ class ExportController:
         database: str,
         spec_payload: dict,
         *,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         """
         Crea el PLAN: valida el spec, snapshotea el catálogo y persiste el job ``pending``.
@@ -1523,7 +1523,7 @@ class ExportController:
         *,
         confirm_target_name: str,
         confirm_token: str,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         """
         Confirma el plan congelado y encola la generación del artefacto.
@@ -1726,7 +1726,7 @@ class ExportController:
             "executed_at": row.executed_at,
         }
 
-    def cancel(self, job_id: int, *, admin: dict | None = None) -> dict:
+    def cancel(self, job_id: int, *, admin: "dict | Actor | None" = None) -> dict:
         """
         Solicita la cancelación COOPERATIVA (el worker corta en el próximo punto seguro).
 
@@ -2282,7 +2282,7 @@ class ExportController:
     # ------------------------------------------------------------------ #
     # 10) Manifiesto (§10.4)                                              #
     # ------------------------------------------------------------------ #
-    def manifest(self, job_id: int, *, admin: dict | None) -> dict:
+    def manifest(self, job_id: int, *, admin: "dict | Actor | None") -> dict:
         """
         Inventario verificable del artefacto: qué salió, cuánto pesa y con qué checksum.
 
@@ -2358,7 +2358,7 @@ class ExportController:
     # ------------------------------------------------------------------ #
     # 11-12) Entrega (§10.2) — el punto de DIVULGACIÓN                    #
     # ------------------------------------------------------------------ #
-    def prepare_download(self, job_id: int, *, admin: dict | None, inline: bool) -> dict:
+    def prepare_download(self, job_id: int, *, admin: "dict | Actor | None", inline: bool) -> dict:
         """
         Valida, **audita fail-closed** y devuelve por dónde entregar el artefacto.
 
@@ -2471,7 +2471,7 @@ class ExportController:
         }
 
     def finish_delivery(
-        self, job_id: int, *, admin: dict | None = None, consume: bool = True
+        self, job_id: int, *, admin: "dict | Actor | None" = None, consume: bool = True
     ) -> None:
         """
         Cierra la entrega: cuenta la descarga y, con un solo uso, borra el archivo.
@@ -2502,7 +2502,7 @@ class ExportController:
             ),
         )
 
-    def read_inline(self, job_id: int, *, admin: dict | None) -> dict:
+    def read_inline(self, job_id: int, *, admin: "dict | Actor | None") -> dict:
         """
         Entrega EN LÍNEA: el artefacto como texto plano, para copiar al portapapeles.
 
@@ -2553,7 +2553,7 @@ class ExportController:
         return f"{base}{export_package.artifact_extension(spec)}"
 
     @staticmethod
-    def _guard_owner(job: ExportJob, admin: dict | None) -> None:
+    def _guard_owner(job: ExportJob, admin: "dict | Actor | None") -> None:
         """
         Quien descarga tiene que ser quien exportó (§9.3).
 

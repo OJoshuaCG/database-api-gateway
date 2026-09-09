@@ -10,7 +10,7 @@ Endpoints de LOTES de clonación — copiar N bases de un servidor a otro en un 
 - GET  /database-clone-batches/{id}/retry-candidates — qué se puede reintentar y qué no.
 - POST /database-clone-batches/{id}/retry-failed     — arma un lote NUEVO con lo reintentable.
 
-Todo detrás de ``AdminDep``. Los límites siguen el criterio de la familia: crear el plan toca
+Todo detrás de ``clones.read`` / ``clones.execute``. Los límites siguen el criterio de la familia: crear el plan toca
 el motor (una lista de bases por servidor) → 10/min; ``execute`` y ``retry-failed`` son las
 operaciones sensibles → 3/min; el polling → 30/min; la lectura pura de la BD del gateway, sin
 decorador.
@@ -23,7 +23,10 @@ es el CONJUNTO de pares origen→destino, que es lo que ata ``confirm_token``.
 from fastapi import APIRouter, Request
 
 from app.controllers.clone_batch_controller import CloneBatchController
-from app.core.auth import AdminDep
+from app.core.authz import (
+    ClonesExecute,
+    ClonesRead,
+)
 from app.core.limiter import limiter
 from app.schemas.clone_batch import (
     CloneBatchCreateIn,
@@ -53,7 +56,7 @@ router = APIRouter(prefix="/database-clone-batches", tags=["Database Clone Batch
     },
 )
 @limiter.limit("10/minute")
-def create_clone_batch_plan(request: Request, admin: AdminDep, payload: CloneBatchCreateIn):
+def create_clone_batch_plan(request: Request, actor: ClonesExecute, payload: CloneBatchCreateIn):
     """
     Arma el plan del lote sin fotografiar ninguna base.
 
@@ -62,12 +65,12 @@ def create_clone_batch_plan(request: Request, admin: AdminDep, payload: CloneBat
     ``blocked`` con su código, para que el operador vea todos los motivos de una vez en lugar
     de corregir de a una.
     """
-    result = CloneBatchController().create_batch_plan(payload.model_dump(), admin=admin)
+    result = CloneBatchController().create_batch_plan(payload.model_dump(), admin=actor)
     return success(data=result, message="Plan del lote creado.")
 
 
 @router.get("", response_model=ApiResponse[list[CloneBatchOut]])
-def list_clone_batches(admin: AdminDep, pagination: PaginationDep):
+def list_clone_batches(actor: ClonesRead, pagination: PaginationDep):
     items, total = CloneBatchController().list_batches(
         offset=pagination.offset, limit=pagination.size
     )
@@ -76,13 +79,13 @@ def list_clone_batches(admin: AdminDep, pagination: PaginationDep):
 
 @router.get("/{batch_id}", response_model=ApiResponse[CloneBatchOut])
 @limiter.limit("30/minute")
-def get_clone_batch(request: Request, admin: AdminDep, batch_id: int):
+def get_clone_batch(request: Request, actor: ClonesRead, batch_id: int):
     """Cabecera + ``counts`` derivados en vivo. Es el latido del polling del lote."""
     return success(data=CloneBatchController().get_batch(batch_id))
 
 
 @router.get("/{batch_id}/items", response_model=ApiResponse[list[CloneBatchItemOut]])
-def list_clone_batch_items(admin: AdminDep, batch_id: int, pagination: PaginationDep):
+def list_clone_batch_items(actor: ClonesRead, batch_id: int, pagination: PaginationDep):
     items, total = CloneBatchController().list_items(
         batch_id, offset=pagination.offset, limit=pagination.size
     )
@@ -100,30 +103,30 @@ def list_clone_batch_items(admin: AdminDep, batch_id: int, pagination: Paginatio
 )
 @limiter.limit("3/minute")
 def execute_clone_batch(
-    request: Request, admin: AdminDep, batch_id: int, payload: CloneBatchExecuteIn
+    request: Request, actor: ClonesExecute, batch_id: int, payload: CloneBatchExecuteIn
 ):
     result = CloneBatchController().execute_batch(
         batch_id,
         confirm_server_name=payload.confirm_server_name,
         confirm_token=payload.confirm_token,
-        admin=admin,
+        admin=actor,
     )
     return success(data=result, message="Lote de clonación encolado.")
 
 
 @router.post("/{batch_id}/cancel", response_model=ApiResponse[CloneBatchOut])
-def cancel_clone_batch(admin: AdminDep, batch_id: int):
+def cancel_clone_batch(actor: ClonesExecute, batch_id: int):
     """
     Cancela el lote y **también** el job de la fila en curso. Sin esa propagación, cancelar
     solo evitaba que arrancaran las siguientes y la base que se estaba copiando seguía hasta
     el final, que en una tabla grande son horas.
     """
-    result = CloneBatchController().cancel_batch(batch_id, admin=admin)
+    result = CloneBatchController().cancel_batch(batch_id, admin=actor)
     return success(data=result, message="Cancelación del lote solicitada.")
 
 
 @router.get("/{batch_id}/retry-candidates", response_model=ApiResponse[CloneBatchRetryOut])
-def clone_batch_retry_candidates(admin: AdminDep, batch_id: int):
+def clone_batch_retry_candidates(actor: ClonesRead, batch_id: int):
     """
     Parte las filas no exitosas según si el destino quedó intacto.
 
@@ -141,10 +144,10 @@ def clone_batch_retry_candidates(admin: AdminDep, batch_id: int):
     responses={422: {"description": "No hay ninguna fila reintentable en este lote."}},
 )
 @limiter.limit("3/minute")
-def retry_clone_batch(request: Request, admin: AdminDep, batch_id: int):
+def retry_clone_batch(request: Request, actor: ClonesExecute, batch_id: int):
     """
     Arma un lote NUEVO con las filas reintentables. Vuelve a pasar por la confirmación
     agregada a propósito: el estado de los servidores cambió desde el plan original.
     """
-    result = CloneBatchController().retry_failed(batch_id, admin=admin)
+    result = CloneBatchController().retry_failed(batch_id, admin=actor)
     return success(data=result, message="Lote de reintento creado.")

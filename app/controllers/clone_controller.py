@@ -17,6 +17,8 @@ vive en ``app/services/clone_runner.py`` y se dispara desde ``execute_clone``.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import hashlib
 import json
 import time
@@ -91,6 +93,10 @@ from app.services.db_admin.sql_dialect import (
 from app.services.db_admin.sql_dialect import (
     requalify_body_schema,
 )
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
+
 
 logger = get_logger(__name__)
 
@@ -494,7 +500,7 @@ class CloneController:
     # ------------------------------------------------------------------ #
     # Crear plan                                                          #
     # ------------------------------------------------------------------ #
-    def create_plan(self, data: dict, *, admin: dict | None = None) -> dict:
+    def create_plan(self, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         session = self._session()
         try:
             src = self._resolve_source(
@@ -1935,7 +1941,7 @@ class CloneController:
         finally:
             session.close()
 
-    def cancel(self, job_id: int, *, admin: dict | None = None) -> dict:
+    def cancel(self, job_id: int, *, admin: "dict | Actor | None" = None) -> dict:
         """Solicita la cancelación COOPERATIVA (el worker corta en el próximo punto seguro)."""
         session = self._session()
         try:
@@ -1972,7 +1978,7 @@ class CloneController:
     # ------------------------------------------------------------------ #
     def execute_clone(
         self, job_id: int, *, confirm_target_name: str, confirm_token: str,
-        force: bool = False, admin: dict | None = None,
+        force: bool = False, admin: "dict | Actor | None" = None,
     ) -> dict:
         session = self._session()
         try:

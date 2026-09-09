@@ -18,7 +18,9 @@ La creación cuelga de ``/servers/...`` porque la BD se identifica por IDENTIDAD
 (``server_id`` + nombre), funcione o no adoptada en el inventario — mismo patrón que
 collation-conversion. Una vez que existe el job, el resto cuelga de él.
 
-Todo detrás de ``AdminDep``. Las capacidades son una lectura barata y muy repetida por el
+Tres niveles y no uno: ``exports.read`` para ver, ``exports.execute`` para planear y generar,
+y ``exports.download`` para retirar el artefacto — planear no divulga nada mientras no se
+entregue, y ``_guard_owner`` ya reconocía esa frontera antes de que existieran las capacidades. Las capacidades son una lectura barata y muy repetida por el
 formulario → 30/min; la planificación toca el motor (catálogo y snapshot en solo lectura) →
 10/min, igual que el clon; la ejecución y las dos entregas → **3/min**, porque son lo caro
 (una lectura completa del origen) y lo sensible (la divulgación de los datos en claro).
@@ -33,7 +35,11 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from starlette.background import BackgroundTask
 
 from app.controllers.export_controller import ExportController
-from app.core.auth import AdminDep
+from app.core.authz import (
+    ExportsDownload,
+    ExportsExecute,
+    ExportsRead,
+)
 from app.core.limiter import limiter
 from app.schemas.export import (
     ExportCapabilitiesOut,
@@ -59,7 +65,7 @@ router = APIRouter(tags=["Database Exports"])
     response_model=ApiResponse[ExportCapabilitiesOut],
 )
 @limiter.limit("30/minute")
-def export_capabilities(request: Request, admin: AdminDep, server_id: int, database: str):
+def export_capabilities(request: Request, actor: ExportsRead, server_id: int, database: str):
     """
     Qué puede exportarse de esta BD y con qué opciones, para ESTE motor.
 
@@ -77,7 +83,7 @@ def export_capabilities(request: Request, admin: AdminDep, server_id: int, datab
 @limiter.limit("10/minute")
 def create_export_plan(
     request: Request,
-    admin: AdminDep,
+    actor: ExportsExecute,
     server_id: int,
     database: str,
     payload: ExportCreate,
@@ -89,7 +95,7 @@ def create_export_plan(
     vez de disparar una segunda lectura del catálogo; con un spec distinto es 409.
     """
     result = ExportController().create_plan(
-        server_id, database, payload.model_dump(mode="json"), admin=admin
+        server_id, database, payload.model_dump(mode="json"), admin=actor
     )
     return success(data=result, message="Plan de exportación creado.")
 
@@ -101,7 +107,7 @@ def create_export_plan(
 @limiter.limit("10/minute")
 def list_export_objects(
     request: Request,
-    admin: AdminDep,
+    actor: ExportsRead,
     job_id: int,
     pagination: PaginationDep,
     object_type: str | None = Query(
@@ -136,7 +142,7 @@ def list_export_objects(
 )
 @limiter.limit("10/minute")
 def resolve_export_selection(
-    request: Request, admin: AdminDep, job_id: int, payload: ExportResolveIn
+    request: Request, actor: ExportsRead, job_id: int, payload: ExportResolveIn
 ):
     """
     Resuelve las dos selecciones y su cierre de dependencias SIN congelar nada.
@@ -161,7 +167,7 @@ def resolve_export_selection(
 )
 @limiter.limit("10/minute")
 def preview_export(
-    request: Request, admin: AdminDep, job_id: int, payload: ExportPreviewIn
+    request: Request, actor: ExportsExecute, job_id: int, payload: ExportPreviewIn
 ):
     """
     Valida el spec entero, CONGELA la selección y emite el ``confirm_token``.
@@ -185,7 +191,7 @@ def preview_export(
 )
 @limiter.limit("3/minute")
 def execute_export(
-    request: Request, admin: AdminDep, job_id: int, payload: ExportExecuteIn
+    request: Request, actor: ExportsExecute, job_id: int, payload: ExportExecuteIn
 ):
     """
     Confirma el plan congelado y ENCOLA la generación del artefacto.
@@ -202,7 +208,7 @@ def execute_export(
         job_id,
         confirm_target_name=payload.confirm_target_name,
         confirm_token=payload.confirm_token,
-        admin=admin,
+        admin=actor,
     )
     return success(data=data, message="Exportación encolada.")
 
@@ -211,7 +217,7 @@ def execute_export(
     "/database-exports/{job_id}",
     response_model=ApiResponse[ExportSummaryOut],
 )
-def get_export(admin: AdminDep, job_id: int):
+def get_export(actor: ExportsRead, job_id: int):
     """
     Estado del job (**polling**).
 
@@ -226,7 +232,7 @@ def get_export(admin: AdminDep, job_id: int):
     "/database-exports/{job_id}/items",
     response_model=ApiResponse[list[ExportItemOut]],
 )
-def list_export_items(admin: AdminDep, job_id: int, pagination: PaginationDep):
+def list_export_items(actor: ExportsRead, job_id: int, pagination: PaginationDep):
     """
     Reporte de incidencias por objeto (§14): qué se exportó, qué se omitió y por qué.
 
@@ -243,7 +249,7 @@ def list_export_items(admin: AdminDep, job_id: int, pagination: PaginationDep):
     "/database-exports/{job_id}/cancel",
     response_model=ApiResponse[ExportSummaryOut],
 )
-def cancel_export(admin: AdminDep, job_id: int):
+def cancel_export(actor: ExportsExecute, job_id: int):
     """
     Pide la cancelación COOPERATIVA: el worker corta en el próximo punto seguro, cierra la
     transacción contra el origen y descarta el artefacto parcial.
@@ -252,7 +258,7 @@ def cancel_export(admin: AdminDep, job_id: int):
     quedar bloqueado por una cuota.
     """
     return success(
-        data=ExportController().cancel(job_id, admin=admin),
+        data=ExportController().cancel(job_id, admin=actor),
         message="Cancelación solicitada.",
     )
 
@@ -261,14 +267,14 @@ def cancel_export(admin: AdminDep, job_id: int):
     "/database-exports/{job_id}/manifest",
     response_model=ApiResponse[ExportManifestOut],
 )
-def export_manifest(admin: AdminDep, job_id: int):
+def export_manifest(actor: ExportsRead, job_id: int):
     """
     Inventario verificable del artefacto: checksum, tamaño, objetos, filas y ``complete``.
 
     Permite comprobar integridad y auditar **sin abrir el archivo** — mirar el contenido para
     saber qué se llevó sería una segunda divulgación.
     """
-    return success(data=ExportController().manifest(job_id, admin=admin))
+    return success(data=ExportController().manifest(job_id, admin=actor))
 
 
 def _range_covers_whole_file(
@@ -318,7 +324,7 @@ def _range_covers_whole_file(
 
 @router.get("/database-exports/{job_id}/download")
 @limiter.limit("3/minute")
-def download_export(request: Request, admin: AdminDep, job_id: int):
+def download_export(request: Request, actor: ExportsDownload, job_id: int):
     """
     Descarga el artefacto. **No usa ``ApiResponse``**: es un archivo, no un recurso JSON
     (mismo criterio que el ``export`` de schema-comparisons).
@@ -343,7 +349,7 @@ def download_export(request: Request, admin: AdminDep, job_id: int):
     en los dos casos (ver ``finish_delivery``).
     """
     controller = ExportController()
-    info = controller.prepare_download(job_id, admin=admin, inline=False)
+    info = controller.prepare_download(job_id, admin=actor, inline=False)
     whole = _range_covers_whole_file(
         request.headers.get("range"),
         request.headers.get("if-range"),
@@ -351,7 +357,7 @@ def download_export(request: Request, admin: AdminDep, job_id: int):
         info["sha256"],
     )
     finish = BackgroundTask(
-        controller.finish_delivery, job_id, admin=admin, consume=whole
+        controller.finish_delivery, job_id, admin=actor, consume=whole
     )
     return FileResponse(
         path=info["path"],
@@ -368,7 +374,7 @@ def download_export(request: Request, admin: AdminDep, job_id: int):
 
 @router.get("/database-exports/{job_id}/content")
 @limiter.limit("3/minute")
-def export_content(request: Request, admin: AdminDep, job_id: int):
+def export_content(request: Request, actor: ExportsDownload, job_id: int):
     """
     Entrega EN LÍNEA: el artefacto como ``text/plain`` **sin envolver**, para copiarlo al
     portapapeles tal cual.
@@ -378,7 +384,7 @@ def export_content(request: Request, admin: AdminDep, job_id: int):
     script cortado que alguien pega y ejecuta es peor que un fallo. El preview ya publica
     ``inline_delivery_viable`` para que el cliente lo sepa antes de lanzar el job.
     """
-    info = ExportController().read_inline(job_id, admin=admin)
+    info = ExportController().read_inline(job_id, admin=actor)
     return PlainTextResponse(
         content=info["text"],
         headers={

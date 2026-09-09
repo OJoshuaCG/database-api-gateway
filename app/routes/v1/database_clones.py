@@ -11,7 +11,8 @@ Endpoints de clonación de bases de datos entre servidores.
 - GET  /database-clones/{id}/items            — pasos ejecutados (paginado).
 - POST /database-clones/{id}/cancel           — cancelación cooperativa.
 
-Todo detrás de ``AdminDep``. Crear toca el motor (snapshot del origen) → 10/min;
+Todo detrás de ``clones.read`` / ``clones.execute``. ``clones.execute`` vive en ``owner`` y NO
+en ``operator`` aunque el nombre lo emparente con los otros ``*.execute``: un clon copia DATOS. Crear toca el motor (snapshot del origen) → 10/min;
 execute es la operación más sensible → 3/min. El resto es solo lectura.
 """
 
@@ -20,7 +21,10 @@ from typing import Annotated
 from fastapi import APIRouter, Query, Request
 
 from app.controllers.clone_controller import CloneController
-from app.core.auth import AdminDep
+from app.core.authz import (
+    ClonesExecute,
+    ClonesRead,
+)
 from app.core.limiter import limiter
 from app.schemas.clone import (
     CloneClosureOut,
@@ -42,14 +46,14 @@ router = APIRouter(prefix="/database-clones", tags=["Database Clones"])
 
 @router.post("", response_model=ApiResponse[CloneSummaryOut], status_code=201)
 @limiter.limit("10/minute")
-def create_clone_plan(request: Request, admin: AdminDep, payload: CloneCreate):
-    result = CloneController().create_plan(payload.model_dump(), admin=admin)
+def create_clone_plan(request: Request, actor: ClonesExecute, payload: CloneCreate):
+    result = CloneController().create_plan(payload.model_dump(), admin=actor)
     return success(data=result, message="Plan de clonación creado.")
 
 
 @router.get("", response_model=ApiResponse[list[CloneListItemOut]])
 def list_clones(
-    admin: AdminDep,
+    actor: ClonesRead,
     pagination: PaginationDep,
     status: Annotated[list[str] | None, Query(description="Filtro por estado, repetible.")] = None,
     source_server_id: Annotated[int | None, Query(ge=1)] = None,
@@ -91,7 +95,7 @@ def list_clones(
 
 
 @router.get("/{job_id}", response_model=ApiResponse[CloneSummaryOut])
-def get_clone(admin: AdminDep, job_id: int):
+def get_clone(actor: ClonesRead, job_id: int):
     return success(data=CloneController().get_plan(job_id))
 
 
@@ -99,7 +103,7 @@ def get_clone(admin: AdminDep, job_id: int):
 @limiter.limit("10/minute")
 def list_clone_objects(
     request: Request,
-    admin: AdminDep,
+    actor: ClonesRead,
     job_id: int,
     include_data_stats: bool = Query(
         False,
@@ -116,7 +120,7 @@ def list_clone_objects(
 
 @router.post("/{job_id}/resolve-selection", response_model=ApiResponse[CloneClosureOut])
 @limiter.limit("10/minute")
-def resolve_clone_selection(request: Request, admin: AdminDep, job_id: int, payload: CloneResolveSelectionIn):
+def resolve_clone_selection(request: Request, actor: ClonesRead, job_id: int, payload: CloneResolveSelectionIn):
     data = CloneController().resolve_selection(
         job_id, [s.model_dump() for s in payload.selection]
     )
@@ -137,7 +141,7 @@ def resolve_clone_selection(request: Request, admin: AdminDep, job_id: int, payl
     },
 )
 @limiter.limit("10/minute")
-def preview_clone(request: Request, admin: AdminDep, job_id: int, payload: ClonePreviewIn):
+def preview_clone(request: Request, actor: ClonesExecute, job_id: int, payload: ClonePreviewIn):
     """
     Manda el SPEC, lo congela y devuelve el plan exacto + el ``confirm_token``.
 
@@ -157,19 +161,19 @@ def preview_clone(request: Request, admin: AdminDep, job_id: int, payload: Clone
 
 @router.post("/{job_id}/execute", response_model=ApiResponse[CloneSummaryOut])
 @limiter.limit("3/minute")
-def execute_clone(request: Request, admin: AdminDep, job_id: int, payload: CloneExecuteIn):
+def execute_clone(request: Request, actor: ClonesExecute, job_id: int, payload: CloneExecuteIn):
     result = CloneController().execute_clone(
         job_id,
         confirm_target_name=payload.confirm_target_name,
         confirm_token=payload.confirm_token,
         force=payload.force,
-        admin=admin,
+        admin=actor,
     )
     return success(data=result, message="Clonación encolada.")
 
 
 @router.get("/{job_id}/items", response_model=ApiResponse[list[CloneItemOut]])
-def list_clone_items(admin: AdminDep, job_id: int, pagination: PaginationDep):
+def list_clone_items(actor: ClonesRead, job_id: int, pagination: PaginationDep):
     items, total = CloneController().list_items(
         job_id, limit=pagination.size, offset=pagination.offset
     )
@@ -177,5 +181,5 @@ def list_clone_items(admin: AdminDep, job_id: int, pagination: PaginationDep):
 
 
 @router.post("/{job_id}/cancel", response_model=ApiResponse[CloneSummaryOut])
-def cancel_clone(admin: AdminDep, job_id: int):
+def cancel_clone(actor: ClonesExecute, job_id: int):
     return success(data=CloneController().cancel(job_id), message="Cancelación solicitada.")

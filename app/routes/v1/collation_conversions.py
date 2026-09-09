@@ -15,7 +15,7 @@ La creación es anidada bajo ``/servers/...`` porque la BD se identifica por IDE
 (``server_id`` + nombre), funcione o no adoptada en el inventario — mismo patrón que el resto
 del módulo de servidor-BDs. Una vez que existe el job, el resto cuelga de él.
 
-Todo detrás de ``AdminDep``. Crear y previsualizar tocan el motor (lectura del inventario) →
+Todo detrás de ``collation.read`` / ``collation.execute``. Crear y previsualizar tocan el motor (lectura del inventario) →
 10/min, igual que el clon; execute es la operación más sensible → 3/min. El resto es lectura
 de la BD del gateway.
 """
@@ -25,7 +25,10 @@ from fastapi import APIRouter, Request
 from app.controllers.collation_conversion_controller import (
     CollationConversionController,
 )
-from app.core.auth import AdminDep
+from app.core.authz import (
+    CollationExecute,
+    CollationRead,
+)
 from app.core.limiter import limiter
 from app.schemas.collation_conversion import (
     CollationConversionCreate,
@@ -50,7 +53,7 @@ router = APIRouter(tags=["Collation Conversions"])
 @limiter.limit("10/minute")
 def create_collation_conversion(
     request: Request,
-    admin: AdminDep,
+    actor: CollationExecute,
     server_id: int,
     database: str,
     payload: CollationConversionCreate,
@@ -60,7 +63,7 @@ def create_collation_conversion(
         database,
         target_charset=payload.target_charset,
         target_collation=payload.target_collation,
-        admin=admin,
+        admin=actor,
     )
     return success(data=result, message="Plan de conversión de collation creado.")
 
@@ -69,7 +72,7 @@ def create_collation_conversion(
     "/collation-conversions/{job_id}",
     response_model=ApiResponse[CollationConversionSummaryOut],
 )
-def get_collation_conversion(admin: AdminDep, job_id: int):
+def get_collation_conversion(actor: CollationRead, job_id: int):
     return success(data=CollationConversionController().get_plan(job_id))
 
 
@@ -78,7 +81,7 @@ def get_collation_conversion(admin: AdminDep, job_id: int):
     response_model=ApiResponse[CollationInventoryOut],
 )
 @limiter.limit("10/minute")
-def list_collation_conversion_objects(request: Request, admin: AdminDep, job_id: int):
+def list_collation_conversion_objects(request: Request, actor: CollationRead, job_id: int):
     return success(data=CollationConversionController().get_objects(job_id))
 
 
@@ -88,7 +91,7 @@ def list_collation_conversion_objects(request: Request, admin: AdminDep, job_id:
 )
 @limiter.limit("10/minute")
 def preview_collation_conversion(
-    request: Request, admin: AdminDep, job_id: int, payload: CollationConversionPreviewIn
+    request: Request, actor: CollationExecute, job_id: int, payload: CollationConversionPreviewIn
 ):
     data = CollationConversionController().preview(
         job_id,
@@ -106,14 +109,14 @@ def preview_collation_conversion(
 )
 @limiter.limit("3/minute")
 def execute_collation_conversion(
-    request: Request, admin: AdminDep, job_id: int, payload: CollationConversionExecuteIn
+    request: Request, actor: CollationExecute, job_id: int, payload: CollationConversionExecuteIn
 ):
     result = CollationConversionController().execute(
         job_id,
         confirm_target_name=payload.confirm_target_name,
         confirm_token=payload.confirm_token,
         force=payload.force,
-        admin=admin,
+        admin=actor,
     )
     return success(data=result, message="Conversión de collation encolada.")
 
@@ -123,7 +126,7 @@ def execute_collation_conversion(
     response_model=ApiResponse[list[CollationConversionItemOut]],
 )
 def list_collation_conversion_items(
-    admin: AdminDep, job_id: int, pagination: PaginationDep
+    actor: CollationRead, job_id: int, pagination: PaginationDep
 ):
     items, total = CollationConversionController().list_items(
         job_id, limit=pagination.size, offset=pagination.offset
@@ -135,8 +138,8 @@ def list_collation_conversion_items(
     "/collation-conversions/{job_id}/cancel",
     response_model=ApiResponse[CollationConversionSummaryOut],
 )
-def cancel_collation_conversion(admin: AdminDep, job_id: int):
+def cancel_collation_conversion(actor: CollationExecute, job_id: int):
     return success(
-        data=CollationConversionController().cancel(job_id, admin=admin),
+        data=CollationConversionController().cancel(job_id, admin=actor),
         message="Cancelación solicitada.",
     )

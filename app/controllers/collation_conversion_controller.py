@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.controllers.schema_comparison_controller import _synthetic_lock_key
-from app.core.actor import identity_of
+from app.core.actor import Actor, identity_of
 from app.core.database import Database
 from app.core.environments import (
     COLLATION_CONVERSION_TTL_HOURS,
@@ -428,7 +428,7 @@ class CollationConversionController:
         *,
         target_charset: str | None,
         target_collation: str,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
         batch_id: int | None = None,
         batch_seq: int | None = None,
     ) -> dict:
@@ -1340,7 +1340,7 @@ class CollationConversionController:
         confirm_target_name: str,
         confirm_token: str,
         force: bool = False,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         ctx = self._validate_job_execution(
             job_id,
@@ -1370,7 +1370,7 @@ class CollationConversionController:
     # ------------------------------------------------------------------ #
     # Cancelación / barrido                                               #
     # ------------------------------------------------------------------ #
-    def cancel(self, job_id: int, *, admin: dict | None = None) -> dict:
+    def cancel(self, job_id: int, *, admin: "dict | Actor | None" = None) -> dict:
         """
         Cancelación COOPERATIVA: el worker corta en el próximo punto seguro (entre pasos).
 
@@ -2184,7 +2184,7 @@ class CollationConversionController:
         include_database_default: bool = True,
         environment_id: int | None = None,
         max_databases: int = 10,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         """
         Planifica el lote: un job por BD elegible, previsualizado, con el ``batch_token``.
@@ -2399,7 +2399,7 @@ class CollationConversionController:
         database_ids: list[int],
         confirmations: dict[int, str] | None = None,
         force: bool = False,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         """
         Confirma y encola el lote. Es el punto donde se repone lo que un lote se lleva.
@@ -2688,7 +2688,7 @@ class CollationConversionController:
         return {"batch": summary, "jobs": items}
 
     def cancel_batch(
-        self, model_id: int, batch_id: int, *, admin: dict | None = None
+        self, model_id: int, batch_id: int, *, admin: "dict | Actor | None" = None
     ) -> dict:
         """
         Frena el resto del lote. Cooperativo, igual que el cancel unitario.
@@ -2816,7 +2816,7 @@ class CollationConversionController:
 
     def create_blueprint_version(
         self, model_id: int, batch_id: int, *, name: str | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         """
         Materializa el lote como una versión del blueprint y la STAMPEA en sus N BDs.

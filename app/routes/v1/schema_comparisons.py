@@ -11,7 +11,8 @@ Endpoints de comparaciones estructurales entre dos BDs gestionadas (Plan diff).
 - POST /schema-comparisons/{id}/adopt         — Opción A: nueva versión de blueprint.
 - POST /schema-comparisons/{id}/execute       — Opción B: ejecución directa ad-hoc.
 
-Todo detrás de ``AdminDep``. La creación toca ambos motores (introspección, coste
+Todo detrás de ``schema_diff.read`` / ``schema_diff.execute``; ``adopt`` exige además
+``blueprints.write``, porque crea una versión de blueprint desde otro módulo. La creación toca ambos motores (introspección, coste
 alto → 10/min); adopt/execute son las operaciones más sensibles → 3/min (alineado
 con apply-all).
 """
@@ -20,8 +21,13 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import Response
 
 from app.controllers.schema_comparison_controller import SchemaComparisonController
-from app.core.auth import AdminDep
+from app.core.authz import (
+    SchemaDiffExecute,
+    SchemaDiffRead,
+    assert_capability,
+)
 from app.core.limiter import limiter
+from app.services.capability_catalog import Capability
 from app.schemas.schema_comparison import (
     AdoptComparisonIn,
     AdoptComparisonOut,
@@ -43,7 +49,7 @@ router = APIRouter(prefix="/schema-comparisons", tags=["Schema Comparisons"])
 
 @router.post("", response_model=ApiResponse[SchemaComparisonSummaryOut], status_code=201)
 @limiter.limit("10/minute")
-def create_comparison(request: Request, admin: AdminDep, payload: SchemaComparisonCreate):
+def create_comparison(request: Request, actor: SchemaDiffRead, payload: SchemaComparisonCreate):
     result = SchemaComparisonController().create_comparison(
         source_database_id=payload.source_database_id,
         source_server_id=payload.source_server_id,
@@ -51,13 +57,13 @@ def create_comparison(request: Request, admin: AdminDep, payload: SchemaComparis
         target_database_id=payload.target_database_id,
         target_server_id=payload.target_server_id,
         target_database_name=payload.target_database_name,
-        admin=admin,
+        admin=actor,
     )
     return success(data=result, message="Comparación de esquema creada.")
 
 
 @router.get("/{comparison_id}", response_model=ApiResponse[SchemaComparisonSummaryOut])
-def get_comparison(admin: AdminDep, comparison_id: int):
+def get_comparison(actor: SchemaDiffRead, comparison_id: int):
     return success(data=SchemaComparisonController().get_comparison(comparison_id))
 
 
@@ -66,7 +72,7 @@ def get_comparison(admin: AdminDep, comparison_id: int):
     response_model=ApiResponse[list[SchemaComparisonItemOut]],
 )
 def list_comparison_items(
-    admin: AdminDep,
+    actor: SchemaDiffRead,
     comparison_id: int,
     pagination: PaginationDep,
     object_type: str | None = Query(None, description="Filtra por tipo de objeto."),
@@ -86,7 +92,7 @@ def list_comparison_items(
 
 @router.get("/{comparison_id}/export")
 def export_comparison_sql(
-    admin: AdminDep,
+    actor: SchemaDiffRead,
     comparison_id: int,
     item_ids: list[int] | None = Query(
         None,
@@ -119,7 +125,7 @@ def export_comparison_sql(
         object_type=object_type,
         change_type=change_type,
         include_rollback=include_rollback,
-        admin=admin,
+        admin=actor,
     )
     return Response(
         content=content,
@@ -133,8 +139,17 @@ def export_comparison_sql(
 )
 @limiter.limit("3/minute")
 def adopt_comparison(
-    request: Request, admin: AdminDep, comparison_id: int, payload: AdoptComparisonIn
+    request: Request, actor: SchemaDiffExecute, comparison_id: int, payload: AdoptComparisonIn
 ):
+    """
+    Adopta el diff como una versión NUEVA del blueprint del target.
+
+    **Exige ``blueprints.write`` ADEMÁS de ``schema_diff.execute``.** Es la regla del §6.6: esto
+    crea una versión de blueprint **desde otro módulo**, así que sin la segunda exigencia el
+    módulo de diff sería una vía para escribir blueprints sin tener el permiso de escribirlos.
+    Y la escritura no es cosmética: la versión creada la aplican después N bases.
+    """
+    assert_capability(actor, Capability.BLUEPRINTS_WRITE)
     result = SchemaComparisonController().adopt_comparison(
         comparison_id,
         selected_item_ids=payload.selected_item_ids,
@@ -143,7 +158,7 @@ def adopt_comparison(
         execute_immediately=payload.execute_immediately,
         auto_resolve_dependencies=payload.auto_resolve_dependencies,
         confirm_target_name=payload.confirm_target_name,
-        admin=admin,
+        admin=actor,
     )
     msg = f"Versión {result['version']} creada desde la comparación."
     if result.get("added_item_ids"):
@@ -159,7 +174,7 @@ def adopt_comparison(
 @router.post(
     "/{comparison_id}/resolve-selection", response_model=ApiResponse[ResolveSelectionOut]
 )
-def resolve_selection(admin: AdminDep, comparison_id: int, payload: ResolveSelectionIn):
+def resolve_selection(actor: SchemaDiffRead, comparison_id: int, payload: ResolveSelectionIn):
     """
     Expande una selección a su CIERRE de dependencias, sin adoptar ni ejecutar nada.
 
@@ -185,7 +200,7 @@ def resolve_selection(admin: AdminDep, comparison_id: int, payload: ResolveSelec
     "/{comparison_id}/execute-preview", response_model=ApiResponse[ExecutePreviewOut]
 )
 def preview_execution(
-    admin: AdminDep, comparison_id: int, payload: ExecutePreviewIn
+    actor: SchemaDiffExecute, comparison_id: int, payload: ExecutePreviewIn
 ):
     """
     Resuelve un modo/selección SIN ejecutar nada: devuelve las sentencias exactas y el
@@ -206,7 +221,7 @@ def preview_execution(
 @limiter.limit("3/minute")
 def execute_comparison(
     request: Request,
-    admin: AdminDep,
+    actor: SchemaDiffExecute,
     comparison_id: int,
     payload: ExecuteComparisonIn,
     force: bool = Query(
@@ -220,7 +235,7 @@ def execute_comparison(
         confirm_target_name=payload.confirm_target_name,
         confirm_token=payload.confirm_token,
         force=force,
-        admin=admin,
+        admin=actor,
     )
     suffix = " (con fallo)" if result["failed"] else ""
     msg = f"Ejecutadas {result['applied_count']}/{result['total']} sentencia(s){suffix}."

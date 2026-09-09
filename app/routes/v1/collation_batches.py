@@ -45,8 +45,13 @@ from fastapi import APIRouter, Request
 
 from app.controllers.collation_conversion_controller import CollationConversionController
 from app.controllers.database_model_controller import DatabaseModelController
-from app.core.auth import AdminDep
+from app.core.authz import (
+    CollationExecute,
+    CollationRead,
+    assert_capability,
+)
 from app.core.limiter import limiter
+from app.services.capability_catalog import Capability
 from app.schemas.collation_conversion import (
     CollationBatchCreate,
     CollationBatchExecuteIn,
@@ -69,7 +74,7 @@ router = APIRouter(prefix="/database-models", tags=["Collation Batches"])
 )
 @limiter.limit("10/minute")
 def create_collation_batch(
-    request: Request, admin: AdminDep, model_id: int, payload: CollationBatchCreate
+    request: Request, actor: CollationExecute, model_id: int, payload: CollationBatchCreate
 ):
     """
     🔌 Planifica el lote: crea y previsualiza un job por cada BD **activa** del blueprint.
@@ -92,7 +97,7 @@ def create_collation_batch(
         include_database_default=payload.include_database_default,
         environment_id=payload.environment_id,
         max_databases=payload.max_databases,
-        admin=admin,
+        admin=actor,
     )
     return success(data=data, message="Lote de conversión planificado.")
 
@@ -104,7 +109,7 @@ def create_collation_batch(
 @limiter.limit("3/minute")
 def execute_collation_batch(
     request: Request,
-    admin: AdminDep,
+    actor: CollationExecute,
     model_id: int,
     batch_id: int,
     payload: CollationBatchExecuteIn,
@@ -126,7 +131,7 @@ def execute_collation_batch(
         database_ids=payload.database_ids,
         confirmations=payload.confirmations,
         force=payload.force,
-        admin=admin,
+        admin=actor,
     )
     msg = (
         f"Lote encolado: {data['enqueued']} conversión(es). Corren EN SERIE."
@@ -141,7 +146,7 @@ def execute_collation_batch(
     response_model=ApiResponse[CollationBatchStatusOut],
 )
 @limiter.limit("30/minute")
-def get_collation_batch(request: Request, admin: AdminDep, model_id: int, batch_id: int):
+def get_collation_batch(request: Request, actor: CollationRead, model_id: int, batch_id: int):
     """
     Estado del lote + un job por BD, para el polling.
 
@@ -158,7 +163,7 @@ def get_collation_batch(request: Request, admin: AdminDep, model_id: int, batch_
 )
 @limiter.limit("10/minute")
 def cancel_collation_batch(
-    request: Request, admin: AdminDep, model_id: int, batch_id: int
+    request: Request, actor: CollationExecute, model_id: int, batch_id: int
 ):
     """
     Cancelación COOPERATIVA del lote.
@@ -168,7 +173,7 @@ def cancel_collation_batch(
     mitad dejaría la tabla a medio reescribir, que es peor que dejarlo terminar.
     """
     return success(
-        data=CollationConversionController().cancel_batch(model_id, batch_id, admin=admin),
+        data=CollationConversionController().cancel_batch(model_id, batch_id, admin=actor),
         message="Cancelación del lote solicitada.",
     )
 
@@ -181,13 +186,17 @@ def cancel_collation_batch(
 @limiter.limit("3/minute")
 def create_collation_blueprint_version(
     request: Request,
-    admin: AdminDep,
+    actor: CollationExecute,
     model_id: int,
     batch_id: int,
     payload: CollationBlueprintVersionIn,
 ):
     """
     🔌 Registra el lote como versión del blueprint y la **stampea** en sus N BDs.
+
+    **Exige ``blueprints.write`` ADEMÁS de ``collation.execute``** (regla del §6.6): crea una
+    versión de blueprint desde otro módulo, y sin esa segunda exigencia el módulo de collation
+    sería una vía para escribir blueprints sin el permiso de escribirlos.
 
     La versión es CONTABILIDAD de algo ya ocurrido: se crea y se marca, **no se aplica**. La
     conversión la hizo cada job leyendo su propio inventario, que es lo único que puede recrear
@@ -203,8 +212,9 @@ def create_collation_blueprint_version(
     si los conjuntos de tablas difieren, si alguna conversión fue parcial, si alguna base está
     en cuarentena, o si el SQL supera el tope por versión.
     """
+    assert_capability(actor, Capability.BLUEPRINTS_WRITE)
     data = CollationConversionController().create_blueprint_version(
-        model_id, batch_id, name=payload.name, admin=admin
+        model_id, batch_id, name=payload.name, admin=actor
     )
     return success(
         data=data,
@@ -216,7 +226,7 @@ def create_collation_blueprint_version(
     "/{model_id}/collation-drift",
     response_model=ApiResponse[CollationDriftOut],
 )
-def get_collation_drift(admin: AdminDep, model_id: int):
+def get_collation_drift(actor: CollationRead, model_id: int):
     """
     Qué BDs del blueprint se desviaron del charset/collation declarado.
 
