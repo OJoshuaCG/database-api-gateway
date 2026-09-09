@@ -72,5 +72,24 @@ class AuditLog(Base, TimestampMixin):
         String(255), nullable=True, comment="Credencial del gateway que ejecutó el DCL"
     )
 
+    # Qué CLASE de actor hizo la operación. Sin esto, una fila de un agente y una de un humano
+    # son indistinguibles salvo por el `admin_username`, y eso es exactamente la pregunta que se
+    # hace después de un incidente: "¿esto lo hizo una persona o un token?".
+    actor_type: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="admin",
+        server_default="admin",
+        comment="admin | api_token. Las filas históricas son todas 'admin', que es la verdad",
+    )
+
+    # El token, cuando el actor es uno. **Nunca el secreto**: solo el id de la fila.
+    api_token_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        index=True,
+        comment="Token de agente que originó la operación, si el actor fue un token",
+    )
+
     def __repr__(self) -> str:
         return f"<AuditLog(id={self.id}, action='{self.action}', status='{self.status}')>"

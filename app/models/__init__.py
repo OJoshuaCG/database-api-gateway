@@ -16,6 +16,7 @@ Ejemplo:
 """
 
 from app.models.access_grant import AccessGrant, UserGlobalCapability
+from app.models.api_token import ApiToken
 from app.models.gateway_session import GatewaySession
 from app.models.audit_log import AuditLog
 from app.models.base import Base, TimestampMixin
@@ -57,6 +58,7 @@ __all__ = [
     "Base",
     "TimestampMixin",
     "AccessGrant",
+    "ApiToken",
     "GatewaySession",
     "UserGlobalCapability",
     "User",

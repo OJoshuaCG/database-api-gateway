@@ -10,6 +10,7 @@ El campo ``status`` refleja la consistencia entre el inventario y el motor:
 ``pending`` → ``active`` | ``error`` (ver ``ProvisionStatus``).
 """
 
+from sqlalchemy import Boolean
 from sqlalchemy import Enum as SQLAEnum
 from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
@@ -105,6 +106,30 @@ class ManagedDatabase(Base, TimestampMixin):
         default="provisioned",
         server_default="provisioned",
         comment="Origen del registro: 'provisioned' (creada por el gateway) | 'adopted' (preexistente, adoptada — Plan 09)",
+    )
+
+    # EL EJE QUE DECIDE EL ALCANCE ES ESTE OPT-IN, no el veto de abajo. Con solo un opt-out,
+    # habilitar un entorno dejaría legibles TODAS sus bases de golpe —incluidas las que nadie
+    # revisó y las que se creen después— y "activar una" obligaría a ir a bloquear N a mano,
+    # invirtiendo el trabajo y dejando el default del lado permisivo. El default-deny existiría
+    # una sola vez, al nivel del entorno, y de ahí en adelante el sistema sería default-allow.
+    agent_access_allowed: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+        comment="Opt-in POR BASE para agentes (MCP). Nace en false: cada activación es explícita",
+    )
+
+    # Veto de emergencia: el bloqueo gana sobre el permiso. **No tiene override**: ni `force`
+    # —que es override de cuarentena y nada más, como documenta CLAUDE.md— ni nada. Un agente no
+    # tiene manera de elevar.
+    agent_access_blocked: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+        comment="Veto de emergencia para agentes. Gana sobre agent_access_allowed. Sin override",
     )
 
     def __repr__(self) -> str:

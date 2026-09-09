@@ -50,10 +50,16 @@ def _build(
     grantor: str | None,
 ) -> AuditLog:
     admin_id, admin_username = identity_of(admin)
+    # La CLASE de actor sale del propio actor, no de un parámetro que el llamador pueda
+    # equivocar. Un dict legado o `None` son siempre "admin", que es la verdad histórica.
+    actor_type = getattr(admin, "kind", None) or "admin"
+    api_token_id = admin.id if getattr(admin, "kind", None) == "api_token" else None
     return AuditLog(
         request_id=_safe_get(current_http_identifier),
         admin_id=admin_id,
         admin_username=admin_username,
+        actor_type=actor_type,
+        api_token_id=api_token_id,
         action=action,
         target_type=target_type,
         target_id=target_id,

@@ -140,6 +140,21 @@ class Environment(Base, TimestampMixin):
         ),
     )
 
+    # Nace en `false`, NO en `true`, y la asimetría está puesta en el DDL y no solo en el
+    # código del gate: con default permisivo, el momento en que se habilita el MCP dejaría
+    # legible todo lo ya clasificado sin que nadie lo haya decidido.
+    #
+    # Y ojo: habilitar el entorno NO alcanza. El gate exige entorno permite Y base opt-in Y
+    # base no vetada — si el entorno fuera el único eje, activarlo abriría de golpe todas sus
+    # bases, incluidas las que nadie revisó y **las que se creen después**.
+    allows_agent_access: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+        comment="Si los agentes (MCP) pueden inspeccionar bases de este entorno. Nace en false",
+    )
+
     def __repr__(self) -> str:
         return (
             f"<Environment(id={self.id}, slug='{self.slug}', rank={self.rank}, "
