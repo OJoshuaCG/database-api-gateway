@@ -26,7 +26,17 @@ SESSION_USERNAME = "admin_username"
 
 
 def login_session(request: Request, user: dict) -> None:
-    """Marca la sesión como autenticada para el usuario dado."""
+    """
+    Marca la sesión como autenticada para el usuario dado.
+
+    El ``clear()`` va PRIMERO y no es cosmético: sin él, cualquier clave que ya estuviera en
+    la sesión sobrevive al login. Hoy es inocuo porque acá solo viven dos claves y el login
+    las sobreescribe — pero deja de serlo en cuanto la sesión guarde algo más (un marcador de
+    reautenticación, un flag de "2FA pendiente"), porque ahí un valor plantado por el dueño
+    anterior de la sesión pasa al dueño nuevo. ``logout_session`` y ``get_current_admin`` ya
+    limpiaban; el login era el único de los tres que no.
+    """
+    request.session.clear()
     request.session[SESSION_USER_ID] = user["id"]
     request.session[SESSION_USERNAME] = user["username"]
 

@@ -45,6 +45,24 @@ def test_login_validation_error(client):
     assert r.status_code == 422
 
 
+def test_login_clears_stale_session_data(client):
+    """
+    ``login_session`` limpia la sesión ANTES de escribir.
+
+    Hoy es inocuo porque solo viven dos claves y el login las sobreescribe, pero deja de
+    serlo en cuanto la sesión guarde algo más (un marcador de reautenticación, un flag de
+    "2FA pendiente"): ahí un valor plantado por el dueño anterior pasaría al dueño nuevo.
+    ``logout_session`` y ``get_current_admin`` ya limpiaban; el login era el único que no.
+    """
+    from app.core import auth as auth_mod
+
+    stale = {"basura": "sobreviviente", auth_mod.SESSION_USER_ID: 999}
+    auth_mod.login_session(
+        type("R", (), {"session": stale})(), {"id": 1, "username": "admin"}
+    )
+    assert stale == {auth_mod.SESSION_USER_ID: 1, auth_mod.SESSION_USERNAME: "admin"}
+
+
 def test_template_demo_routes_are_not_mounted(client):
     """
     Los ``/api/v1/test/*`` del template NO están montados.
