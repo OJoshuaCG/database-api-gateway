@@ -19,7 +19,7 @@ máximo de página.
 from fastapi import APIRouter, Query
 
 from app.controllers.environment_controller import EnvironmentController
-from app.core.auth import AdminDep
+from app.core.authz import EnvironmentsRead, GatewayAdmin
 from app.schemas.environment import EnvironmentCreate, EnvironmentOut, EnvironmentUpdate
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
@@ -35,7 +35,7 @@ _CONFIRM_SLUG_DESC = (
 
 @router.get("", response_model=ApiResponse[list[EnvironmentOut]])
 def list_environments(
-    admin: AdminDep,
+    actor: EnvironmentsRead,
     pagination: PaginationDep,
     only_active: bool = Query(
         False,
@@ -53,21 +53,21 @@ def list_environments(
 
 
 @router.post("", response_model=ApiResponse[EnvironmentOut], status_code=201)
-def create_environment(admin: AdminDep, payload: EnvironmentCreate):
+def create_environment(actor: GatewayAdmin, payload: EnvironmentCreate):
     created = EnvironmentController().create_environment(
-        payload.model_dump(), admin=admin
+        payload.model_dump(), admin=actor
     )
     return success(data=created, message="Entorno creado.")
 
 
 @router.get("/{environment_id}", response_model=ApiResponse[EnvironmentOut])
-def get_environment(admin: AdminDep, environment_id: int):
+def get_environment(actor: EnvironmentsRead, environment_id: int):
     return success(data=EnvironmentController().get_environment(environment_id))
 
 
 @router.patch("/{environment_id}", response_model=ApiResponse[EnvironmentOut])
 def update_environment(
-    admin: AdminDep,
+    actor: GatewayAdmin,
     environment_id: int,
     payload: EnvironmentUpdate,
     confirm_slug: str | None = Query(None, max_length=60, description=_CONFIRM_SLUG_DESC),
@@ -82,14 +82,14 @@ def update_environment(
         environment_id,
         payload.model_dump(exclude_unset=True),
         confirm_slug=confirm_slug,
-        admin=admin,
+        admin=actor,
     )
     return success(data=updated, message="Entorno actualizado.")
 
 
 @router.delete("/{environment_id}", response_model=ApiResponse[None])
 def delete_environment(
-    admin: AdminDep,
+    actor: GatewayAdmin,
     environment_id: int,
     confirm_slug: str | None = Query(None, max_length=60, description=_CONFIRM_SLUG_DESC),
 ):
@@ -102,6 +102,6 @@ def delete_environment(
     así. Para retirar un entorno que todavía tiene BDs, ``is_active=false``.
     """
     EnvironmentController().delete_environment(
-        environment_id, confirm_slug=confirm_slug, admin=admin
+        environment_id, confirm_slug=confirm_slug, admin=actor
     )
     return empty(message="Entorno borrado.")

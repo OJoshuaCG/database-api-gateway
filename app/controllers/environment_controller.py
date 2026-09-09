@@ -14,6 +14,8 @@ Tres reglas que este archivo tiene que preservar:
    ``_weakenings``.
 """
 
+from typing import TYPE_CHECKING
+
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
@@ -24,6 +26,9 @@ from app.models.environment import Environment
 from app.models.managed_database import ManagedDatabase
 from app.services import audit
 from app.services import environment_catalog as ecodes
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
 
 
 class EnvironmentController:
@@ -258,7 +263,7 @@ class EnvironmentController:
     # ------------------------------------------------------------------ #
     # Escritura                                                          #
     # ------------------------------------------------------------------ #
-    def create_environment(self, data: dict, *, admin: dict | None = None) -> dict:
+    def create_environment(self, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         session = self._session()
         try:
             self._raise_duplicate(session, name=data["name"], slug=data["slug"])
@@ -297,7 +302,7 @@ class EnvironmentController:
 
     def update_environment(
         self, environment_id: int, data: dict, *, confirm_slug: str | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         session = self._session()
         try:
@@ -377,7 +382,7 @@ class EnvironmentController:
 
     def delete_environment(
         self, environment_id: int, *, confirm_slug: str | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> None:
         """
         Borra un entorno. **Exige que no tenga ninguna BD asignada.**
