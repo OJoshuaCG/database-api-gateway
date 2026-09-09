@@ -15,6 +15,8 @@ gateway → 409) y CASCADE solo con confirmación explícita. La intención de T
 se audita fail-closed antes de ejecutar.
 """
 
+from typing import TYPE_CHECKING
+
 from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
@@ -38,6 +40,10 @@ from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.dtos import EngineUserInfo, GrantInfo, GrantLevel, ObjectRef
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import validate_host, validate_identifier
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
+
 
 logger = get_logger(__name__)
 
@@ -178,7 +184,7 @@ class GrantController:
     # Grant                                                                #
     # ------------------------------------------------------------------ #
     def grant_object(
-        self, user_id: int, payload: GrantRequest, *, admin: dict | None = None
+        self, user_id: int, payload: GrantRequest, *, admin: "dict | Actor | None" = None
     ) -> dict:
         session = self._session()
         try:
@@ -276,7 +282,7 @@ class GrantController:
         payload: RevokeRequest,
         *,
         confirm_grantee: str | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> None:
         session = self._session()
         try:
@@ -532,7 +538,7 @@ class GrantController:
         profile_id: int,
         payload: ApplyProfileRequest,
         *,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> ApplyProfileResult:
         """
         Aplica un perfil de permisos a un usuario. Para cada item del perfil, busca
@@ -604,7 +610,7 @@ class GrantController:
         profile_id: int,
         payload: ApplyProfileBulkRequest,
         *,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> ApplyProfileBulkResult:
         """
         Aplica el MISMO perfil al MISMO usuario sobre N bases de datos en una llamada.

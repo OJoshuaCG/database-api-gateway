@@ -16,6 +16,8 @@ Consistencia GW↔motor:
 La credencial descifrada NUNCA se persiste en claro, se serializa ni se loguea.
 """
 
+from typing import TYPE_CHECKING
+
 from sqlalchemy.exc import IntegrityError
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
@@ -45,6 +47,10 @@ from app.schemas.server_user import (
 )
 from app.services import audit
 from app.services.db_admin.factory import get_adapter
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
+
 
 
 class ServerUserController:
@@ -143,7 +149,7 @@ class ServerUserController:
     # Escritura (inventario + motor)                                      #
     # ------------------------------------------------------------------ #
     def create_server_user(
-        self, data: dict, *, provision: bool, admin: dict | None = None
+        self, data: dict, *, provision: bool, admin: "dict | Actor | None" = None
     ) -> dict:
         password = data.get("password")
         if provision and not password:
@@ -209,7 +215,7 @@ class ServerUserController:
         )
         return result
 
-    def adopt_user(self, data: dict, *, admin: dict | None = None) -> dict:
+    def adopt_user(self, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         """
         Adopta un usuario/rol que YA existe en el motor (Plan 09): registra metadata
         SIN ejecutar CREATE USER y SIN password (``has_password=false`` hasta que se
@@ -277,7 +283,7 @@ class ServerUserController:
         return result
 
     def update_server_user(
-        self, user_id: int, data: dict, *, provision: bool, admin: dict | None = None
+        self, user_id: int, data: dict, *, provision: bool, admin: "dict | Actor | None" = None
     ) -> dict:
         new_password = data.get("password")
 
@@ -339,7 +345,7 @@ class ServerUserController:
         data: dict,
         initial_grants: list[GrantOnCreate],
         *,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> ServerUserFullOut:
         """
         Crea y aprovisiona el usuario (igual que create_server_user con provision=True)
@@ -422,7 +428,7 @@ class ServerUserController:
         *,
         drop_remote: bool,
         confirm_username: str | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> None:
         session = self._session()
         try:
@@ -609,7 +615,7 @@ class ServerUserController:
         )
 
     def reveal_password(
-        self, server_id: int, username: str, host: str, *, admin: dict | None = None
+        self, server_id: int, username: str, host: str, *, admin: "dict | Actor | None" = None
     ) -> RevealedPasswordOut:
         """
         Revela la contraseña de un usuario ADOPTADO/gestionado — solo posible cuando el
@@ -673,7 +679,7 @@ class ServerUserController:
         )
 
     def create_user_by_identity(
-        self, server_id: int, data: dict, *, admin: dict | None = None
+        self, server_id: int, data: dict, *, admin: "dict | Actor | None" = None
     ) -> EngineUserActionOut:
         username = data["username"]
         host = data.get("host") or "%"
@@ -727,7 +733,7 @@ class ServerUserController:
         )
 
     def set_password_by_identity(
-        self, server_id: int, data: dict, *, admin: dict | None = None
+        self, server_id: int, data: dict, *, admin: "dict | Actor | None" = None
     ) -> EngineUserActionOut:
         username = data["username"]
         host = data.get("host") or "%"
@@ -793,7 +799,7 @@ class ServerUserController:
         host: str,
         *,
         confirm_username: str | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> EngineUserActionOut:
         host = host or "%"
         session = self._session()
@@ -873,7 +879,7 @@ class ServerUserController:
         )
 
     def add_host(
-        self, server_id: int, data: dict, *, admin: dict | None = None
+        self, server_id: int, data: dict, *, admin: "dict | Actor | None" = None
     ) -> AddHostOut:
         username = data["username"]
         source_host = data.get("source_host") or "%"
@@ -984,7 +990,7 @@ class ServerUserController:
         return [u.host or "%" for u in live if u.username == username]
 
     def adopt_user_all_hosts(
-        self, server_id: int, data: dict, *, admin: dict | None = None
+        self, server_id: int, data: dict, *, admin: "dict | Actor | None" = None
     ) -> BatchAdoptOut:
         """
         Adopta TODAS las identidades en vivo de un username en una sola operación
@@ -1065,7 +1071,7 @@ class ServerUserController:
         )
 
     def set_known_password(
-        self, server_id: int, data: dict, *, admin: dict | None = None
+        self, server_id: int, data: dict, *, admin: "dict | Actor | None" = None
     ) -> KnownPasswordSetOut:
         """
         Registra una contraseña YA conocida por el admin humano SIN ejecutar ALTER
@@ -1191,7 +1197,7 @@ class ServerUserController:
         )
 
     def set_password_by_identity_all_hosts(
-        self, server_id: int, data: dict, *, admin: dict | None = None
+        self, server_id: int, data: dict, *, admin: "dict | Actor | None" = None
     ) -> PasswordChangeBatchOut:
         """
         Rota la contraseña REAL (ALTER USER/ROLE) en TODOS los hosts en vivo de un

@@ -15,11 +15,17 @@ from fastapi import APIRouter, Query, Request
 
 from app.controllers.grant_controller import GrantController
 from app.controllers.server_user_controller import ServerUserController
-from app.core.auth import AdminDep
+from app.core.authz import (
+    DatabasesRead,
+    EngineUsersRead,
+    EngineUsersWrite,
+    assert_capability,
+)
 from app.core.limiter import limiter
 from app.schemas.grant import ApplyProfileBulkRequest, ApplyProfileBulkResult, ApplyProfileRequest, ApplyProfileResult, GrantInfo, GrantRequest, RevokeRequest
 from app.schemas.managed_database import ManagedDatabaseOut
 from app.schemas.server_user import AdoptUserIn, ServerUserCreate, ServerUserFullCreate, ServerUserFullOut, ServerUserOut, ServerUserUpdate
+from app.services.capability_catalog import Capability
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
@@ -28,7 +34,7 @@ router = APIRouter(prefix="/server-users", tags=["Server Users"])
 
 @router.get("", response_model=ApiResponse[list[ServerUserOut]])
 def list_server_users(
-    admin: AdminDep,
+    actor: EngineUsersRead,
     pagination: PaginationDep,
     server_id: int | None = Query(None, ge=1),
 ):
@@ -40,10 +46,10 @@ def list_server_users(
 
 @router.post("", response_model=ApiResponse[ServerUserOut], status_code=201)
 def create_server_user(
-    admin: AdminDep, payload: ServerUserCreate, provision: bool = Query(False)
+    actor: EngineUsersWrite, payload: ServerUserCreate, provision: bool = Query(False)
 ):
     created = ServerUserController().create_server_user(
-        payload.model_dump(), provision=provision, admin=admin
+        payload.model_dump(), provision=provision, admin=actor
     )
     msg = "Usuario creado en el inventario."
     if provision:
@@ -52,36 +58,36 @@ def create_server_user(
 
 
 @router.post("/adopt", response_model=ApiResponse[ServerUserOut], status_code=201)
-def adopt_server_user(admin: AdminDep, payload: AdoptUserIn):
+def adopt_server_user(actor: EngineUsersWrite, payload: AdoptUserIn):
     """
     Adopta un usuario/rol que YA existe en el motor (Plan 09): registra metadata sin
     CREATE USER ni password. 404 si no existe en el motor; 409 si ya está adoptado.
     """
-    created = ServerUserController().adopt_user(payload.model_dump(), admin=admin)
+    created = ServerUserController().adopt_user(payload.model_dump(), admin=actor)
     return success(data=created, message="Usuario existente adoptado al inventario.")
 
 
 @router.get("/{user_id}", response_model=ApiResponse[ServerUserOut])
-def get_server_user(admin: AdminDep, user_id: int):
+def get_server_user(actor: EngineUsersRead, user_id: int):
     return success(data=ServerUserController().get_server_user(user_id))
 
 
 @router.patch("/{user_id}", response_model=ApiResponse[ServerUserOut])
 def update_server_user(
-    admin: AdminDep,
+    actor: EngineUsersWrite,
     user_id: int,
     payload: ServerUserUpdate,
     provision: bool = Query(False),
 ):
     updated = ServerUserController().update_server_user(
-        user_id, payload.model_dump(exclude_unset=True), provision=provision, admin=admin
+        user_id, payload.model_dump(exclude_unset=True), provision=provision, admin=actor
     )
     return success(data=updated, message="Usuario actualizado.")
 
 
 @router.delete("/{user_id}", response_model=ApiResponse[None])
 def delete_server_user(
-    admin: AdminDep,
+    actor: EngineUsersWrite,
     user_id: int,
     drop_remote: bool = Query(False),
     confirm_username: str | None = Query(
@@ -89,8 +95,18 @@ def delete_server_user(
         description="Obligatorio si drop_remote=true: repetir el username exacto para confirmar el DROP USER en el motor.",
     ),
 ):
+    """
+    Saca el usuario del inventario y, con ``drop_remote=true``, lo BORRA del motor.
+
+    **``drop_remote`` exige ``engine_users.drop``, no ``write``.** Sin él esto olvida una fila;
+    con él ejecuta un DROP USER que puede dejar sin acceso a la aplicación de un tercero. Es la
+    misma frontera que ``drop_remote`` en ``/managed-databases/{id}``, y el nivel existe porque
+    su ausencia contradecía lo que ``operator`` declara de sí mismo ("no incluye ``*.drop``").
+    """
+    if drop_remote:
+        assert_capability(actor, Capability.ENGINE_USERS_DROP)
     ServerUserController().delete_server_user(
-        user_id, drop_remote=drop_remote, confirm_username=confirm_username, admin=admin
+        user_id, drop_remote=drop_remote, confirm_username=confirm_username, admin=actor
     )
     return empty("Usuario eliminado.")
 
@@ -98,14 +114,14 @@ def delete_server_user(
 @router.get(
     "/{user_id}/databases", response_model=ApiResponse[list[ManagedDatabaseOut]]
 )
-def list_user_databases(admin: AdminDep, user_id: int):
+def list_user_databases(actor: DatabasesRead, user_id: int):
     return success(data=ServerUserController().list_user_databases(user_id))
 
 
 # ----------------------- Grants granulares -------------------------------- #
 @router.get("/{user_id}/grants", response_model=ApiResponse[list[GrantInfo]])
 def list_grants(
-    admin: AdminDep,
+    actor: EngineUsersRead,
     user_id: int,
     database: str | None = Query(
         None,
@@ -120,8 +136,8 @@ def list_grants(
 
 
 @router.post("/{user_id}/grants", response_model=ApiResponse[dict])
-def grant_object(admin: AdminDep, user_id: int, payload: GrantRequest):
-    result = GrantController().grant_object(user_id, payload, admin=admin)
+def grant_object(actor: EngineUsersWrite, user_id: int, payload: GrantRequest):
+    result = GrantController().grant_object(user_id, payload, admin=actor)
     priv_summary = ", ".join(payload.privileges)
     return success(
         data=result,
@@ -131,7 +147,7 @@ def grant_object(admin: AdminDep, user_id: int, payload: GrantRequest):
 
 @router.delete("/{user_id}/grants", response_model=ApiResponse[None])
 def revoke_object(
-    admin: AdminDep,
+    actor: EngineUsersWrite,
     user_id: int,
     payload: RevokeRequest,
     confirm_grantee: str | None = Query(
@@ -143,7 +159,7 @@ def revoke_object(
     ),
 ):
     GrantController().revoke_object(
-        user_id, payload, confirm_grantee=confirm_grantee, admin=admin
+        user_id, payload, confirm_grantee=confirm_grantee, admin=actor
     )
     priv_summary = ", ".join(payload.privileges)
     return empty(f"Privilegio(s) revocado(s): {priv_summary} a nivel {payload.level.value}.")
@@ -154,13 +170,13 @@ def revoke_object(
     response_model=ApiResponse[ApplyProfileResult],
 )
 def apply_profile(
-    admin: AdminDep,
+    actor: EngineUsersWrite,
     user_id: int,
     profile_id: int,
     payload: ApplyProfileRequest,
 ):
     """Aplica un perfil de permisos guardado al usuario. Los niveles sin mapeo se omiten."""
-    result = GrantController().apply_profile(user_id, profile_id, payload, admin=admin)
+    result = GrantController().apply_profile(user_id, profile_id, payload, admin=actor)
     msg = f"Perfil '{result.profile_name}' aplicado: {result.grants_applied} grant(s)."
     if result.errors:
         msg += f" {len(result.errors)} error(es) parciales."
@@ -182,7 +198,7 @@ def apply_profile(
 @limiter.limit("5/minute")
 def apply_profile_bulk(
     request: Request,
-    admin: AdminDep,
+    actor: EngineUsersWrite,
     user_id: int,
     profile_id: int,
     payload: ApplyProfileBulkRequest,
@@ -203,7 +219,7 @@ def apply_profile_bulk(
     de ~20 BDs en lugar de agotar la cota de 100.
     """
     result = GrantController().apply_profile_bulk(
-        user_id, profile_id, payload, admin=admin
+        user_id, profile_id, payload, admin=actor
     )
     applied = sum(r.grants_applied for r in result.results)
     failed = [r for r in result.results if not r.ok]
@@ -223,7 +239,7 @@ def apply_profile_bulk(
     status_code=201,
     summary="Crear usuario + aprovisionar en motor + aplicar grants iniciales",
 )
-def provision_with_grants(admin: AdminDep, payload: ServerUserFullCreate):
+def provision_with_grants(actor: EngineUsersWrite, payload: ServerUserFullCreate):
     """
     Endpoint unificado: crea el usuario en el inventario, lo aprovisiona en el motor
     destino (CREATE USER) y aplica los ``initial_grants`` indicados. Los grants son
@@ -232,7 +248,7 @@ def provision_with_grants(admin: AdminDep, payload: ServerUserFullCreate):
     result = ServerUserController().provision_with_grants(
         payload.model_dump(exclude={"initial_grants"}),
         payload.initial_grants,
-        admin=admin,
+        admin=actor,
     )
     msg = f"Usuario '{payload.username}' aprovisionado."
     if result.grants_applied:
