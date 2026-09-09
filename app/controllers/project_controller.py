@@ -11,6 +11,8 @@ el esquema que replican N bases de datos reales; que un agrupador pueda arrastra
 una pérdida de datos causada por una operación de organización.
 """
 
+from typing import TYPE_CHECKING
+
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
@@ -22,6 +24,9 @@ from app.models.database_model import DatabaseModel
 from app.models.project import Project, ProjectDatabaseModel
 from app.services import audit
 from app.services import project_catalog as project_codes
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
 
 
 class ProjectController:
@@ -139,7 +144,7 @@ class ProjectController:
         finally:
             session.close()
 
-    def create_project(self, data: dict, *, admin: dict | None = None) -> dict:
+    def create_project(self, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         model_ids = data.get("model_ids") or []
         session = self._session()
         try:
@@ -179,7 +184,7 @@ class ProjectController:
         return result
 
     def update_project(
-        self, project_id: int, data: dict, *, admin: dict | None = None
+        self, project_id: int, data: dict, *, admin: "dict | Actor | None" = None
     ) -> dict:
         session = self._session()
         try:
@@ -210,7 +215,7 @@ class ProjectController:
         )
         return result
 
-    def delete_project(self, project_id: int, *, admin: dict | None = None) -> int:
+    def delete_project(self, project_id: int, *, admin: "dict | Actor | None" = None) -> int:
         """
         Borra el proyecto y SOLO sus vínculos. Devuelve cuántos vínculos se soltaron.
 
@@ -263,7 +268,7 @@ class ProjectController:
             session.close()
 
     def link_blueprints(
-        self, project_id: int, model_ids: list[int], *, admin: dict | None = None
+        self, project_id: int, model_ids: list[int], *, admin: "dict | Actor | None" = None
     ) -> dict:
         session = self._session()
         try:
@@ -319,7 +324,7 @@ class ProjectController:
         return result
 
     def unlink_blueprint(
-        self, project_id: int, model_id: int, *, admin: dict | None = None
+        self, project_id: int, model_id: int, *, admin: "dict | Actor | None" = None
     ) -> None:
         """Suelta UN vínculo. El blueprint no se toca: sigue existiendo con sus BDs."""
         session = self._session()

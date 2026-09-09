@@ -14,7 +14,7 @@ sobre ``/database-models``.
 from fastapi import APIRouter
 
 from app.controllers.project_controller import ProjectController
-from app.core.auth import AdminDep
+from app.core.authz import BlueprintsRead, BlueprintsWrite
 from app.schemas.database_model import DatabaseModelOut
 from app.schemas.project import (
     ProjectBlueprintsIn,
@@ -31,7 +31,7 @@ model_router = APIRouter(prefix="/database-models", tags=["Projects"])
 
 
 @router.get("", response_model=ApiResponse[list[ProjectOut]])
-def list_projects(admin: AdminDep, pagination: PaginationDep):
+def list_projects(actor: BlueprintsRead, pagination: PaginationDep):
     items, total = ProjectController().list_projects(
         limit=pagination.size, offset=pagination.offset
     )
@@ -39,26 +39,26 @@ def list_projects(admin: AdminDep, pagination: PaginationDep):
 
 
 @router.post("", response_model=ApiResponse[ProjectOut], status_code=201)
-def create_project(admin: AdminDep, payload: ProjectCreate):
-    created = ProjectController().create_project(payload.model_dump(), admin=admin)
+def create_project(actor: BlueprintsWrite, payload: ProjectCreate):
+    created = ProjectController().create_project(payload.model_dump(), admin=actor)
     return success(data=created, message="Proyecto creado.")
 
 
 @router.get("/{project_id}", response_model=ApiResponse[ProjectOut])
-def get_project(admin: AdminDep, project_id: int):
+def get_project(actor: BlueprintsRead, project_id: int):
     return success(data=ProjectController().get_project(project_id))
 
 
 @router.patch("/{project_id}", response_model=ApiResponse[ProjectOut])
-def update_project(admin: AdminDep, project_id: int, payload: ProjectUpdate):
+def update_project(actor: BlueprintsWrite, project_id: int, payload: ProjectUpdate):
     updated = ProjectController().update_project(
-        project_id, payload.model_dump(exclude_unset=True), admin=admin
+        project_id, payload.model_dump(exclude_unset=True), admin=actor
     )
     return success(data=updated, message="Proyecto actualizado.")
 
 
 @router.delete("/{project_id}", response_model=ApiResponse[None])
-def delete_project(admin: AdminDep, project_id: int):
+def delete_project(actor: BlueprintsWrite, project_id: int):
     """
     Borra el proyecto y sus vínculos. **Los blueprints NO se borran.**
 
@@ -67,7 +67,7 @@ def delete_project(admin: AdminDep, project_id: int):
     puede arrastrarlas. Tampoco hace falta confirmar el nombre como en los borrados
     destructivos del gateway: acá no se pierde nada recuperable con dos llamadas.
     """
-    unlinked = ProjectController().delete_project(project_id, admin=admin)
+    unlinked = ProjectController().delete_project(project_id, admin=actor)
     return empty(
         f"Proyecto eliminado. {unlinked} blueprint(s) desvinculado(s); ninguno fue borrado."
     )
@@ -76,7 +76,7 @@ def delete_project(admin: AdminDep, project_id: int):
 @router.get(
     "/{project_id}/blueprints", response_model=ApiResponse[list[DatabaseModelOut]]
 )
-def list_project_blueprints(admin: AdminDep, project_id: int):
+def list_project_blueprints(actor: BlueprintsRead, project_id: int):
     """Blueprints del proyecto. Sin paginar: son unidades, no miles."""
     return success(data=ProjectController().list_project_blueprints(project_id))
 
@@ -85,7 +85,7 @@ def list_project_blueprints(admin: AdminDep, project_id: int):
     "/{project_id}/blueprints",
     response_model=ApiResponse[ProjectBlueprintsLinkOut],
 )
-def link_blueprints(admin: AdminDep, project_id: int, payload: ProjectBlueprintsIn):
+def link_blueprints(actor: BlueprintsWrite, project_id: int, payload: ProjectBlueprintsIn):
     """
     Vincula uno o varios blueprints al proyecto. Idempotente y todo-o-nada.
 
@@ -93,7 +93,7 @@ def link_blueprints(admin: AdminDep, project_id: int, payload: ProjectBlueprints
     devuelve 422 con la lista y no vincula ninguno.
     """
     result = ProjectController().link_blueprints(
-        project_id, payload.model_ids, admin=admin
+        project_id, payload.model_ids, admin=actor
     )
     return success(data=result, message="Blueprints vinculados al proyecto.")
 
@@ -101,15 +101,15 @@ def link_blueprints(admin: AdminDep, project_id: int, payload: ProjectBlueprints
 @router.delete(
     "/{project_id}/blueprints/{model_id}", response_model=ApiResponse[None]
 )
-def unlink_blueprint(admin: AdminDep, project_id: int, model_id: int):
+def unlink_blueprint(actor: BlueprintsWrite, project_id: int, model_id: int):
     """Suelta el vínculo. El blueprint queda intacto, con sus migraciones y sus BDs."""
-    ProjectController().unlink_blueprint(project_id, model_id, admin=admin)
+    ProjectController().unlink_blueprint(project_id, model_id, admin=actor)
     return empty("Blueprint desvinculado del proyecto (el blueprint no se borró).")
 
 
 @model_router.get(
     "/{model_id}/projects", response_model=ApiResponse[list[ProjectOut]]
 )
-def list_model_projects(admin: AdminDep, model_id: int):
+def list_model_projects(actor: BlueprintsRead, model_id: int):
     """Proyectos a los que pertenece este blueprint (puede ser ninguno o varios)."""
     return success(data=ProjectController().list_model_projects(model_id))
