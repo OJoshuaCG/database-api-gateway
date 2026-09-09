@@ -190,3 +190,68 @@ def test_a_snapshot_without_data_is_not_blocked_by_the_guard(operator_client, se
         },
     )
     assert r.status_code != 403, r.text
+
+
+# --------------------------------------------------------------------------- #
+# drop_remote: la MISMA forma de agujero, en otro módulo                      #
+# --------------------------------------------------------------------------- #
+
+
+def _managed_db(client) -> int:
+    """
+    Siembra la BD directo en el inventario.
+
+    Por la API haría falta un motor real: ``/server-users/adopt`` lista los usuarios del
+    servidor antes de adoptar. Lo que se mide acá es la autorización, no el aprovisionamiento,
+    así que la fila va derecho — mismo atajo que usa ``test_api_migrations_edit_applied``.
+    """
+    from app.core.database import Database
+    from app.models.managed_database import ManagedDatabase
+
+    srv = client.post("/api/v1/servers", json={
+        "name": "srv-drop", "host": "127.0.0.1", "port": 3399, "engine": "mysql",
+        "root_username": "root", "root_password": "supersecret",
+    })
+    assert srv.status_code == 201, srv.text
+
+    session = Database().get_declarative_base_session()
+    try:
+        bd = ManagedDatabase(name="app_db", server_id=srv.json()["data"]["id"], owner_id=1)
+        session.add(bd)
+        session.commit()
+        return bd.id
+    finally:
+        session.close()
+
+
+def test_operator_cannot_drop_the_database_on_the_engine(operator_client):
+    """
+    Con ``drop_remote=true`` la misma ruta ejecuta un DROP DATABASE sobre la base de un
+    tercero, así que exige ``databases.drop`` — que ``operator`` no tiene. El 403 llega ANTES
+    de abrir la conexión al motor, que es lo que hace verificable este test sin un motor.
+    """
+    db_id = _managed_db(operator_client)
+    r = operator_client.delete(
+        f"/api/v1/managed-databases/{db_id}?drop_remote=true&confirm_name=app_db"
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["public_context"]["code"] == "access.forbidden"
+
+
+def test_operator_can_forget_a_database_from_the_inventory(operator_client):
+    """Sin ``drop_remote`` el piso es ``write``: se olvida una fila y nada más."""
+    db_id = _managed_db(operator_client)
+    r = operator_client.delete(f"/api/v1/managed-databases/{db_id}")
+    assert r.status_code == 200, r.text
+
+
+def test_owner_is_not_blocked_by_the_drop_guard(admin_client):
+    """
+    El otro lado: ``owner`` sí tiene ``databases.drop``, así que el guard no lo frena y el
+    rechazo que llega es el del motor inexistente, no un 403.
+    """
+    db_id = _managed_db(admin_client)
+    r = admin_client.delete(
+        f"/api/v1/managed-databases/{db_id}?drop_remote=true&confirm_name=app_db"
+    )
+    assert r.status_code != 403, r.text
