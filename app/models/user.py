@@ -11,7 +11,7 @@ Este modelo demuestra las mejores prácticas para definir modelos con:
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, String, Text
+from sqlalchemy import Boolean, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -84,6 +84,18 @@ class User(Base, TimestampMixin):
         server_default="viewer",
         index=True,
         comment="Rol base del usuario en el gateway: viewer | operator | owner",
+    )
+
+    # Contador de credenciales. Sube cada vez que se fija una password, y es lo que hace que
+    # el token de invitación sea de UN SOLO USO: el token se firma sobre (user_id, epoch), así
+    # que en cuanto se usa deja de validar. Sin esto, un token con 48 h de TTL se puede
+    # reutilizar para reescribir la password de la cuenta las veces que quiera quien lo tenga.
+    credential_epoch: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="Sube al fijar una password; invalida los tokens de invitación anteriores",
     )
 
     # Traza de autenticación. Entra CON su lector: `/auth/me` las publica y el login las

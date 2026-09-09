@@ -55,6 +55,97 @@ class UserModel:
             fetchone=True,
         )
 
+    def find_without_credential(self) -> list[dict]:
+        """
+        Usuarios con la invitación PENDIENTE, o sea sin credencial fijada.
+
+        Son los únicos candidatos contra los que puede validar un token de invitación, y en este
+        sistema son unidades — así que probar el token contra cada uno es más barato que
+        arrastrar el ``user_id`` como parámetro y tener que verificar que coincida con el del
+        token, que es el chequeo que alguien olvida.
+        """
+        return (
+            self.db.execute_query(
+                "SELECT id, username, credential_epoch FROM users WHERE hashed_password = ''",
+                {},
+                fetchone=False,
+            )
+            or []
+        )
+
+    def bump_credential_epoch(self, user_id: int) -> int:
+        """
+        Sube el contador de credenciales y devuelve el valor nuevo.
+
+        Es lo que invalida los tokens de invitación anteriores. Se lee DESPUÉS del UPDATE y no
+        se calcula en Python: dos administradores re-invitando a la vez tienen que terminar con
+        un solo epoch válido, no con dos que creen ser el mismo.
+        """
+        self.db.execute_query(
+            "UPDATE users SET credential_epoch = credential_epoch + 1 WHERE id = :id",
+            {"id": user_id},
+            commit=True,
+        )
+        fila = self.db.execute_query(
+            "SELECT credential_epoch FROM users WHERE id = :id", {"id": user_id}, fetchone=True
+        )
+        return (fila or {}).get("credential_epoch") or 0
+
+    def set_credential(self, user_id: int, hashed_password: str) -> None:
+        """
+        Fija la credencial **y sube el epoch en la misma sentencia**.
+
+        Las dos cosas juntas y no en dos llamadas: si el epoch se subiera aparte y esa segunda
+        escritura fallara, el token de invitación seguiría siendo válido sobre una cuenta que ya
+        tiene password — o sea que quien lo tenga podría reescribirla.
+        """
+        self.db.execute_query(
+            "UPDATE users SET hashed_password = :h, credential_epoch = credential_epoch + 1 "
+            "WHERE id = :id",
+            {"h": hashed_password, "id": user_id},
+            commit=True,
+        )
+
+    def replace_access(self, user_id: int, *, grants: list, globals_: list[str]) -> None:
+        """
+        Reemplaza TODO el acceso por alcance y las globales del usuario.
+
+        Borra y vuelve a insertar en vez de reconciliar: la operación que expone la API es
+        "el acceso de esta persona es EXACTAMENTE esto", y reconciliar diferencias abre el
+        camino a un estado intermedio que nadie pidió si algo falla a mitad.
+
+        Las dos tablas se tocan en la MISMA transacción por el mismo motivo: dejar las globales
+        viejas con los alcances nuevos es un acceso que no corresponde a ninguna decisión.
+        """
+        from sqlalchemy import text
+
+        with self.db.engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM access_grants WHERE user_id = :id AND scope_type <> 'global'"),
+                {"id": user_id},
+            )
+            for scope_type, scope_id, role in grants:
+                conn.execute(
+                    text(
+                        "INSERT INTO access_grants "
+                        "(user_id, scope_type, scope_id, role, created_at) "
+                        "VALUES (:u, :t, :i, :r, CURRENT_TIMESTAMP)"
+                    ),
+                    {"u": user_id, "t": scope_type, "i": scope_id, "r": role},
+                )
+            conn.execute(
+                text("DELETE FROM user_global_capabilities WHERE user_id = :id"),
+                {"id": user_id},
+            )
+            for cap in globals_:
+                conn.execute(
+                    text(
+                        "INSERT INTO user_global_capabilities "
+                        "(user_id, capability, created_at) VALUES (:u, :c, CURRENT_TIMESTAMP)"
+                    ),
+                    {"u": user_id, "c": cap},
+                )
+
     def count_active_access_admins(self, *, exclude_user_id: int | None = None) -> int:
         """
         Usuarios ACTIVOS con la capacidad global ``access_admin``.
@@ -137,7 +228,13 @@ class UserModel:
             "SELECT * FROM users WHERE email = :email", {"email": email}, fetchone=True
         )
 
-    def find_all(self, is_active: bool | None = None) -> list[dict]:
+    def find_all(
+        self,
+        is_active: bool | None = None,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[dict]:
         """
         Listar todos los usuarios con filtros opcionales
 
@@ -147,14 +244,21 @@ class UserModel:
         Returns:
             list[dict]: Lista de usuarios
         """
-        if is_active is None:
-            query = "SELECT * FROM users ORDER BY created_at DESC"
-            params = {}
-        else:
-            query = "SELECT * FROM users WHERE is_active = :is_active ORDER BY created_at DESC"
-            params = {"is_active": is_active}
+        # El orden es (created_at, id) y no solo `created_at`: dos usuarios creados en el
+        # mismo segundo —el caso de un alta por script— tendrían orden indefinido, y con
+        # paginación eso significa una fila que aparece dos veces o ninguna.
+        query = "SELECT * FROM users"
+        params: dict = {}
+        if is_active is not None:
+            query += " WHERE is_active = :is_active"
+            params["is_active"] = is_active
+        query += " ORDER BY created_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT :limit OFFSET :offset"
+            params["limit"] = limit
+            params["offset"] = offset or 0
 
-        return self.db.execute_query(query, params, fetchone=False)
+        return self.db.execute_query(query, params, fetchone=False) or []
 
     def create(self, user_data: dict) -> int:
         """

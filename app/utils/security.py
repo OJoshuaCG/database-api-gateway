@@ -15,6 +15,17 @@ from argon2.exceptions import (
 _hasher = PasswordHasher()
 
 
+#: Largo mínimo de una password que elige una persona.
+#:
+#: Vive acá y no en el schema ni en el controller porque los DOS la necesitan y una constante
+#: duplicada es una constante que se desincroniza: el día que alguien suba una y no la otra, el
+#: schema rechaza lo que el controller acepta (o peor, al revés).
+#:
+#: Y no hay política de composición a propósito: las reglas de "una mayúscula y un símbolo"
+#: empujan a `Password1!` y bajan la entropía real. Largo mínimo alto y nada más.
+PASSWORD_MIN_LENGTH = 12
+
+
 def hash_password(password: str) -> str:
     """Devuelve el hash Argon2id de un password en texto plano."""
     return _hasher.hash(password)

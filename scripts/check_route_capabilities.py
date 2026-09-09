@@ -90,6 +90,11 @@ PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/auth/login"),  # no puede exigir sesión: la crea
         ("GET", "/health"),  # sonda del orquestador, sin versión y sin rate limit
         ("GET", "/health/ready"),
+        # Aceptar una invitación NO puede exigir sesión: quien la usa todavía no tiene
+        # credencial, que es justamente el punto del diseño (la password inicial no la pone
+        # quien crea la cuenta). Se autoriza con el token firmado, que va atado al
+        # `credential_epoch` del usuario y por eso es de un solo uso.
+        ("POST", "/api/v1/gateway-users/invite/accept"),
     }
 )
 
@@ -98,7 +103,7 @@ PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
 NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset()
 
 #: Cuántas rutas declaran capacidad. **Solo puede SUBIR.** Ver "EL TRINQUETE".
-MIN_MIGRATED_ROUTES = 158
+MIN_MIGRATED_ROUTES = 164
 
 
 def _iter_routes(app, prefix: str = ""):

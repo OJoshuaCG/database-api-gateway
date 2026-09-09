@@ -61,8 +61,11 @@ class AuthController:
 
         existe = user is not None
         activo = bool(user and user.get("is_active"))
-        # SIEMPRE se paga el hash, exista o no la fila.
-        hash_a_verificar = user["hashed_password"] if existe else _DUMMY_HASH
+        # SIEMPRE se paga el hash, exista o no la fila. Y el `or _DUMMY_HASH` cubre el estado
+        # SIN CREDENCIAL de una invitación pendiente: con `hashed_password=''`, Argon2 levanta
+        # `InvalidHashError` de inmediato y el 401 volvería en ~1 ms — o sea el mismo oráculo de
+        # timing que este método existe para cerrar, reintroducido por una cuenta nueva.
+        hash_a_verificar = (user["hashed_password"] or _DUMMY_HASH) if existe else _DUMMY_HASH
         password_ok = verify_password(password, hash_a_verificar)
 
         if not (existe and activo and password_ok):
