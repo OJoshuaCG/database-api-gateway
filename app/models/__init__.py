@@ -15,6 +15,7 @@ Ejemplo:
     __all__ = [..., "NewModel"]
 """
 
+from app.models.access_grant import AccessGrant, UserGlobalCapability
 from app.models.audit_log import AuditLog
 from app.models.base import Base, TimestampMixin
 from app.models.charset_collation_option import CharsetCollationOption
@@ -54,6 +55,8 @@ from app.models.user import User
 __all__ = [
     "Base",
     "TimestampMixin",
+    "AccessGrant",
+    "UserGlobalCapability",
     "User",
     "Server",
     "ServerUser",
