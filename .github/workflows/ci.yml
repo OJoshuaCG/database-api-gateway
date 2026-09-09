@@ -68,6 +68,32 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check .
 
+  # ─── Cobertura de autorización (bloqueante) ─────────────────────────────── #
+  #
+  # Va en un job propio y RÁPIDO, no en `tests`, por la regla del repo: nadie corre
+  # `pytest` en su máquina, así que el gate tiene que estar donde sí corre siempre. El
+  # test equivalente (`tests/test_route_capability_coverage.py`) corre la MISMA función
+  # para que el fallo aparezca con el diff que lo causó, pero éste es el que manda.
+  #
+  # Lo que verifica: que ninguna de las 157 rutas quede sin capacidad declarada, sin
+  # `AdminDep` y sin estar en `PUBLIC_ROUTES`. El modo de fallo que cubre ya pasó acá —
+  # `app/routes/v1/test.py` tuvo 7 rutas sin autenticación montadas durante meses, dos
+  # de ellas escribiendo archivos a disco.
+  #
+  # No necesita servicios ni `.env`: el script fija por su cuenta las variables mínimas
+  # y la BD se instancia perezosamente, así que importar la app no abre conexión.
+  cobertura-authz:
+    name: Cobertura de autorización (bloqueante)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Ninguna ruta sin guard de autorización
+        run: uv run python scripts/check_route_capabilities.py
+
   # ─── Lint INFORMATIVO ───────────────────────────────────────────────────── #
   #
   # `continue-on-error` a propósito: son 477 hallazgos y bloquear con eso volvería el
