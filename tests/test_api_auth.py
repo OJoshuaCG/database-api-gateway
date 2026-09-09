@@ -47,20 +47,22 @@ def test_login_validation_error(client):
 
 def test_login_clears_stale_session_data(client):
     """
-    ``login_session`` limpia la sesión ANTES de escribir.
+    ``login_session`` limpia la sesión ANTES de escribir, y deja **una sola clave**.
 
-    Hoy es inocuo porque solo viven dos claves y el login las sobreescribe, pero deja de
-    serlo en cuanto la sesión guarde algo más (un marcador de reautenticación, un flag de
-    "2FA pendiente"): ahí un valor plantado por el dueño anterior pasaría al dueño nuevo.
-    ``logout_session`` y ``get_current_admin`` ya limpiaban; el login era el único que no.
+    Con la cookie llevando solo el ``sid`` el riesgo de un valor plantado se achica, pero el
+    orden se mantiene porque ahí van a vivir el marcador de reautenticación y el flag de 2FA
+    pendiente — y ahí un valor del dueño anterior pasaría al dueño nuevo.
     """
     from app.core import auth as auth_mod
 
-    stale = {"basura": "sobreviviente", auth_mod.SESSION_USER_ID: 999}
-    auth_mod.login_session(
-        type("R", (), {"session": stale})(), {"id": 1, "username": "admin"}
-    )
-    assert stale == {auth_mod.SESSION_USER_ID: 1, auth_mod.SESSION_USERNAME: "admin"}
+    stale = {"basura": "sobreviviente", "admin_id": 999}
+    pedido = type(
+        "R", (), {"session": stale, "client": None, "headers": {}}
+    )()
+    auth_mod.login_session(pedido, {"id": 1, "username": "admin"})
+
+    assert set(stale) == {auth_mod.SESSION_SID}, "la cookie lleva más que el sid"
+    assert isinstance(stale[auth_mod.SESSION_SID], str) and stale[auth_mod.SESSION_SID]
 
 
 def test_template_demo_routes_are_not_mounted(client):
