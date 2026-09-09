@@ -155,15 +155,51 @@ def test_a_legacy_route_still_attributes_the_dict(admin_client, server_payload):
 
 def test_identity_reads_both_shapes_without_giving_actor_a_get():
     """
-    ``audit._identity`` es lo que hace posible la migración incremental — y el ``Actor`` sigue
+    ``identity_of`` es lo que hace posible la migración incremental — y el ``Actor`` sigue
     siendo estricto, que es lo que hace ruidosos los olvidos.
+
+    Vive en ``app/core/actor.py`` y no en ``audit`` porque la auditoría no es su único
+    consumidor: el historial de la consola SQL, la autoría de un lote y el ``_guard_owner`` de
+    exportación leen la misma identidad — y ese último es una decisión de autorización.
     """
-    from app.core.actor import admin_actor
-    from app.services.audit import _identity
+    from app.core.actor import admin_actor, identity_of
     from app.services.capability_catalog import GatewayRole
 
     actor = admin_actor(user_id=9, username="leo", role=GatewayRole.VIEWER)
-    assert _identity(actor) == (9, "leo")
-    assert _identity({"id": 7, "username": "ana"}) == (7, "ana")
-    assert _identity(None) == (None, None)
+    assert identity_of(actor) == (9, "leo")
+    assert identity_of({"id": 7, "username": "ana"}) == (7, "ana")
+    assert identity_of(None) == (None, None)
     assert not hasattr(actor, "get")
+
+
+def test_a_swallowed_call_site_is_the_exception_to_the_loud_failure():
+    """
+    La propiedad "un sitio olvidado explota" **no** vale dentro de un ``try/except``
+    best-effort: ahí el ``AttributeError`` se lo traga el except y el efecto es el silencioso
+    que el tipo existía para evitar.
+
+    Pasó de verdad: ``_record_history`` de la consola SQL leía ``admin.get("id")`` dentro de su
+    swallow, y con un ``Actor`` la fila del historial **desaparecía sin error** — lo detectaron
+    dos tests del módulo, no el tipo. Este test fija la lección midiendo la mitad que sí se
+    puede medir sin un motor: que el acceso tipo dict falla, para que quede claro por qué el
+    swallow lo vuelve invisible y por qué toda lectura de identidad va por ``identity_of``.
+    """
+    from app.core.actor import admin_actor
+    from app.services.capability_catalog import GatewayRole
+
+    actor = admin_actor(user_id=9, username="leo", role=GatewayRole.VIEWER)
+
+    try:
+        actor.get("id")  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("el Actor aceptó .get(): se perdió la propiedad de fallo ruidoso")
+
+    # Y el modo de fallo real: envuelto, el mismo acceso no deja rastro.
+    capturado = None
+    try:
+        capturado = actor.get("id")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    assert capturado is None

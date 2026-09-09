@@ -222,6 +222,11 @@ def test_execute_bloqueada_persiste_historial_con_status_blocked(admin_client, m
     assert len(hist) == 1
     assert hist[0]["status"] == "blocked"
     assert hist[0]["danger_level"] == "blocked"
+    # La fila tiene que quedar ATRIBUIDA. El `assert len(hist) == 1` de arriba ya detectó una
+    # vez que no se guardaba nada —la persistencia leía la identidad tipo dict y con un `Actor`
+    # el `AttributeError` se lo tragaba el `try/except` best-effort—, pero "existe" y "dice
+    # quién" son dos propiedades: un historial anónimo de la consola SQL no sirve para nada.
+    assert hist[0]["admin_username"] == "admin"
 
 
 def test_preview_de_sentencia_bloqueada_no_emite_token(admin_client, monkeypatch):
