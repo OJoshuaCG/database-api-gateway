@@ -17,7 +17,7 @@ solo agregaría una vía de pérdida de contexto sin resolver nada.
 from fastapi import APIRouter, Query, Request
 
 from app.controllers.charset_collation_controller import CharsetCollationController
-from app.core.auth import AdminDep
+from app.core.authz import CatalogsRead, CatalogsWrite
 from app.core.limiter import limiter
 from app.schemas.charset_collation_option import (
     CharsetCollationOptionCreate,
@@ -31,7 +31,7 @@ router = APIRouter(prefix="/charset-collation-options", tags=["Charset & Collati
 
 @router.get("", response_model=ApiResponse[list[CharsetCollationOptionOut]])
 def list_charset_collation_options(
-    admin: AdminDep,
+    actor: CatalogsRead,
     engine_family: str | None = Query(
         None, description="mysql (cubre MySQL y MariaDB) | postgresql"
     ),
@@ -50,11 +50,11 @@ def list_charset_collation_options(
 )
 @limiter.limit("20/minute")
 def create_charset_collation_option(
-    request: Request, admin: AdminDep, payload: CharsetCollationOptionCreate
+    request: Request, actor: CatalogsWrite, payload: CharsetCollationOptionCreate
 ):
     """Agrega una combinación no sembrada. Nace DESHABILITADA salvo ``enabled=true`` explícito."""
     row = CharsetCollationController().create_option(
-        payload.model_dump(), admin=admin
+        payload.model_dump(), admin=actor
     )
     return success(data=row, message="Combinación agregada al catálogo.")
 
@@ -65,12 +65,12 @@ def create_charset_collation_option(
 @limiter.limit("20/minute")
 def update_charset_collation_option(
     request: Request,
-    admin: AdminDep,
+    actor: CatalogsRead,
     option_id: int,
     payload: CharsetCollationOptionUpdate,
 ):
     """Habilita/deshabilita la combinación y/o la marca como default de su familia."""
     row = CharsetCollationController().update_option(
-        option_id, payload.model_dump(exclude_unset=True), admin=admin
+        option_id, payload.model_dump(exclude_unset=True), admin=actor
     )
     return success(data=row, message="Catálogo actualizado.")

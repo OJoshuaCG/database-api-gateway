@@ -9,6 +9,11 @@ Modificar el catálogo NO toca ningún servidor destino, pero SÍ cambia qué DD
 gateway más adelante: por eso se audita (``touched_engine=False``).
 """
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
+
 from app.exceptions import AppHttpException
 from app.services import audit, charset_catalog
 
@@ -26,7 +31,7 @@ class CharsetCollationController:
             engine_family_filter=family, only_enabled=only_enabled
         )
 
-    def create_option(self, data: dict, *, admin: dict | None = None):
+    def create_option(self, data: dict, *, admin: "dict | Actor | None" = None):
         family = charset_catalog.normalize_family(data.get("engine_family", ""))
         charset, collation = charset_catalog.validate_option_values(
             family, data.get("charset", ""), data.get("collation")
@@ -51,7 +56,7 @@ class CharsetCollationController:
         )
         return row
 
-    def update_option(self, option_id: int, data: dict, *, admin: dict | None = None):
+    def update_option(self, option_id: int, data: dict, *, admin: "dict | Actor | None" = None):
         enabled = data.get("enabled")
         is_default = data.get("is_default")
         if enabled is None and is_default is None:

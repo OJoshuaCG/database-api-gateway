@@ -9,7 +9,7 @@ rápido a un usuario. Todo requiere admin autenticado.
 from fastapi import APIRouter, Query
 
 from app.controllers.permission_profile_controller import PermissionProfileController
-from app.core.auth import AdminDep
+from app.core.authz import CatalogsRead, CatalogsWrite
 from app.schemas.permission_profile import (
     PermissionProfileCreate,
     PermissionProfileOut,
@@ -22,7 +22,7 @@ router = APIRouter(prefix="/permission-profiles", tags=["Permission Profiles"])
 
 @router.get("", response_model=ApiResponse[list[PermissionProfileOut]])
 def list_profiles(
-    admin: AdminDep,
+    actor: CatalogsRead,
     engine: str | None = Query(None, description="mysql | mariadb | postgresql"),
     active: bool | None = Query(None),
     exact_engine: bool = Query(
@@ -41,18 +41,18 @@ def list_profiles(
 
 
 @router.post("", response_model=ApiResponse[PermissionProfileOut], status_code=201)
-def create_profile(admin: AdminDep, payload: PermissionProfileCreate):
+def create_profile(actor: CatalogsWrite, payload: PermissionProfileCreate):
     created = PermissionProfileController().create_profile(payload.model_dump())
     return success(data=created, message="Perfil de permisos creado.")
 
 
 @router.get("/{profile_id}", response_model=ApiResponse[PermissionProfileOut])
-def get_profile(admin: AdminDep, profile_id: int):
+def get_profile(actor: CatalogsRead, profile_id: int):
     return success(data=PermissionProfileController().get_profile(profile_id))
 
 
 @router.patch("/{profile_id}", response_model=ApiResponse[PermissionProfileOut])
-def update_profile(admin: AdminDep, profile_id: int, payload: PermissionProfileUpdate):
+def update_profile(actor: CatalogsWrite, profile_id: int, payload: PermissionProfileUpdate):
     updated = PermissionProfileController().update_profile(
         profile_id, payload.model_dump(exclude_unset=True)
     )
@@ -60,6 +60,6 @@ def update_profile(admin: AdminDep, profile_id: int, payload: PermissionProfileU
 
 
 @router.delete("/{profile_id}", response_model=ApiResponse[None])
-def delete_profile(admin: AdminDep, profile_id: int):
+def delete_profile(actor: CatalogsWrite, profile_id: int):
     PermissionProfileController().delete_profile(profile_id)
     return empty("Perfil de permisos eliminado.")

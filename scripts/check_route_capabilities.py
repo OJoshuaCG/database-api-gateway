@@ -98,10 +98,10 @@ PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
 NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset()
 
 #: Cuántas rutas siguen con el guard legado. **Solo puede BAJAR.** Ver "EL TRINQUETE".
-MAX_LEGACY_ROUTES = 151
+MAX_LEGACY_ROUTES = 141
 
 #: Cuántas rutas ya declaran capacidad. **Solo puede SUBIR.**
-MIN_MIGRATED_ROUTES = 3
+MIN_MIGRATED_ROUTES = 13
 
 
 def _iter_routes(app, prefix: str = ""):
