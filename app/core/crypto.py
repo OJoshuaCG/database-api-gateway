@@ -49,6 +49,48 @@ def _derive_fernet_key(secret_key: str, salt: bytes) -> bytes:
     return base64.urlsafe_b64encode(raw_key)
 
 
+#: `info` del pepper de los tokens de API. DISTINTO del de Fernet a propósito: con el mismo
+#: `info`, el pepper y la KEK serían el mismo material y guardar uno sería filtrar el otro.
+_HKDF_INFO_API_TOKEN = b"api_token_hmac/v1"
+
+
+def api_token_pepper() -> bytes:
+    """
+    32 bytes derivados de ``SECRET_KEY`` con HKDF, para el HMAC de los tokens de agente.
+
+    POR QUÉ UN PEPPER Y NO LA DEK
+    -----------------------------
+    Rotar la DEK es una operación de RUTINA (``POST /admin/crypto/rotate``), y que eso
+    invalidara todos los tokens de agente sería una caída sorpresa: el CI de tres repos deja de
+    andar un lunes a la mañana por una rotación de claves que nadie relacionó.
+
+    Lo que sí acopla: **rotar `SECRET_KEY` invalida los tokens**. No es una decisión abierta —
+    la KEK de Fernet ya se deriva de `SECRET_KEY`, así que rotarla YA invalida toda credencial
+    cifrada del inventario. Rotar `SECRET_KEY` no es rutina, es un re-key total; que los tokens
+    se sumen a ese conjunto no cambia nada.
+
+    Lo que compra: **un dump de `api_tokens` por sí solo no alcanza** para verificar un token
+    adivinado offline. Con el flanco que hay que decir: en no-producción
+    ``SESSION_SECRET = SECRET_KEY``, así que ese beneficio solo vale donde el guard de
+    `SESSION_SECRET` de producción está activo.
+
+    Devuelve los bytes CRUDOS, no base64: esto es una clave de HMAC, no una clave Fernet, y
+    reusar ``_derive_fernet_key`` con otro `info` guardaría una clave con forma Fernet donde no
+    corresponde.
+    """
+    if not SECRET_KEY:
+        raise CryptoConfigError(
+            "SECRET_KEY no está definido; no se pueden verificar tokens de agente."
+        )
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=CRYPTO_KEY_SALT.encode("utf-8"),
+        info=_HKDF_INFO_API_TOKEN,
+    )
+    return hkdf.derive(SECRET_KEY.encode("utf-8"))
+
+
 def _kek_key() -> bytes:
     if not SECRET_KEY:
         raise CryptoConfigError(

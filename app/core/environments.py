@@ -403,6 +403,14 @@ SESSION_COOKIE_SECURE = (
     else _session_cookie_secure_raw.lower() == "true"
 )
 
+# ======= Servidor MCP (agentes) ======= #
+# KILL SWITCH del MCP. Nace APAGADO: un endpoint que sirve estructura de bases de terceros a un
+# agente no puede quedar habilitado por el default de un despliegue que nadie configuró.
+MCP_ENABLED = os.getenv("MCP_ENABLED", "false").lower() == "true"
+# Tope de vida de un token de agente. Sin tokens perpetuos: un token vive en un `.mcp.json` del
+# repo de otra gente, o sea es la credencial con más chance de terminar commiteada.
+MCP_TOKEN_MAX_TTL_DAYS = int(os.getenv("MCP_TOKEN_MAX_TTL_DAYS", "90"))
+
 # ======= Startup validation ======= #
 if not SECRET_KEY:
     if APP_ENV == "production":
