@@ -188,6 +188,27 @@ documento nombraba y la descartada quedaría como **vocabulario muerto que el pu
 fallar** — o peor, se cablearía `servers.admin` dentro de `owner` y el requisito del §4.6 se
 perdería en silencio.
 
+**Cuarta asignación, que este plan había omitido: el OPT-IN que genera los datos capturados
+también es `captures`, no `write`.** La tabla mapeaba `select-results` (leerlos) a `captures` y
+se olvidó de quién puede encenderlos. Son dos rutas, y con `write` alcanzaba para las dos:
+
+| Payload | Qué hace | Capacidad |
+|---|---|---|
+| `POST /database-models/from-snapshot` con `data_tables` | EXTRAE FILAS de la BD de origen y las deja como datos-semilla dentro de una migración del blueprint — o sea, dentro de algo que después lee cualquiera con `blueprints.read` | `blueprints.captures` |
+| `POST`/`PATCH` de una migración con `capture_selects=true` | los SELECT de esa versión guardan sus resultados al aplicarse | `blueprints.captures` |
+
+Las dos son decisiones de **divulgación disfrazadas de escritura**, que es exactamente el agujero
+del §4.2. Y el `PATCH` hay que chequearlo aparte: si el guard viviera solo en el `POST`, la vía
+para saltearlo sería crear la versión sin captura y prenderla después. **Apagarla no pide nada
+extra** — exigir `captures` para desactivar una captura sería pedir el permiso de divulgar para
+dejar de divulgar.
+
+Dónde vive el chequeo: en la **ruta**, con `assert_capability(actor, …)`, porque depende del
+payload y una ruta declara UNA capacidad (§6.3 punto 1) — el piso va en la firma y el extra al
+lado. Los dos llamadores internos de `create_migration` (`schema-comparisons/adopt` y el lote de
+collation) no piden captura, así que la frontera de la ruta las cubre a todas; cuando llegue la
+capa 2 se muda al controller, con el destino en la mano.
+
 **El criterio que impide que crezca a 150, y va en el docstring del catálogo: una capacidad nace
 cuando dos roles necesitan diferir en ella.** Si los tres roles coinciden sobre un conjunto de
 endpoints, ese conjunto es **una** capacidad.

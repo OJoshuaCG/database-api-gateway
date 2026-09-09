@@ -4,6 +4,8 @@ Controller de DatabaseModel (blueprints/categorías).
 CRUD puro sobre la BD de metadatos del gateway: NO toca ningún motor destino.
 """
 
+from typing import TYPE_CHECKING
+
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import Database
@@ -14,6 +16,9 @@ from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.models.project import ProjectDatabaseModel
 from app.services import audit
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
 
 
 class DatabaseModelController:
@@ -70,7 +75,7 @@ class DatabaseModelController:
         finally:
             session.close()
 
-    def create_model(self, data: dict, *, admin: dict | None = None) -> dict:
+    def create_model(self, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         session = self._session()
         try:
             model = DatabaseModel(
@@ -102,7 +107,7 @@ class DatabaseModelController:
         )
         return result
 
-    def update_model(self, model_id: int, data: dict, *, admin: dict | None = None) -> dict:
+    def update_model(self, model_id: int, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         session = self._session()
         try:
             model = self._get_or_404(session, model_id)
@@ -133,7 +138,7 @@ class DatabaseModelController:
         )
         return result
 
-    def delete_model(self, model_id: int, *, admin: dict | None = None) -> None:
+    def delete_model(self, model_id: int, *, admin: "dict | Actor | None" = None) -> None:
         session = self._session()
         try:
             model = self._get_or_404(session, model_id)

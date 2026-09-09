@@ -12,6 +12,7 @@ motor) usando ``MigrationRunner``.
 """
 
 import hashlib
+from typing import TYPE_CHECKING
 
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -50,6 +51,9 @@ from app.services.db_admin.identifiers import references_gateway_internal_table
 from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
 from app.services.db_admin.migrations import MigrationRunner
 from app.services.db_admin.sql_dialect import RollbackGenerator, SqlTranslator
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
 
 logger = get_logger(__name__)
 
@@ -695,7 +699,7 @@ class ModelMigrationController:
         return {r[0] for r in rows if r[0] is not None}
 
     def preview_sql_edit(
-        self, model_id: int, version: str, data: dict, *, admin: dict | None = None
+        self, model_id: int, version: str, data: dict, *, admin: "dict | Actor | None" = None
     ) -> dict:
         """Emite el ``confirm_token`` para editar una versión, y dice a QUIÉN va a divergir.
 
@@ -829,7 +833,7 @@ class ModelMigrationController:
         next_n = (int(latest[0]) + 1) if latest else 1
         return f"{next_n:04d}"
 
-    def create_migration(self, model_id: int, data: dict, *, admin: dict | None = None) -> dict:
+    def create_migration(self, model_id: int, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         session = self._session()
         try:
             self._model_or_404(session, model_id)
@@ -1014,7 +1018,7 @@ class ModelMigrationController:
     # Motivos de omisión de datos-semilla que honran on_oversize="error".
     _OVERSIZE_REASONS = ("oversize_rows", "oversize_bytes")
 
-    def create_from_snapshot(self, data: dict, *, admin: dict | None = None) -> dict:
+    def create_from_snapshot(self, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         """
         Crea un blueprint NUEVO desde el snapshot de una BD existente (snapshot selectivo).
 
@@ -1299,7 +1303,7 @@ class ModelMigrationController:
         }
 
     def update_migration(
-        self, model_id: int, version: str, data: dict, *, admin: dict | None = None
+        self, model_id: int, version: str, data: dict, *, admin: "dict | Actor | None" = None
     ) -> dict:
         # Se SACAN de ``data`` antes de cualquier otra cosa: son factores de
         # autorización, no campos de la migración, y dejarlos adentro los expondría a
@@ -2068,7 +2072,7 @@ class ModelMigrationController:
         version: str,
         *,
         confirm_token_value: str | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         """
         Elimina una versión del blueprint, renumerando las posteriores y moviendo el puntero
@@ -2462,7 +2466,7 @@ class ModelMigrationController:
         finally:
             session.close()
 
-    def validate_migration(self, model_id: int, data: dict, *, admin: dict | None = None) -> dict:
+    def validate_migration(self, model_id: int, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         """
         Analiza el SQL de una migración ANTES de aplicarla.
 

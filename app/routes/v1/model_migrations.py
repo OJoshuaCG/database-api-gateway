@@ -11,7 +11,12 @@ from fastapi import APIRouter, Path, Query, Request
 
 from app.controllers.managed_migration_controller import ManagedMigrationController
 from app.controllers.model_migration_controller import ModelMigrationController
-from app.core.auth import AdminDep
+from app.core.authz import (
+    BlueprintsApply,
+    BlueprintsRead,
+    BlueprintsWrite,
+    assert_capability,
+)
 from app.core.limiter import limiter
 from app.schemas.model_migration import (
     ApplyAllOut,
@@ -26,6 +31,7 @@ from app.schemas.model_migration import (
     ModelMigrationPatch,
     ModelMigrationSummary,
 )
+from app.services.capability_catalog import Capability
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, paginated, success
 
@@ -39,7 +45,7 @@ _VERSION_PATH = Path(..., pattern=r"^\d{4,10}$", description="Versión: 0001, 00
     response_model=ApiResponse[list[ModelMigrationSummary]],
 )
 def list_migrations(
-    admin: AdminDep,
+    actor: BlueprintsRead,
     model_id: int,
     pagination: PaginationDep,
     order: Literal["asc", "desc"] = Query(
@@ -61,9 +67,19 @@ def list_migrations(
     response_model=ApiResponse[ModelMigrationOut],
     status_code=201,
 )
-def create_migration(admin: AdminDep, model_id: int, payload: ModelMigrationCreate):
+def create_migration(actor: BlueprintsWrite, model_id: int, payload: ModelMigrationCreate):
+    """
+    Crea una versión del blueprint.
+
+    **``capture_selects`` exige ``blueprints.captures``, no ``write``.** Escribir SQL es
+    trabajo de operador; encender la captura convierte esa versión en la única vía por la que
+    el gateway persiste DATOS DE NEGOCIO (cifrados, pero legibles después por endpoint). Es
+    una decisión de divulgación, no de escritura, así que no puede viajar con el mismo permiso.
+    """
+    if payload.capture_selects:
+        assert_capability(actor, Capability.BLUEPRINTS_CAPTURES)
     created = ModelMigrationController().create_migration(
-        model_id, payload.model_dump(), admin=admin
+        model_id, payload.model_dump(), admin=actor
     )
     return success(data=created, message="Migración creada.")
 
@@ -75,7 +91,7 @@ def create_migration(admin: AdminDep, model_id: int, payload: ModelMigrationCrea
 @limiter.limit("3/minute")
 def apply_all(
     request: Request,
-    admin: AdminDep,
+    actor: BlueprintsApply,
     model_id: int,
     max_databases: int = Query(10, ge=1, le=100, description="Cota de BDs a procesar"),
     database_ids: list[int] | None = Query(
@@ -127,7 +143,7 @@ def apply_all(
         model_id, max_databases=max_databases, database_ids=database_ids,
         environment_id=environment_id,
         force=force, dry_run=dry_run,
-        on_failure=on_failure, admin=admin,
+        on_failure=on_failure, admin=actor,
     )
     msg = "Plan masivo (dry-run)." if dry_run else "Aplicación masiva ejecutada."
     return success(data=result, message=msg)
@@ -140,7 +156,7 @@ def apply_all(
 @limiter.limit("20/minute")
 def validate_migration(
     request: Request,
-    admin: AdminDep,
+    actor: BlueprintsRead,
     model_id: int,
     payload: MigrationValidateIn,
 ):
@@ -156,7 +172,7 @@ def validate_migration(
     los dos casos.
     """
     result = ModelMigrationController().validate_migration(
-        model_id, payload.model_dump(exclude_unset=True), admin=admin
+        model_id, payload.model_dump(exclude_unset=True), admin=actor
     )
     return success(data=result, message="SQL analizado.")
 
@@ -165,7 +181,7 @@ def validate_migration(
     "/{model_id}/migrations/{version}",
     response_model=ApiResponse[ModelMigrationOut],
 )
-def get_migration(admin: AdminDep, model_id: int, version: str = _VERSION_PATH):
+def get_migration(actor: BlueprintsRead, model_id: int, version: str = _VERSION_PATH):
     return success(data=ModelMigrationController().get_migration(model_id, version))
 
 
@@ -176,7 +192,7 @@ def get_migration(admin: AdminDep, model_id: int, version: str = _VERSION_PATH):
 @limiter.limit("20/minute")
 def preview_migration_edit(
     request: Request,
-    admin: AdminDep,
+    actor: BlueprintsWrite,
     model_id: int,
     payload: MigrationEditPreviewIn,
     version: str = _VERSION_PATH,
@@ -196,7 +212,7 @@ def preview_migration_edit(
     """
     return success(
         data=ModelMigrationController().preview_sql_edit(
-            model_id, version, payload.model_dump(exclude_unset=True), admin=admin
+            model_id, version, payload.model_dump(exclude_unset=True), admin=actor
         )
     )
 
@@ -206,13 +222,22 @@ def preview_migration_edit(
     response_model=ApiResponse[ModelMigrationOut],
 )
 def update_migration(
-    admin: AdminDep,
+    actor: BlueprintsWrite,
     model_id: int,
     payload: ModelMigrationPatch,
     version: str = _VERSION_PATH,
 ):
+    """
+    PATCH parcial de una versión.
+
+    **ENCENDER ``capture_selects`` exige ``blueprints.captures``** — mismo criterio que el POST,
+    y por eso se chequea acá también: si solo estuviera en el POST, la vía para saltearlo sería
+    crear la versión sin captura y prenderla con un PATCH. Apagarla no pide nada extra.
+    """
+    if payload.capture_selects:
+        assert_capability(actor, Capability.BLUEPRINTS_CAPTURES)
     updated = ModelMigrationController().update_migration(
-        model_id, version, payload.model_dump(exclude_unset=True), admin=admin
+        model_id, version, payload.model_dump(exclude_unset=True), admin=actor
     )
     return success(data=updated, message="Migración actualizada.")
 
@@ -221,7 +246,7 @@ def update_migration(
     "/{model_id}/migrations/{version}/delete-plan",
     response_model=ApiResponse[MigrationDeletePlanOut],
 )
-def plan_delete_migration(admin: AdminDep, model_id: int, version: str = _VERSION_PATH):
+def plan_delete_migration(actor: BlueprintsApply, model_id: int, version: str = _VERSION_PATH):
     """
     Preview del borrado: qué versiones se renumeran, qué punteros se mueven y qué lo bloquea.
 
@@ -240,7 +265,7 @@ def plan_delete_migration(admin: AdminDep, model_id: int, version: str = _VERSIO
     response_model=ApiResponse[MigrationDeleteOut],
 )
 def delete_migration(
-    admin: AdminDep,
+    actor: BlueprintsApply,
     model_id: int,
     version: str = _VERSION_PATH,
     confirm_token: str | None = Query(
@@ -267,6 +292,6 @@ def delete_migration(
     esté parada acá ni moverle el puntero, y renumerar la dejaría huérfana.
     """
     result = ModelMigrationController().delete_migration(
-        model_id, version, confirm_token_value=confirm_token, admin=admin
+        model_id, version, confirm_token_value=confirm_token, admin=actor
     )
     return success(data=result, message="Migración eliminada.")

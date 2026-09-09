@@ -1,14 +1,22 @@
 """
 Endpoints de DatabaseModels (blueprints/categorías).
 
-CRUD puro sobre el inventario del gateway (no toca ningún motor).
+CRUD sobre el inventario del gateway. Dos rutas SÍ tocan motores destino y por eso tienen
+rate limit propio: ``/from-snapshot`` (fotografía una BD existente) y
+``/{id}/databases/refresh`` (relee la versión real de cada BD del blueprint).
 """
 
 from fastapi import APIRouter, Request
 
 from app.controllers.database_model_controller import DatabaseModelController
 from app.controllers.model_migration_controller import ModelMigrationController
-from app.core.auth import AdminDep
+from app.core.authz import (
+    BlueprintsRead,
+    BlueprintsWrite,
+    DatabasesRead,
+    DatabasesWrite,
+    assert_capability,
+)
 from app.core.limiter import limiter
 from app.schemas.database_model import (
     DatabaseModelCreate,
@@ -19,6 +27,7 @@ from app.schemas.database_model import (
     ModelDatabaseStatusOut,
 )
 from app.services import audit
+from app.services.capability_catalog import Capability
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
@@ -26,7 +35,7 @@ router = APIRouter(prefix="/database-models", tags=["Database Models"])
 
 
 @router.get("", response_model=ApiResponse[list[DatabaseModelOut]])
-def list_models(admin: AdminDep, pagination: PaginationDep):
+def list_models(actor: BlueprintsRead, pagination: PaginationDep):
     items, total = DatabaseModelController().list_models(
         limit=pagination.size, offset=pagination.offset
     )
@@ -34,47 +43,54 @@ def list_models(admin: AdminDep, pagination: PaginationDep):
 
 
 @router.post("", response_model=ApiResponse[DatabaseModelOut], status_code=201)
-def create_model(admin: AdminDep, payload: DatabaseModelCreate):
-    created = DatabaseModelController().create_model(payload.model_dump(), admin=admin)
+def create_model(actor: BlueprintsWrite, payload: DatabaseModelCreate):
+    created = DatabaseModelController().create_model(payload.model_dump(), admin=actor)
     return success(data=created, message="Blueprint creado.")
 
 
 @router.post("/from-snapshot", response_model=ApiResponse[FromSnapshotOut], status_code=201)
 @limiter.limit("10/minute")
-def create_from_snapshot(request: Request, admin: AdminDep, payload: FromSnapshotIn):
+def create_from_snapshot(request: Request, actor: BlueprintsWrite, payload: FromSnapshotIn):
     """
-    Crea un blueprint NUEVO cuyo baseline (v0001) es el snapshot estructural de una BD
-    existente (Plan 09, modo 3). Lee la estructura del motor (nunca filas) y la fija
-    como migración baseline. Si incluye objetos procedurales, el baseline queda atado a
-    su motor de origen (no aplicable cross-engine).
+    Crea un blueprint NUEVO cuyo baseline (v0001) es el snapshot de una BD existente
+    (Plan 09, modo 3). Si incluye objetos procedurales, el baseline queda atado a su motor de
+    origen (no aplicable cross-engine).
+
+    **``data_tables`` exige ``blueprints.captures``, no ``write``.** Sin ese parámetro esto lee
+    solo estructura; con él EXTRAE FILAS de la BD de origen y las deja como datos-semilla
+    dentro de una migración del blueprint — o sea, dentro de algo que después lee cualquiera
+    con ``blueprints.read``. Es el mismo tipo de camino que ``capture_selects`` y por eso pide
+    la misma capacidad: es la que gobierna que el gateway persista datos de negocio.
     """
-    result = ModelMigrationController().create_from_snapshot(payload.model_dump(), admin=admin)
+    if payload.data_tables:
+        assert_capability(actor, Capability.BLUEPRINTS_CAPTURES)
+    result = ModelMigrationController().create_from_snapshot(payload.model_dump(), admin=actor)
     return success(data=result, message="Blueprint baseline creado desde snapshot.")
 
 
 @router.get("/{model_id}", response_model=ApiResponse[DatabaseModelOut])
-def get_model(admin: AdminDep, model_id: int):
+def get_model(actor: BlueprintsRead, model_id: int):
     return success(data=DatabaseModelController().get_model(model_id))
 
 
 @router.patch("/{model_id}", response_model=ApiResponse[DatabaseModelOut])
-def update_model(admin: AdminDep, model_id: int, payload: DatabaseModelUpdate):
+def update_model(actor: BlueprintsWrite, model_id: int, payload: DatabaseModelUpdate):
     updated = DatabaseModelController().update_model(
-        model_id, payload.model_dump(exclude_unset=True), admin=admin
+        model_id, payload.model_dump(exclude_unset=True), admin=actor
     )
     return success(data=updated, message="Blueprint actualizado.")
 
 
 @router.delete("/{model_id}", response_model=ApiResponse[None])
-def delete_model(admin: AdminDep, model_id: int):
-    DatabaseModelController().delete_model(model_id, admin=admin)
+def delete_model(actor: BlueprintsWrite, model_id: int):
+    DatabaseModelController().delete_model(model_id, admin=actor)
     return empty("Blueprint eliminado.")
 
 
 @router.get(
     "/{model_id}/databases", response_model=ApiResponse[list[ModelDatabaseStatusOut]]
 )
-def list_model_databases(admin: AdminDep, model_id: int):
+def list_model_databases(actor: DatabasesRead, model_id: int):
     """
     BDs del blueprint **con su estado de despliegue** (versión actual, pendientes, parcial).
 
@@ -93,7 +109,7 @@ def list_model_databases(admin: AdminDep, model_id: int):
     response_model=ApiResponse[list[ModelDatabaseStatusOut]],
 )
 @limiter.limit("10/minute")
-def refresh_model_databases(request: Request, admin: AdminDep, model_id: int):
+def refresh_model_databases(request: Request, actor: DatabasesWrite, model_id: int):
     """
     🔌 Relee la versión REAL de cada BD del blueprint y resincroniza la copia del gateway.
 
@@ -107,7 +123,7 @@ def refresh_model_databases(request: Request, admin: AdminDep, model_id: int):
     data = DatabaseModelController().list_model_databases(model_id, refresh=True)
     audit.record(
         "database_model.databases.refresh",
-        admin=admin,
+        admin=actor,
         target_type="database_model",
         target_id=model_id,
         touched_engine=True,
