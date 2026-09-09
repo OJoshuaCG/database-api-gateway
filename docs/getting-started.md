@@ -195,12 +195,11 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
 |---|---|
 | `http://localhost:8000/health` | Retorna `{"status": "ok", ...}` |
 | `http://localhost:8000/api/v1/docs` | Swagger UI de v1 |
-| `http://localhost:8000/api/v1/test/ping` | Retorna `{"data": {"message": "pong!"}}` |
 
 **Ejemplo de log en consola (si LOGGER_MIDDLEWARE_ENABLED=True):**
 ```
-2026-03-08 10:30:15 [INFO] a1b2c3d4 | Host: 127.0.0.1 | Request: GET /api/v1/test/ping
-2026-03-08 10:30:15 [INFO] a1b2c3d4 | Host: 127.0.0.1 | Response: GET /api/v1/test/ping | Status: 200 | Duration: 0.003s
+2026-03-08 10:30:15 [INFO] a1b2c3d4 | Host: 127.0.0.1 | Request: GET /health
+2026-03-08 10:30:15 [INFO] a1b2c3d4 | Host: 127.0.0.1 | Response: GET /health | Status: 200 | Duration: 0.003s
 ```
 
 ---

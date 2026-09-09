@@ -19,7 +19,6 @@ from app.routes.v1 import (
     schema_comparisons,
     server_users,
     servers,
-    test,
 )
 
 router = APIRouter()
@@ -43,4 +42,9 @@ router.include_router(environments.router)
 router.include_router(charset_collation_options.router)
 router.include_router(permission_profiles.router)
 router.include_router(crypto.router)
-router.include_router(test.router)
+
+# app/routes/v1/test.py NO se monta: son endpoints de demostración del template
+# (`api-reference.md` los declara fuera de la API funcional) y NINGUNO exige sesión, así que
+# montados dejaban 7 rutas sin autenticar en un gateway con credenciales pseudo-root — dos de
+# ellas (`POST /test/upload` y `/upload/multiple`) escribiendo archivos a disco. Para el smoke
+# test de "¿levanta?" está `GET /health`, que es público a propósito.

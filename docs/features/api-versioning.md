@@ -17,7 +17,7 @@ main.py  (app principal — solo /health y los mounts)
 ├── /api/v1  → v1_app (sub-aplicación FastAPI)
 │   ├── GET /docs
 │   ├── GET /redoc
-│   └── /test/...
+│   └── /auth, /servers, /managed-databases, …
 └── /api/v2  → v2_app (cuando sea necesario)
     ├── GET /docs
     └── /...
@@ -120,9 +120,7 @@ v1_app = create_versioned_app(
 | `GET /api/v1/docs` | Swagger UI de v1 |
 | `GET /api/v1/redoc` | ReDoc de v1 |
 | `GET /api/v1/openapi.json` | Schema OpenAPI de v1 |
-| `GET /api/v1/test/ping` | Endpoint de prueba |
-| `GET /api/v1/test/paginated` | Ejemplo paginación |
-| `DELETE /api/v1/test/resource/{id}` | Ejemplo respuesta vacía |
-| `PUT /api/v1/test/custom-error` | Ejemplo manejo de errores |
-| `POST /api/v1/test/upload` | Ejemplo upload de un archivo |
-| `POST /api/v1/test/upload/multiple` | Ejemplo upload múltiple |
+
+> Los `/api/v1/test/*` del template **ya no se montan** (`app/routes/v1/routes.py`): eran 7
+> rutas sin `AdminDep` en un gateway con credenciales pseudo-root, y dos de ellas escribían
+> archivos a disco sin autenticación. Para el smoke test de "¿levanta?" está `GET /health`.
