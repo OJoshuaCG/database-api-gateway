@@ -34,40 +34,41 @@ def guard():
 
 def test_no_route_is_left_without_a_guard(guard):
     """
-    El chequeo completo sobre la app REAL: toda ruta declara capacidad, o ``AdminDep``, o está
-    en ``PUBLIC_ROUTES``. Ninguna las tres cosas a la vez ausentes.
+    El chequeo completo sobre la app REAL: toda ruta declara una capacidad del catálogo o está
+    en ``PUBLIC_ROUTES``. No hay tercera opción desde que se retiró ``AdminDep``.
     """
     assert guard.main() == 0
 
 
-def test_the_three_buckets_add_up_to_every_mounted_route(guard):
+def test_the_two_buckets_add_up_to_every_mounted_route(guard):
     """
-    Migradas + legadas + públicas == total montado.
+    Con capacidad + públicas == total montado, **sin rama de descarte**.
 
-    Si la suma no cierra, hay rutas que la clasificación no ve — y una ruta invisible al
-    chequeo es exactamente una ruta sin guard que el chequeo declara sana.
+    Eran tres cubetas mientras existía el guard legado. Ahora son dos, y la suma exacta es lo
+    que hace que el test valga: si hubiera un ``else`` que absorbiera lo no clasificado, esto
+    pasaría con rutas invisibles al chequeo — y una ruta invisible es exactamente una ruta sin
+    guard que el chequeo declara sana.
     """
     from main import app
 
     total = sum(
         len(r.methods - {"HEAD", "OPTIONS"}) for _, r in guard._iter_routes(app)
     )
-    migradas = legadas = publicas = 0
+    con_capacidad = publicas = 0
     for path, route in guard._iter_routes(app):
         for method in route.methods - {"HEAD", "OPTIONS"}:
             if guard._capability_of(route):
-                migradas += 1
+                con_capacidad += 1
             elif (method, path) in guard.PUBLIC_ROUTES:
                 publicas += 1
-            elif guard._uses_legacy_guard(route):
-                legadas += 1
-    assert migradas + legadas + publicas == total
+    assert con_capacidad + publicas == total
+    assert publicas == len(guard.PUBLIC_ROUTES)
 
 
 def test_detects_a_route_with_no_guard_at_all(guard):
     """
-    La prueba de que el chequeo SIRVE: sobre una app sintética con una ruta desnuda, ni
-    ``_capability_of`` ni ``_uses_legacy_guard`` la reconocen.
+    La prueba de que el chequeo SIRVE: sobre una app sintética con una ruta desnuda,
+    ``_capability_of`` no la reconoce y por eso la clasificación la manda a ``sin_guard``.
 
     Sin este test, el de arriba podría pasar por una regla que no detecta nada.
     """
@@ -79,7 +80,6 @@ def test_detects_a_route_with_no_guard_at_all(guard):
 
     (_, route), = list(guard._iter_routes(app))
     assert guard._capability_of(route) is None
-    assert guard._uses_legacy_guard(route) is False
 
 
 def test_detects_a_declared_capability_through_a_dependency(guard):
@@ -96,18 +96,19 @@ def test_detects_a_declared_capability_through_a_dependency(guard):
     assert guard._capability_of(route) == "databases.drop"
 
 
-def test_detects_the_legacy_guard(guard):
-    from app.core.auth import AdminDep
+def test_the_legacy_guard_no_longer_exists(guard):
+    """
+    ``AdminDep`` se RETIRÓ del código, no se deprecó, y esa diferencia es la que importa: un
+    endpoint nuevo copiado de uno viejo tiene que **fallar al importar** en vez de nacer
+    autenticado y sin autorizar. Este test fija esa propiedad, porque reponerlo "por
+    compatibilidad" es exactamente el atajo que reabriría el agujero.
+    """
+    import app.core.auth as auth_mod
 
-    app = FastAPI()
-
-    @app.get("/legada")
-    def legada(admin: AdminDep):
-        return {}
-
-    (_, route), = list(guard._iter_routes(app))
-    assert guard._capability_of(route) is None
-    assert guard._uses_legacy_guard(route) is True
+    assert not hasattr(auth_mod, "AdminDep")
+    assert not hasattr(auth_mod, "get_current_admin")
+    # Y lo que sí queda: la resolución de sesión, que NO autoriza.
+    assert hasattr(auth_mod, "authenticated_user")
 
 
 def test_public_routes_allowlist_is_short_and_explicit(guard):
