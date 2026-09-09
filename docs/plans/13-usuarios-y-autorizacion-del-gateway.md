@@ -1116,11 +1116,26 @@ inverso. Y `app/models/__init__.py` debe importar los modelos nuevos o Alembic n
 | `global_capabilities` | **nueva**, las ORTOGONALES: `user_id` FK CASCADE · `capability ∈ {access_admin, security_officer}` · `UNIQUE(user_id, capability)` |
 | `gateway_sessions` | **nueva**: `sid` unique · `user_id` · `created_at` · `last_seen_at` · `ip` · `user_agent_hash` · `revoked_at` · `revoked_reason` · `reauth_at` |
 | `access_approvals` | **nueva** (fase 4): §9.2 |
-| `audit_log` | + `actor_type` · + `api_token_id` · + `role_at_time` · + `previous_value` · + `new_value` |
+| `audit_log` | + `actor_type` · + `api_token_id` · + `role_at_time` · + `previous_value` · + `new_value` — **pero NO todas en la misma entrega**: ver la nota de abajo |
 | `environments` | + `blocks_data_disclosure` · + `requires_second_actor` · + `allows_emergency_override` — **cada uno con su guard en esta entrega** (cero flags inertes) |
 | `api_tokens` (plan 12) | + `created_by_user_id` FK, para la revocación en cascada del §8.3 |
 | `servers` | + `environment_id` nullable FK RESTRICT (§16.1) |
 
+
+> **Las columnas de auditoría entran CON SU LECTOR, no antes.** Es la misma regla de cero flags
+> inertes que este plan invoca seis veces, aplicada a sí mismo. Hoy las cinco serían inertes:
+> `actor_type` valdría siempre `"admin"`, `api_token_id` apuntaría a una tabla que no existe,
+> `role_at_time` a roles que no existen, y `previous_value`/`new_value` no tienen ningún escritor
+> hasta que exista el cambio de rol o la escritura de datos de política. El reparto:
+>
+> | Columna | Entra con |
+> |---|---|
+> | `actor_type`, `api_token_id` | `api_tokens` (plan 12) — ahí `Actor.kind` es su escritor y el filtro de auditoría por token su lector |
+> | `role_at_time` | el swap de la fase 1, cuando `Actor` lleva `role` |
+> | `previous_value`, `new_value` | el CRUD de `/gateway-users` y la escritura de datos de política (§4.5), que son quienes registran "de X a Y" |
+>
+> Agregarlas antes no adelanta nada: una columna que nadie escribe ni lee es exactamente el
+> defecto que este plan le achaca a `is_superuser`.
 **Y NO hay `session_epoch`.** Es la técnica de invalidación para cookies *stateless*: sin poder
 borrar lo que no guardás, metés un contador en el payload y lo comparás. El §7.1 elimina esa
 premisa — la cookie lleva solo el `sid` y hay una fila por sesión con `revoked_at`, así que "revocar
@@ -1310,14 +1325,15 @@ Los cuatro primeros son **arreglos de código existente**, van antes y cada uno 
 | 3 | Auditoría en `server_controller` + rate limit en `reveal-password` + `_guard_owner` en `/manifest` | Máximo privilegio con cero rastro; el llavero a 100/min (§2.1.b, d, e) |
 | 4 | `request.session.clear()` en `login_session` | Una línea, independiente de todo (§7.1) |
 | 5 | `--forwarded-allow-ips` al CIDR del proxy + Valkey obligatorio con multi-worker | Sin esto, el anti-fuerza-bruta que documentes **no existe** (§7.4) |
-| 6 | `Actor` + `capability_catalog` + `require()` + los tres puntos del guard (sin el assert de arranque) + `/auth/me` extendido + `/authz/catalog` + la migración | **Fase 0: comportamiento idéntico.** El único usuario queda `admin` con todo ⇒ ningún 403 posible el día del deploy |
-| 7 | El swap: 153 gates + 227 sitios que pasan el dict `admin` → `Actor`; borrar `AdminDep`; **encender el assert de arranque** | **Fase 1, un commit.** Diff grande y 100% mecánico; la red es el `frozen`/`slots` |
-| 8 | Sesiones server-side + CSRF + timing del login + auditoría `auth.*` | Fase 2 |
-| 9 | Capa 2 (alcance), precedida del **reporte de reconciliación** de `environment_id IS NULL` | Fase 3. Recién acá "lector en producción" muerde |
-| 10 | CRUD de `/gateway-users` + el primer usuario no-admin + invariante del último admin + break-glass | **Fase 4. NUNCA antes de la 9**: crear un segundo usuario mientras el alcance no se hace cumplir es exactamente el agujero que este plan existe para cerrar |
-| 11 | Separación de deberes (`access_approvals`) + step-up | Fase 5 |
-| 12 | TOTP + códigos de recuperación | Fase 6 |
-| 13 | OIDC | Fase 7 |
+| 6 | **OPS, no código: el rol acotado de la BD de metadatos** (`docs/deployment.md`, "El rol de la BD de metadatos") | Hoy el gateway usa **una sola credencial** en los 18 sitios que instancian `Database(...)`, así que `audit_log` es mutable por cualquier camino de código y **las dos features que lo declaran su control compensatorio —el export sin enmascarado y esta autorización— tienen esa dependencia sin respaldo**. Requiere al operador; el gateway no puede hacerlo solo. Si no se hace, la decisión correcta es **dejar de llamar "control compensatorio" a la auditoría**, no seguir asumiéndolo |
+| 7 | `Actor` + `capability_catalog` + `require()` + los tres puntos del guard (sin el assert de arranque) + `/auth/me` extendido + `/authz/catalog` + la migración | **Fase 0: comportamiento idéntico.** El único usuario queda `admin` con todo ⇒ ningún 403 posible el día del deploy |
+| 8 | El swap: 153 gates + 227 sitios que pasan el dict `admin` → `Actor`; borrar `AdminDep`; **encender el assert de arranque** | **Fase 1, un commit.** Diff grande y 100% mecánico; la red es el `frozen`/`slots` |
+| 9 | Sesiones server-side + CSRF + timing del login + auditoría `auth.*` | Fase 2 |
+| 10 | Capa 2 (alcance), precedida del **reporte de reconciliación** de `environment_id IS NULL` | Fase 3. Recién acá "lector en producción" muerde |
+| 11 | CRUD de `/gateway-users` + el primer usuario no-admin + invariante del último admin + break-glass | **Fase 4. NUNCA antes de la 10**: crear un segundo usuario mientras el alcance no se hace cumplir es exactamente el agujero que este plan existe para cerrar |
+| 12 | Separación de deberes (`access_approvals`) + step-up | Fase 5 |
+| 13 | TOTP + códigos de recuperación | Fase 6 |
+| 14 | OIDC | Fase 7 |
 
 **La capacidad de cada endpoint se fija en la fase 1 y para siempre.** Lo que itera después es
 `ROLE_CAPABILITIES` — un `Mapping` en un archivo, sin tocar rutas. Esa separación es el punto de todo

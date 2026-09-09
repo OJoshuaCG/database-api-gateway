@@ -576,6 +576,63 @@ async def root(request: Request):
     return {"message": "Hello World"}
 ```
 
+
+### El rol de la BD de metadatos, y por qué `audit_log` hoy es mutable
+
+**Esto es un prerequisito de operación, no de código, y sin él hay una afirmación de seguridad
+del repo que no está respaldada.**
+
+El gateway usa **una sola credencial** (`DB_USER`) para su propia base de metadatos, en los 18
+sitios que instancian `Database(DB_NAME, DB_USER, …)`. Consecuencia: **no hay forma de revocar
+`UPDATE`/`DELETE` sobre `audit_log`**, porque el rol de la aplicación es el único que existe.
+Cualquier camino de código del proceso puede reescribir el registro.
+
+Y eso choca de frente con dos cosas que el repo declara:
+
+- El módulo de exportación dice que *"el único control compensatorio en pie es la auditoría, que
+  por eso no es negociable"* — porque un export entrega datos en claro sin enmascarado.
+- El plan 13 hace de la auditoría **la evidencia en una disputa entre colegas**, que es el punto
+  de tener usuarios nominales en vez de un admin único.
+
+Las dos apuestan a un registro que no es a prueba de manipulación.
+
+#### Lo que hay que hacer, del lado del motor
+
+Dos roles en la base de metadatos del gateway, no uno:
+
+```sql
+-- PostgreSQL
+CREATE ROLE gateway_app LOGIN PASSWORD '…';
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO gateway_app;
+-- y se le QUITA la capacidad de reescribir el rastro:
+REVOKE UPDATE, DELETE ON audit_log FROM gateway_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO gateway_app;
+```
+
+```sql
+-- MySQL / MariaDB
+CREATE USER 'gateway_app'@'10.0.0.%' IDENTIFIED BY '…';
+GRANT SELECT, INSERT, UPDATE, DELETE ON gateway_db.* TO 'gateway_app'@'10.0.0.%';
+REVOKE UPDATE, DELETE ON gateway_db.audit_log FROM 'gateway_app'@'10.0.0.%';
+```
+
+Y `DB_USER` pasa a ser `gateway_app`. **El rol que aplica migraciones tiene que ser OTRO** (las
+migraciones necesitan DDL, que `gateway_app` no debe tener): el `entrypoint.sh` corre
+`alembic upgrade head` antes de arrancar la app, así que ese paso usa una credencial con DDL y
+la app arranca con la acotada. Hoy las dos son la misma.
+
+#### Lo que NO resuelve
+
+Ni esto ni nada de lo que el gateway pueda hacer solo vuelve `audit_log` **append-only** de
+verdad: un `INSERT` con datos falsos sigue siendo posible, y quien tenga la credencial de
+migraciones puede hacer lo que quiera. La solución completa es un sink externo (WORM, o
+replicación a un bucket con retención en modo compliance), y eso está registrado como pendiente
+en `docs/plans/08-production-readiness.md`.
+
+**Mientras esto no esté hecho, lo honesto es no llamar "control compensatorio" a la
+auditoría.** Es un registro best-effort y mutable, y las dos features que se apoyan en él —la
+exportación sin enmascarado y la autorización con usuarios nominales— quedan con esa dependencia
+sin respaldo. Es una decisión de riesgo, y hay que tomarla explícitamente en vez de heredarla.
 ## Backups
 
 ### Base de Datos
