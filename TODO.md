@@ -161,6 +161,7 @@ los bugs corregidos) vive en `CLAUDE.md` y en `docs/features/`.
 
 | Fecha | Ítem | Estado de verificación |
 | --- | --- | --- |
+| 2026-09-09 | **Sesiones server-side, CSRF, usuarios del gateway y el servidor MCP** (`T-260909-ojoshuac-sesiones-usuarios-y-mcp`, pasos 6–9 del plan 13 + primera entrega del plan 12). Cierra **cinco defectos vivos** que no estaban en ningún plan: el login delataba qué usuarios existen **por timing**; la cookie de sesión hacía inimplementables la vida absoluta, el logout real y la revocación; `same_site="lax"` es same-**site** y no same-origin; **DOS** GET de exportación mutaban y un `<img>` destruía el artefacto del cliente dejando la entrega registrada contra él; y `bootstrap_admin` estaba anclado al username, así que no reparaba nada. Agrega `/gateway-users` (alta **sin password**, invitación de un solo uso), `/api-tokens` y `POST /mcp/` con una tool. Detalle abajo. | Tres guards en verde: cobertura de autorización (**167 con capacidad, 4 públicas, 1 de agente, 0 sin guard, 0 capacidad muerta**), grafo de migraciones (35 revisiones, head único) y tope de `CLAUDE.md`. **~1.000 checks** por ejecución directa; 10 archivos de tests nuevos (149 casos). Cuatro migraciones con ciclo upgrade → downgrade −1 → upgrade contra **SQLite** y `alembic check` sin deriva nueva (una apareció y se corrigió). `ruff check .` limpio. **`pytest` NO se corrió** (deny del repo) y **nada contra motores reales** |
 | 2026-09-09 | **Autorización por capacidades: 154 rutas, vocabulario cerrado y cuatro agujeros cerrados** (`T-260909-ojoshuac-autorizacion-por-capacidades`, pasos 0–5 del plan 13). Antes, un endpoint solo exigía **sesión válida**: quien entraba podía todo. Ahora cada ruta declara **una capacidad** de un catálogo cerrado de 29, con roles `viewer ⊆ operator ⊆ owner` y dos capacidades globales ortogonales. `AdminDep` **se retiró** (no se deprecó) para que un endpoint nuevo copiado de uno viejo falle al importar. Guard de cobertura bloqueante en CI: **0 rutas sin guard, 0 capacidad muerta**. Detalle abajo. | Guards: `check_route_capabilities` (154/3/0/0) y `check_migration_graph` (31 revisiones, head único) en verde. **~700 checks** por ejecución directa en 30 módulos, incluidos 51 del catálogo, 13 de los guards por payload y 8 de atribución de auditoría. `ruff check .` limpio. **`pytest` NO se corrió** (deny del repo): sin él quedan sin ver los `parametrize` y las fixtures de scope module/session. **Nada contra motores reales.** La migración `c8d9e0f1a2b3` solo hizo ciclo en SQLite (hereda `P-10`) |
 | 2026-08-25 | **CI: el repo tiene gate** (`P-15`). Cierra el hallazgo de fondo de `T-260825-lz-sanear-verificacion`: sin gate la suite se degradaba en silencio. **`ci.yml`** con 5 jobs — Ruff bloqueante, Ruff informativo, `actionlint` sobre los propios workflows, la suite completa con **`pytest` de verdad**, y `detect-secrets`. **`migrations-apply.yml`** aplica las migraciones contra **MariaDB y PostgreSQL efímeros**, que es lo que `migration-graph.yml` no puede ver (lee el grafo con `ast`, no ejecuta DDL); incluye `downgrade -1` y de vuelta, y que la BD quede EN head. **La decisión de diseño:** en CI corre `pytest`, no el arnés — la política de no correrlo es sobre la máquina de quien trabaja y el `deny` es un permiso de Claude Code que no alcanza a un runner; además el arnés no multiplica por `params` ni tiene fixtures de scope module/session, o sea que hay fallas que estructuralmente no puede ver. Escrito en la cabecera del workflow y en `CLAUDE.md` para que nadie "arregle" la contradicción borrando el job. Ruff configurado en `pyproject.toml` con el gate en `F` (20 hallazgos, arreglados) y el set amplio en el job informativo; el mismo guard en `.githooks/pre-push`, sin duplicar reglas. `.secrets.baseline` **se versiona** (estaba en `.gitignore` sin motivo escrito, lo que habría hecho fallar el gate en el primer PR). `permissions: contents: read` en los cuatro workflows y `uv sync --locked` en vez de `--frozen`, que detecta un `pyproject.toml` sin re-lockear. | **1776/1776 + 3 skips** con el arnés, `ruff check .` limpio, `actionlint` limpio (probado que detecta: exit 1 con un error deliberado), `alembic upgrade head` + `downgrade -1` + vuelta **ejecutados contra SQLite local**, `detect-secrets-hook` probado en los dos sentidos (exit 0 limpio, exit 1 con un secreto nuevo), `uv sync --locked` probado en los dos sentidos, y el `pre-push` completo probado en los dos sentidos. **NADA de esto corrió en GitHub Actions**: los workflows están validados estáticamente y con sus comandos ejecutados a mano, pero sin push no hay corrida real, y `pytest` no se pudo ejecutar (deny del repo). Los 3 skips son `test_grants_integration`, sin Docker. |
 | 2026-08-25 | **Saneada la verificación del repo: el arnés se versiona y tres tests vuelven a cubrir lo que dicen** (`T-260825-lz-sanear-verificacion`). El arnés de ejecución directa vivía en un scratchpad y se reescribía por sesión: acumuló **cinco** huecos y dos volvieron tras haber sido corregidos. El más caro no fue un test que no corría sino uno que corría **verificando otra cosa** — `server_payload` fabricada con valores distintos a los de `conftest` dejó dos aserciones de seguridad sin poder fallar (la del password en claro buscaba un string que el payload falso nunca enviaba; la del bloqueo de loopback usaba un host que no es loopback), y esa fixture la usan 56 tests en 12 archivos. Causa raíz única: reimplementar el sistema de fixtures de pytest en vez de **cargar el real**. Ahora vive en `scripts/run_tests_direct.py` con `tests/test_run_tests_direct.py` (19 casos) y una sección en `docs/development/best-practices.md`. Tests reparados: `test_structural_snapshot_excludes_the_version_table` (su doble se escribió con duck-typing y dejó de encajar al aparecer `_conn_ctx` y `_database_defaults`; ahora presta los reales de `ServerAdapter`), `test_order_statements_respects_class_order` (afirmaba el orden ANTERIOR a `ff42389`, que reordenó `_CLASS_ORDER` a propósito y no actualizó el test) y `test_health_endpoints_send_cors_header` (el middleware está sano; la aserción fijaba la codificación `*` vs origen reflejado en vez de la garantía). **Cero cambios en `app/`.** | **1775/1775 + 3 skips**, 74 archivos, ninguno abortado (base: 1745/1758 con 7 degradados). **11 mutaciones, 11 detectadas**, incluidas las dos aserciones de seguridad —filtrar el password y desactivar el guard de loopback las ponen rojas— y las 9 del propio arnés. Sin Ruff: no está instalado ni configurado en el repo, así que imports huérfanos y longitud de línea se chequearon a mano. Nada verificado contra motores reales (sin Docker): los 3 skips son `test_grants_integration`. |
@@ -676,3 +677,93 @@ fallar.
 | `T-260909-ojoshuac-simplificar-union-identidad` | Las firmas de ~20 controllers siguen aceptando `"dict \| Actor \| None"` y `identity_of` conserva su rama de `dict`. Ya no hay ruta que pase un dict, así que la rama está muerta desde el retiro de `AdminDep` — pero simplificarla toca ~20 archivos para cero cambio de comportamiento, así que se separó a propósito en vez de inflar el swap. Al hacerlo, el docstring de `identity_of` ya dice qué se cae |
 | `T-260909-ojoshuac-dependencia-global-subapp` | El guard de cobertura documenta por qué **no** es un assert de arranque y qué es mejor: una **dependencia global de la sub-app**, evaluada en runtime, que corre después del routing y sí ve la ruta resuelta. Con `AdminDep` retirado ya no hay nada que la bloquee |
 | `TRUSTED_PROXY_IPS` y `WORKERS` en `.env.example` | Las dos variables nuevas del paso 1 **faltan ahí**, y `CLAUDE.md` lo exige. El archivo está denegado por permisos para el agente: lo tiene que agregar una persona |
+
+---
+
+## Detalle — `T-260909-ojoshuac-sesiones-usuarios-y-mcp`
+
+Pasos 6 a 9 del plan `docs/plans/13-usuarios-y-autorizacion-del-gateway.md` y primera entrega del
+plan 12. Contrato para el frontend en `docs/api-reference-v23.md` §7 a §9.
+
+### Los cinco defectos que encontró, y que no estaban en ningún plan
+
+1. **El login delataba qué usuarios existen por TIMING.** El mensaje ya era genérico y la
+   condición cortocircuitaba con `or`, así que un usuario inexistente **no pagaba Argon2id**:
+   ~1 ms contra decenas o cientos, medible con `curl`. Los tests que había verificaban el *texto*
+   del 401, o sea justo la propiedad que ya estaba bien.
+2. **La cookie de sesión hacía inimplementables cuatro controles**, y está medido leyendo el
+   middleware instalado: se re-firma en **cada** respuesta, así que `SESSION_MAX_AGE` era timeout
+   de inactividad puro —con actividad continua la sesión **no expiraba nunca**— y `logout` borraba
+   la cookie *del cliente* sin invalidar nada.
+3. **`same_site="lax"` es same-SITE, no same-origin.** Cualquier cosa en `*.midominio.com` con un
+   XSS podía operar el gateway con la cookie del admin.
+4. **DOS GET que mutan**, no uno: `/database-exports/{id}/download` **y** `/content` consumen y
+   borran el artefacto, y Lax manda la cookie en una navegación GET de primer nivel. Un `<img>` en
+   cualquier página destruía el export del cliente **y dejaba la entrega registrada contra él**.
+   El segundo endpoint no estaba en el plan: salió de leer `read_inline`.
+5. **`bootstrap_admin` estaba anclado al username**, así que si al administrador se lo renombraba
+   o desactivaba **no reparaba nada**: bloqueo total sin salida que no fuera SQL a mano contra la
+   BD de metadatos, en plena incidencia.
+
+### Tres decisiones que el plan dejaba abiertas y que deciden si el diseño sirve
+
+- **El grant por alcance REEMPLAZA al rol base, no se suma.** La respuesta intuitiva —el máximo,
+  como en la capa 1— **rompe el caso de uso**: con `base=operator` y un grant `viewer` sobre
+  producción, `max` da `operator` y la restricción no hace nada.
+- **Dos grants que aplican al mismo destino resuelven al más restrictivo.** Al revés, *agregar* un
+  grant podría ampliar el acceso.
+- **La password inicial no la pone quien crea la cuenta.** Si la tipeara, conocería una credencial
+  funcional de esa identidad y **toda fila de auditoría atribuida a esa persona sería repudiable**.
+  Con `access_admin` en el modelo, además, es la vía de escalada.
+
+### Verificado
+
+- Los tres guards en verde: cobertura de autorización (**167 con capacidad, 4 públicas, 1 de
+  agente, 0 sin guard, 0 capacidad muerta**), grafo de migraciones (35 revisiones, head único) y
+  tope de `CLAUDE.md`.
+- **~1.000 checks** con `scripts/run_tests_direct.py`. Los archivos nuevos de estos pasos:
+  `test_mcp_server` (29), `test_api_gateway_users` (23), `test_scope_layer` (20),
+  `test_mcp_import_guard` (19), `test_auth_hardening` (12), `test_csrf` (12),
+  `test_session_lifecycle` (10), `test_last_admin_invariant` (10),
+  `test_export_download_ticket` (9), `test_rate_limit_axis` (5).
+- **Cuatro migraciones** (`d9e0f1a2b3c4`, `e0f1a2b3c4d5`, `f1a2b3c4d5e6`, `a2b3c4d5e6f7`) con
+  ciclo upgrade → downgrade −1 → upgrade contra SQLite y `alembic check` sin deriva nueva. La
+  última tenía una deriva real —`unique=True, index=True` produce un índice único, no una
+  constraint más un índice— y se corrigió.
+- `ruff check .` limpio.
+
+### Qué quedó SIN verificar
+
+- **`pytest` no se corrió** (deny del repo). El arnés no multiplica por `parametrize` ni tiene
+  fixtures de scope module/session: hay fallas que estructuralmente no puede ver. **Correr la
+  suite es el primer paso antes de desplegar cualquiera de estos cambios.**
+- **Nada contra motores reales.** Los guards de autorización rechazan *antes* de abrir conexión,
+  que es lo que permitió probarlos sin Docker; el resto del recorrido no se ejercitó.
+- **Las cuatro migraciones solo hicieron ciclo en SQLite.** Hereda `P-10`, y con un agravante: la
+  autogeneración local usa `batch_alter_table`, que funciona en SQLite y **no es lo que MySQL
+  necesita**. Verificar contra la BD del gateway real antes de desplegar.
+- **Concurrencia**: nada del modelo se probó con dos sesiones simultáneas.
+
+### Lo que falta del paso 9, y por qué se cortó ahí
+
+`app/mcp/` tiene **una** tool: `list_databases`, que lee el inventario y no abre ninguna conexión.
+Faltan `list_objects`, `get_schema` y `check_freshness`.
+
+**No se entregaron porque no se pueden verificar acá.** Esas tres **son** consultas al catálogo de
+cada motor —`information_schema` de MySQL, `pg_catalog`, las diferencias de MariaDB—, no lógica
+que rodea a una consulta. Sin Docker no hay forma de comprobar ni una, y entregarlas a ciegas las
+sumaría a la deuda que este mismo archivo declara como la más grande del proyecto (`P-01` a `P-10`:
+diez scripts e2e escritos y **nunca ejecutados**).
+
+Con ellas van las tres columnas `servers.readonly_*` y el façade de solo lectura, que tampoco
+tienen sentido antes: sin consumidor serían tres columnas sin lector.
+
+### Follow-ups que estos pasos dejaron abiertos
+
+| Ítem | Detalle |
+| --- | --- |
+| `T-260909-ojoshuac-env-example` | **Seis variables nuevas faltan en `.env.example`**, y `CLAUDE.md` lo exige: `TRUSTED_PROXY_IPS`, `WORKERS`, `SESSION_ABSOLUTE_MAX_HOURS`, `SESSION_IDLE_MINUTES`, `MCP_ENABLED`, `MCP_TOKEN_MAX_TTL_DAYS`. El archivo está denegado por permisos para el agente: lo tiene que agregar una persona |
+| `T-260909-ojoshuac-mcp-tools-motor` | Las tres tools que leen el catálogo del motor, el façade de solo lectura y las columnas `servers.readonly_*`. **Bloqueado por Docker**, no por diseño |
+| `T-260909-ojoshuac-session-cookie-secure` | `SESSION_COOKIE_SECURE=False` en producción sigue siendo WARNING. El plan lo condiciona a que exista multiusuario — que ahora existe — así que pasa a ser candidato a **error de arranque**. No se cambió acá porque convertirlo en un rechazo de arranque puede dejar sin bootear un despliegue que hoy funciona: es decisión del dueño del entorno |
+| `T-260909-ojoshuac-2fa-y-break-glass` | Del paso 8 quedaron fuera, con su porqué: 2FA, el CLI de break-glass **offline** (nunca por HTTP: no hay forma de distinguir al operador de alguien que leyó el entorno en un deploy filtrado), la transferencia de tokens al desactivar a su emisor, y el override de emergencia de la separación de deberes |
+| `T-260909-ojoshuac-step-up` | `requires_step_up` se **publica** en `/auth/me` y **no se exige**. Está declarado en el addendum del contrato para que la SPA no construya un flujo que el servidor no respalda |
