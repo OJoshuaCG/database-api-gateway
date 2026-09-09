@@ -159,6 +159,12 @@ guard no usa `ScriptDirectory` están en el archivo de decisiones e incidentes.
 valores para cosas distintas. En el código: la config siempre por su constante (`APP_ENV`), la
 tabla siempre como `Environment`. **Nunca "el entorno" a secas.**
 
+**Y hay DOS cosas llamadas "permisos".** `Capability`/`GatewayRole` (`app/services/capability_catalog.py`)
+es qué puede hacer un usuario **del gateway**; `Privilege`/`PermissionProfile` es qué puede hacer un
+usuario **del motor**. Agravante sobre el caso de "environment": PostgreSQL llama **roles** a los
+usuarios del motor, así que la colisión es del dominio, no del repo. **Nunca "permisos" a secas**:
+es *capacidad del gateway* o *privilegio del motor*.
+
 **`force` NO saltea el guard de entornos.** `force` es override de cuarentena y nada más. En la
 SPA es un `Switch` sin fricción: si algún día saltea el guard, la barrera de producción se abre
 con un click.

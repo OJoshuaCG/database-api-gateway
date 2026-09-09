@@ -161,6 +161,7 @@ los bugs corregidos) vive en `CLAUDE.md` y en `docs/features/`.
 
 | Fecha | Ítem | Estado de verificación |
 | --- | --- | --- |
+| 2026-09-09 | **Autorización por capacidades: 154 rutas, vocabulario cerrado y cuatro agujeros cerrados** (`T-260909-ojoshuac-autorizacion-por-capacidades`, pasos 0–5 del plan 13). Antes, un endpoint solo exigía **sesión válida**: quien entraba podía todo. Ahora cada ruta declara **una capacidad** de un catálogo cerrado de 29, con roles `viewer ⊆ operator ⊆ owner` y dos capacidades globales ortogonales. `AdminDep` **se retiró** (no se deprecó) para que un endpoint nuevo copiado de uno viejo falle al importar. Guard de cobertura bloqueante en CI: **0 rutas sin guard, 0 capacidad muerta**. Detalle abajo. | Guards: `check_route_capabilities` (154/3/0/0) y `check_migration_graph` (31 revisiones, head único) en verde. **~700 checks** por ejecución directa en 30 módulos, incluidos 51 del catálogo, 13 de los guards por payload y 8 de atribución de auditoría. `ruff check .` limpio. **`pytest` NO se corrió** (deny del repo): sin él quedan sin ver los `parametrize` y las fixtures de scope module/session. **Nada contra motores reales.** La migración `c8d9e0f1a2b3` solo hizo ciclo en SQLite (hereda `P-10`) |
 | 2026-08-25 | **CI: el repo tiene gate** (`P-15`). Cierra el hallazgo de fondo de `T-260825-lz-sanear-verificacion`: sin gate la suite se degradaba en silencio. **`ci.yml`** con 5 jobs — Ruff bloqueante, Ruff informativo, `actionlint` sobre los propios workflows, la suite completa con **`pytest` de verdad**, y `detect-secrets`. **`migrations-apply.yml`** aplica las migraciones contra **MariaDB y PostgreSQL efímeros**, que es lo que `migration-graph.yml` no puede ver (lee el grafo con `ast`, no ejecuta DDL); incluye `downgrade -1` y de vuelta, y que la BD quede EN head. **La decisión de diseño:** en CI corre `pytest`, no el arnés — la política de no correrlo es sobre la máquina de quien trabaja y el `deny` es un permiso de Claude Code que no alcanza a un runner; además el arnés no multiplica por `params` ni tiene fixtures de scope module/session, o sea que hay fallas que estructuralmente no puede ver. Escrito en la cabecera del workflow y en `CLAUDE.md` para que nadie "arregle" la contradicción borrando el job. Ruff configurado en `pyproject.toml` con el gate en `F` (20 hallazgos, arreglados) y el set amplio en el job informativo; el mismo guard en `.githooks/pre-push`, sin duplicar reglas. `.secrets.baseline` **se versiona** (estaba en `.gitignore` sin motivo escrito, lo que habría hecho fallar el gate en el primer PR). `permissions: contents: read` en los cuatro workflows y `uv sync --locked` en vez de `--frozen`, que detecta un `pyproject.toml` sin re-lockear. | **1776/1776 + 3 skips** con el arnés, `ruff check .` limpio, `actionlint` limpio (probado que detecta: exit 1 con un error deliberado), `alembic upgrade head` + `downgrade -1` + vuelta **ejecutados contra SQLite local**, `detect-secrets-hook` probado en los dos sentidos (exit 0 limpio, exit 1 con un secreto nuevo), `uv sync --locked` probado en los dos sentidos, y el `pre-push` completo probado en los dos sentidos. **NADA de esto corrió en GitHub Actions**: los workflows están validados estáticamente y con sus comandos ejecutados a mano, pero sin push no hay corrida real, y `pytest` no se pudo ejecutar (deny del repo). Los 3 skips son `test_grants_integration`, sin Docker. |
 | 2026-08-25 | **Saneada la verificación del repo: el arnés se versiona y tres tests vuelven a cubrir lo que dicen** (`T-260825-lz-sanear-verificacion`). El arnés de ejecución directa vivía en un scratchpad y se reescribía por sesión: acumuló **cinco** huecos y dos volvieron tras haber sido corregidos. El más caro no fue un test que no corría sino uno que corría **verificando otra cosa** — `server_payload` fabricada con valores distintos a los de `conftest` dejó dos aserciones de seguridad sin poder fallar (la del password en claro buscaba un string que el payload falso nunca enviaba; la del bloqueo de loopback usaba un host que no es loopback), y esa fixture la usan 56 tests en 12 archivos. Causa raíz única: reimplementar el sistema de fixtures de pytest en vez de **cargar el real**. Ahora vive en `scripts/run_tests_direct.py` con `tests/test_run_tests_direct.py` (19 casos) y una sección en `docs/development/best-practices.md`. Tests reparados: `test_structural_snapshot_excludes_the_version_table` (su doble se escribió con duck-typing y dejó de encajar al aparecer `_conn_ctx` y `_database_defaults`; ahora presta los reales de `ServerAdapter`), `test_order_statements_respects_class_order` (afirmaba el orden ANTERIOR a `ff42389`, que reordenó `_CLASS_ORDER` a propósito y no actualizó el test) y `test_health_endpoints_send_cors_header` (el middleware está sano; la aserción fijaba la codificación `*` vs origen reflejado en vez de la garantía). **Cero cambios en `app/`.** | **1775/1775 + 3 skips**, 74 archivos, ninguno abortado (base: 1745/1758 con 7 degradados). **11 mutaciones, 11 detectadas**, incluidas las dos aserciones de seguridad —filtrar el password y desactivar el guard de loopback las ponen rojas— y las 9 del propio arnés. Sin Ruff: no está instalado ni configurado en el repo, así que imports huérfanos y longitud de línea se chequearon a mano. Nada verificado contra motores reales (sin Docker): los 3 skips son `test_grants_integration`. |
 | 2026-08-24 | **Se elimina el consentimiento por corrida de la captura de SELECT, backend Y frontend** (`T-260824-lz-quitar-consentimiento-captura`) — `allow_result_capture` desaparece de `apply`/`rollback`/`apply-all` y `_guard_capture_consent` se borra; queda `reviewed` como ÚNICO gate, ahora con `public_context.code` (`migration.capture_unreviewed`, más `…_stamp` donde `force` sí es escape). Lo reemplaza INFORMACIÓN: `will_capture_versions` en el dry-run, `captured_versions` en la corrida real (arregla el enlace a `select-results`, que adivinaba con `to_version`) y el `detail` de la auditoría de intento nombrando las versiones con captura. En la SPA, el interruptor pasa a aviso, se unifica el predicado divergente en `features/database-models/capture.ts` y el rechazo por captura sin revisar deja de caer como toast rojo pelado en el apply masivo | Backend: 305 checks por ejecución directa en 13 suites, 0 fallos, incluido un test anti-regresión del gate y una comprobación sobre el **OpenAPI real** de que el parámetro no quedó declarado. **Sin migración Alembic.** Frontend: `typecheck`, `lint` (0 errores) y `build` en verde; los tests de vitest **no se ejecutaron** (política de ese repo). **Nada verificado contra motores reales.** Al runner del scratchpad se le agregó soporte de `@pytest.mark.parametrize`: sin él, 3 tests de `is_capturable` no corrían en ninguna verificación previa |
@@ -597,3 +598,81 @@ Ruff limpio. `scripts/check_claude_md_size.py` en verde (188/250).
 **Sin verificar:** que los planes de UI se correspondan con la SPA real (no se leyó `src/`); los
 `public_context` nuevos no tienen test propio que afirme la forma del payload — los tests
 existentes pasan porque afirman status y prosa, no el `code`. Vale la pena agregarlos.
+
+---
+
+## Detalle — `T-260909-ojoshuac-autorizacion-por-capacidades`
+
+Pasos 0–5 del plan `docs/plans/13-usuarios-y-autorizacion-del-gateway.md`. Contrato para el
+frontend en `docs/api-reference-v23.md`.
+
+### Por qué no alcanzaba con tres roles
+
+El plan lo justifica en su §4; lo que importa acá es el resultado: **los ejes `mutates` y
+`discloses` son independientes**. `exports.download`, `engine_users.secrets`,
+`blueprints.captures` y `sql_console.execute` no destruyen nada, así que un modelo partido en
+destructivo/no-destructivo los deja pasar completos — y `operator` en producción habría incluido
+en silencio exportar la base del cliente en claro y leer las contraseñas de su motor.
+
+### Los cuatro agujeros que encontró la migración (no estaban en el plan)
+
+1. **El opt-in que GENERA los datos capturados era `write`.** El plan mapeó `blueprints.captures`
+   a *leer* los resultados y no dijo nada de quién puede encenderlos. Con `blueprints.write` —que
+   tiene `operator`— alcanzaba para `from-snapshot` con `data_tables` (extrae **filas** de la base
+   de origen y las deja dentro de una migración, o sea dentro de algo que después lee cualquiera
+   con `blueprints.read`) y para `capture_selects=true`. Se chequea en el POST **y** en el PATCH:
+   si estuviera solo en el POST, la vía de escape sería crear sin captura y prenderla después.
+2. **`drop_remote` no pedía nada extra.** `DELETE /managed-databases/{id}` hace dos cosas muy
+   distintas detrás de un query param: sin él olvida una fila del inventario, con él ejecuta un
+   **DROP DATABASE sobre la base de un tercero**.
+3. **`engine_users` no tenía nivel `drop`.** Consecuencia: borrar una BD pedía `owner` y borrar al
+   **usuario que la posee** pedía `operator` — y el comentario de `operator` en el catálogo dice de
+   sí mismo que no incluye `*.drop`. El invariante estaba escrito y el vocabulario no lo podía
+   cumplir.
+4. **El `Actor` estricto NO explota dentro de un `try/except` best-effort.** La premisa de todo el
+   refactor era que un sitio olvidado falla ruidosamente. Falso ahí: `_record_history` de la
+   consola SQL leía `admin.get("id")` dentro de su swallow y, con un `Actor`, **la fila del
+   historial desaparecía sin ningún error**. Lo detectaron dos tests del módulo, no el tipo. El
+   swallow es correcto y no se toca; lo que se arregló es que **toda lectura de identidad va por
+   `identity_of`** (`app/core/actor.py`), y se convirtieron los 9 sitios que la leían a mano — uno
+   de ellos el `_guard_owner` de exportación, que es una decisión de **autorización** donde un
+   `None` silencioso abre la puerta en vez de cerrarla.
+
+### La mecánica que hizo seguro migrar de a un módulo
+
+`scripts/check_route_capabilities.py` exige que **toda ruta declare capacidad o esté en
+`PUBLIC_ROUTES`**, y durante el swap admitía una tercera opción (`AdminDep`) con un **trinquete**:
+las legadas solo podían bajar y las migradas solo subir, apretado en el mismo commit. Con eso
+nunca existió un commit donde algo quedara sin guard, así que no hubo que vigilar el estado
+intermedio: el chequeo lo volvía no-mergeable. Terminado el swap, el script dejó de ser trinquete
+de migración y quedó como **invariante**, y el chequeo de vocabulario muerto pasó de informar a
+fallar.
+
+### Verificado
+
+- Los dos guards en verde, el de cobertura ya bloqueante en CI (job `cobertura-authz`).
+- **~700 checks** con `scripts/run_tests_direct.py` sobre 30 módulos. Los nuevos:
+  `test_capability_catalog` (51, incluye los invariantes del catálogo al importar),
+  `test_authz_payload_guards` (13), `test_api_authz` (11), `test_audit_actor_attribution` (8),
+  `test_route_capability_coverage` (6), `test_startup_guards` (6).
+- Sin regresión en los 24 módulos de API que toca el swap.
+- `ruff check .` limpio.
+
+### Qué quedó SIN verificar
+
+- **`pytest` no se corrió** (deny del repo). El arnés no multiplica por `parametrize` ni tiene
+  fixtures de scope module/session, así que hay fallas que estructuralmente no puede ver. **Corré
+  la suite vos** antes de dar esto por cerrado.
+- **Nada contra motores reales.** Los guards de autorización rechazan **antes** de abrir conexión,
+  que es lo que permitió probarlos sin Docker, pero el resto del recorrido no se ejercitó.
+- **La migración `c8d9e0f1a2b3`** (`gateway_role` + `access_grants` + `user_global_capabilities`)
+  solo hizo ciclo upgrade/downgrade/upgrade **en SQLite**. Hereda `P-10`.
+- **Concurrencia**: nada del modelo se probó con dos sesiones simultáneas.
+
+### Follow-ups que este trabajo dejó abiertos
+
+| Ítem | Detalle |
+| --- | --- |
+| `T-260909-ojoshuac-simplificar-union-identidad` | Las firmas de ~20 controllers siguen aceptando `"dict \| Actor \| None"` y `identity_of` conserva su rama de `dict`. Ya no hay ruta que pase un dict, así que la rama está muerta desde el retiro de `AdminDep` — pero simplificarla toca ~20 archivos para cero cambio de comportamiento, así que se separó a propósito en vez de inflar el swap. Al hacerlo, el docstring de `identity_of` ya dice qué se cae |
+| `T-260909-ojoshuac-dependencia-global-subapp` | El guard de cobertura documenta por qué **no** es un assert de arranque y qué es mejor: una **dependencia global de la sub-app**, evaluada en runtime, que corre después del routing y sí ve la ruta resuelta. Con `AdminDep` retirado ya no hay nada que la bloquee |
+| `TRUSTED_PROXY_IPS` y `WORKERS` en `.env.example` | Las dos variables nuevas del paso 1 **faltan ahí**, y `CLAUDE.md` lo exige. El archivo está denegado por permisos para el agente: lo tiene que agregar una persona |
