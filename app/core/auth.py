@@ -15,6 +15,7 @@ from fastapi import Depends, Request
 from app.core.environments import ADMIN_PASSWORD, ADMIN_USERNAME
 from app.core.logger import get_logger
 from app.exceptions import AppHttpException
+from app.services.capability_catalog import GatewayRole, GlobalCapability
 from app.models.user_model import UserModel
 from app.utils.security import hash_password
 
@@ -71,6 +72,17 @@ def bootstrap_admin() -> None:
     """
     Siembra el administrador único desde ADMIN_USERNAME/ADMIN_PASSWORD si aún no
     existe. Idempotente. Se llama en el lifespan de arranque.
+
+    El rol y las capacidades globales se fijan EXPLÍCITAMENTE y no se heredan del default de
+    la columna: ``users.gateway_role`` tiene ``server_default='viewer'`` a propósito —para que
+    ninguna fila nazca con privilegio— así que un despliegue nuevo sin este bloque sembraría
+    un administrador que no puede administrar. Y ``owner`` no alcanza solo: ``servers.admin``,
+    ``catalogs.write`` y ``gateway.admin`` viven **únicamente** en las capacidades globales, así
+    que sin las dos filas de ``user_global_capabilities`` el admin recién sembrado no podría dar
+    de alta un servidor ni rotar la clave de datos.
+
+    Es también el escritor que hace que esas dos tablas no nazcan inertes: el lector es el
+    resolvedor de ``Actor``.
     """
     if not ADMIN_PASSWORD:
         logger.warning(
@@ -90,7 +102,11 @@ def bootstrap_admin() -> None:
             "full_name": "Administrador",
             "notes": None,
             "is_active": True,
-            "is_superuser": True,
+            "gateway_role": GatewayRole.OWNER.value,
         }
+    )
+    user_model.grant_global_capabilities(
+        ADMIN_USERNAME,
+        [GlobalCapability.ACCESS_ADMIN.value, GlobalCapability.SECURITY_OFFICER.value],
     )
     logger.info("Administrador '%s' sembrado.", ADMIN_USERNAME)

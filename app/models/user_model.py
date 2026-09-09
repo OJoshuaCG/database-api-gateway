@@ -93,7 +93,7 @@ class UserModel:
                 - full_name (str, optional): Nombre completo
                 - notes (str, optional): Notas adicionales
                 - is_active (bool, optional): Estado activo (default: True)
-                - is_superuser (bool, optional): Es superusuario (default: False)
+                - gateway_role (str, optional): Rol base en el gateway (default: "viewer")
 
         Returns:
             int: ID del usuario creado
@@ -106,7 +106,7 @@ class UserModel:
                 full_name,
                 notes,
                 is_active,
-                is_superuser
+                gateway_role
             ) VALUES (
                 :username,
                 :email,
@@ -114,7 +114,7 @@ class UserModel:
                 :full_name,
                 :notes,
                 COALESCE(:is_active, 1),
-                COALESCE(:is_superuser, 0)
+                COALESCE(:gateway_role, 'viewer')
             )
         """
 
@@ -158,6 +158,79 @@ class UserModel:
         # Retorna número de filas eliminadas
         return self.db.execute_query(query, {"id": user_id})
 
+
+    # ------------------------------------------------------------------ #
+    # Acceso al gateway (plano de CONTROL)                                #
+    # ------------------------------------------------------------------ #
+    def grant_global_capabilities(self, username: str, capabilities: list[str]) -> None:
+        """
+        Otorga capacidades globales a un usuario, por username. Idempotente.
+
+        Idempotente porque la tabla tiene PK compuesta ``(user_id, capability)``: un doble
+        otorgamiento es imposible incluso ante un bug del llamador, así que se puede reintentar
+        sin comprobar antes. Se usa un ``SELECT`` en el ``INSERT`` para no necesitar el id en el
+        llamador — ``bootstrap_admin`` acaba de crear la fila y no lo tiene a mano.
+        """
+        for capability in capabilities:
+            self.db.execute_query(
+                """
+                INSERT INTO user_global_capabilities (user_id, capability, created_at, updated_at)
+                SELECT u.id, :capability, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                FROM users u
+                WHERE u.username = :username
+                  AND NOT EXISTS (
+                      SELECT 1 FROM user_global_capabilities g
+                      WHERE g.user_id = u.id AND g.capability = :capability
+                  )
+                """,
+                {"username": username, "capability": capability},
+            )
+
+    def find_access_context(self, user_id: int) -> dict:
+        """
+        Lo que hace falta para acuñar un ``Actor``: rol base, overrides por alcance y globales.
+
+        Tres consultas locales a la BD del gateway, en el camino de CADA request autenticada.
+        Es el precio de que **el rol no viaje en la cookie**: se relee siempre, igual que ya se
+        hacía con ``is_active``. Un rol cacheado en la cookie sería un rol que no se puede
+        revocar, porque el ``SessionMiddleware`` re-firma en cada respuesta y una sesión activa
+        no expira nunca.
+
+        Devuelve ``{"role": str, "overrides": {scope_id: role}, "globals": [str]}``. Un usuario
+        sin filas devuelve overrides y globals vacíos, que es el lado seguro: el rol base manda.
+
+        Los dos ``SELECT`` de lista pasan ``fetchone=False`` EXPLÍCITO y no lo omiten: el
+        contrato de ``execute_query`` devuelve ``lastrowid``/``rowcount`` —o sea un ``int``—
+        cuando ``fetchone`` es ``None``. Omitirlo daba un ``TypeError: 'int' object is not
+        iterable`` recién con la tabla vacía, que es el caso normal el día del deploy.
+        """
+        row = self.db.execute_query(
+            "SELECT gateway_role FROM users WHERE id = :id", {"id": user_id}, fetchone=True
+        )
+        grants = (
+            self.db.execute_query(
+                """
+                SELECT scope_type, scope_id, role FROM access_grants
+                WHERE user_id = :id AND scope_type <> 'global'
+                """,
+                {"id": user_id},
+                fetchone=False,
+            )
+            or []
+        )
+        globals_ = (
+            self.db.execute_query(
+                "SELECT capability FROM user_global_capabilities WHERE user_id = :id",
+                {"id": user_id},
+                fetchone=False,
+            )
+            or []
+        )
+        return {
+            "role": (row or {}).get("gateway_role") or "viewer",
+            "overrides": {g["scope_id"]: g["role"] for g in grants},
+            "globals": [g["capability"] for g in globals_],
+        }
     def count(self, is_active: bool | None = None) -> int:
         """
         Contar usuarios con filtros opcionales

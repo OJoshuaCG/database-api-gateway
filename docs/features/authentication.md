@@ -35,8 +35,20 @@ GET /servers (con cookie) ──▶ get_current_admin lee la sesión, recarga el
 ### Bootstrap del administrador
 
 En el `lifespan` de `main.py` se llama `bootstrap_admin()`: si no existe el usuario
-`ADMIN_USERNAME`, lo crea con el password **hasheado con Argon2** y `is_superuser=True`.
-Es idempotente. En producción, arrancar sin `ADMIN_PASSWORD` aborta el inicio.
+`ADMIN_USERNAME`, lo crea con el password **hasheado con Argon2**, con
+`gateway_role='owner'` y con las dos capacidades globales (`access_admin` y
+`security_officer`). Es idempotente. En producción, arrancar sin `ADMIN_PASSWORD` aborta el
+inicio.
+
+Las tres cosas se fijan EXPLÍCITAMENTE y no se heredan de defaults: `users.gateway_role` tiene
+`server_default='viewer'` a propósito —para que ninguna fila nazca con privilegio— y `owner`
+no alcanza solo, porque `servers.admin`, `catalogs.write` y `gateway.admin` viven **únicamente**
+en las capacidades globales. Sin ellas, el admin recién sembrado no podría dar de alta un
+servidor ni rotar la clave de datos.
+
+> `is_superuser` **se retiró**: se escribía en tres lugares y no se leía en ninguno para
+> autorizar, así que no era "todavía no hay permisos" sino un sistema multiusuario sin puerta.
+> Retirarlo no cambió el contrato: `AdminOut` sigue siendo `{id, username}`.
 
 ### La dependencia `get_current_admin`
 

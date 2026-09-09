@@ -71,12 +71,17 @@ class User(Base, TimestampMixin):
         comment="Indica si el usuario está activo en el sistema",
     )
 
-    is_superuser: Mapped[bool] = mapped_column(
-        Boolean,
-        default=False,
-        server_default="0",
+    # `is_superuser` se RETIRÓ acá. Se escribía en tres lugares y no se leía en ninguno para
+    # autorizar: `get_current_admin` solo verificaba sesión + `is_active`. O sea no era "todavía
+    # no hay permisos", era un sistema multiusuario SIN PUERTA, y un flag inerte —que este repo
+    # prohíbe— con la peor forma posible: la que hace creer que algo está protegido.
+    # Retirarlo no rompe el contrato con la SPA: `AdminOut` es solo `{id, username}`.
+    gateway_role: Mapped[str] = mapped_column(
+        String(16),
         nullable=False,
-        comment="Indica si el usuario tiene privilegios de superusuario",
+        server_default="viewer",
+        index=True,
+        comment="Rol base del usuario en el gateway: viewer | operator | owner",
     )
 
     def __repr__(self) -> str:
