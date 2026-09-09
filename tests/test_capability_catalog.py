@@ -19,6 +19,7 @@ MOTOR viven en ``privilege_catalog`` y sus tests son otros.
 
 import pytest
 
+from app.core.actor import admin_actor, token_actor
 from app.services import capability_catalog as cc
 from app.services.capability_catalog import (
     AGENT_ALLOWED,
@@ -241,3 +242,64 @@ def test_the_matrix_publishes_exactly_what_the_roles_grant():
 
 def test_the_matrix_covers_every_capability():
     assert {row["id"] for row in cc.capability_matrix()} == {c.value for c in Capability}
+
+
+# --------------------------------------------------------------------------- #
+# Actor                                                                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_actor_is_not_subscriptable_so_forgotten_sites_explode():
+    """
+    Los 227 sitios que hoy pasan el dict ``admin`` se migran a mano. Con un dict, un
+    ``actor.get("id")`` mal escrito devuelve ``None`` y ``audit_log`` queda con ``admin_id``
+    nulo — un agujero de auditabilidad silencioso. Sin ``__getitem__`` ni ``.get()``, el olvido
+    es ruidoso.
+    """
+    actor = admin_actor(user_id=1, username="admin", role=GatewayRole.OWNER)
+    with pytest.raises(TypeError):
+        actor["id"]
+    assert not hasattr(actor, "get")
+
+
+def test_actor_is_immutable():
+    actor = admin_actor(user_id=1, username="admin", role=GatewayRole.VIEWER)
+    with pytest.raises(Exception):
+        actor.capabilities = frozenset()
+
+
+def test_admin_actor_capabilities_come_from_the_union_role():
+    actor = admin_actor(
+        user_id=1,
+        username="ana",
+        role=GatewayRole.VIEWER,
+        overrides={3: GatewayRole.OPERATOR},
+    )
+    assert actor.role is GatewayRole.OPERATOR
+    assert actor.capabilities == ROLE_CAPABILITIES[GatewayRole.OPERATOR]
+
+
+def test_global_capabilities_add_on_top_of_the_role():
+    actor = admin_actor(
+        user_id=1,
+        username="ana",
+        role=GatewayRole.VIEWER,
+        globals_=frozenset({GlobalCapability.SECURITY_OFFICER}),
+    )
+    assert actor.has(Capability.SERVERS_ADMIN)
+    assert actor.has(Capability.CATALOGS_WRITE)
+    # Y sigue sin poder operar: la global no arrastra la cadena.
+    assert not actor.has(Capability.DATABASES_DROP)
+
+
+def test_token_actor_is_capped_at_the_agent_ceiling():
+    actor = token_actor(
+        token_pk=1,
+        token_id="tok",
+        name="ci-facturacion",
+        scopes=",".join(c.value for c in Capability),
+        project_id=7,
+    )
+    assert actor.capabilities == AGENT_ALLOWED
+    assert actor.is_agent
+    assert not actor.has(Capability.DATABASES_DROP)
