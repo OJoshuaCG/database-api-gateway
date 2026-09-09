@@ -87,3 +87,47 @@ class CapabilityRowOut(BaseModel):
     scope_axis: str
     roles: list[str]
     global_capabilities: list[str]
+
+
+class ScopeReadinessServerOut(BaseModel):
+    """Un servidor y a qué entorno derivaría si se activara el alcance por destino."""
+
+    server_id: int
+    server_name: str
+    engine: str
+    databases: int = Field(..., description="BDs del inventario en este servidor")
+    unclassified: int = Field(..., description="Cuántas no tienen entorno asignado")
+    derived_environment_slug: str | None = Field(
+        None,
+        description=(
+            "Entorno que el guard le atribuiría a una operación a nivel SERVIDOR sobre este "
+            "servidor. Sale de la MISMA regla que aplica el guard, no de un criterio paralelo"
+        ),
+    )
+    derived_from_gap: bool = Field(
+        ...,
+        description=(
+            "True si el entorno derivado sale del hueco de datos (sin bases, o con alguna sin "
+            "clasificar) y NO de una clasificación real. Es la fila que hay que arreglar"
+        ),
+    )
+
+
+class ScopeReadinessOut(BaseModel):
+    """
+    Preparación para otorgar acceso por alcance.
+
+    Se pide ANTES de crear el primer grant restrictivo, porque una BD sin entorno se trata como
+    el entorno más protegido: si hay filas sin clasificar, otorgar "lector en producción" le
+    saca a esa persona el acceso a bases que nadie clasificó todavía.
+    """
+
+    total_databases: int
+    unclassified_databases: int
+    ready: bool = Field(
+        ..., description="True cuando no queda ninguna BD sin entorno: se puede otorgar sin sorpresas"
+    )
+    fallback_environment_slug: str | None = Field(
+        None, description="El entorno más protegido: a este resuelve todo lo que no esté clasificado"
+    )
+    servers: list[ScopeReadinessServerOut] = Field(default_factory=list)

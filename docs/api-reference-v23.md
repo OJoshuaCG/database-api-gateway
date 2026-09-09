@@ -221,3 +221,33 @@ al login a mitad de una operación. Conviene avisar antes de que llegue.
   propósito: cuando la SPA pide `/auth/me`, el último ya es el login en curso.
 - El límite de tasa pasa a contarse **por sesión** y no por IP, así que varias personas detrás de
   la misma salida NAT ya no comparten cupo. El login sigue por IP: todavía no hay sesión.
+
+---
+
+## 8. Alcance por destino (capa 2)
+
+`GET /authz/scope-readiness` (detrás de `gateway.admin`) — **se pide ANTES de otorgar el primer
+acceso por alcance.**
+
+```jsonc
+{ "total_databases": 42, "unclassified_databases": 7, "ready": false,
+  "fallback_environment_slug": "production",
+  "servers": [ { "server_id": 3, "server_name": "…", "engine": "mysql",
+                 "databases": 12, "unclassified": 7,
+                 "derived_environment_slug": "production", "derived_from_gap": true } ] }
+```
+
+**Por qué existe**: una BD sin `environment_id` **no** resuelve al entorno por defecto —ése es el
+más permisivo— sino al **más protegido**. Así que otorgar "lector en producción" también le saca a
+esa persona el acceso a toda base que nadie clasificó. `derived_from_gap: true` marca las filas que
+hay que arreglar; `ready: true` dice que se puede otorgar sin sorpresas.
+
+**Qué cambia en la superficie**: las operaciones con destino resoluble (por ahora el borrado, el
+aprovisionamiento y el apply/rollback de `/managed-databases/{id}/*`) evalúan la capacidad **dos
+veces**: una global —"¿podría en algún alcance?"— y otra en el destino. El 403 es el mismo
+`access.forbidden` en los dos casos: **no distingue cuál de las dos capas negó**, porque decir "no
+la tenés *acá*" le regala a un atacante el mapa de sus propios alcances por fuerza bruta.
+
+Mientras nadie tenga grants por alcance —el estado de un despliegue recién migrado— la capa 2 no
+cambia ningún resultado, y no toca la BD para decidirlo.
+

@@ -667,6 +667,27 @@ operativo real: el día del encendido de la capa 2, un `operator` pierde acceso 
 clasificar — **por eso la capa 2 va en una fase posterior, precedida de un reporte de
 reconciliación** de `environment_id IS NULL` (§14, fase 2).
 
+**Dos reglas que este §6.4 no fijaba y que la implementación tuvo que decidir:**
+
+1. **El grant REEMPLAZA al rol base en su alcance; no se suma.** El §6.4 decía "`effective_role(env_id)`"
+   sin decir cómo se combina con el rol base, y la respuesta intuitiva —el máximo, como en la capa 1—
+   **rompe el caso de uso**: con `base=operator` y un grant `viewer` sobre producción,
+   `max(operator, viewer) = operator` y la restricción no hace nada. Así que: si hay grant para el
+   alcance del destino, manda el grant; si no hay ninguno, manda el rol base.
+2. **Dos grants que aplican al mismo destino resuelven al MÁS RESTRICTIVO.** Pasa cuando alguien tiene
+   uno por entorno y otro por servidor. Al revés, **agregar** un grant podría *ampliar* el acceso sin
+   que nadie lo pida, que es lo contrario de lo que un grant significa.
+
+Y una desviación de forma, declarada: la regla vive en **`app/core/scope.py`** y no dentro de
+`app/core/authz.py`. Lo que el §6.4 pedía era que estuviera escrita **una** vez, no en un archivo
+puntual; separarla deja `authz.py` como la capa 1 (capacidad) y `scope.py` como la capa 2 (destino),
+que es la misma división que el documento hace conceptualmente.
+
+**Y el lector de grants perdía el `scope_type`.** `find_access_context` devolvía `{scope_id: role}`,
+así que un grant con alcance de SERVIDOR se leía como uno de entorno: el entorno 3 y el servidor 3
+colisionaban en silencio. Para la capa 1 era inocuo (solo mira los roles); para la capa 2 el tipo ES
+la pregunta. Corregido, con test.
+
 ### 6.5 Los 21 endpoints que operan fuera del inventario
 
 `/servers/{sid}/databases/*` y `/servers/{sid}/users/*` identifican la base por **referencia

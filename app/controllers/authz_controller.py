@@ -26,6 +26,18 @@ def _catalog_version() -> str:
 
 
 class AuthzController:
+    def _session(self):
+        """
+        Sesión ORM contra la BD de metadatos.
+
+        Se construye por llamada y no en un ``__init__`` porque este controller lo instancian
+        rutas que NO tocan la BD (``/authz/catalog`` es todo cálculo en memoria): abrir una
+        conexión para servirlas sería pagarla en el 99 % de las llamadas.
+        """
+        from app.core.database import Database
+
+        return Database().get_declarative_base_session()
+
     def me(self, actor: Actor) -> dict:
         """
         Identidad y capacidades efectivas del actor.
@@ -61,3 +73,84 @@ class AuthzController:
     def catalog(self) -> list[dict]:
         """El catálogo completo, para que la SPA renderice etiquetas sin hardcodear vocabulario."""
         return capability_matrix()
+
+    def scope_readiness(self) -> dict:
+        """
+        Qué pasaría si se empezara a otorgar acceso por alcance, HOY.
+
+        Existe porque la capa 2 tiene un costo operativo que no se ve venir: una BD sin
+        ``environment_id`` **no resuelve al entorno por defecto** —ése es el más permisivo— sino
+        al más protegido. Así que el día que alguien reciba su primer grant restrictivo sobre
+        producción, toda base sin clasificar queda tratada como producción para él.
+
+        El plan lo pone como PRECONDICIÓN y no como una pantalla más: se clasifica primero, se
+        otorga después. Este reporte es lo que dice cuánto falta.
+
+        **Cero conexiones al motor**: se lee el inventario del gateway y nada más. Un reporte de
+        preparación que dependa de que N motores respondan es un reporte que no se puede correr
+        el día que hace falta.
+        """
+        from sqlalchemy import func
+
+        from app.core.scope import most_protected_environment_id
+        from app.models.environment import Environment
+        from app.models.managed_database import ManagedDatabase
+        from app.models.server import Server
+
+        session = self._session()
+        try:
+            total = session.query(func.count(ManagedDatabase.id)).scalar() or 0
+            sin_clasificar = (
+                session.query(func.count(ManagedDatabase.id))
+                .filter(ManagedDatabase.environment_id.is_(None))
+                .scalar()
+                or 0
+            )
+
+            por_servidor = []
+            for srv in session.query(Server).order_by(Server.name).all():
+                filas = (
+                    session.query(ManagedDatabase.environment_id)
+                    .filter(ManagedDatabase.server_id == srv.id)
+                    .all()
+                )
+                ids = [f[0] for f in filas]
+                faltantes = sum(1 for i in ids if i is None)
+                # La MISMA regla que `resolve_environment_id`, no una segunda implementación:
+                # sin bases o con al menos una sin clasificar, el servidor entero cae en el
+                # más protegido. Si el reporte usara otro criterio, diría una cosa y el guard
+                # haría otra — que es peor que no tener reporte.
+                if not ids or faltantes:
+                    derivado_id = most_protected_environment_id()
+                else:
+                    peor = (
+                        session.query(Environment)
+                        .filter(Environment.id.in_(ids))
+                        .order_by(Environment.rank.desc(), Environment.id.desc())
+                        .first()
+                    )
+                    derivado_id = peor.id if peor else None
+                derivado = session.get(Environment, derivado_id) if derivado_id else None
+                por_servidor.append(
+                    {
+                        "server_id": srv.id,
+                        "server_name": srv.name,
+                        "engine": str(srv.engine),
+                        "databases": len(ids),
+                        "unclassified": faltantes,
+                        "derived_environment_slug": derivado.slug if derivado else None,
+                        "derived_from_gap": bool(not ids or faltantes),
+                    }
+                )
+
+            protegido = most_protected_environment_id()
+            env = session.get(Environment, protegido) if protegido else None
+            return {
+                "total_databases": total,
+                "unclassified_databases": sin_clasificar,
+                "ready": sin_clasificar == 0,
+                "fallback_environment_slug": env.slug if env else None,
+                "servers": por_servidor,
+            }
+        finally:
+            session.close()
