@@ -19,6 +19,8 @@ Integridad: el propietario debe ser un ServerUser del MISMO servidor (se valida 
 el controller; endurecimiento futuro con FK compuesta — ver docs/plans/00).
 """
 
+from typing import TYPE_CHECKING
+
 from sqlalchemy.exc import IntegrityError
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
@@ -41,6 +43,9 @@ from app.services.db_admin.identifiers import (
     ensure_not_reserved_database,
     validate_identifier,
 )
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
 
 #: Marca del bloque de diagnóstico que escribe el gateway dentro de ``notes``. Todo lo que NO
 #: empieza con esto es del operador y no se toca.
@@ -231,7 +236,7 @@ class ManagedDatabaseController:
     # Escritura (inventario + motor)                                      #
     # ------------------------------------------------------------------ #
     def create_database(
-        self, data: dict, *, provision: bool, admin: dict | None = None
+        self, data: dict, *, provision: bool, admin: "dict | Actor | None" = None
     ) -> dict:
         session = self._session()
         try:
@@ -438,7 +443,7 @@ class ManagedDatabaseController:
         )
         return result
 
-    def adopt_database(self, data: dict, *, admin: dict | None = None) -> dict:
+    def adopt_database(self, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         """
         Adopta una BD que YA existe en el motor (Plan 09): registra metadata SIN
         ejecutar CREATE DATABASE. Verifica la existencia real (404 si no), exige un
@@ -554,7 +559,7 @@ class ManagedDatabaseController:
         return result
 
     def provision_database(
-        self, db_id: int, *, allow_recreate: bool = False, admin: dict | None = None
+        self, db_id: int, *, allow_recreate: bool = False, admin: "dict | Actor | None" = None
     ) -> dict:
         """
         Ejecuta el ``CREATE DATABASE`` faltante sobre una fila YA registrada.
@@ -742,7 +747,7 @@ class ManagedDatabaseController:
             )
 
     def update_database(
-        self, db_id: int, data: dict, *, admin: dict | None = None
+        self, db_id: int, data: dict, *, admin: "dict | Actor | None" = None
     ) -> dict:
         """Actualiza solo metadatos del inventario (no ejecuta DDL en el motor)."""
         session = self._session()
@@ -811,7 +816,7 @@ class ManagedDatabaseController:
         *,
         drop_remote: bool,
         confirm_name: str | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> None:
         session = self._session()
         try:
@@ -867,7 +872,7 @@ class ManagedDatabaseController:
         )
 
     def reassign_owner(
-        self, db_id: int, new_owner_id: int, *, provision: bool, admin: dict | None = None
+        self, db_id: int, new_owner_id: int, *, provision: bool, admin: "dict | Actor | None" = None
     ) -> dict:
         session = self._session()
         try:

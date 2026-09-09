@@ -14,7 +14,15 @@ from fastapi import APIRouter, Path as FPath, Query, Request
 
 from app.controllers.managed_database_controller import ManagedDatabaseController
 from app.controllers.managed_migration_controller import ManagedMigrationController
-from app.core.auth import AdminDep
+from app.core.authz import (
+    BlueprintsApply,
+    BlueprintsCaptures,
+    BlueprintsRead,
+    BlueprintsWrite,
+    DatabasesRead,
+    DatabasesWrite,
+    assert_capability,
+)
 from app.core.limiter import limiter
 from app.models.enums import EngineType, ProvisionStatus
 from app.schemas.managed_database import (
@@ -33,6 +41,7 @@ from app.schemas.model_migration import (
     MigrationSelectResultsOut,
     MigrationStatusOut,
 )
+from app.services.capability_catalog import Capability
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
@@ -41,7 +50,7 @@ router = APIRouter(prefix="/managed-databases", tags=["Managed Databases"])
 
 @router.get("", response_model=ApiResponse[list[ManagedDatabaseOut]])
 def list_databases(
-    admin: AdminDep,
+    actor: DatabasesRead,
     pagination: PaginationDep,
     server_id: int | None = Query(None, ge=1),
     owner_id: int | None = Query(None, ge=1),
@@ -83,12 +92,12 @@ def list_databases(
 @limiter.limit("10/minute")
 def create_database(
     request: Request,
-    admin: AdminDep,
+    actor: DatabasesWrite,
     payload: ManagedDatabaseCreate,
     provision: bool = Query(False),
 ):
     created = ManagedDatabaseController().create_database(
-        payload.model_dump(), provision=provision, admin=admin
+        payload.model_dump(), provision=provision, admin=actor
     )
     msg = "Base de datos registrada en el inventario."
     if provision:
@@ -97,31 +106,31 @@ def create_database(
 
 
 @router.post("/adopt", response_model=ApiResponse[ManagedDatabaseOut], status_code=201)
-def adopt_database(admin: AdminDep, payload: AdoptDatabaseIn):
+def adopt_database(actor: DatabasesWrite, payload: AdoptDatabaseIn):
     """
     Adopta una BD que YA existe en el motor (Plan 09): registra metadata sin ejecutar
     CREATE DATABASE. 404 si la BD no existe; 409 si ya está en el inventario.
     """
-    created = ManagedDatabaseController().adopt_database(payload.model_dump(), admin=admin)
+    created = ManagedDatabaseController().adopt_database(payload.model_dump(), admin=actor)
     return success(data=created, message="Base de datos existente adoptada al inventario.")
 
 
 @router.get("/{db_id}", response_model=ApiResponse[ManagedDatabaseOut])
-def get_database(admin: AdminDep, db_id: int):
+def get_database(actor: DatabasesRead, db_id: int):
     return success(data=ManagedDatabaseController().get_database(db_id))
 
 
 @router.patch("/{db_id}", response_model=ApiResponse[ManagedDatabaseOut])
-def update_database(admin: AdminDep, db_id: int, payload: ManagedDatabaseUpdate):
+def update_database(actor: DatabasesWrite, db_id: int, payload: ManagedDatabaseUpdate):
     updated = ManagedDatabaseController().update_database(
-        db_id, payload.model_dump(exclude_unset=True), admin=admin
+        db_id, payload.model_dump(exclude_unset=True), admin=actor
     )
     return success(data=updated, message="Base de datos actualizada.")
 
 
 @router.delete("/{db_id}", response_model=ApiResponse[None])
 def delete_database(
-    admin: AdminDep,
+    actor: DatabasesWrite,
     db_id: int,
     drop_remote: bool = Query(False),
     confirm_name: str | None = Query(
@@ -129,8 +138,22 @@ def delete_database(
         description="Obligatorio si drop_remote=true: repetir el nombre exacto de la BD para confirmar el DROP en el motor.",
     ),
 ):
+    """
+    Saca la BD del inventario y, con ``drop_remote=true``, la BORRA del motor.
+
+    **``drop_remote`` exige ``databases.drop``, no ``write``.** Son dos operaciones muy
+    distintas detrás de un query param: sin él esto olvida una fila —reversible adoptándola de
+    nuevo—; con él ejecuta un DROP DATABASE sobre la base de un tercero. Mapear la ruta entera
+    a ``databases.drop`` sería el error simétrico: pediría el permiso más alto del módulo para
+    limpiar una fila del inventario.
+
+    El ``confirm_name`` sigue siendo obligatorio con ``drop_remote``: la capacidad dice quién
+    puede, la confirmación dice sobre qué.
+    """
+    if drop_remote:
+        assert_capability(actor, Capability.DATABASES_DROP)
     ManagedDatabaseController().delete_database(
-        db_id, drop_remote=drop_remote, confirm_name=confirm_name, admin=admin
+        db_id, drop_remote=drop_remote, confirm_name=confirm_name, admin=actor
     )
     return empty("Base de datos eliminada.")
 
@@ -139,13 +162,13 @@ def delete_database(
     "/{db_id}/reassign-owner", response_model=ApiResponse[ManagedDatabaseOut]
 )
 def reassign_owner(
-    admin: AdminDep,
+    actor: DatabasesWrite,
     db_id: int,
     payload: ReassignOwnerIn,
     provision: bool = Query(False),
 ):
     updated = ManagedDatabaseController().reassign_owner(
-        db_id, payload.owner_id, provision=provision, admin=admin
+        db_id, payload.owner_id, provision=provision, admin=actor
     )
     return success(data=updated, message="Propietario reasignado.")
 
@@ -156,7 +179,7 @@ def reassign_owner(
 @limiter.limit("10/minute")
 def provision_database(
     request: Request,
-    admin: AdminDep,
+    actor: DatabasesWrite,
     db_id: int,
     allow_recreate: bool = Query(
         False,
@@ -182,7 +205,7 @@ def provision_database(
     ``POST /managed-databases/adopt``.
     """
     result = ManagedDatabaseController().provision_database(
-        db_id, allow_recreate=allow_recreate, admin=admin
+        db_id, allow_recreate=allow_recreate, admin=actor
     )
     msg = (
         "Base de datos creada en el motor."
@@ -199,7 +222,7 @@ def provision_database(
 @router.get(
     "/{db_id}/migrations/status", response_model=ApiResponse[MigrationStatusOut]
 )
-def migration_status(admin: AdminDep, db_id: int):
+def migration_status(actor: BlueprintsRead, db_id: int):
     return success(data=ManagedMigrationController().status(db_id))
 
 
@@ -207,7 +230,7 @@ def migration_status(admin: AdminDep, db_id: int):
 @limiter.limit("10/minute")
 def apply_migrations(
     request: Request,
-    admin: AdminDep,
+    actor: BlueprintsApply,
     db_id: int,
     version: str | None = Query(
         None,
@@ -260,7 +283,7 @@ def apply_migrations(
     """
     result = ManagedMigrationController().apply(
         db_id, up_to_version=version, force=force, dry_run=dry_run,
-        on_failure=on_failure, admin=admin,
+        on_failure=on_failure, admin=actor,
     )
     msg = _apply_message(result, dry_run=dry_run)
     return success(data=result, message=msg)
@@ -308,7 +331,7 @@ def _apply_message(result: dict, *, dry_run: bool) -> str:
 @limiter.limit("10/minute")
 def rollback_migration(
     request: Request,
-    admin: AdminDep,
+    actor: BlueprintsApply,
     db_id: int,
     confirm_version: str = Query(
         ...,
@@ -343,7 +366,7 @@ def rollback_migration(
         db_id,
         confirm_version=confirm_version,
         target_version=target_version,
-        admin=admin,
+        admin=actor,
     )
     return success(data=result, message=_rollback_message(result))
 
@@ -369,7 +392,7 @@ def _rollback_message(result: dict) -> str:
 @limiter.limit("10/minute")
 def reconcile_partial_migration(
     request: Request,
-    admin: AdminDep,
+    actor: BlueprintsApply,
     db_id: int,
     confirm_version: str = Query(
         ...,
@@ -414,7 +437,7 @@ def reconcile_partial_migration(
         confirm_version=confirm_version,
         dry_run=dry_run,
         force=force,
-        admin=admin,
+        admin=actor,
     )
     if result.get("dry_run"):
         msg = (
@@ -438,7 +461,7 @@ def reconcile_partial_migration(
 @limiter.limit("10/minute")
 def stamp_migration(
     request: Request,
-    admin: AdminDep,
+    actor: BlueprintsApply,
     db_id: int,
     version: str = Query(..., pattern=r"^\d{4,10}$", description="Versión a marcar"),
     force: bool = Query(
@@ -451,7 +474,7 @@ def stamp_migration(
         ),
     ),
 ):
-    result = ManagedMigrationController().stamp(db_id, version, force=force, admin=admin)
+    result = ManagedMigrationController().stamp(db_id, version, force=force, admin=actor)
     msg = "Versión marcada (stamp)." + (" Checkpoint parcial descartado." if force else "")
     return success(data=result, message=msg)
 
@@ -463,7 +486,7 @@ def stamp_migration(
 @limiter.limit("20/minute")
 def migration_select_results(
     request: Request,
-    admin: AdminDep,
+    actor: BlueprintsCaptures,
     db_id: int,
     version: str = FPath(..., pattern=r"^\d{4,10}$", description="Versión de la migración"),
 ):
@@ -482,7 +505,7 @@ def migration_select_results(
     Ojo con ``durability='rolled_back'`` (solo PostgreSQL): esas filas describen lo que se
     vio DURANTE el intento, no el estado final de la base.
     """
-    return success(data=ManagedMigrationController().select_results(db_id, version, admin=admin))
+    return success(data=ManagedMigrationController().select_results(db_id, version, admin=actor))
 
 
 @router.delete(
@@ -490,7 +513,7 @@ def migration_select_results(
     response_model=ApiResponse[None],
 )
 def purge_migration_select_results(
-    admin: AdminDep,
+    actor: BlueprintsWrite,
     db_id: int,
     version: str = FPath(..., pattern=r"^\d{4,10}$", description="Versión de la migración"),
 ):
@@ -500,7 +523,7 @@ def purge_migration_select_results(
     Las capturas expiran solas por TTL (``MIGRATION_CAPTURE_TTL_HOURS``, default 7 días);
     esto es la vía para borrarlas ya, en cuanto el diagnóstico terminó.
     """
-    deleted = ManagedMigrationController().purge_select_results(db_id, version, admin=admin)
+    deleted = ManagedMigrationController().purge_select_results(db_id, version, admin=actor)
     return empty(f"{deleted} resultado(s) capturado(s) eliminado(s).")
 
 
@@ -508,7 +531,7 @@ def purge_migration_select_results(
     "/{db_id}/migrations/history",
     response_model=ApiResponse[list[MigrationHistoryOut]],
 )
-def migration_history(admin: AdminDep, db_id: int, pagination: PaginationDep):
+def migration_history(actor: BlueprintsRead, db_id: int, pagination: PaginationDep):
     items, total = ManagedMigrationController().history(
         db_id, limit=pagination.size, offset=pagination.offset
     )

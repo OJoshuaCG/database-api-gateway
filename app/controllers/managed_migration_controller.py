@@ -16,6 +16,7 @@ Integridad: antes de tocar el motor se re-valida el ``checksum`` de cada migraci
 
 import re
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 from sqlalchemy import or_ as sa_or
 
@@ -54,6 +55,10 @@ from app.services.db_admin.migrations import (
 )
 from app.services.db_admin.identifiers import references_gateway_internal_table
 from app.services.db_admin.sql_dialect import SqlTranslator, split_sql_statements
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
+
 
 logger = get_logger(__name__)
 
@@ -491,7 +496,7 @@ class ManagedMigrationController:
         force: bool = False,
         dry_run: bool = False,
         on_failure: str = "auto",
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         session = self._session()
         try:
@@ -1221,7 +1226,7 @@ class ManagedMigrationController:
         return written, versions
 
     def select_results(
-        self, db_id: int, version: str, *, admin: dict | None = None
+        self, db_id: int, version: str, *, admin: "dict | Actor | None" = None
     ) -> dict:
         """
         Devuelve las capturas de una versión sobre esta BD, DESCIFRADAS.
@@ -1297,7 +1302,7 @@ class ManagedMigrationController:
         }
 
     def purge_select_results(
-        self, db_id: int, version: str, *, admin: dict | None = None
+        self, db_id: int, version: str, *, admin: "dict | Actor | None" = None
     ) -> int:
         """Borra las capturas de una versión sobre esta BD. Devuelve cuántas se borraron."""
         session = self._session()
@@ -1352,7 +1357,7 @@ class ManagedMigrationController:
         *,
         confirm_version: str | None = None,
         target_version: str | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         """
         Revierte una BD a ``target_version`` de forma SECUENCIAL en una sola llamada
@@ -1536,7 +1541,7 @@ class ManagedMigrationController:
         }
 
     def stamp(
-        self, db_id: int, version: str, *, force: bool = False, admin: dict | None = None
+        self, db_id: int, version: str, *, force: bool = False, admin: "dict | Actor | None" = None
     ) -> dict:
         session = self._session()
         try:
@@ -1865,7 +1870,7 @@ class ManagedMigrationController:
         confirm_version: str,
         dry_run: bool = False,
         force: bool = False,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         """
         Deshace las sentencias que SÍ se aplicaron de una migración que falló a mitad.
@@ -2050,7 +2055,7 @@ class ManagedMigrationController:
         force: bool = False,
         dry_run: bool = False,
         on_failure: str = "auto",
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         """
         Aplica las pendientes a TODAS las BDs del blueprint (síncrono, acotado).
