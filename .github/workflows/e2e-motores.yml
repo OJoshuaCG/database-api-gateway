@@ -1,0 +1,128 @@
+# Los `scripts/verify_*_e2e.py` contra motores REALES y efímeros.
+#
+# POR QUÉ EXISTE ESTE WORKFLOW
+# ---------------------------
+# El repo tiene DIEZ scripts de verificación end-to-end, escritos entre junio y agosto de
+# 2026, y **ninguno había corrido nunca**: se escribieron en una máquina sin Docker y se
+# quedaron ahí. Uno de ellos, `verify_query_console_e2e.py`, verifica lo que el archivo de
+# incidentes llama "la garantía central del diseño" — que la transacción READ ONLY rechace de
+# verdad una escritura mal clasificada. Esa defensa está desplegada y nunca se comprobó.
+#
+# El job `tests` de ci.yml no puede cubrirlo: corre sin servicios de base de datos, así que
+# los tests marcados `@pytest.mark.integration` se auto-saltean. Y eso es deliberado (un skip
+# visible es información), pero significa que la brecha entre "lo que SQLite valida" y "lo que
+# el motor real hace" no tiene gate. Este workflow es ese gate.
+#
+# La infraestructura no es nueva: el bloque `services:` es el mismo patrón que
+# migrations-apply.yml ya usa para aplicar migraciones contra MariaDB y PostgreSQL efímeros.
+#
+# POR QUÉ UN SOLO JOB Y NO UN MATRIX
+# ----------------------------------
+# Los diez scripts usan la MISMA convención de puertos y credenciales (13399 mysql, 13400
+# mariadb, 15499 postgres, todos con `rootpw`), así que un set de tres contenedores sirve a
+# todos. Un matrix daría estado por script en la UI, pero levantaría 30 contenedores y
+# repetiría el pull de tres imágenes diez veces. Con un job y un bucle, el costo es tres
+# contenedores y el log completo se lee de una vez — que es lo que hace falta la primera vez
+# que esto corre.
+#
+# Los scripts NO se adaptan: se invocan tal cual. Adaptarlos introduciría el riesgo de que la
+# versión que corre en CI no sea la que alguien ejecutó a mano la última vez. El único cambio
+# que hizo falta fue unificar el puerto de MariaDB en `verify_query_console_e2e.py`, que decía
+# 13309 mientras los otros nueve dicen 13400.
+#
+# `continue-on-error: true` — Y CUÁNDO SACARLO
+# --------------------------------------------
+# Ninguno de estos scripts corrió nunca, así que la primera corrida es un descubrimiento, no
+# un gate: bloquear merges con diez scripts de resultado desconocido pararía todo el trabajo
+# sin agregar información. **Se saca en cuanto los diez estén verdes**, y ahí este workflow
+# pasa a ser bloqueante como `lint` y `migraciones aplicables`. Dejarlo informativo después de
+# eso sería la ventana en la que alguien fusiona sobre una garantía nunca probada.
+name: E2E contra motores reales
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Mínimo privilegio: estos jobs solo leen el árbol.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  e2e:
+    name: verify_*_e2e.py
+    runs-on: ubuntu-latest
+    # Ver la cabecera: informativo hasta que los diez estén verdes.
+    continue-on-error: true
+    services:
+      # Los puertos del HOST son los que los scripts tienen hardcodeados. Mapearlos acá es lo
+      # que permite invocarlos sin tocarles una línea.
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpw
+          MYSQL_ROOT_HOST: '%'
+        ports: ['13399:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -prootpw"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: rootpw
+        ports: ['13400:3306']
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: rootpw
+        ports: ['15499:5432']
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    env:
+      # Los scripts arman su propia BD de metadatos (SQLite) y su propio TestClient; estas
+      # variables solo evitan los guards de arranque de app/core/environments.py.
+      APP_ENV: development
+      SECRET_KEY: ci-solo-para-e2e
+      CRYPTO_KEY_SALT: ci-salt
+      ADMIN_PASSWORD: ci-admin-password
+      PYTHONPATH: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+
+      # Un bucle y no diez `- run:` para que el fallo de uno no esconda a los otros nueve: la
+      # primera corrida necesita el cuadro completo, no el primer error.
+      - name: Correr los diez scripts
+        run: |
+          set -uo pipefail
+          fallaron=()
+          for s in scripts/verify_*_e2e.py; do
+            echo "::group::$s"
+            if uv run python "$s"; then
+              echo "OK  $s"
+            else
+              echo "FALLA  $s"
+              fallaron+=("$s")
+            fi
+            echo "::endgroup::"
+          done
+          echo
+          echo "===================== RESUMEN ====================="
+          if [ ${#fallaron[@]} -eq 0 ]; then
+            echo "Los diez scripts pasaron."
+          else
+            echo "Fallaron ${#fallaron[@]}:"
+            printf '  - %s\n' "${fallaron[@]}"
+            exit 1
+          fi

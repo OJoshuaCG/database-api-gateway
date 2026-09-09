@@ -63,8 +63,8 @@ from app.models import Base  # noqa: E402
 ENGINES = {
     "mysql": {"port": 13399, "driver": "mysql+pymysql", "user": "root", "pw": "rootpw"},
     # MariaDB necesita SU PROPIO contenedor/puerto (no reusar el de mysql): ajustar el
-    # puerto acá si se corre, p.ej. ``docker run ... -p 13309:3306 mariadb:11``.
-    "mariadb": {"port": 13309, "driver": "mysql+pymysql", "user": "root", "pw": "rootpw"},
+    # puerto acá si se corre, p.ej. ``docker run ... -p 13400:3306 mariadb:11``.
+    "mariadb": {"port": 13400, "driver": "mysql+pymysql", "user": "root", "pw": "rootpw"},
     "postgresql": {"port": 15499, "driver": "postgresql+psycopg", "user": "postgres", "pw": "rootpw"},
 }
 
