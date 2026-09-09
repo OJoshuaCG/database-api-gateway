@@ -14,15 +14,11 @@ Principios:
 
 from contextvars import ContextVar
 
+from app.core.actor import Actor, identity_of
 from app.core.context import current_http_identifier, current_request_ip
 from app.core.database import Database
 from app.core.logger import get_logger
 from app.exceptions import AppHttpException
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from app.core.actor import Actor
-
 from app.models.audit_log import AuditLog
 
 logger = get_logger(__name__)
@@ -36,32 +32,11 @@ def _safe_get(ctxvar: ContextVar) -> str | None:
     return value or None
 
 
-def _identity(subject) -> tuple[int | None, str | None]:
-    """
-    ``(id, username)`` de la identidad que audita, sea un ``dict`` legado o un ``Actor``.
-
-    Durante la migración a ``Actor`` conviven las dos: las rutas ya migradas pasan el actor y
-    las 151 que siguen con ``AdminDep`` pasan el ``dict``. Normalizar acá —y no darle un
-    ``.get()`` al ``Actor``— es lo que mantiene la propiedad que hace segura la migración: el
-    ``Actor`` sigue siendo frozen, sin ``.get()`` y no subscriptable, así que cualquiera de los
-    227 sitios que se olvide de adaptar **explota ruidosamente** en vez de dejar ``admin_id``
-    nulo en el registro.
-
-    **Se retira cuando no queden rutas con el guard legado** (lo mide
-    ``scripts/check_route_capabilities.py``): ahí el parámetro pasa a ser ``Actor`` a secas.
-    """
-    if subject is None:
-        return None, None
-    if isinstance(subject, dict):
-        return subject.get("id"), subject.get("username")
-    return getattr(subject, "id", None), getattr(subject, "username", None)
-
-
 def _build(
     action: str,
     *,
     status: str,
-    admin: "dict | Actor | None",
+    admin: dict | Actor | None,
     target_type: str | None,
     target_id: int | None,
     server_id: int | None,
@@ -74,7 +49,7 @@ def _build(
     with_grant_option: bool | None,
     grantor: str | None,
 ) -> AuditLog:
-    admin_id, admin_username = _identity(admin)
+    admin_id, admin_username = identity_of(admin)
     return AuditLog(
         request_id=_safe_get(current_http_identifier),
         admin_id=admin_id,
@@ -100,7 +75,7 @@ def record(
     action: str,
     *,
     status: str = "success",
-    admin: "dict | Actor | None" = None,
+    admin: dict | Actor | None = None,
     target_type: str | None = None,
     target_id: int | None = None,
     server_id: int | None = None,
@@ -147,7 +122,7 @@ def record(
 def record_intent(
     action: str,
     *,
-    admin: "dict | Actor | None" = None,
+    admin: dict | Actor | None = None,
     target_type: str | None = None,
     target_id: int | None = None,
     server_id: int | None = None,

@@ -15,9 +15,12 @@ canjear el token para ejecutar un ``DROP``, que es justo lo que la confirmación
 para impedir.
 """
 
+from typing import TYPE_CHECKING
+
 from datetime import datetime, timezone
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
+from app.core.actor import identity_of
 from app.core.context import current_http_identifier, current_request_ip
 from app.core.crypto import CryptoConfigError, CryptoError, decrypt
 from app.core.database import Database
@@ -66,6 +69,10 @@ from app.services.db_admin.query_runner import (
     MODE_STORED,
     QueryCredential,
 )
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
+
 
 logger = get_logger(__name__)
 
@@ -306,7 +313,7 @@ class QueryConsoleController:
         sql: str,
         connection: QueryConnectionIn,
         estimate_impact: bool = True,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> QueryPreviewOut:
         sql = self._validate_sql(sql)
         dialect, target, credential = self._load_context(server_id, database, connection)
@@ -388,7 +395,7 @@ class QueryConsoleController:
         dialect: str,
         plan: query_policy.QueryPlan,
         credential: QueryCredential,
-        admin: dict | None,
+        admin: "dict | Actor | None",
         dry_run: bool,
         message: str,
         reasons: list[dict],
@@ -453,7 +460,7 @@ class QueryConsoleController:
         dry_run: bool = False,
         max_rows: int | None = None,
         timeout_ms: int | None = None,
-        admin: dict | None = None,
+        admin: "dict | Actor | None" = None,
     ) -> QueryExecuteOut:
         sql = self._validate_sql(sql)
         dialect, target, credential = self._load_context(server_id, database, connection)
@@ -666,7 +673,7 @@ class QueryConsoleController:
         engine: str,
         plan: query_policy.QueryPlan,
         credential: QueryCredential,
-        admin: dict | None,
+        admin: "dict | Actor | None",
         status: str,
         read_only: bool,
         dry_run: bool,
@@ -682,7 +689,11 @@ class QueryConsoleController:
         ``audit.record_intent``, así que un fallo al guardar el historial no debe tirar
         abajo una operación que ya se ejecutó en el motor.
         """
-        admin = admin or {}
+        # `identity_of` y no `admin.get(...)`: este bloque corre dentro de un `try/except`
+        # best-effort, así que un acceso tipo dict sobre un `Actor` NO explota — se lo traga el
+        # except y la fila del historial desaparece en silencio. Ver el docstring de
+        # `app/core/actor.py`.
+        admin_id, admin_username = identity_of(admin)
         # Se guarda el SQL COMPLETO del lote (con contraseñas redactadas), recortado al
         # tope: es lo que la UI vuelve a cargar para re-ejecutar.
         sql_text = query_policy.redact_secrets(
@@ -695,8 +706,8 @@ class QueryConsoleController:
                     server_id=server_id,
                     database_name=database,
                     engine=engine,
-                    admin_id=admin.get("id"),
-                    admin_username=admin.get("username"),
+                    admin_id=admin_id,
+                    admin_username=admin_username,
                     connection_mode=credential.mode,
                     run_as_username=credential.username,
                     impersonated_role=credential.impersonate_role,

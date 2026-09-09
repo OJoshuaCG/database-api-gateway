@@ -48,6 +48,7 @@ from sqlalchemy import func
 from app.controllers.clone_controller import CloneController
 from app.controllers.common import build_target, get_server_or_404
 from app.core.context import current_http_identifier
+from app.core.actor import identity_of
 from app.core.database import Database
 from app.core.environments import (
     CLONE_BATCH_MAX_DATABASES,
@@ -375,6 +376,7 @@ class CloneBatchController:
                 },
             )
 
+        _admin_id, _admin_username = identity_of(admin)
         session = self._session()
         try:
             batch = CloneBatch(
@@ -391,8 +393,8 @@ class CloneBatchController:
                 # operador confirma es exactamente el que vio en pantalla.
                 confirm_token=self.batch_token(data["target_server_id"], resolved),
                 expires_at=_utcnow() + timedelta(hours=CLONE_TTL_HOURS),
-                created_by_admin_id=(admin or {}).get("id"),
-                created_by_username=(admin or {}).get("username"),
+                created_by_admin_id=_admin_id,
+                created_by_username=_admin_username,
                 origin_request_id=current_http_identifier.get(),
                 status=CLONE_BATCH_PENDING,
             )

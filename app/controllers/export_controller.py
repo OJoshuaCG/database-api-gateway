@@ -32,6 +32,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.controllers.clone_controller import _snapshot_fingerprint
 from app.controllers.common import build_target, engine_value, get_server_or_404
+from app.core.actor import identity_of
 from app.core.database import Database
 from app.core.environments import (
     DB_HOST,
@@ -780,6 +781,7 @@ class ExportController:
         snapshot = adapter.structural_snapshot(database)
         fingerprint = _snapshot_fingerprint(snapshot)
 
+        _admin_id, _ = identity_of(admin)
         session = self._session()
         try:
             job = ExportJob(
@@ -791,7 +793,7 @@ class ExportController:
                 source_fingerprint=fingerprint,
                 expires_at=_utcnow() + timedelta(hours=EXPORT_TTL_HOURS),
                 status=EXPORT_STATUS_PENDING,
-                created_by_admin_id=(admin or {}).get("id"),
+                created_by_admin_id=_admin_id,
                 idempotency_key=spec.idempotency_key,
             )
             session.add(job)
@@ -2562,7 +2564,7 @@ class ExportController:
         artefacto propio por un dato ausente sería peor que el riesgo que evita.
         """
         owner = job.created_by_admin_id
-        current = (admin or {}).get("id")
+        current, _ = identity_of(admin)
         if owner is None or current is None or owner == current:
             return
         raise AppHttpException(

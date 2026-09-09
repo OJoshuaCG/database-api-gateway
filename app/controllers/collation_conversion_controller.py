@@ -50,6 +50,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.controllers.schema_comparison_controller import _synthetic_lock_key
+from app.core.actor import identity_of
 from app.core.database import Database
 from app.core.environments import (
     COLLATION_CONVERSION_TTL_HOURS,
@@ -2229,6 +2230,7 @@ class CollationConversionController:
             )
 
         expires = _utcnow() + timedelta(hours=COLLATION_CONVERSION_TTL_HOURS)
+        _admin_id, _admin_username = identity_of(admin)
         session = self._session()
         try:
             batch = CollationConversionBatch(
@@ -2240,8 +2242,8 @@ class CollationConversionController:
                 capped=capped,
                 expires_at=expires,
                 status=BATCH_STATUS_PENDING,
-                created_by_admin_id=(admin or {}).get("id"),
-                created_by_username=(admin or {}).get("username"),
+                created_by_admin_id=_admin_id,
+                created_by_username=_admin_username,
                 origin_request_id=current_http_identifier.get(),
             )
             session.add(batch)

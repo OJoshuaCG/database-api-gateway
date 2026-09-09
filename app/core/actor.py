@@ -18,6 +18,14 @@ rutas. Migrarlos es mecánico, pero un olvido silencioso sería caro: con un dic
 ``AttributeError``/``TypeError`` **ruidoso**. Por eso **no hay shim de compatibilidad**: el
 valor entero del tipo es que el olvido falle fuerte y temprano.
 
+**Y esa propiedad tiene una excepción que costó un fallo real:** un sitio olvidado que corre
+dentro de un ``try/except`` best-effort **no** es ruidoso — el ``AttributeError`` se lo traga el
+except y el efecto es justo el silencioso que el tipo existía para evitar. Pasó con
+``_record_history`` de la consola SQL, cuyo swallow es correcto para su propio propósito (una
+fila de historial no debe tirar abajo una operación ya ejecutada en el motor), así que el
+problema no era el except: era leer la identidad a mano. **Toda lectura de identidad va por
+``identity_of``.**
+
 ``frozen=True`` además impide que un camino de código "corrija" el actor a mitad de request,
 que es la clase de bug donde "quién es el actor" y "qué política aplica" divergen.
 
@@ -133,3 +141,28 @@ def token_actor(
         token_id=token_id,
         project_id=project_id,
     )
+
+
+def identity_of(subject: "Actor | dict | None") -> tuple[int | None, str | None]:
+    """
+    ``(id, username)`` de una identidad, sea un ``Actor`` o el ``dict`` legado.
+
+    Es el ÚNICO lugar donde se lee la identidad de un sujeto que puede tener las dos formas.
+    Vive acá y no en ``audit`` porque no es solo para auditar: la persistencia del historial de
+    la consola SQL, la autoría de un lote y el ``_guard_owner`` de exportación leen lo mismo — y
+    ese último es una decisión de AUTORIZACIÓN, donde un ``None`` silencioso abre la puerta en
+    vez de cerrarla.
+
+    Normalizar acá es lo que permite migrar de a un módulo **sin** darle un ``.get()`` al
+    ``Actor``: el tipo sigue estricto (ver el docstring del módulo), y los sitios que sí tienen
+    que leer identidad la piden por nombre.
+
+    **Se simplifica —no se retira— cuando no queden rutas con el guard legado** (lo mide
+    ``scripts/check_route_capabilities.py``): ahí la rama del ``dict`` se cae y queda la lectura
+    de atributos.
+    """
+    if subject is None:
+        return None, None
+    if isinstance(subject, dict):
+        return subject.get("id"), subject.get("username")
+    return getattr(subject, "id", None), getattr(subject, "username", None)
