@@ -331,6 +331,20 @@ por versión y cruzando blueprints.
 
 ## 6. Servidor MCP para agentes de IA
 
+> **⚠️ SUPERADA por [`12-mcp-contexto-de-esquema.md`](12-mcp-contexto-de-esquema.md).**
+>
+> Esta sección **no se puede implementar como está escrita**. Su tesis central —que el
+> `confirm_token` protege porque "un agente no puede fabricarlo"— es falsa: el `preview` lo
+> DEVUELVE en la respuesta, y esta sección pone `preview` en el nivel `analyze`. Además el §7
+> autoriza adelantar `inspect`/`analyze` **sin gate**, que es la puerta de atrás que la tabla de
+> riesgos dice querer evitar; el nivel `query` corre con pseudo-root y alcanza otras bases del
+> mismo servidor; `author` puede auto-aprobarse `reviewed=true`; y las dependencias del §8
+> (entornos, proyectos, head de Alembic) están desactualizadas.
+>
+> El plan 12 conserva lo que esta sección resolvió bien (el gate de dos ejes fail-closed, la
+> inyección de prompt como riesgo de primer orden, el reuso de `query_policy`, el kill switch, el
+> rate limit por token) y reescribe el resto. **Leé el 12, no este §6.**
+
 Exponer el gateway a un agente autónomo **amplía la superficie de ataque más que ninguna otra
 feature de esta lista**, porque el gateway conecta a servidores de terceros con credenciales
 pseudo-root. Esta sección se escribe en ese registro.

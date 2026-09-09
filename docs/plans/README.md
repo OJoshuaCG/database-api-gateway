@@ -39,7 +39,9 @@ modelo de datos/endpoints, decisiones, riesgos, pasos y verificación.
 | 08 | [Production readiness: estado y bloqueantes](08-production-readiness.md) | transversal | 🔴 NO listo (ver bloqueantes) |
 | 09 | [Adopción de BDs/usuarios existentes, reconciliación (drift) y snapshot estructural](09-adopcion-reconciliacion-y-snapshot.md) | 01, 02 | ✅ Implementado (F1–F4; 329 tests, seguridad sin bloqueantes) |
 | 10 | [Exportación de bases de datos (estructura y/o datos, multiformato)](10-exportacion-de-bases-de-datos.md) | 01, 09 | ✅ Implementado (F1–F6) — 🔴 **e2e contra motores reales escrito pero NUNCA ejecutado** (sin Docker) |
-| 11 | [Organización lógica (proyectos/entornos), copia de datos, releases y acceso para agentes (MCP)](11-organizacion-copia-de-datos-releases-y-mcp.md) | 01, 02, 05 | 📋 Propuesta — sin implementar (la feature 3 está **parcialmente** hecha en el módulo de clon) |
+| 11 | [Organización lógica (proyectos/entornos), copia de datos, releases y acceso para agentes (MCP)](11-organizacion-copia-de-datos-releases-y-mcp.md) | 01, 02, 05 | 📋 Propuesta parcial — features 1 (entornos) y 2 (proyectos) **ya implementadas**; la 3 parcialmente en el módulo de clon; **el §6 (MCP) está SUPERADO por el plan 12** |
+| 12 | [Servidor MCP de contexto de esquema para agentes de IA](12-mcp-contexto-de-esquema.md) | 11 (features 1 y 2, ya hechas) | 📋 Propuesta — sin implementar. Reemplaza al §6 del plan 11. Incluye 3 **bugs vivos** a arreglar antes (fuga de credenciales en `dump_structure`, `_safe_fetch` de PG, guard de metadatos ausente en `drop_database`) |
+| 13 | [Usuarios y autorización del gateway](13-usuarios-y-autorizacion-del-gateway.md) | — (lo fuerza el 12) | 📋 Propuesta — sin implementar. Incluye **5 huecos vivos** a arreglar antes: `test.py` con 7 endpoints sin autenticar (2 suben archivos), `server_controller` sin auditoría, `schema-comparisons/adopt` sin confirmación, `reveal-password` sin rate limit, `/manifest` sin `_guard_owner` |
 
 ## Diagrama de dependencias
 
