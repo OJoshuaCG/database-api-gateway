@@ -500,6 +500,33 @@ UNKNOWN_DATABASE_CODES = frozenset({"1049", "3D000"})
 #: "La base de datos ya existe" — MySQL/MariaDB errno 1007, PostgreSQL SQLSTATE 42P04.
 DUPLICATE_DATABASE_CODES = frozenset({"1007", "42P04"})
 
+#: "Falta un privilegio" — PostgreSQL SQLSTATE 42501 (``insufficient_privilege``);
+#: MySQL/MariaDB errno 1142 (``ER_TABLEACCESS_DENIED_ERROR``, negado sobre un objeto
+#: concreto) y 1227 (``ER_SPECIFIC_ACCESS_DENIED_ERROR``, falta un privilegio global tipo
+#: ``PROCESS``/``SHOW_ROUTINE``/``EVENT``).
+#:
+#: NO incluye 1044 ni 1143, que también mapean a 403: este conjunto lo consumen las
+#: consultas de catálogo OPCIONALES para distinguir "no tengo permiso" de "esta versión
+#: del motor no tiene la feature", y ahí la lista tiene que ser cerrada — un código de más
+#: convertiría un fallo estructural en un "denied" tranquilizador.
+PERMISSION_DENIED_CODES = frozenset({"42501", "1142", "1227"})
+
+
+def extract_driver_error_code(exc: Exception) -> str | None:
+    """
+    Código nativo del error del driver, NORMALIZADO a string, o ``None``.
+
+    Misma extracción que usa ``map_driver_error`` (de ahí la delegación: un segundo
+    criterio para leer el código del driver es exactamente lo que hace divergir dos
+    archivos) y misma forma en que ese mapeo deja el código en
+    ``context["remote_error_code"]``: string. Así se compara directo contra los frozensets
+    de arriba (``PERMISSION_DENIED_CODES``, ``UNKNOWN_DATABASE_CODES``…), que también son
+    strings, sin que cada llamador reinvente el ``str()`` y el errno int de pymysql deje
+    de matchear contra el SQLSTATE str de psycopg.
+    """
+    code = _extract_code(exc)
+    return None if code is None else str(code)
+
 
 def _extract_code(exc: Exception) -> Any | None:
     """

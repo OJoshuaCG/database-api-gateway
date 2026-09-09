@@ -16,13 +16,16 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from contextlib import contextmanager
+from typing import Any, Literal, NamedTuple
 
-from sqlalchemy import Connection, MetaData, Table, inspect, select, text
+from sqlalchemy import Connection, MetaData, Row, Table, inspect, select, text
 from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 
 from app.core.remote_engine import (
+    PERMISSION_DENIED_CODES,
     ServerTarget,
     database_connection,
+    extract_driver_error_code,
     map_driver_error,
     server_connection,
 )
@@ -76,6 +79,36 @@ from app.services.db_admin.schema_diff import (
 from app.services.db_admin.sql_dialect import body_delimiter_wrapper
 
 logger = get_logger(__name__)
+
+
+#: Por qué una consulta de catálogo OPCIONAL devolvió lo que devolvió.
+#:
+#: - ``ok``: la consulta corrió. Cero filas significa CERO OBJETOS.
+#: - ``denied``: falta un privilegio (``PERMISSION_DENIED_CODES``). Las filas están
+#:   vacías o INCOMPLETAS y el consumidor NO puede reportar "no hay objetos".
+#: - ``unsupported``: la consulta falló por cualquier otra causa — típicamente que el
+#:   catálogo o la feature no existe en esta versión del motor.
+#:
+#: La distinción entre los dos últimos es el punto de todo esto: hoy ``[]`` es
+#: indistinguible de "no hay objetos" y un dump con el cuerpo vacío pasa por bueno.
+CatalogAvailability = Literal["ok", "denied", "unsupported"]
+
+
+class CatalogFetch(NamedTuple):
+    """
+    Resultado de una consulta de catálogo OPCIONAL: las filas MÁS por qué son esas.
+
+    ``NamedTuple`` y no dataclass por dos razones concretas: (a) desempaqueta como tupla
+    (``rows, availability = ...``), así que un llamador puede migrar sin reescribir el
+    bucle que ya tenía, y ``.rows`` mantiene el sitio de lectura autoexplicativo; (b) es
+    inmutable y barata, y esto corre una vez por CLASE DE OBJETO en cada snapshot.
+
+    ``rows`` es siempre una secuencia real —nunca ``None``— para que el llamador que
+    ignora ``availability`` se comporte EXACTAMENTE como antes.
+    """
+
+    rows: Sequence[Row[Any]]
+    availability: CatalogAvailability
 
 
 class ServerAdapter(ABC):
@@ -139,6 +172,59 @@ class ServerAdapter(ABC):
         concreto); el riesgo de escalada se documenta para revisión del admin.
         """
         return cls._DEFINER_RE.sub("", ddl)
+
+    # ------------------------------------------------------------------ #
+    # Snapshot: consulta de catálogo OPCIONAL (compartida)                #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _catalog_fetch(conn, sql: str, params: dict | None = None) -> CatalogFetch:
+        """
+        Ejecuta una consulta de catálogo OPCIONAL y devuelve ``(rows, availability)``.
+
+        POR QUÉ EXISTE: el patrón anterior era ``try: … except SQLAlchemyError: return []``
+        con el comentario "``[]`` si la feature no existe en esta versión". Pero ese
+        ``except`` atrapa por igual un error de PRIVILEGIO, y todo el snapshot de
+        PostgreSQL (vistas, matviews, rutinas, triggers, secuencias, tipos enum,
+        extensiones) pasaba por ahí. Resultado: sin ``SELECT`` sobre un catálogo, el
+        objeto entero desaparecía del dump como ``[]`` — **indistinguible de "no hay
+        objetos"**, y el diff y el export sub-reportaban en silencio. Ese es el modo de
+        fallo que importa: no un 500, sino un artefacto incompleto que nadie nota.
+
+        POR QUÉ ACÁ Y COMPARTIDA (a diferencia de ``_redact_embedded_credentials``, que es
+        de la familia MySQL): la clasificación es cross-engine — se apoya en
+        ``PERMISSION_DENIED_CODES``, que ya cubre el ``42501`` de PostgreSQL y los
+        ``1142``/``1227`` de MySQL/MariaDB. Escribir el criterio dos veces, uno por
+        adapter, es exactamente cómo divergen.
+
+        El código se lee con ``extract_driver_error_code`` —el MISMO extractor que usa
+        ``map_driver_error``— y no con un segundo criterio propio: si mañana un driver
+        cambia dónde deja el errno, hay UN lugar que arreglar.
+
+        NO propaga la excepción: sigue siendo una consulta opcional y el llamador que
+        ignore ``availability`` ve el mismo ``[]`` de antes. Lo que se agrega es la señal.
+        El ``str(exc)`` del motor va SOLO al log (puede llevar host o fragmentos de
+        sentencia), nunca a una respuesta.
+        """
+        try:
+            return CatalogFetch(conn.execute(text(sql), params or {}).fetchall(), "ok")
+        except SQLAlchemyError as exc:
+            code = extract_driver_error_code(exc)
+            if code in PERMISSION_DENIED_CODES:
+                # WARNING y no DEBUG: acá el vacío MIENTE. Es el único nivel al que un
+                # operador puede enterarse de que el dump salió incompleto.
+                logger.warning(
+                    "Consulta de catálogo opcional DENEGADA por privilegio (code=%s): el "
+                    "resultado vacío no significa que no haya objetos.",
+                    code,
+                )
+                return CatalogFetch([], "denied")
+            # ``unsupported`` es el caso ESPERADO (catálogo ausente en esta versión del
+            # motor) y se repite una vez por clase de objeto en cada snapshot: a WARNING
+            # sería ruido que entierra al caso de arriba.
+            logger.debug(
+                "Consulta de catálogo opcional no disponible (code=%s)", code, exc_info=exc
+            )
+            return CatalogFetch([], "unsupported")
 
     # ------------------------------------------------------------------ #
     # Específico de dialecto                                              #

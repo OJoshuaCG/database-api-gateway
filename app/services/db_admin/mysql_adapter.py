@@ -563,21 +563,19 @@ class MySQLAdapter(ServerAdapter):
                         )
                     )
 
-                # 5) Events (scheduler). information_schema.EVENTS puede no existir en
-                #    instalaciones mínimas; se ignora si la consulta falla.
-                try:
-                    events = [
-                        r[0]
-                        for r in conn.execute(
-                            text(
-                                "SELECT EVENT_NAME FROM information_schema.EVENTS "
-                                "WHERE EVENT_SCHEMA = :db ORDER BY EVENT_NAME"
-                            ),
-                            {"db": database},
-                        ).fetchall()
-                    ]
-                except SQLAlchemyError:
-                    events = []
+                # 5) Events (scheduler). Consulta OPCIONAL: information_schema.EVENTS
+                #    puede no existir en instalaciones mínimas, y el privilegio ``EVENT``
+                #    puede faltar. ``_catalog_fetch`` mantiene el ``[]`` de siempre pero
+                #    distingue ambos casos en el log (ver su docstring).
+                events = [
+                    r[0]
+                    for r in self._catalog_fetch(
+                        conn,
+                        "SELECT EVENT_NAME FROM information_schema.EVENTS "
+                        "WHERE EVENT_SCHEMA = :db ORDER BY EVENT_NAME",
+                        {"db": database},
+                    ).rows
+                ]
                 for ev in events:
                     q = quote_identifier(
                         validate_identifier(ev, self.dialect, "event", allow_existing=True),
@@ -787,16 +785,18 @@ class MySQLAdapter(ServerAdapter):
         return collation.split("_", 1)[0] or None
 
     def _collation_charset_map(self, conn) -> dict[str, str]:
-        """``{collation_lower: charset}`` desde ``information_schema.COLLATIONS``."""
-        try:
-            rows = conn.execute(
-                text(
-                    "SELECT COLLATION_NAME, CHARACTER_SET_NAME "
-                    "FROM information_schema.COLLATIONS"
-                )
-            ).fetchall()
-        except SQLAlchemyError:
-            return {}
+        """
+        ``{collation_lower: charset}`` desde ``information_schema.COLLATIONS``.
+
+        Consulta OPCIONAL: si no corre, ``_charset_of`` cae al prefijo del nombre de la
+        collation. Pasa por ``_catalog_fetch`` (en vez de su propio ``except``) para que
+        el criterio de "por qué no hay filas" sea UNO en todo el módulo; el ``{}`` de
+        salida es idéntico al de antes.
+        """
+        rows = self._catalog_fetch(
+            conn,
+            "SELECT COLLATION_NAME, CHARACTER_SET_NAME FROM information_schema.COLLATIONS",
+        ).rows
         return {str(c).lower(): str(cs) for c, cs in rows if c and cs}
 
     def _frozen_objects(
@@ -1915,16 +1915,19 @@ class MySQLAdapter(ServerAdapter):
         return out
 
     def _snapshot_events(self, conn, database, schema) -> list[EventInfo]:
-        try:
-            rows = conn.execute(
-                text(
-                    "SELECT EVENT_NAME FROM information_schema.EVENTS "
-                    "WHERE EVENT_SCHEMA = :db ORDER BY EVENT_NAME"
-                ),
-                {"db": database},
-            ).fetchall()
-        except SQLAlchemyError:
-            return []
+        """
+        Events del scheduler. ``information_schema.EVENTS`` puede no existir en una
+        instalación mínima, así que es una consulta OPCIONAL: es el equivalente exacto del
+        ``_safe_fetch`` de PostgreSQL y pasa por el mismo ``_catalog_fetch``. Sin él,
+        faltar el privilegio ``EVENT`` devolvía ``[]`` — indistinguible de "esta BD no
+        tiene events" — y el snapshot quedaba incompleto en silencio.
+        """
+        rows = self._catalog_fetch(
+            conn,
+            "SELECT EVENT_NAME FROM information_schema.EVENTS "
+            "WHERE EVENT_SCHEMA = :db ORDER BY EVENT_NAME",
+            {"db": database},
+        ).rows
         out: list[EventInfo] = []
         for (name,) in rows:
             q = quote_identifier(

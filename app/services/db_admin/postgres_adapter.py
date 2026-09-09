@@ -1393,13 +1393,23 @@ class PostgresAdapter(ServerAdapter):
         return int(row)
 
     # ------------------------- snapshot canónico (hooks) ---------------------- #
-    @staticmethod
-    def _safe_fetch(conn, sql, params=None):
-        """Consulta de catálogo OPCIONAL: [] si la feature no existe en esta versión."""
-        try:
-            return conn.execute(text(sql), params or {}).fetchall()
-        except SQLAlchemyError:
-            return []
+    @classmethod
+    def _safe_fetch(cls, conn, sql, params=None):
+        """
+        Consulta de catálogo OPCIONAL: solo las filas, ``[]`` si la consulta no corrió.
+
+        Compatibilidad DELIBERADA: mismo nombre, misma firma y mismo valor de retorno que
+        antes, para que los ~11 sitios del snapshot de PG que la usan no cambien de
+        comportamiento en este commit. Lo único que se movió es el ``except``, que ahora
+        vive en ``ServerAdapter._catalog_fetch`` y CLASIFICA el fallo.
+
+        El docstring viejo decía "``[]`` si la feature no existe en esta versión" y eso
+        era falso: también devolvía ``[]`` ante un ``42501 insufficient_privilege``, y ahí
+        el vacío miente. Quien necesite distinguirlo tiene que llamar a
+        ``_catalog_fetch`` y leer ``availability``; esta variante, por construcción, NO
+        puede: descarta la señal.
+        """
+        return cls._catalog_fetch(conn, sql, params).rows
 
     def _column_extras(self, conn, database, table, schema) -> dict[str, dict]:
         # PG: solo collation por columna. information_schema.columns.collation_name es
