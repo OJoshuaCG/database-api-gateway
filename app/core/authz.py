@@ -109,24 +109,40 @@ def get_current_actor(request: Request) -> Actor:
     )
 
 
-def require(capability: Capability) -> Callable[[Request], Actor]:
+def assert_capability(actor: Actor, capability: Capability) -> None:
     """
-    Fábrica de la dependencia que exige una capacidad. Devuelve el ``Actor`` resuelto.
+    Exige una capacidad sobre un ``Actor`` ya resuelto. Levanta 403 si no la tiene.
+
+    Existe además de ``require`` porque **hay exigencias que no se pueden declarar en la firma
+    del endpoint**: dependen del payload. Dos rutas persisten DATOS DE NEGOCIO solo si el
+    cliente lo pide (``from-snapshot`` con ``data_tables``, y una migración con
+    ``capture_selects``), y una ruta declara UNA capacidad —el punto 1 del §6.3— así que el
+    piso va en la firma y el extra va acá.
 
     El 403 usa un código CERRADO (``access.forbidden``) y **no nombra la capacidad que falta**:
     un mensaje como "falta servers.admin" le da a un atacante un mapa de la superficie por
     fuerza bruta de 403. El criterio es el mismo que el de nunca volcar ``str(exc)`` del motor,
     aplicado a nombres de capacidad.
     """
+    if not actor.has(capability):
+        raise AppHttpException(
+            message="No tienes permiso para esta operación.",
+            status_code=403,
+            public_context={"code": CODE_FORBIDDEN},
+        )
+
+
+def require(capability: Capability) -> Callable[[Request], Actor]:
+    """
+    Fábrica de la dependencia que exige una capacidad. Devuelve el ``Actor`` resuelto.
+
+    Delega el veredicto en ``assert_capability`` para que la forma del 403 —y sobre todo la
+    decisión de no nombrar la capacidad faltante— viva en UN solo lugar.
+    """
 
     def _dependency(request: Request) -> Actor:
         actor = get_current_actor(request)
-        if not actor.has(capability):
-            raise AppHttpException(
-                message="No tienes permiso para esta operación.",
-                status_code=403,
-                public_context={"code": CODE_FORBIDDEN},
-            )
+        assert_capability(actor, capability)
         return actor
 
     # El marcador que hace enumerable la cobertura. Ver el docstring del módulo.
