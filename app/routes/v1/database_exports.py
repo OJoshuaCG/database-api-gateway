@@ -35,6 +35,8 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from starlette.background import BackgroundTask
 
 from app.controllers.export_controller import ExportController
+from app.core import csrf
+from app.core.auth import SESSION_SID
 from app.core.authz import (
     ExportsDownload,
     ExportsExecute,
@@ -42,6 +44,7 @@ from app.core.authz import (
 )
 from app.core.limiter import limiter
 from app.schemas.export import (
+    DownloadTicketOut,
     ExportCapabilitiesOut,
     ExportCatalogOut,
     ExportClosureOut,
@@ -322,9 +325,45 @@ def _range_covers_whole_file(
         return False
 
 
+@router.post(
+    "/database-exports/{job_id}/download-ticket",
+    response_model=ApiResponse[DownloadTicketOut],
+)
+@limiter.limit("10/minute")
+def issue_download_ticket(request: Request, actor: ExportsDownload, job_id: int):
+    """
+    Emite el ticket que autoriza UNA descarga. Paso 1 de dos.
+
+    **Existe porque el GET de descarga MUTA**: con ``EXPORT_SINGLE_USE_DOWNLOAD`` la entrega
+    consume y borra el artefacto, y ``same_site="lax"`` **sí** manda la cookie en una navegación
+    GET de primer nivel. O sea que un ``<img src=".../download">`` en cualquier página que el
+    admin abra destruía el artefacto del cliente y dejaba la entrega registrada contra él.
+
+    Un token CSRF no lo arreglaba: un ``<img>`` no puede mandar un header, y a una navegación de
+    primer nivel tampoco se le puede pedir. Lo que hace falta es una credencial que el navegador
+    **no adjunte solo** — y este POST sí está cubierto por CSRF, así que la cadena queda
+    cerrada.
+    """
+    return success(
+        data=ExportController().issue_download_ticket(job_id, admin=actor),
+        message="Ticket emitido.",
+    )
+
+
 @router.get("/database-exports/{job_id}/download")
 @limiter.limit("3/minute")
-def download_export(request: Request, actor: ExportsDownload, job_id: int):
+def download_export(
+    request: Request,
+    actor: ExportsDownload,
+    job_id: int,
+    ticket: str = Query(
+        ...,
+        description=(
+            "Ticket de 'download-ticket'. OBLIGATORIO: es lo que impide que una navegación "
+            "cross-site con la cookie adjunta consuma el artefacto."
+        ),
+    ),
+):
     """
     Descarga el artefacto. **No usa ``ApiResponse``**: es un archivo, no un recurso JSON
     (mismo criterio que el ``export`` de schema-comparisons).
@@ -349,6 +388,18 @@ def download_export(request: Request, actor: ExportsDownload, job_id: int):
     en los dos casos (ver ``finish_delivery``).
     """
     controller = ExportController()
+    # El ticket se valida ANTES de `prepare_download`, y eso importa: `prepare_download` audita
+    # fail-closed la intención de divulgar. Validar después dejaría una fila de "INTENT
+    # descargar" por cada `<img>` malicioso, o sea que el atacante podría escribir en el
+    # registro de auditoría del gateway a voluntad.
+    info_ticket = controller.peek_download_target(job_id, admin=actor)
+    controller.verify_download_ticket(
+        ticket,
+        job_id=job_id,
+        server_id=info_ticket["server_id"],
+        database=info_ticket["database"],
+        admin=actor,
+    )
     info = controller.prepare_download(job_id, admin=actor, inline=False)
     whole = _range_covers_whole_file(
         request.headers.get("range"),
@@ -384,6 +435,11 @@ def export_content(request: Request, actor: ExportsDownload, job_id: int):
     script cortado que alguien pega y ejecuta es peor que un fallo. El preview ya publica
     ``inline_delivery_viable`` para que el cliente lo sepa antes de lanzar el job.
     """
+    # GET que MUTA: `read_inline` consume el artefacto igual que la descarga. La SPA lo pide
+    # con `fetch` (necesita el cuerpo para el portapapeles), así que puede mandar el header y
+    # no le hace falta la exención por método — a diferencia de `/download`, que se abre como
+    # navegación y por eso usa un ticket.
+    csrf.enforce_regardless_of_method(request, request.session.get(SESSION_SID) or "")
     info = ExportController().read_inline(job_id, admin=actor)
     return PlainTextResponse(
         content=info["text"],

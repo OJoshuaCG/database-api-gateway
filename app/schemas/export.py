@@ -669,3 +669,18 @@ class ExportManifestOut(BaseModel):
     part_count: int | None = None
     created_at: datetime | None = None
     expires_at: datetime | None = None
+
+
+class DownloadTicketOut(BaseModel):
+    """
+    Ticket que autoriza UNA descarga.
+
+    Se devuelve el ``filename`` para que el cliente pueda armar el enlace con el nombre
+    correcto sin una tercera llamada; el ticket **no** es de un solo uso y eso está explicado
+    en ``ExportController.verify_download_ticket``: la propiedad de un solo uso la tiene el
+    artefacto, no el ticket.
+    """
+
+    ticket: str = Field(..., description="Se manda como query param ?ticket= en la descarga")
+    expires_at: datetime = Field(..., description="Vence en 60 s: el tamaño de un click")
+    filename: str = Field(..., description="Nombre del archivo que va a entregar la descarga")

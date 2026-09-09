@@ -121,7 +121,22 @@ def enforce(request: Request, sid: str) -> None:
     """
     if request.method.upper() in SAFE_METHODS:
         return
+    enforce_regardless_of_method(request, sid)
 
+
+def enforce_regardless_of_method(request: Request, sid: str) -> None:
+    """
+    Lo mismo, **sin la exención por método**. Para un GET que muta y que el cliente sí puede
+    llamar con un header.
+
+    Existe porque ``GET`` está exento por convención HTTP, no por seguridad, y en este repo hay
+    endpoints que la violan: ``GET /database-exports/{id}/content`` **consume y borra el
+    artefacto**. La SPA lo pide con ``fetch`` (necesita el cuerpo para el portapapeles), así que
+    puede mandar el header y la exención no le hace falta.
+
+    Su hermano ``/download`` NO puede usar esto: se abre como navegación, y a una navegación de
+    primer nivel no se le puede pedir un header. Ése se arregla con un ticket.
+    """
     origin = request.headers.get("origin")
     if origin and not _origin_permitido(origin):
         # `context` (solo en desarrollo) lleva el origin; `public_context` NO, porque

@@ -2358,9 +2358,114 @@ class ExportController:
     # ------------------------------------------------------------------ #
     # 11-12) Entrega (§10.2) — el punto de DIVULGACIÓN                    #
     # ------------------------------------------------------------------ #
-    def prepare_download(self, job_id: int, *, admin: "dict | Actor | None", inline: bool) -> dict:
+    #: Operación con la que se firma el ticket de descarga. Constante y no un literal
+    #: repetido: el emisor y el verificador tienen que coincidir exactamente o el ticket no
+    #: valida nunca, y ese fallo se ve recién en runtime.
+    TICKET_OPERATION = "export_download"
+    #: 60 s. Corto a propósito: el ticket viaja en la query, o sea que entra en los logs del
+    #: proxy y en el historial del navegador. La ventana tiene que ser del tamaño de un click.
+    TICKET_TTL_SECONDS = 60
+
+    def peek_download_target(self, job_id: int, *, admin: "dict | Actor | None") -> dict:
+        """
+        ``(server_id, database)`` del job, con ``_guard_owner`` y **sin auditar nada**.
+
+        Existe para que la ruta pueda validar el ticket ANTES de llamar a ``prepare_download``,
+        que audita fail-closed la intención de divulgar. Si el orden fuera al revés, cada
+        ``<img>`` malicioso dejaría una fila de "INTENT descargar" — o sea que un atacante
+        podría escribir en el registro de auditoría del gateway a voluntad, que es exactamente
+        el rastro del que depende el módulo.
+
+        No es un agujero de autorización: sigue pasando por ``_guard_owner`` y por la capacidad
+        de la ruta, y lo único que devuelve son dos identificadores que el llamante ya tenía que
+        conocer para pedir la descarga.
+        """
+        session = self._session()
+        try:
+            job = self._job_or_404(session, job_id)
+            self._guard_owner(job, admin)
+            return {"server_id": job.server_id, "database": job.database_name}
+        finally:
+            session.close()
+
+    def issue_download_ticket(self, job_id: int, *, admin: "dict | Actor | None") -> dict:
+        """
+        Emite el ticket que autoriza UNA descarga, tras los MISMOS guards que la descarga.
+
+        Corre `prepare_download` completo —incluido `_guard_owner` y la validación de que el
+        artefacto exista y esté entregable— para que el POST falle acá y no emita un ticket que
+        el GET va a rechazar. Un ticket para una descarga imposible es peor que un error: manda
+        al cliente a un segundo request que va a fallar por otro motivo.
+
+        El ticket queda atado a `(job_id, usuario)`: el de otro job no sirve, y el de otro
+        usuario tampoco. Eso último importa porque `_guard_owner` no es la única frontera —dos
+        personas con `exports.download` sobre el mismo servidor no comparten artefactos—.
+        """
+        from app.services import confirm_token
+
+        info = self.prepare_download(
+            job_id, admin=admin, inline=False, audit_intent=False
+        )
+        audit.record(
+            "database_export.download_ticket",
+            admin=admin,
+            target_type="server_database",
+            server_id=info["server_id"],
+            touched_engine=False,
+            detail=f"ticket emitido para la exportación {job_id} (TTL {self.TICKET_TTL_SECONDS}s)",
+        )
+        user_id, _ = identity_of(admin)
+        token, expira = confirm_token.issue(
+            self.TICKET_OPERATION,
+            info["server_id"],
+            info["database"],
+            ttl_seconds=self.TICKET_TTL_SECONDS,
+            subject=f"{job_id}:{user_id}",
+        )
+        return {"ticket": token, "expires_at": expira, "filename": info["filename"]}
+
+    def verify_download_ticket(
+        self, ticket: str | None, *, job_id: int, server_id: int, database: str,
+        admin: "dict | Actor | None",
+    ) -> None:
+        """
+        Valida el ticket de una descarga. Lanza 422 si no corresponde y 410 si expiró.
+
+        **Por qué el ticket y no el token CSRF**: la descarga se abre como navegación
+        (`<a download>`, `window.open`), y a una navegación de primer nivel no se le puede
+        pedir un header. Lo que hace falta es una credencial que el navegador **no adjunte
+        solo**, y un query param lo es: un `<img src=".../download">` en una página maliciosa
+        lleva la cookie pero no el ticket.
+
+        **Lo que este ticket NO es: de un solo uso.** No se persiste, así que un replay dentro
+        de los 60 s revalida. Es deliberado y no un descuido: la propiedad de un solo uso **ya
+        la tiene el artefacto** —se consume y se borra al entregarlo—, así que el replay
+        encuentra un 404. Guardar dos columnas para duplicar una garantía que ya existe no
+        paga; lo que el ticket aporta es no ser ambiental.
+        """
+        from app.services import confirm_token
+
+        user_id, _ = identity_of(admin)
+        confirm_token.verify(
+            ticket or "",
+            self.TICKET_OPERATION,
+            server_id,
+            database,
+            subject=f"{job_id}:{user_id}",
+        )
+
+    def prepare_download(
+        self, job_id: int, *, admin: "dict | Actor | None", inline: bool, audit_intent: bool = True
+    ) -> dict:
         """
         Valida, **audita fail-closed** y devuelve por dónde entregar el artefacto.
+
+        ``audit_intent=False`` lo usa SOLO la emisión del ticket, y el motivo es que la
+        intención registrada acá es *"se entregó el artefacto"*: emitir un ticket no entrega
+        nada, así que auditarlo con la misma acción dejaría dos filas de divulgación por una
+        sola descarga y volvería inútil el conteo. La emisión tiene su propia acción, que es
+        best-effort porque **no divulga bytes**. El default es ``True``: el que se olvide del
+        parámetro audita, no lo contrario.
 
         Este es el punto crítico del §9.4 y replica el patrón de
         ``server_user_controller.reveal_password``: la intención se registra ANTES de abrir
@@ -2430,22 +2535,25 @@ class ExportController:
                 },
             )
 
-        audit.record_intent(
-            "database_export.download",
-            admin=admin,
-            target_type="managed_database" if managed_id is not None else "server_database",
-            target_id=managed_id,
-            server_id=server_id,
-            # No se toca el motor: el artefacto ya está en disco. El rastro se exige igual
-            # (mismo criterio que revelar una contraseña) porque lo que ocurre acá es la
-            # DIVULGACIÓN de los datos, no su lectura del origen.
-            touched_engine=False,
-            detail=(
-                f"INTENT descargar el artefacto de la exportación {job_id} "
-                f"({server_id}/{database}, {artifact['byte_size']} bytes, "
-                f"{'en línea' if inline else 'archivo'})"
-            ),
-        )
+        if audit_intent:
+            audit.record_intent(
+                "database_export.download",
+                admin=admin,
+                target_type=(
+                    "managed_database" if managed_id is not None else "server_database"
+                ),
+                target_id=managed_id,
+                server_id=server_id,
+                # No se toca el motor: el artefacto ya está en disco. El rastro se exige igual
+                # (mismo criterio que revelar una contraseña) porque lo que ocurre acá es la
+                # DIVULGACIÓN de los datos, no su lectura del origen.
+                touched_engine=False,
+                detail=(
+                    f"INTENT descargar el artefacto de la exportación {job_id} "
+                    f"({server_id}/{database}, {artifact['byte_size']} bytes, "
+                    f"{'en línea' if inline else 'archivo'})"
+                ),
+            )
 
         path = export_storage.path_for(artifact["storage_name"])
         if not path.exists():
@@ -2468,6 +2576,11 @@ class ExportController:
             "encoding": spec.output.file_encoding,
             "complete": complete,
             "single_use": EXPORT_SINGLE_USE_DOWNLOAD,
+            # Los dos siguientes los necesita el ticket de descarga para atarse a la misma
+            # (operación, servidor, base) con la que se firmó. Salen de acá y no de una
+            # segunda lectura del job para que no puedan divergir.
+            "server_id": server_id,
+            "database": database,
         }
 
     def finish_delivery(

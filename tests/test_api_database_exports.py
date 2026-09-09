@@ -919,6 +919,26 @@ def test_execute_rejects_a_changed_schema(admin_client, monkeypatch):
     assert _public(r)["code"] == "export.fingerprint_changed"
 
 
+def _download(client, job, **kwargs):
+    """
+    Pide el ticket y descarga. Es el ciclo de DOS pasos que la SPA tiene que hacer.
+
+    Existe porque el GET de descarga MUTA —consume y borra el artefacto— y `same_site="lax"`
+    manda la cookie en una navegación GET de primer nivel: sin el ticket, un `<img>` en
+    cualquier página destruía el artefacto del cliente. El ticket es la credencial que el
+    navegador NO adjunta solo.
+
+    Devuelve la respuesta del GET. Si el POST del ticket falla, se devuelve ESE error en vez de
+    afirmar: los tests que esperan un 409/410 en la descarga lo esperan igual acá, porque el
+    ticket corre los mismos guards.
+    """
+    t = client.post(f"/api/v1/database-exports/{job}/download-ticket")
+    if t.status_code != 200:
+        return t
+    ticket = t.json()["data"]["ticket"]
+    return client.get(f"/api/v1/database-exports/{job}/download?ticket={ticket}", **kwargs)
+
+
 def test_full_cycle_generates_downloads_and_consumes(admin_client, monkeypatch):
     """
     Ciclo completo: plan → preview → execute → polling → manifiesto → descarga → consumido.
@@ -949,7 +969,7 @@ def test_full_cycle_generates_downloads_and_consumes(admin_client, monkeypatch):
     row = _artifact_row(job)
     assert row.state == "available"
 
-    dl = admin_client.get(f"/api/v1/database-exports/{job}/download")
+    dl = _download(admin_client, job)
     assert dl.status_code == 200, dl.text
     assert dl.text == "-- cabecera\nCREATE TABLE t (id int);\n"
     assert dl.headers["x-export-complete"] == "true"
@@ -959,7 +979,7 @@ def test_full_cycle_generates_downloads_and_consumes(admin_client, monkeypatch):
 
     # Un solo uso: el archivo se borró y el segundo intento es 410 accionable.
     assert _artifact_row(job).state == "consumed"
-    again = admin_client.get(f"/api/v1/database-exports/{job}/download")
+    again = _download(admin_client, job)
     assert again.status_code == 410, again.text
     assert _public(again)["code"] == "export.artifact_consumed"
 
@@ -986,7 +1006,7 @@ def test_partial_artifact_is_always_marked(admin_client, monkeypatch):
     failed = [o for o in manifest["objects"] if o["status"] == "error"]
     assert failed and failed[0]["reason"] == "unsupported_type:Foo"
 
-    dl = admin_client.get(f"/api/v1/database-exports/{job}/download")
+    dl = _download(admin_client, job)
     assert dl.status_code == 200, dl.text
     assert dl.headers["x-export-complete"] == "false"
     assert f"EXPORTACIÓN INCOMPLETA — ver el reporte de incidencias del job {job}" in dl.text
@@ -1011,7 +1031,7 @@ def test_download_delivers_nothing_if_the_audit_fails(admin_client, monkeypatch)
         raise AppHttpException(message="auditoría caída", status_code=500)
 
     monkeypatch.setattr(ec.audit, "record_intent", _boom)
-    r = admin_client.get(f"/api/v1/database-exports/{job}/download")
+    r = _download(admin_client, job)
     assert r.status_code == 500, r.text
     # Ni entregado ni consumido: el artefacto sigue disponible en disco.
     import app.services.export_storage as storage
@@ -1072,7 +1092,7 @@ def test_cancel_stops_the_worker_and_discards_the_artifact(admin_client, monkeyp
     assert _artifact_row(job) is None
     assert not any(storage.artifact_dir().iterdir())
 
-    r = admin_client.get(f"/api/v1/database-exports/{job}/download")
+    r = _download(admin_client, job)
     assert r.status_code == 409, r.text
     assert _public(r)["code"] == "export.no_artifact"
 
@@ -1082,7 +1102,7 @@ def test_download_is_409_while_the_job_is_pending(admin_client, monkeypatch):
     _install_execution(monkeypatch)
     sid = _server(admin_client, 3769)
     job, _token = _ready(admin_client, sid)
-    r = admin_client.get(f"/api/v1/database-exports/{job}/download")
+    r = _download(admin_client, job)
     assert r.status_code == 409, r.text
     assert _public(r)["code"] == "export.not_ready"
 
@@ -1103,7 +1123,7 @@ def test_expired_artifact_is_410_and_the_purge_removes_the_file(admin_client, mo
     assert storage.path_for(storage_name).exists()
 
     _expire_artifact(job)
-    r = admin_client.get(f"/api/v1/database-exports/{job}/download")
+    r = _download(admin_client, job)
     assert r.status_code == 410, r.text
     assert _public(r)["code"] == "export.artifact_expired"
 
@@ -1154,7 +1174,7 @@ def test_kill_switch_closes_execution_and_delivery(admin_client, monkeypatch):
 
     monkeypatch.setattr(ec, "EXPORT_ENABLED", False)
     assert _execute(admin_client, job, token).status_code == 409
-    assert admin_client.get(f"/api/v1/database-exports/{job}/download").status_code == 409
+    assert _download(admin_client, job).status_code == 409
     assert admin_client.get(f"/api/v1/database-exports/{job}/content").status_code == 409
 
 
@@ -1200,7 +1220,7 @@ def test_download_rejects_an_artifact_of_another_admin(admin_client, monkeypatch
     finally:
         session.close()
 
-    r = admin_client.get(f"/api/v1/database-exports/{job}/download")
+    r = _download(admin_client, job)
     assert r.status_code == 403, r.text
     assert _public(r)["code"] == "export.not_owner"
 
@@ -1450,7 +1470,7 @@ def test_ciclo_completo_en_csv_entrega_un_zip_con_un_archivo_por_tabla(
     assert manifiesto["format"] == "csv"
     assert manifiesto["part_count"] >= 3
 
-    dl = admin_client.get(f"/api/v1/database-exports/{job}/download")
+    dl = _download(admin_client, job)
     assert dl.status_code == 200, dl.text
     assert dl.headers["content-type"] == "application/zip"
     assert ".zip" in dl.headers["content-disposition"]
@@ -1477,7 +1497,7 @@ def test_ciclo_completo_en_ndjson_entrega_un_registro_por_linea(admin_client, mo
     ).json()["data"]["confirm_token"]
     assert _execute(admin_client, job, token).status_code == 200
 
-    dl = admin_client.get(f"/api/v1/database-exports/{job}/download")
+    dl = _download(admin_client, job)
     assert dl.status_code == 200, dl.text
     assert dl.headers["content-type"].startswith("application/x-ndjson")
     lineas = [json.loads(x) for x in dl.text.splitlines()]
@@ -1552,21 +1572,17 @@ def test_un_range_que_cubre_todo_consume_el_artefacto(admin_client, monkeypatch)
     assert _execute(admin_client, job, token).status_code == 200
 
     # Parcial de verdad: ni consume, pero SÍ cuenta.
-    parcial = admin_client.get(
-        f"/api/v1/database-exports/{job}/download", headers={"Range": "bytes=0-3"}
-    )
+    parcial = _download(admin_client, job, headers={"Range": "bytes=0-3"})
     assert parcial.status_code == 206, parcial.text
     assert _artifact_row(job).state == "available"
     assert _artifact_row(job).download_count == 1
 
-    completo = admin_client.get(
-        f"/api/v1/database-exports/{job}/download", headers={"Range": "bytes=0-"}
-    )
+    completo = _download(admin_client, job, headers={"Range": "bytes=0-"})
     assert completo.status_code in (200, 206), completo.text
     assert _artifact_row(job).download_count == 2
     assert _artifact_row(job).state == "consumed"
 
-    otra = admin_client.get(f"/api/v1/database-exports/{job}/download")
+    otra = _download(admin_client, job)
     assert otra.status_code == 410, otra.text
     assert _public(otra)["code"] == "export.artifact_consumed"
 
