@@ -323,6 +323,19 @@ class DumpStatement(BaseModel):
             "del split manual. Solo aristas baratas/fiables; vistas/rutinas no se parsean."
         ),
     )
+    requires_manual_credentials: bool = Field(
+        default=False,
+        description=(
+            "El DDL traía una credencial embebida (tabla FEDERATED/CONNECT: "
+            "``CONNECTION='mysql://user:pass@host/…'`` / ``OPTION_LIST='…password=…'``) y "
+            "el gateway la REDACTÓ a ``***``. Consecuencia: este DDL **no es re-aplicable "
+            "tal cual** — recrear el objeto exige reponer la contraseña a mano. Se modela "
+            "como flag y no como error porque el resto del DDL sigue siendo información "
+            "válida y útil; lo que no se hace nunca es escribir la contraseña en el "
+            "artefacto. ``False`` por defecto: los llamadores que no lo leen ven el mismo "
+            "contrato de antes."
+        ),
+    )
 
 
 class StructureDump(BaseModel):
@@ -340,6 +353,16 @@ class StructureDump(BaseModel):
     source_engine: str  # 'mysql' | 'mariadb' | 'postgresql'
     statements: list[DumpStatement]
     has_non_portable: bool = False
+    requires_manual_credentials: bool = Field(
+        default=False,
+        description=(
+            "``True`` si ALGÚN ``statements[*].requires_manual_credentials`` lo está: el "
+            "dump contiene al menos un objeto cuya credencial embebida se redactó, así que "
+            "el blueprint resultante NO se re-aplica sin intervención manual. Agregado a "
+            "nivel dump por la misma razón que ``has_non_portable``: el consumidor decide "
+            "sobre el conjunto sin recorrer las sentencias."
+        ),
+    )
     table_stats: "list[TableStat] | None" = Field(
         default=None,
         description=(

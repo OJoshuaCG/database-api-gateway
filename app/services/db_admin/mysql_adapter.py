@@ -68,6 +68,37 @@ def _in_list(values: tuple[str, ...]) -> str:
     return ", ".join("'" + v + "'" for v in values)
 
 
+# --------------------------------------------------------------------------- #
+# Redacción de credenciales embebidas en el DDL de una tabla                   #
+# --------------------------------------------------------------------------- #
+# Las DOS opciones de tabla de esta familia que pueden llevar una contraseña EN CLARO.
+# El literal admite los dos escapes que reconoce el resto del repo (ver
+# ``sql_dialect.mask_quoted_spans``): backslash (``\'``, el ``sql_mode`` por defecto) y
+# comilla duplicada (``''``). La alternancia es no ambigua carácter a carácter — el
+# siguiente carácter decide la rama — así que no hay backtracking exponencial.
+_CREDENTIAL_TABLE_OPTION_RE = re.compile(
+    r"\b(CONNECTION|OPTION_LIST)(\s*=\s*)('(?:[^'\\]|\\.|'')*')",
+    re.IGNORECASE,
+)
+
+# ``scheme://usuario:CONTRASEÑA@host…`` (FEDERATED, y el URI de CONNECT).
+# El ``@`` es OBLIGATORIO y la contraseña tiene que tener AL MENOS un carácter: sin eso no
+# hay nada que redactar, que es justo el caso ``mysql://user@host/db/tbl`` (y el de
+# ``CONNECTION='fedlink'``, un nombre de ``mysql.servers`` sin URI).
+_URI_USERINFO_PASSWORD_RE = re.compile(r"(://[^:/?#@'\s]+):(?:\\.|''|[^@'\\])+(@)")
+
+# ``password=…`` / ``pwd=…`` dentro de un OPTION_LIST de CONNECT o de una cadena ODBC.
+# El valor termina en ``,`` (separador de OPTION_LIST), ``;`` (ODBC) o el cierre del
+# literal. ``\'``/``''`` se consumen como escape para no cortar el valor por la mitad, y
+# el ``+`` evita inventar un ``***`` donde el valor venía vacío.
+_KV_PASSWORD_RE = re.compile(
+    r"\b(password|passwd|pwd)(\s*=\s*)(?:\\.|''|[^,;'\\])+",
+    re.IGNORECASE,
+)
+
+_REDACTED = "***"
+
+
 class MySQLAdapter(ServerAdapter):
     dialect = "mysql"
 
@@ -342,6 +373,53 @@ class MySQLAdapter(ServerAdapter):
                 return mapping[key]
         return row[fallback_idx]
 
+    @classmethod
+    def _redact_embedded_credentials(cls, ddl: str) -> tuple[str, bool]:
+        """
+        Redacta la contraseña embebida en el DDL de una tabla. Devuelve ``(ddl, redactado)``.
+
+        Una tabla ``ENGINE=FEDERATED`` (MySQL) o ``ENGINE=CONNECT`` (MariaDB) guarda la
+        credencial del servidor remoto EN CLARO dentro de sus opciones de tabla, y
+        ``SHOW CREATE TABLE`` la devuelve tal cual:
+
+            CONNECTION='mysql://usuario:contrasena@host:3306/base/tabla'
+            OPTION_LIST='host=h,user=u,password=contrasena,port=3306'
+
+        Persistir eso escribe la contraseña de un tercero en el artefacto de snapshot (y en
+        ``model_migrations.up_sql``, donde queda para siempre). ``_strip_definer_clause``
+        NO cubre este caso: solo saca ``DEFINER=``.
+
+        POR QUÉ ACÁ Y NO EN ``base_adapter``, al contrario de ``_strip_definer_clause``:
+        ``CONNECTION``/``OPTION_LIST`` son opciones de tabla EXCLUSIVAS de la familia
+        MySQL/MariaDB. En PostgreSQL el equivalente (FDW) no vive en el DDL de la tabla
+        sino en un objeto aparte (``CREATE USER MAPPING``) que este dump no captura, y su
+        DDL de tabla además no es verbatim: se compila por reflexión (``CreateTable``). Un
+        helper compartido sería una abstracción sin segundo usuario.
+
+        Se redacta SOLO el valor de la contraseña, dentro del literal de esas dos opciones
+        y en ningún otro lado: el resto del DDL (host, puerto, usuario, base y tabla
+        remotas) queda legible, que es lo que hace revisable el objeto. Un ``COMMENT`` que
+        casualmente diga ``password=…`` no se toca, porque el barrido está acotado al
+        literal de la opción.
+
+        Cuando no hay nada que redactar el DDL se devuelve **idéntico** y el flag es
+        ``False``: ni ``CONNECTION='fedlink'`` (nombre de ``mysql.servers``) ni
+        ``mysql://user@host/db/t`` (sin contraseña) se modifican.
+        """
+        redacted = False
+
+        def _scrub_option(m: re.Match[str]) -> str:
+            nonlocal redacted
+            literal, hits = _URI_USERINFO_PASSWORD_RE.subn(
+                rf"\1:{_REDACTED}\2", m.group(3)
+            )
+            literal, kv_hits = _KV_PASSWORD_RE.subn(rf"\1\2{_REDACTED}", literal)
+            if hits or kv_hits:
+                redacted = True
+            return f"{m.group(1)}{m.group(2)}{literal}"
+
+        return _CREDENTIAL_TABLE_OPTION_RE.sub(_scrub_option, ddl), redacted
+
     def dump_structure(self, database: str, *, conn=None) -> StructureDump:
         """
         Dump estructural de una BD MySQL/MariaDB vía ``SHOW CREATE *``.
@@ -349,12 +427,18 @@ class MySQLAdapter(ServerAdapter):
         Orden de dependencia: tablas → vistas → rutinas → triggers → events. El
         ``DEFINER`` se sanea (ver base). Solo estructura, nunca filas.
 
+        El DDL de una tabla pasa además por ``_redact_embedded_credentials``: una tabla
+        FEDERATED/CONNECT trae la contraseña del servidor remoto EN CLARO en sus opciones
+        y sin eso quedaba escrita en el snapshot. Los objetos afectados se marcan con
+        ``requires_manual_credentials`` (por sentencia y agregado en el dump).
+
         ``conn`` (§6.4 del módulo de exportación): ver ``ServerAdapter._conn_ctx``.
         ``None`` = comportamiento histórico (conexión propia).
         """
         validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         statements: list[DumpStatement] = []
         has_non_portable = False
+        needs_manual_credentials = False
         try:
             with self._conn_ctx(database, conn) as conn:
                 # Aristas FK entre tablas (una sola consulta) para depends_on / topo-sort.
@@ -391,11 +475,15 @@ class MySQLAdapter(ServerAdapter):
                         self.dialect,
                     )
                     row = conn.execute(text(f"SHOW CREATE TABLE {q}")).fetchone()
-                    ddl = self._show_create_value(row, ("Create Table",), 1)
+                    ddl, redacted = self._redact_embedded_credentials(
+                        self._show_create_value(row, ("Create Table",), 1)
+                    )
+                    needs_manual_credentials |= redacted
                     statements.append(
                         DumpStatement(
                             object_type="table", name=t, ddl=ddl,
                             depends_on=sorted(fk_map.get(t, set())),
+                            requires_manual_credentials=redacted,
                         )
                     )
 
@@ -513,6 +601,7 @@ class MySQLAdapter(ServerAdapter):
             source_engine=self.dialect,
             statements=statements,
             has_non_portable=has_non_portable,
+            requires_manual_credentials=needs_manual_credentials,
         )
 
     # ------------------------- escritura (Iteración 2) ------------------------ #
@@ -935,6 +1024,13 @@ class MySQLAdapter(ServerAdapter):
         pseudo-root no tiene permiso para fijar un DEFINER ajeno (``SET_USER_ID``/``SUPER``),
         el CREATE falla y el paso se reporta como error, que es el resultado correcto:
         preferible a recrear el objeto con permisos distintos de los que tenía.
+
+        Por la MISMA razón acá tampoco corre ``_redact_embedded_credentials``: el DDL se
+        reejecuta tal cual para recrear el objeto, así que redactar la contraseña de un
+        ``CONNECTION=`` lo dejaría inservible. Hoy no hay riesgo porque
+        ``_SHOW_CREATE_SPECS`` no incluye ``table`` (ningún tipo de objeto de esta lista
+        lleva credenciales embebidas); si algún día se agrega ``table``, este camino tiene
+        que dejar de devolver el DDL crudo hacia afuera.
         """
         spec = self._SHOW_CREATE_SPECS.get(object_type)
         if spec is None:
