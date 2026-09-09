@@ -142,6 +142,7 @@ def adopt_comparison(
         description=payload.description,
         execute_immediately=payload.execute_immediately,
         auto_resolve_dependencies=payload.auto_resolve_dependencies,
+        confirm_target_name=payload.confirm_target_name,
         admin=admin,
     )
     msg = f"Versión {result['version']} creada desde la comparación."

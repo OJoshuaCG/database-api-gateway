@@ -286,6 +286,42 @@ class SchemaComparisonController:
             )
 
     @staticmethod
+    def _guard_adopt_confirmation(
+        comp: SchemaComparison,
+        *,
+        execute_immediately: bool,
+        confirm_target_name: str | None,
+    ) -> None:
+        """
+        Doble intención para el ``adopt`` que EJECUTA.
+
+        ``adopt`` con ``execute_immediately=true`` aplica DDL sobre la BD del cliente, y era
+        el ÚNICO camino de ejecución del repo que no pedía re-tipear el nombre del destino:
+        ``/execute``, el clon, el export, la conversión de collation y el ``DROP DATABASE``
+        todos lo exigen. La asimetría no era una decisión, era un olvido.
+
+        Solo se exige cuando ejecuta. Crear la versión sin aplicarla es escritura de
+        metadatos del gateway —reversible, sin tocar ningún motor— y pedir confirmación ahí
+        sería fricción sobre el caso inofensivo, que es exactamente cómo se entrena el
+        reflejo de confirmar sin leer.
+        """
+        if not execute_immediately:
+            return
+        if confirm_target_name != comp.target_database_name:
+            raise AppHttpException(
+                message=(
+                    "'confirm_target_name' debe coincidir exactamente con el nombre de la "
+                    "base de datos target para aplicar la versión."
+                ),
+                status_code=422,
+                public_context={"code": "schema_comparison.adopt_confirmation_required"},
+                context={
+                    "comparison_id": comp.id,
+                    "required": "confirm_target_name == target_database_name",
+                },
+            )
+
+    @staticmethod
     def _engines_compatible(a: str, b: str) -> bool:
         if a == b:
             return True
@@ -1066,12 +1102,18 @@ class SchemaComparisonController:
         description: str | None = None,
         execute_immediately: bool = False,
         auto_resolve_dependencies: bool = False,
+        confirm_target_name: str | None = None,
         admin: dict | None = None,
     ) -> dict:
         session = self._session()
         try:
             comp = self._comparison_or_404(session, comparison_id)
             self._assert_not_expired(comp)
+            self._guard_adopt_confirmation(
+                comp,
+                execute_immediately=execute_immediately,
+                confirm_target_name=confirm_target_name,
+            )
             # Re-resolver el estado ACTUAL del target por (server_id, nombre): la Opción A
             # solo existe si el target está en el inventario Y tiene blueprint. Se re-resuelve
             # (no se confía en el managed_database_id persistido, que pudo quedar obsoleto).

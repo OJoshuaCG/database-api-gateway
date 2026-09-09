@@ -105,6 +105,15 @@ class AdoptComparisonIn(BaseModel):
             "(ManagedMigrationController.apply, con todos sus guards)."
         ),
     )
+    confirm_target_name: str | None = Field(
+        None,
+        description=(
+            "OBLIGATORIO cuando execute_immediately=true: debe coincidir exactamente con el "
+            "nombre de la BD target. Doble intención, el mismo gesto que exigen /execute, el "
+            "clon, el export y el DROP. Se ignora cuando solo se crea la versión sin "
+            "aplicarla, porque eso no toca el motor del cliente."
+        ),
+    )
     auto_resolve_dependencies: bool = Field(
         False,
         description=(

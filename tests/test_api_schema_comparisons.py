@@ -451,6 +451,7 @@ def test_adopt_execute_immediately_applies(admin_client, monkeypatch):
             "selected_item_ids": [new_t["id"]],
             "name": "immediate",
             "execute_immediately": True,
+            "confirm_target_name": "tgt_db",
         },
     )
     assert r.status_code == 200, r.text
@@ -459,6 +460,73 @@ def test_adopt_execute_immediately_applies(admin_client, monkeypatch):
     assert data["migration"]["reviewed"] is True
     assert data["apply_result"] is not None
 
+
+
+def test_adopt_execute_immediately_requires_target_name_confirmation(
+    admin_client, monkeypatch
+):
+    """
+    ``adopt`` que EJECUTA exige re-tipear el nombre del target.
+
+    Era el único camino de ejecución del repo sin doble intención por nombre: ``/execute``,
+    el clon, el export, la conversión de collation y el ``DROP DATABASE`` todos lo exigen.
+    """
+    src_id, tgt_id, _, _ = _setup(
+        admin_client, monkeypatch, port=3514, target_has_model=True
+    )
+    cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
+    items = admin_client.get(f"/api/v1/schema-comparisons/{cid}/items").json()["data"]
+    new_t = next(i for i in items if i["object_name"] == "new_t")
+
+    # Sin confirmación: rechazado ANTES de resolver el target o tocar nada.
+    r = admin_client.post(
+        f"/api/v1/schema-comparisons/{cid}/adopt",
+        json={
+            "selected_item_ids": [new_t["id"]],
+            "name": "sin-confirmar",
+            "execute_immediately": True,
+        },
+    )
+    assert r.status_code == 422, r.text
+    assert (
+        r.json()["detail"]["public_context"]["code"]
+        == "schema_comparison.adopt_confirmation_required"
+    )
+
+    # Con el nombre EQUIVOCADO: mismo rechazo.
+    r = admin_client.post(
+        f"/api/v1/schema-comparisons/{cid}/adopt",
+        json={
+            "selected_item_ids": [new_t["id"]],
+            "name": "nombre-mal",
+            "execute_immediately": True,
+            "confirm_target_name": "src_db",
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_adopt_without_executing_does_not_require_confirmation(
+    admin_client, monkeypatch
+):
+    """
+    Crear la versión SIN aplicarla no pide confirmación: es escritura de metadatos del
+    gateway, reversible y sin tocar ningún motor. Pedirla ahí sería fricción sobre el caso
+    inofensivo, que es cómo se entrena el reflejo de confirmar sin leer.
+    """
+    src_id, tgt_id, _, _ = _setup(
+        admin_client, monkeypatch, port=3515, target_has_model=True
+    )
+    cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
+    items = admin_client.get(f"/api/v1/schema-comparisons/{cid}/items").json()["data"]
+    new_t = next(i for i in items if i["object_name"] == "new_t")
+
+    r = admin_client.post(
+        f"/api/v1/schema-comparisons/{cid}/adopt",
+        json={"selected_item_ids": [new_t["id"]], "name": "solo-version"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["executed"] is False
 
 # =========================================================================== #
 # Fase 6 — execute (Opción B)                                                  #
