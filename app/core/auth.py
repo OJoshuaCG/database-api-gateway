@@ -3,14 +3,17 @@ Autenticación del gateway: sesión firmada + administrador único.
 
 El gateway es una herramienta interna; no gestiona múltiples usuarios. La sesión
 se guarda en una cookie httpOnly firmada (Starlette SessionMiddleware, backend
-itsdangerous). Toda la lógica de "quién está autenticado" pasa por la dependencia
-`get_current_admin`, de modo que migrar a OIDC/SSO en el futuro no requiere tocar
-los endpoints.
+itsdangerous). Toda la lógica de "quién está autenticado" pasa por `authenticated_user`, de modo que
+migrar a OIDC/SSO en el futuro no requiere tocar los endpoints.
+
+**Acá NO hay ninguna dependencia inyectable.** La que había —`AdminDep`, que solo verificaba
+sesión— se retiró al terminar el swap a capacidades, y se retiró en vez de deprecarse
+justamente para que un endpoint nuevo copiado de uno viejo **falle al importar** en lugar de
+nacer autenticado y sin autorizar. Lo inyectable vive en `app/core/authz.py`, y ahí todo alias
+lleva capacidad.
 """
 
-from typing import Annotated
-
-from fastapi import Depends, Request
+from fastapi import Request
 
 from app.core.environments import ADMIN_PASSWORD, ADMIN_USERNAME
 from app.core.logger import get_logger
@@ -50,17 +53,17 @@ def authenticated_user(request: Request) -> dict:
     """
     La fila COMPLETA del usuario de la sesión, o 401. Es la única resolución de sesión.
 
-    Existe extraída y no duplicada porque de acá cuelgan DOS dependencias —``get_current_admin``
-    y ``get_current_actor`` de ``app/core/authz.py``— y dos chequeos de sesión paralelos son
-    exactamente cómo se termina con dos políticas que divergen en silencio. El riesgo está
-    anotado en el plan 11 §9; esto lo cierra por construcción.
+    Existe extraída y no duplicada porque de acá cuelga ``get_current_actor`` de
+    ``app/core/authz.py`` y de acá va a colgar la autenticación por token del servidor MCP. Dos
+    chequeos de sesión paralelos son exactamente cómo se termina con dos políticas que divergen
+    en silencio: el riesgo está anotado en el plan 11 §9 y esto lo cierra por construcción.
 
     Relee la BD en CADA request, a propósito: es lo que hace que desactivar a alguien surta
     efecto de inmediato, y lo mismo va a valer para el rol.
 
     OJO: devuelve la fila entera, que incluye ``hashed_password``. Quien la consuma tiene que
-    ESTRECHARLA — ``get_current_admin`` a ``{id, username}``, ``get_current_actor`` a los campos
-    del ``Actor``. Ninguno de los dos propaga el hash.
+    ESTRECHARLA: ``get_current_actor`` la reduce a los campos del ``Actor``, que no propaga el
+    hash.
     """
     admin_id = request.session.get(SESSION_USER_ID)
     if not admin_id:
@@ -73,22 +76,6 @@ def authenticated_user(request: Request) -> dict:
             message="Sesión inválida o usuario inactivo.", status_code=401
         )
     return user
-
-
-def get_current_admin(request: Request) -> dict:
-    """
-    Dependencia LEGADA que exige sesión válida y devuelve ``{id, username}``.
-
-    Sigue en pie porque las 153 rutas la usan y el swap a ``Actor`` es la fase 1. Se retira
-    entera ahí, no se deprecia: un endpoint nuevo copiado de uno viejo tiene que fallar al
-    importar.
-    """
-    user = authenticated_user(request)
-    return {"id": user["id"], "username": user["username"]}
-
-
-# Alias de tipo para inyectar en endpoints protegidos.
-AdminDep = Annotated[dict, Depends(get_current_admin)]
 
 
 def bootstrap_admin() -> None:

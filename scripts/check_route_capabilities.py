@@ -12,23 +12,23 @@ Precedente exacto en este repo: ``app/routes/v1/test.py`` tenía **siete rutas s
 autenticación** —dos de ellas subiendo archivos a disco— montadas en la API durante meses,
 porque nadie las miró de nuevo después de escribirlas.
 
-LA REGLA, EN LA VARIANTE DE MIGRACIÓN
--------------------------------------
-Toda ruta tiene que declarar **una de dos** cosas, nunca ninguna:
+LA REGLA
+--------
+**Toda ruta declara una capacidad del catálogo** (el marcador ``__gw_capability__`` que estampa
+``require()``) o está en ``PUBLIC_ROUTES``. No hay tercera opción.
 
-- una **capacidad** del catálogo (el marcador ``__gw_capability__`` que estampa ``require()``), o
-- ``AdminDep``, el guard legado, y estar en ``LEGACY_ROUTES``.
-
-Eso es lo que hace SEGURO el swap de la fase 1: mientras la migración avanza, una ruta sin
-ninguna de las dos rompe el chequeo, así que **nunca existe un commit donde algo quede sin
-guard**. No hace falta vigilar el estado intermedio: el chequeo lo vuelve no-mergeable.
+Durante el swap sí la había —``AdminDep``, el guard que solo verificaba sesión— y eso es lo que
+hizo seguro migrar de a un módulo: una ruta sin ninguna de las dos rompía el chequeo, así que
+**nunca existió un commit donde algo quedara sin guard**. Terminado el swap, ``AdminDep`` se
+retiró del código en vez de deprecarse, para que un endpoint nuevo copiado de uno viejo falle al
+importar; así que acá quedó el invariante, sin la rama de transición.
 
 EL TRINQUETE
 ------------
-``LEGACY_ROUTES`` solo puede DECRECER y las migradas solo CRECER. Un umbral que solo se mueve
-en una dirección convierte la migración en un trinquete en vez de en una intención: un revert
-parcial que devuelva una ruta a ``AdminDep`` sin actualizar el conteo falla, en vez de pasar
-inadvertido.
+Las rutas migradas solo pueden CRECER (``MIN_MIGRATED_ROUTES``). Un umbral que solo se mueve en
+una dirección es un trinquete en vez de una intención: un revert parcial que deje N rutas sin
+capacidad falla en el conteo aunque el chequeo 1 no lo vea —por ejemplo si alguien las mete en
+``PUBLIC_ROUTES`` para "arreglar" el build—, en vez de pasar inadvertido.
 
 POR QUÉ IMPORTA LA APP Y NO LEE LOS FUENTES CON ``ast``
 --------------------------------------------------------
@@ -56,7 +56,7 @@ scale-up) deja un pod que no puede volver con el binario que andaba bien hace un
 
 La propiedad de "no puede servir una respuesta" se consigue mejor con una **dependencia global
 de la sub-app**, evaluada en runtime, que corre DESPUÉS del routing y por eso sí ve la ruta
-resuelta. Eso entra con el swap de la fase 1, cuando ya no queden rutas con ``AdminDep``.
+resuelta. Ya no hay nada que la bloquee: es el siguiente endurecimiento posible sobre esta base.
 
 Uso::
 
@@ -97,11 +97,8 @@ PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
 #: esta lista, el chequeo 4 reportaría como vocabulario muerto algo que sí tiene consumidor.
 NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset()
 
-#: Cuántas rutas siguen con el guard legado. **Solo puede BAJAR.** Ver "EL TRINQUETE".
-MAX_LEGACY_ROUTES = 50
-
-#: Cuántas rutas ya declaran capacidad. **Solo puede SUBIR.**
-MIN_MIGRATED_ROUTES = 104
+#: Cuántas rutas declaran capacidad. **Solo puede SUBIR.** Ver "EL TRINQUETE".
+MIN_MIGRATED_ROUTES = 154
 
 
 def _iter_routes(app, prefix: str = ""):
@@ -134,24 +131,11 @@ def _capability_of(route: APIRoute) -> str | None:
     return walk(route.dependant)
 
 
-def _uses_legacy_guard(route: APIRoute) -> bool:
-    """``True`` si la ruta sigue con ``AdminDep``. Se detecta por el callable de la dependencia."""
-    from app.core.auth import get_current_admin
-
-    def walk(dependant) -> bool:
-        if getattr(dependant, "call", None) is get_current_admin:
-            return True
-        return any(walk(s) for s in (getattr(dependant, "dependencies", []) or []))
-
-    return walk(route.dependant)
-
-
 def main() -> int:
     from main import app
 
     errores: list[str] = []
     sin_guard: list[str] = []
-    legacy: list[str] = []
     migradas: list[str] = []
     usadas: set[str] = set()
     validas = {c.value for c in Capability}
@@ -174,17 +158,13 @@ def main() -> int:
             if clave in PUBLIC_ROUTES:
                 continue
 
-            if _uses_legacy_guard(route):
-                legacy.append(f"{method} {path}")
-                continue
-
-            # Chequeo 1: ni capacidad, ni pública, ni legada. Nace abierta.
+            # Chequeo 1: ni capacidad ni pública. Nace abierta.
             sin_guard.append(f"{method} {path}")
 
     if sin_guard:
         errores.append(
-            "Rutas SIN ningún guard de autorización (ni capacidad, ni AdminDep, ni en "
-            "PUBLIC_ROUTES):\n  " + "\n  ".join(sorted(sin_guard))
+            "Rutas SIN capacidad declarada y fuera de PUBLIC_ROUTES:\n  "
+            + "\n  ".join(sorted(sin_guard))
         )
 
     # Chequeo 2: toda entrada de PUBLIC_ROUTES corresponde a una ruta VIVA. Sin esto la lista
@@ -204,9 +184,7 @@ def main() -> int:
     # Chequeo 4: vocabulario muerto. Una capacidad que ninguna ruta usa y que no está
     # declarada como no-ruta es una promesa que `/auth/me` publica y nadie puede ejercer.
     muertas = validas - usadas - {c.value for c in NON_ROUTE_CAPABILITIES}
-    # Durante la migración esto es lo esperado, así que informa en vez de fallar. Pasa a error
-    # cuando `MAX_LEGACY_ROUTES` llegue a 0.
-    aviso_muertas = sorted(muertas) if MAX_LEGACY_ROUTES == 0 else []
+    aviso_muertas = sorted(muertas)
     if aviso_muertas:
         errores.append(
             "Capacidades que ninguna ruta declara (vocabulario muerto): "
@@ -214,12 +192,6 @@ def main() -> int:
         )
 
     # El trinquete.
-    if len(legacy) > MAX_LEGACY_ROUTES:
-        errores.append(
-            f"El guard legado CRECIÓ: {len(legacy)} rutas con AdminDep, el tope es "
-            f"{MAX_LEGACY_ROUTES}. Si una ruta volvió a AdminDep a propósito, bajá el tope en "
-            "el mismo commit; si no, migrala."
-        )
     if len(migradas) < MIN_MIGRATED_ROUTES:
         errores.append(
             f"Las rutas migradas BAJARON: {len(migradas)}, el mínimo es "
@@ -230,13 +202,7 @@ def main() -> int:
         print(f"Migradas ({len(migradas)}):")
         for r in sorted(migradas):
             print(f"  {r}")
-        print(f"\nCon guard legado ({len(legacy)}):")
-        for r in sorted(legacy):
-            print(f"  {r}")
-        if muertas:
-            print(f"\nCapacidades sin ruta todavía ({len(muertas)}):")
-            for c in sorted(muertas):
-                print(f"  {c}")
+
         print()
 
     if errores:
@@ -246,8 +212,7 @@ def main() -> int:
 
     print(
         f"OK: cobertura de autorización sana — {len(migradas)} ruta(s) con capacidad, "
-        f"{len(legacy)} con el guard legado, {len(PUBLIC_ROUTES)} públicas declaradas, "
-        "0 sin guard."
+        f"{len(PUBLIC_ROUTES)} públicas declaradas, 0 sin guard, 0 capacidad muerta."
     )
     return 0
 
