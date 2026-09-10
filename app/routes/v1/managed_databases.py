@@ -25,7 +25,9 @@ from app.core.authz import (
 )
 from app.core.limiter import limiter
 from app.models.enums import EngineType, ProvisionStatus
+from app.core.authz import GatewayAdmin
 from app.schemas.managed_database import (
+    AgentAccessIn,
     AdoptDatabaseIn,
     ManagedDatabaseCreate,
     ManagedDatabaseOut,
@@ -165,6 +167,37 @@ def delete_database(
         db_id, drop_remote=drop_remote, confirm_name=confirm_name, admin=actor
     )
     return empty("Base de datos eliminada.")
+
+
+@router.put("/{db_id}/agent-access", response_model=ApiResponse[ManagedDatabaseOut])
+def set_agent_access(actor: GatewayAdmin, db_id: int, payload: AgentAccessIn):
+    """
+    Abre o cierra esta BD para los agentes (MCP). Es el **opt-in por base**.
+
+    ENDPOINT PROPIO Y NO UN CAMPO DEL PATCH, a propósito: es la palanca que decide si la
+    estructura de la base de un tercero sale del gateway hacia el contexto de un modelo. Como
+    campo de `ManagedDatabaseUpdate` se movería junto con un cambio de nombre o de entorno, sin
+    gesto propio y sin rastro distinguible.
+
+    Detrás de ``gateway.admin`` —no del rol operativo— porque es **dato de política**: la regla
+    del §4.5 es que toda fila que un guard lee es una frontera de privilegio, así que su escritor
+    necesita al menos el privilegio del guard que puede apagar.
+
+    Se audita con ``record_intent`` **fail-closed** cuando ABRE: si el rastro no se puede
+    persistir, la apertura no ocurre. Cerrar se audita best-effort — negar acceso no necesita
+    la misma garantía que otorgarlo.
+
+    El veto (``blocked``) **gana sobre el permiso** y no tiene override: ni ``force``, ni nada.
+    """
+    return success(
+        data=ManagedDatabaseController().set_agent_access(
+            db_id,
+            allowed=payload.allowed,
+            blocked=payload.blocked,
+            admin=actor,
+        ),
+        message="Acceso de agentes actualizado.",
+    )
 
 
 @router.post(

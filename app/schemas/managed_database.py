@@ -214,3 +214,28 @@ class ManagedDatabaseProvisionOut(BaseModel):
         None, description="Forma CANÓNICA del catálogo que efectivamente viajó al DDL"
     )
     collation: str | None = None
+
+
+class AgentAccessIn(BaseModel):
+    """
+    Las dos palancas de agentes de una BD, juntas y explícitas.
+
+    Los dos campos son OBLIGATORIOS y no opcionales: un PATCH parcial acá dejaría al operador
+    creyendo que cerró el acceso cuando solo tocó una de las dos. La pregunta que este endpoint
+    responde es "cuál es el estado de acceso de agentes de esta base", y la respuesta completa
+    es dos booleanos.
+    """
+
+    allowed: bool = Field(
+        ...,
+        description=(
+            "Opt-in. Es el eje que DECIDE el alcance: sin esto en true, ningún agente ve la "
+            "base aunque su entorno los permita"
+        ),
+    )
+    blocked: bool = Field(
+        ...,
+        description=(
+            "Veto de emergencia. GANA sobre 'allowed' y no tiene override: ni force, ni nada"
+        ),
+    )

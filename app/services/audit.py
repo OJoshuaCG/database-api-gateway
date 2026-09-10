@@ -16,7 +16,6 @@ from contextvars import ContextVar
 
 from app.core.actor import Actor, identity_of
 from app.core.context import current_http_identifier, current_request_ip
-from app.core.database import Database
 from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.models.audit_log import AuditLog
@@ -96,6 +95,7 @@ def record(
 ) -> None:
     """Registra una entrada de auditoría. Nunca lanza: ante error, solo loguea."""
     try:
+        from app.core.database import Database  # import local: ver el guard de app/mcp
         session = Database().get_declarative_base_session()
         try:
             session.add(
@@ -152,6 +152,7 @@ def record_intent(
     exigen rastro garantizado igual (p.ej. revelar una contraseña).
     """
     try:
+        from app.core.database import Database  # import local: ver el guard de app/mcp
         session = Database().get_declarative_base_session()
         try:
             session.add(

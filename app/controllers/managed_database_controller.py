@@ -118,6 +118,67 @@ class ManagedDatabaseController:
             )
         return d
 
+    def set_agent_access(
+        self, db_id: int, *, allowed: bool, blocked: bool, admin: "dict | Actor | None"
+    ) -> dict:
+        """
+        Escribe el opt-in y el veto de agentes de una BD.
+
+        Es el ESCRITOR que a estas dos columnas les faltaba: hasta ahora solo existía el lector
+        (el gate del MCP), así que la única forma de abrir una base era un ``UPDATE`` a mano
+        sobre la BD de metadatos — sin actor, sin Request ID y **sin ninguna fila de
+        auditoría**. Es exactamente el escenario que el invariante del último administrador
+        describe como inaceptable, aplicado a la palanca más sensible de la feature.
+
+        **Abrir se audita fail-closed** (``record_intent``): si el rastro no se puede persistir,
+        la apertura no ocurre. Cerrar va best-effort — negar acceso no necesita la misma
+        garantía que otorgarlo, y un fallo de auditoría no puede impedir que alguien corte el
+        acceso en una emergencia.
+        """
+        session = self._session()
+        try:
+            md = self._get_or_404(session, db_id)
+            abre = allowed and not blocked
+            antes = bool(md.agent_access_allowed) and not bool(md.agent_access_blocked)
+            nombre, server_id = md.name, md.server_id
+        finally:
+            session.close()
+
+        if abre and not antes:
+            audit.record_intent(
+                "managed_database.agent_access_open",
+                admin=admin,
+                target_type="managed_database",
+                target_id=db_id,
+                server_id=server_id,
+                touched_engine=False,
+                detail=(
+                    f"INTENT abrir '{nombre}' a agentes (MCP): la estructura de esta base pasa "
+                    "a ser legible por un token de agente"
+                ),
+            )
+
+        session = self._session()
+        try:
+            md = self._get_or_404(session, db_id)
+            md.agent_access_allowed = allowed
+            md.agent_access_blocked = blocked
+            session.commit()
+        finally:
+            session.close()
+
+        if not abre:
+            audit.record(
+                "managed_database.agent_access_close",
+                admin=admin,
+                target_type="managed_database",
+                target_id=db_id,
+                server_id=server_id,
+                touched_engine=False,
+                detail=f"'{nombre}' allowed={allowed} blocked={blocked}",
+            )
+        return self._serialize_by_id(db_id)
+
     def _serialize_by_id(self, db_id: int) -> dict:
         """Re-lee y serializa una BD por id en una sesión propia (estado ya commiteado)."""
         session = self._session()

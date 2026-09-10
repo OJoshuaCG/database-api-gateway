@@ -52,6 +52,7 @@ class EnvironmentController:
             "is_default": e.is_default,
             "is_active": e.is_active,
             "blocks_destructive_migrations": e.blocks_destructive_migrations,
+            "allows_agent_access": e.allows_agent_access,
             "database_count": database_count,
             "created_at": e.created_at,
             "updated_at": e.updated_at,
@@ -137,6 +138,12 @@ class EnvironmentController:
         out = []
         if data.get("blocks_destructive_migrations") is False and env.blocks_destructive_migrations:
             out.append("blocks_destructive_migrations")
+        # ENCENDER el acceso de agentes es un debilitamiento, aunque el verbo sea "activar":
+        # habilita una superficie de LECTURA nueva sobre bases de terceros. Es la misma trampa
+        # que `is_active`, donde el toggle se llama "activo" y apagarlo aflojaba la política —
+        # acá es al revés y por eso hay que escribirlo.
+        if data.get("allows_agent_access") is True and not env.allows_agent_access:
+            out.append("allows_agent_access")
         if data.get("is_active") is False and env.is_active:
             out.append("is_active")
         if data.get("is_default") is False and env.is_default:
@@ -333,9 +340,17 @@ class EnvironmentController:
                 "is_default": env.is_default,
                 "is_active": env.is_active,
                 "blocks_destructive_migrations": env.blocks_destructive_migrations,
+                "allows_agent_access": env.allows_agent_access,
             }
             wants_default = data.pop("is_default", None)
-            for field in ("name", "rank", "color", "is_active", "blocks_destructive_migrations"):
+            for field in (
+                "name",
+                "rank",
+                "color",
+                "is_active",
+                "blocks_destructive_migrations",
+                "allows_agent_access",
+            ):
                 if field in data:
                     setattr(env, field, data[field])
             if wants_default is True:
@@ -351,6 +366,7 @@ class EnvironmentController:
                 "is_default": env.is_default,
                 "is_active": env.is_active,
                 "blocks_destructive_migrations": env.blocks_destructive_migrations,
+                "allows_agent_access": env.allows_agent_access,
             }
             changed = {k: (before[k], after[k]) for k in before if before[k] != after[k]}
             detail = f"slug={env.slug} " + " ".join(

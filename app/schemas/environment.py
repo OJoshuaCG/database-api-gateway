@@ -109,6 +109,15 @@ class EnvironmentUpdate(BaseModel):
     """
 
     name: str | None = Field(None, min_length=1, max_length=60, description=_NAME_DESC)
+    allows_agent_access: bool | None = Field(
+        None,
+        description=(
+            "Si los agentes (MCP) pueden inspeccionar bases de este entorno. ENCENDERLO exige "
+            "'confirm_slug': habilita una superficie de lectura nueva sobre bases de terceros, "
+            "así que cuenta como debilitamiento de la política igual que apagar el bloqueo de "
+            "destructivas. No alcanza solo: cada base necesita además su propio opt-in"
+        ),
+    )
     rank: int | None = Field(None, ge=0, le=10_000, description=_RANK_DESC)
     color: str | None = Field(None, description=_COLOR_DESC)
     is_default: bool | None = Field(None, description=_IS_DEFAULT_DESC)
@@ -141,6 +150,13 @@ class EnvironmentOut(BaseModel):
     is_default: bool = False
     is_active: bool = True
     blocks_destructive_migrations: bool = False
+    allows_agent_access: bool = Field(
+        False,
+        description=(
+            "Si los agentes (MCP) pueden inspeccionar bases de este entorno. No alcanza solo: "
+            "cada base necesita además su propio opt-in"
+        ),
+    )
     database_count: int = Field(
         0,
         description=(
