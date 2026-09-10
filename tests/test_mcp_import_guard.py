@@ -6,15 +6,27 @@ QUÉ COMPRA Y QUÉ NO — LEER ESTO ANTES DE CONFIAR EN ÉL
 **Compra**: evitar la deriva accidental. Alguien que agregue una tool y necesite "solo consultar
 algo rápido" tiene que romper este test para hacerlo, y ahí aparece la conversación.
 
-**NO compra**: probar que no hay puerta de atrás. Es evadible de dos maneras conocidas y las dos
-están escritas acá para que nadie lo sobreestime:
+**NO compra**: probar que no hay puerta de atrás. Y las vías de evasión que este archivo
+declaraba antes **eran las equivocadas** — una auditoría lo midió y hay que corregirlo, porque un
+control cuya autoevaluación apunta al lugar equivocado es peor que uno sin autoevaluación:
 
-1. **Por transitividad.** ``app/mcp/context.py`` importa el resolvedor, que necesariamente importa
-   la capa de motor: está siempre a un salto.
-2. **Por ``importlib.import_module``**, que no produce ningún nodo ``Import`` en el AST.
+- Se decía "por transitividad, ``context.py`` importa el resolvedor que importa la capa de
+  motor". **Falso**: ``target_resolution`` importa ``Database`` DENTRO de la función, así que no
+  hay atributo de módulo que alcanzar.
+- La que **sí** funcionaba: un módulo de la allowlist que re-exporta la capa de motor como
+  **atributo de módulo**. ``app.services.audit`` importaba ``Database`` a nivel de módulo, así
+  que ``from app.services.audit import Database`` pasaba el guard tal cual estaba. El chequeo de
+  atributos de abajo cierra esa vía, y por eso existe.
+- Sigue en pie ``importlib.import_module``, que no produce ningún nodo ``Import`` en el AST.
+- Y sigue en pie forjar un ``Actor``: ``dataclasses.replace(ctx.actor, project_id=OTRO)`` con el
+  resolvedor de la allowlist devuelve las bases de otro proyecto. **Explotarlo exige commitear
+  código en ``app/mcp/**``**, o sea que quien lo haga ya es autor del repo y no hay entrada
+  remota — pero conviene saber que ``ToolContext`` acota lo que un handler *recibe*, no lo que un
+  handler *puede construir*.
 
-La capa que de verdad cierra la puerta es ``ToolContext``: un handler no recibe nada reusable.
-Este guard es la red de arriba, no la cerradura.
+La capa que de verdad cierra la puerta al agente es que **ninguna tool acepte un identificador
+de proyecto**: el alcance sale del token y nada más. Este guard es la red de arriba, no la
+cerradura.
 
 ES UNA ALLOWLIST, NO UNA BLOCKLIST
 ----------------------------------
@@ -48,6 +60,12 @@ PERMITIDOS = frozenset(
         "app.middleware.ContextMiddleware",
         "app.services.audit",
         "app.services.capability_catalog",
+        # Los tres siguientes entraron con el endurecimiento del transporte —tope de cuerpo,
+        # límite de tasa por token y validación de `Origin`— y se declaran uno por uno, no como
+        # un paquete: `app.core` entero incluiría `database` y `remote_engine`.
+        "app.core.csrf",
+        "app.core.limiter",
+        "app.middleware.RequestSizeMiddleware",
         "app.services.mcp_catalog",
         "app.schemas.mcp",
     }
@@ -141,3 +159,38 @@ def test_the_blocklist_names_real_modules():
 
     for nombre in NUNCA:
         assert importlib.util.find_spec(nombre) is not None, f"{nombre} no existe"
+
+
+@pytest.mark.parametrize("nombre", sorted(PERMITIDOS), ids=lambda n: n.rsplit(".", 1)[-1])
+def test_no_allowed_module_re_exports_the_engine_layer(nombre):
+    """
+    **El chequeo que la allowlist necesitaba y no tenía.**
+
+    Un módulo permitido puede re-exportar la capa de motor como atributo, y ahí el guard de
+    imports no ve nada: ``from app.services.audit import Database`` es un import a un módulo de
+    ``PERMITIDOS``. Pasó de verdad —``audit`` importaba ``Database`` a nivel de módulo— y lo
+    encontró una auditoría, no este test.
+
+    Se mira el ``__module__`` de cada atributo, público y privado: un ``_Database`` re-exportado
+    es igual de alcanzable que uno público.
+    """
+    import importlib
+
+    try:
+        mod = importlib.import_module(nombre)
+    except ImportError:
+        pytest.skip(f"{nombre} no es importable en este entorno")
+
+    filtrados = []
+    for attr in dir(mod):
+        valor = getattr(mod, attr, None)
+        origen = getattr(valor, "__module__", None) or (
+            valor.__name__ if isinstance(valor, type(importlib)) else None
+        )
+        if origen in NUNCA:
+            filtrados.append(f"{attr} (de {origen})")
+
+    assert not filtrados, (
+        f"{nombre} re-exporta la capa de motor: {filtrados}. Importalo DENTRO de la función "
+        "que lo usa, como ya hace app/controllers/target_resolution.py."
+    )

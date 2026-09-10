@@ -11,6 +11,13 @@ _SENSITIVE_SUBSTRINGS = (
     "api_key",
     "apikey",
     "private_key",
+    # Una cookie de sesión ES una credencial de sesión: con la cookie de `gw_session` en un log,
+    # quien lea ese log puede actuar como el usuario. Entra acá desde que los headers también
+    # se enmascaran — antes esta lista solo veía cuerpos de request, donde una cookie no llega.
+    "cookie",
+    # El token de CSRF no es una credencial por sí solo —el servidor lo recomputa del `sid`—
+    # pero loguearlo junto a la cookie de sesión le da a quien lea el log el par completo.
+    "csrf",
 )
 
 

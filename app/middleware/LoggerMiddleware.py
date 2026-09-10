@@ -60,7 +60,15 @@ class LoggerMiddleware(BaseHTTPMiddleware):
                     f"Query: {query_string if query_string else '<no parameters>'}"
                 )
             if LOGGER_MIDDLEWARE_SHOW_HEADERS:
-                request_parts.append(f"Headers: {headers}")
+                # Los headers pasan por el MISMO enmascarado que el body. La versión anterior
+                # los volcaba crudos, y con eso `Authorization` y `Cookie` iban completos al
+                # log — el bearer de un agente entero, en texto plano, en un archivo que
+                # típicamente se envía a un agregador de logs de terceros.
+                #
+                # No era explotable hoy porque el flag nace en `False` y la sub-app del MCP no
+                # monta este middleware, pero estaba a UNA línea de serlo: alcanzaba con que
+                # alguien lo agregara para depurar un cliente.
+                request_parts.append(f"Headers: {_sanitize_dict(dict(headers))}")
             logger.info(" | ".join(request_parts))
 
         def _log_response(display_path: str, status_code: int, duration: float) -> None:

@@ -20,7 +20,7 @@ from app.core.mcp_auth import mint, token_hmac
 from app.exceptions import AppHttpException
 from app.models.api_token import ApiToken
 from app.services import audit
-from app.services.capability_catalog import AGENT_ALLOWED, Capability
+from app.services.capability_catalog import AGENT_ALLOWED, Capability, parse_scopes
 
 CODE_NOT_FOUND = "api_token.not_found"
 CODE_TTL_TOO_LONG = "api_token.ttl_too_long"
@@ -47,11 +47,17 @@ class ApiTokenController:
         con el token que la originó.
         """
         ahora = _utcnow()
+        # Los scopes EFECTIVOS, no el string crudo de la fila. La diferencia importa cuando la
+        # fila fue manipulada: con `scopes="gateway.admin"` en la BD, el crudo se le mostraba al
+        # operador como si el token tuviera esa capacidad, mientras el efectivo es vacío. La
+        # autorización ya era fail-closed —`parse_scopes` intersecta con el techo de agente— pero
+        # la PANTALLA afirmaba otra cosa, y en una revisión de accesos eso es lo que se lee.
+        efectivos = sorted(c.value for c in parse_scopes(t.scopes))
         return {
             "id": t.id,
             "token_id": t.token_id,
             "name": t.name,
-            "scopes": t.scopes.split(","),
+            "scopes": efectivos,
             "project_id": t.project_id,
             "expires_at": t.expires_at,
             "last_used_at": t.last_used_at,
