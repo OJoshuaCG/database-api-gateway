@@ -181,14 +181,22 @@ def test_a_malformed_body_is_a_protocol_error_not_a_422(client, admin_client, mc
     r = client.post(
         "/mcp/", content=b"esto no es json", headers={"Authorization": f"Bearer {token}"}
     )
-    assert r.status_code == 200, r.text
+    # 400 y no 200: el status es parte del contrato del transporte en esta revisión. Lo que
+    # importa es que NO sea el 422 de FastAPI, que un cliente MCP lee como servidor roto.
+    assert r.status_code == 400, r.text
     assert r.json()["error"]["code"] == -32700
 
 
 def test_an_unknown_method_is_a_protocol_error(client, admin_client, mcp_on):
+    """
+    404 y no 200: es lo que la spec pide, y es lo que le permite a un cliente moderno distinguir
+    este caso del 404 de un servidor legado que no hospeda el endpoint — el cuerpo lleva un
+    error reconocible.
+    """
     pid = _proyecto(admin_client)
     token = _crear_token(admin_client, project_id=pid)["token"]
     r = _rpc(client, token, "resources/list")
+    assert r.status_code == 404, r.text
     assert r.json()["error"]["code"] == -32601
 
 
@@ -204,6 +212,7 @@ def test_a_batch_is_rejected(client, admin_client, mcp_on):
         json=[{"jsonrpc": "2.0", "id": 1, "method": "initialize"}],
         headers={"Authorization": f"Bearer {token}"},
     )
+    assert r.status_code == 400, r.text
     assert r.json()["error"]["code"] == -32600
 
 
@@ -226,11 +235,14 @@ def test_an_unknown_tool_is_a_protocol_error(client, admin_client, mcp_on):
     """
     Una tool que ``tools/list`` no publica es un bug del cliente, no una negación de acceso: va
     como error de PROTOCOLO para que el agente no lo confunda con "no tenés permiso".
+
+    Y el código es **-32602** y no -32601: la spec clasifica "tool desconocida" como problema de
+    PARÁMETROS, porque el método `tools/call` sí existe.
     """
     pid = _proyecto(admin_client)
     token = _crear_token(admin_client, project_id=pid)["token"]
     r = _rpc(client, token, "tools/call", {"name": "query", "arguments": {}})
-    assert r.json()["error"]["code"] == -32601
+    assert r.json()["error"]["code"] == -32602
 
 
 # --------------------------------------------------------------------------- #

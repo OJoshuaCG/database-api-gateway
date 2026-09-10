@@ -271,54 +271,134 @@ que **no hay forma de volver a mostrarlo**: si se pierde, se emite otro.
 entorno**, nunca el literal. El gate de secretos del CI protege *este* repo; el token se commitea
 en los repos de otra gente, así que ahí hace falta su propia regla de escaneo.
 
-### 9.2 `POST /mcp/` — JSON-RPC 2.0, bearer
+### 9.2 `POST /mcp` — JSON-RPC 2.0, bearer, DOS eras del protocolo
 
 **Nace apagado** (`MCP_ENABLED=false`). Apagado, todo request recibe 503 `mcp.disabled`, incluido
-uno con token válido y uno con token basura — o sea que apagado tampoco es un oráculo.
+uno con token válido y uno con token basura — así que apagado tampoco es un oráculo.
 
-Tres métodos: `initialize`, `tools/list`, `tools/call`. Sin batches.
+Funciona con `/mcp` **y** `/mcp/`, sin redirección. Es deliberado: la URL natural de un
+`.mcp.json` es `https://host/mcp`, y un `307` obliga al cliente a reintentar el POST — hay
+clientes HTTP que **no reenvían `Authorization`** en el salto, y el síntoma sería "el token no
+funciona".
 
-**La v1 tiene UNA tool: `list_databases`**, que lee el inventario del gateway y **no abre ninguna
-conexión a los motores**. Devuelve, por base: `database_id`, `name`, `engine`, `environment`,
-`blueprint` y `applied_version`.
+#### Configuración en Claude Code
 
-Las tres tools que faltan (`list_objects`, `get_schema`, `check_freshness`) **son** consultas al
-catálogo de cada motor, así que no se entregaron sin un motor real contra el que correrlas.
+```bash
+claude mcp add --transport http gateway https://host/mcp \
+  --header "Authorization: Bearer $GATEWAY_MCP_TOKEN"
+```
 
-### 9.3 El gate: niega por default, y hay que abrirlo base por base
+```jsonc
+// .mcp.json del repo consumidor
+{ "mcpServers": { "gateway": {
+    "type": "http",
+    "url": "https://host/mcp",
+    // Por VARIABLE DE ENTORNO, nunca el literal: el gate de secretos del CI protege el repo
+    // del gateway, no el de quien consume.
+    "headers": { "Authorization": "Bearer ${GATEWAY_MCP_TOKEN}" }
+} } }
+```
 
-Para que una base aparezca hacen falta **las cuatro**:
+#### Las dos eras, y por qué se soportan las dos
 
-1. pertenece al **proyecto del token**;
-2. tiene `environment_id` (una base sin clasificar nunca es alcanzable);
-3. su entorno tiene `allows_agent_access = true`;
-4. la base tiene `agent_access_allowed = true` y `agent_access_blocked = false`.
+La revisión **2026-07-28** rehízo el transporte: **no hay handshake** (`initialize` y
+`notifications/initialized` desaparecieron), no hay sesiones de protocolo (`Mcp-Session-Id` se
+retiró) y no hay stream por GET. Cada request trae su contexto en `params._meta`.
 
-**Las tres columnas nacen en `false`**, y la asimetría está en el DDL y no solo en el código: con
-default permisivo, el momento en que alguien prende el MCP dejaría legible todo lo ya clasificado
-sin que nadie lo haya decidido, y las bases que se creen después nacerían abiertas.
+El servidor **detecta la era por la presencia del header `MCP-Protocol-Version`** —lo que la
+propia spec autoriza— y habla las dos, porque el parque real tiene las dos:
 
-**El opt-in por base es el eje que decide el alcance, no el veto.** Con solo un opt-out,
-habilitar un entorno abriría de golpe todas sus bases — incluidas las que nadie revisó — y
-"activar una" obligaría a ir a bloquear N a mano. `agent_access_blocked` es el veto de emergencia
-y **no tiene override**: ni `force`, ni nada.
-
-**El listado nunca enumera lo negado.** Una base de otro proyecto, o sin opt-in, simplemente no
-está: decir "existe y no te la doy" sería un oráculo de inventario.
-
-### 9.4 Errores: protocolo vs. tool
-
-| Dónde | Cuándo | Ejemplo |
+| | Era stateless (`2026-07-28`, `2025-11-25`) | Era del handshake (`2025-06-18` y anteriores) |
 |---|---|---|
-| campo `error` de JSON-RPC | el mensaje está mal formado o pide algo que no existe | `-32700` cuerpo no-JSON, `-32601` tool desconocida |
-| `result` con `isError: true` | la operación se entendió y se negó | `mcp.scope_denied`, `mcp.not_found` |
+| Handshake | **no existe**: `initialize` da 404 | `initialize` → `notifications/initialized` |
+| Headers | `MCP-Protocol-Version`, `Mcp-Method`, y `Mcp-Name` en `tools/call` — **obligatorios y validados contra el cuerpo** | ninguno |
+| `params._meta` | `protocolVersion` y `clientCapabilities` **obligatorios** | no se pide |
+| Sesión | ninguna | ninguna |
+
+#### Métodos
+
+`tools/list`, `tools/call`, `ping`, y `initialize` **solo** en la era del handshake.
+
+**La v1 tiene UNA tool: `list_databases`**, que lee el inventario y **no abre ninguna conexión a
+los motores**. Devuelve por base: `database_id`, `name`, `engine`, `environment`, `blueprint`,
+`applied_version`. Faltan `list_objects`, `get_schema` y `check_freshness`.
+
+#### Status HTTP: es parte del contrato, no un detalle
+
+| Caso | Status | Cuerpo |
+|---|---|---|
+| request atendido | `200` | `result` con `resultType: "complete"` y `_meta.serverInfo` |
+| **notificación** (sin `id`) | `202` | **vacío** — JSON-RPC prohíbe responderla |
+| método desconocido | `404` | `-32601` |
+| headers que no calzan con el cuerpo | `400` | `-32020` `HeaderMismatch` |
+| versión no soportada | `400` | `-32022`, con `data.supported` |
+| falta un `_meta` obligatorio | `400` | `-32602` |
+| `Origin` presente y ajeno | `403` | — |
+| `GET` o `DELETE` al endpoint | `405` | — |
+| cuerpo > 256 KiB | `413` | — |
+| credencial inválida | `401` | `mcp.token_invalid`, **un solo código opaco** |
+
+**`Origin` ausente NO rechaza**: un cliente que no es un navegador no lo manda y no está sujeto a
+DNS rebinding. Se rechaza un `Origin` **presente y ajeno**, que es la señal positiva.
+
+#### Errores: protocolo vs. tool
+
+| Dónde | Cuándo |
+|---|---|
+| campo `error` de JSON-RPC | el mensaje está mal formado o pide algo que no existe |
+| `result` con `isError: true` | la operación se entendió y se negó (`mcp.scope_denied`, `mcp.not_found`, …) |
 
 Mezclarlos rompe el cliente de dos maneras: un error de tool en `error` hace que el agente crea
 que el servidor está roto y **reintente**; uno de protocolo en `result` hace que lo muestre como
 contenido.
 
-**Un solo código opaco para toda credencial inválida** (`mcp.token_invalid`): inexistente,
-expirado, revocado y malformado responden igual.
+### 9.3 El gate: niega por default, y hay que abrirlo base por base
+
+Para que una base aparezca hacen falta **las cinco**:
+
+1. pertenece al **proyecto del token**;
+2. **su blueprint pertenece a un solo proyecto** — un blueprint compartido deja la base fuera del
+   alcance de *todos* los agentes;
+3. tiene `environment_id` (una base sin clasificar nunca es alcanzable);
+4. su entorno tiene `allows_agent_access = true`;
+5. la base tiene `agent_access_allowed = true` y `agent_access_blocked = false`.
+
+La condición 2 no estaba y era una **fuga cross-tenant**: `managed_databases` no tiene
+`project_id`, así que el alcance se resolvía por el pivote de blueprints — que es N:M por diseño —
+y un token de un cliente veía nombres, entorno y versión de las bases de otro.
+
+**Cómo se abre** (todo detrás de `gateway.admin`):
+
+```
+PATCH /environments/{id}   {"allows_agent_access": true}   + ?confirm_slug=<slug>
+PUT   /managed-databases/{id}/agent-access   {"allowed": true, "blocked": false}
+```
+
+Encender el flag del entorno **exige `confirm_slug`**: habilita una superficie de lectura nueva
+sobre bases de terceros, así que cuenta como debilitamiento de la política igual que apagar el
+bloqueo de destructivas. Y abrir una base se audita **fail-closed**: si el rastro no se puede
+persistir, la apertura no ocurre.
+
+**Las tres columnas nacen en `false`**, y la asimetría está en el DDL. **El opt-in por base es el
+eje que decide el alcance, no el veto**: con solo un opt-out, habilitar un entorno abriría de golpe
+todas sus bases — incluidas las que nadie revisó. `agent_access_blocked` es el veto de emergencia
+y **no tiene override**: ni `force`, ni nada.
+
+**El listado nunca enumera lo negado.** Una base de otro proyecto simplemente no está.
+
+### 9.4 Topes
+
+| Tope | Default | Variable |
+|---|---|---|
+| objetos por respuesta, **antes** de consultar | 500 | `MCP_MAX_OBJECTS` |
+| bytes de la respuesta, después de serializar | 512 KiB | — |
+| cuerpo del request | 256 KiB | `MCP_MAX_BODY_KIB` |
+| tasa, **por token** | 120/min | `MCP_RATE_LIMIT` |
+
+Los topes de tamaño **cortan con un error y nunca truncan**: una lista cortada le haría creer al
+agente que no hay más, y un JSON cortado que parsea a medias le haría creer que el esquema es más
+chico de lo que es. El límite de tasa es **por token y no por IP** porque un agente en CI comparte
+IP con todos los demás jobs.
 
 ### 9.5 Lo que el MCP nunca va a hacer
 

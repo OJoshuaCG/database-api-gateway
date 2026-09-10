@@ -155,6 +155,16 @@ class _Request:
 
 def _parametrize_cases(fn):
     """Producto cartesiano de las marcas `@pytest.mark.parametrize`."""
+    def _es_param(v) -> bool:
+        """
+        ``True`` solo si es un ``pytest.param``, no cualquier cosa con ``.values``.
+
+        Se pide `.values` **y** `.marks`: los dos juntos identifican al `ParameterSet` de pytest
+        y ningún tipo común de Python los tiene a la vez. Mirar solo `.values` clasificaba un
+        `dict` como parámetro.
+        """
+        return hasattr(v, "values") and hasattr(v, "marks")
+
     marcas = [m for m in getattr(fn, "pytestmark", []) if m.name == "parametrize"]
     casos = [{}]
     for m in reversed(marcas):
@@ -164,7 +174,12 @@ def _parametrize_cases(fn):
         nuevos = []
         for base in casos:
             for v in argvalues:
-                vals = list(v.values) if hasattr(v, "values") else (
+                # `_es_param` y no `hasattr(v, "values")`: un **dict** también tiene
+                # `.values`, así que un caso parametrizado con un dict como valor se
+                # interpretaba como un `pytest.param` y explotaba con
+                # `TypeError: 'builtin_function_or_method' object is not iterable`. Lo
+                # encontró un test real con `@parametrize("params", [..., {"a": 1}])`.
+                vals = list(v.values) if _es_param(v) else (
                     list(v) if len(nombres) > 1 else [v])
                 nuevos.append({**base, **dict(zip(nombres, vals))})
         casos = nuevos
