@@ -18,7 +18,7 @@ from app.core.versioned_app import (
     create_versioned_app,
 )
 from app.routes.health import router as health_router
-from app.mcp.app_factory import create_mcp_app
+from app.mcp.app_factory import McpPathNormalizer, create_mcp_app
 from app.routes.v1.routes import router as v1_router
 from app.services.charset_catalog import seed_charset_options
 from app.services.db_admin import migration_results
@@ -219,6 +219,10 @@ app.mount("/api/v1", v1_app)
 # recibe 503 desde el choke point único.
 mcp_app = create_mcp_app()
 app.mount("/mcp", mcp_app)
+# `POST /mcp` (sin barra) es la URL natural de un `.mcp.json`, y `Mount` no la matchea: el
+# router externo emitiría un 307 que algunos clientes reintentan SIN el header
+# `Authorization`. Este shim las hace equivalentes en vez de redirigir. Ver su docstring.
+app.add_middleware(McpPathNormalizer)
 
 # === API v2 (ejemplo — descomentar cuando sea necesario)
 # from app.routes.v2.routes import router as v2_router

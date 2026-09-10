@@ -18,14 +18,10 @@ from typing import Any
 
 from app.core.actor import Actor
 from app.exceptions import AppHttpException
-from app.mcp import jsonrpc
+from app.mcp import jsonrpc, protocol
 from app.mcp.context import ToolContext
 from app.mcp.registry import BY_NAME, TOOLS
 from app.services import audit
-
-#: Versión del protocolo que este servidor habla. Se declara y no se refleja lo que mande el
-#: cliente: reflejarlo es cómo un servidor "soporta" una versión que no implementó.
-PROTOCOL_VERSION = "2024-11-05"
 
 #: Tope de bytes de la respuesta de una tool, **después** de serializar. El tope de objetos
 #: (antes de consultar) es responsabilidad de cada tool; éste es la red de abajo, para el caso
@@ -36,7 +32,7 @@ PROTOCOL_VERSION = "2024-11-05"
 MAX_RESULT_BYTES = 512 * 1024
 
 
-def _server_info() -> dict:
+def server_info() -> dict:
     from app.core.environments import APP_NAME
 
     return {"name": f"{APP_NAME} MCP", "version": "1"}
@@ -50,82 +46,204 @@ def _tool_descriptor(spec) -> dict:
     }
 
 
-def handle(payload: Any, actor: Actor) -> dict:
-    """
-    Procesa un mensaje JSON-RPC. Devuelve el dict de respuesta.
+def _ok(rid: Any, result: dict) -> protocol.Respuesta:
+    """200 con el ``result`` completado (``resultType`` + ``_meta.serverInfo``)."""
+    return protocol.Respuesta(
+        200, jsonrpc.ok(rid, protocol.envolver_result(result, server_info=server_info()))
+    )
 
-    Nunca levanta: todo termina en una respuesta JSON-RPC bien formada. Un 500 en este canal es
-    un cliente MCP que se cuelga sin decir por qué.
+
+def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Respuesta:
+    """
+    Procesa un mensaje JSON-RPC y devuelve **status HTTP y cuerpo**.
+
+    El status es parte del contrato en esta revisión, no un detalle: una notificación es ``202``
+    sin cuerpo, un método desconocido es ``404``, una validación de headers es ``400``. Un
+    servidor que contestara ``200`` a todo sería inválido incluso con el JSON correcto.
+
+    Nunca levanta: todo termina en una respuesta bien formada. Un 500 en este canal es un
+    cliente MCP que se cuelga sin decir por qué.
     """
     if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0":
-        return jsonrpc.error(None, jsonrpc.INVALID_REQUEST, "Mensaje JSON-RPC 2.0 inválido.")
+        return protocol.Respuesta(
+            400,
+            jsonrpc.error(None, jsonrpc.INVALID_REQUEST, "Mensaje JSON-RPC 2.0 inválido."),
+        )
+
+    stateless = protocol.es_stateless(headers)
+
+    # UNA NOTIFICACIÓN NO SE RESPONDE. JSON-RPC define una notificación como un request SIN
+    # `id` y prohíbe contestarla; sobre HTTP, la spec pide **202 sin cuerpo**.
+    #
+    # Es la regla que este servidor violaba de la forma más visible: todo cliente de la era del
+    # handshake manda `notifications/initialized` inmediatamente después de `initialize`, y
+    # recibía un `-32601` con `id: null`. Un cliente estricto lo lee como servidor roto en el
+    # primer intercambio.
+    #
+    # Vale para TODA notificación, conocida o no: las que vengan en versiones futuras tienen que
+    # poder ignorarse en silencio.
+    if "id" not in payload:
+        return protocol.Respuesta(202)
 
     rid = payload.get("id")
+    # `id` nulo está prohibido en MCP, a diferencia de JSON-RPC pelado.
+    if rid is None:
+        return protocol.Respuesta(
+            400, jsonrpc.error(None, jsonrpc.INVALID_REQUEST, "El 'id' no puede ser nulo.")
+        )
+
     metodo = payload.get("method")
 
+    if stateless:
+        rechazo = protocol.validar(payload, headers)
+        if rechazo is not None:
+            return rechazo
+
+    # `initialize` y `notifications/initialized` NO existen en la era stateless. Aceptarlos ahí
+    # sería anunciar un handshake que el protocolo retiró, y un cliente moderno que por error lo
+    # llame tiene que enterarse.
     if metodo == "initialize":
-        return jsonrpc.ok(
+        if stateless:
+            return protocol.Respuesta(
+                404,
+                jsonrpc.error(
+                    rid,
+                    jsonrpc.METHOD_NOT_FOUND,
+                    (
+                        "Esta revisión del protocolo no tiene handshake: el contexto viaja en "
+                        "_meta de cada request."
+                    ),
+                ),
+            )
+        pedida = (payload.get("params") or {}).get("protocolVersion")
+        acordada = pedida if pedida in protocol.SUPPORTED_VERSIONS else protocol.LATEST_VERSION
+        return _ok(
             rid,
             {
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": acordada,
                 # Solo `tools`. No se declara `resources` ni `prompts` porque no están
                 # implementados, y declarar una capability vacía hace que el cliente la
                 # consulte y reciba un método desconocido.
                 "capabilities": {"tools": {}},
-                "serverInfo": _server_info(),
+                "serverInfo": server_info(),
             },
         )
 
+    if metodo == "ping":
+        # Utilidad del protocolo que cualquiera de los dos lados puede mandar y que los clientes
+        # usan como keepalive. Sin implementarla, un `-32601` le dice al cliente que la conexión
+        # está rota. Responde un result VACÍO, que es lo que la spec define.
+        return _ok(rid, {})
+
     if metodo == "tools/list":
-        return jsonrpc.ok(rid, {"tools": [_tool_descriptor(t) for t in TOOLS]})
+        return _ok(rid, {"tools": [_tool_descriptor(t) for t in TOOLS]})
 
     if metodo != "tools/call":
-        return jsonrpc.error(rid, jsonrpc.METHOD_NOT_FOUND, f"Método desconocido: {metodo!r}.")
+        # 404 y no 200: es lo que la spec pide para un método que el servidor no implementa, y
+        # es lo que le permite a un cliente moderno distinguir este caso de un 404 de un
+        # servidor legado que no hospeda el endpoint — el cuerpo lleva un error reconocible.
+        return protocol.Respuesta(
+            404,
+            jsonrpc.error(rid, jsonrpc.METHOD_NOT_FOUND, f"Método desconocido: {metodo!r}."),
+        )
 
-    params = payload.get("params") or {}
+    params = payload.get("params")
+    # `isinstance` y no `or {}`: un `params` truthy que no sea dict —una cadena, un número, una
+    # lista— pasaba el `or` y reventaba en el `.get()` de la línea siguiente con un 500. El
+    # docstring de esta función promete "nunca levanta" y no era cierto: `params: "x"` daba
+    # `AttributeError` y, con `APP_ENV=development`, el handler genérico devolvía archivo,
+    # función, línea Y la línea de código al agente — o sea al contexto de un modelo.
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return protocol.Respuesta(
+            200, jsonrpc.error(rid, jsonrpc.INVALID_PARAMS, "'params' tiene que ser un objeto.")
+        )
+
     nombre = params.get("name")
+    # Y el nombre tiene que ser un STRING antes de tocar el dict: con una lista o un dict,
+    # `BY_NAME.get(nombre)` levantaba `TypeError: unhashable type`. Mismo 500, otra puerta.
+    if not isinstance(nombre, str):
+        return protocol.Respuesta(
+            200,
+            jsonrpc.error(
+                rid, jsonrpc.INVALID_PARAMS, "'params.name' tiene que ser una cadena."
+            ),
+        )
+
     spec = BY_NAME.get(nombre)
     if spec is None:
-        # Método desconocido es PROTOCOLO; una tool desconocida también, porque el agente pidió
-        # algo que `tools/list` no publica: es un bug del cliente, no una negación de acceso.
-        return jsonrpc.error(rid, jsonrpc.METHOD_NOT_FOUND, f"Tool desconocida: {nombre!r}.")
+        # `-32602` y no `-32601`: la spec clasifica "tool desconocida" como problema de
+        # PARÁMETROS, no de método — el método `tools/call` existe. Y sigue siendo error de
+        # protocolo y no de tool, porque el agente pidió algo que `tools/list` no publica: es un
+        # bug del cliente, no una negación de acceso.
+        return protocol.Respuesta(
+            200, jsonrpc.error(rid, jsonrpc.INVALID_PARAMS, f"Tool desconocida: {nombre!r}.")
+        )
 
     argumentos = params.get("arguments") or {}
     if not isinstance(argumentos, dict):
-        return jsonrpc.error(rid, jsonrpc.INVALID_PARAMS, "'arguments' tiene que ser un objeto.")
+        return protocol.Respuesta(
+            200,
+            jsonrpc.error(rid, jsonrpc.INVALID_PARAMS, "'arguments' tiene que ser un objeto."),
+        )
+
+    # El schema de entrada es CERRADO y hay que hacerlo cumplir, no solo publicarlo: un
+    # `additionalProperties: false` que el servidor no valida es una promesa que el cliente lee
+    # y el servidor no sostiene — y la diferencia entre lo que el operador cree que pidió y lo
+    # que se ejecutó vive exactamente ahí.
+    permitidas = set((spec.input_schema.get("properties") or {}).keys())
+    if spec.input_schema.get("additionalProperties") is False:
+        sobrantes = sorted(set(argumentos) - permitidas)
+        if sobrantes:
+            return protocol.Respuesta(
+                200,
+                jsonrpc.error(
+                    rid,
+                    jsonrpc.INVALID_PARAMS,
+                    f"Argumentos no declarados en el schema de {spec.name!r}: {sobrantes}.",
+                ),
+            )
 
     try:
         resultado = spec.handler(ToolContext(actor=actor), argumentos)
     except AppHttpException as exc:
         # LA traducción que este módulo existe para hacer: la negación del gate viaja como
-        # contenido, con su código del vocabulario cerrado.
+        # contenido de TOOL, con su código del vocabulario cerrado. Un error de tool en el campo
+        # `error` haría que el agente crea que el servidor está roto y reintente.
         codigo = (exc.public_context or {}).get("code") or "mcp.error"
         _audit(spec.name, actor, ok=False, detail=f"denegado: {codigo}")
-        return jsonrpc.tool_error(rid, codigo, exc.message)
+        return _ok(rid, jsonrpc.tool_error_result(codigo, exc.message))
     except Exception:  # noqa: BLE001 — ver el comentario
-        # Cualquier otra cosa NO puede salir con detalle: un traceback o un `str(exc)` del
-        # motor por este canal termina en el contexto de un modelo y de ahí en la pantalla de
+        # Cualquier otra cosa NO puede salir con detalle: un traceback o un `str(exc)` del motor
+        # por este canal termina en el contexto de un modelo y de ahí en la pantalla de
         # cualquiera. El detalle va al log con el Request ID, que es la regla del repo.
         from app.core.logger import get_logger
 
         get_logger(__name__).exception("Fallo no esperado en la tool %s", spec.name)
         _audit(spec.name, actor, ok=False, detail="fallo interno")
-        return jsonrpc.error(rid, jsonrpc.INTERNAL_ERROR, "Fallo interno del servidor MCP.")
+        return protocol.Respuesta(
+            200, jsonrpc.error(rid, jsonrpc.INTERNAL_ERROR, "Fallo interno del servidor MCP.")
+        )
 
-    serializado = json.dumps(resultado, ensure_ascii=False, default=str)
+    payload_tool = jsonrpc.tool_result_payload(resultado)
+    serializado = json.dumps(payload_tool, ensure_ascii=False, default=str)
     if len(serializado.encode("utf-8")) > MAX_RESULT_BYTES:
         _audit(spec.name, actor, ok=False, detail="excedió el presupuesto de bytes")
-        return jsonrpc.tool_error(
+        return _ok(
             rid,
-            "mcp.result_too_large",
-            (
-                "El resultado supera el tope de la respuesta. Acotá la consulta: no se trunca "
-                "a propósito, porque un JSON cortado haría creer que el esquema es más chico."
+            jsonrpc.tool_error_result(
+                "mcp.result_too_large",
+                (
+                    "El resultado supera el tope de la respuesta. Acotá la consulta: no se "
+                    "trunca a propósito, porque un JSON cortado haría creer que el esquema es "
+                    "más chico."
+                ),
             ),
         )
 
     _audit(spec.name, actor, ok=True, detail=f"{len(serializado)} bytes")
-    return jsonrpc.tool_result(rid, resultado)
+    return _ok(rid, payload_tool)
 
 
 def _audit(tool: str, actor: Actor, *, ok: bool, detail: str) -> None:

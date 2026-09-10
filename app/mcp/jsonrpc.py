@@ -37,31 +37,35 @@ def error(request_id: Any, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-def tool_result(request_id: Any, payload: dict) -> dict:
+def tool_result_payload(payload: dict) -> dict:
     """
-    Resultado de una tool que salió bien.
+    El ``result`` de una tool que salió bien. Lo envuelve ``dispatch``, que le agrega
+    ``resultType`` y ``_meta``.
 
-    El contenido va como un bloque de texto con el JSON serializado, que es la forma que el
-    protocolo define y que todo cliente sabe renderizar. El objeto estructurado va **además**
-    en ``structuredContent``, para los clientes que lo soportan.
+    El contenido va como un bloque de texto con el JSON serializado —la forma que el protocolo
+    define y que todo cliente sabe renderizar— y **además** como objeto en
+    ``structuredContent``. Las dos, y no una: la spec pide que una tool con contenido
+    estructurado devuelva igual el JSON serializado en un bloque de texto, para los clientes
+    que no lo soportan.
     """
     import json
 
-    return ok(
-        request_id,
-        {
-            "content": [
-                {"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str)}
-            ],
-            "structuredContent": payload,
-            "isError": False,
-        },
-    )
+    return {
+        "content": [
+            {"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str)}
+        ],
+        "structuredContent": payload,
+        "isError": False,
+    }
 
 
-def tool_error(request_id: Any, code: str, message: str) -> dict:
+def tool_error_result(code: str, message: str) -> dict:
     """
-    Error de TOOL: va en ``result`` con ``isError: true``, no en ``error``.
+    El ``result`` de una tool que falló: ``isError: true``, **no** el campo ``error``.
+
+    La distinción no es estética. Un error de tool en ``error`` hace que el agente crea que el
+    servidor está roto y **reintente**; y un error de protocolo en ``result`` hace que lo
+    interprete como contenido y se lo muestre al usuario como si fuera una respuesta.
 
     Lleva el ``code`` del vocabulario cerrado además del mensaje, porque el agente puede
     reaccionar a un código y no a una frase — y porque el mensaje está en español para el
@@ -70,13 +74,8 @@ def tool_error(request_id: Any, code: str, message: str) -> dict:
     import json
 
     payload = {"error": {"code": code, "message": message}}
-    return ok(
-        request_id,
-        {
-            "content": [
-                {"type": "text", "text": json.dumps(payload, ensure_ascii=False)}
-            ],
-            "structuredContent": payload,
-            "isError": True,
-        },
-    )
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
+        "structuredContent": payload,
+        "isError": True,
+    }

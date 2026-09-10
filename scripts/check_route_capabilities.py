@@ -107,6 +107,8 @@ PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
 #: agentes: sin eso, esta lista sería un agujero con nombre elegante.
 AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
+        # UNA sola entrada: `POST /mcp` (sin barra) llega acá reescrito por
+        # `McpPathNormalizer`, no como una ruta aparte. Ver su docstring.
         ("POST", "/mcp/"),
     }
 )
@@ -116,7 +118,7 @@ AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
 NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset()
 
 #: Cuántas rutas declaran capacidad. **Solo puede SUBIR.** Ver "EL TRINQUETE".
-MIN_MIGRATED_ROUTES = 167
+MIN_MIGRATED_ROUTES = 168
 
 
 def _iter_routes(app, prefix: str = ""):
