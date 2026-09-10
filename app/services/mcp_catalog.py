@@ -30,6 +30,10 @@ CODE_ENV_DENIES = "mcp.environment_denies_agents"
 CODE_NOT_OPTED_IN = "mcp.database_not_opted_in"
 CODE_BLOCKED = "mcp.database_blocked"
 
+#: Tope de objetos superado. Se corta con un ERROR y nunca truncando: una lista cortada le hace
+#: creer al agente que no hay más, que es peor que un fallo.
+CODE_TOO_MANY_OBJECTS = "mcp.too_many_objects"
+
 #: --- Referencias ---------------------------------------------------------- #
 #: v1 NO acepta referencia cruda (`server_id` + nombre) y se rechaza ANTES de cualquier lookup.
 #: La referencia cruda existe para flujos de adopción y legado de la SPA; para un agente es puro

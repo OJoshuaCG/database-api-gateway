@@ -410,6 +410,16 @@ MCP_ENABLED = os.getenv("MCP_ENABLED", "false").lower() == "true"
 # Tope de vida de un token de agente. Sin tokens perpetuos: un token vive en un `.mcp.json` del
 # repo de otra gente, o sea es la credencial con más chance de terminar commiteada.
 MCP_TOKEN_MAX_TTL_DAYS = int(os.getenv("MCP_TOKEN_MAX_TTL_DAYS", "90"))
+# Tope de objetos que una tool puede devolver, evaluado ANTES de materializarlos. El presupuesto
+# de bytes del dispatch corre después de serializar, así que sin este tope el proceso paga el
+# costo completo de la consulta para después descartarla.
+MCP_MAX_OBJECTS = int(os.getenv("MCP_MAX_OBJECTS", "500"))
+# Tope del cuerpo de un mensaje JSON-RPC, en KiB. Un mensaje legítimo son kilobytes; sin este
+# tope, `await request.json()` bufferea en memoria lo que le manden.
+MCP_MAX_BODY_KIB = int(os.getenv("MCP_MAX_BODY_KIB", "256"))
+# Límite de tasa del endpoint MCP, por TOKEN. Por IP no sirve: un agente en CI comparte IP con
+# todos los demás jobs.
+MCP_RATE_LIMIT = os.getenv("MCP_RATE_LIMIT", "120/minute")
 
 # ======= Startup validation ======= #
 if not SECRET_KEY:

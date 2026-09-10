@@ -15,6 +15,24 @@ niega siempre y tres columnas sin escritor — la regla de "cero flags inertes" 
 La tool de la v1 que ya funciona (``list_databases``) **no toca ningún motor**: lee el inventario
 del gateway. Así que lo que hace falta es el filtro de alcance, y es lo que hay acá.
 
+EL ALCANCE DEL TOKEN ES POR PROYECTO, Y EL PIVOTE ES N:M
+--------------------------------------------------------
+Acá hubo una fuga real, encontrada en auditoría y reproducida: ``managed_databases`` **no tiene
+``project_id``**, así que la única vía para saber qué proyecto alcanza una base es el pivote
+``project_database_models`` — y ese pivote es N:M **por diseño**, porque el propio
+``app/models/project.py`` declara que "una BD compartida entre iniciativas es el caso normal".
+
+Consecuencia: con un blueprint vinculado a los proyectos A y B, un token acotado a A veía las
+bases de B —nombre, entorno y versión aplicada— porque comparten el blueprint. Es reconocimiento
+cross-tenant, y el operador de B había puesto el opt-in creyendo que habilitaba a *su* agente.
+
+**El arreglo es fail-closed y no una heurística: una base solo es alcanzable si su blueprint
+pertenece a EXACTAMENTE UN proyecto, y ese proyecto es el del token.** Un blueprint compartido
+deja la base fuera del alcance de todos los agentes, incluido el del proyecto que "debería"
+verla. Es más restrictivo que lo que alguien podría querer, y es lo correcto mientras el modelo
+no tenga forma de expresar *para qué proyecto* se abrió una base — eso pide una columna y va
+anotado como follow-up, no resuelto a ojo acá.
+
 EL ORDEN ES AUTORIZACIÓN PRIMERO, POLÍTICA DESPUÉS
 --------------------------------------------------
 Y no de más barato a más caro. Ver el docstring de ``app/services/mcp_catalog.py``: los ejes son
@@ -84,7 +102,10 @@ def reachable_databases(actor: Actor) -> list[ReachableDatabase]:
     habilitar un entorno abriría de golpe todas sus bases, incluidas las que nadie revisó y las
     que se creen después.
     """
+    from sqlalchemy import func
+
     from app.core.database import Database
+    from app.core.environments import MCP_MAX_OBJECTS
     from app.models.database_model import DatabaseModel
     from app.models.environment import Environment
     from app.models.managed_database import ManagedDatabase
@@ -95,6 +116,15 @@ def reachable_databases(actor: Actor) -> list[ReachableDatabase]:
 
     session = Database().get_declarative_base_session()
     try:
+        # Blueprints que pertenecen a EXACTAMENTE un proyecto. Es la mitad del arreglo de la
+        # fuga cross-proyecto: sin esto, un blueprint compartido entre dos proyectos hace que el
+        # token de uno alcance las bases del otro.
+        exclusivos = (
+            session.query(ProjectDatabaseModel.model_id)
+            .group_by(ProjectDatabaseModel.model_id)
+            .having(func.count(func.distinct(ProjectDatabaseModel.project_id)) == 1)
+            .subquery()
+        )
         filas = (
             session.query(ManagedDatabase, Server, DatabaseModel, Environment)
             .join(Server, Server.id == ManagedDatabase.server_id)
@@ -108,14 +138,33 @@ def reachable_databases(actor: Actor) -> list[ReachableDatabase]:
                 # Eje 3 — el proyecto del token. Es un JOIN y no un filtro posterior: así una
                 # base de otro proyecto simplemente no está, en vez de estar y ser negada.
                 ProjectDatabaseModel.project_id == actor.project_id,
+                # …y su blueprint no puede estar compartido con otro proyecto. Las dos
+                # condiciones juntas son el alcance real; la primera sola es la fuga.
+                ManagedDatabase.model_id.in_(session.query(exclusivos.c.model_id)),
                 # Ejes 6, 7 y 8.
                 Environment.allows_agent_access.is_(True),
                 ManagedDatabase.agent_access_allowed.is_(True),
                 ManagedDatabase.agent_access_blocked.is_(False),
             )
             .order_by(ManagedDatabase.name)
+            # Tope de objetos ANTES de materializar. El presupuesto de bytes del dispatch corre
+            # después de serializar, así que sin esto un proyecto con miles de bases hace que el
+            # proceso construya N×4 objetos ORM para después descartarlos — 636 ms de CPU por
+            # cada 120 bytes de request, medido. Se pide uno más que el tope para poder
+            # distinguir "justo el tope" de "se pasó".
+            .limit(MCP_MAX_OBJECTS + 1)
             .all()
         )
+        if len(filas) > MCP_MAX_OBJECTS:
+            raise AppHttpException(
+                message=(
+                    f"El proyecto tiene más de {MCP_MAX_OBJECTS} bases alcanzables. Acotá el "
+                    "alcance del token a un proyecto más chico: no se trunca a propósito, "
+                    "porque una lista cortada le haría creer al agente que no hay más."
+                ),
+                status_code=413,
+                public_context={"code": codes.CODE_TOO_MANY_OBJECTS},
+            )
         # El eje 5 (base sin entorno) no necesita filtro propio: el `join` con `Environment` ya
         # excluye las que tienen `environment_id` nulo. Se declara porque su ausencia parece un
         # olvido y no lo es.
@@ -124,7 +173,9 @@ def reachable_databases(actor: Actor) -> list[ReachableDatabase]:
                 database_id=bd.id,
                 database=bd.name,
                 server_id=srv.id,
-                engine=str(srv.engine),
+                # `.value` y no `str()`: `EngineType` es `str, Enum` y `Enum.__str__` gana, así
+                # que `str()` devolvía "EngineType.mysql" — y eso es lo que veía el agente.
+                engine=srv.engine.value if hasattr(srv.engine, "value") else str(srv.engine),
                 environment_slug=env.slug,
                 model_id=bd.model_id,
                 model_slug=modelo.slug if modelo else None,
