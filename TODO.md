@@ -161,6 +161,7 @@ los bugs corregidos) vive en `CLAUDE.md` y en `docs/features/`.
 
 | Fecha | Ítem | Estado de verificación |
 | --- | --- | --- |
+| 2026-09-09 | **Validación del MCP contra la especificación y auditoría de seguridad** (`T-260909-ojoshuac-validacion-mcp`). Diez iteraciones, **11 defectos** encontrados y cerrados. El servidor pasaba 29/29 sus tests de lógica y **no habría conectado con un cliente moderno**: la revisión `2026-07-28` **retiró el handshake `initialize`** y él solo hablaba la era vieja, contestaba un error a `notifications/initialized` —que JSON-RPC prohíbe responder y todo cliente manda como segundo mensaje—, no implementaba `ping`, devolvía `200` a todo y le faltaba `resultType`. La auditoría encontró además una **fuga cross-tenant** (un blueprint compartido entre dos proyectos hacía que el token de uno viera las bases del otro), 500s con traceback al agente, cero límites de tasa y cuerpo, y que la autenticación de agentes **no dejaba ningún rastro**. Detalle abajo. | **40/40 en una sonda contra un proceso uvicorn REAL** (las dos eras del protocolo). `test_mcp_protocol` 27/27 (nuevo), `test_mcp_server` 29/29, `test_mcp_import_guard` 35/35, más 8 módulos vecinos. Los tres guards en verde. `ruff check .` limpio. **La sonda del transporte NO está automatizada** — `TestClient` no ejercita redirecciones ni proxies. **Nada contra un cliente MCP real** ni contra motores. `pytest` no se corrió |
 | 2026-09-09 | **Sesiones server-side, CSRF, usuarios del gateway y el servidor MCP** (`T-260909-ojoshuac-sesiones-usuarios-y-mcp`, pasos 6–9 del plan 13 + primera entrega del plan 12). Cierra **cinco defectos vivos** que no estaban en ningún plan: el login delataba qué usuarios existen **por timing**; la cookie de sesión hacía inimplementables la vida absoluta, el logout real y la revocación; `same_site="lax"` es same-**site** y no same-origin; **DOS** GET de exportación mutaban y un `<img>` destruía el artefacto del cliente dejando la entrega registrada contra él; y `bootstrap_admin` estaba anclado al username, así que no reparaba nada. Agrega `/gateway-users` (alta **sin password**, invitación de un solo uso), `/api-tokens` y `POST /mcp/` con una tool. Detalle abajo. | Tres guards en verde: cobertura de autorización (**167 con capacidad, 4 públicas, 1 de agente, 0 sin guard, 0 capacidad muerta**), grafo de migraciones (35 revisiones, head único) y tope de `CLAUDE.md`. **~1.000 checks** por ejecución directa; 10 archivos de tests nuevos (149 casos). Cuatro migraciones con ciclo upgrade → downgrade −1 → upgrade contra **SQLite** y `alembic check` sin deriva nueva (una apareció y se corrigió). `ruff check .` limpio. **`pytest` NO se corrió** (deny del repo) y **nada contra motores reales** |
 | 2026-09-09 | **Autorización por capacidades: 154 rutas, vocabulario cerrado y cuatro agujeros cerrados** (`T-260909-ojoshuac-autorizacion-por-capacidades`, pasos 0–5 del plan 13). Antes, un endpoint solo exigía **sesión válida**: quien entraba podía todo. Ahora cada ruta declara **una capacidad** de un catálogo cerrado de 29, con roles `viewer ⊆ operator ⊆ owner` y dos capacidades globales ortogonales. `AdminDep` **se retiró** (no se deprecó) para que un endpoint nuevo copiado de uno viejo falle al importar. Guard de cobertura bloqueante en CI: **0 rutas sin guard, 0 capacidad muerta**. Detalle abajo. | Guards: `check_route_capabilities` (154/3/0/0) y `check_migration_graph` (31 revisiones, head único) en verde. **~700 checks** por ejecución directa en 30 módulos, incluidos 51 del catálogo, 13 de los guards por payload y 8 de atribución de auditoría. `ruff check .` limpio. **`pytest` NO se corrió** (deny del repo): sin él quedan sin ver los `parametrize` y las fixtures de scope module/session. **Nada contra motores reales.** La migración `c8d9e0f1a2b3` solo hizo ciclo en SQLite (hereda `P-10`) |
 | 2026-08-25 | **CI: el repo tiene gate** (`P-15`). Cierra el hallazgo de fondo de `T-260825-lz-sanear-verificacion`: sin gate la suite se degradaba en silencio. **`ci.yml`** con 5 jobs — Ruff bloqueante, Ruff informativo, `actionlint` sobre los propios workflows, la suite completa con **`pytest` de verdad**, y `detect-secrets`. **`migrations-apply.yml`** aplica las migraciones contra **MariaDB y PostgreSQL efímeros**, que es lo que `migration-graph.yml` no puede ver (lee el grafo con `ast`, no ejecuta DDL); incluye `downgrade -1` y de vuelta, y que la BD quede EN head. **La decisión de diseño:** en CI corre `pytest`, no el arnés — la política de no correrlo es sobre la máquina de quien trabaja y el `deny` es un permiso de Claude Code que no alcanza a un runner; además el arnés no multiplica por `params` ni tiene fixtures de scope module/session, o sea que hay fallas que estructuralmente no puede ver. Escrito en la cabecera del workflow y en `CLAUDE.md` para que nadie "arregle" la contradicción borrando el job. Ruff configurado en `pyproject.toml` con el gate en `F` (20 hallazgos, arreglados) y el set amplio en el job informativo; el mismo guard en `.githooks/pre-push`, sin duplicar reglas. `.secrets.baseline` **se versiona** (estaba en `.gitignore` sin motivo escrito, lo que habría hecho fallar el gate en el primer PR). `permissions: contents: read` en los cuatro workflows y `uv sync --locked` en vez de `--frozen`, que detecta un `pyproject.toml` sin re-lockear. | **1776/1776 + 3 skips** con el arnés, `ruff check .` limpio, `actionlint` limpio (probado que detecta: exit 1 con un error deliberado), `alembic upgrade head` + `downgrade -1` + vuelta **ejecutados contra SQLite local**, `detect-secrets-hook` probado en los dos sentidos (exit 0 limpio, exit 1 con un secreto nuevo), `uv sync --locked` probado en los dos sentidos, y el `pre-push` completo probado en los dos sentidos. **NADA de esto corrió en GitHub Actions**: los workflows están validados estáticamente y con sus comandos ejecutados a mano, pero sin push no hay corrida real, y `pytest` no se pudo ejecutar (deny del repo). Los 3 skips son `test_grants_integration`, sin Docker. |
@@ -767,3 +768,91 @@ tienen sentido antes: sin consumidor serían tres columnas sin lector.
 | `T-260909-ojoshuac-session-cookie-secure` | `SESSION_COOKIE_SECURE=False` en producción sigue siendo WARNING. El plan lo condiciona a que exista multiusuario — que ahora existe — así que pasa a ser candidato a **error de arranque**. No se cambió acá porque convertirlo en un rechazo de arranque puede dejar sin bootear un despliegue que hoy funciona: es decisión del dueño del entorno |
 | `T-260909-ojoshuac-2fa-y-break-glass` | Del paso 8 quedaron fuera, con su porqué: 2FA, el CLI de break-glass **offline** (nunca por HTTP: no hay forma de distinguir al operador de alguien que leyó el entorno en un deploy filtrado), la transferencia de tokens al desactivar a su emisor, y el override de emergencia de la separación de deberes |
 | `T-260909-ojoshuac-step-up` | `requires_step_up` se **publica** en `/auth/me` y **no se exige**. Está declarado en el addendum del contrato para que la SPA no construya un flujo que el servidor no respalda |
+
+---
+
+## Detalle — `T-260909-ojoshuac-validacion-mcp`
+
+Validación del servidor MCP contra la **especificación** y contra una **auditoría de seguridad**.
+Diez iteraciones. Salieron **11 defectos** y están todos cerrados.
+
+### Lo que no funcionaba, y por qué ningún test lo veía
+
+El servidor pasaba `test_mcp_server` 29/29 y **no habría conectado con un cliente moderno**. Los
+tests que había verifican la LÓGICA —el gate, el token, las tools—; lo que fallaba era el
+**contrato del transporte**, y eso `TestClient` no lo ejercita porque corre la app en proceso.
+
+Se encontró con una sonda contra un **uvicorn real**:
+
+1. **Contestaba `-32601` a `notifications/initialized`.** JSON-RPC **prohíbe** responder una
+   notificación, y todo cliente de la era del handshake la manda como **segundo mensaje**: el
+   servidor se veía roto en el primer intercambio.
+2. **No implementaba `ping`**, que los clientes usan como keepalive.
+3. **Devolvía `200` a todo.** El status **es parte del contrato**: `202` notificación, `404`
+   método desconocido, `400` validación, `403` origen ajeno, `413` cuerpo grande.
+4. **Le faltaba `resultType`** (MUST de la spec) y `_meta.serverInfo`.
+5. **No negociaba la versión**: respondía una fija.
+6. **Hablaba solo la era del handshake.** La revisión `2026-07-28` **retiró el `initialize`**, las
+   sesiones de protocolo y el stream por GET. Ahora se detecta la era por la presencia del header
+   `MCP-Protocol-Version` —lo que la spec autoriza— y se hablan las dos.
+7. **`POST /mcp` sin barra daba `307`.** Es la URL natural de un `.mcp.json`, y hay clientes HTTP
+   que **no reenvían `Authorization`** en el salto: el síntoma sería "el token no funciona".
+
+### Lo que la auditoría de seguridad encontró
+
+**Los cuatro bloqueantes, reproducidos de forma independiente antes de arreglarlos:**
+
+1. **Fuga cross-tenant.** `managed_databases` no tiene `project_id`, así que el alcance del token
+   se resolvía por el pivote de blueprints — que es **N:M por diseño**. Con un blueprint
+   compartido entre dos proyectos, el token de uno **veía las bases del otro** con su entorno y
+   su versión aplicada. Arreglo fail-closed: una base solo es alcanzable si su blueprint pertenece
+   a **exactamente un** proyecto.
+2. **`handle()` tiraba 500** con un `params` no-dict o un `params.name` no hasheable, y con
+   `APP_ENV=development` el handler genérico devolvía **archivo, función, línea y código** al
+   agente. El arreglo tuvo que ir en **dos** lados: el validador corre antes del dispatch, así que
+   arreglar uno movía el 500 de lugar.
+3. **Sin límite de tasa, sin tope de cuerpo y sin tope de filas.** Un cuerpo de 20 MB daba `200`;
+   60 bearers inválidos, 60 rechazos sin throttle; y una consulta sin `LIMIT` costaba **636 ms de
+   CPU medidos por cada 120 bytes de request** sobre la misma BD que sirve a la SPA.
+4. **La autenticación de agentes no dejaba ningún rastro.** Ni fallos ni usos. Un token robado
+   podía enumerar toda la superficie de tools sin aparecer en la auditoría.
+
+**Y dos cosas que este proyecto había afirmado y eran falsas:**
+
+- **"Las columnas del gate entran con su escritor y su lector en la misma entrega."** Falso: el
+  único archivo que las mencionaba era el que las **lee**. Abrir una base a los agentes solo se
+  podía con un `UPDATE` a mano, sin actor y sin auditoría — el escenario que el invariante del
+  último administrador declara inaceptable, aplicado a la palanca más sensible de la feature.
+- **El guard de importaciones nombraba las vías de evasión equivocadas.** Decía "por
+  transitividad"; era falso. La que funcionaba era un módulo de la allowlist que **re-exporta** la
+  capa de motor como atributo, y `app.services.audit` lo hacía. Un control cuya autoevaluación
+  apunta al lugar equivocado es peor que uno sin autoevaluación.
+
+### Verificado
+
+- **40/40 en la sonda contra un proceso uvicorn real**, cubriendo las dos eras del protocolo.
+- `test_mcp_protocol` 27/27 (nuevo), `test_mcp_server` 29/29, `test_mcp_import_guard` 35/35, más
+  los 8 módulos vecinos que el cambio toca.
+- Los tres guards del repo en verde.
+- **Un defecto del propio arnés**: trataba cualquier valor con `.values` como un `pytest.param`, y
+  un `dict` también lo tiene, así que un `parametrize` con un dict explotaba.
+
+### Qué quedó SIN verificar
+
+- **`pytest` no se corrió** (deny del repo).
+- **La sonda del transporte NO está automatizada.** `TestClient` no ejercita redirecciones ni el
+  comportamiento de un proxy, así que esa verificación se hizo a mano contra un uvicorn y no
+  quedó en la suite. Es la brecha más importante de esta tanda.
+- **Nada contra un cliente MCP real.** Se validó contra el texto normativo de la spec, no contra
+  Claude Code conectado de verdad.
+- **Nada contra motores reales ni contra MySQL como BD de metadatos.** En particular sin verificar:
+  el `server_default="0"` de los tres booleanos del gate bajo MySQL, y el `UPDATE` amortiguado de
+  `last_used_at` con requests concurrentes del mismo token (en SQLite todo se serializa).
+
+### Follow-ups
+
+| Ítem | Detalle |
+| --- | --- |
+| `T-260909-ojoshuac-mcp-project-por-base` | El arreglo de la fuga es **más restrictivo de lo que alguien podría querer**: un blueprint compartido deja la base fuera del alcance de todos los agentes. Para que el caso compartido funcione hace falta expresar *para qué proyecto* se abrió una base — o sea `managed_databases.project_id`, o un vínculo explícito en el opt-in. Es una decisión de modelo, no un ajuste |
+| `T-260909-ojoshuac-mcp-sonda-en-ci` | Automatizar la sonda del transporte: levantar el proceso y hablarle HTTP de verdad. Es lo único que detecta un `307`, un content-type mal, o un status que no corresponde |
+| `T-260909-ojoshuac-mcp-cliente-real` | Conectar Claude Code contra el servidor y verificar el handshake end to end. La spec se leyó; el cliente no se probó |

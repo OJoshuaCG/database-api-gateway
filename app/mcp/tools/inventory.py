@@ -20,10 +20,11 @@ def list_databases(ctx: ToolContext, params: dict) -> dict:
     doy" sería el mismo oráculo de inventario que el orden de los ejes del gate existe para
     evitar. El agente recibe lo que alcanza y no aprende nada de lo demás.
 
-    Tampoco devuelve ``server_id`` como algo direccionable: viaja porque dos bases del mismo
-    servidor comparten motor y eso es contexto útil para programar, pero **no hay ninguna tool
-    que acepte un ``server_id``** — la referencia cruda (servidor + nombre) es la forma que se
-    escapa del inventario y en la v1 no se acepta.
+    **No devuelve ``server_id``.** El docstring anterior decía que "viaja porque dos bases del
+    mismo servidor comparten motor" y el dict no lo incluía: el código estaba bien y el
+    comentario mentía. No se incluye porque no hay ninguna tool que acepte un ``server_id`` — la
+    referencia cruda (servidor + nombre) es la forma que se escapa del inventario, y en la v1 no
+    se acepta. Un identificador que ninguna tool consume es superficie sin uso.
     """
     bases = ctx.reachable_databases()
     return {
