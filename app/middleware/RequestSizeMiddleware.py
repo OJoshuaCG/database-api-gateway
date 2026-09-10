@@ -30,9 +30,26 @@ class RequestSizeMiddleware(BaseHTTPMiddleware):
         )
     """
 
-    def __init__(self, app, excluded_paths: list[str] | None = None):
+    def __init__(
+        self,
+        app,
+        excluded_paths: list[str] | None = None,
+        max_size_mb: float | None = None,
+    ):
+        """
+        ``max_size_mb`` permite un tope POR INSTANCIA, con default al global.
+
+        Existe porque el endpoint MCP necesita uno mucho más chico que la API: un mensaje
+        JSON-RPC legítimo son kilobytes, mientras la API sube artefactos. Un parámetro con
+        default al valor global es más barato que una segunda implementación de "rechazá un
+        cuerpo grande" — y una segunda implementación es la que se olvida de la estrategia del
+        `Content-Length` ausente.
+        """
         super().__init__(app)
-        self.max_bytes: float = REQUEST_MAX_SIZE_MB * 1024 * 1024
+        self.max_size_mb: float = (
+            REQUEST_MAX_SIZE_MB if max_size_mb is None else max_size_mb
+        )
+        self.max_bytes: float = self.max_size_mb * 1024 * 1024
         self.excluded_paths: list[str] = excluded_paths or []
 
     async def dispatch(self, request: Request, call_next):
@@ -63,7 +80,12 @@ class RequestSizeMiddleware(BaseHTTPMiddleware):
             status_code=413,
             content={
                 "detail": {
-                    "msg": f"El cuerpo de la solicitud supera el límite permitido de {REQUEST_MAX_SIZE_MB}MB",
+                    # El límite EFECTIVO de esta instancia, no el global: con dos topes
+                    # distintos en el proceso, el mensaje tiene que decir cuál se aplicó.
+                    "msg": (
+                        "El cuerpo de la solicitud supera el límite permitido de "
+                        f"{self.max_size_mb}MB"
+                    ),
                     "type": "RequestTooLarge",
                 }
             },

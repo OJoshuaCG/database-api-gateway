@@ -29,7 +29,12 @@ from fastapi import Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from app.core.environments import RATE_LIMIT_DEFAULT, RATE_LIMIT_REDIS_ENABLED, RATE_LIMIT_REDIS_URL
+from app.core.environments import (
+    MCP_RATE_LIMIT,
+    RATE_LIMIT_DEFAULT,
+    RATE_LIMIT_REDIS_ENABLED,
+    RATE_LIMIT_REDIS_URL,
+)
 
 
 def session_or_address(request: Request) -> str:
@@ -56,5 +61,37 @@ def session_or_address(request: Request) -> str:
 limiter = Limiter(
     key_func=session_or_address,
     default_limits=[RATE_LIMIT_DEFAULT],
+    storage_uri=RATE_LIMIT_REDIS_URL if RATE_LIMIT_REDIS_ENABLED else "memory://",
+)
+
+
+def agent_token_key(request) -> str:
+    """
+    Clave del límite de tasa del endpoint MCP: el ``token_id``, y la IP como último recurso.
+
+    **Por token y no por IP**, y es una diferencia de comportamiento, no de estilo: un agente
+    corriendo en CI comparte IP con todos los demás jobs del runner, así que un límite por IP
+    sería colectivo — el primero en gastarlo deja afuera al resto, y el operador no tiene forma
+    de entender por qué.
+
+    Se lee del header y **sin verificar el HMAC**, a propósito: el ``key_func`` corre antes de
+    las dependencias, así que la credencial todavía no está validada. Eso es correcto para
+    limitar — un atacante que rote identificadores inventados solo se reparte su propio cupo, y
+    los que no parsean caen todos juntos en la clave de IP.
+    """
+    crudo = request.headers.get("authorization") or ""
+    if crudo.lower().startswith("bearer "):
+        partes = crudo[7:].strip().split(".")
+        if len(partes) == 3 and partes[0] == "dbgw" and partes[1]:
+            return f"agent:{partes[1]}"
+    return f"ip:{get_remote_address(request)}"
+
+
+#: Limitador propio del endpoint MCP. Instancia aparte y no el `limiter` de la API porque el eje
+#: es otro —el token en vez de la sesión— y compartir instancia haría que un agente y un humano
+#: se pisaran el cupo.
+mcp_limiter = Limiter(
+    key_func=agent_token_key,
+    default_limits=[MCP_RATE_LIMIT],
     storage_uri=RATE_LIMIT_REDIS_URL if RATE_LIMIT_REDIS_ENABLED else "memory://",
 )
