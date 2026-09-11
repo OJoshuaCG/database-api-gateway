@@ -111,6 +111,35 @@ En la pestaña **Domains** del servicio Compose:
 > Dokploy actualiza esta UI con frecuencia; si los nombres de campo difieren de los descritos
 > aquí, el punto fijo es: el servicio a exponer es `api` y el puerto de contenedor es `8000`.
 
+### 4.1 Alcanzar el backend desde otro contenedor: `gateway-api`
+
+El dominio de arriba es para el **tráfico externo**. Otro contenedor de la misma instancia
+—hoy, el del frontend— no debe pasar por ahí: tendría que salir de la red de Docker, llegar a
+la IP pública del host y volver a entrar por Traefik, un rebote que falla en cuanto esa IP es
+de una VPN (Tailscale, WireGuard) o de una LAN detrás de NAT. El síntoma es desconcertante:
+`curl` desde una máquina del equipo funciona, pero el contenedor recibe `502`.
+
+Para eso el servicio `api` publica un alias estable en la red de Dokploy:
+
+```
+http://gateway-api:8000
+```
+
+El alias se declara en `docker-compose.dokploy.yml` y **lo elegimos nosotros**. La alternativa
+sería el nombre del contenedor de compose (`<app>-<hash>-api-1`), pero ese hash lo asigna
+Dokploy al crear la aplicación: sobrevive a los deploys, pero no a borrar y recrear la app
+desde el panel. El alias no depende de nada externo.
+
+`db` y `valkey` **no** están en esa red: siguen sólo en la red interna del compose, que es lo
+que los mantiene fuera de alcance del resto de la instancia.
+
+**Por qué el frontend lo necesita.** Desde la v23 el backend exige el header `X-CSRF-Token` en
+toda escritura de una sesión, y ese token viaja en una cookie *host-only* (el prefijo `__Host-`
+prohíbe el atributo `Domain`). Una SPA servida en otro host no puede leerla con
+`document.cookie`, así que toda escritura muere con `403 auth.csrf_missing`. La SPA resuelve
+eso sirviendo la API bajo su mismo origen mediante un proxy, y ese proxy es quien consume este
+alias. El detalle completo está en `database-api-gateway-frontend/docs/dokploy.md` §3.
+
 ## 5. Verificar el despliegue
 
 ```bash
@@ -225,6 +254,8 @@ Si necesitas levantar el gateway en un VPS sin Dokploy (o con nginx/Certbot manu
 - [ ] `DOCS_ENABLED=False` (o protegido con `DOCS_PASSWORD_ENABLED`)
 - [ ] Deploy completado, `db`/`valkey` healthy, `api` corriendo
 - [ ] Dominio configurado en la pestaña Domains (`api`, puerto `8000`, HTTPS habilitado)
+- [ ] Si hay un frontend en la misma instancia: alcanza al backend por `http://gateway-api:8000`
+      y **no** por el dominio público (ver §4.1)
 - [ ] Se accede siempre por `https://tu-dominio.com` (nunca por IP ni `http://` — la
       cookie de sesión requiere HTTPS en producción, ver [Troubleshooting](#troubleshooting))
 - [ ] `GET /health` y `GET /health/ready` responden `200`
