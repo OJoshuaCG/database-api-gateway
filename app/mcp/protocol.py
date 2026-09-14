@@ -16,11 +16,21 @@ anterior:
   concreta y de seguridad: un balanceador puede rutear por el header mientras el servidor
   ejecuta por el cuerpo, y ahí hay una discrepancia explotable.
 
-CÓMO SE DETECTA LA ERA, Y POR QUÉ ASÍ
--------------------------------------
-Por la **presencia del header ``MCP-Protocol-Version``**, que es lo que la propia spec autoriza:
-un servidor que quiera atender clientes anteriores a ``2025-06-18`` —que no lo definían— *puede*
-tratar un request sin ese header como ``2025-03-26``, o sea la era del handshake.
+CÓMO SE DETECTA LA ERA, Y POR QUÉ NO POR LA PRESENCIA DEL HEADER
+----------------------------------------------------------------
+Por el **valor** del header ``MCP-Protocol-Version``, no por su presencia.
+
+La presencia parece el criterio natural y **es incorrecta**: ese header es obligatorio desde
+``2025-06-18``, que es era del HANDSHAKE. Un cliente con handshake lo manda igual, así que
+tomarlo por moderno lo rechaza con ``-32020`` por un ``_meta`` que su revisión ni define. Eso fue
+exactamente lo que pasó en producción: ningún cliente ``2025-11-25`` podía listar una sola tool.
+
+Lo que la spec sí autoriza es lo otro, y sigue valiendo: un request **sin** el header puede
+tratarse como ``2025-03-26``, porque los clientes anteriores a ``2025-06-18`` no lo definían.
+
+Una versión **desconocida** se trata como moderna a propósito, para contestarle
+``UnsupportedProtocolVersion`` con la lista de las que hablamos —un error moderno reconocible con
+el que puede reintentar— en vez de dejarla caer al ``initialize`` de la era vieja.
 
 Se soportan las dos porque el parque real tiene las dos, y porque el propio documento describe la
 ruta de compatibilidad: un cliente moderno prueba primero lo moderno y, si recibe un ``400`` cuyo
@@ -45,7 +55,16 @@ from typing import Any
 SUPPORTED_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 
 #: Versiones de la era STATELESS: sin handshake, con headers obligatorios y `_meta` por request.
-STATELESS_VERSIONS = frozenset({"2026-07-28", "2025-11-25"})
+#:
+#: **Solo `2026-07-28`.** `2025-11-25` estuvo acá y era un BUG: la spec la clasifica del otro
+#: lado —"handshake-based protocol revisions (`2025-11-25` and earlier)"—, conserva `initialize`
+#: y `Mcp-Session-Id`, y fue `2026-07-28` la que los retiró. El síntoma no era un error de
+#: versión sino un `-32020` por `_meta` faltante, que manda a investigar el header equivocado.
+STATELESS_VERSIONS = frozenset({"2026-07-28"})
+
+#: El complemento: las que SÍ tienen handshake. Se DERIVA en vez de escribirse, porque dos listas
+#: en paralelo se desincronizan en la primera revisión nueva y el fallo vuelve por la otra punta.
+HANDSHAKE_VERSIONS = frozenset(SUPPORTED_VERSIONS) - STATELESS_VERSIONS
 
 LATEST_VERSION = SUPPORTED_VERSIONS[0]
 
@@ -130,12 +149,24 @@ def es_stateless(headers: dict[str, str]) -> bool:
     """
     ``True`` si el request pertenece a la era sin handshake.
 
-    Se decide por la PRESENCIA del header, no por su valor: un valor desconocido igual pertenece
-    a la era nueva —y hay que contestarle ``UnsupportedProtocolVersion``, que es un error moderno
-    reconocible— mientras que su ausencia es un cliente viejo al que hay que dejarle el
-    ``initialize``.
+    Se decide por el VALOR del header, **no por su presencia**. La presencia no sirve como
+    criterio porque el header es obligatorio desde ``2025-06-18``, que es era del handshake: un
+    cliente ``2025-11-25`` lo manda, y tomarlo por moderno lo rechazaba con ``-32020`` por un
+    ``_meta`` que su revisión no define. Ningún cliente de esa revisión podía listar una tool.
+
+    Las tres ramas, y por qué cada una:
+
+    - **Sin header** → handshake. Es lo que la spec autoriza para los clientes anteriores a
+      ``2025-06-18``, que no lo definían.
+    - **Versión con handshake conocida** → handshake, sin exigirle ``_meta``.
+    - **Cualquier otra** —moderna o desconocida— → moderna, para que una versión que no hablamos
+      reciba ``UnsupportedProtocolVersion`` con la lista de las que sí. Ese error es reconocible
+      y le permite reintentar, en vez de caer al ``initialize`` de la era vieja.
     """
-    return _valor_header(headers, H_PROTOCOL_VERSION) is not None
+    version = _valor_header(headers, H_PROTOCOL_VERSION)
+    if version is None:
+        return False
+    return version not in HANDSHAKE_VERSIONS
 
 
 def error(code: int, message: str, *, rid: Any = None, data: dict | None = None) -> dict:

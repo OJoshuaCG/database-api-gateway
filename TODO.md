@@ -793,8 +793,10 @@ Se encontró con una sonda contra un **uvicorn real**:
 4. **Le faltaba `resultType`** (MUST de la spec) y `_meta.serverInfo`.
 5. **No negociaba la versión**: respondía una fija.
 6. **Hablaba solo la era del handshake.** La revisión `2026-07-28` **retiró el `initialize`**, las
-   sesiones de protocolo y el stream por GET. Ahora se detecta la era por la presencia del header
-   `MCP-Protocol-Version` —lo que la spec autoriza— y se hablan las dos.
+   sesiones de protocolo y el stream por GET. Ahora se hablan las dos, y la era se detecta por el
+   **valor** del header `MCP-Protocol-Version`. Detectarla por su *presencia* fue un bug propio:
+   el header es obligatorio desde `2025-06-18` —era del handshake—, así que dejaba afuera a todo
+   cliente `2025-11-25` con un `-32020`.
 7. **`POST /mcp` sin barra daba `307`.** Es la URL natural de un `.mcp.json`, y hay clientes HTTP
    que **no reenvían `Authorization`** en el salto: el síntoma sería "el token no funciona".
 

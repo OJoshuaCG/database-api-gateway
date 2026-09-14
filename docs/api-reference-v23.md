@@ -305,13 +305,20 @@ La revisión **2026-07-28** rehízo el transporte: **no hay handshake** (`initia
 `notifications/initialized` desaparecieron), no hay sesiones de protocolo (`Mcp-Session-Id` se
 retiró) y no hay stream por GET. Cada request trae su contexto en `params._meta`.
 
-El servidor **detecta la era por la presencia del header `MCP-Protocol-Version`** —lo que la
-propia spec autoriza— y habla las dos, porque el parque real tiene las dos:
+El servidor **detecta la era por el VALOR del header `MCP-Protocol-Version`**, y habla las dos
+porque el parque real tiene las dos.
 
-| | Era stateless (`2026-07-28`, `2025-11-25`) | Era del handshake (`2025-06-18` y anteriores) |
+**No por su presencia**, que es el error fácil: ese header es obligatorio desde `2025-06-18`, o
+sea que un cliente de la era del handshake **también lo manda**. Tomar su presencia como señal de
+era moderna rechaza con `-32020` a todo cliente `2025-11-25` por un `_meta` que su revisión ni
+define. Lo que la spec sí autoriza —y sigue valiendo— es tratar un request **sin** el header como
+`2025-03-26`. Una versión desconocida se trata como moderna, para contestarle `-32022` con la
+lista de las soportadas.
+
+| | Era stateless (`2026-07-28`) | Era del handshake (`2025-11-25` y anteriores) |
 |---|---|---|
 | Handshake | **no existe**: `initialize` da 404 | `initialize` → `notifications/initialized` |
-| Headers | `MCP-Protocol-Version`, `Mcp-Method`, y `Mcp-Name` en `tools/call` — **obligatorios y validados contra el cuerpo** | ninguno |
+| Headers | `MCP-Protocol-Version`, `Mcp-Method`, y `Mcp-Name` en `tools/call` — **obligatorios y validados contra el cuerpo** | `MCP-Protocol-Version` desde `2025-06-18`; nunca se valida contra el cuerpo |
 | `params._meta` | `protocolVersion` y `clientCapabilities` **obligatorios** | no se pide |
 | Sesión | ninguna | ninguna |
 
