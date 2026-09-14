@@ -209,6 +209,10 @@ Hay dos formas, y **la elección importa**:
 servidor una vez, y cada persona pone su propio token en su entorno. Claude Code expande `${VAR}`
 en `headers` y en `url`.
 
+**Ese `.mcp.json` va en la raíz del repo que *consume* el MCP**, el de tu equipo — no en el del
+gateway. En el repo del gateway no existe ni tiene que existir: ese **sirve** el MCP, no lo usa.
+Se crea desde cero; no hay ningún archivo previo que sobrescribir.
+
 ```jsonc
 // .mcp.json — SE COMMITEA. Por eso va la variable y nunca el literal.
 {
@@ -225,15 +229,22 @@ en `headers` y en `url`.
 La primera vez que se abra Claude Code en ese repo, pide **aprobar** el servidor del proyecto. Es
 esperado: un `.mcp.json` viene del repositorio y el cliente no lo confía solo.
 
-**Opción alternativa — solo en su máquina**, sin tocar el repo:
+**Opción alternativa — global en su máquina**, sin tocar ningún repo:
 
 ```bash
 claude mcp add --transport http --scope user gateway https://gateway.interno/mcp \
-  --header "Authorization: Bearer $GATEWAY_MCP_TOKEN"
+  --header 'Authorization: Bearer ${GATEWAY_MCP_TOKEN}'
 ```
 
-`--scope user` lo deja disponible en **todos** sus proyectos y **no** se commitea. Ojo: acá el
-token queda **literal** en su configuración local, no expandido.
+`--scope user` lo deja disponible en **todos** sus proyectos y **no** se commitea. Dos detalles
+que muerden:
+
+- **El default de `--scope` es `local`, no `user`.** Omitir el flag ata el servidor a un solo
+  directorio y no aparece en ningún otro proyecto.
+- **Las comillas tienen que ser simples.** Con dobles, `$GATEWAY_MCP_TOKEN` lo expande el *shell*
+  antes de que la CLI lo vea, y el secreto queda **literal** dentro de `~/.claude.json`. Con
+  simples se guarda `${GATEWAY_MCP_TOKEN}` tal cual y lo resuelve Claude Code al conectar: scope
+  global y token en el entorno, las dos cosas a la vez.
 
 > **Lo que nunca hay que hacer**: poner el token literal en `.mcp.json`. Ese archivo se commitea,
 > y el gate de secretos del CI protege el repo del gateway, **no** el de quien consume. Si el
