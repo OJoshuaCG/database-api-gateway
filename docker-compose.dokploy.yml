@@ -70,6 +70,34 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
+    # Alias ESTABLE en la red de Dokploy, para que otros contenedores puedan alcanzar este
+    # servicio sin depender del nombre que Dokploy genera.
+    #
+    # Sin esto, la única referencia es el nombre del contenedor de compose
+    # (`<app>-<hash>-api-1`), donde el hash lo asigna Dokploy **al crear la aplicación**. Ese
+    # hash sobrevive a los deploys, pero NO a borrar y recrear la app en el panel — y el día que
+    # eso pase, quien apunte a ese nombre se queda sin backend con un 502 que no explica por qué.
+    # El alias lo elegimos nosotros y vive en este archivo, así que no depende de nada externo.
+    #
+    # Quien lo consume hoy: el proxy del contenedor del frontend, que sirve la API bajo el mismo
+    # origen que la SPA porque la cookie de CSRF es host-only y desde otro host el JS no puede
+    # leerla. Ver `database-api-gateway-frontend/docs/dokploy.md` §3.
+    #
+    # `default` se declara explícitamente porque al listar `networks` el servicio deja de unirse
+    # sola a la red por defecto del compose, y la necesita para alcanzar a `db` y a `valkey` por
+    # sus nombres de servicio.
+    networks:
+      default: {}
+      dokploy-network:
+        aliases:
+          - gateway-api
+
+# `dokploy-network` la crea Dokploy, no este compose: acá sólo se declara para poder colgarle el
+# alias de arriba. `db` y `valkey` NO se unen a ella — siguen sólo en la red interna del compose,
+# que es lo que los mantiene sin alcance desde el resto de la instancia.
+networks:
+  dokploy-network:
+    external: true
 
 volumes:
   mariadb_data:   # Datos persistentes de la BD de metadatos (MariaDB)
