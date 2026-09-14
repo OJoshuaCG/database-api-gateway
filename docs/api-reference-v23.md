@@ -17,6 +17,10 @@ Sigue devolviendo `id` y `username`; se agregan campos. **Ojo con el `safeParse`
 completo que hace la SPA de este repo**: una divergencia de un campo descarta la respuesta
 entera, así que cada campo nuevo va `.nullish()`, nunca `.optional()`.
 
+**Este ejemplo es la respuesta COMPLETA: diez campos, no ocho.** `previous_login_at` y
+`last_failed_at` se describen en el §7.4 y se incluyen acá a propósito — tipar el schema desde un
+ejemplo recortado es exactamente cómo se dispara el `safeParse` que el párrafo anterior advierte.
+
 ```jsonc
 {
   "id": 1,
@@ -26,9 +30,14 @@ entera, así que cada campo nuevo va `.nullish()`, nunca `.optional()`.
   "global_capabilities": ["access_admin", "security_officer"],
   "scope_roles": [{ "scope_type": "environment", "scope_id": 3, "role": "operator" }],
   "step_up_capabilities": ["databases.drop", "..."],
+  "previous_login_at": "2026-09-08T14:02:11Z",  // el ANTERIOR al actual — ver §7.4
+  "last_failed_at": null,                       // nullable: puede no haber ninguno
   "catalog_version": "9f2c1a…"        // sha256 corto, para invalidar caché del cliente
 }
 ```
+
+`last_login_at` **no** se publica acá y es deliberado: cuando la SPA pide `/auth/me`, el último
+login es el que está en curso. Ese campo sí existe en `GatewayUserOut` (ver `api-reference-v24.md`).
 
 - **`capabilities` no es una lista paralela**: se deriva del MISMO predicado que hace cumplir el
   servidor. Es la única fuente para habilitar o deshabilitar controles.
@@ -144,12 +153,15 @@ En los tres primeros, **apagar** la captura no pide nada extra: solo encenderla.
 
 ## 6. Lo que este addendum NO trae todavía
 
-- **Alcance por destino.** `scope_roles` se publica, pero el chequeo por entorno o por servidor de
-  cada objeto concreto es una fase posterior: hoy la capacidad se evalúa global. **No presentes en
-  la UI un alcance que el servidor todavía no aplica.**
-- **Step-up.** Ver §1.
-- **Administración de usuarios.** `/gateway-users` y `/api-tokens` no existen aún; el único usuario
-  es el administrador sembrado. Su rol se cambia hoy en la BD.
+- **Step-up.** Ver §1. Es lo único de esta lista que sigue sin implementarse.
+
+> **Nota de corrección.** Una versión anterior de este §6 también declaraba fuera de alcance el
+> **alcance por destino** y la **administración de usuarios y tokens**. Las tres cosas se
+> entregaron en la misma tanda y este mismo documento las describe: el alcance por destino en el
+> **§8**, los tokens de agente en el **§9.1**. `/gateway-users` existe —siete endpoints— y su
+> contrato está en **`api-reference-v24.md`**, junto con el resto de lo que quedó fuera de acá.
+> El rol de un usuario se cambia con `PATCH /gateway-users/{id}`, no con SQL contra la BD de
+> metadatos.
 
 ---
 
@@ -167,14 +179,29 @@ Entregados junto con lo de arriba. **Tres rompen el cliente actual si no se adap
 ```
 
 Qué hacer: leer la cookie **`__Host-gw_csrf`** (o `gw_csrf` sin TLS) y mandarla en el header
-**`X-CSRF-Token`** en todo `POST`/`PATCH`/`DELETE`. La cookie **no** es httpOnly justamente para
-eso.
+**`X-CSRF-Token`** en todo `POST`/`PATCH`/`DELETE` **de una sesión autenticada**. La cookie **no**
+es httpOnly justamente para eso.
 
-Dos cosas que no son obvias:
+**El alcance es "con sesión", no "todo método no seguro".** El chequeo vive dentro del guard de
+capacidades y solo corre para un actor de sesión, así que los dos `POST` que se hacen **sin estar
+logueado** no lo exigen ni lo podrían exigir —el token se deriva del identificador de sesión, y
+ahí todavía no hay ninguno—:
+
+| Endpoint | `X-CSRF-Token` |
+|---|---|
+| `POST /auth/login` | **no** |
+| `POST /gateway-users/invite/accept` (ver `api-reference-v24.md`) | **no** |
+| todo el resto de `POST`/`PATCH`/`DELETE`, y `GET /database-exports/{id}/content` | **sí** |
+
+Un interceptor que aplique la regla al pie va a buscar una cookie que en la pantalla de login
+todavía no existe, y va a bloquear el request antes de mandarlo.
+
+Dos cosas más que no son obvias:
 
 - **El token ROTA con la sesión.** Se deriva del identificador de sesión, y ese identificador
   cambia en cada login. Un token cacheado en memoria de un login anterior da `auth.csrf_invalid`:
-  hay que releer la cookie después de cada login.
+  hay que releer la cookie después de cada login. La repone un middleware en **cualquier**
+  respuesta con sesión, no solo en la del login, así que no hace falta un flujo de recuperación.
 - **No es double-submit.** El servidor lo recomputa; plantar la cookie no sirve. No intentes
   "arreglar" un 403 seteando la cookie desde el JS.
 
@@ -188,8 +215,19 @@ GET  /api/v1/database-exports/{id}/download?ticket=…
 ```
 
 El ticket **vence en 60 segundos**, así que se pide en el momento del click y no al cargar la
-pantalla. El POST corre los mismos guards que la descarga, o sea que un 409/410 llega ahí y no en
-el GET.
+pantalla. El POST corre los mismos guards que la descarga, o sea que un 409/410 de *autorización o
+estado del artefacto* llega ahí y no en el GET.
+
+**Pero el GET todavía puede fallar por el ticket mismo**, y esos dos errores **no traen
+`public_context.code`**: solo se distinguen por status.
+
+| Status en el `GET …/download` | Qué pasó |
+|---|---|
+| `422` | ticket malformado, o **emitido para otro usuario** — está atado a `(job_id, user_id)` |
+| `410` | ticket vencido (los 60 s) |
+
+Si la SPA cachea tickets, el de otra sesión no sirve. Y `GET /database-exports/{id}/manifest`
+ahora también pasa por el guard de dueño (403 `export.not_owner`): ver `api-reference-v24.md`.
 
 Y `GET /database-exports/{id}/content` —la entrega en línea para el portapapeles— **exige el
 header `X-CSRF-Token` aunque sea un GET**. Los dos endpoints consumen el artefacto, y una
@@ -242,11 +280,15 @@ más permisivo— sino al **más protegido**. Así que otorgar "lector en produc
 esa persona el acceso a toda base que nadie clasificó. `derived_from_gap: true` marca las filas que
 hay que arreglar; `ready: true` dice que se puede otorgar sin sorpresas.
 
-**Qué cambia en la superficie**: las operaciones con destino resoluble (por ahora el borrado, el
-aprovisionamiento y el apply/rollback de `/managed-databases/{id}/*`) evalúan la capacidad **dos
+**Qué cambia en la superficie**: las operaciones con destino resoluble evalúan la capacidad **dos
 veces**: una global —"¿podría en algún alcance?"— y otra en el destino. El 403 es el mismo
 `access.forbidden` en los dos casos: **no distingue cuál de las dos capas negó**, porque decir "no
 la tenés *acá*" le regala a un atacante el mapa de sus propios alcances por fuerza bruta.
+
+**Son exactamente cuatro operaciones, no el subárbol entero de `/managed-databases/{id}/*`**: el
+borrado, el aprovisionamiento, el apply y el rollback. `reconcile` y `stamp` **no** pasan por la
+capa 2 aunque también tocan el motor. No asumas que la restricción por alcance cubre todo lo que
+cuelga de esa ruta.
 
 Mientras nadie tenga grants por alcance —el estado de un despliegue recién migrado— la capa 2 no
 cambia ningún resultado, y no toca la BD para decidirlo.
@@ -263,7 +305,7 @@ que **no hay forma de volver a mostrarlo**: si se pierde, se emite otro.
 | Regla | Por qué |
 |---|---|
 | `project_id` obligatorio | Un token sin proyecto no alcanza ninguna base, así que lo único que un nulo podría significar es "token global" |
-| `expires_in_days` ≤ 90 | Sin tokens perpetuos: un token de agente vive en el `.mcp.json` del repo de otra gente |
+| `expires_in_days` ≤ 90, y **90 es también el default** | Sin tokens perpetuos: un token de agente vive en el `.mcp.json` del repo de otra gente. Omitir el campo **no** crea un token sin vencimiento ni uno corto: crea uno de exactamente 90 días, así que la UI debería mostrarlo pre-seleccionado |
 | `scopes` dentro del techo de agente | Un token **no puede** recibir una capacidad que mute o divulgue, ni por error del operador |
 | `DELETE` no se deshace | Un token que alguien creyó muerto y no lo está es peor que emitir uno nuevo. Revocar dos veces da 409 |
 
@@ -340,10 +382,15 @@ los motores**. Devuelve por base: `database_id`, `name`, `engine`, `environment`
 | headers que no calzan con el cuerpo | `400` | `-32020` `HeaderMismatch` |
 | versión no soportada | `400` | `-32022`, con `data.supported` |
 | falta un `_meta` obligatorio | `400` | `-32602` |
+| **tool desconocida** | `200` | `-32602` — el método `tools/call` **sí** existe, así que el transporte funcionó |
 | `Origin` presente y ajeno | `403` | — |
 | `GET` o `DELETE` al endpoint | `405` | — |
 | cuerpo > 256 KiB | `413` | — |
 | credencial inválida | `401` | `mcp.token_invalid`, **un solo código opaco** |
+
+**`-32602` llega con DOS status y significan cosas distintas.** Con `400` el mensaje estaba mal
+formado; con `200` el mensaje estaba bien y la tool pedida no existe — que casi siempre es un bug
+del cliente. Un cliente que rutee solo por status va a tratar su propio bug como éxito.
 
 **`Origin` ausente NO rechaza**: un cliente que no es un navegador no lo manda y no está sujeto a
 DNS rebinding. Se rechaza un `Origin` **presente y ajeno**, que es la señal positiva.
@@ -380,6 +427,16 @@ y un token de un cliente veía nombres, entorno y versión de las bases de otro.
 PATCH /environments/{id}   {"allows_agent_access": true}   + ?confirm_slug=<slug>
 PUT   /managed-databases/{id}/agent-access   {"allowed": true, "blocked": false}
 ```
+
+En el `PUT`, **`allowed` y `blocked` son los dos obligatorios**: no hay forma parcial, y mandar
+solo `{"allowed": true}` da 422.
+
+> ⚠️ **El estado resultante hoy no se puede leer por ninguna vía.** `agent_access_allowed` y
+> `agent_access_blocked` no están en `ManagedDatabaseOut`, ni en `GET /managed-databases`, ni en
+> `GET /managed-databases/{id}`, ni en la respuesta del propio `PUT`. Se puede **escribir** el
+> estado pero no consultarlo ni confirmarlo, así que **una pantalla de administración de agentes
+> todavía no se puede construir**: falta exponer las dos columnas. Es un pendiente de backend, no
+> del contrato.
 
 Encender el flag del entorno **exige `confirm_slug`**: habilita una superficie de lectura nueva
 sobre bases de terceros, así que cuenta como debilitamiento de la política igual que apagar el
