@@ -29,6 +29,9 @@ import pytest
 
 V_STATELESS = "2026-07-28"
 V_HANDSHAKE = "2025-06-18"
+#: La ÚLTIMA revisión con handshake, y la que el parque real habla hoy. Se nombra aparte de
+#: `V_HANDSHAKE` porque es la que estaba mal clasificada como stateless.
+V_HANDSHAKE_ULTIMA = "2025-11-25"
 
 META_VERSION = "io.modelcontextprotocol/protocolVersion"
 META_CAPS = "io.modelcontextprotocol/clientCapabilities"
@@ -81,6 +84,22 @@ def _legado(client, bearer, metodo, params=None, rid=1):
     if params is not None:
         cuerpo["params"] = params
     return client.post("/mcp/", json=cuerpo, headers={"Authorization": f"Bearer {bearer}"})
+
+
+def _legado_con_header(client, bearer, metodo, version, params=None, rid=1):
+    """
+    Handshake que **sí manda** ``MCP-Protocol-Version``, que es lo que la spec exige desde
+    ``2025-06-18``. ``_legado`` no lo manda, y por eso la suite no veía el bug.
+    """
+    cuerpo = {"jsonrpc": "2.0", "method": metodo}
+    if rid is not None:
+        cuerpo["id"] = rid
+    if params is not None:
+        cuerpo["params"] = params
+    return client.post(
+        "/mcp/", json=cuerpo,
+        headers={"Authorization": f"Bearer {bearer}", "MCP-Protocol-Version": version},
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -286,6 +305,101 @@ def test_the_handshake_era_can_call_tools_without_meta(client, bearer):
     r = _legado(client, bearer, "tools/call", {"name": "list_databases", "arguments": {}})
     assert r.status_code == 200, r.text
     assert r.json()["result"]["isError"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Regresión: el handshake que MANDA el header de versión                      #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("version", [V_HANDSHAKE_ULTIMA, V_HANDSHAKE])
+def test_the_handshake_era_may_send_the_version_header(client, bearer, version):
+    """
+    **El bug que ningún test veía, y que dejaba al servidor sin un solo cliente moderno.**
+
+    La era se decidía por la PRESENCIA de ``MCP-Protocol-Version``. Pero ese header es
+    obligatorio desde ``2025-06-18``, que es era del handshake: el cliente lo manda, el servidor
+    lo tomaba por moderno y lo rechazaba con ``-32020`` por un ``_meta`` que su revisión ni
+    define. Agravado porque ``2025-11-25`` estaba listada como stateless, cuando la spec la
+    define como handshake —"handshake-based protocol revisions (`2025-11-25` and earlier)"—.
+
+    La suite no lo veía porque ``_legado`` **omite** el header, o sea probaba un cliente que la
+    spec ya no permite desde ``2025-06-18``. El servidor pasaba los tests y no conectaba con
+    nadie: el síntoma real fue ``claude mcp list`` sin poder listar una sola tool.
+    """
+    r = _legado_con_header(client, bearer, "initialize", version,
+                           {"protocolVersion": version})
+    assert r.status_code == 200, r.text
+    assert r.json()["result"]["protocolVersion"] == version
+
+
+@pytest.mark.parametrize("version", [V_HANDSHAKE_ULTIMA, V_HANDSHAKE])
+def test_the_handshake_era_calls_tools_with_the_header_and_no_meta(client, bearer, version):
+    """
+    El ``initialize`` es solo el primer mensaje. Si el resto de la sesión volviera a caer en el
+    validador moderno, el cliente haría el handshake y moriría en la primera tool — que es peor,
+    porque el fallo llega después de un intercambio exitoso.
+    """
+    r = _legado_con_header(client, bearer, "tools/call", version,
+                           {"name": "list_databases", "arguments": {}})
+    assert r.status_code == 200, r.text
+    assert r.json()["result"]["isError"] is False
+
+
+def test_a_real_client_completes_a_whole_session_with_the_header(client, bearer):
+    """
+    La sesión ENTERA de un cliente real, no dos llamadas sueltas.
+
+    Los tests de arriba prueban ``initialize`` y ``tools/call`` por separado; este encadena lo
+    que un cliente hace de verdad, porque el fallo de esta familia aparece en el paso que nadie
+    probó. Verificado además contra un ``uvicorn`` real y el CLI ``claude``: sin esto, el
+    servidor pasaba el 100% de la suite y ``claude mcp list`` no listaba una sola tool.
+    """
+    def _post(cuerpo):
+        return client.post("/mcp/", json=cuerpo, headers={
+            "Authorization": f"Bearer {bearer}",
+            "MCP-Protocol-Version": V_HANDSHAKE_ULTIMA,
+            "Accept": "application/json, text/event-stream",
+        })
+
+    r = _post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": V_HANDSHAKE_ULTIMA, "capabilities": {},
+        "clientInfo": {"name": "claude-code", "version": "1"}}})
+    assert r.status_code == 200, r.text
+    assert r.json()["result"]["protocolVersion"] == V_HANDSHAKE_ULTIMA
+
+    # El segundo mensaje de todo cliente con handshake, y una notificación no se responde.
+    r = _post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    assert r.status_code == 202, r.text
+    assert not r.content
+
+    r = _post({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    assert r.status_code == 200, r.text
+    assert r.json()["result"]["tools"], "sin tools el cliente muestra el servidor como vacío"
+
+    r = _post({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+    assert r.status_code == 200, r.text
+
+    r = _post({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+               "params": {"name": "list_databases", "arguments": {}}})
+    assert r.status_code == 200, r.text
+    assert r.json()["result"]["isError"] is False
+
+
+def test_only_the_stateless_revision_is_classified_as_stateless():
+    """
+    El guard a nivel de dato. ``2026-07-28`` es la única revisión que retiró el ``initialize``;
+    cualquier otra que aparezca acá vuelve a romper a todos los clientes de su era.
+    """
+    from app.mcp import protocol
+
+    assert protocol.STATELESS_VERSIONS == {"2026-07-28"}
+    assert V_HANDSHAKE_ULTIMA in protocol.HANDSHAKE_VERSIONS
+    # Las dos particiones tienen que cubrir lo soportado, sin solaparse.
+    assert protocol.HANDSHAKE_VERSIONS | protocol.STATELESS_VERSIONS == set(
+        protocol.SUPPORTED_VERSIONS
+    )
+    assert not (protocol.HANDSHAKE_VERSIONS & protocol.STATELESS_VERSIONS)
 
 
 # --------------------------------------------------------------------------- #

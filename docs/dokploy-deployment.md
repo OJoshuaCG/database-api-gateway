@@ -244,6 +244,129 @@ docker compose -f docker-compose.dokploy.yml exec -T db \
 Si necesitas levantar el gateway en un VPS sin Dokploy (o con nginx/Certbot manual), usa
 `docs/docker-deployment.md` y `docker-compose.yml` en su lugar.
 
+## 10. Servidor MCP
+
+**Comparte el mismo despliegue: no hay servicio, imagen, puerto ni dominio nuevo.** El servidor
+MCP es una sub-app montada en `/mcp` del mismo proceso FastAPI (`main.py`), así que viaja en el
+contenedor `api` que ya está en `docker-compose.dokploy.yml` y sale por el mismo Traefik y el
+mismo certificado. Los endpoints de emisión y revocación de tokens viven en `/api/v1/api-tokens`,
+también en el mismo host.
+
+### Lo único obligatorio en Dokploy
+
+```env
+MCP_ENABLED=True
+```
+
+Se agrega en la pestaña **Environment** y requiere **redeploy** (o reinicio del servicio): la
+variable se lee una vez al importar `app/core/environments.py`, no por request. La sub-app se
+monta siempre; el kill switch se evalúa adentro, en `app/core/mcp_auth.py`. Con `MCP_ENABLED`
+en su default (`false`) el endpoint existe pero **rechaza todo con `503`** (código
+`mcp.disabled`), antes de mirar el `Authorization` — `503` y no `404` a propósito: el operador
+que lo prendió y no le anda necesita saber que está apagado, no buscar un endpoint inexistente.
+O sea que un despliegue actual **no expone nada** hasta que alguien fije la variable a propósito.
+
+El resto tiene defaults sanos y solo se toca para ajustar:
+
+| Variable                 | Default       | Para qué                                              |
+|--------------------------|---------------|-------------------------------------------------------|
+| `MCP_TOKEN_MAX_TTL_DAYS` | `90`          | Techo del vencimiento que puede pedir quien emite      |
+| `MCP_MAX_OBJECTS`        | `500`         | Tope de filas que devuelve una herramienta             |
+| `MCP_MAX_BODY_KIB`       | `256`         | Tope del cuerpo del POST, aplicado en la app           |
+| `MCP_RATE_LIMIT`         | `120/minute`  | Límite por token de agente (fallback: por IP)          |
+
+### Migraciones
+
+Las cinco revisiones que traen el MCP (`c8d9e0f1a2b3` → `a2b3c4d5e6f7`: roles del gateway,
+traza de auth, sesiones, época de credenciales, y `api_tokens` + el gate de agentes) las aplica
+el `entrypoint.sh` como cualquier otra, sin paso manual. Su `upgrade()` usa solo DDL portable
+(`create_table`, `add_column` con `server_default`, `create_index`, un `MODIFY` vía
+`batch_alter_table`); `batch_alter_table` aparece sobre todo en los `downgrade()`, que es donde
+SQLite lo necesita.
+
+**Pero nunca corrieron contra MariaDB**: se ciclaron en SQLite. El primer deploy es su primera
+ejecución real. Si alguna falla, el contenedor `api` queda en loop de reinicios y el pre-vuelo
+del grafo garantiza que la BD no se tocó — se lee el error en los logs del panel. Con un
+`audit_log` grande, los dos `ADD COLUMN` sobre esa tabla alargan el arranque del contenedor
+(en MariaDB 11 son *instant*, pero no hay que asumirlo con tablas de millones de filas):
+conviene tener el backup de `mariadb_data` hecho antes de este deploy en particular.
+
+### Traefik: nada que agregar, y una cosa que NO hay que agregar
+
+El ruteo es por `Host`, y Traefik pasa el path tal cual: `/mcp` llega solo. **No agregues un
+middleware de redirect ni de `StripPrefix`/`AddPrefix` para la barra final.** `POST /mcp` y
+`POST /mcp/` son la misma request y eso lo resuelve `McpPathNormalizer` **dentro** del proceso,
+justamente para evitar el `307` que emitía el router: hay clientes HTTP que no reenvían el
+header `Authorization` a través del salto, así que un redirect reintroducido en el proxy se ve
+como un token inválido y no como un redirect.
+
+### HTTPS y `Origin`
+
+- **HTTPS es obligatorio** (paso 4). El token del agente viaja como `Authorization: Bearer`; por
+  `http://` va en claro. Acá no hay el síntoma amable de la cookie: el agente simplemente funciona
+  y la credencial queda expuesta en la red.
+- La validación de `Origin` reutiliza la de CSRF: **ausente no rechaza** (un cliente que no es
+  navegador no lo manda, y no está sujeto a DNS rebinding), pero un `Origin` presente y ajeno es
+  `403`. Si el cliente MCP que usen sí manda `Origin`, ese valor tiene que estar en `CORS_ORIGINS`.
+- `MCP_MAX_BODY_KIB` lo aplica la app; Traefik no limita el cuerpo por default. No hace falta
+  configurarlo del lado del proxy.
+
+### `TRUSTED_PROXY_IPS` — el que la guía venía omitiendo
+
+Detrás del Traefik de Dokploy la IP que ve uvicorn es la del contenedor del proxy, no la del
+cliente. El default (`TRUSTED_PROXY_IPS=127.0.0.1`) hace que `X-Forwarded-For` se **ignore**, así
+que **todos los clientes comparten una sola clave de rate limit**: un solo usuario agota los 5/min
+del login para todos. No es spoofeable (es el lado seguro), pero tampoco es lo que se quiere.
+
+Fijá el CIDR de la red Docker donde corre el Traefik de Dokploy:
+
+```env
+TRUSTED_PROXY_IPS=10.0.0.0/8
+```
+
+En producción la app **se niega a arrancar con `*`** (`app/core/environments.py`), así que no hay
+atajo. Para el MCP el impacto es menor —su limiter se keyea por `agent:<token_id>` y solo cae a la
+IP cuando no hay token— pero el resto del gateway sí lo paga.
+
+### Después del deploy: activar es dato, no configuración
+
+`MCP_ENABLED=True` habilita el transporte; **no habilita ninguna base**. Los tres booleanos del
+gate nacen en `false` y hay que activarlos base por base, y además emitir el token de cada
+colaborador. Ese procedimiento completo está en
+[docs/features/mcp-para-colaboradores.md](features/mcp-para-colaboradores.md).
+
+### Verificar
+
+```bash
+# Sin token. El código dice en qué estado está el kill switch:
+#   503 -> montado pero DESHABILITADO (falta MCP_ENABLED=True, o falta el redeploy)
+#   401 -> habilitado y exigiendo el bearer  <- lo que se busca
+#   404 -> el proxy no está llegando a la sub-app (revisar Traefik / la ruta)
+curl -si -X POST https://gateway.tudominio.com/mcp \
+     -H 'Content-Type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -1
+
+# Con token: lista las herramientas disponibles
+curl -s -X POST https://gateway.tudominio.com/mcp \
+     -H "Authorization: Bearer dbgw.<id>.<secreto>" \
+     -H 'Content-Type: application/json' \
+     -H 'MCP-Protocol-Version: 2026-07-28' \
+     -H 'Mcp-Method: tools/list' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{}}}'
+```
+
+Que la primera responda `401` (y no `503` ni `404`) es la señal de que el montaje, el proxy y el
+kill switch están bien; que la segunda liste herramientas es la señal de que el token y el gate
+de la base están bien.
+
+### Lo que sigue sin verificar
+
+- Las cinco migraciones nunca se aplicaron sobre MariaDB (solo SQLite).
+- El transporte se probó contra un uvicorn local, **no** contra el Traefik de Dokploy.
+- Nunca se conectó un cliente Claude Code real: la validación fue por `curl` sobre los dos
+  protocolos (`2026-07-28`/`2025-11-25` sin handshake, y `2025-06-18` con `initialize`).
+- La suite `pytest` completa no se corrió para este cambio.
+
 ## Checklist de despliegue
 
 - [ ] Dominio con registro DNS `A` apuntando al servidor Dokploy
@@ -259,4 +382,6 @@ Si necesitas levantar el gateway en un VPS sin Dokploy (o con nginx/Certbot manu
 - [ ] Se accede siempre por `https://tu-dominio.com` (nunca por IP ni `http://` — la
       cookie de sesión requiere HTTPS en producción, ver [Troubleshooting](#troubleshooting))
 - [ ] `GET /health` y `GET /health/ready` responden `200`
+- [ ] Si se usa el MCP: `MCP_ENABLED=True` en Environment + redeploy (ver [sección 10](#10-servidor-mcp))
+- [ ] `TRUSTED_PROXY_IPS` con el CIDR de la red del Traefik de Dokploy (no el default `127.0.0.1`, que colapsa el rate limit de todos los clientes en una sola clave)
 - [ ] Backup de `mariadb_data` configurado (nativo de Dokploy o script manual)
