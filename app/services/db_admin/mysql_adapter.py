@@ -1628,25 +1628,36 @@ class MySQLAdapter(ServerAdapter):
         }
 
     @staticmethod
-    def _storage_from_row(engine_name, table_collation) -> dict[str, str]:
-        """Fila de ``information_schema.TABLES`` → opciones de almacenamiento de la tabla."""
+    def _storage_from_row(engine_name, table_collation, row_format=None) -> dict[str, str]:
+        """
+        Fila de ``information_schema.TABLES`` → opciones de almacenamiento de la tabla.
+
+        ``ROW_FORMAT`` no es decorativo y por eso viaja: de él depende el límite de bytes
+        de una clave de índice (3072 B con ``DYNAMIC``/``COMPRESSED``, apenas 767 con
+        ``COMPACT``/``REDUNDANT``). Omitirlo hace que la tabla herede el
+        ``innodb_default_row_format`` del host destino, así que el mismo clon entra en un
+        servidor y falla con ``1071`` en otro — un fallo que depende de dónde se ejecuta y
+        no de lo que se clona.
+        """
         opts: dict[str, str] = {}
         if engine_name:
             opts["engine"] = str(engine_name)
         if table_collation:
             opts["collation"] = str(table_collation)
             opts["charset"] = str(table_collation).split("_", 1)[0]
+        if row_format:
+            opts["row_format"] = str(row_format)
         return opts
 
     def _table_storage_options(self, conn, database, table, schema) -> dict[str, str]:
         row = conn.execute(
             text(
-                "SELECT ENGINE, TABLE_COLLATION FROM information_schema.TABLES "
+                "SELECT ENGINE, TABLE_COLLATION, ROW_FORMAT FROM information_schema.TABLES "
                 "WHERE TABLE_SCHEMA = :db AND TABLE_NAME = :t"
             ),
             {"db": database, "t": table},
         ).fetchone()
-        opts = self._storage_from_row(row[0], row[1]) if row else {}
+        opts = self._storage_from_row(row[0], row[1], row[2]) if row else {}
         opts.update(self._db_charset_options(conn, database))
         return opts
 
@@ -1748,7 +1759,7 @@ class MySQLAdapter(ServerAdapter):
     def _prefetch_table_storage_options(
         self, conn, database, schema, tables
     ) -> dict[str, dict[str, str]] | None:
-        """Engine y collation de TODAS las tablas, más el default de la base, en dos consultas."""
+        """Engine, collation y row format de TODAS las tablas, más el default de la base."""
         if not tables:
             return {}
         db_opts = self._db_charset_options(conn, database)
@@ -1756,14 +1767,16 @@ class MySQLAdapter(ServerAdapter):
         out: dict[str, dict[str, str]] = {t: dict(db_opts) for t in tables}
         rows = conn.execute(
             text(
-                "SELECT TABLE_NAME, ENGINE, TABLE_COLLATION FROM information_schema.TABLES "
-                "WHERE TABLE_SCHEMA = :db"
+                "SELECT TABLE_NAME, ENGINE, TABLE_COLLATION, ROW_FORMAT "
+                "FROM information_schema.TABLES WHERE TABLE_SCHEMA = :db"
             ),
             {"db": database},
         ).fetchall()
-        for table, engine_name, table_collation in rows:
+        for table, engine_name, table_collation, row_format in rows:
             if table in pedidas:
-                out[table].update(self._storage_from_row(engine_name, table_collation))
+                out[table].update(
+                    self._storage_from_row(engine_name, table_collation, row_format)
+                )
         return out
 
     def _database_defaults(self, conn, database, schema) -> dict[str, str | None]:
@@ -2101,6 +2114,16 @@ class MySQLAdapter(ServerAdapter):
             sql += f" DEFAULT CHARSET={validate_identifier(opts['charset'], self.dialect, 'charset', allow_existing=True)}"
         if opts.get("collation"):
             sql += f" COLLATE={validate_identifier(opts['collation'], self.dialect, 'collation', allow_existing=True)}"
+        if opts.get("row_format"):
+            row_format = validate_identifier(
+                opts["row_format"], self.dialect, "row_format", allow_existing=True
+            )
+            sql += f" ROW_FORMAT={row_format}"
+        # El COMMENT de tabla se reflejaba en ``TableSchema.comment`` y no se emitía: el
+        # clon perdía la documentación del modelo sin que nada fallara. Va como literal
+        # (no como identificador) porque es texto libre del usuario.
+        if tbl.comment:
+            sql += f" COMMENT={quote_string_literal(tbl.comment, self.dialect)}"
         return sql
 
     def _render_modify_column(self, table, src_col, tgt_col, changed) -> list[str]:

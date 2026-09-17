@@ -1,6 +1,6 @@
 """
-Tests de la longitud de PREFIJO de índice (``key(191)``), en todo el recorrido:
-reflexión → DTO → firma del diff → DDL renderizado.
+Tests de la longitud de PREFIJO de índice (``key(191)``) y del ``ROW_FORMAT`` de tabla,
+en todo el recorrido: reflexión → DTO → firma del diff → DDL renderizado.
 
 El incidente que los origina: clonar una base de tenant fallaba con
 ``(1071, 'Specified key was too long; max key length is 3072 bytes')`` al recrear
@@ -18,15 +18,21 @@ diff, que sin el prefijo dejaba la deriva invisible para schema-comparison.
 
 import pytest
 
+from app.exceptions.AppHttpException import AppHttpException
 from app.services.db_admin.base_adapter import ServerAdapter
 from app.services.db_admin.dtos import (
     ColumnInfo,
     IndexInfo,
+    SchemaSnapshot,
     TableSchema,
     UniqueConstraintInfo,
 )
 from app.services.db_admin.mysql_adapter import MariaDBAdapter, MySQLAdapter
-from app.services.db_admin.schema_diff import _index_signature, _unique_signature
+from app.services.db_admin.schema_diff import (
+    _index_signature,
+    _unique_signature,
+    diff_snapshots,
+)
 
 
 def _adapter(dialect="mysql"):
@@ -219,6 +225,60 @@ def test_inline_unique_without_prefix_is_unchanged():
 
 
 # --------------------------------------------------------------------------- #
+# ROW_FORMAT y COMMENT de tabla                                                #
+# --------------------------------------------------------------------------- #
+def test_create_table_pins_row_format():
+    """
+    Sin el pin, el límite de la clave lo decide el ``innodb_default_row_format`` del HOST.
+
+    Ahí el mismo clon entra en un servidor y falla con 1071 en otro: 3072 bytes con
+    ``DYNAMIC``/``COMPRESSED``, apenas 767 con ``COMPACT``/``REDUNDANT``.
+    """
+    tbl = _table(storage_options={"engine": "InnoDB", "row_format": "DYNAMIC"})
+    assert _adapter()._render_create_table(tbl).endswith(
+        "ENGINE=InnoDB ROW_FORMAT=DYNAMIC"
+    )
+
+
+def test_create_table_without_row_format_is_unchanged():
+    tbl = _table(storage_options={"engine": "InnoDB"})
+    assert _adapter()._render_create_table(tbl).endswith("ENGINE=InnoDB")
+
+
+def test_create_table_emits_table_comment():
+    """El COMMENT se reflejaba en ``TableSchema.comment`` y no se emitía nunca."""
+    tbl = _table(comment="Bitacora de operaciones")
+    assert _adapter()._render_create_table(tbl).endswith(
+        "COMMENT='Bitacora de operaciones'"
+    )
+
+
+def test_table_comment_with_quotes_is_escaped():
+    """El comentario es texto libre del usuario y va interpolado en DDL."""
+    tbl = _table(comment="'; DROP TABLE users; --")
+    ddl = _adapter()._render_create_table(tbl)
+    assert ddl.endswith("COMMENT='''; DROP TABLE users; --'")
+
+
+def test_table_comment_with_null_byte_is_rejected():
+    tbl = _table(comment="\x00")
+    with pytest.raises(AppHttpException):
+        _adapter()._render_create_table(tbl)
+
+
+def test_storage_from_row_reads_row_format():
+    opts = MySQLAdapter._storage_from_row("InnoDB", "utf8mb4_unicode_ci", "Dynamic")
+    assert opts["row_format"] == "Dynamic"
+    assert opts["engine"] == "InnoDB"
+    assert opts["charset"] == "utf8mb4"
+
+
+def test_storage_from_row_omits_absent_row_format():
+    """Una vista devuelve NULL en ROW_FORMAT: la clave no debe aparecer vacía."""
+    assert "row_format" not in MySQLAdapter._storage_from_row("InnoDB", None, None)
+
+
+# --------------------------------------------------------------------------- #
 # Firma del diff: que la deriva DEJE de ser invisible                          #
 # --------------------------------------------------------------------------- #
 def test_diff_signature_distinguishes_prefixed_from_plain_index():
@@ -266,3 +326,46 @@ def test_signatures_unchanged_when_no_prefixes_on_either_side():
     u1 = UniqueConstraintInfo(name="u", columns=["x"])
     u2 = UniqueConstraintInfo(name="u", columns=["x"])
     assert _unique_signature(u1) == _unique_signature(u2)
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end: el pipeline que usa el clon                                      #
+# --------------------------------------------------------------------------- #
+def test_clone_pipeline_preserves_prefix_row_format_and_comment():
+    """
+    El recorrido REAL de la fase de estructura del clon:
+    ``diff(origen, snapshot vacío)`` → ``render_diff`` (ver ``_build_execution_plan``).
+
+    Reproduce ``wa_wasabi_logs`` del incidente sobre MariaDB, que es donde se reportó.
+    """
+    tbl = TableSchema(
+        database="cirox_012_tenant",
+        table="wa_wasabi_logs",
+        columns=[
+            ColumnInfo(name="id", type="bigint(20) unsigned", nullable=False,
+                       primary_key=True, autoincrement=True),
+            ColumnInfo(name="bucket", type="varchar(255)", nullable=False),
+            ColumnInfo(name="key", type="varchar(1024)", nullable=False),
+        ],
+        primary_key=["id"],
+        foreign_keys=[],
+        indexes=[
+            IndexInfo(name="idx_bucket_key", columns=["bucket", "key"], unique=False,
+                      prefix_lengths={"key": 191}),
+        ],
+        comment="Bitacora de operaciones Wasabi",
+        storage_options={"engine": "InnoDB", "charset": "utf8mb4",
+                         "collation": "utf8mb4_unicode_ci", "row_format": "DYNAMIC"},
+    )
+    src = SchemaSnapshot(database="cirox_012_tenant", source_engine="mariadb", tables=[tbl])
+    empty = SchemaSnapshot(database="cirox_099_tenant", source_engine="mariadb", tables=[])
+
+    rendered = _adapter("mariadb").render_diff(diff_snapshots(src, empty))
+    by_type = {st.object_type: st.sql for st in rendered}
+
+    # El índice va en una sentencia SEPARADA del CREATE TABLE: es el punto exacto
+    # donde el prefijo se perdía, y el que el reporte del incidente marcaba como
+    # ``index · wa_wasabi_logs.idx_bucket_key  failed``.
+    assert "(`bucket`, `key`(191))" in by_type["index"]
+    assert "ROW_FORMAT=DYNAMIC" in by_type["table"]
+    assert "COMMENT='Bitacora de operaciones Wasabi'" in by_type["table"]
