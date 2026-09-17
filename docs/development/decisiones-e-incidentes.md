@@ -907,6 +907,79 @@ destino nuevo o existente. Guía de uso: `docs/features/database-clone.md`.
   clonados y re-calificados al destino). `scripts/verify_clone_e2e.py` cubre tablas/datos;
   cross-engine MySQL→PostgreSQL pendiente de corrida.
 
+### El clon reescribía índices en silencio: prefijo perdido (1071) y `ROW_FORMAT`
+
+**Incidente** (reportado desde `omnicanal-api`, zona `cirox_tenant`, MariaDB 11.8.3): clonar
+una base de tenant fallaba al recrear `wa_wasabi_logs.idx_bucket_key` con
+`(1071, 'Specified key was too long; max key length is 3072 bytes')`. El origen era
+correcto: el índice es `(bucket, key(191))` y ocupa `255×4 + 191×4 = 1784` bytes, con 1288
+de margen. El clon lo reconstruía **sin el `(191)`**, con lo que pasaba a `1020 + 4096 =
+5116` y el motor lo rechazaba.
+
+**Causa raíz**: la estructura NO se copia verbatim, se re-sintetiza desde DTOs
+(`structural_snapshot` → `diff_snapshots` contra un snapshot vacío → `render_diff`, ver
+`_build_execution_plan`). `ServerAdapter._index_from_raw` traducía `dialect_options`
+reconociendo solo los sufijos `_using`, `_where` e `_include`; SQLAlchemy expone la longitud
+de prefijo como `dialect_options["mysql_length"]`, que no caía en ninguna rama y se
+descartaba sin aviso. `IndexInfo` tampoco tenía dónde guardarla.
+
+**Por qué el match es por SUFIJO `_length` y no por la cadena `mysql_length`**: SQLAlchemy
+arma la clave con `dialect_options["%s_length" % self.name]`, así que la misma opción llega
+como **`mariadb_length`** cuando la URL declara MariaDB — el motor exacto donde se reportó
+el fallo. Un fix que buscara el literal de MySQL no habría arreglado nada.
+
+**Hay DOS rutas de emisión y las dos lo perdían.** El índice suelto
+(`_render_create_index`) y la `UNIQUE` inline del `CREATE TABLE`: el diff descarta el índice
+que respalda una unique constraint para no emitir la misma clave dos veces (`1061 Duplicate
+key name`, ver `_index_backs_unique_constraint`), así que arreglar solo el `CREATE INDEX`
+dejaba el caso UNIQUE roto. Y ahí el prefijo hay que **prestárselo desde la cara de índice**:
+`get_unique_constraints` se queda con `col[0]` y tira `col[1]`, así que la cara de constraint
+no lo expone. Se cruza por `duplicates_index` en `_build_table_schema`.
+
+**El 1071 fue el caso afortunado.** Un prefijo descartado solo falla cuando el índice
+completo supera el límite de bytes. Las dos columnas con prefijo de esa zona son
+`varchar(1024)` y con `utf8mb4` se van a 4096 B, por eso explotaron. Con una columna más
+corta el índice se habría creado **sin un solo error** sobre la columna completa — y si la
+clave es `UNIQUE`, eso DEBILITA la restricción: el clon acepta filas que el origen rechazaba.
+Deja de ser una diferencia de performance y pasa a ser una diferencia de datos.
+
+**`_index_signature` también lo ignoraba**, así que el diff consideraba `idx(key(191))`
+idéntico a `idx(key)` y schema-comparison se quedaba callado: la herramienta que existe para
+detectar la deriva de un clon era ciega justo a esta. Por eso el prefijo entra en la firma, y
+**ordenado por nombre de columna**: un dict no tiene orden estable entre reflexiones y un
+falso positivo emitiría un DROP+CREATE de índice sin ningún cambio real detrás, sobre una
+tabla de producción de un tercero.
+
+**`ROW_FORMAT` viajaba perdido por el mismo camino.** `_table_storage_options` y su variante
+prefetch leían solo `ENGINE` y `TABLE_COLLATION`. Sin el pin explícito, la tabla hereda el
+`innodb_default_row_format` del host destino, y de eso depende el límite de la clave: 3072
+bytes con `DYNAMIC`/`COMPRESSED`, apenas **767** con `COMPACT`/`REDUNDANT`. El clon sobrevivía
+porque el destino resolvía `DYNAMIC` por default — un éxito que dependía de dónde se ejecuta
+y no de lo que se clona. El `COMMENT` de tabla tenía la forma inversa del mismo defecto: se
+reflejaba en `TableSchema.comment` y `_render_create_table` no lo emitía nunca.
+
+**El mensaje de error trae el límite computado, no una constante** — es diagnóstico gratis:
+3072 ⇒ `DYNAMIC`/`COMPRESSED` con página de 16K; 1536 ⇒ página de 8K; 768 ⇒ 4K; 767 ⇒
+`COMPACT`/`REDUNDANT`. Cuidado con la inferencia fácil: que el mensaje diga 3072 prueba que
+el **servidor destino** resuelve `DYNAMIC`, no que el DDL emitido pinnee el `ROW_FORMAT`.
+Confundir las dos cosas es lo que dejó este segundo defecto sin detectar en el diagnóstico
+original.
+
+**Lo que quedó FUERA y sigue abierto** (ninguno es regresión de este fix; los tres ya estaban):
+- `dialect_options["mysql_prefix"]` (FULLTEXT/SPATIAL) termina en `_prefix`, no en `_length`:
+  tampoco se captura, así que un índice FULLTEXT se clona como BTREE normal y rompe
+  `MATCH … AGAINST` en el destino. Mismo defecto de clase, distinta opción.
+- `column_sort` (índices DESC) se captura en el DTO y ningún adapter lo renderiza.
+- La compatibilidad de unicidad de `clone_spec` (camino `data_only`) compara por columnas sin
+  mirar el prefijo, así que un `UNIQUE (col(191))` que existe solo en el destino no bloquea.
+- Cross-engine hacia PostgreSQL descarta el prefijo por necesidad (PG no tiene índices por
+  prefijo) y no lo avisa.
+
+**Verificación**: `tests/test_index_prefix_lengths.py` (25 casos: reflexión en las dos
+variantes de dialecto, las dos rutas de emisión, firmas del diff, `ROW_FORMAT`, escapado del
+`COMMENT`, y el pipeline end-to-end del clon). **Sin motor real**: es render y diff puros,
+nunca se ejecutó contra MariaDB.
+
 ## Lote de Clonación (clonar N bases de un servidor a otro)
 
 Capa de ORQUESTACIÓN sobre el módulo de clonado, no un motor nuevo: cada fila termina siendo un
