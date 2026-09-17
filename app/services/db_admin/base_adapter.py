@@ -667,6 +667,7 @@ class ServerAdapter(ABC):
         method = None
         predicate = None
         include_columns: list[str] = []
+        prefix_lengths: dict[str, int] = {}
         for key, val in dialect_opts.items():
             if key.endswith("_using") and val:
                 method = str(val)
@@ -674,6 +675,14 @@ class ServerAdapter(ABC):
                 predicate = str(val)
             elif key.endswith("_include") and val:
                 include_columns = list(val)
+            elif key.endswith("_length") and val:
+                # Longitud de prefijo de MySQL/MariaDB: ``{columna: N}`` para ``col(N)``.
+                # El match es por SUFIJO y no por la cadena literal ``mysql_length`` a
+                # propósito: SQLAlchemy arma la clave con ``self.name`` del dialecto, así
+                # que la MISMA opción llega como ``mariadb_length`` cuando la URL declara
+                # MariaDB. Buscar el literal de MySQL dejaba el fix sin efecto justo en el
+                # motor donde se reportó el 1071.
+                prefix_lengths = {str(c): int(n) for c, n in dict(val).items() if n}
         # column_sorting: {col: ('desc', 'nulls_first')} solo cuando no es el default.
         column_sort: dict[str, list[str]] = {}
         for col, opts in (ix.get("column_sorting") or {}).items():
@@ -695,6 +704,7 @@ class ServerAdapter(ABC):
             expressions=expressions,
             column_sort=column_sort,
             include_columns=include_columns,
+            prefix_lengths=prefix_lengths,
         )
 
     def _build_table_schema(
@@ -809,9 +819,23 @@ class ServerAdapter(ABC):
             for ck in checks_raw
             if ck.get("sqltext")
         ]
+        # Prefijos de la cara de ÍNDICE, para prestárselos a la cara de CONSTRAINT.
+        # En MySQL/MariaDB una UNIQUE se refleja dos veces (índice + constraint) y solo la
+        # primera expone la longitud: ``get_unique_constraints`` se queda con ``col[0]`` y
+        # descarta ``col[1]``. Sin este cruce, una ``UNIQUE KEY (col(191))`` que el
+        # ``CREATE TABLE`` emite inline perdería el prefijo aunque el índice suelto ya lo
+        # preserve — y ahí el fallo es SILENCIOSO: el UNIQUE pasa a cubrir la columna
+        # completa y acepta filas que el origen rechazaba.
+        prefixes_by_index_name = {
+            ix.name: ix.prefix_lengths for ix in indexes if ix.name and ix.prefix_lengths
+        }
         unique_constraints = [
             UniqueConstraintInfo(
-                name=uc.get("name"), columns=uc.get("column_names") or []
+                name=uc.get("name"),
+                columns=uc.get("column_names") or [],
+                prefix_lengths=prefixes_by_index_name.get(
+                    uc.get("duplicates_index") or uc.get("name"), {}
+                ),
             )
             for uc in uniques_raw
         ]

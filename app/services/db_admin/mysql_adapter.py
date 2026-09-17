@@ -2032,13 +2032,40 @@ class MySQLAdapter(ServerAdapter):
             parts.append(f"COMMENT {quote_string_literal(col.comment, self.dialect)}")
         return " ".join(parts)
 
+    def _key_columns(self, columns, prefix_lengths) -> str:
+        """
+        Lista de columnas de una clave, con la longitud de PREFIJO cuando la hay:
+        ``` `bucket`, `key`(191) ```.
+
+        Emitir la columna pelada cuando el origen indexaba un prefijo no es una
+        diferencia cosmética. Con ``utf8mb4`` cada carácter reserva 4 bytes en la clave,
+        así que un ``varchar(1024)`` sin prefijo pesa 4096 B y se pasa del límite de 3072
+        (``1071 Specified key was too long``). Y ese es el caso AFORTUNADO: con una
+        columna más corta el índice se crea sin error sobre la columna completa, y si la
+        clave es UNIQUE el destino pasa a aceptar filas que el origen rechazaba — una
+        diferencia de datos, no de performance.
+
+        La longitud se interpola sin parametrizar porque va en DDL, donde un bind no es
+        legal; por eso se emite solo si es un entero POSITIVO. Un valor no numérico o
+        <= 0 no puede venir de la reflexión, así que se descarta en silencio en vez de
+        abortar el clon entero por un dato que el motor no debería haber devuelto.
+        """
+        parts = []
+        for c in columns:
+            q = self._q(c, "columna")
+            n = (prefix_lengths or {}).get(c)
+            if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                q += f"({n})"
+            parts.append(q)
+        return ", ".join(parts)
+
     def _render_create_table(self, tbl) -> str:
         lines = [self._render_column_def(c) for c in tbl.columns]
         if tbl.primary_key:
             pk = ", ".join(self._q(c, "columna") for c in tbl.primary_key)
             lines.append(f"PRIMARY KEY ({pk})")
         for uc in tbl.unique_constraints:
-            cols = ", ".join(self._q(c, "columna") for c in uc.columns)
+            cols = self._key_columns(uc.columns, uc.prefix_lengths)
             name = f"CONSTRAINT {self._q(uc.name, 'constraint')} " if uc.name else ""
             lines.append(f"{name}UNIQUE ({cols})")
         for ck in tbl.check_constraints:
@@ -2109,7 +2136,7 @@ class MySQLAdapter(ServerAdapter):
 
     def _render_create_index(self, table, ix) -> str:
         unique = "UNIQUE " if ix.unique else ""
-        cols = ", ".join(self._q(c, "columna") for c in ix.columns)
+        cols = self._key_columns(ix.columns, ix.prefix_lengths)
         name = self._q(ix.name, "indice") if ix.name else self._q(f"ix_{table}_{'_'.join(ix.columns)}"[:64], "indice")
         sql = f"CREATE {unique}INDEX {name} ON {self._q(table, 'tabla')} ({cols})"
         if ix.method:

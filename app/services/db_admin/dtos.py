@@ -161,6 +161,16 @@ class IndexInfo(BaseModel):
         description="col -> ['desc','nulls_first'] cuando el orden no es el default.",
     )
     include_columns: list[str] = Field(default_factory=list)  # PG INCLUDE (covering)
+    prefix_lengths: dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "col -> longitud de PREFIJO indexada, solo MySQL/MariaDB (``key(191)``). "
+            "Perderla no es cosmético: el índice pasa a cubrir la columna COMPLETA, lo "
+            "que puede superar el límite de bytes de la clave (error 1071) o —peor, "
+            "porque es silencioso— debilitar un UNIQUE hasta aceptar filas que el "
+            "origen rechaza. Vacío en PostgreSQL, que no tiene índices por prefijo."
+        ),
+    )
 
 
 class CheckConstraintInfo(BaseModel):
@@ -175,6 +185,16 @@ class UniqueConstraintInfo(BaseModel):
 
     name: str | None = None
     columns: list[str]
+    prefix_lengths: dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "col -> longitud de prefijo, igual que en ``IndexInfo``. En MySQL/MariaDB una "
+            "UNIQUE se refleja DUPLICADA (como constraint y como índice), pero solo la "
+            "cara de índice expone el prefijo: ``get_unique_constraints`` descarta la "
+            "longitud al quedarse con ``col[0]``. Se completa cruzando por nombre contra "
+            "los índices reflejados (ver ``_build_table_schema``)."
+        ),
+    )
 
 
 class TableSchema(BaseModel):

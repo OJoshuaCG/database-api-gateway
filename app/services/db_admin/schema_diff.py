@@ -316,6 +316,19 @@ def _fk_options(fk: ForeignKeyInfo) -> tuple:
     )
 
 
+def _prefix_signature(prefix_lengths: dict[str, int]) -> tuple:
+    """
+    Los prefijos como par ordenado por columna, para que entren en la comparación.
+
+    Sin esto el diff considera ``idx(url(255))`` IDÉNTICO a ``idx(url)`` y se queda
+    callado: la deriva de un clon que perdió el prefijo sería invisible justo para la
+    herramienta que existe para detectarla. Se ordena por nombre de columna porque un
+    dict no tiene orden estable entre reflexiones y un falso positivo por reordenamiento
+    emitiría un DROP+CREATE de índice sin ningún cambio real detrás.
+    """
+    return tuple(sorted((str(c), int(n)) for c, n in (prefix_lengths or {}).items()))
+
+
 def _index_signature(ix: IndexInfo) -> tuple:
     return (
         tuple(ix.columns),
@@ -324,11 +337,12 @@ def _index_signature(ix: IndexInfo) -> tuple:
         _norm_expr(ix.predicate),
         tuple(_norm_expr(e) for e in ix.expressions),
         tuple(ix.include_columns),
+        _prefix_signature(ix.prefix_lengths),
     )
 
 
 def _unique_signature(uc: UniqueConstraintInfo) -> tuple:
-    return tuple(uc.columns)
+    return (tuple(uc.columns), _prefix_signature(uc.prefix_lengths))
 
 
 def _check_signature(ck: CheckConstraintInfo) -> str:
