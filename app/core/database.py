@@ -13,9 +13,12 @@ def _get_engine_kwargs(engine_prefix: str) -> dict:
     Retorna kwargs para create_engine según el motor de base de datos.
 
     Motores soportados:
-      - mysql / mariadb  → charset utf8mb4, init_command
-      - postgresql       → connect_timeout
+      - mysql / mariadb  → charset utf8mb4, init_command (incluye time_zone UTC)
+      - postgresql       → connect_timeout, timezone UTC
       - sqlite           → check_same_thread=False
+
+    SQLite queda afuera del pin de zona a propósito: no tiene sesión con ``time_zone`` y su
+    ``CURRENT_TIMESTAMP`` ya es UTC.
     """
     base = {
         "pool_size": 10,
@@ -24,13 +27,26 @@ def _get_engine_kwargs(engine_prefix: str) -> dict:
         "pool_pre_ping": True,  # verifica la conexión antes de usarla (evita stale connections)
     }
 
+    # La SESIÓN se fija en UTC en los dos motores, y no es preferencia de formato: en la
+    # misma fila conviven timestamps de DOS relojes. ``applied_at`` de
+    # ``database_migration_history`` lo escribe el proceso Python con
+    # ``datetime.now(timezone.utc)``, mientras que ``created_at``/``updated_at`` del
+    # ``TimestampMixin`` salen de ``func.now()``, o sea del reloj del MOTOR. Sin fijar la
+    # zona, un servidor en horario local hace que las dos columnas de una misma fila difieran
+    # por el offset **y nada lo declare**, que es la peor forma de un dato de auditoría.
+    #
+    # OJO AL DESPLEGAR: si este servidor NO venía en UTC, los ``created_at`` escritos ANTES
+    # de este cambio están en su hora local y los de después en UTC. Hay una discontinuidad
+    # en ese punto. En un contenedor con la zona por defecto (UTC) el cambio es un no-op.
     if engine_prefix in ("mysql", "mariadb"):
         base["connect_args"] = {
             "charset": "utf8mb4",
-            "init_command": "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+            "init_command": (
+                "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci, time_zone = '+00:00'"
+            ),
         }
     elif engine_prefix == "postgresql":
-        base["connect_args"] = {"connect_timeout": 10}
+        base["connect_args"] = {"connect_timeout": 10, "options": "-c timezone=UTC"}
     elif engine_prefix == "sqlite":
         base["connect_args"] = {"check_same_thread": False}
 
