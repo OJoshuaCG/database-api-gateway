@@ -15,10 +15,14 @@ from app.models.database_model import DatabaseModel
 from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.models.project import ProjectDatabaseModel
+from app.core.logger import get_logger
 from app.services import audit
+from app.services import database_model_catalog as dm_codes
 
 if TYPE_CHECKING:
     from app.core.actor import Actor
+
+logger = get_logger(__name__)
 
 
 class DatabaseModelController:
@@ -95,6 +99,7 @@ class DatabaseModelController:
                 raise AppHttpException(
                     message="Ya existe un blueprint con ese nombre o slug.",
                     status_code=409,
+                    public_context={"code": dm_codes.CODE_NAME_OR_SLUG_TAKEN},
                     context={"slug": data.get("slug")},
                 ) from exc
             session.refresh(model)
@@ -117,6 +122,39 @@ class DatabaseModelController:
             for field in ("charset", "collation"):
                 if field in data:
                     setattr(model, field, data[field])
+            # El ``slug`` NO es una etiqueta: ``migrations.version_table_name`` lo usa
+            # para nombrar la tabla de versión de Alembic (``_gw_v_{slug}``) DENTRO de cada
+            # BD gestionada. Cambiarlo acá no renombra nada en los motores, así que la
+            # contabilidad de todas esas bases queda huérfana de golpe: el gateway pasa a
+            # leer una tabla inexistente, ``compute_pending`` reporta la cadena ENTERA como
+            # pendiente y un ``apply`` la reaplica desde la 0001 sobre bases que ya tienen el
+            # esquema. Ya ocurrió en producción. El ``name`` no nombra ninguna tabla y por
+            # eso sigue siendo libre: renombrar el blueprint para una persona es seguro,
+            # cambiar su identificador para el motor no lo es.
+            nuevo_slug = data.get("slug")
+            if nuevo_slug is not None and nuevo_slug != model.slug:
+                bases = (
+                    session.query(ManagedDatabase.id)
+                    .filter(ManagedDatabase.model_id == model_id)
+                    .count()
+                )
+                if bases:
+                    raise AppHttpException(
+                        message=(
+                            f"No se puede cambiar el slug de un blueprint con {bases} base(s) "
+                            "gestionada(s): dejaría huérfana su tabla de versión y la cadena "
+                            "entera pasaría a figurar como pendiente. Renombrá el 'name', que "
+                            "es libre, o desasociá las bases primero."
+                        ),
+                        status_code=409,
+                        public_context={
+                            "code": dm_codes.CODE_SLUG_IN_USE,
+                            "current_slug": model.slug,
+                            "requested_slug": nuevo_slug,
+                            "managed_database_count": bases,
+                        },
+                        context={"model_id": model_id},
+                    )
             for field in ("name", "slug", "description", "current_version", "is_active"):
                 if field in data and data[field] is not None:
                     setattr(model, field, data[field])
@@ -127,6 +165,7 @@ class DatabaseModelController:
                 raise AppHttpException(
                     message="Ya existe un blueprint con ese nombre o slug.",
                     status_code=409,
+                    public_context={"code": dm_codes.CODE_NAME_OR_SLUG_TAKEN},
                     context={"model_id": model_id},
                 ) from exc
             session.refresh(model)
@@ -256,6 +295,24 @@ class DatabaseModelController:
                     current = controller.runner.get_current_version(
                         targets[row.server_id], row.name, slug
                     )
+                    # ``None`` acá significa "no encontré tabla de versión", y eso es
+                    # INDISTINGUIBLE de "la BD está en base". Pisar con ``None`` una versión
+                    # que el gateway ya tenía registrada destruye la única evidencia de dónde
+                    # estaba parada esa base: es lo que borró el rastro de las BDs de un
+                    # blueprint al que le cambiaron el slug, y lo que las hizo desaparecer del
+                    # conteo de "aplicado a N BDs" (que se calcula sobre ``model_version``,
+                    # no sobre ``model_id``). Un refresh es una LECTURA: si el motor deja de
+                    # reportar una versión que antes existía, se conserva la registrada y se
+                    # deja rastro. Reconciliar de verdad es trabajo de ``stamp``, que es una
+                    # afirmación explícita del operador.
+                    if current is None and row.model_version is not None:
+                        logger.warning(
+                            "resync: la BD %s (id=%s) no reporta tabla de versión para el "
+                            "blueprint '%s'; se conserva la versión registrada %s. Puede ser "
+                            "un slug renombrado o una tabla de versión borrada.",
+                            row.name, row.id, slug, row.model_version,
+                        )
+                        continue
                     row.model_version = current
                     out[row.id] = current
                 except AppHttpException:
