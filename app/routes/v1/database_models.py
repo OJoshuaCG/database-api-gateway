@@ -25,6 +25,7 @@ from app.schemas.database_model import (
     FromSnapshotIn,
     FromSnapshotOut,
     ModelDatabaseStatusOut,
+    MigrateVersionTableIn,
     RenameSlugIn,
     RenameSlugOut,
     RenameSlugPlanOut,
@@ -144,6 +145,58 @@ def rename_slug_plan(
     """
     result = DatabaseModelController().rename_slug_plan(model_id, payload.new_slug)
     return success(data=result, message="Plan de renombrado del slug.")
+
+
+@router.post(
+    "/{model_id}/migrate-version-table/plan",
+    response_model=ApiResponse[RenameSlugPlanOut],
+)
+@limiter.limit("10/minute")
+def migrate_version_table_plan(request: Request, actor: BlueprintsWrite, model_id: int):
+    """
+    Preflight de la migración de PREFIJO de la tabla de versión. **No escribe nada.**
+
+    Moderniza `_gw_v_{slug}` → `_datum_version_{slug}` **sin cambiar el slug**. Es la misma
+    operación que el renombrado de slug con el slug igual a sí mismo, así que reusa su
+    aparato completo: preview, `confirm_token`, advisory lock y compensación.
+
+    **No hace falta correrla.** El gateway resuelve el nombre contra cada base, así que una
+    con el prefijo histórico sigue funcionando indefinidamente. Esto es para uniformar cuando
+    se quiera, base por base y con red.
+
+    Misma clasificación que `rename-slug`, con un valor más: `already` — la base ya tiene el
+    nombre vigente y no hay nada que hacer. **No bloquea**, a diferencia de `conflict`, que es
+    cuando conviven las dos tablas y no se puede decidir cuál es el puntero bueno.
+    """
+    result = DatabaseModelController().migrate_version_tables_plan(model_id)
+    return success(data=result, message="Plan de migración de la tabla de versión.")
+
+
+@router.post(
+    "/{model_id}/migrate-version-table", response_model=ApiResponse[RenameSlugOut]
+)
+@limiter.limit("3/minute")
+def migrate_version_table(
+    request: Request,
+    actor: BlueprintsWrite,
+    model_id: int,
+    payload: MigrateVersionTableIn,
+):
+    """
+    Migra la tabla de versión al prefijo vigente en cada BD gestionada del blueprint.
+
+    Renombra `_gw_v_{slug}` → `_datum_version_{slug}`. El slug **no** cambia, así que el
+    inventario del gateway queda igual: lo único que se mueve son las tablas en los motores.
+
+    Mismas garantías que `rename-slug`: el plan se recalcula desde cero, el token está atado a
+    la huella del parque, cada base se renombra bajo el advisory lock que toman
+    apply/rollback/stamp, y ante un fallo a mitad se compensa devolviendo cada tabla a su
+    nombre de origen — que se resuelve por base, no se asume uno solo.
+    """
+    result = DatabaseModelController().migrate_version_tables(
+        model_id, confirm_token=payload.confirm_token, admin=actor
+    )
+    return success(data=result, message="Tabla de versión migrada al prefijo vigente.")
 
 
 @router.post("/{model_id}/rename-slug", response_model=ApiResponse[RenameSlugOut])

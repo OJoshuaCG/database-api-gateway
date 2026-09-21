@@ -488,9 +488,16 @@ class DatabaseModelController:
     # Renombrado del slug, propagado a los motores                        #
     # ------------------------------------------------------------------ #
     #: Qué hay que hacer con cada BD del blueprint.
-    _RN_RENAME = "rename"          # tiene la tabla vieja y el nombre nuevo está libre
+    _RN_RENAME = "rename"          # tiene la origen y el destino está libre
     _RN_SKIP = "skip"              # nunca fue posicionada: no hay tabla que renombrar
-    _RN_CONFLICT = "conflict"      # el nombre DESTINO ya existe ahí
+    #: Ya tiene el destino y NO tiene origen: no hay nada que hacer y **no bloquea**.
+    #: Distinguirlo de ``conflict`` importa en los dos flujos. En la migración de prefijo es
+    #: el caso normal de una base ya migrada, y tratarla como conflicto haría que la segunda
+    #: corrida fallara entera. En el renombrado de slug es una base que YA estaba huérfana
+    #: —el gateway leía un nombre que ella no tiene—, y dejarla pasar la repara.
+    _RN_ALREADY = "already"
+    #: Tiene las DOS. Ahí sí es ambiguo cuál es el puntero bueno, y bloquea.
+    _RN_CONFLICT = "conflict"
     _RN_UNREACHABLE = "unreachable"  # no se pudo leer (fail-closed)
 
     _RN_BLOCKING = frozenset({_RN_CONFLICT, _RN_UNREACHABLE})
@@ -511,7 +518,47 @@ class DatabaseModelController:
             parts.append(f"{it['managed_database_id']}:{it['action']}")
         return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
-    def rename_slug_plan(self, model_id: int, new_slug: str) -> dict:
+    def migrate_version_tables_plan(self, model_id: int) -> dict:
+        """Preflight de la migración de PREFIJO. El slug no cambia. 🔌 Solo lectura.
+
+        Es la misma operación que el renombrado de slug con el slug igual a sí mismo: el
+        origen se resuelve por base y el destino es siempre el prefijo vigente. Por eso reusa
+        el aparato entero —preview, token, advisory lock, compensación— en vez de tener uno
+        propio que habría que mantener en paralelo.
+
+        No hace falta correrla: ``resolve_version_table`` deja funcionando a las bases con el
+        prefijo viejo indefinidamente. Esto es para uniformar cuando se quiera, base por base
+        y con red.
+        """
+        session = self._session()
+        try:
+            slug = self._get_or_404(session, model_id).slug
+        finally:
+            session.close()
+        plan = self.rename_slug_plan(model_id, slug, _same_slug_ok=True)
+        plan["prefix_only"] = True
+        return plan
+
+    def migrate_version_tables(
+        self,
+        model_id: int,
+        *,
+        confirm_token: str | None = None,
+        admin: "dict | Actor | None" = None,
+    ) -> dict:
+        """Ejecuta la migración de prefijo. Mismo aparato que el renombrado de slug. 🔌"""
+        session = self._session()
+        try:
+            slug = self._get_or_404(session, model_id).slug
+        finally:
+            session.close()
+        return self.rename_slug(
+            model_id, slug, confirm_token=confirm_token, admin=admin, _same_slug_ok=True
+        )
+
+    def rename_slug_plan(
+        self, model_id: int, new_slug: str, *, _same_slug_ok: bool = False
+    ) -> dict:
         """Preflight del renombrado. **No escribe nada**, ni en el gateway ni en un motor. 🔌
 
         Devuelve el plan SIEMPRE: los bloqueos viajan en ``blockers`` en vez de lanzarse,
@@ -529,7 +576,10 @@ class DatabaseModelController:
         try:
             model = self._get_or_404(session, model_id)
             old_slug = model.slug
-            if new_slug == old_slug:
+            # ``_same_slug_ok`` es la migración de PREFIJO: el slug no cambia y lo único
+            # que se mueve es ``_gw_v_`` -> ``_datum_version_``. Por la vía pública sigue
+            # siendo un 422, porque pedir un rename al mismo valor es un error del cliente.
+            if new_slug == old_slug and not _same_slug_ok:
                 raise AppHttpException(
                     message="El slug nuevo es igual al actual.",
                     status_code=422,
@@ -568,11 +618,22 @@ class DatabaseModelController:
         # renombrado del prefijo tiene ``_gw_v_`` y una nueva ``_datum_version_``. El DESTINO
         # es siempre el vigente, así que renombrar el slug moderniza el prefijo de paso — sin
         # necesidad de una migración de parque aparte.
-        origenes = (version_table_name(old_slug), legacy_version_table_name(old_slug))
         tabla_nueva = version_table_name(new_slug)
+        # Los orígenes posibles EXCLUYEN el destino, y eso resuelve dos casos de una. En la
+        # migración de prefijo el destino ES el nombre vigente del mismo slug, así que sin
+        # excluirlo una base ya migrada tendría "origen" y "destino" apuntando a la MISMA
+        # tabla y saldría clasificada como conflicto. Y si dos slugs distintos truncan al
+        # mismo nombre, la lista queda vacía: no hay nada que renombrar, que es la definición
+        # de ``no_op``.
+        origenes = tuple(
+            o
+            for o in (version_table_name(old_slug), legacy_version_table_name(old_slug))
+            if o != tabla_nueva
+        )
         # Dos slugs distintos pueden truncar al MISMO nombre (63 chars). Ahí no hay nada que
         # renombrar en ningún motor y el cambio es puramente local.
-        no_op = tabla_nueva in origenes
+        # Sin orígenes posibles no hay nada que tocar en ningún motor: el cambio es local.
+        no_op = not origenes
 
         items: list[dict] = []
         for db_id, db_name, server_id in filas:
@@ -599,9 +660,15 @@ class DatabaseModelController:
                 item["detail"] = getattr(exc, "message", "No se pudo leer la base.")
                 items.append(item)
                 continue
-            if tiene_nueva:
+            if tiene_nueva and origen:
                 item["action"] = self._RN_CONFLICT
-                item["detail"] = f"Ya existe la tabla '{tabla_nueva}' en esta base."
+                item["detail"] = (
+                    f"Conviven '{origen}' y '{tabla_nueva}': no se puede decidir cuál es el "
+                    "puntero bueno sin mirar esa base."
+                )
+            elif tiene_nueva:
+                item["action"] = self._RN_ALREADY
+                item["detail"] = f"Ya tiene '{tabla_nueva}'. Nada que hacer."
             elif origen:
                 item["action"] = self._RN_RENAME
                 # El origen va POR BASE: dentro de un mismo blueprint puede haber bases con el
@@ -618,7 +685,7 @@ class DatabaseModelController:
             "model_id": model_id,
             "current_slug": old_slug,
             "new_slug": new_slug,
-            "current_table": origenes[0],
+            "current_table": origenes[0] if origenes else tabla_nueva,
             "new_table": tabla_nueva,
             "no_op": no_op,
             "databases": items,
@@ -733,6 +800,7 @@ class DatabaseModelController:
         *,
         confirm_token: str | None = None,
         admin: "dict | Actor | None" = None,
+        _same_slug_ok: bool = False,
     ) -> dict:
         """Cambia el ``slug`` del blueprint y propaga el rename de su tabla de versión. 🔌
 
@@ -750,7 +818,7 @@ class DatabaseModelController:
         from app.services.db_admin.factory import get_adapter
         from app.services.db_admin.migrations import MigrationRunner
 
-        plan = self.rename_slug_plan(model_id, new_slug)
+        plan = self.rename_slug_plan(model_id, new_slug, _same_slug_ok=_same_slug_ok)
         self._enforce_rename_plan(plan)
         old_slug = plan["current_slug"]
         tabla_nueva = plan["new_table"]

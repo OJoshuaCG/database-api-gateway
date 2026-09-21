@@ -121,6 +121,18 @@ class RenameSlugIn(BaseModel):
     )
 
 
+class MigrateVersionTableIn(BaseModel):
+    """Cuerpo de la migración de prefijo. No lleva slug: el slug no cambia."""
+
+    confirm_token: str | None = Field(
+        None,
+        description=(
+            "Token del preview. Obligatorio si hay bases que migrar; se omite cuando no hay "
+            "ninguna."
+        ),
+    )
+
+
 class RenameSlugDatabaseOut(BaseModel):
     """Qué le toca a cada BD del blueprint en el renombrado."""
 
@@ -128,7 +140,15 @@ class RenameSlugDatabaseOut(BaseModel):
     database_name: str
     server_id: int
     server_name: str | None = None
-    action: Literal["rename", "skip", "conflict", "unreachable"]
+    action: Literal["rename", "skip", "already", "conflict", "unreachable"]
+    source_table: str | None = Field(
+        None,
+        description=(
+            "La tabla que se va a renombrar EN ESTA base. Se resuelve por base: dentro de un "
+            "mismo blueprint puede haber bases con el prefijo histórico y otras con el "
+            "vigente. Solo viene cuando `action` es `rename`."
+        ),
+    )
     detail: str | None = None
 
 
@@ -151,6 +171,13 @@ class RenameSlugPlanOut(BaseModel):
     rename_count: int
     blockers: list[RenameSlugDatabaseOut]
     requires_confirmation: bool
+    prefix_only: bool = Field(
+        False,
+        description=(
+            "True cuando la operación solo moderniza el PREFIJO de la tabla de versión "
+            "(`_gw_v_` → `_datum_version_`) sin cambiar el slug."
+        ),
+    )
     confirm_token: str | None = None
     expires_at: datetime | None = None
     fingerprint: str
