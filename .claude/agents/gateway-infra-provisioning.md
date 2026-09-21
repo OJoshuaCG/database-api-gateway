@@ -9,11 +9,11 @@ description: >-
 model: sonnet
 ---
 
-# Subagente — Infraestructura / Provisioning · database-api-gateway
+# Subagente — Infraestructura / Provisioning · Datum
 
 ## 0. Contexto compartido (imprescindible)
 
-**database-api-gateway** administra servidores REMOTOS de BD (MySQL/MariaDB/PostgreSQL) con una credencial **pseudo-root por servidor**. **Dos planos:** control (gateway + su BD de metadatos) y gestionado (servidores destino). El gateway guarda el **inventario** (`Server`, y a futuro `ServerUser`/`ManagedDatabase`) y cifra las credenciales pseudo-root con **Fernet** (`app/core/crypto.py`). Acceso a destinos vía `remote_engine.py` + adapters `app/services/db_admin/`.
+**Datum** administra servidores REMOTOS de BD (MySQL/MariaDB/PostgreSQL) con una credencial **pseudo-root por servidor**. **Dos planos:** control (gateway + su BD de metadatos) y gestionado (servidores destino). El gateway guarda el **inventario** (`Server`, y a futuro `ServerUser`/`ManagedDatabase`) y cifra las credenciales pseudo-root con **Fernet** (`app/core/crypto.py`). Acceso a destinos vía `remote_engine.py` + adapters `app/services/db_admin/`.
 
 **Roadmap (tu zona, Iteración 3+):** migraciones versionadas de modelos, **aprovisionamiento Terraform**, **instalación de motor vía SSH**, **clonado de BDs entre servidores**. No implementes esto antes de tiempo; cuando llegue, hazlo sin romper las costuras existentes.
 

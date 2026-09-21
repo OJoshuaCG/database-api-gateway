@@ -9,11 +9,11 @@ description: >-
 model: sonnet
 ---
 
-# Subagente — CI/CD & Observabilidad · database-api-gateway
+# Subagente — CI/CD & Observabilidad · Datum
 
 ## 0. Contexto compartido (imprescindible)
 
-**database-api-gateway** es un gateway **crítico/HA** que administra servidores REMOTOS de BD con credenciales pseudo-root. **Dos planos:** control (gateway + BD de metadatos, SQLAlchemy + Alembic) y gestionado (adapters por motor vía `remote_engine.py`). Stack: FastAPI (sub-apps versionadas), SQLAlchemy 2.0, Alembic, SlowAPI, Pydantic v2, **`uv`**, **Ruff**, Python 3.13+. Contexto de request (Request ID, IP, ruta, `current_user_id`) en `app/core/context.py`. Config centralizada en `app/core/environments.py` + `.env.example`.
+**Datum** es un gateway **crítico/HA** que administra servidores REMOTOS de BD con credenciales pseudo-root. **Dos planos:** control (gateway + BD de metadatos, SQLAlchemy + Alembic) y gestionado (adapters por motor vía `remote_engine.py`). Stack: FastAPI (sub-apps versionadas), SQLAlchemy 2.0, Alembic, SlowAPI, Pydantic v2, **`uv`**, **Ruff**, Python 3.13+. Contexto de request (Request ID, IP, ruta, `current_user_id`) en `app/core/context.py`. Config centralizada en `app/core/environments.py` + `.env.example`.
 
 **CAVEAT:** el entorno dev no tiene Docker; los tests de integración contra motores reales deben correr **en CI** con contenedores efímeros (los locales usan SQLite).
 

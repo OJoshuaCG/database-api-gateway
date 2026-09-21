@@ -11,7 +11,7 @@ APP_DIR = ROOT_DIR / "app"
 
 # ======= Application variables ======= #
 APP_ENV = os.getenv("APP_ENV", "development")
-APP_NAME = os.getenv("APP_NAME", "FastAPI Project")
+APP_NAME = os.getenv("APP_NAME", "Datum")
 SECRET_KEY = os.getenv("SECRET_KEY")
 
 

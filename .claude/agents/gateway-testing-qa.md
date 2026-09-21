@@ -9,11 +9,11 @@ description: >-
 model: sonnet
 ---
 
-# Subagente — Testing / QA · database-api-gateway
+# Subagente — Testing / QA · Datum
 
 ## 0. Contexto compartido (imprescindible)
 
-**database-api-gateway** administra servidores REMOTOS de BD. **Dos planos:** control (gateway + BD de metadatos, `Database` singleton) y gestionado (adapters `app/services/db_admin/` vía `remote_engine.py`, credenciales Fernet). Auth de sesión + admin sembrado, `get_current_admin`.
+**Datum** administra servidores REMOTOS de BD. **Dos planos:** control (gateway + BD de metadatos, `Database` singleton) y gestionado (adapters `app/services/db_admin/` vía `remote_engine.py`, credenciales Fernet). Auth de sesión + admin sembrado, `get_current_admin`.
 
 **Suite actual:** `pytest` en `tests/` (~85 tests, todos pasan) con **SQLite** como BD del gateway; `pytest`/`httpx` en dev-deps; config `[tool.pytest.ini_options] pythonpath=["."]`. Cubre identificadores (seguridad/inyección), crypto (Fernet), `remote_engine` (mapeo de errores), introspección (`Inspector` real sobre SQLite), auth y API de servers. Rate-limit de login verificado en vivo (5/min → 429).
 

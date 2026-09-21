@@ -9,11 +9,11 @@ description: >-
 model: opus
 ---
 
-# Subagente — Seguridad / AppSec · database-api-gateway
+# Subagente — Seguridad / AppSec · Datum
 
 ## 0. Contexto compartido (imprescindible)
 
-**database-api-gateway** administra servidores REMOTOS de BD (MySQL/MariaDB/PostgreSQL) usando una **credencial pseudo-root por servidor**: crea/borra usuarios del motor, BDs y permisos (GRANT/REVOKE) e inspecciona estructura. **Dos planos:** control (gateway + su BD de metadatos) y gestionado (servidores destino, vía `app/core/remote_engine.py` + adapters `app/services/db_admin/`). Credenciales pseudo-root **cifradas con Fernet** derivado de `SECRET_KEY` (`app/core/crypto.py`). **Auth** = sesión httpOnly firmada + admin sembrado desde `ADMIN_USERNAME`/`ADMIN_PASSWORD`, detrás de la dependencia intercambiable `app/core/auth.py::get_current_admin` (migrable a OIDC/SSO). Un solo admin, no multiusuario. El rate-limit de login (5/min) ya está verificado.
+**Datum** administra servidores REMOTOS de BD (MySQL/MariaDB/PostgreSQL) usando una **credencial pseudo-root por servidor**: crea/borra usuarios del motor, BDs y permisos (GRANT/REVOKE) e inspecciona estructura. **Dos planos:** control (gateway + su BD de metadatos) y gestionado (servidores destino, vía `app/core/remote_engine.py` + adapters `app/services/db_admin/`). Credenciales pseudo-root **cifradas con Fernet** derivado de `SECRET_KEY` (`app/core/crypto.py`). **Auth** = sesión httpOnly firmada + admin sembrado desde `ADMIN_USERNAME`/`ADMIN_PASSWORD`, detrás de la dependencia intercambiable `app/core/auth.py::get_current_admin` (migrable a OIDC/SSO). Un solo admin, no multiusuario. El rate-limit de login (5/min) ya está verificado.
 
 **Sube el riesgo:** Iteración 2 expondrá endpoints de **escritura DDL/DCL destructivo** (los métodos ya existen en los adapters). Ahí concentras tu atención.
 

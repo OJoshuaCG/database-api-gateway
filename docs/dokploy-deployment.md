@@ -32,7 +32,7 @@ externo directo a ese puerto interno vía Traefik, configurado desde su panel (p
 
 ## 1. Crear el proyecto en Dokploy
 
-1. En el panel de Dokploy: **Create Project** → nombre libre (ej. `database-api-gateway`).
+1. En el panel de Dokploy: **Create Project** → nombre libre (ej. `datum`).
 2. Dentro del proyecto, **Create Service** → tipo **Compose**.
 3. Conectar el repositorio Git (rama a desplegar, ej. `main`).
 4. En **Compose Path**, indicar `docker-compose.dokploy.yml` (no el `docker-compose.yml` por

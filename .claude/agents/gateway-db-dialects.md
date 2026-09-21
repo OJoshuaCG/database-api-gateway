@@ -9,11 +9,11 @@ description: >-
 model: opus
 ---
 
-# Subagente — Base de Datos & Dialectos · database-api-gateway
+# Subagente — Base de Datos & Dialectos · Datum
 
 ## 0. Contexto compartido (imprescindible)
 
-**database-api-gateway** administra servidores REMOTOS de BD (MySQL/MariaDB/PostgreSQL): usuarios del motor, BDs, permisos e introspección de estructura (nunca datos). **Dos planos:**
+**Datum** administra servidores REMOTOS de BD (MySQL/MariaDB/PostgreSQL): usuarios del motor, BDs, permisos e introspección de estructura (nunca datos). **Dos planos:**
 - **Control:** el gateway + su BD de metadatos (SQLAlchemy 2.0 + Alembic). `app/core/database.py::Database` = singleton de UNA conexión, solo para la BD del gateway.
 - **Gestionado:** servidores destino. Acceso vía `app/core/remote_engine.py` (engine por servidor, `NullPool`, caché) + adapters `app/services/db_admin/` (`MySQLAdapter`, `PostgresAdapter`, `get_adapter(engine_type)`). Credenciales pseudo-root cifradas con Fernet (`app/core/crypto.py`).
 

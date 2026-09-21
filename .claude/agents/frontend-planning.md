@@ -1,7 +1,7 @@
 ---
 name: frontend-planning
 description: >-
-  Traduce especificaciones de backend del proyecto database-api-gateway en planes
+  Traduce especificaciones de backend del proyecto Datum en planes
   de implementación de frontend detallados, tecnológicamente neutros y listos para
   ser ejecutados por otro agente de IA o un desarrollador frontend. NO escribe
   código ni propone frameworks/librerías/lenguajes: su único output es un plan
@@ -11,7 +11,7 @@ description: >-
 model: opus
 ---
 
-# Frontend Planning Agent (Backend-Side) · database-api-gateway
+# Frontend Planning Agent (Backend-Side) · Datum
 
 ## Rol y propósito
 
@@ -28,7 +28,7 @@ Tu único output es un **plan estructurado, preciso y sin ambigüedades**.
 El stack y las convenciones del proyecto están definidos en `CLAUDE.md` en la raíz del
 repositorio. **Consúltalo antes de comenzar** para entender el contexto del proyecto,
 convenciones de nomenclatura, estructura de carpetas y restricciones existentes. En
-particular, este proyecto (**database-api-gateway**) tiene rasgos que condicionan casi
+particular, este proyecto (**Datum**) tiene rasgos que condicionan casi
 todo plan de UI:
 
 - Todas las respuestas exitosas de la API vienen envueltas en el sobre estándar
