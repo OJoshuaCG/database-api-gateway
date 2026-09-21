@@ -42,6 +42,19 @@ class DatabaseModelUpdate(BaseModel):
     collation: str | None = Field(None, max_length=100, description=_COLLATION_DESC)
 
 
+class OrphanVersionTableOut(BaseModel):
+    """Una tabla de versión que el gateway NO lee, con la versión que guarda."""
+
+    table: str
+    version: str | None = Field(
+        None,
+        description=(
+            "Versión guardada en esa tabla. Es el dato con el que se decide el `stamp` de "
+            "recuperación. `null` si la tabla existe pero está vacía."
+        ),
+    )
+
+
 class VersionTableDatabaseOut(BaseModel):
     """Qué contabilidad de versiones tiene realmente UNA base del blueprint."""
 
@@ -55,9 +68,12 @@ class VersionTableDatabaseOut(BaseModel):
     present_tables: list[str] = Field(
         default_factory=list, description="Tablas internas del gateway halladas en la base."
     )
-    orphan_tables: list[str] = Field(
+    orphan_tables: list[OrphanVersionTableOut] = Field(
         default_factory=list,
-        description="Tablas de versión que NO son la esperada. El gateway no las lee.",
+        description=(
+            "Tablas de versión que NO son la esperada, con la versión que guarda cada una. "
+            "El gateway no las lee."
+        ),
     )
     current_version: str | None = Field(
         None, description="Versión leída de la tabla esperada, si está presente."

@@ -155,7 +155,9 @@ Solo lectura. Compara, base por base, lo que el gateway **espera** contra lo que
       "server_id": 3, "server_name": "mysql-prod-1",
       "expected_table": "_gw_v_production_db",
       "present_tables": ["_gw_v_test_db"],
-      "orphan_tables": ["_gw_v_test_db"],
+      "orphan_tables": [
+        { "table": "_gw_v_test_db", "version": "0012" }
+      ],
       "current_version": null,
       "cached_version": "0012",
       "status": "orphaned",
@@ -181,8 +183,13 @@ Solo lectura. Compara, base por base, lo que el gateway **espera** contra lo que
 
 Un motor caído **no rompe el informe**: esa base sale `unreachable` y el resto se reporta igual.
 
-**Límite conocido**: el informe dice CUÁL tabla quedó huérfana pero **no qué versión tiene
-adentro**. Para eso todavía hace falta leerla por fuera del gateway.
+**`orphan_tables[].version` es el dato con el que se decide la recuperación**: es la versión
+que esa base tiene realmente, guardada en la tabla que el gateway dejó de leer. `null` significa
+que la tabla existe pero está vacía.
+
+Con eso, el `stamp` de recuperación sale de acá: `POST /managed-databases/{id}/migrations/stamp`
+con esa versión. Comparalo contra `cached_version` antes de ejecutar — si difieren, mirá esa
+base en particular antes de tocarla.
 
 ---
 

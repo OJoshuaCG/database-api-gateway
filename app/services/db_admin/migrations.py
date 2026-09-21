@@ -37,6 +37,7 @@ from pathlib import Path
 from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
+from sqlalchemy import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.environments import MIGRATION_CAPTURE_ENABLED
@@ -627,13 +628,39 @@ class MigrationRunner:
     # ------------------------------------------------------------------ #
     def get_current_version(self, target: ServerTarget, db_name: str, slug: str) -> str | None:
         """Lee la versión actual de la BD destino desde su tabla ``_gw_v_{slug}``."""
-        version_table = version_table_name(slug)
+        return self.read_version_table(target, db_name, version_table_name(slug))
+
+    @staticmethod
+    def read_version_table(
+        target: ServerTarget,
+        db_name: str,
+        version_table: str,
+        *,
+        conn: Connection | None = None,
+    ) -> str | None:
+        """Lee la versión de UNA tabla de versión, nombrada explícitamente.
+
+        ``get_current_version`` deriva el nombre del slug y por eso solo sabe leer la tabla
+        VIGENTE. Este método recibe el nombre, que es lo que hace falta para leer una tabla
+        HUÉRFANA —la que quedó con el nombre de un slug anterior y que el gateway ya no mira—.
+        Sin esto, el informe de contabilidad puede decir CUÁL tabla sobró pero no qué versión
+        guarda, que es justo el dato con el que se decide el ``stamp`` de recuperación.
+
+        La restricción nunca estuvo en Alembic: ``MigrationContext`` acepta cualquier nombre
+        en ``version_table``. Estaba en que el único camino de lectura lo derivaba del slug.
+
+        ``conn`` permite reusar una conexión ya abierta. Importa en los informes, que si no
+        abrirían una por cada tabla que quieren leer de la misma base.
+        """
         try:
-            with database_connection(target, db_name) as conn:
-                ctx = MigrationContext.configure(
+            if conn is not None:
+                return MigrationContext.configure(
                     conn, opts={"version_table": version_table}
-                )
-                return ctx.get_current_revision()
+                ).get_current_revision()
+            with database_connection(target, db_name) as own:
+                return MigrationContext.configure(
+                    own, opts={"version_table": version_table}
+                ).get_current_revision()
         except SQLAlchemyError as exc:
             raise map_driver_error(
                 exc, op="migration_status", target=target, extra={"database": db_name}

@@ -361,6 +361,7 @@ class DatabaseModelController:
         """
         from app.controllers.common import build_target, get_server_or_404
         from app.models.server import Server
+        from app.core.remote_engine import database_connection
         from app.services.db_admin.factory import get_adapter
         from app.services.db_admin.identifiers import GATEWAY_TABLE_PREFIXES
         from app.services.db_admin.migrations import MigrationRunner, version_table_name
@@ -405,29 +406,41 @@ class DatabaseModelController:
                 "status": self._VT_UNREACHABLE,
                 "detail": None,
             }
+            # UNA conexión por base para todo: el listado y la versión de cada tabla. Abrir
+            # una por lectura multiplicaría las conexiones contra motores de producción justo
+            # en la pantalla que se usa cuando algo ya salió mal.
             try:
-                presentes = get_adapter(targets[server_id]).list_internal_tables(db_name)
+                with database_connection(targets[server_id], db_name) as conn:
+                    presentes = get_adapter(targets[server_id]).list_internal_tables(
+                        db_name, conn=conn
+                    )
+                    versiones = [n for n in presentes if n.startswith(prefijo_version)]
+                    huerfanas = [n for n in versiones if n != esperada]
+                    item["present_tables"] = presentes
+
+                    # La versión que guarda CADA huérfana. Es el dato con el que se decide el
+                    # stamp de recuperación: sin él, el informe dice qué tabla sobra pero no
+                    # en qué versión quedó realmente esa base, que es la pregunta entera.
+                    item["orphan_tables"] = [
+                        {
+                            "table": nombre,
+                            "version": runner.read_version_table(
+                                targets[server_id], db_name, nombre, conn=conn
+                            ),
+                        }
+                        for nombre in huerfanas
+                    ]
+                    if esperada in versiones:
+                        item["current_version"] = runner.read_version_table(
+                            targets[server_id], db_name, esperada, conn=conn
+                        )
             except AppHttpException as exc:
                 item["detail"] = getattr(exc, "message", "No se pudo leer la base.")
                 items.append(item)
                 continue
 
-            versiones = [n for n in presentes if n.startswith(prefijo_version)]
-            huerfanas = [n for n in versiones if n != esperada]
-            item["present_tables"] = presentes
-            item["orphan_tables"] = huerfanas
-
             if esperada in versiones:
                 item["status"] = self._VT_MIXED if huerfanas else self._VT_OK
-                try:
-                    item["current_version"] = runner.get_current_version(
-                        targets[server_id], db_name, slug
-                    )
-                except AppHttpException:
-                    # La tabla está pero no se pudo leer. No se degrada a "ok": el veredicto
-                    # de este informe es la versión, no la existencia del archivo.
-                    item["status"] = self._VT_UNREACHABLE
-                    item["detail"] = "La tabla existe pero no se pudo leer su versión."
             elif huerfanas:
                 item["status"] = self._VT_ORPHANED
                 item["detail"] = (
@@ -639,24 +652,37 @@ class DatabaseModelController:
             )
 
     @staticmethod
-    def _compensate_renames(hechas: list[dict], targets: dict, desde: str, hacia: str) -> list[dict]:
+    def _compensate_renames(
+        hechas: list[dict], targets: dict, engines: dict, desde: str, hacia: str
+    ) -> list[dict]:
         """Devuelve a su nombre original las tablas ya renombradas.
 
         Retorna las que NO se pudieron devolver (lista vacía ⇒ se compensó todo). Devolver la
         lista y no un booleano importa: es lo que el operador necesita para reparar a mano, y
         un ``False`` global reportaría como rotas también a las bases que sí volvieron.
 
+        Toma el MISMO advisory lock que el rename original, y no es simetría estética: la
+        compensación corre después de que algo falló, que es exactamente cuando alguien puede
+        estar reintentando un apply sobre esas bases. Renombrarle la tabla de versión por
+        debajo a una migración en curso es peor que el fallo que se está compensando.
+
         Se recorre en orden INVERSO por simetría con el resto del repo, aunque acá cada base
         es independiente de las demás.
         """
         from app.services.db_admin.factory import get_adapter
+        from app.services.db_admin.migrations import MigrationRunner
 
+        runner = MigrationRunner()
         quedaron: list[dict] = []
         for it in reversed(hechas):
+            sid = it["server_id"]
             try:
-                get_adapter(targets[it["server_id"]]).rename_internal_table(
-                    it["database_name"], desde, hacia
-                )
+                with runner.advisory_lock(
+                    targets[sid], engine=engines[sid], lock_key=it["managed_database_id"]
+                ):
+                    get_adapter(targets[sid]).rename_internal_table(
+                        it["database_name"], desde, hacia
+                    )
             except Exception:
                 logger.exception(
                     "falló la compensación del rename en la BD %s (%s: %s -> %s)",
@@ -779,7 +805,7 @@ class DatabaseModelController:
                     it["managed_database_id"], it["database_name"],
                 )
                 no_compensadas = self._compensate_renames(
-                    hechas, targets, tabla_nueva, tabla_vieja
+                    hechas, targets, engines, tabla_nueva, tabla_vieja
                 )
                 audit.record(
                     dm_codes.RENAME_SLUG_OPERATION,

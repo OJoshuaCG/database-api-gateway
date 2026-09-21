@@ -14,7 +14,7 @@ motor) usando ``MigrationRunner``.
 import hashlib
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
@@ -267,6 +267,22 @@ class ModelMigrationController:
 
         Una sola query para todo el lote. Las BDs dadas de baja del inventario no aparecen:
         el ``ondelete='CASCADE'`` de ``managed_database_id`` ya se llevó sus filas.
+
+        **Se excluyen las filas de ROLLBACK.** Durante mucho tiempo esta query no podía
+        distinguirlas: ``_record_history`` se llamaba igual desde ``apply`` que desde
+        ``rollback`` y las dos escribían ``status='applied'``, así que un rollback exitoso
+        contaba como "esta versión se aplicó acá" y congelaba de más. Ahora la fila lleva
+        ``direction``.
+
+        El filtro es ``!= 'down'`` y no ``== 'up'`` a propósito, y la diferencia importa: todo
+        el historial ANTERIOR a esa columna la tiene en ``NULL``. Con ``== 'up'`` esas filas
+        quedarían afuera y el pre-filtro diría "esta versión no se aplicó nunca" sobre un
+        parque entero, **abriendo el freeze de versiones que sí están aplicadas**. Fail-closed:
+        lo desconocido cuenta.
+
+        Por lo mismo esto NO permite todavía saltear la lectura en vivo de los motores: con
+        filas en ``NULL`` el pre-filtro sigue sin poder ser el veredicto. Lo será cuando el
+        historial acumule direcciones, y recién ahí el guard se vuelve barato.
         """
         if not migration_ids:
             return {}
@@ -278,6 +294,10 @@ class ModelMigrationController:
             .filter(
                 DatabaseMigrationHistory.model_migration_id.in_(migration_ids),
                 DatabaseMigrationHistory.status == MigrationStatus.applied,
+                or_(
+                    DatabaseMigrationHistory.direction.is_(None),
+                    DatabaseMigrationHistory.direction != "down",
+                ),
             )
             .distinct()
             .all()
