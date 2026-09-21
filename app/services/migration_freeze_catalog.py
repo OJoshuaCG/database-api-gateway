@@ -69,20 +69,6 @@ CODE_RENUMBER_TARGET_MISSING = "model_migration.renumber_target_missing"
 #: que entra en el ``checksum``, y eso invalidaría el checkpoint de esa aplicación a medias.
 CODE_AFFECTED_PARTIAL = "model_migration.affected_partial_application"
 
-ERROR_CODES = frozenset(
-    {
-        CODE_SQL_FROZEN,
-        CODE_STILL_APPLIED,
-        CODE_VERSION_IN_USE,
-        CODE_UNREADABLE_DATABASES,
-        CODE_RENUMBER_CONFIRMATION_REQUIRED,
-        CODE_RENUMBER_PLAN_STALE,
-        CODE_RENUMBER_STAMP_FAILED,
-        CODE_RENUMBER_TARGET_MISSING,
-        CODE_AFFECTED_PARTIAL,
-    }
-)
-
 # --------------------------------------------------------------------------- #
 # Motivos por BD bloqueante (campo ``reason`` de ``blocking_databases``)        #
 # --------------------------------------------------------------------------- #
@@ -160,10 +146,23 @@ CODE_PARTIAL_APPLICATION = "model_migration.partial_application"
 #: el formulario ya sabe qué overrides existen.
 CODE_STALE_OVERRIDES = "model_migration.stale_overrides"
 
+# Definición ÚNICA y al final del módulo a propósito: tiene que poder nombrar los códigos de
+# la vía de excepción, que se declaran más abajo que los del freeze. Hubo dos definiciones
+# —una acá y otra antes de esos códigos—, y la segunda pisaba a la primera en silencio: el
+# vocabulario terminaba con 5 de 12 y se caían los 7 del borrado con renumerado. Las
+# constantes se referencian por nombre, así que el runtime no fallaba; lo que fallaba era
+# todo consumidor que use este set como catálogo exhaustivo.
 ERROR_CODES = frozenset(
     {
         CODE_SQL_FROZEN,
         CODE_STILL_APPLIED,
+        CODE_VERSION_IN_USE,
+        CODE_UNREADABLE_DATABASES,
+        CODE_RENUMBER_CONFIRMATION_REQUIRED,
+        CODE_RENUMBER_PLAN_STALE,
+        CODE_RENUMBER_STAMP_FAILED,
+        CODE_RENUMBER_TARGET_MISSING,
+        CODE_AFFECTED_PARTIAL,
         CODE_EDIT_CONFIRM_MISMATCH,
         CODE_PARTIAL_APPLICATION,
         CODE_STALE_OVERRIDES,

@@ -184,6 +184,31 @@ def test_los_codigos_llevan_prefijo_de_recurso(catalogo):
         assert code == code.lower(), code
 
 
+def test_los_codigos_del_freeze_estan_en_el_vocabulario_cerrado():
+    """
+    Todo ``CODE_*`` de ``migration_freeze_catalog`` tiene que estar en su ``ERROR_CODES``.
+
+    Es la misma afirmación que ya protege al catálogo del clon, y faltaba justo acá. Sin
+    ella el módulo llegó a tener **dos** definiciones de ``ERROR_CODES``: la segunda pisaba
+    a la primera y el vocabulario quedaba con 5 de 12 códigos, perdiendo los 7 del borrado
+    con renumerado. El test de formato de abajo no lo veía porque solo recorre los MIEMBROS
+    del set, así que un set incompleto pasaba sin ruido.
+    """
+    codigos = {v for k, v in vars(freeze_codes).items() if k.startswith("CODE_")}
+    assert codigos, "no se encontró ningún código de freeze"
+    assert codigos <= freeze_codes.ERROR_CODES
+
+
+def test_los_codigos_de_blueprint_estan_en_el_vocabulario_cerrado():
+    """Mismo invariante para el catálogo de blueprints (``database_model_catalog``)."""
+    from app.services import database_model_catalog as dm_codes
+
+    codigos = {v for k, v in vars(dm_codes).items() if k.startswith("CODE_")}
+    assert codigos, "no se encontró ningún código de blueprint"
+    assert codigos <= dm_codes.ERROR_CODES
+    assert all(c.startswith("database_model.") for c in codigos)
+
+
 # --------------------------------------------------------------------------- #
 # Lote de clonación                                                            #
 # --------------------------------------------------------------------------- #
