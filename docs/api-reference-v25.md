@@ -10,23 +10,54 @@ capacidades, la fuente sigue siendo v23.
 
 ---
 
-## 0. Lo que ordena todo: tres schemas EXISTENTES ganan campos 🔴
+## 0. Lo que ordena todo: dos campos cambian de TIPO 🔴
 
-La SPA hace `safeParse` del envelope **completo**: un campo nuevo descarta la respuesta entera.
-Tres schemas que ya consumís ganan campos en esta entrega:
+> **Corrección sobre addendums anteriores.** v24 y sus predecesores dicen que la SPA hace
+> `safeParse` del envelope completo y que "un campo nuevo descarta la respuesta entera". **Eso
+> no es cierto en este repo**: no hay un solo `.strict()` en `src/lib/contracts/`, así que
+> `z.object` hace *strip* y un campo nuevo se ignora en silencio. Ya estaba verificado por
+> escrito en el JSDoc de `allows_agent_access` en `src/lib/contracts/environments.ts`, contra
+> zod 4.4.3. Esta sección corrige la premisa, no la conclusión: **el orden de despliegue sigue
+> siendo obligatorio**, por un motivo distinto y más concreto.
 
-| Endpoint | Campos nuevos |
-|---|---|
-| `GET /managed-databases/{id}/migrations/status` | `cached_version`, `orphan_version_tables`, `has_orphan_accounting` |
-| `GET /managed-databases/{id}/migrations/history` | `direction`, `applied_checksum`, `actor_type`, `actor_id`, `actor_username`, `request_id` |
-| `GET .../history` (cambio de tipo) | `model_migration_id` pasa a **nullable** |
+### Lo que SÍ rompe el `safeParse`
 
-**Todos se declaran `.nullish()` en zod, nunca `.optional()`.** Y el orden de despliegue no es
-negociable: **primero zod, después el backend.** Al revés, la pantalla de migraciones deja de
-parsear el minuto en que sube la API.
+`migrationHistoryItemSchema` (`src/lib/contracts/db-migrations.ts:271`) declara hoy:
 
-El cambio de tipo de `model_migration_id` es el más fácil de pasar por alto: dejó de ser
-`number` y ahora es `number | null`, porque su FK pasó de `ON DELETE CASCADE` a `SET NULL`.
+```ts
+model_migration_id: z.number().int(),   // pasa a number | null
+version: z.string(),                    // pasa a string | null
+```
+
+Los dos pasan a **nullable** en esta entrega, porque la FK de `model_migration_id` cambió de
+`ON DELETE CASCADE` a `SET NULL`. Un `null` contra `z.number().int()` **falla el parseo y
+descarta la página entera de historial**.
+
+**Y el fallo es DIFERIDO**, que es lo que lo vuelve peligroso: solo aparece cuando alguien
+borra una versión del blueprint, que puede ser semanas después del despliegue. Para entonces
+nadie lo asocia a este cambio.
+
+### Lo que NO rompe, pero es peor
+
+Los demás campos nuevos se strippean sin ruido. No rompen nada — **reproducen el incidente.**
+
+Sin declarar `has_orphan_accounting` en el schema de `status`, zod lo descarta, la UI nunca se
+entera de que la contabilidad está huérfana y **vuelve a ofrecer el botón de aplicar con la
+cadena entera figurando pendiente**, exactamente como durante el incidente que originó esta
+entrega.
+
+Un campo faltante que no rompe nada es más difícil de detectar que uno que sí.
+
+### El resumen operativo
+
+| Endpoint | Cambio | Si no se declara |
+|---|---|---|
+| `GET .../migrations/history` | `model_migration_id` y `version` pasan a **nullable** | 🔴 Rompe el parseo, de forma diferida |
+| `GET .../migrations/history` | `direction`, `applied_checksum`, `actor_type`, `actor_id`, `actor_username`, `request_id` | Se strippean; el historial pierde las cuatro dimensiones nuevas |
+| `GET .../migrations/status` | `cached_version`, `orphan_version_tables`, `has_orphan_accounting` | 🔴 Se strippea; la UI reproduce el incidente |
+
+**Campos nuevos: `.nullish()`, nunca `.optional()`.** Y los dos cambios de tipo van **antes**
+de que el backend se despliegue.
 
 ---
 
