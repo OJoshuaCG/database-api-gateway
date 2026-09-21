@@ -635,6 +635,37 @@ class ServerAdapter(ABC):
                 exc, op="list_tables", target=self.target, extra={"database": database}
             )
 
+    def list_internal_tables(
+        self, database: str, *, conn: Connection | None = None
+    ) -> list[str]:
+        """Las tablas de contabilidad del gateway que HAY en esta BD destino.
+
+        Es el complemento exacto de ``list_tables``, que las excluye. Existe para poder
+        DETECTAR contabilidad huérfana: una ``_gw_v_*`` cuyo nombre ya no se corresponde con
+        el slug vigente de ningún blueprint queda invisible para todo el resto del gateway,
+        y esa invisibilidad es lo que convirtió un renombrado de slug en "toda la cadena
+        figura pendiente" sin que nada fallara.
+
+        Solo lista; no decide si algo es huérfano ni lo toca. Esa lectura es del controller,
+        que es el único que sabe qué slug se espera.
+        """
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        schema = self._inspect_schema(database)
+        try:
+            with self._conn_ctx(database, conn) as conn:
+                return sorted(
+                    n
+                    for n in inspect(conn).get_table_names(schema=schema)
+                    if is_gateway_internal_table(n)
+                )
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc,
+                op="list_internal_tables",
+                target=self.target,
+                extra={"database": database},
+            )
+
     def internal_table_exists(
         self, database: str, table: str, *, conn: Connection | None = None
     ) -> bool:
