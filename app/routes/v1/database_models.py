@@ -25,6 +25,9 @@ from app.schemas.database_model import (
     FromSnapshotIn,
     FromSnapshotOut,
     ModelDatabaseStatusOut,
+    RenameSlugIn,
+    RenameSlugOut,
+    RenameSlugPlanOut,
 )
 from app.services import audit
 from app.services.capability_catalog import Capability
@@ -79,6 +82,60 @@ def update_model(actor: BlueprintsWrite, model_id: int, payload: DatabaseModelUp
         model_id, payload.model_dump(exclude_unset=True), admin=actor
     )
     return success(data=updated, message="Blueprint actualizado.")
+
+
+@router.post(
+    "/{model_id}/rename-slug/plan", response_model=ApiResponse[RenameSlugPlanOut]
+)
+@limiter.limit("10/minute")
+def rename_slug_plan(
+    request: Request, actor: BlueprintsWrite, model_id: int, payload: RenameSlugIn
+):
+    """
+    Preflight del renombrado del slug. **No escribe nada**, ni en el gateway ni en un motor.
+
+    Abre una conexión por servidor del blueprint para preguntar, en cada BD gestionada, si
+    tiene la tabla de versión vieja y si el nombre nuevo está libre. Por eso tiene rate
+    limit propio aunque sea una lectura.
+
+    Clasifica cada base en `rename`, `skip` (nunca fue posicionada, no hay tabla),
+    `conflict` (el nombre destino YA existe ahí) o `unreachable`. Los dos últimos son
+    **bloqueantes de toda la operación**, no solo de esa base: el gateway apunta a UN
+    nombre, así que dejar medio parque renombrado deja a la otra mitad huérfana.
+
+    Si hay bases que renombrar y nada bloquea, emite `confirm_token` atado a la huella del
+    parque. Si no hay ninguna, no emite token: uno que no hace falta entrena a mandarlo
+    siempre.
+    """
+    result = DatabaseModelController().rename_slug_plan(model_id, payload.new_slug)
+    return success(data=result, message="Plan de renombrado del slug.")
+
+
+@router.post("/{model_id}/rename-slug", response_model=ApiResponse[RenameSlugOut])
+@limiter.limit("3/minute")
+def rename_slug(
+    request: Request, actor: BlueprintsWrite, model_id: int, payload: RenameSlugIn
+):
+    """
+    Cambia el `slug` del blueprint y **renombra su tabla de versión en cada BD gestionada**.
+
+    El `slug` nombra la tabla de Alembic (`_gw_v_{slug}`) DENTRO de cada base, así que
+    cambiarlo son N escrituras remotas sobre bases de terceros, sin transacción compartida.
+    Por eso no se acepta por el `PATCH` común, que sigue respondiendo 409.
+
+    **El orden importa y no es negociable**: primero los renames remotos, y el slug del
+    gateway se actualiza último. Al revés, un fallo dejaría al gateway apuntando a un nombre
+    que no existe en ningún motor, toda la cadena figuraría pendiente y un `apply` la
+    reaplicaría desde la primera versión.
+
+    Ante un fallo a mitad se compensa renombrando de vuelta, y el 409 trae `not_compensated`
+    con las bases que quedaron con el nombre nuevo y hay que reparar a mano. El slug del
+    blueprint **no se modifica** en ese caso.
+    """
+    result = DatabaseModelController().rename_slug(
+        model_id, payload.new_slug, confirm_token=payload.confirm_token, admin=actor
+    )
+    return success(data=result, message="Slug renombrado.")
 
 
 @router.delete("/{model_id}", response_model=ApiResponse[None])

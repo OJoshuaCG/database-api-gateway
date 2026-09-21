@@ -4,6 +4,7 @@ Controller de DatabaseModel (blueprints/categorías).
 CRUD puro sobre la BD de metadatos del gateway: NO toca ningún motor destino.
 """
 
+import hashlib
 from typing import TYPE_CHECKING
 
 from sqlalchemy.exc import IntegrityError
@@ -17,6 +18,7 @@ from app.models.model_migration import ModelMigration
 from app.models.project import ProjectDatabaseModel
 from app.core.logger import get_logger
 from app.services import audit
+from app.services import confirm_token as confirm_token_service
 from app.services import database_model_catalog as dm_codes
 
 if TYPE_CHECKING:
@@ -141,10 +143,10 @@ class DatabaseModelController:
                 if bases:
                     raise AppHttpException(
                         message=(
-                            f"No se puede cambiar el slug de un blueprint con {bases} base(s) "
-                            "gestionada(s): dejaría huérfana su tabla de versión y la cadena "
-                            "entera pasaría a figurar como pendiente. Renombrá el 'name', que "
-                            "es libre, o desasociá las bases primero."
+                            f"El slug nombra la tabla de versión dentro de {bases} base(s) "
+                            "gestionada(s), así que cambiarlo acá las dejaría huérfanas. "
+                            f"Usá POST /database-models/{model_id}/rename-slug, que renombra "
+                            "también en los motores con preview y confirmación."
                         ),
                         status_code=409,
                         public_context={
@@ -321,6 +323,394 @@ class DatabaseModelController:
         finally:
             session.close()
         return out
+
+    # ------------------------------------------------------------------ #
+    # Renombrado del slug, propagado a los motores                        #
+    # ------------------------------------------------------------------ #
+    #: Qué hay que hacer con cada BD del blueprint.
+    _RN_RENAME = "rename"          # tiene la tabla vieja y el nombre nuevo está libre
+    _RN_SKIP = "skip"              # nunca fue posicionada: no hay tabla que renombrar
+    _RN_CONFLICT = "conflict"      # el nombre DESTINO ya existe ahí
+    _RN_UNREACHABLE = "unreachable"  # no se pudo leer (fail-closed)
+
+    _RN_BLOCKING = frozenset({_RN_CONFLICT, _RN_UNREACHABLE})
+
+    @staticmethod
+    def _rename_fingerprint(
+        model_id: int, old_slug: str, new_slug: str, items: list[dict]
+    ) -> str:
+        """Huella del parque que congeló el preview; viaja como ``subject`` del token.
+
+        Mismo criterio que ``_plan_fingerprint`` del borrado con renumerado: si entre el
+        preview y la ejecución alguna BD cambió de estado —apareció la tabla destino, se
+        cayó un servidor—, el token deja de verificar y no se ejecuta un plan que ya no
+        describe la realidad.
+        """
+        parts = [str(model_id), old_slug, new_slug]
+        for it in sorted(items, key=lambda i: i["managed_database_id"]):
+            parts.append(f"{it['managed_database_id']}:{it['action']}")
+        return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+    def rename_slug_plan(self, model_id: int, new_slug: str) -> dict:
+        """Preflight del renombrado. **No escribe nada**, ni en el gateway ni en un motor. 🔌
+
+        Devuelve el plan SIEMPRE: los bloqueos viajan en ``blockers`` en vez de lanzarse,
+        porque este mismo cálculo alimenta el preview, que tiene que poder explicar por qué
+        no se puede además de negarse.
+        """
+        from app.controllers.common import build_target, get_server_or_404
+        from app.services.db_admin.factory import get_adapter
+        from app.services.db_admin.migrations import version_table_name
+
+        session = self._session()
+        try:
+            model = self._get_or_404(session, model_id)
+            old_slug = model.slug
+            if new_slug == old_slug:
+                raise AppHttpException(
+                    message="El slug nuevo es igual al actual.",
+                    status_code=422,
+                    context={"model_id": model_id},
+                )
+            ocupado = (
+                session.query(DatabaseModel.id)
+                .filter(DatabaseModel.slug == new_slug, DatabaseModel.id != model_id)
+                .first()
+            )
+            if ocupado:
+                raise AppHttpException(
+                    message="Ya existe otro blueprint con ese slug.",
+                    status_code=409,
+                    public_context={"code": dm_codes.CODE_NAME_OR_SLUG_TAKEN},
+                    context={"model_id": model_id},
+                )
+            filas = [
+                (md.id, md.name, md.server_id)
+                for md in session.query(ManagedDatabase)
+                .filter(ManagedDatabase.model_id == model_id)
+                .order_by(ManagedDatabase.id)
+                .all()
+            ]
+            nombres_servidor = {}
+            targets = {}
+            for _id, _name, server_id in filas:
+                if server_id not in targets:
+                    server = get_server_or_404(session, server_id)
+                    targets[server_id] = build_target(server)
+                    nombres_servidor[server_id] = server.name
+        finally:
+            session.close()
+
+        tabla_vieja = version_table_name(old_slug)
+        tabla_nueva = version_table_name(new_slug)
+        # Dos slugs distintos pueden truncar al MISMO nombre (63 chars). Ahí no hay nada que
+        # renombrar en ningún motor y el cambio es puramente local.
+        no_op = tabla_vieja == tabla_nueva
+
+        items: list[dict] = []
+        for db_id, db_name, server_id in filas:
+            item = {
+                "managed_database_id": db_id,
+                "database_name": db_name,
+                "server_id": server_id,
+                "server_name": nombres_servidor.get(server_id),
+                "action": self._RN_SKIP,
+                "detail": None,
+            }
+            if no_op:
+                items.append(item)
+                continue
+            try:
+                adapter = get_adapter(targets[server_id])
+                tiene_vieja = adapter.internal_table_exists(db_name, tabla_vieja)
+                tiene_nueva = adapter.internal_table_exists(db_name, tabla_nueva)
+            except AppHttpException as exc:
+                item["action"] = self._RN_UNREACHABLE
+                item["detail"] = getattr(exc, "message", "No se pudo leer la base.")
+                items.append(item)
+                continue
+            if tiene_nueva:
+                item["action"] = self._RN_CONFLICT
+                item["detail"] = f"Ya existe la tabla '{tabla_nueva}' en esta base."
+            elif tiene_vieja:
+                item["action"] = self._RN_RENAME
+            items.append(item)
+
+        bloqueantes = [i for i in items if i["action"] in self._RN_BLOCKING]
+        a_renombrar = [i for i in items if i["action"] == self._RN_RENAME]
+        huella = self._rename_fingerprint(model_id, old_slug, new_slug, items)
+
+        plan = {
+            "model_id": model_id,
+            "current_slug": old_slug,
+            "new_slug": new_slug,
+            "current_table": tabla_vieja,
+            "new_table": tabla_nueva,
+            "no_op": no_op,
+            "databases": items,
+            "rename_count": len(a_renombrar),
+            "blockers": bloqueantes,
+            "requires_confirmation": bool(a_renombrar) and not bloqueantes,
+            "confirm_token": None,
+            "expires_at": None,
+            "fingerprint": huella,
+        }
+        # El token se emite SOLO si hay motores que tocar y nada bloquea. Emitir uno que no
+        # hace falta entrena al cliente a mandarlo siempre.
+        if plan["requires_confirmation"]:
+            token, expira = confirm_token_service.issue(
+                dm_codes.RENAME_SLUG_OPERATION,
+                model_id,
+                f"{old_slug}:{new_slug}",
+                subject=huella,
+            )
+            plan["confirm_token"] = token
+            plan["expires_at"] = expira
+        return plan
+
+    def _enforce_rename_plan(self, plan: dict) -> None:
+        """Convierte los bloqueos del plan en el 409 que corresponde. Sin efectos.
+
+        Los dos bloqueos abortan el renombrado ENTERO y no solo la BD que los causa. Dejar
+        la mitad del parque con un nombre y la otra mitad con otro es precisamente el estado
+        del que cuesta salir: el gateway solo puede apuntar a UN nombre, así que la mitad que
+        no coincida queda con su contabilidad huérfana y toda su cadena figurando pendiente.
+        """
+        conflictos = [i for i in plan["blockers"] if i["action"] == self._RN_CONFLICT]
+        if conflictos:
+            raise AppHttpException(
+                message=(
+                    f"{len(conflictos)} base(s) ya tienen una tabla '{plan['new_table']}'. "
+                    "Renombrar encima pisaría un puntero de versión ajeno. Resolvé esas "
+                    "bases antes de renombrar el slug."
+                ),
+                status_code=409,
+                public_context={
+                    "code": dm_codes.CODE_SLUG_RENAME_CONFLICT,
+                    "new_table": plan["new_table"],
+                    "conflicting_databases": conflictos,
+                },
+                context={"model_id": plan["model_id"]},
+            )
+        ilegibles = [i for i in plan["blockers"] if i["action"] == self._RN_UNREACHABLE]
+        if ilegibles:
+            raise AppHttpException(
+                message=(
+                    f"No se pudo leer {len(ilegibles)} base(s) del blueprint. Se aborta: "
+                    "renombrar el resto dejaría la contabilidad de esas huérfana sin que "
+                    "nada falle."
+                ),
+                status_code=409,
+                public_context={
+                    "code": dm_codes.CODE_SLUG_RENAME_UNREACHABLE,
+                    "unreachable_databases": ilegibles,
+                },
+                context={"model_id": plan["model_id"]},
+            )
+
+    @staticmethod
+    def _compensate_renames(hechas: list[dict], targets: dict, desde: str, hacia: str) -> list[dict]:
+        """Devuelve a su nombre original las tablas ya renombradas.
+
+        Retorna las que NO se pudieron devolver (lista vacía ⇒ se compensó todo). Devolver la
+        lista y no un booleano importa: es lo que el operador necesita para reparar a mano, y
+        un ``False`` global reportaría como rotas también a las bases que sí volvieron.
+
+        Se recorre en orden INVERSO por simetría con el resto del repo, aunque acá cada base
+        es independiente de las demás.
+        """
+        from app.services.db_admin.factory import get_adapter
+
+        quedaron: list[dict] = []
+        for it in reversed(hechas):
+            try:
+                get_adapter(targets[it["server_id"]]).rename_internal_table(
+                    it["database_name"], desde, hacia
+                )
+            except Exception:
+                logger.exception(
+                    "falló la compensación del rename en la BD %s (%s: %s -> %s)",
+                    it["managed_database_id"], it["database_name"], desde, hacia,
+                )
+                quedaron.append(it)
+        return quedaron
+
+    def rename_slug(
+        self,
+        model_id: int,
+        new_slug: str,
+        *,
+        confirm_token: str | None = None,
+        admin: "dict | Actor | None" = None,
+    ) -> dict:
+        """Cambia el ``slug`` del blueprint y propaga el rename de su tabla de versión. 🔌
+
+        **El orden no es negociable: primero los N renames remotos, y el ``slug`` del gateway
+        se actualiza ÚLTIMO.** Al revés, un fallo remoto dejaría al gateway apuntando a un
+        nombre que no existe en ningún motor — que es exactamente el incidente que originó
+        este endpoint: la cadena entera pasa a figurar pendiente y un ``apply`` la reaplica
+        desde la primera versión sobre bases que ya tienen el esquema.
+
+        El plan se recalcula DESDE CERO acá: el token no transporta el plan, solo prueba que
+        el estado del parque no cambió desde el preview.
+        """
+        from app.controllers.common import build_target, engine_value, get_server_or_404
+        from app.models.enums import EngineType
+        from app.services.db_admin.factory import get_adapter
+        from app.services.db_admin.migrations import MigrationRunner
+
+        plan = self.rename_slug_plan(model_id, new_slug)
+        self._enforce_rename_plan(plan)
+        old_slug = plan["current_slug"]
+        tabla_vieja, tabla_nueva = plan["current_table"], plan["new_table"]
+        a_renombrar = [i for i in plan["databases"] if i["action"] == self._RN_RENAME]
+
+        if a_renombrar:
+            if not confirm_token:
+                raise AppHttpException(
+                    message=(
+                        f"Renombrar el slug implica renombrar '{tabla_vieja}' en "
+                        f"{len(a_renombrar)} base(s) de sus motores. Pedí el plan en "
+                        f"POST /database-models/{model_id}/rename-slug/plan y reenviá su "
+                        "confirm_token."
+                    ),
+                    status_code=409,
+                    public_context={
+                        "code": dm_codes.CODE_SLUG_RENAME_CONFIRMATION_REQUIRED,
+                        "rename_plan": a_renombrar,
+                    },
+                    context={"model_id": model_id},
+                )
+            try:
+                confirm_token_service.verify(
+                    confirm_token,
+                    dm_codes.RENAME_SLUG_OPERATION,
+                    model_id,
+                    f"{old_slug}:{new_slug}",
+                    subject=plan["fingerprint"],
+                )
+            except AppHttpException as exc:
+                # Se re-etiqueta con código propio: el 422 genérico del servicio dice "token
+                # inválido", que manda a revisar el token cuando lo que pasó es que el parque
+                # se movió y hay que volver a mirar el plan.
+                raise AppHttpException(
+                    message=(
+                        "El plan de renombrado quedó viejo: alguna base cambió de estado "
+                        "desde el preview. Volvé a pedirlo."
+                    ),
+                    status_code=getattr(exc, "status_code", 422),
+                    public_context={"code": dm_codes.CODE_SLUG_RENAME_PLAN_STALE},
+                    context={"model_id": model_id},
+                ) from exc
+
+            # Fail-closed ANTES del primer motor: un renombrado que muere a mitad tiene que
+            # dejar rastro de lo que intentó, que es justo cuando alguien pregunta qué pasó.
+            audit.record_intent(
+                dm_codes.RENAME_SLUG_OPERATION,
+                admin=admin,
+                target_type="database_model",
+                target_id=model_id,
+                touched_engine=True,
+                detail=(
+                    f"blueprint {model_id}: '{old_slug}' -> '{new_slug}'; renombra "
+                    f"{tabla_vieja} -> {tabla_nueva} en {len(a_renombrar)} BD(s)"
+                ),
+            )
+
+        session = self._session()
+        try:
+            targets = {}
+            engines = {}
+            for it in a_renombrar:
+                sid = it["server_id"]
+                if sid not in targets:
+                    server = get_server_or_404(session, sid)
+                    targets[sid] = build_target(server)
+                    engines[sid] = EngineType(engine_value(server))
+        finally:
+            session.close()
+
+        runner = MigrationRunner()
+        hechas: list[dict] = []
+        for it in a_renombrar:
+            sid = it["server_id"]
+            try:
+                # El lock es el MISMO que toman apply/rollback/stamp (clave =
+                # managed_database_id), así que un renombrado no puede cruzarse con una
+                # migración en curso sobre esa base.
+                with runner.advisory_lock(targets[sid], engine=engines[sid], lock_key=it["managed_database_id"]):
+                    get_adapter(targets[sid]).rename_internal_table(
+                        it["database_name"], tabla_vieja, tabla_nueva
+                    )
+                hechas.append(it)
+            except Exception as exc:  # noqa: BLE001 — se compensa y se reporta, no se traga
+                logger.exception(
+                    "rename de slug: falló en la BD %s (%s)",
+                    it["managed_database_id"], it["database_name"],
+                )
+                no_compensadas = self._compensate_renames(
+                    hechas, targets, tabla_nueva, tabla_vieja
+                )
+                audit.record(
+                    dm_codes.RENAME_SLUG_OPERATION,
+                    status="error",
+                    admin=admin,
+                    target_type="database_model",
+                    target_id=model_id,
+                    touched_engine=True,
+                    detail=(
+                        f"falló en la BD {it['managed_database_id']}; "
+                        f"{len(hechas)} renombrada(s), "
+                        f"{len(no_compensadas)} sin compensar. Slug NO modificado."
+                    ),
+                )
+                raise AppHttpException(
+                    message=(
+                        f"Falló el renombrado en la base {it['database_name']}. "
+                        + (
+                            f"{len(no_compensadas)} base(s) quedaron con el nombre nuevo y "
+                            "no se pudieron devolver: hay que repararlas a mano."
+                            if no_compensadas
+                            else "Las bases ya renombradas volvieron a su nombre original."
+                        )
+                        + " El slug del blueprint NO se modificó."
+                    ),
+                    status_code=409,
+                    public_context={
+                        "code": dm_codes.CODE_SLUG_RENAME_FAILED,
+                        "failed": it,
+                        "renamed": hechas,
+                        "not_compensated": no_compensadas,
+                        "old_table": tabla_vieja,
+                        "new_table": tabla_nueva,
+                    },
+                    context={"model_id": model_id},
+                ) from exc
+
+        # ÚLTIMO: recién ahora el gateway cambia de nombre. Una transacción local.
+        session = self._session()
+        try:
+            model = self._get_or_404(session, model_id)
+            model.slug = new_slug
+            session.commit()
+            session.refresh(model)
+            resultado = self._serialize(model)
+        finally:
+            session.close()
+
+        audit.record(
+            dm_codes.RENAME_SLUG_OPERATION,
+            status="success",
+            admin=admin,
+            target_type="database_model",
+            target_id=model_id,
+            touched_engine=bool(a_renombrar),
+            detail=(
+                f"'{old_slug}' -> '{new_slug}'; {len(hechas)} BD(s) renombradas "
+                f"({tabla_vieja} -> {tabla_nueva})"
+            ),
+        )
+        return {"model": resultado, "renamed_databases": hechas, "no_op": plan["no_op"]}
 
     # ------------------------------------------------------------------ #
     # Deriva de charset/collation contra la declaración del blueprint     #

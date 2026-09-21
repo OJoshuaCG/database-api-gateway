@@ -42,6 +42,59 @@ class DatabaseModelUpdate(BaseModel):
     collation: str | None = Field(None, max_length=100, description=_COLLATION_DESC)
 
 
+class RenameSlugIn(BaseModel):
+    """Cuerpo del renombrado de slug. ``confirm_token`` sale del preview.
+
+    No se acepta por ``PATCH``: cambiar el slug renombra una tabla DENTRO de cada BD
+    gestionada, o sea N escrituras remotas sobre bases de terceros. Un campo más de un
+    formulario no puede disparar eso.
+    """
+
+    new_slug: str = Field(..., min_length=1, max_length=120, pattern=_SLUG)
+    confirm_token: str | None = Field(
+        None,
+        description=(
+            "Token del preview. Obligatorio si el plan tiene bases que renombrar; se omite "
+            "cuando no hay ninguna (ahí el cambio es puramente local)."
+        ),
+    )
+
+
+class RenameSlugDatabaseOut(BaseModel):
+    """Qué le toca a cada BD del blueprint en el renombrado."""
+
+    managed_database_id: int
+    database_name: str
+    server_id: int
+    server_name: str | None = None
+    action: Literal["rename", "skip", "conflict", "unreachable"]
+    detail: str | None = None
+
+
+class RenameSlugPlanOut(BaseModel):
+    """Preflight del renombrado. No escribe nada."""
+
+    model_id: int
+    current_slug: str
+    new_slug: str
+    current_table: str
+    new_table: str
+    no_op: bool = Field(
+        ...,
+        description=(
+            "Los dos slugs truncan al MISMO nombre de tabla (límite de 63 chars): no hay "
+            "nada que renombrar en ningún motor y el cambio es local."
+        ),
+    )
+    databases: list[RenameSlugDatabaseOut]
+    rename_count: int
+    blockers: list[RenameSlugDatabaseOut]
+    requires_confirmation: bool
+    confirm_token: str | None = None
+    expires_at: datetime | None = None
+    fingerprint: str
+
+
 class DatabaseModelOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -64,6 +117,14 @@ _OBJECT_TYPES = (
     "table", "view", "materialized_view", "routine", "trigger",
     "sequence", "type", "extension", "index", "event",
 )
+
+
+class RenameSlugOut(BaseModel):
+    """Resultado del renombrado."""
+
+    model: DatabaseModelOut
+    renamed_databases: list[RenameSlugDatabaseOut]
+    no_op: bool
 
 
 class SnapshotObjectRef(BaseModel):
