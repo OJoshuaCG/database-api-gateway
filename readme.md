@@ -1,13 +1,40 @@
-# Database API Gateway
+# Datum
 
-> **Gateway de administración de servidores de bases de datos.** Permite registrar
-> múltiples servidores remotos (MySQL, MariaDB, PostgreSQL) y, mediante una credencial
-> *pseudo-root*, gestionar usuarios del motor, bases de datos y permisos, además de
-> inspeccionar la **estructura** de las tablas (nunca los datos).
+> **Plano de control de un parque de servidores de bases de datos.** Registra servidores
+> remotos (MySQL, MariaDB, PostgreSQL) con una credencial *pseudo-root* y administra lo que
+> vive adentro: bases, usuarios del motor, privilegios y el **versionado del esquema**.
+> Nunca lee ni expone los datos de negocio de las tablas gestionadas.
+
+## Por qué "Datum"
+
+Un *datum*, en geodesia, es el **marco de referencia desde el cual se mide todo lo demás**:
+el que define el sistema de coordenadas.
+
+Ese es el concepto central del producto. Un **blueprint** describe una estructura como una
+cadena versionada de deltas SQL, y las N bases de datos que lo replican se alinean contra
+él. El blueprint es el datum; cada base gestionada es una medición contra ese marco.
+
+En computación, además, *datum* es el singular de *data*.
+
+## Qué lleva a cabo
+
+| | |
+|---|---|
+| **Versionado de esquema** | Aplica, revierte y marca versiones de blueprint sobre N bases, con checkpoint por sentencia, resume automático y cuarentena ante fallo parcial |
+| **Administración del motor** | Bases, usuarios, privilegios y perfiles de permisos, con paridad entre los tres motores |
+| **Clonado** | Replica la estructura de una base entre servidores |
+| **Comparación de esquemas** | Diffea dos bases y puede adoptar el diff como una versión nueva de blueprint |
+| **Exportación** | Artefactos verificables, con manifiesto y checksum |
+| **Consola SQL** | Ejecución ad-hoc bajo política |
+| **Guardas por entorno** | Clasifica las bases y bloquea DDL destructivo donde corresponde |
+| **Superficie MCP** | Acceso para agentes, con opt-in explícito por base y veto de emergencia |
+
+La prudencia operativa no es un adorno: cada operación se ejecuta contra la base de
+producción de un tercero.
 
 Construido sobre una plantilla profesional de FastAPI (arquitectura MVC, versionado de
-API, middlewares, manejo de errores y utilidades). El estado actual corresponde a la
-**Iteración 1** del [roadmap](docs/plans/README.md).
+API, middlewares, manejo de errores y utilidades). Roadmap en
+[`docs/plans/`](docs/plans/README.md).
 
 ---
 
@@ -24,7 +51,7 @@ El sistema separa dos planos:
 
 ```
                  ┌──────────────────────────────┐
-   Admin  ──────▶│   Database API Gateway        │
+   Admin  ──────▶│   Datum                       │
  (sesión)        │   FastAPI + BD de metadatos   │
                  └───────────────┬───────────────┘
                                  │ pseudo-root (cifrada)
