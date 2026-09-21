@@ -211,6 +211,22 @@ fiable:
 | `ALTER … MODIFY … AUTO_INCREMENT` | sin equivalente | **Override PG** |
 | Rutinas `BEGIN…END` con `;` internos | el splitter las parte mal | Subir como un solo delta / **override** |
 
+## El slug nombra una tabla DENTRO de cada base
+
+El `slug` del blueprint no es una etiqueta: `version_table_name` lo usa para nombrar la tabla de
+versión de Alembic (`_gw_v_{slug}`) **dentro de cada BD gestionada**. Por eso cambiarlo no se
+acepta por el `PATCH` común —responde 409 `database_model.slug_in_use`— y tiene endpoint propio
+con preview y confirmación: `POST /database-models/{id}/rename-slug`. El `name` sí es libre.
+
+Y por eso existe `GET /database-models/{id}/version-tables`: una tabla de versión cuyo nombre ya
+no corresponde al slug vigente es **invisible** para el resto del gateway, y esa invisibilidad
+hace que la cadena entera figure pendiente sin que nada falle. Con
+`status.has_orphan_accounting` en `true`, **`pending_versions` no es de fiar**.
+
+El incidente que originó todo esto, la cadena causal completa y por qué no hay auto-corrección
+están en [`docs/development/decisiones-e-incidentes.md`](../development/decisiones-e-incidentes.md).
+Contrato para el frontend: [`docs/api-reference-v25.md`](../api-reference-v25.md).
+
 ## Integridad, cuarentena y recuperación
 
 - **La BD tiene que EXISTIR en el motor.** Una BD registrada sin aprovisionar (`status=pending`)

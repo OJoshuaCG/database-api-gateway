@@ -609,6 +609,75 @@ regresiones en `test_api_model_migrations.py` (28), `test_api_migrations_rollbac
 (16), `test_migration_reconcile_partial.py` (26) y `test_query_policy.py` (83). **Sigue pendiente
 el e2e contra motores reales.**
 
+### Renombrar el slug de un blueprint dejó huérfana la contabilidad de 8 bases
+
+**El incidente.** Se renombró el `name` y el `slug` de un blueprint con 10 bases asignadas. La
+app pasó a mostrar **todas las versiones como pendientes desde la 0001**; se aplicó sobre 8
+bases y falló con "ya existen tablas". **Ese fallo fue lo único que evitó el daño real.** Al
+reingresar, el blueprint mostraba 2 bases en vez de 10, y dentro de cada base afectada
+convivían dos tablas de versión: `_gw_v_test_db` con el dato bueno y `_gw_v_production_db`
+vacía.
+
+**La cadena, y ninguno de sus eslabones es un bug suelto.** `version_table_name` deriva el
+nombre de la tabla de versión ÚNICAMENTE del `slug` —texto mutable— y nunca del `id`.
+`update_model` lo incluía en su bucle de campos actualizables sin guard. Con el slug nuevo,
+`get_current_version` lee una tabla que no existe: Alembic devuelve `None` **sin crearla** (la
+crea recién el `apply`, vía `_ensure_version_table`), y `compute_pending(None, specs)` devuelve
+la cadena entera. Hasta acá todo "funciona": nada falla, nada avisa.
+
+**Lo que convirtió un susto en pérdida de datos fue el paso siguiente.**
+`_resync_model_versions` escribió ese `None` en `managed_databases.model_version`, borrando el
+único registro de dónde estaba parada cada base. Por eso "desaparecieron" 8: el conteo de
+aplicadas se calcula sobre `model_version`, **no** sobre `model_id`, que nunca se perdió. El
+vínculo estuvo intacto todo el tiempo.
+
+**Tres correcciones, y la tercera es la que importa.** (1) El `PATCH` dejó de aceptar cambios
+de `slug` sobre un blueprint con bases. (2) El refresh dejó de pisar con `NULL` una versión ya
+registrada: es una LECTURA, así que conserva el dato y deja rastro en el log — reconciliar es
+trabajo de `stamp`, que es una afirmación explícita del operador. (3) **El silencio se
+rompió**: `get_current_version` devolviendo `None` es ambiguo entre "base en cero" y "la tabla
+existe con otro nombre", así que `status` ahora sondea las `_gw_v_*` presentes y expone
+`has_orphan_accounting`, con `GET /database-models/{id}/version-tables` como informe completo.
+La sonda se dispara solo ante la firma exacta —el motor no reporta versión pero el inventario
+sí tenía una—, así que una base nueva no paga ni una consulta.
+
+**Por qué NO hay auto-corrección.** Sería fácil que `get_current_version` buscara cualquier
+`_gw_v_*` y la adoptara. No se hace: leer en silencio una tabla que no corresponde al slug
+vigente **enmascara** el problema en vez de mostrarlo, y con varias huérfanas es ambiguo cuál
+adoptar. El diagnóstico informa; mover el puntero sigue siendo `stamp`.
+
+**El slug volvió a ser renombrable, por pedido explícito, con todo el aparato.** `POST
+/database-models/{id}/rename-slug` propaga el rename a los motores con el mismo molde que el
+borrado con renumerado: preview que clasifica cada base (`rename`/`skip`/`conflict`/
+`unreachable`), `confirm_token` atado a la huella del parque, `record_intent` fail-closed,
+advisory lock por BD —el MISMO que toman apply/rollback/stamp— y compensación que devuelve la
+LISTA de las no revertidas. **`conflict` y `unreachable` abortan la operación entera**, no solo
+esa base: el gateway apunta a un solo nombre, así que medio parque renombrado deja a la otra
+mitad huérfana. Y **el orden no es negociable**: primero los N renames remotos, el `slug` local
+último. Al revés, un fallo remoto reproduce el incidente sobre todo el parque a la vez.
+
+**Se advirtió dos veces que propagar renames convierte un PATCH de metadatos en una escritura
+distribuida sobre bases de terceros** —con fallo parcial, y con huérfanas permanentes si una
+base está caída ese día—. La alternativa propuesta era congelar un `table_slug` inmutable, que
+da el mismo resultado legible con cero escrituras remotas. El usuario reafirmó el pedido; queda
+registrado acá porque el costo es real y reaparece en cada rename.
+
+**Bug colateral del mismo barrido.** `migration_freeze_catalog.ERROR_CODES` estaba definido DOS
+veces (líneas 72 y 163) y la segunda pisaba a la primera: el vocabulario efectivo tenía **5 de
+12** códigos y se caían los siete del borrado con renumerado. El runtime no fallaba —el
+controller referencia las constantes por nombre— pero cualquier consumidor que lo use como
+catálogo exhaustivo recibía esos códigos como desconocidos. La definición quedó una sola y al
+final del módulo, que es donde puede nombrar los códigos de la vía de excepción; probablemente
+esa fue la razón de la segunda. El test de contrato no lo atrapaba porque solo recorre los
+MIEMBROS del set validando su formato: se agregó la afirmación que ya protegía al catálogo del
+clon.
+
+**Lo que este trabajo NO resolvió.** Las 8 bases del incidente **siguen rotas**: todo lo
+anterior es código, ningún commit tocó un motor. Y quedan dos agujeros del mismo tipo: una base
+restaurada de un backup anterior a un rename vuelve con el nombre viejo, y el informe de
+`/version-tables` dice CUÁL tabla es huérfana pero todavía no qué versión tiene adentro.
+
+
 ## Módulo de Adopción, Reconciliación y Snapshot (Plan 09)
 
 Puente entre el **plano en vivo** (motor real) y el **inventario** del gateway. Guía de uso:
