@@ -68,6 +68,7 @@ from app.services.db_admin.dtos import (
 )
 from app.services.db_admin.identifiers import (
     exclude_gateway_internal_tables,
+    is_gateway_internal_table,
     quote_identifier,
     validate_identifier,
 )
@@ -632,6 +633,73 @@ class ServerAdapter(ABC):
         except SQLAlchemyError as exc:
             raise map_driver_error(
                 exc, op="list_tables", target=self.target, extra={"database": database}
+            )
+
+    def internal_table_exists(
+        self, database: str, table: str, *, conn: Connection | None = None
+    ) -> bool:
+        """¿Existe esta tabla de contabilidad interna del gateway en la BD destino?
+
+        Hace falta un método aparte porque ``list_tables`` **excluye** las internas a
+        propósito, así que no sirve para preguntar por ellas. Se acota a las internas de
+        forma explícita: un ``table_exists`` genérico sería otra vía de introspección sin
+        guard, y el gateway ya tiene la suya (``get_table_schema``).
+        """
+        if not is_gateway_internal_table(table):
+            raise AppHttpException(
+                message="Este método solo consulta la contabilidad interna del gateway.",
+                status_code=422,
+                context={"reason": "not_internal_table"},
+            )
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        validate_identifier(table, self.dialect, "tabla")
+        schema = self._inspect_schema(database)
+        try:
+            with self._conn_ctx(database, conn) as conn:
+                return inspect(conn).has_table(table, schema=schema)
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc,
+                op="internal_table_exists",
+                target=self.target,
+                extra={"database": database},
+            )
+
+    def rename_internal_table(
+        self, database: str, old: str, new: str, *, conn: Connection | None = None
+    ) -> None:
+        """Renombra una tabla de contabilidad interna del gateway DENTRO de la BD destino.
+
+        Acotado a las internas, y no es simetría estética: el gateway no tiene ningún motivo
+        legítimo para renombrar una tabla del usuario, y una primitiva genérica de rename es
+        destructiva (pisa el nombre destino si existe en algunos motores). Los DOS nombres se
+        validan con la whitelist ESTRICTA —no la ampliada de introspección— porque acá el
+        gateway los está creando, no leyéndolos.
+
+        ``ALTER TABLE … RENAME TO …`` es la forma que entienden los tres motores. El DDL hace
+        commit implícito en MySQL/MariaDB, así que esta operación **no es reversible por
+        transacción**: quien la orqueste sobre N bases necesita compensación explícita.
+        """
+        for nombre in (old, new):
+            if not is_gateway_internal_table(nombre):
+                raise AppHttpException(
+                    message="Solo se renombra contabilidad interna del gateway.",
+                    status_code=422,
+                    context={"reason": "not_internal_table"},
+                )
+            validate_identifier(nombre, self.dialect, "tabla")
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        old_q = quote_identifier(old, self.dialect)
+        new_q = quote_identifier(new, self.dialect)
+        try:
+            with self._conn_ctx(database, conn) as conn:
+                conn.exec_driver_sql(f"ALTER TABLE {old_q} RENAME TO {new_q}")
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc,
+                op="rename_internal_table",
+                target=self.target,
+                extra={"database": database},
             )
 
     def get_table_schema(self, database: str, table: str) -> TableSchema:
