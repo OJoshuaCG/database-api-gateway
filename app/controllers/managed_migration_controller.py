@@ -2526,6 +2526,10 @@ class ManagedMigrationController:
         """
         if not results:
             return
+        from app.core.environments import MIGRATION_MIRROR_ENABLED
+
+        if not MIGRATION_MIRROR_ENABLED:
+            return
         from app.core.remote_engine import database_connection
         from app.services.db_admin import migration_mirror
 

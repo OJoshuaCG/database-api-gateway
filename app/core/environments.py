@@ -320,6 +320,20 @@ QUERY_MAX_CELL_CHARS = int(os.getenv("QUERY_MAX_CELL_CHARS", "4096"))
 # Tope de caracteres del SQL que se PERSISTE en el historial (con contraseñas redactadas).
 QUERY_HISTORY_SQL_MAX_CHARS = int(os.getenv("QUERY_HISTORY_SQL_MAX_CHARS", "16384"))
 
+# ======= Espejo del historial dentro de cada BD gestionada ======= #
+# KILL SWITCH. False = el gateway NO crea ni escribe ``_datum_migrations`` dentro de las BDs
+# que administra. Apagarlo no pierde información: el historial AUTORITATIVO vive en
+# ``database_migration_history``, en la BD del gateway. Lo que se pierde es que la base se
+# explique a sí misma cuando el gateway no está (un backup restaurado en otro lado).
+#
+# Existe porque es la única feature que crea una tabla NUEVA dentro de bases de datos de
+# terceros. Poder apagarla sin desplegar código es la diferencia entre un incidente y una
+# variable de entorno, y una tabla ya creada no se borra sola al apagar el switch: deja de
+# escribirse, nada más.
+MIGRATION_MIRROR_ENABLED = (
+    os.getenv("MIGRATION_MIRROR_ENABLED", "True").lower() == "true"
+)
+
 # ======= Captura de resultados de SELECT en migraciones de blueprint ======= #
 # KILL SWITCH global. False = ninguna migración captura resultados, ni con
 # capture_selects=true en la versión (el SQL se ejecuta exactamente igual que hoy: la

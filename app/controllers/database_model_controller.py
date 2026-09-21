@@ -364,11 +364,17 @@ class DatabaseModelController:
         from app.core.remote_engine import database_connection
         from app.services.db_admin.factory import get_adapter
         from app.services.db_admin.identifiers import GATEWAY_TABLE_PREFIXES
-        from app.services.db_admin.migrations import MigrationRunner, version_table_name
+        from app.services.db_admin.migrations import (
+            MigrationRunner,
+            legacy_version_table_name,
+            resolve_version_table,
+            version_table_name,
+        )
 
         # El prefijo sale de la MISMA constante que usan el nombrado y la exclusión: si se
         # escribiera a mano acá, este informe podría dejar de ver justo la tabla que busca.
-        prefijo_version = GATEWAY_TABLE_PREFIXES[0]
+        prefijos_version = ("_gw_v_", "_datum_version_")
+        assert all(p in GATEWAY_TABLE_PREFIXES for p in prefijos_version)
 
         session = self._session()
         try:
@@ -389,6 +395,11 @@ class DatabaseModelController:
         finally:
             session.close()
 
+        # La tabla esperada NO es una sola para todo el blueprint: una base anterior al
+        # renombrado del prefijo espera ``_gw_v_`` y una nueva ``_datum_version_``. Tomar solo
+        # la vigente marcaría TODO el parque existente como huérfano — una alarma falsa sobre
+        # el propio informe que existe para detectar huérfanas de verdad.
+        esperadas_validas = {version_table_name(slug), legacy_version_table_name(slug)}
         esperada = version_table_name(slug)
         runner = MigrationRunner()
         items: list[dict] = []
@@ -414,8 +425,13 @@ class DatabaseModelController:
                     presentes = get_adapter(targets[server_id]).list_internal_tables(
                         db_name, conn=conn
                     )
-                    versiones = [n for n in presentes if n.startswith(prefijo_version)]
-                    huerfanas = [n for n in versiones if n != esperada]
+                    versiones = [
+                        n for n in presentes if n.startswith(prefijos_version)
+                    ]
+                    # Se resuelve contra ESTA base: la que tenga, vieja o nueva, es la buena.
+                    esperada_aqui = resolve_version_table(conn, slug)
+                    item["expected_table"] = esperada_aqui
+                    huerfanas = [n for n in versiones if n not in esperadas_validas]
                     item["present_tables"] = presentes
 
                     # La versión que guarda CADA huérfana. Es el dato con el que se decide el
@@ -430,16 +446,17 @@ class DatabaseModelController:
                         }
                         for nombre in huerfanas
                     ]
-                    if esperada in versiones:
+                    tiene_esperada = esperada_aqui in versiones
+                    if tiene_esperada:
                         item["current_version"] = runner.read_version_table(
-                            targets[server_id], db_name, esperada, conn=conn
+                            targets[server_id], db_name, esperada_aqui, conn=conn
                         )
             except AppHttpException as exc:
                 item["detail"] = getattr(exc, "message", "No se pudo leer la base.")
                 items.append(item)
                 continue
 
-            if esperada in versiones:
+            if tiene_esperada:
                 item["status"] = self._VT_MIXED if huerfanas else self._VT_OK
             elif huerfanas:
                 item["status"] = self._VT_ORPHANED
@@ -503,7 +520,10 @@ class DatabaseModelController:
         """
         from app.controllers.common import build_target, get_server_or_404
         from app.services.db_admin.factory import get_adapter
-        from app.services.db_admin.migrations import version_table_name
+        from app.services.db_admin.migrations import (
+            legacy_version_table_name,
+            version_table_name,
+        )
 
         session = self._session()
         try:
@@ -544,11 +564,15 @@ class DatabaseModelController:
         finally:
             session.close()
 
-        tabla_vieja = version_table_name(old_slug)
+        # El ORIGEN puede tener cualquiera de los dos prefijos: una base anterior al
+        # renombrado del prefijo tiene ``_gw_v_`` y una nueva ``_datum_version_``. El DESTINO
+        # es siempre el vigente, así que renombrar el slug moderniza el prefijo de paso — sin
+        # necesidad de una migración de parque aparte.
+        origenes = (version_table_name(old_slug), legacy_version_table_name(old_slug))
         tabla_nueva = version_table_name(new_slug)
         # Dos slugs distintos pueden truncar al MISMO nombre (63 chars). Ahí no hay nada que
         # renombrar en ningún motor y el cambio es puramente local.
-        no_op = tabla_vieja == tabla_nueva
+        no_op = tabla_nueva in origenes
 
         items: list[dict] = []
         for db_id, db_name, server_id in filas:
@@ -565,7 +589,10 @@ class DatabaseModelController:
                 continue
             try:
                 adapter = get_adapter(targets[server_id])
-                tiene_vieja = adapter.internal_table_exists(db_name, tabla_vieja)
+                origen = next(
+                    (o for o in origenes if adapter.internal_table_exists(db_name, o)),
+                    None,
+                )
                 tiene_nueva = adapter.internal_table_exists(db_name, tabla_nueva)
             except AppHttpException as exc:
                 item["action"] = self._RN_UNREACHABLE
@@ -575,8 +602,12 @@ class DatabaseModelController:
             if tiene_nueva:
                 item["action"] = self._RN_CONFLICT
                 item["detail"] = f"Ya existe la tabla '{tabla_nueva}' en esta base."
-            elif tiene_vieja:
+            elif origen:
                 item["action"] = self._RN_RENAME
+                # El origen va POR BASE: dentro de un mismo blueprint puede haber bases con el
+                # prefijo viejo y otras con el nuevo, y renombrar todas desde un único nombre
+                # supuesto fallaría en la mitad.
+                item["source_table"] = origen
             items.append(item)
 
         bloqueantes = [i for i in items if i["action"] in self._RN_BLOCKING]
@@ -587,7 +618,7 @@ class DatabaseModelController:
             "model_id": model_id,
             "current_slug": old_slug,
             "new_slug": new_slug,
-            "current_table": tabla_vieja,
+            "current_table": origenes[0],
             "new_table": tabla_nueva,
             "no_op": no_op,
             "databases": items,
@@ -653,7 +684,7 @@ class DatabaseModelController:
 
     @staticmethod
     def _compensate_renames(
-        hechas: list[dict], targets: dict, engines: dict, desde: str, hacia: str
+        hechas: list[dict], targets: dict, engines: dict, desde: str
     ) -> list[dict]:
         """Devuelve a su nombre original las tablas ya renombradas.
 
@@ -680,13 +711,17 @@ class DatabaseModelController:
                 with runner.advisory_lock(
                     targets[sid], engine=engines[sid], lock_key=it["managed_database_id"]
                 ):
+                    # ``hacia`` sale de CADA ítem: dentro de un mismo blueprint puede haber
+                    # bases que venían del prefijo viejo y otras del nuevo, y devolverlas
+                    # todas a un único nombre supuesto dejaría la mitad peor que antes.
                     get_adapter(targets[sid]).rename_internal_table(
-                        it["database_name"], desde, hacia
+                        it["database_name"], desde, it["source_table"]
                     )
             except Exception:
                 logger.exception(
                     "falló la compensación del rename en la BD %s (%s: %s -> %s)",
-                    it["managed_database_id"], it["database_name"], desde, hacia,
+                    it["managed_database_id"], it["database_name"], desde,
+                    it.get("source_table"),
                 )
                 quedaron.append(it)
         return quedaron
@@ -718,14 +753,14 @@ class DatabaseModelController:
         plan = self.rename_slug_plan(model_id, new_slug)
         self._enforce_rename_plan(plan)
         old_slug = plan["current_slug"]
-        tabla_vieja, tabla_nueva = plan["current_table"], plan["new_table"]
+        tabla_nueva = plan["new_table"]
         a_renombrar = [i for i in plan["databases"] if i["action"] == self._RN_RENAME]
 
         if a_renombrar:
             if not confirm_token:
                 raise AppHttpException(
                     message=(
-                        f"Renombrar el slug implica renombrar '{tabla_vieja}' en "
+                        f"Renombrar el slug implica renombrar la tabla de versión en "
                         f"{len(a_renombrar)} base(s) de sus motores. Pedí el plan en "
                         f"POST /database-models/{model_id}/rename-slug/plan y reenviá su "
                         "confirm_token."
@@ -769,7 +804,7 @@ class DatabaseModelController:
                 touched_engine=True,
                 detail=(
                     f"blueprint {model_id}: '{old_slug}' -> '{new_slug}'; renombra "
-                    f"{tabla_vieja} -> {tabla_nueva} en {len(a_renombrar)} BD(s)"
+                    f"la tabla de versión a {tabla_nueva} en {len(a_renombrar)} BD(s)"
                 ),
             )
 
@@ -796,7 +831,7 @@ class DatabaseModelController:
                 # migración en curso sobre esa base.
                 with runner.advisory_lock(targets[sid], engine=engines[sid], lock_key=it["managed_database_id"]):
                     get_adapter(targets[sid]).rename_internal_table(
-                        it["database_name"], tabla_vieja, tabla_nueva
+                        it["database_name"], it["source_table"], tabla_nueva
                     )
                 hechas.append(it)
             except Exception as exc:  # noqa: BLE001 — se compensa y se reporta, no se traga
@@ -805,7 +840,7 @@ class DatabaseModelController:
                     it["managed_database_id"], it["database_name"],
                 )
                 no_compensadas = self._compensate_renames(
-                    hechas, targets, engines, tabla_nueva, tabla_vieja
+                    hechas, targets, engines, tabla_nueva
                 )
                 audit.record(
                     dm_codes.RENAME_SLUG_OPERATION,
@@ -837,7 +872,7 @@ class DatabaseModelController:
                         "failed": it,
                         "renamed": hechas,
                         "not_compensated": no_compensadas,
-                        "old_table": tabla_vieja,
+                        "new_table_target": tabla_nueva,
                         "new_table": tabla_nueva,
                     },
                     context={"model_id": model_id},
@@ -863,7 +898,7 @@ class DatabaseModelController:
             touched_engine=bool(a_renombrar),
             detail=(
                 f"'{old_slug}' -> '{new_slug}'; {len(hechas)} BD(s) renombradas "
-                f"({tabla_vieja} -> {tabla_nueva})"
+                f"a {tabla_nueva}"
             ),
         )
         return {"model": resultado, "renamed_databases": hechas, "no_op": plan["no_op"]}

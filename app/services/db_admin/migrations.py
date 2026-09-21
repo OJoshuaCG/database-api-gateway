@@ -37,7 +37,7 @@ from pathlib import Path
 from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
-from sqlalchemy import Connection
+from sqlalchemy import Connection, inspect
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.environments import MIGRATION_CAPTURE_ENABLED
@@ -162,7 +162,70 @@ class StatementResult:
 # Prefijo de la tabla de versión, tomado de la lista de objetos internos del gateway
 # (``identifiers.GATEWAY_TABLE_PREFIXES``) para que el nombre que se CREA y el que los
 # snapshots EXCLUYEN no puedan divergir nunca.
-_VERSION_TABLE_PREFIX = GATEWAY_TABLE_PREFIXES[0]  # "_gw_v_"
+def _require_known_prefix(prefix: str) -> str:
+    """El prefijo TIENE que estar en ``GATEWAY_TABLE_PREFIXES``.
+
+    Antes esto se garantizaba indexando la tupla, pero con cinco prefijos el índice es más
+    frágil que el literal. La propiedad que hay que conservar es la misma y es la que evita un
+    incidente conocido: si el prefijo con el que se CREA la tabla de versión no está en la
+    lista que los snapshots EXCLUYEN, el diff la ve como esquema del usuario y emite
+    ``DROP TABLE`` sobre la propia contabilidad del gateway. Falla al importar, no en runtime.
+    """
+    if prefix not in GATEWAY_TABLE_PREFIXES:
+        raise RuntimeError(
+            f"El prefijo de tabla de versión {prefix!r} no está en GATEWAY_TABLE_PREFIXES: "
+            "el diff lo trataría como esquema del usuario."
+        )
+    return prefix
+
+
+#: Prefijo HISTÓRICO. Se conserva para siempre: las bases creadas antes del renombrado lo
+#: tienen, y un backup restaurado o un clon viejo lo devuelven aunque el parque ya se haya
+#: migrado. Dejar de reconocerlo dejaría huérfana su contabilidad.
+_LEGACY_VERSION_PREFIX = _require_known_prefix("_gw_v_")
+
+#: Prefijo VIGENTE. Lo usan solo las bases nuevas y las que se renombren explícitamente.
+#: OJO con el presupuesto de nombre: el truncado a 63 deja 48 caracteres de slug contra los
+#: 57 que dejaba ``_gw_v_``, así que dos slugs que compartan sus primeros 48 caracteres
+#: colapsan en la misma tabla.
+_VERSION_TABLE_PREFIX = _require_known_prefix("_datum_version_")
+
+
+def _safe_slug(slug: str) -> str:
+    return "".join(c if (c.isalnum() or c == "_") else "_" for c in slug.lower())
+
+
+def legacy_version_table_name(slug: str) -> str:
+    """Nombre HISTÓRICO de la tabla de versión: ``_gw_v_{slug}``."""
+    return f"{_LEGACY_VERSION_PREFIX}{_safe_slug(slug)}"[:63]
+
+
+def resolve_version_table(conn: Connection, slug: str, schema: str | None = None) -> str:
+    """El nombre REAL de la tabla de versión en ESTA base.
+
+    **Resuelve, no asume**, y es la diferencia entre una migración de parque y un cambio sin
+    día D. Si el nombre se cambiara a secas, cada base existente pasaría a ser consultada por
+    una tabla que no tiene: ``get_current_version`` devolvería ``None``, la cadena entera
+    figuraría pendiente y un apply la reaplicaría desde la 0001 — el incidente del slug
+    renombrado, pero sobre TODO el parque a la vez.
+
+    Con esta resolución no hay ventana: una base vieja sigue usando su ``_gw_v_`` sin que
+    nadie la toque, una base nueva nace con ``_datum_version_``, y el renombrado explícito
+    pasa a ser opcional en vez de obligatorio.
+
+    El orden de preferencia importa: si por un rename a medias existieran las DOS, gana la
+    nueva — es la que el renombrado dejó como destino.
+    """
+    nuevo = version_table_name(slug)
+    viejo = legacy_version_table_name(slug)
+    if nuevo == viejo:  # defensivo: no puede pasar con los prefijos actuales
+        return nuevo
+    insp = inspect(conn)
+    if insp.has_table(nuevo, schema=schema):
+        return nuevo
+    if insp.has_table(viejo, schema=schema):
+        return viejo
+    return nuevo
 
 
 def version_table_name(slug: str) -> str:
@@ -178,8 +241,7 @@ def version_table_name(slug: str) -> str:
     usan los snapshots para excluir esta tabla del diff. Si se cambiara acá sin cambiarla
     allá, el gateway volvería a generar DDL contra su propia contabilidad.
     """
-    safe = "".join(c if (c.isalnum() or c == "_") else "_" for c in slug.lower())
-    return f"{_VERSION_TABLE_PREFIX}{safe}"[:63]
+    return f"{_VERSION_TABLE_PREFIX}{_safe_slug(slug)}"[:63]
 
 
 class MigrationRunner:
@@ -627,8 +689,22 @@ class MigrationRunner:
     # Lectura de versión actual (sin archivos, thread-safe)               #
     # ------------------------------------------------------------------ #
     def get_current_version(self, target: ServerTarget, db_name: str, slug: str) -> str | None:
-        """Lee la versión actual de la BD destino desde su tabla ``_gw_v_{slug}``."""
-        return self.read_version_table(target, db_name, version_table_name(slug))
+        """Lee la versión actual de la BD destino, resolviendo el nombre de su tabla.
+
+        Resuelve porque el nombre no es uno solo: las bases anteriores al renombrado tienen
+        ``_gw_v_{slug}`` y las nuevas ``_datum_version_{slug}``. Leer solo el vigente
+        devolvería ``None`` sobre todo el parque existente, que es indistinguible de "la base
+        está en cero" y dispararía una reaplicación desde la primera versión.
+        """
+        try:
+            with database_connection(target, db_name) as conn:
+                return self.read_version_table(
+                    target, db_name, resolve_version_table(conn, slug), conn=conn
+                )
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="migration_status", target=target, extra={"database": db_name}
+            )
 
     @staticmethod
     def read_version_table(
@@ -819,7 +895,10 @@ class MigrationRunner:
         que un apply largo sostiene la request y su hilo mientras dura. Es el mismo costo que ya
         asumió la conversión de collation, y la alternativa era el bucle.
         """
-        version_table = version_table_name(slug)
+        # El nombre se RESUELVE contra cada base (ver ``resolve_version_table``), no se
+        # asume: una base vieja sigue con su ``_gw_v_`` y una nueva nace con
+        # ``_datum_version_``. Asumirlo haría que todo el parque existente pasara a ser
+        # consultado por una tabla que no tiene.
         transactional = self.use_transactional_ddl(engine, specs)
         with tempfile.TemporaryDirectory(prefix="gw_mig_") as tmp:
             versions_dir = Path(tmp) / "versions"
@@ -831,6 +910,7 @@ class MigrationRunner:
                 if transactional:
                     with self.advisory_lock(target, engine=engine, lock_key=managed_db_id):
                         with database_connection(target, db_name, bulk=bulk) as conn:
+                            version_table = resolve_version_table(conn, slug)
                             cfg = self._make_config(versions_dir, conn, version_table)
                             yield conn, cfg, version_table
                 else:
@@ -838,6 +918,7 @@ class MigrationRunner:
                         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
                         self._acquire_lock(conn, engine, managed_db_id)
                         try:
+                            version_table = resolve_version_table(conn, slug)
                             cfg = self._make_config(versions_dir, conn, version_table)
                             yield conn, cfg, version_table
                         finally:
