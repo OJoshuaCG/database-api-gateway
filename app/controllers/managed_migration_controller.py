@@ -1153,6 +1153,10 @@ class ManagedMigrationController:
             raise
 
         self._record_history(db_id, results, direction="up", specs=specs, admin=admin)
+        self._mirror_history(
+            target, db_name, engine, model_id=model_id, slug=slug, results=results,
+            direction="up", specs=specs, admin=admin,
+        )
         failed = any(r.status == "failed" for r in results)
 
         # Auto-protección: si quedó una aplicación PARCIAL (solo posible en MySQL/MariaDB,
@@ -1411,7 +1415,10 @@ class ManagedMigrationController:
             md, server, model = self._load_context(session, db_id)
             specs = self._load_specs(session, model.id)
             self._verify_integrity(specs)  # el rollback ejecuta DDL destructivo
-            slug, engine = model.slug, EngineType(engine_value(server))
+            # ``model_id`` se captura ACÁ y no se lee de ``model`` más abajo: fuera del
+            # ``with`` la instancia queda detached, y un atributo expirado reventaría el
+            # rollback entero por un dato que solo alimenta el espejo.
+            slug, engine, model_id = model.slug, EngineType(engine_value(server)), model.id
             db_name, server_id = md.name, md.server_id
             target = build_target(server)
         finally:
@@ -1534,6 +1541,10 @@ class ManagedMigrationController:
             managed_db_id=db_id, specs=specs, to_version=dest,
         )
         self._record_history(db_id, results, direction="down", specs=path, admin=admin)
+        self._mirror_history(
+            target, db_name, engine, model_id=model_id, slug=slug, results=results,
+            direction="down", specs=path, admin=admin,
+        )
         # La versión tras el rollback se RE-LEE del motor (fuente de verdad) y se
         # sincroniza en el inventario del gateway.
         new_current = self.runner.get_current_version(target, db_name, slug)
@@ -2489,6 +2500,72 @@ class ManagedMigrationController:
             session.commit()
         finally:
             session.close()
+
+    def _mirror_history(
+        self,
+        target,
+        db_name: str,
+        engine: EngineType,
+        *,
+        model_id: int,
+        slug: str,
+        results: list[MigrationResult],
+        direction: str,
+        specs: "list[MigrationSpec] | None" = None,
+        admin: "dict | Actor | None" = None,
+    ) -> None:
+        """Replica el historial DENTRO de la BD destino (``_datum_migrations``). Fail-open.
+
+        Es el espejo, no la autoridad: ``_record_history`` ya escribió la fila que manda, en
+        la BD del gateway. Esto existe para que la base se explique a sí misma cuando el
+        gateway no está — un backup restaurado en otro lado, o la base entregada al cliente.
+
+        **No propaga nada.** ``migration_mirror.record`` ya es fail-open por dentro; acá se
+        envuelve además la apertura de la conexión, que ocurre fuera de él. Un espejo que
+        puede tumbar un apply deja de ser un espejo.
+        """
+        if not results:
+            return
+        from app.core.remote_engine import database_connection
+        from app.services.db_admin import migration_mirror
+
+        checksums = {s.id: s.checksum for s in (specs or [])}
+        _, actor_username = identity_of(admin)
+        try:
+            request_id = current_http_identifier.get()
+        except LookupError:
+            request_id = None
+        entries = [
+            {
+                "version": r.version,
+                "direction": direction,
+                "status": r.status,
+                "checksum": checksums.get(r.migration_id),
+                "applied_at": r.applied_at,
+                "execution_ms": r.execution_ms,
+                "actor": actor_username,
+                "request_id": request_id,
+            }
+            for r in results
+        ]
+        try:
+            with database_connection(target, db_name) as conn:
+                # AUTOCOMMIT explícito: esto corre DESPUÉS de la migración, fuera de su
+                # transacción, y no debe quedar colgado de nada que el runner haya dejado
+                # abierto.
+                migration_mirror.record(
+                    conn.execution_options(isolation_level="AUTOCOMMIT"),
+                    engine,
+                    model_id=model_id,
+                    blueprint_slug=slug,
+                    entries=entries,
+                )
+        except Exception:  # noqa: BLE001 — fail-open, ver el docstring
+            logger.exception(
+                "espejo de migraciones: no se pudo abrir la conexión a %s. La migración NO "
+                "se ve afectada.",
+                db_name,
+            )
 
     def _sync_model_version_from_engine(
         self, db_id: int, target, db_name: str, slug: str
