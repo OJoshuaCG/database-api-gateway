@@ -1573,7 +1573,13 @@ class ManagedMigrationController:
         }
 
     def stamp(
-        self, db_id: int, version: str, *, force: bool = False, admin: "dict | Actor | None" = None
+        self,
+        db_id: int,
+        version: str,
+        *,
+        force: bool = False,
+        purge: bool = False,
+        admin: "dict | Actor | None" = None,
     ) -> dict:
         session = self._session()
         try:
@@ -1587,6 +1593,16 @@ class ManagedMigrationController:
         finally:
             session.close()
 
+        if purge and not force:
+            raise AppHttpException(
+                message=(
+                    "'purge' descarta el puntero de versión actual sin leerlo, así que "
+                    "requiere 'force': es una afirmación de que ya sabés en qué versión está "
+                    "esta base."
+                ),
+                status_code=422,
+                context={"managed_database_id": db_id},
+            )
         self._guard_partial_checkpoint(db_id, force)
 
         # ``runner.stamp`` abre conexión a la BD destino, así que una base inexistente YA falla
@@ -1596,9 +1612,16 @@ class ManagedMigrationController:
         with self._translating_unknown_database(
             target, db_id, db_name, server_id, op="marcar una versión"
         ):
+            # ``purge`` VACÍA la tabla de versión antes de escribir, en vez de pedirle a
+            # Alembic que resuelva el puntero ACTUAL para moverlo. Es la única salida para
+            # una BD cuyo puntero nombra una revisión que ya no existe en la cadena: sin
+            # purge, Alembic muere con ``Can't locate revision identified by …`` y esa base
+            # queda sin apply, sin rollback y sin stamp. Exige ``force`` porque descarta el
+            # valor viejo sin leerlo: quien lo pide tiene que estar afirmando que ya sabe
+            # dónde está esa base.
             self.runner.stamp(
                 target, db_name=db_name, slug=slug, engine=engine,
-                managed_db_id=db_id, specs=specs, version=version,
+                managed_db_id=db_id, specs=specs, version=version, purge=purge,
             )
         self._set_model_version(db_id, version)
         # El stamp es una AFIRMACIÓN explícita del admin ("esta BD está en la versión X"):
@@ -1625,7 +1648,8 @@ class ManagedMigrationController:
             "migration.stamp", admin=admin, target_type="managed_database",
             target_id=db_id, server_id=server_id, touched_engine=True,
             detail=f"stamp DECLARA version {version} (sin ejecutar DDL)"
-            + (" (force: checkpoint parcial descartado)" if force else ""),
+            + (" (force: checkpoint parcial descartado)" if force else "")
+            + (" (purge: tabla de versión vaciada antes de escribir)" if purge else ""),
         )
         return self.status(db_id)
 

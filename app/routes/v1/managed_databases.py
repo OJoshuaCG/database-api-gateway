@@ -518,9 +518,25 @@ def stamp_migration(
             "el estado físico real del motor."
         ),
     ),
+    purge: bool = Query(
+        False,
+        description=(
+            "VACÍA la tabla de versión antes de escribir, en vez de resolver el puntero "
+            "actual para moverlo. Única salida para una BD cuyo puntero nombra una revisión "
+            "que ya no existe en la cadena (Alembic muere con 'Can't locate revision' y esa "
+            "base queda sin apply, sin rollback y sin stamp). Requiere 'force': descarta el "
+            "valor viejo SIN leerlo."
+        ),
+    ),
 ):
-    result = ManagedMigrationController().stamp(db_id, version, force=force, admin=actor)
-    msg = "Versión marcada (stamp)." + (" Checkpoint parcial descartado." if force else "")
+    result = ManagedMigrationController().stamp(
+        db_id, version, force=force, purge=purge, admin=actor
+    )
+    msg = (
+        "Versión marcada (stamp)."
+        + (" Checkpoint parcial descartado." if force else "")
+        + (" Tabla de versión vaciada antes de escribir." if purge else "")
+    )
     return success(data=result, message=msg)
 
 
