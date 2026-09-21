@@ -84,7 +84,7 @@ from app.services.db_admin.export_session import ExportDurationExceeded, export_
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import (
     ensure_not_reserved_database,
-    is_gateway_internal_table,
+    is_export_excluded_table,
     validate_identifier,
 )
 from app.services.db_admin.schema_diff import _BODY_TYPE_ORDER, _STEP, _table_dep_order
@@ -933,7 +933,9 @@ class ExportController:
             # Obligatorio en TODO camino que enumera tablas: la contabilidad interna del
             # gateway (``_gw_v_*``/``_gw_stg_*``) no es esquema del usuario, y el incidente
             # de producción de 2026-07-27 nació justo de un camino que no la excluía.
-            if otype == "table" and is_gateway_internal_table(name):
+            # Salvo el espejo del historial: es interno, pero su valor entero es que viaje
+            # con los datos hacia la base restaurada.
+            if otype == "table" and is_export_excluded_table(name):
                 excluded_internal.append(name)
                 continue
             counts[otype] = counts.get(otype, 0) + 1

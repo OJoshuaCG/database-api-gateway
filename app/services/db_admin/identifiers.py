@@ -68,7 +68,30 @@ _PRIV_RE = re.compile(r"^[A-Z][A-Z ]*(,\s*[A-Z][A-Z ]*)*$")
 # ``ON UPDATE CURRENT_TIMESTAMP`` de MySQL): esos SÍ se dejan visibles a propósito.
 # Implementan el comportamiento de una COLUMNA del usuario, así que son parte legítima del
 # esquema resultante; excluirlos haría que el diff intentara recrearlos en cada corrida.
-GATEWAY_TABLE_PREFIXES: tuple[str, ...] = ("_gw_v_", "_gw_stg_")
+# El prefijo `_datum_` es el de la marca nueva; `_gw_` se conserva PARA SIEMPRE y no como
+# transición. Un backup restaurado de antes del renombrado, un clon hecho desde una base que
+# no se migró, o una base que estaba caída el día de la migración vuelven con el nombre viejo.
+# Dejar de reconocerlo haría que el gateway tratara su propia contabilidad como esquema del
+# usuario, que es exactamente el incidente de arriba.
+GATEWAY_TABLE_PREFIXES: tuple[str, ...] = (
+    "_gw_v_",
+    "_datum_version_",
+    "_gw_stg_",
+    "_datum_stg_",
+    "_datum_migrations",
+)
+
+#: Las internas que SÍ tienen que viajar en un export/backup.
+#:
+#: La distinción no existía y hacía falta crearla. "Invisible al diff" y "fuera del backup"
+#: eran la misma lista, y para el espejo del historial son cosas opuestas: tiene que quedar
+#: fuera del diff —si no, el diff emite ``DROP TABLE`` sobre él, que es el incidente de
+#: arriba— pero **dentro del export**, porque su valor entero es que el historial viaje con
+#: los datos. Un backup sin él no puede responder qué se le aplicó a esa base.
+#:
+#: El puntero de versión NO está acá a propósito. Exportarlo inyectaría en la base restaurada
+#: una versión de blueprint ajena: es el caso simétrico que ya documenta el bloque de arriba.
+EXPORTABLE_INTERNAL_PREFIXES: tuple[str, ...] = ("_datum_migrations",)
 
 
 def is_gateway_internal_table(name: str) -> bool:
@@ -79,9 +102,38 @@ def is_gateway_internal_table(name: str) -> bool:
     return any(lowered.startswith(p) for p in GATEWAY_TABLE_PREFIXES)
 
 
+def is_exportable_internal_table(name: str) -> bool:
+    """¿Es contabilidad interna que igual tiene que viajar en un export/backup?"""
+    if not name:
+        return False
+    lowered = name.lower()
+    return any(lowered.startswith(p) for p in EXPORTABLE_INTERNAL_PREFIXES)
+
+
 def exclude_gateway_internal_tables(names) -> list[str]:
-    """Filtra de una lista de tablas las que son contabilidad interna del gateway."""
+    """Filtra TODA la contabilidad interna del gateway.
+
+    Es el filtro del diff, del snapshot, del listado y del clon: ahí ninguna interna tiene
+    nada que hacer. Para el export existe ``exclude_non_exportable_internal_tables``, que
+    conserva el espejo del historial.
+    """
     return [n for n in names if not is_gateway_internal_table(n)]
+
+
+def is_export_excluded_table(name: str) -> bool:
+    """¿Esta tabla queda FUERA de un export? (es interna y no es de las que viajan)"""
+    return is_gateway_internal_table(name) and not is_exportable_internal_table(name)
+
+
+def exclude_non_exportable_internal_tables(names) -> list[str]:
+    """Filtro del EXPORT: saca las internas salvo las que tienen que viajar con los datos.
+
+    Se separa de ``exclude_gateway_internal_tables`` porque el criterio es genuinamente
+    distinto. El diff pregunta "¿esto es esquema del usuario?" —y ninguna interna lo es—,
+    mientras que el export pregunta "¿esto tiene que sobrevivir a una restauración?", y para
+    el historial de migraciones la respuesta es sí.
+    """
+    return [n for n in names if not is_export_excluded_table(n)]
 
 
 def references_gateway_internal_table(sql: str) -> list[str]:

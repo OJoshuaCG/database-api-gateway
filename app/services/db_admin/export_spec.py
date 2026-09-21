@@ -47,7 +47,7 @@ from sqlglot import exp
 from app.exceptions import AppHttpException
 from app.services.db_admin import query_policy
 from app.services.db_admin.identifiers import (
-    is_gateway_internal_table,
+    is_export_excluded_table,
     quote_identifier,
 )
 from app.services.db_admin.sql_literals import BINARY_ENCODINGS
@@ -762,8 +762,11 @@ def resolve_selection(
     ]
     catalog_names = {o.name for o in typed}
 
-    internal = tuple(o.name for o in typed if is_gateway_internal_table(o.name))
-    candidates = [o for o in typed if not is_gateway_internal_table(o.name)]
+    # ``is_export_excluded_table`` y no ``is_gateway_internal_table``: el espejo del
+    # historial (``_datum_migrations``) es interno pero SÍ tiene que viajar con los datos.
+    # Un backup sin él no puede responder qué se le aplicó a esa base.
+    internal = tuple(o.name for o in typed if is_export_excluded_table(o.name))
+    candidates = [o for o in typed if not is_export_excluded_table(o.name)]
 
     mode = str(selection.mode)
     wanted = tuple(selection.names)
