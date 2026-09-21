@@ -270,6 +270,7 @@ class ManagedMigrationController:
             specs = self._load_specs(session, model.id)
             slug = model.slug
             db_name, model_id = md.name, model.id
+            cached_version = md.model_version
             engine = EngineType(engine_value(server))
             target = build_target(server)
         finally:
@@ -287,6 +288,32 @@ class ManagedMigrationController:
         # alcanzó a registrarla), así que sin este campo el estado se lee como sano y el
         # admin descubre el problema recién cuando el rollback se niega.
         incomplete = migration_progress.incomplete_progress_for_database(db_id, direction="up")
+        # Contabilidad HUÉRFANA. ``current is None`` es ambiguo: puede ser "la base está en
+        # cero" o "la tabla de versión existe con OTRO nombre y el gateway no la ve". La
+        # segunda no falla, no avisa, y hace que la cadena entera figure pendiente — es
+        # exactamente como un renombrado de slug terminó reaplicando desde la 0001 sobre
+        # bases que ya tenían el esquema.
+        #
+        # La sonda se dispara SOLO ante la firma del problema: el motor no reporta versión
+        # PERO el inventario tenía una registrada. Una BD genuinamente nueva tiene las dos en
+        # ``None`` y no paga ni una consulta de más, que es el caso común.
+        orphan_tables: list[str] = []
+        if current is None and database_exists and cached_version is not None:
+            try:
+                from app.services.db_admin.factory import get_adapter
+                from app.services.db_admin.identifiers import GATEWAY_TABLE_PREFIXES
+
+                prefijo = GATEWAY_TABLE_PREFIXES[0]
+                orphan_tables = [
+                    n
+                    for n in get_adapter(target).list_internal_tables(db_name)
+                    if n.startswith(prefijo)
+                ]
+            except AppHttpException:
+                # La sonda es un EXTRA de diagnóstico: que falle no puede tumbar el estado,
+                # que es la llamada con la que el operador decide qué hacer.
+                orphan_tables = []
+
         by_id = {s.id: s for s in specs}
         return {
             "managed_database_id": db_id,
@@ -297,6 +324,9 @@ class ManagedMigrationController:
             "latest_available": latest,
             "pending_count": len(pending),
             "pending_versions": [s.version for s in pending],
+            "cached_version": cached_version,
+            "orphan_version_tables": orphan_tables,
+            "has_orphan_accounting": bool(orphan_tables),
             "has_partial_application": bool(incomplete),
             "partial_application": [
                 self._partial_entry(by_id.get(row["model_migration_id"]), engine, row)

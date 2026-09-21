@@ -28,6 +28,7 @@ from app.schemas.database_model import (
     RenameSlugIn,
     RenameSlugOut,
     RenameSlugPlanOut,
+    VersionTablesReportOut,
 )
 from app.services import audit
 from app.services.capability_catalog import Capability
@@ -82,6 +83,40 @@ def update_model(actor: BlueprintsWrite, model_id: int, payload: DatabaseModelUp
         model_id, payload.model_dump(exclude_unset=True), admin=actor
     )
     return success(data=updated, message="Blueprint actualizado.")
+
+
+@router.get(
+    "/{model_id}/version-tables", response_model=ApiResponse[VersionTablesReportOut]
+)
+@limiter.limit("10/minute")
+def version_tables_report(request: Request, actor: BlueprintsRead, model_id: int):
+    """
+    Qué contabilidad de versiones tiene REALMENTE cada BD del blueprint. **Solo lectura.**
+
+    Existe porque una tabla de versión huérfana es INVISIBLE para el resto del gateway:
+    `get_current_version` lee un único nombre —el que predice el slug vigente— y si no está
+    devuelve `null`, que es indistinguible de "la base está en cero". Ese silencio es lo que
+    convierte un renombrado de slug en "todas las versiones pendientes" y habilita un `apply`
+    desde la primera versión sobre bases que ya tienen el esquema.
+
+    Cinco estados por base:
+
+    - `ok` — solo la tabla esperada. Nada que hacer.
+    - `orphaned` — **no** está la esperada pero sí otras. La versión real vive en una tabla
+      que el gateway ya no lee.
+    - `mixed` — está la esperada y además otras. El puntero es correcto; sobra basura.
+    - `none` — ninguna. Es lo normal en una base que nunca fue posicionada.
+    - `unreachable` — no se pudo leer. No se asume nada.
+
+    Abre una conexión por base, así que tiene rate limit propio aunque no escriba. Un motor
+    caído no rompe el informe: esa base sale `unreachable` y el resto se reporta igual.
+
+    **No corrige nada.** Mover un puntero es trabajo de `stamp`, y borrar una tabla huérfana
+    necesita acceso directo al motor: la consola SQL bloquea por diseño cualquier sentencia
+    que nombre `_gw_v_*`.
+    """
+    result = DatabaseModelController().version_tables_report(model_id)
+    return success(data=result, message="Informe de contabilidad de versiones.")
 
 
 @router.post(

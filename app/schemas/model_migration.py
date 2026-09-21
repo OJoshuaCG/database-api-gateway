@@ -302,6 +302,32 @@ class MigrationStatusOut(BaseModel):
     latest_available: str | None = None
     pending_count: int
     pending_versions: list[str]
+    cached_version: str | None = Field(
+        None,
+        description=(
+            "Lo que el inventario del gateway tiene registrado. Normalmente coincide con "
+            "'current_version'; si difiere, la caché está rancia o la BD se movió por fuera."
+        ),
+    )
+    orphan_version_tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Tablas de versión que existen en la BD pero que el gateway NO lee, porque su "
+            "nombre no corresponde al slug vigente del blueprint. Se sondea solo cuando el "
+            "motor no reporta versión y el inventario sí tenía una: esa combinación es la "
+            "firma de un slug renombrado sin propagar."
+        ),
+    )
+    has_orphan_accounting: bool = Field(
+        False,
+        description=(
+            "True si hay contabilidad huérfana. **'pending_versions' NO es de fiar con esto "
+            "en true**: la versión real vive en una tabla que el gateway no está leyendo, así "
+            "que la cadena figura entera pendiente sin estarlo. Aplicar acá reejecutaría "
+            "migraciones ya aplicadas. Diagnóstico completo en "
+            "GET /database-models/{model_id}/version-tables."
+        ),
+    )
     has_partial_application: bool = Field(
         False,
         description=(

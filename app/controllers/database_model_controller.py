@@ -325,6 +325,136 @@ class DatabaseModelController:
         return out
 
     # ------------------------------------------------------------------ #
+    # Diagnóstico: qué contabilidad de versiones hay REALMENTE en cada BD  #
+    # ------------------------------------------------------------------ #
+    #: La BD tiene exactamente la tabla que el slug vigente predice. Nada que hacer.
+    _VT_OK = "ok"
+    #: NO tiene la esperada pero SÍ otras ``_gw_v_*``. Es la firma del incidente: el gateway
+    #: lee un nombre que no existe, obtiene ``None`` y reporta la cadena ENTERA como
+    #: pendiente, en silencio. La versión real está en la huérfana.
+    _VT_ORPHANED = "orphaned"
+    #: Tiene la esperada Y además otras. Residuo de un renombrado o de una recuperación a
+    #: medias: el puntero vigente es correcto, pero hay basura que conviene limpiar.
+    _VT_MIXED = "mixed"
+    #: No tiene ninguna. Es lo NORMAL en una BD que nunca fue posicionada.
+    _VT_NONE = "none"
+    #: No se pudo leer. No se asume nada (fail-closed para cualquier decisión posterior).
+    _VT_UNREACHABLE = "unreachable"
+
+    def version_tables_report(self, model_id: int) -> dict:
+        """Qué tablas de versión tiene REALMENTE cada BD del blueprint. 🔌 Solo lectura.
+
+        Existe porque la contabilidad huérfana es INVISIBLE para el resto del gateway:
+        ``get_current_version`` lee un único nombre —el que predice el slug vigente— y si no
+        está devuelve ``None``, que es indistinguible de "la base está en cero". Ese silencio
+        es lo que convirtió un renombrado de slug en "todas las versiones pendientes" y en un
+        ``apply`` desde la 0001 sobre bases que ya tenían el esquema.
+
+        Este informe rompe ese silencio comparando lo que el gateway ESPERA contra lo que hay
+        en el motor. **No corrige nada**: mover un puntero es trabajo de ``stamp`` y borrar
+        una tabla necesita acceso directo, porque la consola SQL bloquea por diseño cualquier
+        sentencia que nombre ``_gw_v_*``.
+
+        Un motor caído no rompe el informe entero: esa BD sale como ``unreachable`` y el
+        resto se reporta igual. Fallar todo porque un servidor de doce está apagado haría
+        inútil la pantalla justo cuando más se necesita.
+        """
+        from app.controllers.common import build_target, get_server_or_404
+        from app.models.server import Server
+        from app.services.db_admin.factory import get_adapter
+        from app.services.db_admin.identifiers import GATEWAY_TABLE_PREFIXES
+        from app.services.db_admin.migrations import MigrationRunner, version_table_name
+
+        # El prefijo sale de la MISMA constante que usan el nombrado y la exclusión: si se
+        # escribiera a mano acá, este informe podría dejar de ver justo la tabla que busca.
+        prefijo_version = GATEWAY_TABLE_PREFIXES[0]
+
+        session = self._session()
+        try:
+            model = self._get_or_404(session, model_id)
+            slug = model.slug
+            filas = [
+                (md.id, md.name, md.server_id, md.model_version, srv.name)
+                for md, srv in session.query(ManagedDatabase, Server)
+                .join(Server, ManagedDatabase.server_id == Server.id)
+                .filter(ManagedDatabase.model_id == model_id)
+                .order_by(ManagedDatabase.id)
+                .all()
+            ]
+            targets = {}
+            for _id, _name, server_id, _mv, _sn in filas:
+                if server_id not in targets:
+                    targets[server_id] = build_target(get_server_or_404(session, server_id))
+        finally:
+            session.close()
+
+        esperada = version_table_name(slug)
+        runner = MigrationRunner()
+        items: list[dict] = []
+        for db_id, db_name, server_id, cached, server_name in filas:
+            item = {
+                "managed_database_id": db_id,
+                "database_name": db_name,
+                "server_id": server_id,
+                "server_name": server_name,
+                "expected_table": esperada,
+                "present_tables": [],
+                "orphan_tables": [],
+                "current_version": None,
+                "cached_version": cached,
+                "status": self._VT_UNREACHABLE,
+                "detail": None,
+            }
+            try:
+                presentes = get_adapter(targets[server_id]).list_internal_tables(db_name)
+            except AppHttpException as exc:
+                item["detail"] = getattr(exc, "message", "No se pudo leer la base.")
+                items.append(item)
+                continue
+
+            versiones = [n for n in presentes if n.startswith(prefijo_version)]
+            huerfanas = [n for n in versiones if n != esperada]
+            item["present_tables"] = presentes
+            item["orphan_tables"] = huerfanas
+
+            if esperada in versiones:
+                item["status"] = self._VT_MIXED if huerfanas else self._VT_OK
+                try:
+                    item["current_version"] = runner.get_current_version(
+                        targets[server_id], db_name, slug
+                    )
+                except AppHttpException:
+                    # La tabla está pero no se pudo leer. No se degrada a "ok": el veredicto
+                    # de este informe es la versión, no la existencia del archivo.
+                    item["status"] = self._VT_UNREACHABLE
+                    item["detail"] = "La tabla existe pero no se pudo leer su versión."
+            elif huerfanas:
+                item["status"] = self._VT_ORPHANED
+                item["detail"] = (
+                    "La versión real vive en una tabla que el gateway ya no lee. "
+                    "Todas las versiones figuran pendientes aunque no lo estén."
+                )
+            else:
+                item["status"] = self._VT_NONE
+            items.append(item)
+
+        resumen = {estado: 0 for estado in (
+            self._VT_OK, self._VT_ORPHANED, self._VT_MIXED,
+            self._VT_NONE, self._VT_UNREACHABLE,
+        )}
+        for it in items:
+            resumen[it["status"]] += 1
+
+        return {
+            "model_id": model_id,
+            "slug": slug,
+            "expected_table": esperada,
+            "databases": items,
+            "summary": resumen,
+            "needs_attention": resumen[self._VT_ORPHANED] + resumen[self._VT_MIXED] > 0,
+        }
+
+    # ------------------------------------------------------------------ #
     # Renombrado del slug, propagado a los motores                        #
     # ------------------------------------------------------------------ #
     #: Qué hay que hacer con cada BD del blueprint.

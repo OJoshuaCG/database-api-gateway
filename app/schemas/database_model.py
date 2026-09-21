@@ -42,6 +42,51 @@ class DatabaseModelUpdate(BaseModel):
     collation: str | None = Field(None, max_length=100, description=_COLLATION_DESC)
 
 
+class VersionTableDatabaseOut(BaseModel):
+    """Qué contabilidad de versiones tiene realmente UNA base del blueprint."""
+
+    managed_database_id: int
+    database_name: str
+    server_id: int
+    server_name: str | None = None
+    expected_table: str = Field(
+        ..., description="La tabla que el slug VIGENTE del blueprint predice."
+    )
+    present_tables: list[str] = Field(
+        default_factory=list, description="Tablas internas del gateway halladas en la base."
+    )
+    orphan_tables: list[str] = Field(
+        default_factory=list,
+        description="Tablas de versión que NO son la esperada. El gateway no las lee.",
+    )
+    current_version: str | None = Field(
+        None, description="Versión leída de la tabla esperada, si está presente."
+    )
+    cached_version: str | None = Field(
+        None,
+        description=(
+            "Lo que el inventario del gateway tiene registrado. Si difiere de "
+            "`current_version`, la caché está mintiendo."
+        ),
+    )
+    status: Literal["ok", "orphaned", "mixed", "none", "unreachable"]
+    detail: str | None = None
+
+
+class VersionTablesReportOut(BaseModel):
+    """Informe de contabilidad de versiones del blueprint. Solo lectura, no corrige nada."""
+
+    model_id: int
+    slug: str
+    expected_table: str
+    databases: list[VersionTableDatabaseOut]
+    summary: dict[str, int]
+    needs_attention: bool = Field(
+        ...,
+        description="Hay al menos una base `orphaned` o `mixed`: requiere intervención.",
+    )
+
+
 class RenameSlugIn(BaseModel):
     """Cuerpo del renombrado de slug. ``confirm_token`` sale del preview.
 
