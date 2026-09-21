@@ -1,4 +1,4 @@
-# database-api-gateway — Guía para Agentes de IA
+# Datum — Guía para Agentes de IA
 
 Gateway FastAPI que administra **servidores de bases de datos remotos** (MySQL/MariaDB/
 PostgreSQL) con credenciales pseudo-root: crea y migra bases, gestiona usuarios y permisos,
@@ -151,6 +151,15 @@ guard no usa `ScriptDirectory` están en el archivo de decisiones e incidentes.
 ---
 
 ## Trampas que cuestan un incidente
+
+**`Datum` es el NOMBRE; `gateway` es la COSA.** El producto se llama Datum; un *gateway* es
+lo que es. No reemplaces una palabra por la otra. Unas 600 de las menciones a "gateway" son
+justo la forma que desambigua los dos choques de abajo (*usuario del gateway* vs *usuario del
+motor*, *la BD del gateway* vs *la BD destino*), y "la BD del Datum" los vuelve a juntar.
+Datum va solo donde el producto se presenta a una persona: `APP_NAME`, título de Swagger,
+portada del README y de los docs. Los prefijos físicos `_gw_v_`/`_gw_stg_` **no se tocan**:
+son nombres de tablas que ya existen dentro de bases de datos de terceros, y renombrarlos es
+una escritura remota sobre N bases, no un refactor.
 
 **Hay DOS cosas llamadas "environment".** `app/core/environments.py` es la config del PROCESO
 (`APP_ENV`) y gobierna seguridad real del gateway (flag `Secure` de la cookie, exigencia de
