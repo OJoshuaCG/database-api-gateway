@@ -40,6 +40,8 @@ from app.models.enums import EngineType, MigrationStatus, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
+from app.core.actor import identity_of
+from app.core.context import current_http_identifier
 from app.services import audit
 from app.services import environment_catalog as ecodes
 from app.services import migration_capture_catalog as ccodes
@@ -1150,7 +1152,7 @@ class ManagedMigrationController:
             )
             raise
 
-        self._record_history(db_id, results)
+        self._record_history(db_id, results, direction="up", specs=specs, admin=admin)
         failed = any(r.status == "failed" for r in results)
 
         # Auto-protección: si quedó una aplicación PARCIAL (solo posible en MySQL/MariaDB,
@@ -1531,7 +1533,7 @@ class ManagedMigrationController:
             target, db_name=db_name, slug=slug, engine=engine,
             managed_db_id=db_id, specs=specs, to_version=dest,
         )
-        self._record_history(db_id, results)
+        self._record_history(db_id, results, direction="down", specs=path, admin=admin)
         # La versión tras el rollback se RE-LEE del motor (fuente de verdad) y se
         # sincroniza en el inventario del gateway.
         new_current = self.runner.get_current_version(target, db_name, slug)
@@ -2384,11 +2386,20 @@ class ManagedMigrationController:
                     "id": h.id,
                     "managed_database_id": h.managed_database_id,
                     "model_migration_id": h.model_migration_id,
-                    "version": version,
+                    # La CONGELADA gana sobre la del join: el join resuelve la versión
+                    # ACTUAL, que un renumerado pudo haber movido después del evento. El
+                    # fallback cubre las filas previas a la columna.
+                    "version": h.applied_version or version,
                     "applied_at": h.applied_at,
                     "status": h.status.value if hasattr(h.status, "value") else h.status,
                     "error": h.error,
                     "execution_ms": h.execution_ms,
+                    "direction": h.direction,
+                    "applied_checksum": h.applied_checksum,
+                    "actor_type": h.actor_type,
+                    "actor_id": h.actor_id,
+                    "actor_username": h.actor_username,
+                    "request_id": h.request_id,
                 }
                 for h, version in rows
             ]
@@ -2399,9 +2410,38 @@ class ManagedMigrationController:
     # ------------------------------------------------------------------ #
     # Persistencia de resultados                                          #
     # ------------------------------------------------------------------ #
-    def _record_history(self, db_id: int, results: list[MigrationResult]) -> None:
+    def _record_history(
+        self,
+        db_id: int,
+        results: list[MigrationResult],
+        *,
+        direction: str,
+        specs: "list[MigrationSpec] | None" = None,
+        admin: "dict | Actor | None" = None,
+    ) -> None:
+        """Escribe el historial del intento. ``direction`` es obligatorio a propósito.
+
+        Este método se llama desde ``apply`` y desde ``rollback``, y durante mucho tiempo no
+        registró de cuál: una fila ``applied`` de un rollback quedaba indistinguible de un
+        apply. Hacer el parámetro OBLIGATORIO —y no un default ``"up"``— es lo que impide que
+        un camino nuevo vuelva a escribir historial sin dirección y reintroduzca el agujero en
+        silencio.
+
+        ``applied_version`` y ``applied_checksum`` se congelan acá: la FK a ``model_migrations``
+        resuelve la versión ACTUAL (que un renumerado mueve) y el checksum VIGENTE (que una
+        edición recalcula), así que ninguno de los dos sirve para saber qué corrió realmente.
+        """
         if not results:
             return
+        checksums = {s.id: s.checksum for s in (specs or [])}
+        actor_id, actor_username = identity_of(admin)
+        # La CLASE de actor sale del propio actor y no de un parámetro: mismo criterio que
+        # ``audit._build``. Un dict legado o ``None`` son "admin", que es la verdad histórica.
+        actor_type = getattr(admin, "kind", None) or "admin"
+        try:
+            request_id = current_http_identifier.get()
+        except LookupError:
+            request_id = None
         session = self._session()
         try:
             for r in results:
@@ -2413,6 +2453,13 @@ class ManagedMigrationController:
                         status=MigrationStatus(r.status),
                         error=r.error,
                         execution_ms=r.execution_ms,
+                        direction=direction,
+                        applied_version=r.version,
+                        applied_checksum=checksums.get(r.migration_id),
+                        actor_type=actor_type,
+                        actor_id=actor_id,
+                        actor_username=actor_username,
+                        request_id=request_id,
                     )
                 )
             session.commit()

@@ -653,12 +653,45 @@ class MigrationHistoryOut(BaseModel):
 
     id: int
     managed_database_id: int
-    model_migration_id: int
-    version: str | None = None  # versión de la migración (join), si existe
+    model_migration_id: int | None = Field(
+        None,
+        description=(
+            "NULL si la versión se borró del blueprint. El evento sobrevive: la FK es "
+            "ON DELETE SET NULL, no CASCADE."
+        ),
+    )
+    version: str | None = Field(
+        None,
+        description=(
+            "Versión del evento. Sale de 'applied_version' (congelada al momento del "
+            "intento); para filas previas a esa columna cae al join con model_migrations, y "
+            "ahí muestra la versión ACTUAL, que un renumerado pudo haber movido."
+        ),
+    )
     applied_at: datetime
     status: str
     error: str | None = None
     execution_ms: int | None = None
+    direction: str | None = Field(
+        None,
+        description=(
+            "'up' (apply) | 'down' (rollback). NULL en filas previas a esta columna: ahí un "
+            "'applied' es ambiguo y NO prueba que la versión siga vigente."
+        ),
+    )
+    applied_checksum: str | None = Field(
+        None,
+        description=(
+            "Checksum del SQL que REALMENTE corrió. Si difiere del checksum vigente de la "
+            "migración, esa versión se editó después de aplicarse en esta base."
+        ),
+    )
+    actor_type: str | None = None
+    actor_id: int | None = None
+    actor_username: str | None = None
+    request_id: str | None = Field(
+        None, description="Correlaciona con audit_log y con los logs HTTP."
+    )
 
 
 class ApplyAllItemOut(BaseModel):
