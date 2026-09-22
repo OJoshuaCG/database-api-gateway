@@ -1020,7 +1020,6 @@ class DatabaseModelController:
                         "failed": it,
                         "renamed": hechas,
                         "not_compensated": no_compensadas,
-                        "new_table_target": tabla_nueva,
                         "new_table": tabla_nueva,
                     },
                     context={"model_id": model_id},
