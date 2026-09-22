@@ -722,9 +722,22 @@ class ServerAdapter(ABC):
         validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         old_q = quote_identifier(old, self.dialect)
         new_q = quote_identifier(new, self.dialect)
+        propia = conn is None
         try:
-            with self._conn_ctx(database, conn) as conn:
-                conn.exec_driver_sql(f"ALTER TABLE {old_q} RENAME TO {new_q}")
+            with self._conn_ctx(database, conn) as c:
+                c.exec_driver_sql(f"ALTER TABLE {old_q} RENAME TO {new_q}")
+                # **El commit no es opcional en PostgreSQL.** ``_conn_ctx`` está pensado para
+                # LEER el catálogo: abre una conexión y la cierra, sin commitear. En MySQL no
+                # se nota porque el DDL hace commit implícito; en PostgreSQL el ``RENAME``
+                # queda dentro de una transacción que se descarta al cerrar. El rename "salía
+                # bien" y no pasaba nada — y el renombrado de slug actualizaba el slug del
+                # gateway encima, dejándolo apuntando a una tabla inexistente: el incidente
+                # original, reproducido en PostgreSQL. Detectado corriendo contra PG 17 real.
+                #
+                # Solo se commitea la conexión PROPIA: si la dio el llamador, su transacción
+                # es suya, que es el mismo invariante que ``_conn_ctx`` ya declara.
+                if propia and c.in_transaction():
+                    c.commit()
         except SQLAlchemyError as exc:
             raise map_driver_error(
                 exc,
