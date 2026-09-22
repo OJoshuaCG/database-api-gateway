@@ -10,6 +10,52 @@ capacidades, la fuente sigue siendo v23.
 
 ---
 
+## Δ Actualización: lo que cambió DESPUÉS de la primera publicación de este addendum
+
+El frontend ya implementó la primera versión de v25 (`main`, `3e32ff1`). Esta sección es el
+**delta** contra esa versión: lo que todavía no tiene. El resto del documento ya está
+actualizado en su lugar.
+
+### 🔴 Rompe el parseo: `action` gana un quinto valor, `already`
+
+`renameSlugActionSchema` está declarado hoy como `z.enum(['rename', 'skip', 'conflict',
+'unreachable'])`. El backend ahora puede devolver **`already`**, y un valor fuera de un
+`z.enum` **no se strippea: descarta el plan entero**.
+
+```ts
+export const renameSlugActionSchema = z.enum(['rename', 'skip', 'already', 'conflict', 'unreachable'])
+```
+
+`already` = la base **ya tiene** la tabla destino y no tiene la de origen. No hay nada que
+hacer y **no bloquea**. En el renombrado de slug es raro; en la migración de prefijo (§2.3)
+es **el caso normal** de toda base ya migrada. Es el único cambio de esta actualización que
+rompe algo, y va antes de desplegar el backend.
+
+### Campos nuevos (todos `.nullish()`, se strippean sin romper)
+
+| Dónde | Campo | Qué es |
+|---|---|---|
+| Cada ítem de `databases` del plan | `source_table` | La tabla a renombrar **en esa base**. Puede ser `_gw_v_…` o `_datum_version_…`: se resuelve por base |
+| Cada ítem de `databases` del plan | `has_mirror` | Si la base ya tiene `_datum_migrations`. `null` = ilegible |
+| Plan | `mirror_table`, `mirror_pending_count` | Cuántas bases quedan sin espejo |
+| Plan | `prefix_only` | `true` en la migración de prefijo (§2.3) |
+| Resultado de `rename-slug` y `migrate-version-table` | `mirror` | `{created, failed, skipped_disabled}`. Ver §2.2 |
+
+### Dos endpoints nuevos
+
+`POST /database-models/{id}/migrate-version-table/plan` y
+`POST /database-models/{id}/migrate-version-table`. Ver §2.3. **Es el botón de "actualizar al
+formato Datum"** y hoy no tiene ninguna referencia en el frontend.
+
+### Cambió el nombre de las tablas: prefijo `_datum_`
+
+Los ejemplos con `_gw_v_…` de la primera versión quedaron viejos. Ver §8. Lo que importa para
+la UI: **no hay que asumir ningún prefijo**. Usá siempre el nombre que devuelve el backend
+(`new_table`, `source_table`, `expected_table`), porque dentro de un mismo blueprint conviven
+bases con los dos.
+
+---
+
 ## 0. Lo que ordena todo: dos campos cambian de TIPO 🔴
 
 > **Corrección sobre addendums anteriores.** v24 y sus predecesores dicen que la SPA hace
@@ -107,16 +153,21 @@ que tiene rate limit propio (10/min) aunque sea una lectura.
   "model_id": 19,
   "current_slug": "production_db",
   "new_slug": "facturacion",
-  "current_table": "_gw_v_production_db",
-  "new_table": "_gw_v_facturacion",
+  "current_table": "_datum_version_production_db",
+  "new_table": "_datum_version_facturacion",
   "no_op": false,
   "databases": [
     { "managed_database_id": 7, "database_name": "tienda_42", "server_id": 3,
-      "server_name": "mysql-prod-1", "action": "rename", "detail": null },
+      "server_name": "mysql-prod-1", "action": "rename",
+      "source_table": "_gw_v_production_db", "has_mirror": false, "detail": null },
     { "managed_database_id": 8, "database_name": "tienda_43", "server_id": 3,
-      "server_name": "mysql-prod-1", "action": "skip", "detail": null }
+      "server_name": "mysql-prod-1", "action": "skip",
+      "source_table": null, "has_mirror": true, "detail": null }
   ],
   "rename_count": 1,
+  "mirror_table": "_datum_migrations",
+  "mirror_pending_count": 1,
+  "prefix_only": false,
   "blockers": [],
   "requires_confirmation": true,
   "confirm_token": "1790000000.9f2a…",
@@ -125,14 +176,19 @@ que tiene rate limit propio (10/min) aunque sea una lectura.
 }
 ```
 
-`action` es un enum cerrado de cuatro valores:
+`action` es un enum cerrado de **cinco** valores:
 
 | Valor | Significa | ¿Bloquea? |
 |---|---|---|
-| `rename` | Tiene la tabla vieja y el nombre nuevo está libre | No |
+| `rename` | Tiene la tabla de origen y el destino está libre | No |
 | `skip` | Nunca fue posicionada: no hay tabla que renombrar | No |
-| `conflict` | El nombre **destino** ya existe en esa base | **Sí** |
+| `already` | **Ya tiene el destino** y no el origen. Nada que hacer | No |
+| `conflict` | **Conviven las dos** tablas: no se puede decidir cuál es el puntero bueno | **Sí** |
 | `unreachable` | No se pudo leer la base | **Sí** |
+
+`source_table` viene **por base**, y no es un detalle: dentro de un mismo blueprint puede
+haber bases con el prefijo histórico `_gw_v_` y otras con el vigente `_datum_version_`. Si la
+UI muestra "qué se va a renombrar", tiene que mostrar el de cada fila.
 
 **Los dos bloqueantes abortan la operación entera, no solo esa base.** El gateway apunta a UN
 nombre, así que dejar medio parque renombrado deja a la otra mitad con su contabilidad huérfana.
@@ -157,9 +213,16 @@ falta entrena al cliente a mandarlo siempre.
 {
   "model": { /* DatabaseModelOut con el slug nuevo */ },
   "renamed_databases": [ /* los items con action="rename" que sí se renombraron */ ],
-  "no_op": false
+  "no_op": false,
+  "mirror": { "created": [ /* ítems */ ], "failed": [], "skipped_disabled": false }
 }
 ```
+
+**`mirror`**: además de renombrar, la operación crea la tabla espejo `_datum_migrations` en
+las bases donde falte (§8). Un fallo acá **no aborta** la operación, pero **sí se reporta** en
+`mirror.failed`: la UI tiene que mostrarlo, porque sin eso el operador cree que el parque
+quedó uniforme. `skipped_disabled: true` significa que el espejo está apagado por
+`MIGRATION_MIRROR_ENABLED` en el backend.
 
 Rate limit 3/min. El plan se **recalcula desde cero** en la ejecución: el token no transporta el
 plan, solo prueba que el estado del parque no cambió desde el preview.
@@ -167,6 +230,35 @@ plan, solo prueba que el estado del parque no cambió desde el preview.
 **El orden interno importa y conviene que la UI lo explique**: primero los N renames remotos, y
 el slug del gateway se actualiza **último**. Si algo falla a mitad, se compensa renombrando de
 vuelta y **el slug no se modifica**.
+
+---
+
+### 2.3 Migrar al formato Datum: `migrate-version-table` (el botón de "actualizar")
+
+```
+POST /api/v1/database-models/{model_id}/migrate-version-table/plan     (sin cuerpo)
+POST /api/v1/database-models/{model_id}/migrate-version-table          { "confirm_token": "…" }
+```
+
+Moderniza las bases del blueprint al formato vigente **sin cambiar el slug**: renombra
+`_gw_v_{slug}` → `_datum_version_{slug}` y crea `_datum_migrations` donde falte.
+
+Es **la misma operación** que el renombrado de slug con el slug igual a sí mismo, así que
+devuelve **exactamente los mismos schemas** (`RenameSlugPlanOut` y `RenameSlugOut`), con
+`prefix_only: true` en el plan. La UI puede reusar el diálogo de dos pasos del renombrado.
+
+Tres cosas que la UI tiene que saber:
+
+- **Es opcional.** Una base con el prefijo histórico sigue funcionando indefinidamente: el
+  backend resuelve el nombre por base. No hay que presentarlo como una migración obligatoria
+  ni como un error pendiente.
+- **`already` es el caso normal.** Toda base ya migrada sale así. Una segunda corrida sobre un
+  blueprint ya migrado es un plan con todo en `already`, `rename_count: 0` y sin token — y no
+  hay que mostrarlo como fallo.
+- **El parque se moderniza solo con el uso** (§8): cada apply, rollback o stamp moderniza la
+  base que toca. El botón sirve para no esperar.
+
+Rate limit: 10/min el plan, 3/min la ejecución.
 
 ---
 
@@ -179,12 +271,12 @@ Solo lectura. Compara, base por base, lo que el gateway **espera** contra lo que
 {
   "model_id": 19,
   "slug": "production_db",
-  "expected_table": "_gw_v_production_db",
+  "expected_table": "_datum_version_production_db",
   "databases": [
     {
       "managed_database_id": 7, "database_name": "tienda_42",
       "server_id": 3, "server_name": "mysql-prod-1",
-      "expected_table": "_gw_v_production_db",
+      "expected_table": "_datum_version_production_db",
       "present_tables": ["_gw_v_test_db"],
       "orphan_tables": [
         { "table": "_gw_v_test_db", "version": "0012" }
@@ -335,3 +427,36 @@ códigos. Los siete que faltaban son los del borrado con renumerado —`version_
 `renumber_stamp_failed`, `renumber_target_missing`, `affected_partial_application`—. **Siempre se
 emitieron correctamente**; lo que estaba mal era el catálogo. Si el cliente los tenía como
 desconocidos, ya se pueden mapear.
+
+---
+
+## 8. El formato de tablas `_datum_` dentro de cada base
+
+Dos tablas de contabilidad del gateway viven **dentro de cada BD gestionada**. Ninguna es
+esquema del usuario: el diff, el snapshot y el clon las excluyen.
+
+| Tabla | Qué es | Nombre |
+|---|---|---|
+| `_datum_version_{slug}` | El puntero de versión de Alembic. Una fila | Antes `_gw_v_{slug}` |
+| `_datum_migrations` | **Espejo** del historial de migraciones, con el blueprint como columna | Fijo, sin slug |
+
+**El prefijo histórico `_gw_v_` sigue soportado para siempre.** El backend no asume un
+nombre: lo resuelve contra cada base. Una base vieja funciona con su `_gw_v_`, una base nueva
+nace con `_datum_version_`.
+
+**Cuándo una base pasa al formato nuevo**, sin que nadie haga nada:
+
+- una base **nueva** nace con el formato nuevo en su primera migración;
+- **cada apply, rollback o stamp** moderniza la base que toca (renombra `_gw_v_` → `_datum_`
+  y crea el espejo si falta). El `dry_run` **no**: un ensayo no escribe;
+- `rename-slug` y `migrate-version-table` (§2) dejan la base en el formato completo.
+
+**El espejo `_datum_migrations` es un espejo, no la fuente de verdad.** Se escribe fail-open:
+si falla, la migración sigue, así que **puede tener huecos**. La autoridad es el historial del
+gateway (`GET …/migrations/history`, §5). La UI no debe leerlo ni presentarlo como historial
+completo. Existe para que la base se explique a sí misma cuando el gateway no está — un backup
+restaurado en otro lado, por ejemplo — y por eso **sí viaja en el export**, a diferencia del
+puntero de versión.
+
+`MIGRATION_MIRROR_ENABLED` (backend, default `true`) apaga el espejo sin desplegar código.
+
