@@ -62,95 +62,133 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 _TABLE = "database_migration_history"
+
+#: Nombre LÓGICO de la FK según la convención del modelo. **Nunca se usa para buscarla**: tiene
+#: 65 caracteres, más que el límite de MySQL/MariaDB (64) y de PostgreSQL (63), así que cada
+#: motor guardó una versión TRUNCADA con sufijo hash (en MariaDB,
+#: ``fk_database_migration_history_model_migration_id_model_m_be07``). La primera versión de
+#: esta migración hacía ``drop_constraint`` con el nombre largo y producción quedó en loop de
+#: reinicios con ``(1091, "Can't DROP FOREIGN KEY ...; check that it exists")``. La FK se
+#: DESCUBRE por introspección; este nombre solo se pasa por ``op.f`` al crearla de cero, que es
+#: el camino que sí trunca igual que la migración original.
 _FK_MIGRATION = "fk_database_migration_history_model_migration_id_model_migrations"
 
 
-def upgrade() -> None:
-    op.add_column(
-        _TABLE,
+def _columnas_nuevas() -> list[sa.Column]:
+    return [
         sa.Column(
             "direction",
             sa.String(length=4),
             nullable=True,
             comment="'up' (apply) | 'down' (rollback). NULL en filas previas a esta columna",
         ),
-    )
-    op.add_column(
-        _TABLE,
         sa.Column(
             "applied_version",
             sa.String(length=10),
             nullable=True,
             comment="Versión al momento del intento (congelada: el renumerado no la mueve)",
         ),
-    )
-    op.add_column(
-        _TABLE,
         sa.Column(
             "applied_checksum",
             sa.String(length=64),
             nullable=True,
             comment="Checksum del SQL que REALMENTE corrió, no el vigente de la definición",
         ),
-    )
-    op.add_column(
-        _TABLE,
         sa.Column(
             "actor_type",
             sa.String(length=16),
             nullable=True,
             comment="'admin' | 'api_token'. NULL en filas previas a esta columna",
         ),
-    )
-    op.add_column(
-        _TABLE,
         sa.Column(
             "actor_id",
             sa.Integer(),
             nullable=True,
             comment="ID del admin o del token que ejecutó (sin FK: el actor puede borrarse)",
         ),
-    )
-    op.add_column(
-        _TABLE,
         sa.Column(
             "actor_username",
             sa.String(length=128),
             nullable=True,
             comment="Nombre del actor al momento del intento (desnormalizado a propósito)",
         ),
-    )
-    op.add_column(
-        _TABLE,
         sa.Column(
             "request_id",
             sa.String(length=32),
             nullable=True,
             comment="Request ID: une con audit_log y con los logs HTTP sin depender de FKs",
         ),
-    )
+    ]
 
-    # SET NULL exige que la columna admita NULL. El orden importa: primero se afloja la
-    # columna, después se rehace la FK. Al revés, MySQL rechaza la FK por incompatibilidad.
-    op.alter_column(
-        _TABLE,
-        "model_migration_id",
-        existing_type=sa.Integer(),
-        nullable=True,
-        comment=(
-            "Migración aplicada/revertida. NULL si la versión se borró del blueprint: el "
-            "evento histórico sobrevive en applied_version/applied_checksum"
-        ),
-    )
-    op.drop_constraint(_FK_MIGRATION, _TABLE, type_="foreignkey")
-    op.create_foreign_key(
-        _FK_MIGRATION,
-        _TABLE,
-        "model_migrations",
-        ["model_migration_id"],
-        ["id"],
-        ondelete="SET NULL",
-    )
+
+def _columnas(bind) -> dict[str, dict]:
+    # Inspector NUEVO en cada llamada: el inspector cachea, y entre pasos de esta misma
+    # migración el esquema cambia.
+    return {c["name"]: c for c in sa.inspect(bind).get_columns(_TABLE)}
+
+
+def _fk_a_model_migrations(bind) -> dict | None:
+    """La FK REAL de ``model_migration_id`` → ``model_migrations``, con el nombre que tenga."""
+    for fk in sa.inspect(bind).get_foreign_keys(_TABLE):
+        if fk.get("referred_table") == "model_migrations" and fk.get(
+            "constrained_columns"
+        ) == ["model_migration_id"]:
+            return fk
+    return None
+
+
+def _ondelete(fk: dict) -> str:
+    return str((fk.get("options") or {}).get("ondelete") or "").upper()
+
+
+def upgrade() -> None:
+    # **Idempotente paso a paso, y no es prolijidad.** MySQL/MariaDB no tienen DDL
+    # transaccional: si esta migración muere a mitad, lo que ya corrió queda aplicado y
+    # ``alembic_version`` sigue en la revisión anterior, así que el próximo arranque la corre
+    # entera otra vez. Sin estos chequeos, el reintento choca con lo que el intento anterior ya
+    # hizo (``Duplicate column name``) y el contenedor queda en loop. Cada paso pregunta el
+    # estado real antes de actuar, así que retoma desde donde haya quedado.
+    bind = op.get_bind()
+
+    existentes = _columnas(bind)
+    for columna in _columnas_nuevas():
+        if columna.name not in existentes:
+            op.add_column(_TABLE, columna)
+
+    # Orden seguro en cualquier motor: soltar la FK, aflojar la columna, recrear la FK.
+    # Modificar una columna mientras la cubre una FK es lo que MySQL 8 rechaza con 1832.
+    fk = _fk_a_model_migrations(bind)
+    if fk is not None and _ondelete(fk) == "SET NULL":
+        nombre_fk = None  # ya está como se quiere: no se toca
+    else:
+        nombre_fk = fk["name"] if fk is not None else None
+        if fk is not None:
+            op.drop_constraint(fk["name"], _TABLE, type_="foreignkey")
+
+    if not _columnas(bind)["model_migration_id"]["nullable"]:
+        op.alter_column(
+            _TABLE,
+            "model_migration_id",
+            existing_type=sa.Integer(),
+            nullable=True,
+            comment=(
+                "Migración aplicada/revertida. NULL si la versión se borró del blueprint: el "
+                "evento histórico sobrevive en applied_version/applied_checksum"
+            ),
+        )
+
+    if _fk_a_model_migrations(bind) is None:
+        # Se recrea con el MISMO nombre que tenía, así el esquema no cambia de identidad. Si
+        # no había ninguna (un intento anterior la soltó y murió), ``op.f`` produce el mismo
+        # nombre truncado que la migración que la creó originalmente.
+        op.create_foreign_key(
+            nombre_fk or op.f(_FK_MIGRATION),
+            _TABLE,
+            "model_migrations",
+            ["model_migration_id"],
+            ["id"],
+            ondelete="SET NULL",
+        )
 
 
 def downgrade() -> None:
@@ -158,30 +196,33 @@ def downgrade() -> None:
     # model_migration_id NULL viola el NOT NULL, así que hay que descartarla antes. Son
     # exactamente las que sobrevivieron al borrado de su versión — el dato que esta migración
     # existe para conservar.
-    op.execute(f"DELETE FROM {_TABLE} WHERE model_migration_id IS NULL")
-    op.drop_constraint(_FK_MIGRATION, _TABLE, type_="foreignkey")
-    op.alter_column(
-        _TABLE,
-        "model_migration_id",
-        existing_type=sa.Integer(),
-        nullable=False,
-        comment="Migración aplicada/revertida",
-    )
+    bind = op.get_bind()
+    op.execute(sa.text(f"DELETE FROM {_TABLE} WHERE model_migration_id IS NULL"))
+
+    fk = _fk_a_model_migrations(bind)
+    nombre_fk = fk["name"] if fk is not None else None
+    if fk is not None:
+        op.drop_constraint(fk["name"], _TABLE, type_="foreignkey")
+
+    if _columnas(bind)["model_migration_id"]["nullable"]:
+        op.alter_column(
+            _TABLE,
+            "model_migration_id",
+            existing_type=sa.Integer(),
+            nullable=False,
+            comment="Migración aplicada/revertida",
+        )
+
     op.create_foreign_key(
-        _FK_MIGRATION,
+        nombre_fk or op.f(_FK_MIGRATION),
         _TABLE,
         "model_migrations",
         ["model_migration_id"],
         ["id"],
         ondelete="CASCADE",
     )
-    for columna in (
-        "request_id",
-        "actor_username",
-        "actor_id",
-        "actor_type",
-        "applied_checksum",
-        "applied_version",
-        "direction",
-    ):
-        op.drop_column(_TABLE, columna)
+
+    existentes = _columnas(bind)
+    for columna in reversed(_columnas_nuevas()):
+        if columna.name in existentes:
+            op.drop_column(_TABLE, columna.name)
