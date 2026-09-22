@@ -553,7 +553,12 @@ class DatabaseModelController:
         finally:
             session.close()
         return self.rename_slug(
-            model_id, slug, confirm_token=confirm_token, admin=admin, _same_slug_ok=True
+            model_id,
+            slug,
+            confirm_token=confirm_token,
+            admin=admin,
+            _same_slug_ok=True,
+            _provision_mirror=True,
         )
 
     def rename_slug_plan(
@@ -567,6 +572,8 @@ class DatabaseModelController:
         """
         from app.controllers.common import build_target, get_server_or_404
         from app.services.db_admin.factory import get_adapter
+        from app.core.remote_engine import database_connection
+        from app.services.db_admin import migration_mirror
         from app.services.db_admin.migrations import (
             legacy_version_table_name,
             version_table_name,
@@ -643,18 +650,32 @@ class DatabaseModelController:
                 "server_id": server_id,
                 "server_name": nombres_servidor.get(server_id),
                 "action": self._RN_SKIP,
+                "has_mirror": None,
                 "detail": None,
             }
             if no_op:
                 items.append(item)
                 continue
             try:
+                # UNA conexión por base para los tres chequeos. Antes abría una por cada
+                # ``internal_table_exists``, o sea hasta cuatro por base contra motores de
+                # producción, y solo para decidir un preview.
                 adapter = get_adapter(targets[server_id])
-                origen = next(
-                    (o for o in origenes if adapter.internal_table_exists(db_name, o)),
-                    None,
-                )
-                tiene_nueva = adapter.internal_table_exists(db_name, tabla_nueva)
+                with database_connection(targets[server_id], db_name) as conn:
+                    origen = next(
+                        (
+                            o
+                            for o in origenes
+                            if adapter.internal_table_exists(db_name, o, conn=conn)
+                        ),
+                        None,
+                    )
+                    tiene_nueva = adapter.internal_table_exists(
+                        db_name, tabla_nueva, conn=conn
+                    )
+                    item["has_mirror"] = adapter.internal_table_exists(
+                        db_name, migration_mirror.MIRROR_TABLE, conn=conn
+                    )
             except AppHttpException as exc:
                 item["action"] = self._RN_UNREACHABLE
                 item["detail"] = getattr(exc, "message", "No se pudo leer la base.")
@@ -690,6 +711,10 @@ class DatabaseModelController:
             "no_op": no_op,
             "databases": items,
             "rename_count": len(a_renombrar),
+            "mirror_table": migration_mirror.MIRROR_TABLE,
+            "mirror_pending_count": sum(
+                1 for i in items if i.get("has_mirror") is False
+            ),
             "blockers": bloqueantes,
             "requires_confirmation": bool(a_renombrar) and not bloqueantes,
             "confirm_token": None,
@@ -793,6 +818,60 @@ class DatabaseModelController:
                 quedaron.append(it)
         return quedaron
 
+    def _provision_mirrors(self, plan: dict) -> dict:
+        """Crea ``_datum_migrations`` donde falte. Idempotente y NO destructivo. 🔌
+
+        Va DESPUÉS de la fase de renombrado y fuera de su compensación a propósito: crear una
+        tabla vacía no rompe nada y deshacerlo no repara nada, así que meterla en el camino
+        que se compensa solo agregaría un modo de fallo.
+
+        Tampoco aborta la operación si falla en alguna base. Pero **sí lo reporta**: el
+        espejo se escribe fail-open durante un apply —ahí la migración manda—, mientras que
+        acá crearlo ES lo que se pidió, y un fallo silencioso dejaría al operador creyendo que
+        el parque quedó uniforme.
+
+        Se saltean las bases ilegibles (``has_mirror`` en ``None``): no se pudo comprobar nada
+        de ellas en el preview, así que no se les escribe a ciegas.
+        """
+        from app.controllers.common import build_target, engine_value, get_server_or_404
+        from app.core.environments import MIGRATION_MIRROR_ENABLED
+        from app.core.remote_engine import database_connection
+        from app.models.enums import EngineType
+        from app.services.db_admin import migration_mirror
+
+        faltantes = [i for i in plan["databases"] if i.get("has_mirror") is False]
+        if not faltantes or not MIGRATION_MIRROR_ENABLED:
+            return {"created": [], "failed": [], "skipped_disabled": bool(faltantes)}
+
+        session = self._session()
+        try:
+            targets, engines = {}, {}
+            for it in faltantes:
+                sid = it["server_id"]
+                if sid not in targets:
+                    server = get_server_or_404(session, sid)
+                    targets[sid] = build_target(server)
+                    engines[sid] = EngineType(engine_value(server))
+        finally:
+            session.close()
+
+        creadas, fallidas = [], []
+        for it in faltantes:
+            sid = it["server_id"]
+            try:
+                with database_connection(targets[sid], it["database_name"]) as conn:
+                    migration_mirror.ensure_table(
+                        conn.execution_options(isolation_level="AUTOCOMMIT"), engines[sid]
+                    )
+                creadas.append(it)
+            except Exception:  # noqa: BLE001 — se reporta, no aborta
+                logger.exception(
+                    "no se pudo crear el espejo en la BD %s (%s)",
+                    it["managed_database_id"], it["database_name"],
+                )
+                fallidas.append(it)
+        return {"created": creadas, "failed": fallidas, "skipped_disabled": False}
+
     def rename_slug(
         self,
         model_id: int,
@@ -801,6 +880,7 @@ class DatabaseModelController:
         confirm_token: str | None = None,
         admin: "dict | Actor | None" = None,
         _same_slug_ok: bool = False,
+        _provision_mirror: bool = False,
     ) -> dict:
         """Cambia el ``slug`` del blueprint y propaga el rename de su tabla de versión. 🔌
 
@@ -969,7 +1049,13 @@ class DatabaseModelController:
                 f"a {tabla_nueva}"
             ),
         )
-        return {"model": resultado, "renamed_databases": hechas, "no_op": plan["no_op"]}
+        espejo = self._provision_mirrors(plan) if _provision_mirror else None
+        return {
+            "model": resultado,
+            "renamed_databases": hechas,
+            "no_op": plan["no_op"],
+            "mirror": espejo,
+        }
 
     # ------------------------------------------------------------------ #
     # Deriva de charset/collation contra la declaración del blueprint     #

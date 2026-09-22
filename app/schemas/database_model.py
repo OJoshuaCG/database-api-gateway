@@ -149,7 +149,32 @@ class RenameSlugDatabaseOut(BaseModel):
             "vigente. Solo viene cuando `action` es `rename`."
         ),
     )
+    has_mirror: bool | None = Field(
+        None,
+        description=(
+            "Si la base ya tiene la tabla espejo del historial. `null` = no se pudo "
+            "comprobar (base ilegible), y esas no se tocan."
+        ),
+    )
     detail: str | None = None
+
+
+class MirrorProvisionOut(BaseModel):
+    """Resultado de crear la tabla espejo donde faltaba."""
+
+    created: list[RenameSlugDatabaseOut] = Field(default_factory=list)
+    failed: list[RenameSlugDatabaseOut] = Field(
+        default_factory=list,
+        description=(
+            "Bases donde no se pudo crear. **No aborta la operación**, pero se reporta: "
+            "crear el espejo es lo que se pidió acá, y un fallo silencioso dejaría creyendo "
+            "que el parque quedó uniforme."
+        ),
+    )
+    skipped_disabled: bool = Field(
+        False,
+        description="Faltaba en alguna base pero `MIGRATION_MIRROR_ENABLED` está apagado.",
+    )
 
 
 class RenameSlugPlanOut(BaseModel):
@@ -169,6 +194,10 @@ class RenameSlugPlanOut(BaseModel):
     )
     databases: list[RenameSlugDatabaseOut]
     rename_count: int
+    mirror_table: str | None = None
+    mirror_pending_count: int = Field(
+        0, description="Bases del blueprint a las que les falta la tabla espejo."
+    )
     blockers: list[RenameSlugDatabaseOut]
     requires_confirmation: bool
     prefix_only: bool = Field(
@@ -213,6 +242,13 @@ class RenameSlugOut(BaseModel):
     model: DatabaseModelOut
     renamed_databases: list[RenameSlugDatabaseOut]
     no_op: bool
+    mirror: MirrorProvisionOut | None = Field(
+        None,
+        description=(
+            "Solo en `/migrate-version-table`: qué pasó con la tabla espejo. `null` en el "
+            "renombrado de slug, que no la aprovisiona."
+        ),
+    )
 
 
 class SnapshotObjectRef(BaseModel):
