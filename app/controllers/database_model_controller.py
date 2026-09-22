@@ -880,7 +880,7 @@ class DatabaseModelController:
         confirm_token: str | None = None,
         admin: "dict | Actor | None" = None,
         _same_slug_ok: bool = False,
-        _provision_mirror: bool = False,
+        _provision_mirror: bool = True,
     ) -> dict:
         """Cambia el ``slug`` del blueprint y propaga el rename de su tabla de versión. 🔌
 

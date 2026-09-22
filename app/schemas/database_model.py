@@ -245,8 +245,8 @@ class RenameSlugOut(BaseModel):
     mirror: MirrorProvisionOut | None = Field(
         None,
         description=(
-            "Solo en `/migrate-version-table`: qué pasó con la tabla espejo. `null` en el "
-            "renombrado de slug, que no la aprovisiona."
+            "Qué pasó con la tabla espejo `_datum_migrations`. Tanto el renombrado de slug "
+            "como la migración de prefijo dejan la base en el formato vigente completo."
         ),
     )
 

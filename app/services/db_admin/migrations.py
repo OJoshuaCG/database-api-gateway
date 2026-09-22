@@ -51,7 +51,7 @@ from app.core.remote_engine import (
 from app.exceptions import AppHttpException
 from app.models.enums import EngineType
 from app.services.db_admin import migration_progress, migration_results
-from app.services.db_admin.identifiers import GATEWAY_TABLE_PREFIXES
+from app.services.db_admin.identifiers import GATEWAY_TABLE_PREFIXES, quote_identifier
 from app.services.db_admin.migration_integrity import validate_version, version_sort_key
 from app.services.db_admin.sql_dialect import (
     RollbackGenerator,
@@ -226,6 +226,70 @@ def resolve_version_table(conn: Connection, slug: str, schema: str | None = None
     if insp.has_table(viejo, schema=schema):
         return viejo
     return nuevo
+
+
+def modernize_accounting(conn: Connection, slug: str, engine: "EngineType") -> str:
+    """Deja la base en el formato VIGENTE y devuelve el nombre de su tabla de versión.
+
+    Corre en cada operación que ESCRIBE sobre la base —apply, rollback y stamp, que son los
+    únicos que entran por ``MigrationRunner._prepared``—, así que el parque se moderniza con
+    el uso sin un paso aparte. El ``dry_run`` no llega nunca hasta acá: sale antes, en el
+    controller, y un ensayo no puede escribir.
+
+    Dos cosas, las dos idempotentes:
+
+    1. Si la base tiene SOLO la tabla histórica ``_gw_v_{slug}``, se renombra a
+       ``_datum_version_{slug}``. Si tiene las dos no se toca nada: ahí es ambiguo cuál es el
+       puntero bueno, y decidirlo en silencio dentro de un apply sería peor que dejarlo.
+    2. Si falta el espejo ``_datum_migrations`` (y ``MIGRATION_MIRROR_ENABLED`` está
+       encendido), se crea vacío.
+
+    **Fail-open.** Si algo de esto falla, la operación sigue con el nombre que la base ya
+    tenía: ``resolve_version_table`` lo encuentra igual. Modernizar es una mejora; que un
+    rename de contabilidad tumbe una migración sería convertir una mejora en un incidente.
+
+    Corre con el advisory lock YA tomado por ``_prepared``, así que no puede cruzarse con otra
+    migración sobre la misma base. Y se commitea enseguida: en PostgreSQL la conexión no está
+    en AUTOCOMMIT, y dejar el rename dentro de una transacción abierta la mezclaría con la
+    ``transaction_per_migration`` de Alembic.
+    """
+    from app.core.environments import MIGRATION_MIRROR_ENABLED
+    from app.services.db_admin import migration_mirror
+
+    nuevo = version_table_name(slug)
+    viejo = legacy_version_table_name(slug)
+    try:
+        insp = inspect(conn)
+        if insp.has_table(viejo) and not insp.has_table(nuevo):
+            dialecto = engine.value
+            conn.exec_driver_sql(
+                f"ALTER TABLE {quote_identifier(viejo, dialecto)} "
+                f"RENAME TO {quote_identifier(nuevo, dialecto)}"
+            )
+            logger.info("contabilidad modernizada: %s -> %s", viejo, nuevo)
+        if MIGRATION_MIRROR_ENABLED:
+            migration_mirror.ensure_table(conn, engine)
+        if conn.in_transaction():
+            conn.commit()
+    except Exception:  # noqa: BLE001 — fail-open deliberado, ver el docstring
+        logger.exception(
+            "no se pudo modernizar la contabilidad del blueprint '%s'; la operación sigue "
+            "con el nombre que la base ya tenía.",
+            slug,
+        )
+        if conn.in_transaction():
+            conn.rollback()
+    nombre = resolve_version_table(conn, slug)
+    # **Este commit es el que importa, y no se puede quitar.** ``resolve_version_table``
+    # inspecciona la base, y en PostgreSQL inspeccionar ABRE una transacción implícita. Si la
+    # conexión llega así a Alembic, su ``transaction_per_migration`` ve una transacción ya
+    # abierta, anida la suya y NO commitea: lo que el stamp o el apply escriben en la tabla de
+    # versión se descarta al cerrar la conexión, sin ningún error. Es el mismo motivo por el que
+    # ``_read_current`` commitea su SELECT. Detectado contra PostgreSQL 17 real: un stamp sobre
+    # una base nueva "salía bien" y la versión no quedaba. En MySQL (AUTOCOMMIT) es un no-op.
+    if conn.in_transaction():
+        conn.commit()
+    return nombre
 
 
 def version_table_name(slug: str) -> str:
@@ -895,10 +959,10 @@ class MigrationRunner:
         que un apply largo sostiene la request y su hilo mientras dura. Es el mismo costo que ya
         asumió la conversión de collation, y la alternativa era el bucle.
         """
-        # El nombre se RESUELVE contra cada base (ver ``resolve_version_table``), no se
-        # asume: una base vieja sigue con su ``_gw_v_`` y una nueva nace con
-        # ``_datum_version_``. Asumirlo haría que todo el parque existente pasara a ser
-        # consultado por una tabla que no tiene.
+        # El nombre NO se asume: ``modernize_accounting`` lleva la base al formato vigente
+        # si puede (renombra ``_gw_v_`` -> ``_datum_version_`` y crea el espejo) y después
+        # lo RESUELVE contra la base. Asumirlo haría que todo el parque existente pasara a
+        # ser consultado por una tabla que no tiene.
         transactional = self.use_transactional_ddl(engine, specs)
         with tempfile.TemporaryDirectory(prefix="gw_mig_") as tmp:
             versions_dir = Path(tmp) / "versions"
@@ -910,7 +974,7 @@ class MigrationRunner:
                 if transactional:
                     with self.advisory_lock(target, engine=engine, lock_key=managed_db_id):
                         with database_connection(target, db_name, bulk=bulk) as conn:
-                            version_table = resolve_version_table(conn, slug)
+                            version_table = modernize_accounting(conn, slug, engine)
                             cfg = self._make_config(versions_dir, conn, version_table)
                             yield conn, cfg, version_table
                 else:
@@ -918,7 +982,7 @@ class MigrationRunner:
                         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
                         self._acquire_lock(conn, engine, managed_db_id)
                         try:
-                            version_table = resolve_version_table(conn, slug)
+                            version_table = modernize_accounting(conn, slug, engine)
                             cfg = self._make_config(versions_dir, conn, version_table)
                             yield conn, cfg, version_table
                         finally:
