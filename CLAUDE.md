@@ -144,6 +144,13 @@ mano** con forma secuencial, así que dos personas del mismo día eligen plausib
 ID — daño **peor** que una bifurcación, porque una de las dos migraciones queda inalcanzable y
 su DDL nunca se aplica **sin que nada falle**.
 
+**Nunca nombres una constraint a mano en `drop_constraint`: descubrila por introspección.** Los
+nombres de la convención superan el límite del motor (64 en MySQL, 63 en PostgreSQL) y cada uno
+los guardó TRUNCADOS con un hash distinto, así que el nombre "lógico" no existe en ninguno. Y
+como MySQL/MariaDB no tienen DDL transaccional, una migración que muere a mitad deja aplicado lo
+que ya corrió con `alembic_version` atrasado: **escribí cada paso idempotente** o el reintento
+choca consigo mismo y el contenedor queda en loop. Ya pasó; ver `b3c4d5e6f7a8`.
+
 **Al arreglar una bifurcación: ENCADENAR, no `alembic merge heads`.** El merge deja head único
 pero conserva la bifurcación en la historia. La causa raíz completa, el incidente y por qué el
 guard no usa `ScriptDirectory` están en el archivo de decisiones e incidentes.

@@ -1928,6 +1928,34 @@ que lea el fuente con `ast`.
 
 ---
 
+### El nombre de una FK que no existía dejó el contenedor en loop
+
+**El síntoma** fue `(1060, "Duplicate column name 'direction'")` en cada arranque, con el
+contenedor reiniciando cada minuto. Era el reintento, no la causa: el log visible empezaba en
+el segundo intento.
+
+**La causa**, reproducida contra MariaDB 11.8 real: la migración `b3c4d5e6f7a8` hacía
+`drop_constraint` con el nombre que dicta la convención del modelo,
+`fk_database_migration_history_model_migration_id_model_migrations` — **65 caracteres**, uno más
+que el límite de MariaDB. Cuando la migración original creó esa FK, SQLAlchemy la guardó
+truncada con sufijo hash (`..._model_m_be07`), así que el nombre largo nunca existió. El `DROP`
+murió con 1091. Como el DDL de MySQL no es transaccional, las siete columnas ya se habían
+agregado y `alembic_version` seguía en la revisión previa: cada reinicio la corría entera y
+chocaba con la primera columna.
+
+**Por qué no alcanzaba con corregir el nombre**: en PostgreSQL 17 el mismo nombre se truncó
+DISTINTO (`..._model__be07`, 60 caracteres). No hay un literal que sirva para los dos motores.
+La FK se descubre por introspección, y cada paso pregunta el estado real antes de actuar, así
+que la migración retoma desde donde haya quedado. Eso fue lo que permitió que producción se
+recuperara sola al siguiente deploy, sin SQL a mano.
+
+**Por qué pasó**: la migración nunca se había corrido contra un motor antes de llegar a `main`.
+Y la red que debía atraparlo tenía un agujero previo e independiente: la cadena está **rota en
+PostgreSQL desde la segunda revisión** (`5429b83cc392` crea la columna `collation` sin comillas
+y `COLLATION` es reservada), así que el job de PostgreSQL de `migrations-apply.yml` falla antes
+de llegar a cualquier migración nueva. La regla de introspección e idempotencia quedó en
+`CLAUDE.md`, sección de migraciones.
+
 ## Nota al pie — por qué `.env.example` "no se podía actualizar"
 
 Dos entregas de este archivo (captura de `SELECT` y exportación de BDs) anotan que
