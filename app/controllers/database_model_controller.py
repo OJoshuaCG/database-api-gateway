@@ -746,9 +746,9 @@ class DatabaseModelController:
         if conflictos:
             raise AppHttpException(
                 message=(
-                    f"{len(conflictos)} base(s) ya tienen una tabla '{plan['new_table']}'. "
-                    "Renombrar encima pisaría un puntero de versión ajeno. Resolvé esas "
-                    "bases antes de renombrar el slug."
+                    f"En {len(conflictos)} base(s) conviven la tabla de versión de origen y "
+                    f"'{plan['new_table']}': no se puede decidir cuál es el puntero bueno sin "
+                    "mirar esas bases. Revisalas (GET /version-tables) antes de reintentar."
                 ),
                 status_code=409,
                 public_context={

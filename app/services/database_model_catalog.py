@@ -41,11 +41,15 @@ CODE_NAME_OR_SLUG_TAKEN = "database_model.name_or_slug_taken"
 # transacción compartida. Por eso tiene endpoint propio, preview y doble factor — el mismo
 # molde que el borrado de una versión con renumerado.
 
-#: Alguna BD ya tiene una tabla con el nombre DESTINO (``_gw_v_{slug_nuevo}``). Renombrar
-#: encima la pisaría o fallaría según el motor, y esa tabla puede ser el puntero bueno de otro
-#: blueprint —o el residuo de un rename anterior que quedó a medias—. **Bloquea todo el
-#: renombrado**, no solo esa BD: dejar la mitad del parque renombrada es el estado del que
-#: cuesta salir. Trae ``conflicting_databases``.
+#: En alguna BD **conviven** la tabla de ORIGEN y la de DESTINO. Ahí es ambiguo cuál es el
+#: puntero de versión bueno —puede ser el residuo de un rename a medias, o dos tablas con
+#: versiones distintas— y decidirlo en silencio sería apostar con la contabilidad de un
+#: tercero. **Bloquea todo el renombrado**, no solo esa BD: dejar la mitad del parque
+#: renombrada es el estado del que cuesta salir. Trae ``conflicting_databases``.
+#:
+#: NO es "ya tiene la tabla destino": eso, sin origen, es ``already`` en el plan y no bloquea
+#: (es el caso normal de una base ya migrada). La definición vieja de este código era esa, y
+#: tratarla como conflicto hacía fallar entera la segunda corrida de una migración.
 CODE_SLUG_RENAME_CONFLICT = "database_model.slug_rename_conflict"
 
 #: No se pudo leer alguna BD del blueprint. **Fail-closed**: no se puede probar que no tenga

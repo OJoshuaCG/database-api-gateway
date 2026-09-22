@@ -414,7 +414,7 @@ Siete códigos nuevos, todos en `public_context.code`:
 |---|---|---|
 | `database_model.slug_in_use` | `PATCH` que cambia el slug de un blueprint con bases | Usar `/rename-slug` |
 | `database_model.name_or_slug_taken` | Nombre o slug duplicado (alta y `PATCH`) | Elegir otro valor |
-| `database_model.slug_rename_conflict` | Alguna base ya tiene la tabla destino. Trae `conflicting_databases` | Resolver esas bases primero |
+| `database_model.slug_rename_conflict` | En alguna base **conviven** la tabla de origen y la de destino (ambiguo cuál es el puntero bueno). Trae `conflicting_databases`. **No** es "ya tiene el destino": eso es `already` y no bloquea | Revisar esas bases con `/version-tables` |
 | `database_model.slug_rename_unreachable` | Alguna base ilegible. Trae `unreachable_databases` | Recuperar el acceso |
 | `database_model.slug_rename_confirmation_required` | Falta `confirm_token`. Trae `rename_plan` | Pedir el preview |
 | `database_model.slug_rename_plan_stale` | El parque cambió desde el preview | Volver a pedir el plan |
