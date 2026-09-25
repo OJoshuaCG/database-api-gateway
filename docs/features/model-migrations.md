@@ -61,6 +61,7 @@ routes/v1/managed_databases.py    →  controllers/managed_migration_controller.
 
 ```http
 GET    /api/v1/database-models/{id}/migrations            # lista paginada (?page=&size=)
+GET    /api/v1/database-models/{id}/migrations/search     # busca texto en el up_sql (?q= ?case_sensitive= ?last= ?date_from= ?date_to= ?order=)
 POST   /api/v1/database-models/{id}/migrations            # crea una versión
 GET    /api/v1/database-models/{id}/migrations/{version}  # detalle (con translated + sugerencia)
 PATCH  /api/v1/database-models/{id}/migrations/{version}  # confirma down_sql / añade overrides / corrige up_sql (si no aplicada)
@@ -93,6 +94,30 @@ POST   /api/v1/database-models/{id}/migrations/apply-all    # ?max_databases=(1.
 
 `apply-all` es **síncrono y acotado** (`max_databases` ≤100); continúa con las demás BDs
 aunque una falle. El fan-out asíncrono real es del Plan 06.
+
+### Búsqueda en el SQL de las versiones
+
+`GET /database-models/{id}/migrations/search?q=…` encuentra las versiones cuyo `up_sql`
+contiene un texto, sin abrirlas una por una. Solo lee la BD del gateway; no toca motores.
+
+- **Término literal**: `%` y `_` no son comodines. Se busca sin los espacios de los extremos
+  y exige **4 caracteres** después de quitarlos (422 `model_migration.search_query_too_short`).
+- **`case_sensitive`** (default `false`).
+- **`last=N`** acota la búsqueda a las N versiones más altas del blueprint (orden numérico).
+  Las fechas (`date_from`, `date_to`, ambas inclusivas, sobre `created_at`) se aplican dentro
+  de esa ventana. `date_from > date_to` → 422 `model_migration.search_invalid_date_range`.
+- Cada resultado trae `match_count`, `lines_matched`, `is_latest` y hasta 3 fragmentos
+  (`line`, `text`, `match_start`, `match_end`). **Nunca el SQL completo**: para verlo se abre
+  la versión con `GET /{version}`.
+
+No hay índice FULLTEXT a propósito: la búsqueda está acotada a un blueprint (prefijo del índice
+único `(model_id, version)`), y un FULLTEXT tokeniza por palabras — no encontraría `_gw_` ni un
+fragmento como `ON DELETE CAS`. SQL hace un prefiltro insensible a mayúsculas (`LIKE`
+escapado) y el veredicto exacto, el conteo y la paginación se hacen en Python, porque la
+sensibilidad a mayúsculas de `LIKE` no es portable (en MySQL depende de la collation, en
+PostgreSQL distingue). El porqué completo está en el docstring de
+`ModelMigrationController.search_migrations`. Contrato para el frontend:
+`docs/api-reference-v26.md`.
 
 ## Flujo de trabajo (ejemplos)
 

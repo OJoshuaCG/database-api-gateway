@@ -11,7 +11,10 @@ La aplicación sobre BDs gestionadas vive en ``ManagedDatabaseController`` (toca
 motor) usando ``MigrationRunner``.
 """
 
+import bisect
 import hashlib
+import re
+from datetime import date, datetime, time, timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import func, or_
@@ -70,6 +73,17 @@ _VERSION_ORDER_DESC = (
 #: ``(operación, model_id, "{slug}:{version}")`` con la huella del parque como ``subject``:
 #: no hay ``server_id``/``db_name`` porque la operación es del blueprint, no de una BD.
 _DELETE_OPERATION = "model_migration.delete_renumber"
+
+#: Mínimo de caracteres del término de búsqueda en ``up_sql`` (tras ``strip()``). Con menos,
+#: el término casa con casi todo el blueprint y la búsqueda se vuelve un volcado.
+SEARCH_MIN_LENGTH = 4
+#: Máximo del término. Lo aplica la ruta (``max_length``); vive acá para no duplicarlo.
+SEARCH_MAX_LENGTH = 200
+#: Líneas con coincidencia que se devuelven por versión. El resto se informa como conteo.
+SNIPPET_LIMIT = 3
+#: Ancho aproximado (en caracteres) de la ventana que se muestra alrededor de la coincidencia.
+SNIPPET_WIDTH = 160
+_ELLIPSIS = "…"
 
 
 class ModelMigrationController:
@@ -830,6 +844,229 @@ class ModelMigrationController:
             return self._serialize(m, self._policy_for(session, m))
         finally:
             session.close()
+
+    # ------------------------------------------------------------------ #
+    # Búsqueda de texto en el SQL de las versiones                        #
+    # ------------------------------------------------------------------ #
+    def search_migrations(
+        self,
+        model_id: int,
+        *,
+        query: str,
+        case_sensitive: bool = False,
+        last: int | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        order: str = "desc",
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict], int]:
+        """
+        Versiones de UN blueprint cuyo ``up_sql`` contiene ``query``, con fragmentos por línea.
+
+        **Se busca el término SIN espacios en los extremos.** Un espacio final que se coló al
+        tipear no debería vaciar el resultado; y si el operador necesita un espacio, lo pone
+        entre palabras, donde ``strip()`` no llega.
+
+        **Sin índice FULLTEXT, a propósito.** La búsqueda está acotada a un solo blueprint: el
+        filtro por ``model_id`` usa el prefijo del índice único ``(model_id, version)`` y el
+        escaneo recorre solo las versiones de ese blueprint (decenas, a lo sumo unos cientos).
+        ``last`` y el rango de fechas acotan todavía más. Un FULLTEXT tokeniza por palabras —no
+        encuentra ``_gw_`` ni ``ON DELETE CAS``—, difiere entre MySQL, PostgreSQL y SQLite, y
+        exigiría una migración del gateway para servir algo que un LIKE ya resuelve.
+
+        **La ventana ``last`` se resuelve con una query aparte.** MySQL no admite ``LIMIT``
+        dentro de una subconsulta ``IN`` (error 1235), así que primero se traen los ids de las
+        N versiones más altas (solo la columna ``id``) y después se filtra con ``in_(lista)``.
+        Es portable y la lista está acotada por ``le=1000`` en la ruta. Las fechas se aplican
+        DENTRO de esa ventana: "de las últimas 20, las de septiembre".
+
+        **Prefiltro en SQL, veredicto en Python, y por eso la paginación es en Python.**
+        ``icontains(autoescape=True)`` es portable a los tres motores y escapa ``%`` y ``_``,
+        así que el término se busca literal. Es un SUPERCONJUNTO del resultado: la exactitud
+        sensible a mayúsculas no es portable en SQL (``LIKE`` de MySQL sigue la collation, que
+        suele ser ``_ci`` y encima insensible a acentos; el de PostgreSQL distingue
+        mayúsculas), así que quien decide es el conteo en Python, que descarta las filas sin
+        coincidencia real. Como el total depende de ese descarte, ``LIMIT/OFFSET`` en SQL
+        daría páginas cortas y un ``total`` falso. El costo está acotado por el mismo motivo
+        que justifica no tener FULLTEXT: son las versiones de un blueprint.
+
+        **Nunca devuelve el ``up_sql`` completo.** Puede ser LONGTEXT (un snapshot supera los
+        64 KB); la lista lleva fragmentos y el cliente abre la versión con el
+        ``GET /{version}`` existente. Por lo mismo se seleccionan solo las columnas necesarias
+        y no la fila ORM entera, que arrastraría los overrides y el rollback.
+        """
+        needle = query.strip()
+        if len(needle) < SEARCH_MIN_LENGTH:
+            raise AppHttpException(
+                message=(
+                    f"El término de búsqueda debe tener al menos {SEARCH_MIN_LENGTH} caracteres."
+                ),
+                status_code=422,
+                public_context={
+                    "code": freeze_codes.CODE_SEARCH_QUERY_TOO_SHORT,
+                    "min_length": SEARCH_MIN_LENGTH,
+                },
+            )
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise AppHttpException(
+                message="La fecha inicial es posterior a la final.",
+                status_code=422,
+                public_context={"code": freeze_codes.CODE_SEARCH_INVALID_DATE_RANGE},
+                context={"date_from": date_from.isoformat(), "date_to": date_to.isoformat()},
+            )
+
+        session = self._session()
+        try:
+            self._model_or_404(session, model_id)
+
+            # La punta se resuelve sobre TODO el blueprint, no sobre la ventana ni sobre los
+            # resultados: con ``last`` o fechas, la versión más alta de la ventana no tiene por
+            # qué ser la punta. Mismo criterio que ``list_migrations``.
+            tip = (
+                session.query(ModelMigration.version)
+                .filter(ModelMigration.model_id == model_id)
+                .order_by(*_VERSION_ORDER_DESC)
+                .first()
+            )
+            tip_version = tip[0] if tip else None
+
+            q = session.query(
+                ModelMigration.id,
+                ModelMigration.version,
+                ModelMigration.name,
+                ModelMigration.created_at,
+                ModelMigration.up_sql,
+            ).filter(ModelMigration.model_id == model_id)
+
+            if last is not None:
+                window_ids = [
+                    row[0]
+                    for row in session.query(ModelMigration.id)
+                    .filter(ModelMigration.model_id == model_id)
+                    .order_by(*_VERSION_ORDER_DESC)
+                    .limit(last)
+                    .all()
+                ]
+                if not window_ids:
+                    return [], 0
+                q = q.filter(ModelMigration.id.in_(window_ids))
+
+            # Límites de día contra ``created_at`` TAL COMO SE GUARDÓ (reloj del motor del
+            # gateway, sin zona). ``date_to`` es inclusivo: "< día siguiente" en vez de
+            # "<= 23:59:59", que perdería las filas con fracción de segundo.
+            if date_from is not None:
+                q = q.filter(ModelMigration.created_at >= datetime.combine(date_from, time.min))
+            if date_to is not None:
+                q = q.filter(
+                    ModelMigration.created_at
+                    < datetime.combine(date_to + timedelta(days=1), time.min)
+                )
+
+            q = q.filter(ModelMigration.up_sql.icontains(needle, autoescape=True))
+            sort = _VERSION_ORDER_DESC if order == "desc" else _VERSION_ORDER_ASC
+            rows = q.order_by(*sort).all()
+        finally:
+            session.close()
+
+        # ``re.escape`` hace el término LITERAL (nada de metacaracteres, así que tampoco hay
+        # backtracking catastrófico). Se usa regex y no ``str.lower().count`` porque
+        # ``lower()`` puede cambiar la LONGITUD de algunos caracteres (``"İ".lower()`` tiene
+        # dos), y entonces los offsets calculados sobre el texto en minúsculas no caerían
+        # sobre el original. ``re.IGNORECASE`` compara carácter a carácter sin reescribir.
+        pattern = re.compile(re.escape(needle), 0 if case_sensitive else re.IGNORECASE)
+
+        hits: list[dict] = []
+        for row in rows:
+            found = self._search_hit(pattern, row.up_sql)
+            if found is None:
+                continue
+            hits.append(
+                {
+                    "id": row.id,
+                    "model_id": model_id,
+                    "version": row.version,
+                    "name": row.name,
+                    "created_at": row.created_at,
+                    "is_latest": row.version == tip_version,
+                    **found,
+                }
+            )
+        # El orden ya vino de SQL y el filtro de Python lo conserva: solo queda cortar.
+        return hits[offset : offset + limit], len(hits)
+
+    @staticmethod
+    def _search_hit(pattern: "re.Pattern[str]", sql: str) -> dict | None:
+        """
+        Conteo y fragmentos de ``pattern`` en ``sql``, o ``None`` si no hay coincidencia.
+
+        Las coincidencias se buscan sobre el TEXTO ENTERO y no línea por línea: un término con
+        salto de línea (llega URL-encodeado) no casaría nunca en una búsqueda por línea. Cada
+        coincidencia se ubica después en su línea por bisección sobre los inicios de línea, y
+        el fragmento muestra la línea donde EMPIEZA; si la coincidencia sigue en la próxima,
+        ``match_end`` se recorta al fin de la línea.
+        """
+        matches = list(pattern.finditer(sql))
+        if not matches:
+            return None
+
+        line_starts = [0]
+        line_starts.extend(i + 1 for i, ch in enumerate(sql) if ch == "\n")
+
+        seen_lines: set[int] = set()
+        snippets: list[dict] = []
+        for m in matches:
+            line_idx = bisect.bisect_right(line_starts, m.start()) - 1
+            if line_idx in seen_lines:
+                continue
+            seen_lines.add(line_idx)
+            if len(snippets) >= SNIPPET_LIMIT:
+                continue
+            start = line_starts[line_idx]
+            end = line_starts[line_idx + 1] - 1 if line_idx + 1 < len(line_starts) else len(sql)
+            line = sql[start:end].rstrip("\r")
+            snippets.append(
+                {
+                    "line": line_idx + 1,
+                    **ModelMigrationController._snippet_window(
+                        line, m.start() - start, m.end() - start
+                    ),
+                }
+            )
+
+        return {
+            "match_count": len(matches),
+            "lines_matched": len(seen_lines),
+            "snippets": snippets,
+        }
+
+    @staticmethod
+    def _snippet_window(line: str, match_start: int, match_end: int) -> dict:
+        """
+        Recorta ``line`` a ~``SNIPPET_WIDTH`` caracteres centrados en la coincidencia.
+
+        Un snapshot suele traer un ``INSERT`` de miles de caracteres en una sola línea:
+        devolverla entera es devolver el SQL por otro camino. Los offsets se devuelven
+        relativos al texto FINAL, con los ``…`` ya puestos, para que el cliente resalte con un
+        slice y no tenga que recalcular nada.
+        """
+        match_end = min(match_end, len(line))
+        if len(line) <= SNIPPET_WIDTH:
+            return {"text": line, "match_start": match_start, "match_end": match_end}
+
+        match_len = match_end - match_start
+        lo = max(0, match_start - max(0, SNIPPET_WIDTH - match_len) // 2)
+        hi = min(len(line), lo + max(SNIPPET_WIDTH, match_len))
+        lo = max(0, hi - max(SNIPPET_WIDTH, match_len))
+
+        prefix = _ELLIPSIS if lo > 0 else ""
+        suffix = _ELLIPSIS if hi < len(line) else ""
+        shift = len(prefix) - lo
+        return {
+            "text": prefix + line[lo:hi] + suffix,
+            "match_start": match_start + shift,
+            "match_end": match_end + shift,
+        }
 
     # ------------------------------------------------------------------ #
     # Escritura                                                           #

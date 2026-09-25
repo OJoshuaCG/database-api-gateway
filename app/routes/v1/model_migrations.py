@@ -5,12 +5,17 @@ CRUD de migraciones sobre el inventario del gateway (NO toca motores) y el apply
 masivo (síncrono, acotado) sobre todas las BDs del blueprint.
 """
 
-from typing import Literal
+from datetime import date
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Path, Query, Request
 
 from app.controllers.managed_migration_controller import ManagedMigrationController
-from app.controllers.model_migration_controller import ModelMigrationController
+from app.controllers.model_migration_controller import (
+    SEARCH_MAX_LENGTH,
+    SEARCH_MIN_LENGTH,
+    ModelMigrationController,
+)
 from app.core.authz import (
     BlueprintsApply,
     BlueprintsRead,
@@ -24,6 +29,7 @@ from app.schemas.model_migration import (
     MigrationDeletePlanOut,
     MigrationEditPreviewIn,
     MigrationEditPreviewOut,
+    MigrationSearchHit,
     MigrationValidateIn,
     MigrationValidateOut,
     ModelMigrationCreate,
@@ -175,6 +181,79 @@ def validate_migration(
         model_id, payload.model_dump(exclude_unset=True), admin=actor
     )
     return success(data=result, message="SQL analizado.")
+
+
+@router.get(
+    "/{model_id}/migrations/search",
+    response_model=ApiResponse[list[MigrationSearchHit]],
+)
+def search_migrations(
+    actor: BlueprintsRead,
+    model_id: int,
+    pagination: PaginationDep,
+    q: Annotated[
+        str,
+        Query(
+            # min_length=1 y NO SEARCH_MIN_LENGTH, a propósito: el 422 de validación de
+            # FastAPI no lleva 'public_context.code', así que un término de 3 caracteres
+            # llegaría al cliente con una forma de error distinta a uno de 4 con espacios.
+            # El mínimo real lo aplica el controlador, con código, sobre el valor sin espacios.
+            min_length=1,
+            max_length=SEARCH_MAX_LENGTH,
+            description=(
+                f"Texto a buscar en el up_sql de cada versión. Literal ('%' y '_' no son "
+                f"comodines). Se busca SIN los espacios de los extremos y tiene que tener al "
+                f"menos {SEARCH_MIN_LENGTH} caracteres después de quitarlos (si no, 422 "
+                f"'model_migration.search_query_too_short')."
+            ),
+        ),
+    ],
+    case_sensitive: Annotated[
+        bool, Query(description="True = distingue mayúsculas de minúsculas.")
+    ] = False,
+    last: Annotated[
+        int | None,
+        Query(
+            ge=1,
+            le=1000,
+            description=(
+                "Busca solo en las últimas N versiones del blueprint (por número de versión). "
+                "Sin él, en todas. Se combina con las fechas como intersección."
+            ),
+        ),
+    ] = None,
+    date_from: Annotated[
+        date | None, Query(description="Desde esta fecha de creación (inclusive).")
+    ] = None,
+    date_to: Annotated[
+        date | None, Query(description="Hasta esta fecha de creación (inclusive).")
+    ] = None,
+    order: Annotated[
+        Literal["asc", "desc"],
+        Query(description="Orden por número de versión. 'desc' = más nuevas primero."),
+    ] = "desc",
+):
+    """
+    Busca texto dentro del ``up_sql`` de las versiones de UN blueprint.
+
+    Solo lee la BD del gateway (no abre conexión a ningún motor). Devuelve fragmentos por
+    línea, nunca el SQL completo: para verlo se abre la versión con ``GET /{version}``.
+
+    Se declara antes de ``/{version}`` por claridad; no colisionaría igual, porque "search" no
+    casa con el ``pattern`` de versión.
+    """
+    items, total = ModelMigrationController().search_migrations(
+        model_id,
+        query=q,
+        case_sensitive=case_sensitive,
+        last=last,
+        date_from=date_from,
+        date_to=date_to,
+        order=order,
+        limit=pagination.size,
+        offset=pagination.offset,
+    )
+    return paginated(items, total=total, pagination=pagination)
 
 
 @router.get(

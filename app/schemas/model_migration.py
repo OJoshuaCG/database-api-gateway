@@ -1010,3 +1010,57 @@ class MigrationEditPreviewOut(BaseModel):
     expires_at: datetime | None = Field(
         None, description="Vencimiento del token. Vencido: pedir el preview de nuevo (410)."
     )
+
+
+# --------------------------------------------------------------------------- #
+# Búsqueda de texto en el SQL de las versiones                                 #
+# --------------------------------------------------------------------------- #
+class MigrationSearchSnippet(BaseModel):
+    """Una línea de ``up_sql`` con una coincidencia, recortada para mostrarse en una lista."""
+
+    line: int = Field(..., ge=1, description="Número de línea (1-based) dentro de up_sql.")
+    text: str = Field(
+        ...,
+        description=(
+            "La línea, recortada a una ventana alrededor de la coincidencia. Si se recortó, "
+            "lleva '…' al principio y/o al final."
+        ),
+    )
+    match_start: int = Field(
+        ..., ge=0, description="Inicio de la coincidencia, relativo a 'text' (incluye el '…')."
+    )
+    match_end: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "Fin EXCLUSIVO de la coincidencia, relativo a 'text'. Resaltar "
+            "text[match_start:match_end]."
+        ),
+    )
+
+
+class MigrationSearchHit(BaseModel):
+    """
+    Una versión cuyo ``up_sql`` contiene el término buscado.
+
+    No trae el SQL completo a propósito: puede ser LONGTEXT. Para verlo entero, el cliente abre
+    la versión con ``GET /database-models/{model_id}/migrations/{version}``.
+    """
+
+    id: int
+    model_id: int
+    version: str
+    name: str
+    created_at: datetime
+    is_latest: bool = Field(False, description=_IS_LATEST_DESC)
+    match_count: int = Field(..., ge=1, description="Coincidencias totales en up_sql.")
+    lines_matched: int = Field(
+        ..., ge=1, description="Líneas distintas con al menos una coincidencia."
+    )
+    snippets: list[MigrationSearchSnippet] = Field(
+        default_factory=list,
+        description=(
+            "Hasta 3 líneas con coincidencia, en orden de aparición. Si lines_matched es "
+            "mayor, hay más líneas que no se muestran."
+        ),
+    )

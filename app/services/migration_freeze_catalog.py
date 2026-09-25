@@ -146,6 +146,22 @@ CODE_PARTIAL_APPLICATION = "model_migration.partial_application"
 #: el formulario ya sabe qué overrides existen.
 CODE_STALE_OVERRIDES = "model_migration.stale_overrides"
 
+# --------------------------------------------------------------------------- #
+# Búsqueda de texto en el SQL de las versiones (GET .../migrations/search)      #
+# --------------------------------------------------------------------------- #
+# No son códigos del freeze, pero sí del mismo recurso (``model_migration.``), y el frontend
+# agrupa por prefijo: un catálogo aparte obligaría a mantener dos diccionarios para una
+# misma pantalla.
+
+#: El término de búsqueda, ya sin espacios en los extremos, es más corto que el mínimo. Trae
+#: ``min_length``. Un término de 1–3 caracteres casa con casi todas las versiones y convierte
+#: la búsqueda en un volcado del blueprint entero.
+CODE_SEARCH_QUERY_TOO_SHORT = "model_migration.search_query_too_short"
+
+#: ``date_from`` es posterior a ``date_to``. Se rechaza en vez de devolver una lista vacía:
+#: vacía se lee como "no hay coincidencias", que es una afirmación falsa sobre el blueprint.
+CODE_SEARCH_INVALID_DATE_RANGE = "model_migration.search_invalid_date_range"
+
 # Definición ÚNICA y al final del módulo a propósito: tiene que poder nombrar los códigos de
 # la vía de excepción, que se declaran más abajo que los del freeze. Hubo dos definiciones
 # —una acá y otra antes de esos códigos—, y la segunda pisaba a la primera en silencio: el
@@ -166,6 +182,8 @@ ERROR_CODES = frozenset(
         CODE_EDIT_CONFIRM_MISMATCH,
         CODE_PARTIAL_APPLICATION,
         CODE_STALE_OVERRIDES,
+        CODE_SEARCH_QUERY_TOO_SHORT,
+        CODE_SEARCH_INVALID_DATE_RANGE,
     }
 )
 
