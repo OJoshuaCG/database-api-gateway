@@ -249,3 +249,85 @@ def test_revoke_others_keeps_the_current_session(client):
     # …y la otra no.
     client.cookies.set("gw_session", vieja)
     assert client.get("/api/v1/auth/me").status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# Concurrencia: el 1020 de MariaDB con innodb_snapshot_isolation              #
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_refreshes_last_seen_after_the_resolution_window(client):
+    """El UPDATE condicional sigue refrescando: el umbral en el WHERE no lo vuelve un no-op."""
+    _login(client)
+    _envejecer("last_seen_at", timedelta(minutes=5))
+    antes = _filas()[-1].last_seen_at
+
+    assert client.get("/api/v1/auth/me").status_code == 200
+    assert _filas()[-1].last_seen_at > antes
+
+
+class _ConflictSession:
+    """Sesión falsa cuyo ``execute`` levanta el 1020 las primeras ``fallas`` veces."""
+
+    def __init__(self, contador: list[int], fallas: int):
+        self._contador = contador
+        self._fallas = fallas
+
+    def execute(self, stmt, execution_options=None):
+        from unittest import mock
+
+        from sqlalchemy.exc import OperationalError
+
+        self._contador[0] += 1
+        if self._contador[0] <= self._fallas:
+            raise OperationalError(
+                "UPDATE gateway_sessions", {},
+                Exception(1020, "Record has changed since last read"),
+            )
+        return mock.Mock(rowcount=1)
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _patch_sessions(monkeypatch, fallas: int) -> list[int]:
+    from app.core import session_store
+
+    contador = [0]
+    monkeypatch.setattr(session_store, "_session", lambda: _ConflictSession(contador, fallas))
+    return contador
+
+
+def test_a_single_1020_is_retried(monkeypatch):
+    """MariaDB indica reintentar el 1020 como un deadlock; toda escritura acá es idempotente."""
+    from app.core import session_store
+
+    contador = _patch_sessions(monkeypatch, fallas=1)
+    assert session_store._write(object(), best_effort=False) == 1
+    assert contador[0] == 2
+
+
+def test_refreshing_last_seen_never_breaks_authentication(monkeypatch):
+    """Perder un refresco de ``last_seen_at`` es inocuo; un 500 en la autenticación no."""
+    from app.core import session_store
+
+    _patch_sessions(monkeypatch, fallas=2)
+    assert session_store._write(object(), best_effort=True) == 0
+
+
+def test_a_revocation_is_never_silently_dropped(monkeypatch):
+    """Tragarse el error dejaría viva una sesión que un logout o un cambio de password cerraban."""
+    import pytest
+    from sqlalchemy.exc import OperationalError
+
+    from app.core import session_store
+
+    _patch_sessions(monkeypatch, fallas=2)
+    with pytest.raises(OperationalError):
+        session_store._write(object(), best_effort=False)
