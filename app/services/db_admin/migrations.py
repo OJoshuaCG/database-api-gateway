@@ -839,6 +839,53 @@ class MigrationRunner:
         # como int producido por el propio código, nunca texto de usuario.
         return int(lock_key)
 
+    @staticmethod
+    def _align_session_collation(conn, engine: EngineType, db_name: str) -> None:
+        """
+        Pone la collation de la SESIÓN en la collation por defecto de la BD destino.
+
+        **El problema.** ``remote_engine._connect_args`` conecta con ``charset="utf8mb4"`` y sin
+        ``collation``, así que PyMySQL emite ``SET NAMES utf8mb4`` a secas y el motor resuelve la
+        sesión a la collation POR DEFECTO DEL CHARSET (``utf8mb4_general_ci`` en MariaDB 11.4),
+        no a la de la base: ni ``collation-server`` del ``.cnf`` ni el default de la base
+        gobiernan ``SET NAMES``. Todo literal del ``up_sql`` nace en esa collation, y una
+        variable de usuario (``SET @m := 'Tenancy'``) la hereda con coercibilidad IMPLICIT —
+        la misma que una columna—. Contra una columna ``utf8mb4_unicode_ci`` el motor no puede
+        desempatar: ``1267 Illegal mix of collations ... for operation '='``. El script está
+        bien escrito; lo rompe la conexión del gateway.
+
+        **Por qué la collation de la BASE y no una fija.** El gateway administra servidores de
+        terceros y cada base tiene la suya: fijar ``utf8mb4_unicode_ci`` en la conexión solo
+        mudaría el 1267 a las bases ``general_ci``. El default de la base es la mejor señal
+        disponible de en qué collation están sus columnas. Una tabla que se aparta del default
+        de su base puede seguir chocando con variables de usuario: eso se resuelve con
+        ``COLLATE`` explícito en el script, no acá.
+
+        **Por qué solo si el charset de la base es ``utf8mb4``.** ``collation_connection``
+        arrastra ``character_set_connection``: en una base ``latin1`` cambiaría el charset al
+        que el motor transcodifica CADA literal del ``up_sql``, que llega como utf8mb4. Eso es
+        otro cambio de comportamiento, con pérdida posible, y no el que se busca. Esas bases
+        quedan como estaban y se deja rastro en el log.
+
+        **Por qué acá y no en ``remote_engine``.** Esta conexión es la que ejecuta el SQL del
+        usuario; un cambio global también alcanzaría al clon, a la exportación y a la
+        conversión de collation, que maneja su propio ``SET NAMES``. Solo MySQL/MariaDB:
+        PostgreSQL no tiene collation de sesión (``lc_collate`` es de la base e inmutable).
+        """
+        if engine not in (EngineType.mysql, EngineType.mariadb):
+            return
+        charset, collation = conn.exec_driver_sql(
+            "SELECT @@character_set_database, @@collation_database"
+        ).one()
+        if charset != "utf8mb4":
+            logger.warning(
+                "La BD %s usa charset %s: la collation de sesión queda en la del handshake",
+                db_name, charset,
+            )
+            return
+        conn.exec_driver_sql("SET collation_connection = @@collation_database")
+        logger.debug("Collation de sesión alineada a %s para la BD %s", collation, db_name)
+
     def _acquire_lock(self, conn, engine: EngineType, lock_key: int) -> None:
         """
         Advisory lock por BD con semántica HOMOGÉNEA entre motores: si no se obtiene
@@ -980,6 +1027,7 @@ class MigrationRunner:
                 else:
                     with database_connection(target, db_name, bulk=bulk) as conn:
                         conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+                        self._align_session_collation(conn, engine, db_name)
                         self._acquire_lock(conn, engine, managed_db_id)
                         try:
                             version_table = modernize_accounting(conn, slug, engine)

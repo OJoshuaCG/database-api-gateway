@@ -151,6 +151,42 @@ def test_toggle_fk_checks_postgresql():
     ]
 
 
+class _DatabaseDefaultsConn(_RecordingConn):
+    """Conexión falsa que responde el charset/collation por defecto de la BD destino."""
+
+    def __init__(self, charset: str, collation: str):
+        super().__init__()
+        self._defaults = (charset, collation)
+
+    def exec_driver_sql(self, sql):
+        super().exec_driver_sql(sql)
+        return mock.Mock(one=mock.Mock(return_value=self._defaults))
+
+
+@pytest.mark.parametrize("engine", [EngineType.mysql, EngineType.mariadb])
+def test_align_session_collation_follows_the_database_default(engine):
+    """El 1267: la sesión del handshake queda en general_ci aunque la base sea unicode_ci."""
+    conn = _DatabaseDefaultsConn("utf8mb4", "utf8mb4_unicode_ci")
+    MigrationRunner._align_session_collation(conn, engine, "db")
+    assert conn.executed == [
+        "SELECT @@character_set_database, @@collation_database",
+        "SET collation_connection = @@collation_database",
+    ]
+
+
+def test_align_session_collation_skips_a_non_utf8mb4_database():
+    """Cambiar a latin1 transcodificaría cada literal del up_sql: se deja como estaba."""
+    conn = _DatabaseDefaultsConn("latin1", "latin1_swedish_ci")
+    MigrationRunner._align_session_collation(conn, EngineType.mariadb, "db")
+    assert conn.executed == ["SELECT @@character_set_database, @@collation_database"]
+
+
+def test_align_session_collation_is_a_noop_on_postgresql():
+    conn = _RecordingConn()
+    MigrationRunner._align_session_collation(conn, EngineType.postgresql, "db")
+    assert conn.executed == []
+
+
 def test_toggle_fk_checks_is_best_effort():
     """Si el SET falla (motor sin soporte, o el pseudo-root sin permiso), se ignora."""
     conn = _RecordingConn(fail_on="FOREIGN_KEY_CHECKS")
