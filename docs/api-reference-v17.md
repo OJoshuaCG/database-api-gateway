@@ -231,6 +231,7 @@ mensajes con esto y **no inventar copy**, que después diverge.
 | `collation.version_partial_selection` | 409 | «Alguna base convirtió solo parte de sus tablas: no se puede versionar una conversión parcial.» Trae `database_name`. |
 | `collation.version_too_large` | 409 | «El SQL de la versión supera el tope de tamaño.» Trae `bytes` y `max_bytes`. |
 | `collation.version_quarantined_before_batch` | 409 | «Alguna base está en cuarentena: revisala antes de versionar.» Trae `quarantined_database_ids: int[]`. |
+| `collation.version_foreign_keys_unreadable` | 502 | «No se pudieron leer las FKs de una base del lote; reintentá.» Trae `database_name`. No se creó ni se stampeó nada. |
 
 **Forma de error por ítem, una sola**: `ok: bool` + `error_code: string | null`. Molde de
 `classifyItem` de `environments/messages.ts`, cuyo fallback documentado es que un ítem con

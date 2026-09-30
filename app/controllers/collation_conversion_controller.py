@@ -3175,13 +3175,16 @@ class CollationConversionController:
     # ------------------------------------------------------------------ #
     # Fase C — versión de CONTABILIDAD del lote                           #
     # ------------------------------------------------------------------ #
-    # Se crea y se STAMPEA en las N BDs; NO está pensada para aplicarse nunca. La conversión
-    # ya la hizo cada job leyendo su propio inventario; esto solo evita que el ledger del
-    # blueprint mienta sobre lo que sus bases tienen físicamente.
+    # Se crea y se STAMPEA en las N BDs del lote, que ya están convertidas. Sobre ELLAS no se
+    # aplica nunca: la conversión ya la hizo cada job leyendo su propio inventario. Pero una BD
+    # NUEVA creada después desde el blueprint SÍ la aplica, así que su SQL tiene que funcionar.
 
-    def _version_statements(self, job_row: tuple) -> tuple[list[str], set[str], bool]:
+    def _version_statements(
+        self, job_row: tuple
+    ) -> tuple[list[tuple[str, str]], set[str], bool]:
         """
-        Sentencias de la versión para UN job, más su conjunto de tablas y si fue parcial.
+        Sentencias de la versión para UN job como ``(sql, object_type)``, más su conjunto de
+        tablas y si fue parcial.
 
         El plan se RECONSTRUYE desde ``job.selection`` + un inventario fresco, igual que hacen
         ``preview`` y ``execute``. Dos razones:
@@ -3200,6 +3203,31 @@ class CollationConversionController:
         El SQL va **sin calificar** con el nombre de la base: la migración corre conectada al
         destino. ``ALTER DATABASE`` sin nombre aplica a la base por defecto de la conexión
         (documentado en MySQL 8 y en MariaDB).
+
+        POR QUÉ SUELTA Y RECREA LAS FKs DE TEXTO: la versión solo se STAMPEA en las bases del
+        lote, pero una BD nueva creada después desde el blueprint la APLICA con
+        ``MigrationRunner.apply``, que corre con ``foreign_key_checks`` ACTIVO (solo lo apaga
+        la limpieza del clon). Un ``CONVERT TO`` pelado sobre una tabla con una columna de texto
+        usada en una FK falla ahí en los DOS motores: MySQL 8 con 3780 (solo lo acepta con el
+        flag en 0) y MariaDB con 1832 aunque el flag esté en 0 (medido contra 11.8.9). El
+        ``up_sql_mysql`` es uno solo para la familia, así que la única forma que sirve a ambos
+        es la del job en MariaDB (``_convert_fk_group``): soltar, convertir, recrear.
+
+        Orden: ``ALTER DATABASE`` → TODOS los ``DROP FOREIGN KEY`` → los ``CONVERT TO`` → TODOS
+        los ``ADD CONSTRAINT``. Los drops van antes de cualquier conversión y los adds después
+        de todas porque una FK une DOS tablas y recrearla exige que ambas estén ya convertidas.
+        Las FKs se ordenan por ``(tabla, constraint)`` para que el SQL sea determinístico.
+
+        Las FKs se leen de la BD del job, que YA está convertida: su definición es el estado
+        destino. Solo entran las INTERNAS de la base (``text_foreign_keys`` ya descarta las que
+        llegan desde otra) y las que tocan al menos una tabla de la versión. Una FK cuyo otro
+        lado queda fuera de la versión se suelta y se recrea igual: sin soltarla, el
+        ``CONVERT TO`` de su lado falla seguro; recreándola, solo falla si en la BD nueva ese
+        otro lado no está en el charset destino, que es la misma incoherencia que el rechazo
+        por conversión parcial existe para no propagar.
+
+        Si las FKs no se pueden leer se rechaza la versión (fail-closed): sin ellas el SQL
+        volvería a ser el ``CONVERT TO`` pelado que se sabe roto.
         """
         (
             _jid, server_id, db_name, selection_json, charset, collation, _md_id
@@ -3218,11 +3246,14 @@ class CollationConversionController:
         cs = validate_identifier(charset, dialect, "charset")
         co = validate_identifier(collation, dialect, "collation")
 
-        stmts: list[str] = []
+        head: list[tuple[str, str]] = []
         if plan.include_database_default:
-            stmts.append(f"ALTER DATABASE CHARACTER SET {cs} COLLATE {co}")
+            head.append(
+                (f"ALTER DATABASE CHARACTER SET {cs} COLLATE {co}", COLLATION_OBJ_DATABASE)
+            )
 
         tables: set[str] = set()
+        converts: list[tuple[str, str]] = []
         for step in plan.steps:
             if step.object_type != COLLATION_OBJ_TABLE:
                 continue
@@ -3233,7 +3264,35 @@ class CollationConversionController:
             t_q = quote_identifier(
                 validate_identifier(name, dialect, "tabla", allow_existing=True), dialect
             )
-            stmts.append(f"ALTER TABLE {t_q} CONVERT TO CHARACTER SET {cs} COLLATE {co}")
+            converts.append((
+                f"ALTER TABLE {t_q} CONVERT TO CHARACTER SET {cs} COLLATE {co}",
+                COLLATION_OBJ_TABLE,
+            ))
+
+        fks: list[TextForeignKey] = []
+        if tables:
+            try:
+                fks = adapter.text_foreign_keys(db_name, sorted(tables))
+            except Exception:  # el detalle va al log; la respuesta lleva solo el código
+                logger.warning(
+                    "Versión de collation: no se pudieron leer las FKs de texto de %s",
+                    db_name, exc_info=True,
+                )
+                raise AppHttpException(
+                    message=(
+                        "No se pudieron leer las FKs de una base de datos del lote. Sin ellas "
+                        "la versión no se podría aplicar a una base nueva del blueprint."
+                    ),
+                    status_code=502,
+                    public_context={
+                        "code": collation_catalog.CODE_VERSION_FOREIGN_KEYS_UNREADABLE,
+                        "database_name": db_name,
+                    },
+                    context={"job_id": _jid},
+                )
+        fks = sorted(fks, key=lambda fk: (fk.table, fk.name))
+        drops = [(fk.drop_sql, COLLATION_OBJ_FOREIGN_KEY) for fk in fks]
+        adds = [(fk.add_sql, COLLATION_OBJ_FOREIGN_KEY) for fk in fks]
 
         # PARCIAL = quedaron tablas del inventario que necesitan conversión y no están en el
         # plan. Propagar eso a N bases como versión no es la misma decisión que convertir
@@ -3241,7 +3300,7 @@ class CollationConversionController:
         partial = any(
             t.needs_conversion and t.name not in tables for t in inv.tables
         )
-        return stmts, tables, partial
+        return [*head, *drops, *converts, *adds], tables, partial
 
     def create_blueprint_version(
         self, model_id: int, batch_id: int, *, name: str | None = None,
@@ -3407,7 +3466,7 @@ class CollationConversionController:
                 databases_behind=behind,
             )
 
-        all_stmts: list[str] = []
+        all_stmts: list[tuple[str, str]] = []
         table_sets: list[set[str]] = []
         for row in job_rows:
             stmts, tables, partial = self._version_statements(row)
@@ -3435,7 +3494,7 @@ class CollationConversionController:
                 ),
             )
 
-        up_sql = _MANIFEST_JOIN.join(all_stmts)
+        up_sql = _MANIFEST_JOIN.join(sql for sql, _kind in all_stmts)
         if not up_sql.strip():
             _reject(
                 collation_catalog.CODE_VERSION_BATCH_NOT_COMPLETE,
@@ -3490,21 +3549,19 @@ class CollationConversionController:
                 # caracteres irreversible) con collations que las hermanas nunca tuvieron.
                 "statements": [
                     {
-                        "up_sql": s,
+                        "up_sql": sql,
                         "down_sql": None,
                         "down_confirmed": False,
-                        "object_type": (
-                            COLLATION_OBJ_DATABASE
-                            if s.startswith("ALTER DATABASE")
-                            else COLLATION_OBJ_TABLE
-                        ),
+                        "object_type": kind,
                         "object_name": None,
                         "op_group": None,
                         # Coherente con schema_diff, que clasifica un cambio de charset como
                         # destructivo con data_conversion: re-codifica cada valor de texto.
+                        # Los DROP/ADD de FK también: sin DDL transaccional, un ADD que falla
+                        # deja la base SIN la constraint.
                         "destructive": True,
                     }
-                    for s in all_stmts
+                    for sql, kind in all_stmts
                 ],
             },
             admin=admin,

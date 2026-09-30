@@ -210,6 +210,10 @@ Los ítems de FK **no** cuentan en `tables_total` ni en `progress.tables_done`, 
 contando solo pasos de conversión. La lógica vive en `_convert_fk_group` del controller; su
 docstring tiene el porqué completo.
 
+La **versión de contabilidad** tiene el mismo problema por otra vía, y en los **dos** motores: una
+BD nueva del blueprint la aplica con `foreign_key_checks` activo. Por eso su SQL también suelta y
+recrea las FKs de texto (ver *Cómo se construye el SQL*).
+
 ### Los pasos corren con el timeout de volcado, no con el interactivo
 
 Toda sentencia de la conversión va con `bulk=True`
@@ -552,8 +556,10 @@ corrida de la captura de SELECT. Por eso `execute` exige, junto:
 `POST /database-models/{id}/collation-conversions/{batch_id}/blueprint-version` registra un lote
 terminado como versión secuencial y la **stampea** en sus N bases.
 
-**Se crea y se marca; no se aplica nunca.** La conversión ya la hizo cada job. Esto solo evita
-que el ledger del blueprint mienta sobre lo que sus bases tienen físicamente.
+**Sobre las bases del lote se crea y se marca; no se aplica.** La conversión ya la hizo cada job.
+Esto evita que el ledger del blueprint mienta sobre lo que sus bases tienen físicamente. Pero una
+BD **nueva** creada después desde el blueprint **sí la aplica** (`MigrationRunner.apply`, con el
+resto de la cadena), así que su SQL tiene que funcionar sobre una base sin convertir.
 
 Es una llamada **explícita del operador** y no un hook del worker, y eso resuelve cuatro cosas de
 una:
@@ -566,7 +572,7 @@ una:
   propaga ContextVars);
 - un fallo es un HTTP que el operador ve, no un estado que descubre horas después.
 
-### Ocho guards, y por qué cada uno
+### Nueve guards, y por qué cada uno
 
 | Guard | Por qué |
 |---|---|
@@ -578,6 +584,7 @@ una:
 | ninguna conversión parcial | Convertir parcialmente UNA base es una decisión informada; propagar esa incoherencia de FKs a N bases no es la misma decisión. |
 | ninguna en cuarentena | `stamp` limpia la cuarentena: stampearla borraría en silencio la marca de "revisá esta base". |
 | tope de tamaño | `SNAPSHOT_MAX_SQL_PER_VERSION` (4 MB), el que ya usan los llamadores internos — no el cap de 256 KB de la ruta HTTP. |
+| FKs de texto legibles | Sin ellas el SQL sería el `CONVERT TO` pelado que una BD nueva no puede aplicar (ver abajo). Si `text_foreign_keys` falla, `502` con `collation.version_foreign_keys_unreadable` y no se crea ni se stampea nada. |
 
 ### Cómo se construye el SQL
 
@@ -586,6 +593,22 @@ una:
   y en MariaDB). Con el nombre del origen adentro, aplicarla a una hermana convertiría la base
   **equivocada**, en silencio.
 - **Incluye las tablas que en el origen ya estaban al día**: una hermana futura puede no estarlo.
+- **Suelta y recrea las FKs de texto**, en este orden: `ALTER DATABASE` → todos los
+  `DROP FOREIGN KEY` → los `CONVERT TO` → todos los `ADD CONSTRAINT`. El `apply` de una BD nueva
+  corre con `foreign_key_checks` activo (solo lo apaga la limpieza del clon), y ahí un
+  `CONVERT TO` sobre una tabla con una columna de texto usada en una FK falla en **MySQL 8 con
+  3780** y en **MariaDB con 1832**; el flag en 0 salvaría a MySQL pero no a MariaDB, y el
+  `up_sql_mysql` es uno solo para la familia. Los drops van antes de cualquier conversión y los
+  adds después de todas porque una FK une dos tablas y recrearla exige que ambas estén ya
+  convertidas. Las FKs salen de `text_foreign_keys` sobre la BD del job, **ya convertida** (su
+  definición es el estado destino): solo internas, sin calificar, las que tocan al menos una
+  tabla de la versión, ordenadas por `(tabla, constraint)`. Una FK cuyo otro lado quedó fuera de
+  la versión también se suelta y se recrea: sin eso su `CONVERT TO` falla seguro, y con eso solo
+  falla si la BD nueva tiene ese otro lado en otro charset — la incoherencia que el guard de
+  conversión parcial ya no deja propagar. En el manifiesto esas sentencias van con
+  `object_type = "foreign_key"`.
+- De las N bases del lote se usa el SQL de la **primera** (orden del lote); de las demás solo se
+  compara el conjunto de tablas. Las FKs no se comparan entre hermanas.
 - El plan se **reconstruye** desde `selection` + un inventario fresco, no desde los ítems
   persistidos. Las tablas que ya no existen quedan fuera solas (viven en `missing_tables`, que no
   son pasos), mientras que en los ítems "ya no existe" y "ya estaba al día" son ambos `skipped` y
@@ -746,7 +769,10 @@ conversión), no de mención, y hay un test dedicado a fijar esa distinción.
   con `attcollation`, `pg_constraint` con el par `conkey`/`confkey`), que el `ALTER` múltiple
   no reescriba la tabla, el tiempo real de reconstrucción de índices, y el comportamiento
   exacto de 42P22/42P21 en una FK con collations mezcladas.
-- Lote, versión y deriva: `tests/test_api_collation_batches.py` (31 casos, worker síncrono).
+- Lote, versión y deriva: `tests/test_api_collation_batches.py` (33 casos, worker síncrono).
+  Los dos de FKs en la versión
+  (`test_version_drops_text_fks_before_converting_and_recreates_them_after` y
+  `test_version_fails_closed_when_text_fks_are_unreadable`) están **escritos, no ejecutados**.
   Dos de ellos fijan invariantes que se rompen **en silencio** y por eso no alcanzan con una
   aserción indirecta: uno invoca `MigrationRunner.usable_manifest` **de verdad** sobre el spec
   cargado con `_load_specs` (si el separador del manifiesto dejara de coincidir, se descarta el
@@ -755,6 +781,11 @@ conversión), no de mención, y hay un test dedicado a fijar esa distinción.
   `source: "cached"` no se degrade a una lectura del motor sin que nadie se entere.
 
 **Lo que NO está verificado, y hay que decirlo:**
+
+- **Aplicar la versión con FKs a una BD nueva no se corrió contra un motor real.** Ni en MySQL 8
+  ni en MariaDB se ejecutó la secuencia `DROP FOREIGN KEY` → `CONVERT TO` → `ADD CONSTRAINT` por
+  el camino de Alembic (`apply` con `foreign_key_checks` activo), ni se midió el `ADD` sobre una
+  base con datos.
 
 - **El grupo de FKs de MariaDB no se corrió contra un motor real.** La premisa sí está medida
   (MariaDB 11.8.9 rechaza con 1832 con y sin el flag), pero ni los tests unitarios nuevos ni

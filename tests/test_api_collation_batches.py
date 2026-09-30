@@ -13,11 +13,14 @@ un plano en vivo distinto, solo orquesta N veces el mismo.
 import app.controllers.collation_conversion_controller as cc
 import app.services.collation_conversion_runner as ccr
 from tests.test_api_collation_conversions import (
+    _FK_ADD,
+    _FK_DROP,
     TARGET_CO,
     TARGET_CS,
     _FakeAdapter,
     _FakeRunner,
     _inventory,
+    _orders_users_fk,
 )
 
 SLUG = "bp-collation"
@@ -524,6 +527,8 @@ def test_version_is_created_and_stamped_never_applied(admin_client, monkeypatch)
     assert "ALTER DATABASE CHARACTER SET" in sql
     assert "db_a" not in sql and "db_b" not in sql
     assert "ALTER TABLE `users` CONVERT TO CHARACTER SET" in sql
+    # Sin FKs de texto en el origen, la versión no suelta ni recrea ninguna.
+    assert "FOREIGN KEY" not in sql
     # Incluye las tablas que en el origen ya estaban al día: una hermana futura puede no estarlo.
     assert "`already_ok`" in sql
     # Sin reverso: RollbackGenerator devuelve None para este SQL, y eso es la verdad.
@@ -688,6 +693,104 @@ def test_version_manifest_reconstructs_up_sql_via_the_real_join(admin_client, mo
         "un cambio de charset re-codifica cada valor de texto: schema_diff ya lo clasifica "
         "destructivo, y el manifiesto tiene que decir lo mismo"
     )
+
+
+def _batch_with_fake(admin_client, monkeypatch, port, names=("db_a", "db_b")):
+    """Como ``_run_batch``, pero devuelve también el adapter falso para inyectarle FKs."""
+    fake = _install(monkeypatch, databases=list(names))
+    model_id, _sid, ids = _setup(admin_client, port, names=names)
+    plan = _plan(admin_client, model_id).json()["data"]
+    assert _exec(admin_client, model_id, plan).status_code == 200
+    return fake, model_id, plan["batch_id"], ids
+
+
+def _stub_stamp(monkeypatch):
+    import app.controllers.managed_migration_controller as mmc
+
+    _StampSpy.current, _StampSpy.stamped = None, []
+    monkeypatch.setattr(cc, "MigrationRunner", _StampSpy)
+    monkeypatch.setattr(
+        mmc.ManagedMigrationController,
+        "stamp",
+        lambda self, db_id, version, **kw: _StampSpy.stamped.append((db_id, version)),
+    )
+
+
+def test_version_drops_text_fks_before_converting_and_recreates_them_after(
+    admin_client, monkeypatch
+):
+    """
+    Una BD NUEVA del blueprint APLICA esta versión con ``foreign_key_checks`` activo, y ahí un
+    ``CONVERT TO`` pelado sobre una tabla con una FK de texto falla en los dos motores (3780 en
+    MySQL 8, 1832 en MariaDB aunque el flag esté en 0). El SQL tiene que soltar la FK ANTES de
+    convertir cualquiera de sus dos tablas y recrearla DESPUÉS de convertir ambas.
+    """
+    from app.controllers.managed_migration_controller import ManagedMigrationController
+    from app.core.database import Database
+    from app.models.enums import EngineType
+    from app.services.db_admin.migrations import MigrationRunner as RealRunner
+
+    fake, model_id, batch_id, _ids = _batch_with_fake(admin_client, monkeypatch, 3960)
+    fake.text_fks = [_orders_users_fk()]
+    _stub_stamp(monkeypatch)
+
+    r = _version(admin_client, model_id, batch_id)
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    mig = admin_client.get(
+        f"/api/v1/database-models/{model_id}/migrations/{data['version']}"
+    ).json()["data"]
+    stmts = mig["up_sql"].split(cc._MANIFEST_JOIN)
+
+    convert_users = next(
+        i for i, s in enumerate(stmts) if s.startswith("ALTER TABLE `users` CONVERT TO")
+    )
+    convert_orders = next(
+        i for i, s in enumerate(stmts) if s.startswith("ALTER TABLE `orders` CONVERT TO")
+    )
+    assert stmts.count(_FK_DROP) == 1 and stmts.count(_FK_ADD) == 1
+    drop, add = stmts.index(_FK_DROP), stmts.index(_FK_ADD)
+    assert stmts[0].startswith("ALTER DATABASE"), "el ALTER DATABASE sigue primero"
+    assert drop < min(convert_users, convert_orders)
+    assert add > max(convert_users, convert_orders)
+    # Sin calificar, igual que los CONVERT: la migración corre conectada a la BD nueva.
+    assert "db_a" not in mig["up_sql"] and "db_b" not in mig["up_sql"]
+    # Se leyeron las FKs de las tablas de la versión, incluidas las que ya estaban al día.
+    assert all(set(c) == {"users", "orders", "already_ok"} for c in fake.text_fk_calls)
+
+    # El manifiesto sigue reconstruyendo el up_sql y etiqueta las FKs como tales.
+    session = Database().get_declarative_base_session()
+    try:
+        specs = ManagedMigrationController()._load_specs(session, model_id)
+    finally:
+        session.close()
+    spec = next(s for s in specs if s.version == data["version"])
+    manifest = RealRunner().usable_manifest(spec, EngineType.mysql)
+    assert len(manifest) == data["statement_count"] == len(stmts)
+    kinds = {m.up_sql: m.object_type for m in manifest}
+    assert kinds[_FK_DROP] == kinds[_FK_ADD] == "foreign_key"
+    assert kinds[stmts[convert_users]] == "table"
+
+
+def test_version_fails_closed_when_text_fks_are_unreadable(admin_client, monkeypatch):
+    """
+    Sin las FKs, la versión volvería a ser el ``CONVERT TO`` pelado que una BD nueva no puede
+    aplicar. Se rechaza con código propio, sin volcar el error del motor, y sin crear ni
+    stampear nada.
+    """
+    fake, model_id, batch_id, _ids = _batch_with_fake(admin_client, monkeypatch, 3961)
+    fake.text_fks_fail = True
+    _stub_stamp(monkeypatch)
+
+    r = _version(admin_client, model_id, batch_id)
+    assert r.status_code == 502, r.text
+    detail = r.json()["detail"]
+    assert detail["public_context"]["code"] == "collation.version_foreign_keys_unreadable"
+    assert "information_schema ilegible" not in r.text
+    assert _StampSpy.stamped == []
+    versions = admin_client.get(f"/api/v1/database-models/{model_id}/migrations")
+    assert versions.status_code == 200, versions.text
+    assert versions.json()["data"] == []
 
 
 # =========================================================================== #

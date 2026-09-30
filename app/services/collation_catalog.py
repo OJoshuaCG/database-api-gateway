@@ -105,6 +105,12 @@ CODE_VERSION_TOO_LARGE = "collation.version_too_large"
 # así que stampearla borraría en silencio la marca de "revisá esta base".
 CODE_VERSION_QUARANTINED_BEFORE = "collation.version_quarantined_before_batch"
 
+# No se pudieron leer las FKs de texto de alguna BD del lote. La versión las necesita: una BD
+# NUEVA que la aplique tiene que soltarlas antes de convertir y recrearlas después, o el
+# `CONVERT TO` falla (1832 en MariaDB, 3780 en MySQL). Emitir la versión sin ellas sería
+# publicar un SQL que se sabe roto.
+CODE_VERSION_FOREIGN_KEYS_UNREADABLE = "collation.version_foreign_keys_unreadable"
+
 ALL_CODES: frozenset[str] = frozenset(
     {
         CODE_SCOPE_NOT_ALLOWED,
@@ -116,6 +122,7 @@ ALL_CODES: frozenset[str] = frozenset(
         CODE_VERSION_PARTIAL_SELECTION,
         CODE_VERSION_TOO_LARGE,
         CODE_VERSION_QUARANTINED_BEFORE,
+        CODE_VERSION_FOREIGN_KEYS_UNREADABLE,
         CODE_BATCH_DATABASE_SET_MISMATCH,
         CODE_BATCH_CONFIRMATION_REQUIRED,
         CODE_BATCH_NOT_PENDING,
