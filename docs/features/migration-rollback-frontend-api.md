@@ -123,6 +123,7 @@ Respuesta paginada (`data: ModelMigrationSummary[]`):
   "kind": "schema",               // "schema" | "data"
   "is_baseline": false,
   "reviewed": true,
+  "applied_database_count": 2,    // BDs con la versión aplicada HOY (ver api-reference-v27.md)
   "created_at": "2026-01-01T00:00:00Z"
 }
 ```

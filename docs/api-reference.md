@@ -1148,7 +1148,8 @@ confírmalo con `PATCH`).
 
 `ModelMigrationSummary` (item de listado): `{ id, model_id, version, name,
 has_mysql_override, has_postgresql_override, has_rollback, checksum, is_baseline, reviewed,
-created_at }`.
+applied_database_count, created_at }`. `applied_database_count` (cuántas BDs tienen la versión
+aplicada hoy) está en `api-reference-v27.md`.
 
 #### Endpoints
 

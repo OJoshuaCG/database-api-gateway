@@ -457,7 +457,7 @@ caído en el blueprint bloquee el borrado de cualquier versión, incluidas las q
 
 | Camino | Fuente de la versión | Por qué |
 |---|---|---|
-| **Listado / detalle** (`sql_frozen`, `deletable`, `block_reason`, `delete_requires_stamps`) | Caché del inventario (`ManagedDatabase.model_version`) | Corre por cada fila de cada página: abrir una conexión por BD para pintar un botón no se sostiene. |
+| **Listado / detalle** (`sql_frozen`, `deletable`, `block_reason`, `delete_requires_stamps`; en el listado también `applied_database_count`) | Caché del inventario (`ManagedDatabase.model_version`) | Corre por cada fila de cada página: abrir una conexión por BD para pintar un botón no se sostiene. |
 | **`delete-plan` / `PATCH` / `DELETE`** (el 409) | **El motor**, vía `MigrationRunner.get_current_version` | Es el veredicto autoritativo: se está por autorizar algo irreversible, y la caché puede estar rancia. |
 
 La divergencia posible es en la dirección segura: si la caché quedó atrasada, el listado puede

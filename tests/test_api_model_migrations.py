@@ -759,6 +759,86 @@ def test_policy_flags_patch_de_solo_nombre_no_miente(admin_client):
     assert r.json()["data"]["sql_frozen"] is True
 
 # --------------------------------------------------------------------------- #
+# applied_database_count: cuántas BDs tienen la versión aplicada HOY           #
+# --------------------------------------------------------------------------- #
+def _set_cached_version(managed_db_id, version):
+    """Fija ``ManagedDatabase.model_version`` SIN historial: el rastro de un stamp/adopción."""
+    from app.core.database import Database
+    from app.models.managed_database import ManagedDatabase
+
+    s = Database().get_declarative_base_session()
+    try:
+        s.get(ManagedDatabase, managed_db_id).model_version = version
+        s.commit()
+    finally:
+        s.close()
+
+
+def _counts_by_version(admin_client, model_id):
+    items = admin_client.get(f"/api/v1/database-models/{model_id}/migrations").json()["data"]
+    return {it["version"]: it["applied_database_count"] for it in items}
+
+
+def test_applied_database_count_cuenta_solo_las_bds_que_la_aplicaron(admin_client):
+    """
+    Cuenta historial ``applied`` Y versión que la alcanza, por BD.
+
+    La BD stampeada en 0002 sin historial es el caso que el cliente no puede distinguir
+    mirando ``model_version``: DECLARA la 0002 pero nunca la corrió, así que no cuenta para
+    ninguna de las dos versiones.
+    """
+    model_id = _new_model(admin_client, slug="cnt1", name="Cnt1")
+    m1 = _create_migration(admin_client, model_id, version="0001").json()["data"]["id"]
+    m2 = _create_migration(
+        admin_client, model_id, version="0002",
+        up_sql="ALTER TABLE users ADD COLUMN phone VARCHAR(20)",
+    ).json()["data"]["id"]
+
+    # A: corrió las dos y está en 0002.
+    db_a = _managed_db_for_model(admin_client, model_id, port=5471, name="cnt_a")
+    _insert_history_row(db_a, m1, status="applied")
+    _insert_history_row(db_a, m2, status="applied", db_version="0002")
+    # B: corrió solo la 0001 y está en 0001.
+    db_b = _managed_db_for_model(admin_client, model_id, port=5472, name="cnt_b")
+    _insert_history_row(db_b, m1, status="applied", db_version="0001")
+    # C: declarada en 0002 por stamp/adopción, sin historial.
+    db_c = _managed_db_for_model(admin_client, model_id, port=5473, name="cnt_c")
+    _set_cached_version(db_c, "0002")
+
+    assert _counts_by_version(admin_client, model_id) == {"0001": 2, "0002": 1}
+
+
+def test_applied_database_count_es_cero_sin_aplicaciones_vigentes(admin_client):
+    """
+    Cero —nunca null— para una versión sin BDs, una solo fallida y una revertida.
+
+    La revertida tiene historial ``applied`` (el rollback no lo revoca) pero la BD ya no la
+    alcanza: contar el historial solo diría "aplicada" de algo que la BD ya no tiene.
+    """
+    model_id = _new_model(admin_client, slug="cnt2", name="Cnt2")
+    m1 = _create_migration(admin_client, model_id, version="0001").json()["data"]["id"]
+    m2 = _create_migration(
+        admin_client, model_id, version="0002",
+        up_sql="ALTER TABLE users ADD COLUMN phone VARCHAR(20)",
+    ).json()["data"]["id"]
+    _create_migration(
+        admin_client, model_id, version="0003",
+        up_sql="ALTER TABLE users ADD COLUMN email VARCHAR(80)",
+    )
+
+    # Revertida: corrió la 0001 y después volvió a "sin versión" (model_version NULL).
+    db_r = _managed_db_for_model(admin_client, model_id, port=5474, name="cnt_r")
+    _insert_history_row(db_r, m1, status="applied")
+    # Solo fallida.
+    db_f = _managed_db_for_model(admin_client, model_id, port=5475, name="cnt_f")
+    _insert_history_row(db_f, m2, status="failed")
+
+    counts = _counts_by_version(admin_client, model_id)
+    assert counts == {"0001": 0, "0002": 0, "0003": 0}
+    assert all(isinstance(v, int) for v in counts.values())
+
+
+# --------------------------------------------------------------------------- #
 # Vigencia de una versión: lo que congela es la versión ACTUAL, no el historial #
 # --------------------------------------------------------------------------- #
 def _blueprint_con_tres_versiones(admin_client, slug, port, db_version):

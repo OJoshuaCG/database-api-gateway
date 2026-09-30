@@ -341,8 +341,21 @@ class ModelMigrationController:
     @classmethod
     def _still_applied_cached(
         cls, session, migrations: list[ModelMigration]
-    ) -> set[int]:
-        """IDs de migración que HOY siguen aplicadas en alguna BD, según la CACHÉ.
+    ) -> dict[int, int]:
+        """``{migration_id: cuántas BDs la tienen aplicada HOY}``, según la CACHÉ.
+
+        Solo aparecen las migraciones con al menos una BD: ausente ⇒ cero. "Aplicada" es la
+        conjunción de las dos condiciones, y ninguna alcanza sola:
+          - fila de ``database_migration_history`` con ``status=applied`` (y dirección no
+            ``down``) para esa BD — el historial es un log de EVENTOS que el rollback no
+            revoca, así que por sí solo no dice que la BD la tenga hoy;
+          - la versión cacheada de esa BD **alcanza** la de la migración
+            (``_reaches_version``, criterio ``>=``) — por sí sola tampoco: ``stamp``, la
+            adopción y un apply que empezó en una versión intermedia mueven el puntero sin
+            que la migración haya corrido en esa BD.
+
+        El conteo sale del mismo recorrido que alimenta ``sql_frozen``, sin queries extra:
+        antes se cortaba en la primera BD porque solo importaba el booleano.
 
         Usa ``ManagedDatabase.model_version`` (la caché del inventario) y no el motor: esto
         corre por cada fila de cada página del listado de versiones, y abrir una conexión por
@@ -356,22 +369,25 @@ class ModelMigrationController:
         targets = cls._applied_history_targets(session, [m.id for m in migrations])
         db_ids = {db_id for ids in targets.values() for db_id in ids}
         if not db_ids:
-            return set()
+            return {}
         versions = dict(
             session.query(ManagedDatabase.id, ManagedDatabase.model_version)
             .filter(ManagedDatabase.id.in_(db_ids))
             .all()
         )
-        still: set[int] = set()
+        counts: dict[int, int] = {}
         for m in migrations:
-            for db_id in targets.get(m.id, ()):
-                # Una BD con historial cuya fila ya no está en el inventario no debería
-                # existir (CASCADE), pero si aparece se cuenta como vigente: no se puede
-                # probar lo contrario.
-                if db_id not in versions or cls._reaches_version(versions[db_id], m.version):
-                    still.add(m.id)
-                    break
-        return still
+            # Una BD con historial cuya fila ya no está en el inventario no debería existir
+            # (CASCADE), pero si aparece se cuenta como vigente: no se puede probar lo
+            # contrario, y un solo criterio evita que el conteo y ``sql_frozen`` discrepen.
+            n = sum(
+                1
+                for db_id in targets.get(m.id, ())
+                if db_id not in versions or cls._reaches_version(versions[db_id], m.version)
+            )
+            if n:
+                counts[m.id] = n
+        return counts
 
     @classmethod
     def _still_applied_live(cls, session, m: ModelMigration) -> list[dict]:
@@ -456,6 +472,14 @@ class ModelMigrationController:
             checkpoint contra un SQL distinto del que corrió.
           - ``deletable``: lo anterior, y además ser la punta de la secuencia.
 
+        ``applied_database_count`` es la excepción deliberada a "la decisión, no sus
+        insumos": es un DATO para mostrar ("aplicada en N BDs"), no un insumo del que la UI
+        deba deducir si puede editar o borrar — para eso siguen ``sql_frozen``/``deletable``.
+        Y tiene que venir calculado de acá porque el cliente no puede derivarlo: lo que ve
+        es la versión DECLARADA de cada BD (``model_version``), y declarada no es aplicada
+        — ``stamp``, la adopción y un apply que arrancó en una versión intermedia mueven el
+        puntero sin que la migración haya corrido. Ver ``_still_applied_cached``.
+
         Dos queries en lote para toda la página (nada de N+1). No se usa ``func.count(...)
         .filter(...)``: ``FILTER`` es exclusivo de PostgreSQL y la BD de metadatos puede ser
         MySQL/MariaDB, además de SQLite en los tests.
@@ -466,7 +490,7 @@ class ModelMigrationController:
         # No alcanza con "tiene historial de aplicación exitosa": eso es un evento pasado que
         # nunca se revoca (el rollback escribe el MISMO status). Lo que congela es que alguna
         # BD dependa de la versión HOY. Ver el bloque de ``_still_applied_cached``.
-        applied_ids = ModelMigrationController._still_applied_cached(session, migrations)
+        applied_counts = ModelMigrationController._still_applied_cached(session, migrations)
         partial_ids = migration_progress.migrations_with_incomplete_progress(ids, "up")
         parque = ModelMigrationController._cached_versions_by_model(
             session, {m.model_id for m in migrations}
@@ -492,7 +516,7 @@ class ModelMigrationController:
             flags[m.id] = {
                 # Criterio ``>=``: editar el SQL de una versión que alguna BD ya pasó dejaría
                 # la metadata describiendo algo que no fue lo que corrió allí.
-                "sql_frozen": m.id in applied_ids or partial,
+                "sql_frozen": m.id in applied_counts or partial,
                 # Criterio de IGUALDAD, y por eso no coincide con ``sql_frozen``: a las BDs
                 # que están adelante el borrado les mueve el puntero a la etiqueta nueva de su
                 # misma migración, así que no bloquean. Solo bloquea la que está PARADA acá,
@@ -505,6 +529,9 @@ class ModelMigrationController:
                 # el plan autoritativo es ``GET .../{version}/delete-plan``.
                 "delete_requires_stamps": ahead,
                 "sql_diverged": m.id in diverged_ids,
+                # Cuántas BDs la tienen aplicada HOY (historial ``applied`` Y versión que la
+                # alcanza). Sale de la caché, igual que ``sql_frozen``.
+                "applied_database_count": applied_counts.get(m.id, 0),
             }
         return flags
 

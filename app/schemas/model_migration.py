@@ -152,6 +152,15 @@ _IS_LATEST_DESC = (
     "gestionadas y no el catálogo de versiones."
 )
 
+_APPLIED_DB_COUNT_DESC = (
+    "Cuántas BDs gestionadas tienen esta versión aplicada HOY: fila de historial con "
+    "status=applied Y versión cacheada de la BD que la alcanza (>=). Es un dato para mostrar, "
+    "no una regla: para decidir si se puede editar o borrar están sql_frozen y deletable. El "
+    "cliente NO puede derivarlo de model_version de cada BD: esa es la versión DECLARADA, y "
+    "stamp, la adopción o un apply que arrancó en una versión intermedia la mueven sin que la "
+    "migración haya corrido. Sale de la caché del inventario, igual que sql_frozen."
+)
+
 
 class ModelMigrationSummary(BaseModel):
     """Item compacto para listados (no incluye el SQL completo ni traducciones)."""
@@ -164,6 +173,10 @@ class ModelMigrationSummary(BaseModel):
     delete_requires_stamps: bool = Field(False, description=_REQUIRES_STAMPS_DESC)
     sql_diverged: bool = Field(False, description=_SQL_DIVERGED_DESC)
     is_latest: bool = Field(False, description=_IS_LATEST_DESC)
+    # Sin default a propósito, como ``policy`` en ``_serialize``: si un camino nuevo arma el
+    # resumen sin pasar por ``_policy_flags``, tiene que fallar en el serializador y no
+    # responder un 0 que la UI mostraría como "no aplicada en ninguna BD".
+    applied_database_count: int = Field(..., ge=0, description=_APPLIED_DB_COUNT_DESC)
 
     id: int
     model_id: int
