@@ -140,6 +140,37 @@ prohíbe el atributo `Domain`). Una SPA servida en otro host no puede leerla con
 eso sirviendo la API bajo su mismo origen mediante un proxy, y ese proxy es quien consume este
 alias. El detalle completo está en `database-api-gateway-frontend/docs/dokploy.md` §3.
 
+### 4.2 Timeout de las rutas síncronas largas
+
+Seis rutas ejecutan DDL del usuario de forma **síncrona**, con el timeout de volcado del
+backend (`REMOTE_BULK_STATEMENT_TIMEOUT_MS`, 1 h por default): un `ALTER TABLE` sobre una tabla
+grande tarda minutos. Si un proxy intermedio corta antes, el cliente recibe `504` **mientras el
+backend sigue aplicando** — el operador ve un error de algo que en realidad termina bien.
+
+```
+POST /api/v1/managed-databases/{id}/migrations/apply
+POST /api/v1/managed-databases/{id}/migrations/rollback
+POST /api/v1/managed-databases/{id}/migrations/reconcile-partial
+POST /api/v1/database-models/{id}/migrations/apply-all
+POST /api/v1/schema-comparisons/{id}/adopt
+POST /api/v1/schema-comparisons/{id}/execute
+```
+
+**Dónde vive en producción.** La cadena es Traefik → nginx del frontend → uvicorn. Este compose
+no tiene nginx, así que el `proxy_read_timeout` de **3600s** para esas seis rutas está en el
+nginx del **frontend** (`database-api-gateway-frontend`); el resto de la API conserva su
+timeout normal. `docker/nginx/conf.d/app.conf` de este repo es **solo local** y replica la misma
+regla para que local se comporte como producción: si se agrega una ruta síncrona larga, hay que
+tocar los dos.
+
+**Traefik.** Sus `respondingTimeouts` (`readTimeout`, `writeTimeout`, `idleTimeout`) son
+configuración **estática** del entrypoint: en Dokploy se editan en la configuración de Traefik
+del servidor, no en la pestaña Domains del servicio, y requieren reiniciar Traefik. Se cree que
+en Traefik v2/v3 el `readTimeout` por default es `0` (sin límite) y que por lo tanto Traefik no
+corta estas rutas, pero **está sin confirmar**: lo tiene que verificar alguien con acceso al
+panel, mirando la versión de Traefik y su configuración estática. Si hay un valor fijado por
+debajo de 3600s, ese es el que manda.
+
 ## 5. Verificar el despliegue
 
 ```bash

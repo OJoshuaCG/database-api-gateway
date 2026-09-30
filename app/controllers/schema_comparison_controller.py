@@ -1658,12 +1658,20 @@ class SchemaComparisonController:
         )
 
         statements = [d["sql"] for d in resolved]
+        # ``bulk=True``: el DDL del diff es DDL del usuario sobre una BD de volumen
+        # arbitrario (un ``ALTER TABLE`` que reescribe una tabla grande tarda minutos). Con
+        # el timeout interactivo de 15 s, en MySQL/MariaDB ``read_timeout``/``write_timeout``
+        # son de socket DEL CLIENTE: cortan la conexión mientras el motor sigue ejecutando,
+        # así que el ítem quedaba marcado ``failed`` por una sentencia que igual se completa
+        # y el próximo execute la reintentaba sobre un esquema ya cambiado. Es el mismo
+        # defecto que ya se corrigió en ``apply``/``rollback`` del runner; acá faltaba.
         results = MigrationRunner().execute_adhoc(
             target,
             db_name=db_name,
             engine=engine,
             lock_key=lock_key,
             statements=statements,
+            bulk=True,
         )
         self._record_item_results(resolved, results)
 

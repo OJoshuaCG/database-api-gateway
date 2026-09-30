@@ -139,7 +139,7 @@ def _create(admin_client, src_id, tgt_id):
     )
 
 
-def _fake_exec_ok(self, target, *, db_name, engine, lock_key, statements):
+def _fake_exec_ok(self, target, *, db_name, engine, lock_key, statements, bulk=False):
     return [
         StatementResult(
             index=i, status="applied", error=None, execution_ms=1,
@@ -720,7 +720,7 @@ def test_execute_stops_on_first_failure(admin_client, monkeypatch):
     src_id, tgt_id, _, _ = _setup(admin_client, monkeypatch, port=3526)
     cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
 
-    def _fail_first(self, target, *, db_name, engine, lock_key, statements):
+    def _fail_first(self, target, *, db_name, engine, lock_key, statements, bulk=False):
         # Falla la primera; la segunda no llega a ejecutarse (corte en el primer fallo).
         return [
             StatementResult(
@@ -741,6 +741,37 @@ def test_execute_stops_on_first_failure(admin_client, monkeypatch):
     assert data["applied_count"] == 0
     statuses = [s["status"] for s in data["statements"]]
     assert statuses == ["failed", "skipped"]  # la 2ª quedó sin ejecutar
+
+
+def test_execute_uses_bulk_timeout(admin_client, monkeypatch):
+    """
+    El execute de una comparación corre su DDL con ``bulk=True``.
+
+    El timeout interactivo (15 s) se traduce en MySQL/MariaDB a ``read_timeout``/
+    ``write_timeout`` de socket DEL CLIENTE: cortaría la conexión de un ``ALTER TABLE`` sobre
+    una tabla no trivial **mientras el motor lo sigue ejecutando**, y el ítem quedaría
+    ``failed`` por una sentencia que en realidad se completa. Mismo defecto ya corregido en
+    ``apply``/``rollback``; este test evita que el execute vuelva al interactivo.
+    """
+    src_id, tgt_id, _, _ = _setup(admin_client, monkeypatch, port=3528)
+    cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
+    calls: list[bool] = []
+
+    def _spy(self, target, *, db_name, engine, lock_key, statements, bulk=False):
+        calls.append(bulk)
+        return _fake_exec_ok(
+            self, target, db_name=db_name, engine=engine, lock_key=lock_key,
+            statements=statements, bulk=bulk,
+        )
+
+    monkeypatch.setattr(MigrationRunner, "execute_adhoc", _spy)
+    token, _ = _token(admin_client, cid, "mysql", "all")
+    r = admin_client.post(
+        f"/api/v1/schema-comparisons/{cid}/execute",
+        json={"mode": "all", "confirm_target_name": "tgt_db", "confirm_token": token},
+    )
+    assert r.status_code == 200, r.text
+    assert calls == [True], calls
 
 
 def test_execute_anti_toctou_409(admin_client, monkeypatch):
