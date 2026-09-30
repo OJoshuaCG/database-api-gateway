@@ -155,6 +155,30 @@ class ModelMigration(Base, TimestampMixin):
         ),
     )
 
+    # ---- Autoría de la versión ------------------------------------------------------- #
+    # Molde: ``ExportJob.created_by_admin_id`` — ``Integer`` SIN FK, más el username y la clase
+    # de actor desnormalizados. Borrar un admin no debe borrar ni mutilar el rastro de quién
+    # escribió una versión que N bases ya aplicaron, y el día que desaparece tiene que poder
+    # mostrarse "usuario eliminado (#id)" sin reventar en un join ausente. Tampoco es una FK a
+    # ``audit_log``: ``audit.record`` es best-effort y la fila puede no existir justo cuando
+    # hace falta. NULL = autor desconocido (versión anterior a estas columnas que el backfill
+    # no pudo atribuir, ver la migración ``c5e7a9b1d3f6``); no se inventa.
+    created_by_admin_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="Admin o token que creó la versión (sin FK: historial desacoplado). NULL = desconocido",
+    )
+    created_by_username: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        comment="Nombre del actor al crear la versión (mismo ancho que audit_log)",
+    )
+    created_by_actor_type: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        comment="'admin' | 'api_token' (vocabulario de audit_log.actor_type). NULL = desconocido",
+    )
+
     def __repr__(self) -> str:
         return (
             f"<ModelMigration(id={self.id}, model_id={self.model_id}, "

@@ -21,6 +21,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
+from app.core.actor import actor_type_of, identity_of
 from app.core.context import current_http_identifier
 from app.core.database import Database
 from app.core.environments import (
@@ -147,6 +148,7 @@ class ModelMigrationController:
             "reviewed": m.reviewed,
             "capture_selects": m.capture_selects,
             **self._sql_facts(m),
+            **ModelMigrationController._authorship_out(m),
             "created_at": m.created_at,
             "updated_at": m.updated_at,
         }
@@ -169,7 +171,43 @@ class ModelMigrationController:
             "reviewed": m.reviewed,
             "capture_selects": m.capture_selects,
             **ModelMigrationController._sql_facts(m),
+            **ModelMigrationController._authorship_out(m),
             "created_at": m.created_at,
+        }
+
+    @staticmethod
+    def _authorship(admin: "dict | Actor | None") -> dict:
+        """
+        Columnas ``created_by_*`` de una versión NUEVA, leídas del mismo ``admin`` que se
+        audita.
+
+        Va por ``identity_of`` y ``actor_type_of`` y no lee el actor a mano: son la misma
+        lectura que hace ``audit._build``, así que la autoría de la versión y la fila de
+        ``migration.create`` nunca pueden discrepar. Sin actor (un llamador interno que no lo
+        tiene) las tres quedan NULL — "autor desconocido" —, no ``"admin"``: ``actor_type_of``
+        devuelve ``"admin"`` para ``None`` porque en ``audit_log`` la columna es NOT NULL y
+        esa es la verdad histórica, pero acá afirmaría un autor que no se conoce.
+        """
+        if admin is None:
+            return {
+                "created_by_admin_id": None,
+                "created_by_username": None,
+                "created_by_actor_type": None,
+            }
+        admin_id, username = identity_of(admin)
+        return {
+            "created_by_admin_id": admin_id,
+            "created_by_username": username,
+            "created_by_actor_type": actor_type_of(admin),
+        }
+
+    @staticmethod
+    def _authorship_out(m: ModelMigration) -> dict:
+        """Los tres campos de autoría tal como los publica la API (NULL = desconocido)."""
+        return {
+            "created_by_admin_id": m.created_by_admin_id,
+            "created_by_username": m.created_by_username,
+            "created_by_actor_type": m.created_by_actor_type,
         }
 
     @staticmethod
@@ -1156,6 +1194,11 @@ class ModelMigrationController:
             if capture_selects:
                 reviewed = False
 
+            # Autoría: el MISMO actor que firma la fila ``migration.create`` de auditoría. Cubre
+            # también a los llamadores internos que reusan este método (adopción de un diff,
+            # versión de conversión de collation), que pasan su propio ``admin``.
+            authorship = self._authorship(admin)
+
             # Versión: explícita si el admin la pasó; si no, autoasignada (secuencial).
             explicit_version = data.get("version")
             attempts = 1 if explicit_version else self._AUTO_VERSION_RETRIES
@@ -1180,6 +1223,7 @@ class ModelMigrationController:
                     has_non_portable=has_non_portable,
                     reviewed=reviewed,
                     capture_selects=capture_selects,
+                    **authorship,
                 )
                 session.add(migration)
                 try:
@@ -1383,7 +1427,7 @@ class ModelMigrationController:
 
         confirm_data_rollback = bool(data.get("confirm_data_rollback"))
         model_id, model_result, version_summaries = self._persist_snapshot_versions(
-            data, source_engine, version_plans, confirm_data_rollback
+            data, source_engine, version_plans, confirm_data_rollback, admin=admin
         )
 
         total = len(version_plans)
@@ -1504,9 +1548,23 @@ class ModelMigrationController:
         return seeds, skipped
 
     def _persist_snapshot_versions(
-        self, data, source_engine, version_plans, confirm_data_rollback
+        self,
+        data,
+        source_engine,
+        version_plans,
+        confirm_data_rollback,
+        *,
+        admin: "dict | Actor | None" = None,
     ) -> tuple[int, dict, list[dict]]:
-        """Crea el blueprint + las N migraciones en una sola transacción."""
+        """
+        Crea el blueprint + las N migraciones en una sola transacción.
+
+        Las N versiones llevan como autor al actor del snapshot. Este camino NO escribe una
+        fila ``migration.create`` por versión (audita ``database_model.from_snapshot`` una
+        vez), así que la autoría persistida acá es el ÚNICO rastro por versión de quién la
+        creó.
+        """
+        authorship = self._authorship(admin)
         last_version = f"{len(version_plans):04d}"
         session = self._session()
         try:
@@ -1556,6 +1614,7 @@ class ModelMigrationController:
                         is_baseline=True,
                         has_non_portable=vp.has_non_portable,
                         reviewed=False,
+                        **authorship,
                     )
                 )
                 summaries.append(

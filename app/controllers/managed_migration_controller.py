@@ -40,7 +40,7 @@ from app.models.enums import EngineType, MigrationStatus, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.model_migration import ModelMigration
 from app.models.model_migration_statement import ModelMigrationStatement
-from app.core.actor import identity_of
+from app.core.actor import actor_type_of, identity_of
 from app.core.context import current_http_identifier
 from app.services import audit
 from app.services import environment_catalog as ecodes
@@ -2470,9 +2470,7 @@ class ManagedMigrationController:
             return
         checksums = {s.id: s.checksum for s in (specs or [])}
         actor_id, actor_username = identity_of(admin)
-        # La CLASE de actor sale del propio actor y no de un parámetro: mismo criterio que
-        # ``audit._build``. Un dict legado o ``None`` son "admin", que es la verdad histórica.
-        actor_type = getattr(admin, "kind", None) or "admin"
+        actor_type = actor_type_of(admin)
         try:
             request_id = current_http_identifier.get()
         except LookupError:

@@ -14,7 +14,7 @@ Principios:
 
 from contextvars import ContextVar
 
-from app.core.actor import Actor, identity_of
+from app.core.actor import Actor, actor_type_of, identity_of
 from app.core.context import current_http_identifier, current_request_ip
 from app.core.logger import get_logger
 from app.exceptions import AppHttpException
@@ -49,9 +49,7 @@ def _build(
     grantor: str | None,
 ) -> AuditLog:
     admin_id, admin_username = identity_of(admin)
-    # La CLASE de actor sale del propio actor, no de un parámetro que el llamador pueda
-    # equivocar. Un dict legado o `None` son siempre "admin", que es la verdad histórica.
-    actor_type = getattr(admin, "kind", None) or "admin"
+    actor_type = actor_type_of(admin)
     api_token_id = admin.id if getattr(admin, "kind", None) == "api_token" else None
     return AuditLog(
         request_id=_safe_get(current_http_identifier),

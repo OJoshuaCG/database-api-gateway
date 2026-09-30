@@ -161,6 +161,21 @@ _APPLIED_DB_COUNT_DESC = (
     "migración haya corrido. Sale de la caché del inventario, igual que sql_frozen."
 )
 
+_CREATED_BY_ADMIN_ID_DESC = (
+    "ID del admin (o del token de API) que creó la versión. Sin FK: si el usuario se borró, "
+    "el ID sigue acá y la UI puede mostrar 'usuario eliminado (#id)'. null = autor "
+    "desconocido: la versión es anterior al registro de autoría y el backfill desde la "
+    "auditoría no pudo atribuirla."
+)
+_CREATED_BY_USERNAME_DESC = (
+    "Nombre del actor al momento de crear la versión (copia congelada: renombrar al usuario "
+    "no lo cambia). null = autor desconocido, con el mismo criterio que created_by_admin_id."
+)
+_CREATED_BY_ACTOR_TYPE_DESC = (
+    "Clase de actor que creó la versión: 'admin' (una persona) | 'api_token' (un agente vía "
+    "token). Mismo vocabulario que actor_type del log de auditoría. null = autor desconocido."
+)
+
 
 class ModelMigrationSummary(BaseModel):
     """Item compacto para listados (no incluye el SQL completo ni traducciones)."""
@@ -197,6 +212,9 @@ class ModelMigrationSummary(BaseModel):
     destructive: bool = Field(
         False, description="Contiene DROP o TRUNCATE. " + _SQL_FACTS_DESC
     )
+    created_by_admin_id: int | None = Field(None, description=_CREATED_BY_ADMIN_ID_DESC)
+    created_by_username: str | None = Field(None, description=_CREATED_BY_USERNAME_DESC)
+    created_by_actor_type: str | None = Field(None, description=_CREATED_BY_ACTOR_TYPE_DESC)
     created_at: datetime
 
 
@@ -252,6 +270,9 @@ class ModelMigrationOut(BaseModel):
     destructive: bool = Field(
         False, description="Contiene DROP o TRUNCATE. " + _SQL_FACTS_DESC
     )
+    created_by_admin_id: int | None = Field(None, description=_CREATED_BY_ADMIN_ID_DESC)
+    created_by_username: str | None = Field(None, description=_CREATED_BY_USERNAME_DESC)
+    created_by_actor_type: str | None = Field(None, description=_CREATED_BY_ACTOR_TYPE_DESC)
     created_at: datetime
     updated_at: datetime
 

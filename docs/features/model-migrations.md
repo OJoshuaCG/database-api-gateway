@@ -36,6 +36,7 @@ la [capa de conexión remota](remote-connections.md) y la [autenticación](authe
 | `kind` | (auto) | `schema` (DDL, default) o `data` (datos-semilla upsert de un snapshot). Una migración `data` está **atada a `source_engine`** (la sintaxis upsert difiere por motor) y **no se traduce** cross-engine |
 | `reviewed` | (auto) | `true` para migraciones escritas a mano; toda migración generada por **snapshot** (Plan 09) nace `false` y **no se aplica** hasta aprobarla (`PATCH reviewed=true`) |
 | `source_engine` / `is_baseline` / `has_non_portable` | (auto) | Metadatos de una migración generada por snapshot (motor de origen; si trae objetos procedurales no portables). El snapshot puede dividirse en varias versiones — ver [adopción/snapshot](adoption-reconcile-snapshot.md) |
+| `created_by_admin_id` / `created_by_username` / `created_by_actor_type` | (auto) | **Autor de la versión**: el actor de la request que la creó (`admin` o `api_token`), sin FK para que sobreviva al usuario. `null` = autor desconocido: versión anterior al registro de autoría que el backfill desde `audit_log` no pudo atribuir. Ver [api-reference-v28.md](../api-reference-v28.md) |
 
 El gateway **auto-traduce** `up_sql` de MySQL a PostgreSQL con `sqlglot`; el campo
 calculado `translated` muestra el SQL efectivo por motor. Los overrides solo se necesitan

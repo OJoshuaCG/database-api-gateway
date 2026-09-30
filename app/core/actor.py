@@ -172,3 +172,18 @@ def identity_of(subject: "Actor | dict | None") -> tuple[int | None, str | None]
     if isinstance(subject, dict):
         return subject.get("id"), subject.get("username")
     return getattr(subject, "id", None), getattr(subject, "username", None)
+
+
+def actor_type_of(subject: "Actor | dict | None") -> str:
+    """
+    La CLASE de actor (``"admin"`` | ``"api_token"``) de una identidad, para persistirla.
+
+    Sale del propio actor y no de un parámetro que el llamador pueda equivocar. Un ``dict``
+    legado o ``None`` son siempre ``"admin"``, que es la verdad histórica: antes de los tokens
+    de agente no había otra clase de actor. Mismo vocabulario que ``audit_log.actor_type``.
+
+    Vive junto a ``identity_of`` por el mismo motivo: la auditoría, el historial de
+    aplicación y la autoría de una versión de blueprint leen lo mismo, y tres copias de la
+    regla divergen en silencio el día que aparezca una tercera clase de actor.
+    """
+    return getattr(subject, "kind", None) or "admin"

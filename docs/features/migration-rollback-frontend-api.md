@@ -124,6 +124,9 @@ Respuesta paginada (`data: ModelMigrationSummary[]`):
   "is_baseline": false,
   "reviewed": true,
   "applied_database_count": 2,    // BDs con la versión aplicada HOY (ver api-reference-v27.md)
+  "created_by_admin_id": 1,       // autor de la versión; los tres null = desconocido (v28)
+  "created_by_username": "admin",
+  "created_by_actor_type": "admin", // "admin" | "api_token"
   "created_at": "2026-01-01T00:00:00Z"
 }
 ```
@@ -148,6 +151,7 @@ Respuesta (`data: ModelMigrationOut`):
   "checksum": "...", "kind": "schema",
   "source_engine": null, "is_baseline": false, "has_non_portable": false,
   "reviewed": true,
+  "created_by_admin_id": 1, "created_by_username": "admin", "created_by_actor_type": "admin",
   "created_at": "...", "updated_at": "..."
 }
 ```

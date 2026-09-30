@@ -1142,14 +1142,17 @@ BD (`409`) — un intento que solo falló no congela el SQL.
 
 `ModelMigrationOut` (detalle): `{ id, model_id, version, name, up_sql, up_sql_mysql?,
 up_sql_postgresql?, down_sql?, down_sql_suggested?, translated: {mysql, postgresql}, checksum,
-source_engine?, is_baseline, has_non_portable, reviewed, created_at, updated_at }`.
+source_engine?, is_baseline, has_non_portable, reviewed, created_by_admin_id?,
+created_by_username?, created_by_actor_type?, created_at, updated_at }`.
 `down_sql_suggested` es un rollback **auto-generado** para operaciones aditivas (revísalo y
 confírmalo con `PATCH`).
 
 `ModelMigrationSummary` (item de listado): `{ id, model_id, version, name,
 has_mysql_override, has_postgresql_override, has_rollback, checksum, is_baseline, reviewed,
-applied_database_count, created_at }`. `applied_database_count` (cuántas BDs tienen la versión
-aplicada hoy) está en `api-reference-v27.md`.
+applied_database_count, created_by_admin_id?, created_by_username?, created_by_actor_type?,
+created_at }`. `applied_database_count` (cuántas BDs tienen la versión aplicada hoy) está en
+`api-reference-v27.md`; los `created_by_*` (autor de la versión, `null` = desconocido), en
+`api-reference-v28.md`.
 
 #### Endpoints
 
