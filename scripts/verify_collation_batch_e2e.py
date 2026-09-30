@@ -15,11 +15,11 @@ Lo que verifica, y por qué cada punto está:
   1. El lote convierte de verdad. Se comprueba en ``information_schema``, NO en la respuesta de
      la API: que un job diga ``succeeded`` no prueba que el motor haya cambiado nada.
 
-  2. **La premisa del fix de FK checks.** MySQL prohíbe ``CONVERT TO CHARACTER SET`` con
-     ``foreign_key_checks=1`` sobre una tabla con columna de texto en una FK. El fix del backend
-     desactiva el flag asumiendo que **MariaDB se comporta igual**, y eso era una suposición
-     tomada de la documentación de MySQL, no un hecho comprobado. El escenario 1 siembra
-     exactamente ese caso.
+  2. **Una FK sobre columna de texto.** MySQL prohíbe ``CONVERT TO CHARACTER SET`` con
+     ``foreign_key_checks=1`` sobre una tabla con columna de texto en una FK, y el flag en 0 lo
+     levanta; MariaDB lo rechaza con y sin el flag, así que ahí el backend suelta la FK,
+     convierte y la recrea. El escenario 1 siembra exactamente ese caso y comprueba las dos
+     cosas: que las columnas se convirtieron y que la FK sigue existiendo.
 
   3. **Los objetos programables se recrean.** Una vista guarda la collation con la que se creó.
      Si el lote convierte las tablas y deja la vista congelada, produce el
@@ -34,20 +34,21 @@ Lo que verifica, y por qué cada punto está:
 NO es un test de pytest (requiere Docker; se ejecuta a mano). El runner es asíncrono y corre EN
 SERIE (``COLLATION_CONVERSION_MAX_WORKERS`` = 1), así que el polling espera al lote completo.
 
-ESTADO ACTUAL: FALLA, Y ES CORRECTO QUE FALLE
----------------------------------------------
-La primera corrida encontró un defecto real y **sigue sin arreglarse**, así que este script sale
-por 1. No está roto: está reportando.
-
-``T-260825-lz-mariadb-fk-checks-no-alcanza`` (86e2zgkb6) — en MariaDB, ``foreign_key_checks=0``
-**no** levanta la restricción sobre ``ALTER TABLE ... CONVERT TO CHARACTER SET`` de una columna
-usada en una FK. Medido contra los dos motores con el mismo caso mínimo:
+ESTADO: EL DEFECTO QUE ENCONTRÓ ESTÁ CORREGIDO, SIN VOLVER A CORRER
+-------------------------------------------------------------------
+La primera corrida encontró un defecto real: ``T-260825-lz-mariadb-fk-checks-no-alcanza``
+(86e2zgkb6). En MariaDB, ``foreign_key_checks=0`` **no** levanta la restricción sobre
+``ALTER TABLE ... CONVERT TO CHARACTER SET`` de una columna usada en una FK. Medido contra los
+dos motores con el mismo caso mínimo:
 
     MySQL 8.0.46    sin flag: rechaza (3780)   con flag: FUNCIONA
     MariaDB 11.8.9  sin flag: rechaza (1832)   con flag: rechaza igual (1832)
 
-Las siete comprobaciones que fallan son todas esa causa. Cuando se arregle, este script tiene que
-pasar entero; si falla algo distinto, es otro defecto.
+El backend lo resuelve ahora en MariaDB soltando las FKs de texto, convirtiendo juntas las
+tablas que unen y recreándolas, con reversión del grupo si algo falla
+(``_convert_fk_group`` en el controller). Este script **no se volvió a correr** después del
+fix: tiene que pasar entero, incluida la comprobación nueva de que ``fk_child_parent`` sigue
+existiendo después de convertir. Si falla algo, es el fix o es otro defecto.
 
 Uso:
     docker run -d --rm --name gw_collation_mariadb -e MARIADB_ROOT_PASSWORD=rootpw \\
@@ -249,6 +250,15 @@ def _view_collation(db: str, view: str) -> str | None:
     return row[0] if row else None
 
 
+def _fk_exists(db: str, table: str, constraint: str) -> bool:
+    with _root_engine().connect() as conn:
+        row = conn.execute(text(
+            "SELECT 1 FROM information_schema.REFERENTIAL_CONSTRAINTS "
+            "WHERE CONSTRAINT_SCHEMA = :db AND TABLE_NAME = :t AND CONSTRAINT_NAME = :c"
+        ), {"db": db, "t": table, "c": constraint}).fetchone()
+    return row is not None
+
+
 def _db_collation(db: str) -> str | None:
     with _root_engine().connect() as conn:
         row = conn.execute(text(
@@ -364,11 +374,14 @@ def scenario_batch_converts(c: TestClient, mid: int, db_ids: list[int]):
         cols = _column_collations(db)
         check(bool(cols) and all(v == NEW_COLLATION for v in cols.values()), f"{db}: todas las columnas de texto en {NEW_COLLATION}")
         check(_db_collation(db) == NEW_COLLATION, f"{db}: el default de la BD quedó en {NEW_COLLATION}")
-    # ── La premisa del fix de FK checks ───────────────────────────────────────
-    print("\n  El caso que el backend NO había verificado (FK sobre columna de texto):")
+    # ── FK sobre columna de texto (en MariaDB se suelta y se recrea) ─────────
+    print("\n  FK sobre columna de texto (MariaDB la rechaza aunque se desactiven los chequeos):")
     cols = _column_collations(DBS[0])
     check(cols.get("parent.code") == NEW_COLLATION, "la columna dentro de la FK se convirtió (parent.code)")
     check(cols.get("child.parent_code") == NEW_COLLATION, "la columna que la referencia también (child.parent_code)")
+    # En MariaDB el backend SUELTA la FK para convertir y la recrea: una BD sin la constraint
+    # es peor que una sin convertir, así que convertir no alcanza, la FK tiene que seguir ahí.
+    check(_fk_exists(DBS[0], "child", "fk_child_parent"), "la FK fk_child_parent sigue existiendo después de convertir")
     # ── Los objetos congelados ────────────────────────────────────────────────
     print("\n  Objetos programables recreados (si no, Illegal mix of collations):")
     vista = _view_collation(DBS[0], "v_children")
@@ -489,9 +502,9 @@ def main():
         for f in failures:
             print(f"  - {f}")
         print(
-            "\nSi las fallas son las de la BD con FK sobre columna de texto, es el defecto\n"
-            "conocido T-260825-lz-mariadb-fk-checks-no-alcanza (86e2zgkb6): en MariaDB,\n"
-            "foreign_key_checks=0 no levanta la restricción del CONVERT TO. Ver la cabecera."
+            "\nSi las fallas son las de la BD con FK sobre columna de texto, revisá el fix de\n"
+            "T-260825-lz-mariadb-fk-checks-no-alcanza (86e2zgkb6): en MariaDB la FK se suelta,\n"
+            "se convierte el grupo y se recrea. Los ítems del job dicen qué etapa falló."
         )
         sys.exit(1)
     print("Todas las comprobaciones pasaron.")

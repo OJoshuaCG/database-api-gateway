@@ -80,6 +80,9 @@ COLLATION_OBJ_FUNCTION = "function"
 COLLATION_OBJ_TRIGGER = "trigger"
 COLLATION_OBJ_EVENT = "event"
 COLLATION_OBJ_VIEW = "view"
+# Solo MariaDB: una FK sobre columnas de texto que la fase de tablas suelta y recrea (el motor
+# rechaza el CONVERT TO con ella presente). Su ``captured_ddl`` es el ADD CONSTRAINT exacto.
+COLLATION_OBJ_FOREIGN_KEY = "foreign_key"
 
 # Los 5 tipos con collation CONGELADO (los que requieren DROP+CREATE verbatim).
 COLLATION_FROZEN_OBJECT_TYPES: tuple[str, ...] = (

@@ -20,6 +20,7 @@ from app.services.db_admin.dtos import (
     ExternalFkDependent,
     RoutineGrantInfo,
     TableCollationInfo,
+    TextForeignKey,
 )
 from app.services.db_admin.migrations import StatementResult
 
@@ -96,6 +97,10 @@ class _FakeAdapter:
         self.grants_read_fails: set[tuple[str, str]] = set()
         self.grants_apply_fails = False
         self.routine_grants_by_name: dict[str, list[RoutineGrantInfo]] = {}
+        # FKs de texto que devolvería ``information_schema`` (solo las consulta MariaDB).
+        self.text_fks: list[TextForeignKey] = []
+        self.text_fks_fail = False
+        self.text_fk_calls: list[list[str]] = []
 
     def list_databases(self):
         return list(self.databases)
@@ -126,6 +131,15 @@ class _FakeAdapter:
     def external_fk_dependents(self, database):
         return list(self.external_fks)
 
+    def text_foreign_keys(self, database, tables):
+        self.text_fk_calls.append(list(tables))
+        if self.text_fks_fail:
+            raise RuntimeError("information_schema ilegible")
+        wanted = set(tables)
+        return [
+            fk for fk in self.text_fks if fk.table in wanted or fk.referred_table in wanted
+        ]
+
 
 class _FakeRunner:
     """Runner síncrono: todo 'applied' salvo el SQL que el test marque como fallido."""
@@ -136,6 +150,9 @@ class _FakeRunner:
     # los FLAGS de conexión, no solo sobre el SQL — que es donde viven dos correcciones que
     # de otro modo no serían observables desde el test.
     calls: list[tuple[list[str], bool, bool]] = []
+    # Como ``fail_substrings``, pero cada entrada falla UNA sola vez y se consume: permite
+    # simular una sentencia que falla y después, en la compensación, pasa.
+    fail_once_substrings: list[str] = []
 
     @contextmanager
     def advisory_lock(self, target, *, engine, lock_key):
@@ -149,6 +166,10 @@ class _FakeRunner:
         out = []
         for i, stmt in enumerate(statements):
             bad = any(s in stmt for s in type(self).fail_substrings)
+            once = next((s for s in type(self).fail_once_substrings if s in stmt), None)
+            if once is not None:
+                type(self).fail_once_substrings.remove(once)
+                bad = True
             out.append(
                 StatementResult(
                     index=i, status="failed" if bad else "applied",
@@ -165,6 +186,7 @@ def _install(monkeypatch, inventory=None, *, adapter=None):
     """Instala el adapter fake + runner síncrono. Devuelve el fake para inspección."""
     fake = adapter or _FakeAdapter(inventory or _inventory())
     _FakeRunner.fail_substrings = []
+    _FakeRunner.fail_once_substrings = []
     _FakeRunner.executed = []
     _FakeRunner.calls = []
     monkeypatch.setattr(cc, "get_adapter", lambda target: fake)
@@ -868,3 +890,197 @@ def test_preview_freezes_totals_for_the_progress_bar(admin_client, monkeypatch):
     despues = admin_client.get(f"/api/v1/collation-conversions/{job_id}").json()["data"]
     assert despues["tables_total"] == 2
     assert despues["objects_total"] == 1
+
+
+# =========================================================================== #
+# MariaDB: FKs sobre columnas de texto (T-260825-lz-mariadb-fk-checks-no-alcanza) #
+# =========================================================================== #
+_FK_DROP = "ALTER TABLE `orders` DROP FOREIGN KEY `fk_orders_users`"
+_FK_ADD = (
+    "ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_users` FOREIGN KEY (`user_code`) "
+    "REFERENCES `users` (`code`) ON DELETE RESTRICT ON UPDATE RESTRICT"
+)
+
+
+def _convert_sql(table, cs=TARGET_CS, co=TARGET_CO):
+    return f"ALTER TABLE `app_db`.`{table}` CONVERT TO CHARACTER SET {cs} COLLATE {co}"
+
+
+_REVERT_USERS = _convert_sql("users", "utf8mb3", "utf8mb3_general_ci")
+_REVERT_ORDERS = _convert_sql("orders", "utf8mb3", "utf8mb3_general_ci")
+
+
+def _orders_users_fk() -> TextForeignKey:
+    """``orders.user_code`` → ``users.code``, ambas VARCHAR: el caso que MariaDB rechaza."""
+    return TextForeignKey(
+        table="orders", name="fk_orders_users", columns=["user_code"],
+        referred_table="users", referred_columns=["code"],
+        on_delete="RESTRICT", on_update="RESTRICT", drop_sql=_FK_DROP, add_sql=_FK_ADD,
+    )
+
+
+def _run_tables(admin_client, monkeypatch, port, *, engine="mariadb", tables=None, fks=True,
+                extra_tables=()):
+    """Plan + preview + execute de una conversión de tablas (sin ALTER DATABASE ni objetos)."""
+    inv = _inventory()
+    inv.tables.extend(extra_tables)
+    fake = _install(monkeypatch, inv)
+    if fks:
+        fake.text_fks = [_orders_users_fk()]
+    sid = _server(admin_client, port, engine=engine)
+    job_id = _create(admin_client, sid).json()["data"]["id"]
+    return fake, sid, job_id, tables or ["users", "orders"]
+
+
+def _execute_tables(admin_client, job_id, tables):
+    token = _preview(
+        admin_client, job_id, tables=tables, include_database_default=False
+    ).json()["data"]["confirm_token"]
+    assert _execute(admin_client, job_id, token).status_code == 200
+    return admin_client.get(f"/api/v1/collation-conversions/{job_id}").json()["data"]
+
+
+def _captured_ddl(job_id, object_name):
+    """``captured_ddl`` no se expone por la API: se lee de la BD del gateway."""
+    ctl = cc.CollationConversionController()
+    session = ctl._session()
+    try:
+        item = (
+            session.query(cc.CollationConversionJobItem)
+            .filter_by(job_id=job_id, object_name=object_name)
+            .one()
+        )
+        return item.captured_ddl
+    finally:
+        session.close()
+
+
+def test_mariadb_drops_converts_and_recreates_text_fk(admin_client, monkeypatch):
+    """
+    En MariaDB ``foreign_key_checks=0`` NO levanta el rechazo del ``CONVERT TO`` sobre una
+    columna usada en una FK (1832, medido contra 11.8.9). El grupo parent/child se convierte
+    soltando la FK antes y recreándola después, y la FK tiene ítem propio con su DDL
+    persistido como copia de recuperación.
+    """
+    fake, _sid, job_id, tables = _run_tables(admin_client, monkeypatch, 3920)
+    summary = _execute_tables(admin_client, job_id, tables)
+    assert summary["status"] == "succeeded", summary
+
+    stmts = [c[0][-1] for c in _FakeRunner.calls]
+    assert stmts == [_FK_DROP, _convert_sql("users"), _convert_sql("orders"), _FK_ADD]
+    flags = {c[0][-1]: c[1] for c in _FakeRunner.calls}
+    assert flags[_convert_sql("users")] is True and flags[_FK_ADD] is True
+    assert fake.text_fk_calls == [["users", "orders"]]
+
+    items = _items(admin_client, job_id)
+    fk_item = next(i for i in items if i["object_type"] == "foreign_key")
+    assert fk_item["object_name"] == "orders.fk_orders_users"
+    assert fk_item["status"] == "ok"
+    # El ítem de la FK se persiste ANTES que las tablas (antes del DROP).
+    assert fk_item["seq"] < min(i["seq"] for i in items if i["object_type"] == "table")
+    assert _captured_ddl(job_id, "orders.fk_orders_users") == _FK_ADD
+    by_name = {i["object_name"]: i for i in items if i["object_type"] == "table"}
+    assert by_name["users"]["status"] == "ok" and by_name["orders"]["status"] == "ok"
+    # La FK NO infla el progreso de tablas: sigue contando solo pasos de conversión.
+    assert summary["tables_total"] == 2
+    assert summary["progress"]["tables_done"] == 2
+
+
+def test_mysql_keeps_fk_checks_path_without_dropping_fks(admin_client, monkeypatch):
+    """En MySQL el flag SÍ alcanza: ni se consultan las FKs ni se sueltan."""
+    fake, _sid, job_id, tables = _run_tables(admin_client, monkeypatch, 3921, engine="mysql")
+    summary = _execute_tables(admin_client, job_id, tables)
+    assert summary["status"] == "succeeded", summary
+
+    assert fake.text_fk_calls == []
+    stmts = [c[0][-1] for c in _FakeRunner.calls]
+    assert stmts == [_convert_sql("users"), _convert_sql("orders")]
+    assert all(fk is True for _s, fk, _b in _FakeRunner.calls)
+    assert not any(i["object_type"] == "foreign_key" for i in _items(admin_client, job_id))
+
+
+def test_mariadb_child_convert_failure_reverts_parent_and_recreates_fk(
+    admin_client, monkeypatch
+):
+    """
+    Si la conversión del hijo falla, el padre ya convertido vuelve a su collation original y
+    la FK se recrea: la BD queda como estaba, nunca sin su constraint.
+    """
+    _fake, _sid, job_id, tables = _run_tables(admin_client, monkeypatch, 3922)
+    _FakeRunner.fail_substrings = [_convert_sql("orders")]
+    summary = _execute_tables(admin_client, job_id, tables)
+    assert summary["status"] == "failed", summary
+
+    stmts = [c[0][-1] for c in _FakeRunner.calls]
+    assert stmts == [
+        _FK_DROP, _convert_sql("users"), _convert_sql("orders"), _REVERT_USERS, _FK_ADD,
+    ]
+    items = _items(admin_client, job_id)
+    by_name = {i["object_name"]: i for i in items if i["object_type"] == "table"}
+    assert by_name["orders"]["status"] == "error"
+    assert by_name["users"]["status"] == "error"
+    assert "REVIRTIÓ" in by_name["users"]["error"]
+    fk_item = next(i for i in items if i["object_type"] == "foreign_key")
+    assert fk_item["status"] == "skipped"
+    assert "RECREÓ" in fk_item["error"]
+
+
+def test_mariadb_fk_recreate_failure_reverts_group_and_recreates_fk(
+    admin_client, monkeypatch
+):
+    """
+    Si la FK no se puede recrear sobre las tablas convertidas, se revierten AMBAS tablas y la
+    FK se recrea sobre el estado original.
+    """
+    _fake, _sid, job_id, tables = _run_tables(admin_client, monkeypatch, 3923)
+    _FakeRunner.fail_once_substrings = [_FK_ADD]
+    summary = _execute_tables(admin_client, job_id, tables)
+    assert summary["status"] == "failed", summary
+
+    stmts = [c[0][-1] for c in _FakeRunner.calls]
+    assert stmts == [
+        _FK_DROP, _convert_sql("users"), _convert_sql("orders"), _FK_ADD,
+        _REVERT_ORDERS, _REVERT_USERS, _FK_ADD,
+    ]
+    items = _items(admin_client, job_id)
+    by_name = {i["object_name"]: i for i in items if i["object_type"] == "table"}
+    assert all("REVIRTIÓ" in by_name[t]["error"] for t in ("users", "orders"))
+    fk_item = next(i for i in items if i["object_type"] == "foreign_key")
+    assert fk_item["status"] == "error"
+    assert "RECREÓ" in fk_item["error"]
+    assert "NO existe" not in fk_item["error"]
+
+
+def test_mariadb_table_without_text_fk_keeps_per_table_path(admin_client, monkeypatch):
+    """Una tabla sin FKs de texto se convierte sola, como siempre, sin tocar ninguna FK."""
+    audit = TableCollationInfo(name="audit", charset="utf8mb3", collation="utf8mb3_general_ci",
+                               mismatched_columns=1, needs_conversion=True)
+    _fake, _sid, job_id, _t = _run_tables(
+        admin_client, monkeypatch, 3924, extra_tables=[audit],
+    )
+    summary = _execute_tables(admin_client, job_id, ["audit", "users", "orders"])
+    assert summary["status"] == "succeeded", summary
+
+    stmts = [c[0][-1] for c in _FakeRunner.calls]
+    assert stmts == [
+        _convert_sql("audit"), _FK_DROP, _convert_sql("users"), _convert_sql("orders"),
+        _FK_ADD,
+    ]
+    audit_call = next(c for c in _FakeRunner.calls if c[0][-1] == _convert_sql("audit"))
+    assert audit_call[0] == [_convert_sql("audit")] and audit_call[1] is True
+    fks = [i for i in _items(admin_client, job_id) if i["object_type"] == "foreign_key"]
+    assert [i["object_name"] for i in fks] == ["orders.fk_orders_users"]
+    assert summary["progress"]["tables_done"] == 3
+
+
+def test_mariadb_unreadable_fks_converts_nothing(admin_client, monkeypatch):
+    """Fail-closed: sin saber qué FKs hay, convertir en MariaDB podría dejar la BD a medias."""
+    fake, _sid, job_id, tables = _run_tables(admin_client, monkeypatch, 3925)
+    fake.text_fks_fail = True
+    summary = _execute_tables(admin_client, job_id, tables)
+    assert summary["status"] == "failed", summary
+
+    assert _FakeRunner.calls == []
+    items = [i for i in _items(admin_client, job_id) if i["object_type"] == "table"]
+    assert items and all(i["status"] == "error" for i in items)
+    assert all("FKs" in i["error"] for i in items)

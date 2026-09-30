@@ -80,6 +80,7 @@ from app.models.collation_conversion_job import (
     COLLATION_MODE_COLUMNS,
     COLLATION_MODE_UNIVERSAL,
     COLLATION_OBJ_DATABASE,
+    COLLATION_OBJ_FOREIGN_KEY,
     COLLATION_OBJ_FUNCTION,
     COLLATION_OBJ_PROCEDURE,
     COLLATION_OBJ_TABLE,
@@ -101,6 +102,7 @@ from app.models.managed_database import ManagedDatabase
 from app.models.server import Server
 from app.services import audit, charset_catalog, collation_catalog
 from app.services.db_admin import query_policy
+from app.services.db_admin.dtos import TextForeignKey
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import (
     ensure_not_reserved_database,
@@ -180,6 +182,19 @@ class _Plan:
     missing_tables: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     include_database_default: bool = True
+
+
+@dataclass
+class _FkGroup:
+    """
+    Tablas de un ``convert_table`` unidas (directa o transitivamente) por FKs sobre columnas
+    de texto, y esas FKs. Es la unidad ATÓMICA de la fase de tablas en MariaDB (ver
+    ``_convert_fk_group``). ``steps`` va en el orden del plan; una tabla vinculada que no se
+    convierte (``skip`` o fuera de la selección) no tiene paso, pero sus FKs sí están.
+    """
+
+    steps: list[_Step]
+    fks: list[TextForeignKey]
 
 
 class CollationConversionController:
@@ -806,7 +821,9 @@ class CollationConversionController:
                 )
             )
 
-        plan.warnings.extend(self._plan_warnings(inv, plan, wanted_tables, collation))
+        plan.warnings.extend(
+            self._plan_warnings(inv, plan, wanted_tables, collation, engine=job.engine)
+        )
         return plan
 
     # ------------------------------------------------------------------ #
@@ -980,8 +997,17 @@ class CollationConversionController:
         return out
 
     @staticmethod
-    def _plan_warnings(inv, plan: _Plan, wanted_tables: list[str], collation: str) -> list[str]:
+    def _plan_warnings(
+        inv, plan: _Plan, wanted_tables: list[str], collation: str, *, engine: str | None = None
+    ) -> list[str]:
+        """
+        Avisos del preview. ``engine`` distingue MySQL de MariaDB en el aviso de FK: el mismo
+        ``foreign_key_checks=0`` que en MySQL hace pasar la conversión, en MariaDB NO alcanza
+        (1832), y el worker resuelve ese caso soltando y recreando las FKs
+        (``_convert_fk_group``). Afirmar lo de MySQL para MariaDB le mentía al operador.
+        """
         out: list[str] = []
+        is_mariadb = engine == EngineType.mariadb.value
 
         # Selección PARCIAL de tablas: el riesgo más concreto de este feature después de los
         # objetos congelados. MySQL/MariaDB exigen el MISMO charset/collation en ambos lados
@@ -992,16 +1018,30 @@ class CollationConversionController:
         if pending:
             sample = ", ".join(f"`{n}`" for n in pending[:5])
             more = f" (+{len(pending) - 5} más)" if len(pending) > 5 else ""
-            out.append(
+            head = (
                 f"Quedan {len(pending)} tabla(s) sin convertir que NO están en la collation "
                 f"objetivo: {sample}{more}. MySQL/MariaDB exigen la misma collation en ambos "
                 "lados de una FK y comparar columnas de collations distintas produce "
                 "'Illegal mix of collations': una conversión parcial puede romper consultas "
-                "que hoy funcionan. La conversión se ejecuta con los chequeos de FK "
-                "DESACTIVADOS (el motor prohíbe convertir el charset de una tabla con una "
-                "columna de texto en una FK), así que el DDL NO va a fallar: la incoherencia "
-                "entre los dos lados aparece recién al CONSULTAR."
+                "que hoy funcionan. "
             )
+            if is_mariadb:
+                tail = (
+                    "En MariaDB desactivar los chequeos de FK NO alcanza: el motor rechaza "
+                    "convertir una columna de texto usada en una FK (error 1832). Durante la "
+                    "ejecución el gateway suelta esas FKs, convierte juntas las tablas que "
+                    "unen y las recrea; si una FK une una tabla convertida con una que queda "
+                    "sin convertir, recrearla puede fallar, y entonces ese grupo de tablas se "
+                    "revierte a su collation original y la FK se recrea."
+                )
+            else:
+                tail = (
+                    "La conversión se ejecuta con los chequeos de FK DESACTIVADOS (el motor "
+                    "prohíbe convertir el charset de una tabla con una columna de texto en "
+                    "una FK), así que el DDL NO va a fallar: la incoherencia entre los dos "
+                    "lados aparece recién al CONSULTAR."
+                )
+            out.append(head + tail)
 
         outdated = [o for o in inv.objects if o.is_outdated]
         selected_objs = {
@@ -1028,6 +1068,17 @@ class CollationConversionController:
                 "límite de longitud de clave de InnoDB y fallar con "
                 "(1071, 'Specified key was too long')."
             )
+            if is_mariadb:
+                out.append(
+                    "En MariaDB las FKs sobre columnas de texto se SUELTAN y se RECREAN "
+                    "durante la ejecución (el motor rechaza la conversión con ellas presentes "
+                    "aunque se desactiven los chequeos, error 1832). Las tablas unidas por "
+                    "esas FKs se convierten como un grupo: si una conversión o la recreación "
+                    "de una FK falla, el grupo se revierte al charset/collation DEFAULT que "
+                    "tenía cada tabla y las FKs se recrean. Una columna que tenía una "
+                    "collation propia distinta del default de su tabla vuelve normalizada a "
+                    "ese default."
+                )
 
         if any(
             s.action == "recreate" and s.object_type in _GRANTED_OBJECT_TYPES
@@ -1783,7 +1834,26 @@ class CollationConversionController:
             self._set_status(job_id, COLLATION_STATUS_RUNNING, phase=COLLATION_PHASE_TABLES)
             bump(phase=COLLATION_PHASE_TABLES)
             done = 0
+            # Solo MariaDB: las tablas unidas por FKs sobre columnas de texto se convierten
+            # como UN grupo atómico (soltar FKs → convertir → recrear, con reversión). Una
+            # tabla sin esas FKs sigue el camino por tabla de abajo, igual que en MySQL.
+            fk_groups: list[_FkGroup] = []
+            fk_read_error: str | None = None
+            if (
+                ctx["mode"] == COLLATION_MODE_UNIVERSAL
+                and ctx["engine"] == EngineType.mariadb.value
+            ):
+                fk_groups, fk_read_error = self._read_fk_groups(
+                    job_id, adapter, db_name, table_steps
+                )
+            group_of = {
+                s.object_name: i for i, g in enumerate(fk_groups) for s in g.steps
+            }
+            handled_groups: set[int] = set()
             for step in table_steps:
+                gi = group_of.get(step.object_name)
+                if gi is not None and gi in handled_groups:
+                    continue  # ya se procesó junto con su grupo
                 if cancel():
                     self._set_progress(job_id, dict(progress))
                     self._set_status(
@@ -1801,6 +1871,35 @@ class CollationConversionController:
                     ))
                     seq += 1
                     continue
+                if fk_read_error is not None:
+                    # Fail-closed: sin saber qué FKs tiene la BD, en MariaDB un CONVERT TO
+                    # puede fallar con 1832 a mitad de la fase y dejar la BD a medias, que
+                    # es justo el estado que el grupo existe para evitar.
+                    had_failure = True
+                    self._record_item(job_id, dict(
+                        seq=seq, object_type=step.object_type, object_name=step.object_name,
+                        previous_charset=step.previous_charset,
+                        previous_collation=step.previous_collation,
+                        sql=step.sql, status=COLLATION_ITEM_ERROR, executed_at=_utcnow(),
+                        error=fk_read_error,
+                    ))
+                    seq += 1
+                    done += 1
+                    bump(tables_done=done)
+                    continue
+                if gi is not None:
+                    # El cancel se mira ANTES del grupo y nunca adentro: cortar entre el
+                    # DROP de una FK y su recreación dejaría la BD sin la constraint.
+                    handled_groups.add(gi)
+                    seq, failed = self._convert_fk_group(
+                        job_id, run_one, ctx, fk_groups[gi], seq
+                    )
+                    had_failure = had_failure or failed
+                    # Las FKs del grupo tienen ítem propio pero NO cuentan como tablas: el
+                    # denominador ``tables_total`` solo cuenta pasos de conversión.
+                    done += len(fk_groups[gi].steps)
+                    bump(tables_done=done)
+                    continue
                 # FK checks DESACTIVADOS solo acá. MySQL PROHÍBE la conversión de charset
                 # sobre una tabla con una columna de texto usada en una FK
                 # (doc oficial de ALTER TABLE: "character set conversion is not permitted…
@@ -1808,7 +1907,8 @@ class CollationConversionController:
                 # lo dispara cualquier esquema con una FK sobre varchar. No se extiende al
                 # ALTER DATABASE (no toca tablas) ni a la fase de objetos (un DROP/CREATE de
                 # rutina no está sujeto a esta restricción y desactivarlo ahí solo ampliaría
-                # la ventana sin comprar nada).
+                # la ventana sin comprar nada). En MariaDB el flag NO alcanza para una FK de
+                # texto (1832): esas tablas no llegan acá, van por ``_convert_fk_group``.
                 ok, err, ms = run_one(step.sql, disable_fk_checks=True)
                 had_failure = had_failure or not ok
                 self._record_item(job_id, dict(
@@ -1865,6 +1965,335 @@ class CollationConversionController:
             seq += 1
 
         self._finish(job_id, ctx, failed=had_failure, seq=seq, progress=progress)
+
+    # ------------------------------------------------------------------ #
+    # MariaDB: grupos de tablas unidas por FKs sobre columnas de texto    #
+    # ------------------------------------------------------------------ #
+    def _read_fk_groups(
+        self, job_id: int, adapter, db_name: str, table_steps: list[_Step]
+    ) -> tuple[list[_FkGroup], str | None]:
+        """
+        Lee EN LA EJECUCIÓN (no en el preview) las FKs de texto que tocan las tablas a
+        convertir y las agrupa. Devuelve ``(grupos, None)`` o ``([], motivo)`` si no pudo leer.
+
+        Se lee acá y no en ``_build_plan`` a propósito: el plan es el contrato del preview
+        (``_Step.action`` es un enum cerrado en la SPA y el token hashea los pasos), y las FKs
+        son un detalle de CÓMO se ejecuta la conversión en un motor, no de QUÉ se convierte.
+        """
+        converting = [s.object_name for s in table_steps if s.action == "convert_table"]
+        if not converting:
+            return [], None
+        reason = (
+            "No se convirtió: no se pudieron leer las FKs de la base{detail}. En MariaDB "
+            "convertir una tabla con una FK sobre texto sin soltarla falla (1832) y dejaría "
+            "la base a medio convertir."
+        )
+        try:
+            fks = adapter.text_foreign_keys(db_name, converting)
+        except AppHttpException as exc:
+            return [], reason.format(detail=f" ({exc.message})")
+        except Exception:  # el detalle va al log con traceback; acá solo se reporta el ítem
+            logger.warning(
+                "Conversión %s: no se pudieron leer las FKs de texto de %s", job_id, db_name,
+                exc_info=True,
+            )
+            return [], reason.format(detail=" (ver logs del gateway)")
+        return self._fk_groups(fks, table_steps), None
+
+    @staticmethod
+    def _fk_groups(fks: list[TextForeignKey], table_steps: list[_Step]) -> list[_FkGroup]:
+        """
+        Componentes conexos de tablas unidas por ``fks`` que contienen al menos una tabla a
+        convertir. Tienen que ser componentes y no pares: si ``a→b`` y ``c→b``, convertir
+        ``b`` exige soltar AMBAS FKs, así que ``a``, ``b`` y ``c`` son una sola unidad.
+        """
+        convert = {s.object_name for s in table_steps if s.action == "convert_table"}
+        relevant = [fk for fk in fks if fk.table in convert or fk.referred_table in convert]
+        parent: dict[str, str] = {}
+
+        def find(x: str) -> str:
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for fk in relevant:
+            ra, rb = find(fk.table), find(fk.referred_table)
+            if ra != rb:
+                parent[rb] = ra
+        groups: dict[str, _FkGroup] = {}
+        for s in table_steps:  # orden del plan
+            if s.action == "convert_table" and s.object_name in parent:
+                root = find(s.object_name)
+                groups.setdefault(root, _FkGroup(steps=[], fks=[])).steps.append(s)
+        for fk in relevant:
+            groups[find(fk.table)].fks.append(fk)
+        return list(groups.values())
+
+    def _convert_fk_group(
+        self, job_id: int, run_one, ctx: dict, group: _FkGroup, seq: int
+    ) -> tuple[int, bool]:
+        """
+        Convierte un grupo de tablas unidas por FKs de texto en MariaDB. Devuelve
+        ``(seq, falló)``.
+
+        POR QUÉ EXISTE: MariaDB rechaza ``ALTER TABLE ... CONVERT TO CHARACTER SET`` sobre una
+        columna usada en una FK con el error 1832 aunque ``foreign_key_checks`` esté en 0
+        (medido contra 11.8.9; MySQL 8 sí lo acepta con el flag, por eso su camino no cambia).
+        El job fallaba a mitad y dejaba la BD a medio convertir. La única salida es soltar las
+        FKs, convertir y recrearlas; y como una BD SIN la constraint es peor que una sin
+        convertir, el grupo es atómico:
+
+        (a) Se persiste un ítem por FK con el ``ADD CONSTRAINT`` exacto en ``captured_ddl``
+            ANTES de soltar nada (mismo motivo que en ``_recreate_object``: sin DDL
+            transaccional, esa columna es la única copia si algo corta a mitad).
+        (b) DROP de las FKs. Si uno falla, se recrean las ya soltadas y no se convierte nada.
+        (c) Conversión de las tablas en el orden del plan. Si una falla, se revierten las ya
+            convertidas a su collation original y se recrean las FKs.
+        (d) Recreación de las FKs. Si una falla, se sueltan las recreadas, se revierten TODAS
+            las tablas y se recrean las FKs otra vez (con las tablas en su collation original,
+            el ADD es el mismo que ya existía).
+        (e) Si la compensación misma falla, el ítem afectado dice qué etapa falló y cómo
+            recuperarlo a mano; el job queda ``failed`` y ``_finish`` pone la BD en cuarentena.
+
+        LIMITACIÓN de la reversión: vuelve al charset/collation DEFAULT que tenía la TABLA
+        (``CONVERT TO`` de toda la tabla), así que una columna que tenía una collation propia
+        distinta de ese default vuelve normalizada a él.
+
+        No hay chequeo de cancelación adentro: cortar entre el DROP y el ADD dejaría la BD sin
+        sus FKs. Todo error del runner se captura acá por el mismo motivo: una excepción que
+        escapara saltearía la compensación.
+        """
+        dialect = ctx["engine"]
+        db_q = quote_identifier(
+            validate_identifier(ctx["database"], dialect, "base de datos", allow_existing=True),
+            dialect,
+        )
+        target = f"{ctx['charset']}/{ctx['collation']}"
+
+        def label(fk: TextForeignKey) -> str:
+            return f"{fk.table}.{fk.name}"
+
+        def execute(sql: str, *, fk_off: bool) -> tuple[bool, str | None, int | None]:
+            try:
+                return run_one(sql, disable_fk_checks=fk_off)
+            except Exception:  # el detalle va al log; cortar acá saltearía la compensación
+                logger.warning(
+                    "Conversión %s: error inesperado en el grupo de FKs", job_id, exc_info=True,
+                )
+                return False, "Error inesperado del runner (ver logs del gateway).", None
+
+        # (0) Sin la collation ORIGINAL de cada tabla el grupo no se podría revertir: se
+        # verifica antes de tocar el motor, no cuando ya hace falta.
+        revert_sql: dict[str, str] = {}
+        for step in group.steps:
+            try:
+                cs = validate_identifier(step.previous_charset or "", dialect, "charset")
+                co = validate_identifier(step.previous_collation or "", dialect, "collation")
+            except AppHttpException:
+                for s in group.steps:
+                    self._record_item(job_id, dict(
+                        seq=seq, object_type=s.object_type, object_name=s.object_name,
+                        previous_charset=s.previous_charset,
+                        previous_collation=s.previous_collation, sql=s.sql,
+                        status=COLLATION_ITEM_ERROR, executed_at=_utcnow(),
+                        error=(
+                            f"No se convirtió: no se conoce el charset/collation original de "
+                            f"`{step.object_name}` y sin él su grupo de FKs no se podría "
+                            "revertir si algo fallara. No se tocó ninguna tabla del grupo."
+                        ),
+                    ))
+                    seq += 1
+                return seq, True
+            t_q = quote_identifier(
+                validate_identifier(step.object_name, dialect, "tabla", allow_existing=True),
+                dialect,
+            )
+            revert_sql[step.object_name] = (
+                f"ALTER TABLE {db_q}.{t_q} CONVERT TO CHARACTER SET {cs} COLLATE {co}"
+            )
+
+        # (a) Copia de recuperación de cada FK ANTES de soltar nada.
+        fk_items: dict[str, int] = {}
+        for fk in group.fks:
+            fk_items[label(fk)] = self._record_item_returning(job_id, dict(
+                seq=seq, object_type=COLLATION_OBJ_FOREIGN_KEY, object_name=label(fk),
+                captured_ddl=fk.add_sql, sql=fk.add_sql,
+            ))
+            seq += 1
+        # Estado final de cada ítem de FK; se escribe al terminar el grupo.
+        fk_state: dict[str, dict] = {
+            label(fk): {"status": None, "error": None} for fk in group.fks
+        }
+        dropped: set[str] = set()
+        table_items: dict[str, int] = {}
+        compensation_failed = False
+
+        def restore(converted: list[_Step], cause: str) -> None:
+            """Deja el grupo como estaba: tablas a su collation original y FKs recreadas."""
+            nonlocal compensation_failed
+            # 1. Con una FK presente MariaDB rechaza también el CONVERT de reversión (1832),
+            #    así que primero se sueltan las que (d) ya había recreado.
+            blocking: list[tuple[TextForeignKey, str | None]] = []
+            if converted:
+                for fk in group.fks:
+                    if label(fk) in dropped:
+                        continue
+                    ok, err, _ms = execute(fk.drop_sql, fk_off=False)
+                    if ok:
+                        dropped.add(label(fk))
+                    else:
+                        blocking.append((fk, err))
+                        fk_state[label(fk)] = {
+                            "status": COLLATION_ITEM_ERROR,
+                            "error": (
+                                f"La FK existe, pero no se pudo soltar para revertir su grupo "
+                                f"({err}): las tablas del grupo quedaron en {target}."
+                            ),
+                        }
+            # 2. Revertir las tablas convertidas, en orden inverso.
+            for step in reversed(converted):
+                name = step.object_name
+                original = f"{step.previous_charset}/{step.previous_collation}"
+                if blocking:
+                    compensation_failed = True
+                    note = (
+                        f"{cause} ATENCIÓN: la tabla quedó CONVERTIDA a {target} y NO se "
+                        f"revirtió: no se pudo soltar la FK `{label(blocking[0][0])}`. Para "
+                        f"revertirla a mano, soltá esa FK y ejecutá: {revert_sql[name]}"
+                    )
+                else:
+                    ok, err, _ms = execute(revert_sql[name], fk_off=True)
+                    if ok:
+                        note = (
+                            f"{cause} La tabla se había convertido y se REVIRTIÓ a {original}: "
+                            "quedó como estaba (las columnas con una collation propia "
+                            "distinta del default de la tabla vuelven a ese default)."
+                        )
+                    else:
+                        compensation_failed = True
+                        note = (
+                            f"{cause} ATENCIÓN: la tabla quedó CONVERTIDA a {target} y su "
+                            f"reversión a {original} falló ({err}). Para revertirla a mano: "
+                            f"{revert_sql[name]}"
+                        )
+                self._update_item(
+                    table_items[name], dict(status=COLLATION_ITEM_ERROR, error=note)
+                )
+            # 3. Recrear las FKs soltadas.
+            for fk in group.fks:
+                key = label(fk)
+                if key not in dropped:
+                    continue
+                ok, err, _ms = execute(fk.add_sql, fk_off=True)
+                prev = fk_state[key]
+                if ok:
+                    dropped.discard(key)
+                    restored = "La FK se soltó y se RECREÓ: quedó como estaba."
+                    if prev["status"] == COLLATION_ITEM_ERROR:
+                        fk_state[key] = {**prev, "error": f"{prev['error']} {restored}"}
+                    else:
+                        fk_state[key] = {
+                            "status": COLLATION_ITEM_SKIPPED, "error": f"{cause} {restored}",
+                        }
+                else:
+                    compensation_failed = True
+                    fk_state[key] = {
+                        "status": COLLATION_ITEM_ERROR,
+                        "error": (
+                            f"{cause} ATENCIÓN: la FK NO existe en la base de datos: se soltó "
+                            f"y su recreación falló ({err}). El DDL original está guardado en "
+                            "'captured_ddl' de este ítem: usalo para recrearla a mano tras "
+                            "corregir la causa."
+                        ),
+                    }
+
+        def finish(failed: bool) -> tuple[int, bool]:
+            for fk in group.fks:
+                self._update_item(fk_items[label(fk)], dict(
+                    **fk_state[label(fk)], executed_at=_utcnow(),
+                ))
+            if compensation_failed:
+                logger.error(
+                    "Conversión %s: la compensación del grupo de FKs %s falló; ver ítems.",
+                    job_id, [label(fk) for fk in group.fks],
+                )
+            return seq, failed
+
+        # (b) Soltar las FKs.
+        for fk in group.fks:
+            ok, err, _ms = execute(fk.drop_sql, fk_off=False)
+            if ok:
+                dropped.add(label(fk))
+                continue
+            cause = f"Falló el DROP de la FK `{label(fk)}`; no se convirtió su grupo."
+            fk_state[label(fk)] = {
+                "status": COLLATION_ITEM_ERROR,
+                "error": f"Falló el DROP de la FK: {err}. No se tocó ninguna tabla del grupo.",
+            }
+            for other in group.fks:
+                if label(other) not in dropped and other is not fk:
+                    fk_state[label(other)] = {
+                        "status": COLLATION_ITEM_SKIPPED, "error": f"No se soltó: {cause}",
+                    }
+            for step in group.steps:
+                self._record_item(job_id, dict(
+                    seq=seq, object_type=step.object_type, object_name=step.object_name,
+                    previous_charset=step.previous_charset,
+                    previous_collation=step.previous_collation, sql=step.sql,
+                    status=COLLATION_ITEM_ERROR, executed_at=_utcnow(),
+                    error=f"No se convirtió: {cause}",
+                ))
+                seq += 1
+            restore([], cause)
+            return finish(True)
+
+        # (c) Convertir las tablas del grupo.
+        converted: list[_Step] = []
+        for i, step in enumerate(group.steps):
+            ok, err, ms = execute(step.sql, fk_off=True)
+            table_items[step.object_name] = self._record_item_returning(job_id, dict(
+                seq=seq, object_type=step.object_type, object_name=step.object_name,
+                previous_charset=step.previous_charset,
+                previous_collation=step.previous_collation, sql=step.sql,
+                status=COLLATION_ITEM_OK if ok else COLLATION_ITEM_ERROR,
+                error=None if ok else f"{err} (su grupo de FKs se devolvió a como estaba)",
+                execution_ms=ms, executed_at=_utcnow(),
+            ))
+            seq += 1
+            if ok:
+                converted.append(step)
+                continue
+            cause = f"Falló la conversión de `{step.object_name}`, de su mismo grupo de FKs."
+            for rest in group.steps[i + 1:]:
+                self._record_item(job_id, dict(
+                    seq=seq, object_type=rest.object_type, object_name=rest.object_name,
+                    previous_charset=rest.previous_charset,
+                    previous_collation=rest.previous_collation, sql=rest.sql,
+                    status=COLLATION_ITEM_SKIPPED, executed_at=_utcnow(),
+                    error=f"No se convirtió: {cause}",
+                ))
+                seq += 1
+            restore(converted, cause)
+            return finish(True)
+
+        # (d) Recrear las FKs con las tablas ya convertidas.
+        for fk in group.fks:
+            ok, err, _ms = execute(fk.add_sql, fk_off=True)
+            if ok:
+                dropped.discard(label(fk))
+                fk_state[label(fk)] = {"status": COLLATION_ITEM_OK, "error": None}
+                continue
+            cause = f"Falló la recreación de la FK `{label(fk)}` tras convertir su grupo."
+            fk_state[label(fk)] = {
+                "status": COLLATION_ITEM_ERROR,
+                "error": f"Falló la recreación tras convertir: {err}. Se revirtió el grupo.",
+            }
+            restore(converted, cause)
+            return finish(True)
+
+        return finish(False)
 
     def _recreate_object(
         self, job_id, runner, adapter, target, ctx, step: _Step, seq: int,

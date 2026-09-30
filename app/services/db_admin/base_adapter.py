@@ -62,6 +62,7 @@ from app.services.db_admin.dtos import (
     TableCollationInfo,
     TableSchema,
     TableStat,
+    TextForeignKey,
     TriggerInfo,
     UniqueConstraintInfo,
     ViewInfo,
@@ -365,6 +366,19 @@ class ServerAdapter(ABC):
         comparaciones entre ellas fallan al EJECUTARSE (no al crear el constraint). El modo
         ``universal`` ya cubre su caso equivalente por otra vía (MySQL/MariaDB rechazan el
         propio DDL) y no necesita esta consulta.
+        """
+        return []
+
+    def text_foreign_keys(
+        self, database: str, tables: Sequence[str]
+    ) -> list["TextForeignKey"]:
+        """
+        FKs INTERNAS de ``database`` con alguna columna de texto que tocan ``tables``.
+        Lista vacía por default.
+
+        Solo la implementa la familia MySQL: la usa el modo ``universal`` en MariaDB, cuyo
+        motor rechaza ``CONVERT TO CHARACTER SET`` sobre una columna usada en una FK aunque
+        ``foreign_key_checks`` esté desactivado.
         """
         return []
 

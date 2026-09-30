@@ -9,6 +9,7 @@ Particularidades:
 """
 
 import re
+from collections.abc import Sequence
 from typing import ClassVar
 
 from sqlalchemy import text
@@ -31,6 +32,7 @@ from app.services.db_admin.dtos import (
     EngineUserInfo,
     EventInfo,
     ExternalFkDependent,
+    ForeignKeyInfo,
     GrantInfo,
     GrantLevel,
     ObjectRef,
@@ -39,6 +41,7 @@ from app.services.db_admin.dtos import (
     RoutineParam,
     StructureDump,
     TableCollationInfo,
+    TextForeignKey,
     TriggerInfo,
     ViewInfo,
 )
@@ -362,6 +365,92 @@ class MySQLAdapter(ServerAdapter):
             )
             for r in rows
         ]
+
+    def text_foreign_keys(
+        self, database: str, tables: Sequence[str]
+    ) -> list[TextForeignKey]:
+        """
+        FKs INTERNAS de ``database`` con al menos una columna de texto, cuya tabla dueña o
+        referenciada está en ``tables``. Una sola consulta a ``information_schema``.
+
+        La usa la conversión de collation en MariaDB: su motor rechaza ``ALTER TABLE ...
+        CONVERT TO CHARACTER SET`` sobre una columna usada en una FK con el error 1832 aunque
+        ``foreign_key_checks`` esté en 0 (medido contra 11.8.9; MySQL 8 sí lo acepta con el
+        flag). La única salida es soltar la FK, convertir y recrearla, y para eso el worker
+        necesita el DDL exacto de ambos sentidos, que se renderiza acá.
+
+        - ``REFERENCED_TABLE_SCHEMA = :db``: solo FKs internas. Las que llegan desde OTRA BD
+          son el aviso de ``external_fk_dependents`` y quedan fuera de alcance.
+        - ``COLLATION_NAME IS NOT NULL``: la columna es de texto. Alcanza con mirar el lado
+          dueño, porque el motor exige tipos compatibles en ambos lados.
+        - Las columnas salen por ``ORDINAL_POSITION``: el orden de una FK compuesta es parte
+          de su definición y recrearla con otro orden sería otra constraint.
+        """
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        wanted = set(tables)
+        if not wanted:
+            return []
+        sql = (
+            "SELECT k.TABLE_NAME AS table_name, k.CONSTRAINT_NAME AS constraint_name, "
+            "k.COLUMN_NAME AS column_name, k.REFERENCED_TABLE_NAME AS referenced_table, "
+            "k.REFERENCED_COLUMN_NAME AS referenced_column, "
+            "rc.DELETE_RULE AS delete_rule, rc.UPDATE_RULE AS update_rule, "
+            "c.COLLATION_NAME AS collation_name "
+            "FROM information_schema.KEY_COLUMN_USAGE k "
+            "JOIN information_schema.REFERENTIAL_CONSTRAINTS rc "
+            "  ON rc.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA "
+            "  AND rc.CONSTRAINT_NAME = k.CONSTRAINT_NAME "
+            "  AND rc.TABLE_NAME = k.TABLE_NAME "
+            "JOIN information_schema.COLUMNS c "
+            "  ON c.TABLE_SCHEMA = k.TABLE_SCHEMA "
+            "  AND c.TABLE_NAME = k.TABLE_NAME "
+            "  AND c.COLUMN_NAME = k.COLUMN_NAME "
+            "WHERE k.TABLE_SCHEMA = :db AND k.REFERENCED_TABLE_SCHEMA = :db "
+            "AND k.REFERENCED_TABLE_NAME IS NOT NULL "
+            "ORDER BY k.TABLE_NAME, k.CONSTRAINT_NAME, k.ORDINAL_POSITION"
+        )
+        try:
+            with server_connection(self.target) as conn:
+                rows = conn.execute(text(sql), {"db": database}).fetchall()
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="text_foreign_keys", target=self.target,
+                extra={"database": database},
+            )
+
+        grouped: dict[tuple[str, str], dict] = {}
+        for r in rows:
+            key = (str(r.table_name), str(r.constraint_name))
+            fk = grouped.setdefault(key, {
+                "table": key[0], "name": key[1], "columns": [], "referred_columns": [],
+                "referred_table": str(r.referenced_table),
+                "on_delete": r.delete_rule, "on_update": r.update_rule, "has_text": False,
+            })
+            fk["columns"].append(str(r.column_name))
+            fk["referred_columns"].append(str(r.referenced_column))
+            fk["has_text"] = fk["has_text"] or r.collation_name is not None
+
+        out: list[TextForeignKey] = []
+        for fk in grouped.values():
+            if not fk["has_text"]:
+                continue
+            if fk["table"] not in wanted and fk["referred_table"] not in wanted:
+                continue
+            info = ForeignKeyInfo(
+                name=fk["name"], columns=fk["columns"],
+                referred_table=fk["referred_table"],
+                referred_columns=fk["referred_columns"],
+                on_delete=fk["on_delete"], on_update=fk["on_update"],
+            )
+            out.append(TextForeignKey(
+                table=fk["table"], name=fk["name"], columns=fk["columns"],
+                referred_table=fk["referred_table"],
+                referred_columns=fk["referred_columns"],
+                on_delete=fk["on_delete"], on_update=fk["on_update"],
+                drop_sql=self._render_drop_fk(fk["table"], info),
+                add_sql=self._render_add_fk(fk["table"], info),
+            ))
+        return out
 
     # ------------------------- snapshot estructural (Plan 09) ----------------- #
     @staticmethod

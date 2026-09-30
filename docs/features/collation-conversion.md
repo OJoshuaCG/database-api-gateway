@@ -132,7 +132,10 @@ reinicia, los jobs `running` quedan `interrupted` (barrido en el `lifespan`).
 2. **`ALTER TABLE db.t CONVERT TO CHARACTER SET x COLLATE y`** por cada tabla seleccionada,
    *best-effort*: un fallo se reporta en su ítem y **no aborta** las demás (abortar dejaría la
    BD a mitad de camino, el estado más peligroso para este feature). Esta fase —y **solo**
-   esta— corre con los **chequeos de FK desactivados**; ver abajo.
+   esta— corre con los **chequeos de FK desactivados**; ver abajo. **En MariaDB**, las tablas
+   unidas por FKs sobre columnas de texto se procesan como un **grupo atómico**: se sueltan
+   esas FKs, se convierten las tablas del grupo y se recrean, con reversión del grupo si algo
+   falla (ver abajo).
 3. **`SET NAMES x COLLATE y` + `DROP {TIPO} IF EXISTS` + `CREATE` verbatim** por cada objeto
    seleccionado, en cualquier orden, también best-effort.
 
@@ -162,13 +165,50 @@ El flag va **solo** en la fase de tablas. El `ALTER DATABASE` no toca tablas, y 
 `DROP`+`CREATE` de rutina no está sujeto a esta restricción: extenderlo ahí solo ampliaría la
 ventana sin comprar nada.
 
-**Efecto sobre el aviso de conversión parcial**: con los chequeos desactivados el motor
-**acepta** el DDL, así que convertir unas tablas y no otras ya **no falla** con 3780/1832 — la
+**Efecto sobre el aviso de conversión parcial (MySQL)**: con los chequeos desactivados el
+motor **acepta** el DDL, así que convertir unas tablas y no otras ya **no falla** con 3780 — la
 incoherencia entre los dos lados de una FK aparece recién al **consultar**
 (`Illegal mix of collations`). El preview lo dice con ese matiz.
 
-*Pendiente de motor real*: si MariaDB 10.x/11.x impone la misma restricción. Su KB no devolvió
-la sección. El fix es inofensivo en cualquier caso.
+### En MariaDB el flag NO alcanza: la FK se suelta y se recrea
+
+Lo que figuraba como pendiente de motor real ya está medido, con el mismo caso mínimo contra
+los dos motores: **MySQL 8.0.46** rechaza sin el flag (3780) y **funciona** con él; **MariaDB
+11.8.9** rechaza **con y sin** el flag, siempre con **1832** (`Cannot change column ... used in
+a foreign key constraint`). No es el mismo rechazo: MySQL falla por la incompatibilidad de la FK
+y el flag lo levanta; MariaDB se niega a cambiar la columna y el flag no la afecta. Antes del
+fix el job fallaba a mitad y dejaba la BD a medio convertir.
+
+En MariaDB la fase de tablas hace, **en la ejecución** y sin cambiar el plan del preview (ni
+acciones nuevas, ni pasos de FK, ni el token):
+
+1. Lee en **una** consulta a `information_schema` (`KEY_COLUMN_USAGE` ⋈
+   `REFERENTIAL_CONSTRAINTS` ⋈ `COLUMNS`) las FKs **internas** con alguna columna de texto que
+   tocan las tablas a convertir (`text_foreign_keys` del adapter).
+2. Arma **grupos**: componentes conexos de tablas unidas por esas FKs. Una tabla vinculada que no
+   se convierte (`skip` o fuera de la selección) entra al grupo para soltar su FK, pero no se
+   convierte. Una tabla **sin** FKs de texto sigue el camino por tabla de siempre.
+3. Por grupo, como **unidad atómica** (la cancelación se mira **entre** grupos, nunca adentro:
+   cortar entre el `DROP` y el `ADD` dejaría la BD sin la constraint):
+   - registra **un ítem por FK** (`object_type = "foreign_key"`, `object_name =
+     "<tabla>.<constraint>"`) con el `ADD CONSTRAINT` exacto en `captured_ddl`, **antes** de
+     soltar nada;
+   - suelta las FKs. Si un `DROP` falla, recrea las ya soltadas y no convierte el grupo;
+   - convierte las tablas en el orden del plan. Si una falla, **revierte** las ya convertidas a
+     su charset/collation original y recrea las FKs;
+   - recrea las FKs. Si una falla, suelta las ya recreadas, revierte **todas** las tablas del
+     grupo y recrea las FKs sobre el estado original;
+   - si la **compensación misma** falla, el ítem afectado dice qué etapa falló y cómo
+     recuperarlo a mano (el `ADD` está en `captured_ddl`; el `CONVERT TO` de reversión, en el
+     mensaje), y el job termina `failed` con la BD en cuarentena.
+
+Resultado: la BD nunca queda sin sus FKs salvo que falle la compensación, y ese caso queda
+reportado explícitamente. Si no se pueden leer las FKs, **no se convierte ninguna tabla**
+(fail-closed): convertir a ciegas es exactamente lo que dejaba la BD a medias.
+
+Los ítems de FK **no** cuentan en `tables_total` ni en `progress.tables_done`, que siguen
+contando solo pasos de conversión. La lógica vive en `_convert_fk_group` del controller; su
+docstring tiene el porqué completo.
 
 ### Los pasos corren con el timeout de volcado, no con el interactivo
 
@@ -619,7 +659,15 @@ UI necesita poder distinguir un dato leído del motor de una afirmación.
 - **Cancelar no interrumpe un `ALTER TABLE` en curso**: es cooperativa y detiene los pasos que
   todavía no empezaron. Matar la sentencia dejaría la tabla a medio reescribir.
 - **Sin rollback automático**: convertir es una operación de una sola dirección. Volver atrás
-  es otra conversión (a la collation anterior), con el mismo costo.
+  es otra conversión (a la collation anterior), con el mismo costo. La única excepción es el
+  grupo de FKs de MariaDB, que se revierte si falla.
+- **La reversión del grupo de FKs (MariaDB) normaliza las collations por columna.** Revierte con
+  `CONVERT TO` al charset/collation **DEFAULT** que tenía cada tabla, así que una columna que
+  tenía una collation propia distinta de ese default vuelve normalizada a él. Una FK que une
+  una tabla convertida con una que queda sin convertir puede no recrearse, y entonces el grupo
+  se revierte entero.
+- **FKs entre bases** (desde otra BD del servidor) siguen siendo solo un aviso: el grupo de
+  MariaDB mira únicamente FKs internas.
 - **`automatic_sp_privileges`** (default `1` en ambos motores) hace que el creador de una
   rutina reciba `EXECUTE`/`ALTER ROUTINE` automáticamente: recrear una rutina puede agregar
   filas en `mysql.procs_priv` para el definer. Es inocuo (ya tenía esos permisos) pero
@@ -657,7 +705,9 @@ es por lo que la feature figuraba como verificada.
 1. **El motor PROHIBÍA la operación.** MySQL no permite convertir el charset de una tabla con
    una columna de texto usada en una FK mientras `foreign_key_checks` esté activo. No es un
    borde: lo dispara cualquier esquema con una FK sobre `varchar`. La fase de tablas ahora corre
-   con los chequeos desactivados, que es el workaround que la propia doc nombra.
+   con los chequeos desactivados, que es el workaround que la propia doc nombra. **En MariaDB
+   ese workaround no alcanza** (1832 con y sin el flag), y lo encontró el primer e2e del módulo:
+   ahí la FK se suelta y se recrea por grupo (ver *En MariaDB el flag NO alcanza*).
 2. **El timeout de 15 s era de socket DEL CLIENTE.** Cortaba la conexión de un `CONVERT TO`
    **mientras el motor seguía reescribiendo la tabla**: el gateway registraba como fallida una
    sentencia que en realidad se completaba, y encima dejaba la BD en cuarentena. El peor estado
@@ -681,6 +731,10 @@ conversión), no de mención, y hay un test dedicado a fijar esa distinción.
 ## Verificación
 
 - Modo `universal`: `tests/test_api_collation_conversions.py` (adapter y motor mockeados).
+  El grupo de FKs de MariaDB tiene seis casos (`test_mariadb_*` y
+  `test_mysql_keeps_fk_checks_path_without_dropping_fks`): orden `DROP` → convertir → `ADD`,
+  MySQL sin cambios, reversión ante fallo de conversión y de recreación, tabla sin FK por el
+  camino de siempre y fail-closed si no se pueden leer las FKs. **Escritos, no ejecutados.**
   **Pendiente de e2e contra MySQL/MariaDB reales**: el `SET NAMES` + `DROP`+`CREATE`
   refrescando de verdad la `collation_connection` de una rutina, la lectura de
   `mysql.procs_priv` con la credencial pseudo-root real, y la migración Alembic contra la BD
@@ -702,10 +756,14 @@ conversión), no de mención, y hay un test dedicado a fijar esa distinción.
 
 **Lo que NO está verificado, y hay que decirlo:**
 
-- **Nada contra motores reales.** Lo más importante a confirmar es si **MariaDB** impone la misma
-  restricción de `foreign_key_checks` que MySQL documenta — es la premisa del primer fix de arriba
-  y su KB no devolvió la sección —, y el ciclo completo lote → versión → `stamp` contra los tres
-  motores.
+- **El grupo de FKs de MariaDB no se corrió contra un motor real.** La premisa sí está medida
+  (MariaDB 11.8.9 rechaza con 1832 con y sin el flag), pero ni los tests unitarios nuevos ni
+  `scripts/verify_collation_batch_e2e.py` —que ahora además comprueba que `fk_child_parent`
+  sigue existiendo después de convertir— se ejecutaron tras el fix. Tampoco la consulta de
+  `text_foreign_keys` contra el `information_schema` real ni el `ADD CONSTRAINT` renderizado
+  con `foreign_key_checks=0` en MariaDB.
+- **El resto, nada contra motores reales**: el ciclo completo lote → versión → `stamp` contra
+  los tres motores.
 - **El `ALTER DATABASE` sin nombre de base** está documentado en MySQL 8 y MariaDB, pero no se
   ejecutó: es lo que hace replicable el SQL de la versión, así que un fallo ahí la invalida.
 - **Ruff no estaba instalado** en el entorno donde se implementó: el lint no se corrió. Solo se

@@ -555,6 +555,30 @@ class CollatableForeignKey(BaseModel):
     referenced_column: str
 
 
+class TextForeignKey(BaseModel):
+    """
+    Una FOREIGN KEY INTERNA de la BD con al menos una columna de texto (MySQL/MariaDB).
+
+    Existe para la conversión en MariaDB: su motor rechaza ``CONVERT TO CHARACTER SET``
+    sobre una columna usada en una FK (error 1832) incluso con ``foreign_key_checks=0``,
+    así que el worker tiene que soltar la constraint, convertir y recrearla. Por eso trae el
+    DDL de ambos sentidos YA RENDERIZADO por el adapter: el controller no arma SQL de motor.
+
+    Los campos ``name``/``columns``/``referred_*``/``on_*`` son los que lee
+    ``_render_add_fk``; ``table`` es la tabla dueña de la constraint.
+    """
+
+    table: str
+    name: str
+    columns: list[str]
+    referred_table: str
+    referred_columns: list[str]
+    on_delete: str | None = None
+    on_update: str | None = None
+    drop_sql: str
+    add_sql: str
+
+
 class CollationObjectInfo(BaseModel):
     """
     Uno de los CINCO tipos de objeto cuyo collation queda CONGELADO en el momento de su
