@@ -38,6 +38,13 @@ class MeOut(BaseModel):
     id: int
     username: str
     role: str | None = Field(None, description="Rol efectivo (máximo sobre los alcances)")
+    base_role: str | None = Field(
+        None,
+        description=(
+            "Rol base (gateway_role), sin la unión con los grants. Es el que rige en un destino "
+            "donde ningún grant de 'scope_roles' aplica."
+        ),
+    )
     capabilities: list[str] = Field(
         default_factory=list,
         description="Capacidades efectivas: exactamente lo que require() va a aceptar",

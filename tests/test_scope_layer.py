@@ -100,6 +100,60 @@ def test_an_elevating_grant_also_applies(client):
     assert effective_role_at(actor, server_id=1, managed_database_id=bd) == GatewayRole.OWNER
 
 
+def test_an_elevating_grant_does_not_leak_outside_its_scope(client):
+    """
+    REGRESIÓN F-14: sin grant aplicable, ``effective_role_at`` caía a ``actor.role``, que es el
+    rol UNIÓN. Un ``viewer`` con ``owner`` en desarrollo resolvía ``owner`` también en
+    producción. Tiene que resolver su rol BASE.
+    """
+    prod, dev = _env_id("production"), _env_id("development")
+    bd_prod = _sembrar_bd(environment_id=prod)
+    actor = _actor(GatewayRole.VIEWER, [("environment", dev, GatewayRole.OWNER)])
+
+    # La capa 1 sigue usando la unión ("¿podría en algún alcance?")…
+    assert actor.role == GatewayRole.OWNER
+    assert actor.base_role == GatewayRole.VIEWER
+    # …pero la capa 2, fuera del alcance del grant, manda el rol base.
+    assert effective_role_at(actor, server_id=1, managed_database_id=bd_prod) == GatewayRole.VIEWER
+
+
+def test_an_elevating_grant_does_not_reach_unclassified_databases(client):
+    """Una BD sin entorno resuelve al más protegido, que no es desarrollo: rige el base."""
+    dev = _env_id("development")
+    bd = _sembrar_bd(environment_id=None)
+    actor = _actor(GatewayRole.VIEWER, [("environment", dev, GatewayRole.OWNER)])
+
+    assert effective_role_at(actor, server_id=1, managed_database_id=bd) == GatewayRole.VIEWER
+
+
+@pytest.mark.parametrize(
+    "capability", [Capability.DATABASES_DROP, Capability.BLUEPRINTS_APPLY]
+)
+def test_an_elevating_grant_is_denied_in_production_and_allowed_in_its_scope(client, capability):
+    from app.exceptions import AppHttpException
+
+    prod, dev = _env_id("production"), _env_id("development")
+    bd_prod = _sembrar_bd(server_id=1, environment_id=prod)
+    bd_dev = _sembrar_bd(server_id=2, environment_id=dev)
+    actor = _actor(GatewayRole.VIEWER, [("environment", dev, GatewayRole.OWNER)])
+
+    with pytest.raises(AppHttpException) as exc:
+        assert_scope(actor, capability, server_id=1, managed_database_id=bd_prod)
+    assert exc.value.status_code == 403
+    assert exc.value.public_context["code"] == "access.forbidden"
+
+    # En su alcance, el grant sí eleva.
+    assert_scope(actor, capability, server_id=2, managed_database_id=bd_dev)
+
+
+def test_auth_me_exposes_the_base_role(admin_client):
+    """``role`` conserva su significado (unión); ``base_role`` es el que rige sin grant."""
+    _otorgar("environment", _env_id("development"), "viewer")
+    data = admin_client.get("/api/v1/auth/me").json()["data"]
+    assert data["role"] == "owner"
+    assert data["base_role"] == "owner"
+
+
 # --------------------------------------------------------------------------- #
 # 2. NULL no es "permitido"                                                   #
 # --------------------------------------------------------------------------- #

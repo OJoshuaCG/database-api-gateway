@@ -55,7 +55,11 @@ class AuthzController:
         return {
             "id": actor.id,
             "username": actor.username,
+            # ``role`` conserva su significado (rol UNIÓN: "¿podría en algún alcance?") por
+            # compatibilidad con la SPA; ``base_role`` es el que rige donde ningún grant aplica,
+            # y es lo que la SPA necesita para decidir por destino con ``scope_roles``.
             "role": actor.role.value if actor.role else None,
+            "base_role": actor.base_role.value if actor.base_role else None,
             "capabilities": sorted(c.value for c in effective),
             "global_capabilities": sorted(g.value for g in actor.global_capabilities),
             "scope_roles": [

@@ -74,7 +74,13 @@ class Actor:
     id: int
     username: str
     capabilities: frozenset[Capability]
+    #: Rol UNIÓN (máximo sobre el base y los grants): es la entrada de ``capabilities`` para la
+    #: capa 1. NO sirve como respuesta de la capa 2 cuando ningún grant aplica al destino; para
+    #: eso está ``base_role``.
     role: GatewayRole | None = None
+    #: El ``gateway_role`` del usuario ANTES de la unión con los grants. Es lo que manda en un
+    #: destino donde ningún grant aplica (``scope.effective_role_at``). ``None`` en tokens.
+    base_role: GatewayRole | None = None
     global_capabilities: frozenset[GlobalCapability] = field(default_factory=frozenset)
     token_id: str | None = None
     project_id: int | None = None
@@ -110,6 +116,11 @@ def admin_actor(
     versión anterior perdía el ``scope_type`` y con eso un grant de servidor se leía como uno
     de entorno: el entorno 3 y el servidor 3 son cosas distintas. Para la unión da igual
     (solo mira los roles), pero la capa 2 resuelve por destino y ahí el tipo ES la pregunta.
+
+    ``base_role`` guarda el ``role`` recibido SIN la unión. Antes solo se guardaba la unión, y
+    la capa 2 caía a ella cuando ningún grant aplicaba: un ``viewer`` con ``owner`` en
+    desarrollo resolvía ``owner`` también en producción y pasaba ``assert_scope(DROP)``. Un
+    grant que ELEVA tiene que valer solo dentro de su alcance.
     """
     gr = list(grants or [])
     effective = union_role(role, {i: r for i, (_, _, r) in enumerate(gr)})
@@ -124,6 +135,7 @@ def admin_actor(
         username=username,
         capabilities=frozenset(caps),
         role=effective,
+        base_role=role,
         global_capabilities=frozenset(globals_),
         scope_roles=frozenset(gr),
     )

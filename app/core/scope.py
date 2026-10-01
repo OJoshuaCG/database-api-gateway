@@ -155,6 +155,12 @@ def effective_role_at(
     Camino rápido: un actor sin ningún grant por alcance —el caso de todo despliegue hasta que
     alguien otorgue el primero— devuelve su rol base **sin tocar la BD**. Importa porque esto
     corre en el camino de cada operación con destino.
+
+    Sin grant aplicable manda el rol BASE (``actor.base_role``), NUNCA ``actor.role``: ese es
+    el rol UNIÓN, que ya incluye el máximo de todos los grants. Caer a la unión hacía que un
+    grant que ELEVA (``viewer`` con ``owner`` en desarrollo) valiera en todos los destinos,
+    incluido producción — exactamente lo contrario de "el grant manda en SU alcance". Los
+    tests previos no lo veían porque todos usaban base ≥ grant fuera del alcance del grant.
     """
     if actor.role is None:
         # Un actor de tipo token no tiene rol: sus capacidades salen de los scopes, ya
@@ -162,8 +168,9 @@ def effective_role_at(
         # `project_id`, que es otra frontera y no ésta.
         return GatewayRole.VIEWER
 
+    base = actor.base_role if actor.base_role is not None else actor.role
     if not actor.scope_roles:
-        return actor.role
+        return base
 
     env_id = resolve_environment_id(
         server_id=server_id, managed_database_id=managed_database_id
@@ -176,7 +183,7 @@ def effective_role_at(
         or (scope_type == "server" and server_id is not None and scope_id == server_id)
     ]
     if not aplicables:
-        return actor.role
+        return base
     return min(aplicables, key=lambda r: _ROLE_RANK[r])
 
 
