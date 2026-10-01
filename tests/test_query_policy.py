@@ -256,7 +256,9 @@ def test_cuerpo_procedural_no_se_parte_en_su_primer_punto_y_coma():
     )
     plan = qp.classify(sql, engine=MYSQL)
     assert len(plan.statements) == 2
-    assert plan.danger == qp.DDL
+    # Crear rutinas desde la consola está BLOQUEADO (``console_routine_authoring``); lo
+    # que este test fija es el corte del splitter, no el nivel.
+    assert plan.danger == qp.BLOCKED
     assert "sp1" in plan.statements[0].sql and "END" in plan.statements[0].sql
     assert "sp2" in plan.statements[1].sql and "END" in plan.statements[1].sql
 
@@ -544,3 +546,160 @@ def test_un_comentario_de_bloque_normal_sigue_descartandose():
     assert qp._scan_normalize("SELECT 1 /* DROP DATABASE prod */", engine="mysql") == (
         "SELECT 1"
     )
+
+
+# --------------------------------------------------------------------------- #
+# F-44: DCL envuelto en un bloque DO / cuerpo de rutina / evento                #
+# --------------------------------------------------------------------------- #
+MARIADB = "mariadb"
+
+_ROUTINE_WRAPPERS = [
+    # --- PostgreSQL: bloques DO con cualquier tag de dollar-quoting ---
+    (PG, "DO $$BEGIN CREATE ROLE evil SUPERUSER LOGIN PASSWORD 'x'; END$$"),
+    (PG, "DO $$BEGIN ALTER ROLE postgres PASSWORD 'x'; END$$"),
+    (PG, "DO $tag$BEGIN GRANT pg_read_server_files TO app; END$tag$"),
+    (PG, "DO LANGUAGE plpgsql $x$BEGIN ALTER ROLE app SUPERUSER; END$x$"),
+    (PG, "DO $$BEGIN EXECUTE format('GRANT %I TO app', 'pg_read_server_files'); END$$"),
+    (PG, "DO $$BEGIN EXECUTE 'AL' || 'TER ROLE app SUPERUSER'; END$$"),
+    (PG, "do $$begin execute 'ALTER ROLE app SUPERUSER'; end$$"),
+    (PG, "   \n\t DO $$BEGIN NULL; END$$"),
+    (PG, "/* comentario */ DO $$BEGIN NULL; END$$"),
+    (PG, "SELECT 1; DO $$BEGIN GRANT ALL ON DATABASE otra TO app; END$$"),
+    # --- PostgreSQL: funciones, procedimientos, triggers, reglas ---
+    (
+        PG,
+        "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS "
+        "$$BEGIN GRANT pg_read_server_files TO app; END$$",
+    ),
+    (PG, "CREATE FUNCTION f() RETURNS void LANGUAGE sql AS 'GRANT pg_read_server_files TO app'"),
+    (
+        PG,
+        "CREATE FUNCTION f() RETURNS void SECURITY DEFINER LANGUAGE plpgsql AS "
+        "$fn$BEGIN EXECUTE 'GRANT x TO app'; END$fn$",
+    ),
+    (
+        PG,
+        "CREATE OR REPLACE FUNCTION f() RETURNS void AS "
+        "$$BEGIN ALTER ROLE app SUPERUSER; END$$ LANGUAGE plpgsql; SELECT f()",
+    ),
+    (
+        PG,
+        "CREATE PROCEDURE p() LANGUAGE plpgsql AS "
+        "$$BEGIN ALTER ROLE app SUPERUSER; END$$; CALL p()",
+    ),
+    (PG, "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW EXECUTE FUNCTION f()"),
+    (PG, "CREATE OR REPLACE TRIGGER t BEFORE INSERT ON x FOR EACH ROW EXECUTE FUNCTION f()"),
+    (PG, "CREATE CONSTRAINT TRIGGER t AFTER INSERT ON x FOR EACH ROW EXECUTE FUNCTION f()"),
+    (PG, "CREATE EVENT TRIGGER t ON ddl_command_start EXECUTE FUNCTION f()"),
+    (PG, "CREATE OR REPLACE RULE r AS ON INSERT TO t DO INSTEAD NOTHING"),
+    (PG, "ALTER FUNCTION f() SECURITY DEFINER"),
+    (PG, "ALTER FUNCTION f() OWNER TO postgres"),
+    (PG, "ALTER PROCEDURE p() SECURITY DEFINER"),
+    (PG, "ALTER ROUTINE f() SECURITY DEFINER"),
+    (PG, "ALTER TRIGGER t ON x RENAME TO y"),
+    # --- MySQL: procedimientos con DCL / estado global / ciclo de vida ---
+    (MYSQL, "CREATE PROCEDURE p() GRANT ALL ON *.* TO 'x'@'%' WITH GRANT OPTION"),
+    (MYSQL, "CREATE PROCEDURE p() CREATE USER 'x'@'%' IDENTIFIED BY 'y'"),
+    (MYSQL, "CREATE PROCEDURE p() SET GLOBAL read_only = 1"),
+    (MYSQL, "CREATE PROCEDURE p() DROP DATABASE victima"),
+    (MYSQL, "CREATE PROCEDURE p() PREPARE s FROM 'GRANT ALL ON *.* TO x'"),
+    (MYSQL, "CREATE PROCEDURE p() BEGIN SELECT 1; END; CALL p()"),
+    (
+        MYSQL,
+        "CREATE DEFINER=`root`@`%` PROCEDURE p() SQL SECURITY DEFINER "
+        "GRANT ALL ON *.* TO 'x'@'%'",
+    ),
+    (MYSQL, "CREATE DEFINER='root'@'localhost' PROCEDURE p() BEGIN GRANT ALL ON *.* TO 'x'@'%'; END"),
+    (MYSQL, "CREATE DEFINER = root@localhost PROCEDURE p() BEGIN SELECT 1; END"),
+    (MYSQL, "CREATE DEFINER=CURRENT_USER() FUNCTION f() RETURNS INT RETURN 1"),
+    (MYSQL, "CREATE FUNCTION f() RETURNS INT DETERMINISTIC RETURN 1"),
+    # Forma de ``mysqldump``: todo dentro de comentarios ejecutables.
+    (
+        MYSQL,
+        "/*!50003 CREATE*/ /*!50020 DEFINER=`root`@`localhost`*/ "
+        "/*!50003 PROCEDURE p() GRANT ALL ON *.* TO 'x'@'%' */",
+    ),
+    (MYSQL, "/*!50003 CREATE PROCEDURE p() BEGIN SELECT 1; END */"),
+    # --- MySQL: eventos y triggers ---
+    (MYSQL, "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO GRANT ALL ON *.* TO 'x'@'%'"),
+    (
+        MYSQL,
+        "CREATE EVENT e ON SCHEDULE AT CURRENT_TIMESTAMP "
+        "DO ALTER USER 'root'@'localhost' IDENTIFIED BY 'x'",
+    ),
+    (MYSQL, "CREATE DEFINER=`root`@`%` EVENT e ON SCHEDULE EVERY 1 DAY DO DELETE FROM t"),
+    (MYSQL, "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN GRANT ALL ON *.* TO 'x'@'%'; END"),
+    (MYSQL, "CREATE DEFINER=`root`@`%` TRIGGER tr BEFORE INSERT ON t FOR EACH ROW SET NEW.a = 1"),
+    (MYSQL, "ALTER EVENT e ENABLE"),
+    (MYSQL, "ALTER PROCEDURE p SQL SECURITY DEFINER"),
+    (MYSQL, "DO SLEEP(1)"),
+    # --- MariaDB ---
+    (MARIADB, "CREATE OR REPLACE PROCEDURE p() GRANT ALL ON *.* TO 'x'@'%'"),
+    (MARIADB, "CREATE OR REPLACE DEFINER=`root`@`%` PROCEDURE p() BEGIN SELECT 1; END"),
+    (MARIADB, "CREATE AGGREGATE FUNCTION agg(x INT) RETURNS INT BEGIN RETURN 1; END"),
+    (MARIADB, "CREATE PACKAGE pk AS PROCEDURE p(); END"),
+]
+
+
+@pytest.mark.parametrize("engine,sql", _ROUTINE_WRAPPERS)
+def test_la_consola_bloquea_la_autoria_de_codigo_del_servidor(engine, sql):
+    """
+    REGRESIÓN F-44: un ``GRANT``/``CREATE ROLE``/``ALTER USER`` dentro de un ``DO`` o del
+    cuerpo de una rutina/evento dejaba de estar al inicio del segmento, evadía la
+    blocklist anclada y salía ``ddl`` — confirmable por el mismo actor, es decir, un
+    camino de owner a superusuario del motor. Se bloquea la AUTORÍA entera sin mirar el
+    cuerpo (los literales se vacían, así que ``LANGUAGE sql AS 'GRANT …'`` es invisible a
+    cualquier escaneo de texto).
+    """
+    plan = qp.classify(sql, engine=engine)
+    assert plan.is_blocked, [r.code for r in plan.reasons]
+    assert any(r.code == "console_routine_authoring" for r in plan.reasons)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "BEGIN NOT ATOMIC GRANT ALL ON *.* TO 'x'@'%'; END",
+        "begin not atomic select 1; end",
+    ],
+)
+def test_el_bloque_anonimo_de_mariadb_sigue_bloqueado(sql):
+    plan = qp.classify(sql, engine=MARIADB)
+    assert plan.is_blocked
+    assert any(r.code == "session_control" for r in plan.reasons)
+
+
+@pytest.mark.parametrize("engine", [MYSQL, MARIADB, PG])
+def test_call_de_una_rutina_existente_exige_confirmacion_pero_no_se_bloquea(engine):
+    """
+    Decisión documentada en ``_TEXT_ELEVATORS``: invocar una rutina que ya existe (la
+    versionó el módulo de migraciones o un DBA) es operación legítima; lo que no puede
+    pasar es que salga ``read``, porque su cuerpo es opaco para la política.
+    """
+    plan = qp.classify("CALL sp_mantenimiento()", engine=engine)
+    assert plan.danger == qp.DDL
+    assert plan.requires_confirmation
+    assert not plan.is_blocked
+
+
+@pytest.mark.parametrize(
+    "engine,sql,expected",
+    [
+        (MYSQL, "SELECT * FROM t WHERE a = 1", qp.READ),
+        (PG, "SELECT f()", qp.READ),
+        (MYSQL, "SELECT do FROM t", qp.READ),
+        (MYSQL, "SELECT * FROM logs WHERE accion = 'CREATE PROCEDURE'", qp.READ),
+        (MYSQL, "INSERT INTO t VALUES (1)", qp.WRITE),
+        (MYSQL, "UPDATE t SET a = 1 WHERE b = 2", qp.WRITE),
+        (PG, "DELETE FROM t WHERE b = 2", qp.WRITE),
+        (MYSQL, "CREATE TABLE t (a INT)", qp.DDL),
+        (PG, "CREATE TABLE t (a INT)", qp.DDL),
+        (MYSQL, "CREATE TABLE procedure_log (a INT)", qp.DDL),
+        (PG, "CREATE TABLE functions (a INT)", qp.DDL),
+        (MYSQL, "CREATE VIEW v AS SELECT 1", qp.DDL),
+        (PG, "CREATE INDEX i ON t (a)", qp.DDL),
+        (PG, "DROP FUNCTION f()", qp.DDL),
+    ],
+)
+def test_el_bloqueo_de_rutinas_no_cambia_la_clasificacion_del_resto(engine, sql, expected):
+    assert qp.classify(sql, engine=engine).danger == expected

@@ -305,6 +305,54 @@ _BLOCKLIST: tuple[tuple[str, re.Pattern[str], str], ...] = (
         "La gestión de usuarios/roles no se ejecuta desde la consola: usa los endpoints "
         "de usuarios del motor (cifran la credencial y auditan la operación).",
     ),
+    # --- Código del lado del servidor: se BLOQUEA entero, no se inspecciona su cuerpo ---
+    #
+    # POR QUÉ SE BLOQUEA LA SENTENCIA ENTERA Y NO SE ESCANEA EL CUERPO. Las entradas de DCL
+    # de arriba están ancladas con ``^`` al inicio de cada segmento. Envuelto en un bloque
+    # ``DO`` de PostgreSQL o en el cuerpo de una rutina/evento de MySQL, el ``GRANT`` /
+    # ``CREATE ROLE`` / ``ALTER USER`` deja de estar al inicio y la sentencia caía en
+    # ``exp.Command`` -> ``ddl``, es decir, CONFIRMABLE por el mismo actor. Verificado con el
+    # clasificador real: ``DO $$BEGIN ALTER ROLE postgres PASSWORD 'x'; END$$`` salía ``ddl``
+    # y un ``DO`` se ejecuta en el acto — un solo request confirmado creaba un superusuario
+    # o reseteaba la contraseña de ``postgres``. En MySQL, ``CREATE PROCEDURE p() GRANT ALL
+    # ON *.* …`` + ``CALL p()`` (o un ``CREATE EVENT … DO GRANT …``) hacía lo mismo.
+    #
+    # Quitar el ancla y escanear el cuerpo NO alcanza: ``_scan_normalize`` vacía los
+    # literales, así que ``LANGUAGE sql AS 'GRANT …'`` o ``EXECUTE 'AL' || 'TER ROLE …'`` son
+    # invisibles para cualquier escaneo de texto. Por eso se bloquea la AUTORÍA de código del
+    # servidor desde la consola, sin mirar qué hace. No se pierde nada legítimo: las rutinas
+    # se versionan y auditan desde el módulo de migraciones de blueprints.
+    #
+    # Alcance: PostgreSQL ``DO`` (cualquier tag de dollar-quoting, con o sin ``LANGUAGE``),
+    # ``CREATE [OR REPLACE] FUNCTION|PROCEDURE|TRIGGER|CONSTRAINT TRIGGER|EVENT TRIGGER|
+    # RULE`` y ``ALTER FUNCTION|PROCEDURE|ROUTINE|TRIGGER|RULE`` (``ALTER FUNCTION … SECURITY
+    # DEFINER`` / ``OWNER TO`` convierten una función existente en una vía de escalada).
+    # MySQL/MariaDB: ``CREATE [OR REPLACE] [DEFINER=…] [SQL SECURITY …] [AGGREGATE]
+    # FUNCTION|PROCEDURE|TRIGGER|EVENT|PACKAGE`` y ``ALTER [DEFINER=…] EVENT|PROCEDURE|
+    # FUNCTION``. El ``DO expr`` de MySQL también cae (no tiene uso en la consola que un
+    # ``SELECT`` no cubra). El ``BEGIN NOT ATOMIC`` de MariaDB ya lo bloquea
+    # ``session_control``. ``CALL`` NO se bloquea: ver ``_TEXT_ELEVATORS``.
+    #
+    # Comentarios ejecutables (``/*!50003 CREATE*/ /*!50020 DEFINER=… */ /*!50003 PROCEDURE``,
+    # la forma de ``mysqldump``), espacios iniciales, mayúsculas y lotes con varias
+    # sentencias quedan cubiertos por ``_scan_normalize`` + el escaneo por segmento.
+    (
+        "console_routine_authoring",
+        re.compile(
+            r"^DO\b"
+            r"|^CREATE\s+(OR\s+REPLACE\s+)?"
+            r"(DEFINER\s*=\s*\S+?(\s*@\s*\S+)?\s+)?"
+            r"(SQL\s+SECURITY\s+\w+\s+)?"
+            r"(AGGREGATE\s+|CONSTRAINT\s+)?"
+            r"(FUNCTION|PROCEDURE|TRIGGER|EVENT|RULE|PACKAGE)\b"
+            r"|^ALTER\s+(DEFINER\s*=\s*\S+?(\s*@\s*\S+)?\s+)?"
+            r"(FUNCTION|PROCEDURE|ROUTINE|TRIGGER|EVENT|RULE|PACKAGE)\b"
+        ),
+        "La consola no crea ni modifica código del servidor (bloques DO, funciones, "
+        "procedimientos, triggers, eventos ni reglas): su cuerpo puede ejecutar DCL que esta "
+        "política no puede inspeccionar. Las rutinas se versionan desde el módulo de "
+        "migraciones de blueprints.",
+    ),
     # --- Acceso a archivos del host de la BD (≈ ejecución remota con pseudo-root) ---
     (
         "server_file_access",
@@ -502,6 +550,20 @@ _TEXT_ELEVATORS: tuple[tuple[str, re.Pattern[str], str, str], ...] = (
         re.compile(r"\bINTO\s+@"),
         "select_into",
         "SELECT … INTO asigna una variable de sesión; no es una lectura pura.",
+    ),
+    (
+        # ``CALL`` de una rutina YA EXISTENTE queda confirmable (``ddl``), no bloqueado: con
+        # la autoría bloqueada (``console_routine_authoring``), las únicas rutinas
+        # invocables son las que versionó el módulo de migraciones o un DBA, e invocarlas
+        # es operación legítima. Lo que NO puede pasar es que salga ``read``: su cuerpo es
+        # opaco para esta política y puede escribir o ejecutar DCL. Hoy sqlglot lo degrada a
+        # ``exp.Command`` (ya ``ddl``); este respaldo sostiene la garantía si una versión
+        # futura del parser le diera estructura.
+        DDL,
+        re.compile(r"^CALL\b"),
+        "routine_call",
+        "CALL ejecuta una rutina cuyo cuerpo esta política no puede inspeccionar; exige "
+        "confirmación como cualquier sentencia opaca.",
     ),
 )
 
