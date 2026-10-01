@@ -37,7 +37,14 @@ from app.core.authz import assert_not_last_access_admin
 from app.exceptions import AppHttpException
 from app.models.user_model import UserModel
 from app.services import audit, confirm_token
-from app.services.capability_catalog import GatewayRole, GlobalCapability
+from app.core.actor import Actor, identity_of
+from app.services.capability_catalog import (
+    CODE_GRANT_CEILING,
+    CODE_SELF_MODIFICATION,
+    GatewayRole,
+    GlobalCapability,
+    role_at_most,
+)
 from app.utils.security import PASSWORD_MIN_LENGTH, hash_password
 
 #: Operación con la que se firma la invitación. Constante compartida por emisor y verificador:
@@ -140,6 +147,7 @@ class GatewayUserController:
             GatewayRole.VIEWER.value if crudo is None else crudo
         )
         globales = self._validate_globals(data.get("global_capabilities") or [])
+        self._assert_within_ceiling(admin, base_role=rol, new_globals=globales)
 
         user_id = self.users.create(
             {
@@ -256,10 +264,16 @@ class GatewayUserController:
         cambios: dict = {}
 
         if "gateway_role" in data and data["gateway_role"] is not None:
-            cambios["gateway_role"] = self._validate_role(data["gateway_role"]).value
+            nuevo = self._validate_role(data["gateway_role"])
+            actual = fila.get("gateway_role") or GatewayRole.VIEWER.value
+            if nuevo.value != actual:
+                self._guard_not_self(admin, user_id, action="cambiar tu propio rol")
+                self._assert_within_ceiling(admin, base_role=nuevo)
+            cambios["gateway_role"] = nuevo.value
 
         if "is_active" in data and data["is_active"] is not None:
             if not data["is_active"] and fila.get("is_active"):
+                self._guard_not_self(admin, user_id, action="desactivar tu propia cuenta")
                 assert_not_last_access_admin(user_id, action="desactivar este usuario")
             cambios["is_active"] = bool(data["is_active"])
 
@@ -302,6 +316,7 @@ class GatewayUserController:
         cambios que por separado parecen inofensivos.
         """
         self._get_or_404(user_id)
+        self._guard_not_self(admin, user_id, action="cambiar tu propio acceso")
         globales = self._validate_globals(data.get("global_capabilities") or [])
         grants = []
         for g in data.get("scope_grants") or []:
@@ -313,6 +328,20 @@ class GatewayUserController:
                     public_context={"code": CODE_INVALID_CAPABILITY},
                 )
             grants.append((tipo, int(g["scope_id"]), self._validate_role(g["role"]).value))
+
+        # El techo se aplica a lo que se AGREGA, no a lo que la persona ya tenía: un
+        # administrador de accesos sin ``security_officer`` puede seguir editando los alcances
+        # de alguien que sí la tiene sin quitársela, pero no puede otorgarla.
+        actual = self.users.find_access_context(user_id)
+        ya_globales = set(actual.get("globals") or [])
+        ya_grants = {(t, int(i), r) for (t, i, r) in (actual.get("grants") or [])}
+        self._assert_within_ceiling(
+            admin,
+            new_globals=[g for g in globales if g.value not in ya_globales],
+            new_scope_roles=[
+                GatewayRole(r) for (t, i, r) in grants if (t, i, r) not in ya_grants
+            ],
+        )
 
         quita_access_admin = GlobalCapability.ACCESS_ADMIN not in globales
         if quita_access_admin:
@@ -340,6 +369,93 @@ class GatewayUserController:
 
         session_store.revoke_all_for_user(user_id, session_store.REASON_ROLE_CHANGE)
         return self._hydrate(self._get_or_404(user_id))
+
+    # ------------------------------------------------------------------ #
+    # Guards anti auto-escalada                                          #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _guard_not_self(admin, user_id: int, *, action: str) -> None:
+        """
+        Nadie cambia su PROPIO rol, su propio acceso ni se desactiva a sí mismo.
+
+        POR QUÉ. ``gateway.admin`` (``access_admin``, y también ``security_officer``) no es
+        operativo, pero administraba a cualquier usuario sin excepción, incluido quien hacía la
+        request: ``PATCH /gateway-users/{yo} {gateway_role: owner}`` o
+        ``PUT /gateway-users/{yo}/access {global_capabilities: [security_officer]}`` convertían
+        al administrador de accesos en operador de producción en un request, que es justo la
+        separación de deberes que ``access_admin`` existe para sostener (docs/plans/13 §4.4:
+        "self-grant 409 sin override"). Desactivarse también cae acá: el corte de la propia
+        cuenta lo hace otra persona, igual que el resto de su acceso.
+
+        Solo, este guard se esquiva con un títere (crear otra cuenta privilegiada y aceptar su
+        invitación); por eso va SIEMPRE junto con ``_assert_within_ceiling``.
+        """
+        actor_id, _ = identity_of(admin)
+        if actor_id is not None and int(actor_id) == int(user_id):
+            raise AppHttpException(
+                message=(
+                    f"No puedes {action}: esa operación la tiene que hacer otra persona con "
+                    "permiso de administración de accesos."
+                ),
+                status_code=409,
+                public_context={"code": CODE_SELF_MODIFICATION},
+            )
+
+    @staticmethod
+    def _assert_within_ceiling(
+        admin,
+        *,
+        base_role: GatewayRole | None = None,
+        new_scope_roles: "list[GatewayRole] | None" = None,
+        new_globals: "list[GlobalCapability] | None" = None,
+    ) -> None:
+        """
+        Techo de lo que un actor puede OTORGAR: nunca más de lo que tiene.
+
+        - rol base (alta y ``PATCH``) ≤ el rol BASE del actor (``Actor.base_role``);
+        - rol por alcance ≤ el rol efectivo MÁXIMO del actor (``Actor.role``, la unión);
+        - capacidades globales ⊆ las del actor (un ``access_admin`` no otorga
+          ``security_officer`` si no la tiene).
+
+        POR QUÉ, ADEMÁS DEL GUARD DE AUTO-MODIFICACIÓN. Sin techo, ``_guard_not_self`` se
+        esquiva en dos requests: ``POST /gateway-users {gateway_role: owner}`` devuelve el
+        ``invite_token`` a quien la crea, que la acepta en el endpoint público y entra como
+        ese títere. El techo convierte "crear un owner" en algo que solo puede hacer un owner.
+
+        Fail-closed: un actor que no es ``Actor`` (llamador legado sin roles resueltos) no
+        tiene techo conocido y no otorga nada.
+        """
+        if not isinstance(admin, Actor) or admin.role is None:
+            techo_base = techo_alcance = None
+            globales_actor: frozenset = frozenset()
+        else:
+            techo_base = admin.base_role or admin.role
+            techo_alcance = admin.role
+            globales_actor = admin.global_capabilities
+
+        excedidos: list[str] = []
+        if base_role is not None and (
+            techo_base is None or not role_at_most(base_role, techo_base)
+        ):
+            excedidos.append(f"rol base '{base_role.value}'")
+        for rol in new_scope_roles or []:
+            if techo_alcance is None or not role_at_most(rol, techo_alcance):
+                excedidos.append(f"rol por alcance '{rol.value}'")
+                break
+        faltantes = sorted(g.value for g in (new_globals or []) if g not in globales_actor)
+        if faltantes:
+            excedidos.append("capacidades globales [" + ", ".join(faltantes) + "]")
+
+        if excedidos:
+            raise AppHttpException(
+                message=(
+                    "No puedes otorgar más acceso del que tienes: "
+                    + "; ".join(excedidos)
+                    + ". Pídeselo a alguien que tenga ese nivel."
+                ),
+                status_code=409,
+                public_context={"code": CODE_GRANT_CEILING},
+            )
 
     # ------------------------------------------------------------------ #
     # Helpers                                                            #

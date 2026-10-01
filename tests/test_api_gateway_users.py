@@ -179,11 +179,39 @@ def test_the_accept_endpoint_does_not_reveal_which_invites_exist(client):
 # --------------------------------------------------------------------------- #
 
 
+def _cliente_como(datos: dict, username: str, password: str = "ContraseñaLarga123"):
+    """
+    Un client APARTE autenticado como otra identidad. ``admin_client`` es el mismo objeto que
+    ``client``: loguearse ahí con otra cuenta le quitaría al test la sesión del admin.
+    """
+    from fastapi.testclient import TestClient
+
+    from main import app
+    from tests.conftest import attach_csrf
+
+    otra = TestClient(app)
+    assert _aceptar(otra, datos["invite_token"], password=password).status_code == 200
+    r = otra.post("/api/v1/auth/login", json={"username": username, "password": password})
+    assert r.status_code == 200, r.text
+    attach_csrf(otra)
+    return otra
+
+
+def _code(r) -> str | None:
+    return ((r.json().get("detail") or {}).get("public_context") or {}).get("code")
+
+
 def test_deactivating_the_last_access_admin_is_rejected(admin_client):
+    """
+    Lo hace OTRA persona (``security_officer`` también tiene ``gateway.admin``): desactivarse a
+    sí mismo ya lo corta el guard de auto-modificación, antes de llegar a este.
+    """
+    datos = _crear(admin_client, "vigia", global_capabilities=["security_officer"])
+    vigia = _cliente_como(datos, "vigia")
     admin_id = UserModel().find_by_username("admin")["id"]
-    r = admin_client.patch(f"/api/v1/gateway-users/{admin_id}", json={"is_active": False})
+    r = vigia.patch(f"/api/v1/gateway-users/{admin_id}", json={"is_active": False})
     assert r.status_code == 409, r.text
-    assert r.json()["detail"]["public_context"]["code"] == "access.last_admin_protected"
+    assert _code(r) == "access.last_admin_protected"
 
 
 def test_removing_access_admin_from_the_last_one_is_rejected(admin_client):
@@ -191,26 +219,153 @@ def test_removing_access_admin_from_the_last_one_is_rejected(admin_client):
     El otro camino al mismo bloqueo, y el que un guard solo sobre ``is_active`` dejaría abierto:
     quitarle la capacidad global en vez de desactivar la cuenta.
     """
+    datos = _crear(admin_client, "vigia2", global_capabilities=["security_officer"])
+    vigia = _cliente_como(datos, "vigia2")
     admin_id = UserModel().find_by_username("admin")["id"]
-    r = admin_client.put(
+    r = vigia.put(
         f"/api/v1/gateway-users/{admin_id}/access",
         json={"global_capabilities": ["security_officer"], "scope_grants": []},
     )
     assert r.status_code == 409, r.text
-    assert r.json()["detail"]["public_context"]["code"] == "access.last_admin_protected"
+    assert _code(r) == "access.last_admin_protected"
 
 
-def test_with_a_second_active_admin_the_first_can_be_deactivated(client, admin_client):
+def test_with_a_second_active_admin_the_first_can_be_deactivated(admin_client):
     """
     Y la contracara: el guard **no** puede bloquear el offboarding legítimo. Se exige que el
-    segundo administrador esté activo Y con credencial fijada.
+    segundo administrador esté activo Y con credencial fijada — y es él quien desactiva.
     """
     datos = _crear(admin_client, "releva", global_capabilities=["access_admin"])
-    assert _aceptar(client, datos["invite_token"]).status_code == 200
+    releva = _cliente_como(datos, "releva")
 
     admin_id = UserModel().find_by_username("admin")["id"]
-    r = admin_client.patch(f"/api/v1/gateway-users/{admin_id}", json={"is_active": False})
+    r = releva.patch(f"/api/v1/gateway-users/{admin_id}", json={"is_active": False})
     assert r.status_code == 200, r.text
+
+
+# --------------------------------------------------------------------------- #
+# F-2: nadie se escala a sí mismo, ni por un títere                           #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "method,suffix,body",
+    [
+        ("PATCH", "", {"gateway_role": "viewer"}),
+        ("PATCH", "", {"is_active": False}),
+        ("PUT", "/access", {"global_capabilities": ["access_admin"], "scope_grants": []}),
+    ],
+    ids=["role", "deactivate", "access"],
+)
+def test_an_admin_cannot_modify_their_own_access(admin_client, method, suffix, body):
+    """
+    REGRESIÓN F-2: ``PATCH /gateway-users/{yo} {gateway_role: owner}`` y
+    ``PUT /gateway-users/{yo}/access {global_capabilities: [security_officer]}`` convertían a un
+    administrador de accesos en operador de producción en un request.
+    """
+    # Un segundo access_admin, para que el 409 no pueda venir del guard del último admin.
+    _crear(admin_client, "respaldo", global_capabilities=["access_admin"])
+    admin_id = UserModel().find_by_username("admin")["id"]
+    r = admin_client.request(method, f"/api/v1/gateway-users/{admin_id}{suffix}", json=body)
+    assert r.status_code == 409, r.text
+    assert _code(r) == "access.self_modification_forbidden"
+
+
+def test_an_admin_can_still_edit_their_own_contact_data(admin_client):
+    admin_id = UserModel().find_by_username("admin")["id"]
+    r = admin_client.patch(
+        f"/api/v1/gateway-users/{admin_id}", json={"full_name": "Otra Persona", "gateway_role": "owner"}
+    )
+    # ``gateway_role`` igual al actual no es un cambio de rol.
+    assert r.status_code == 200, r.text
+
+
+def test_an_access_admin_cannot_mint_a_privileged_puppet(admin_client):
+    """
+    El bypass del guard anterior: crear una cuenta ``owner`` (o con ``security_officer``),
+    recibir su ``invite_token`` y entrar como ella. El techo lo corta en el alta.
+    """
+    datos = _crear(admin_client, "aa_solo", global_capabilities=["access_admin"])
+    aa = _cliente_como(datos, "aa_solo")
+
+    r = aa.post("/api/v1/gateway-users", json={"username": "titere", "gateway_role": "owner"})
+    assert r.status_code == 409, r.text
+    assert _code(r) == "access.grant_ceiling_exceeded"
+    r = aa.post(
+        "/api/v1/gateway-users",
+        json={"username": "titere2", "global_capabilities": ["security_officer"]},
+    )
+    assert r.status_code == 409, r.text
+    assert _code(r) == "access.grant_ceiling_exceeded"
+    assert UserModel().find_by_username("titere") is None
+    assert UserModel().find_by_username("titere2") is None
+
+    # Lo que sí tiene, lo puede otorgar.
+    r = aa.post(
+        "/api/v1/gateway-users",
+        json={"username": "par", "gateway_role": "viewer", "global_capabilities": ["access_admin"]},
+    )
+    assert r.status_code == 201, r.text
+
+
+def test_an_access_admin_cannot_raise_a_role_above_their_own(admin_client):
+    otro = _crear(admin_client, "objetivo")
+    datos = _crear(admin_client, "aa_rol", global_capabilities=["access_admin"])
+    aa = _cliente_como(datos, "aa_rol")
+
+    r = aa.patch(f"/api/v1/gateway-users/{otro['id']}", json={"gateway_role": "operator"})
+    assert r.status_code == 409, r.text
+    assert _code(r) == "access.grant_ceiling_exceeded"
+
+
+def test_an_access_admin_cannot_grant_above_their_own_reach(admin_client):
+    otro = _crear(admin_client, "objetivo2")
+    datos = _crear(admin_client, "aa_acc", global_capabilities=["access_admin"])
+    aa = _cliente_como(datos, "aa_acc")
+    url = f"/api/v1/gateway-users/{otro['id']}/access"
+
+    r = aa.put(
+        url,
+        json={
+            "global_capabilities": [],
+            "scope_grants": [{"scope_type": "environment", "scope_id": 1, "role": "owner"}],
+        },
+    )
+    assert r.status_code == 409, r.text
+    assert _code(r) == "access.grant_ceiling_exceeded"
+
+    r = aa.put(url, json={"global_capabilities": ["security_officer"], "scope_grants": []})
+    assert r.status_code == 409, r.text
+    assert _code(r) == "access.grant_ceiling_exceeded"
+
+    r = aa.put(
+        url,
+        json={
+            "global_capabilities": ["access_admin"],
+            "scope_grants": [{"scope_type": "environment", "scope_id": 1, "role": "viewer"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_the_ceiling_applies_to_what_is_added_not_to_what_was_there(admin_client):
+    """
+    Un ``access_admin`` sin ``security_officer`` puede seguir editando los alcances de quien sí
+    la tiene, siempre que no se la otorgue él.
+    """
+    otro = _crear(admin_client, "con_so", global_capabilities=["security_officer"])
+    datos = _crear(admin_client, "aa_edit", global_capabilities=["access_admin"])
+    aa = _cliente_como(datos, "aa_edit")
+
+    r = aa.put(
+        f"/api/v1/gateway-users/{otro['id']}/access",
+        json={
+            "global_capabilities": ["security_officer"],
+            "scope_grants": [{"scope_type": "server", "scope_id": 2, "role": "viewer"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["global_capabilities"] == ["security_officer"]
 
 
 # --------------------------------------------------------------------------- #

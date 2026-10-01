@@ -445,6 +445,14 @@ CODE_FORBIDDEN = "access.forbidden"
 CODE_STEP_UP_REQUIRED = "access.step_up_required"
 CODE_NOT_VISIBLE = "access.not_visible"
 CODE_UNDECLARED_ROUTE = "access.undeclared_route"
+#: Un administrador intentó cambiar SU PROPIO rol, su propio acceso (globales o alcances) o
+#: desactivarse. Lo tiene que hacer otra persona con ``gateway.admin``. Ver
+#: ``GatewayUserController._guard_not_self``.
+CODE_SELF_MODIFICATION = "access.self_modification_forbidden"
+#: Se intentó otorgar más de lo que el propio actor tiene: un rol base por encima del suyo,
+#: un rol por alcance por encima de su rol efectivo máximo, o una capacidad global que no
+#: posee. Ver ``GatewayUserController._assert_within_ceiling``.
+CODE_GRANT_CEILING = "access.grant_ceiling_exceeded"
 
 # --------------------------------------------------------------------------- #
 # API                                                                          #
@@ -453,6 +461,11 @@ CODE_UNDECLARED_ROUTE = "access.undeclared_route"
 
 def spec(capability: Capability) -> CapabilitySpec:
     return _BY_ID[capability]
+
+
+def role_at_most(role: GatewayRole, ceiling: GatewayRole) -> bool:
+    """``role`` ≤ ``ceiling`` en la cadena monotónica viewer < operator < owner."""
+    return _ROLE_RANK[role] <= _ROLE_RANK[ceiling]
 
 
 def role_capabilities(role: GatewayRole) -> frozenset[Capability]:
