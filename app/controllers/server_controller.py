@@ -40,6 +40,7 @@ from app.services.db_admin.dtos import (
     TableSchema,
     TableStat,
 )
+from app.services.db_admin.database_scope import assert_database_in_scope
 from app.services.db_admin.factory import get_adapter
 
 if TYPE_CHECKING:
@@ -433,13 +434,30 @@ class ServerController:
 
         return {"server_id": server_id, "databases": databases, "users": users}
 
+    @staticmethod
+    def _scoped_target(target: ServerTarget, database: str) -> ServerTarget:
+        """
+        Rechaza (409) una base de sistema o la de metadatos del gateway ANTES de leerla.
+
+        Estos tres métodos son la puerta de ``POST /database-models/from-snapshot``: sin el
+        guard, ``database="mysql"`` + ``data_tables=["user"]`` convertía los hashes de todas
+        las cuentas del motor en semillas de un blueprint legible por ``viewer``. Ver
+        ``db_admin.database_scope``.
+        """
+        assert_database_in_scope(
+            database, dialect=target.dialect, host=target.host, port=target.port, side="source"
+        )
+        return target
+
     def snapshot(self, server_id: int, database: str) -> StructureDump:
         """Dump estructural EN VIVO de una BD (solo estructura, nunca filas)."""
-        return get_adapter(self._build_target(server_id)).dump_structure(database)
+        target = self._scoped_target(self._build_target(server_id), database)
+        return get_adapter(target).dump_structure(database)
 
     def table_stats(self, server_id: int, database: str) -> list[TableStat]:
         """Estimación por tabla (filas + tiene PK) para informar la selección de datos."""
-        return get_adapter(self._build_target(server_id)).list_table_stats(database)
+        target = self._scoped_target(self._build_target(server_id), database)
+        return get_adapter(target).list_table_stats(database)
 
     def snapshot_data(
         self,
@@ -456,7 +474,7 @@ class ServerController:
         Extrae datos-semilla de varias tablas reutilizando un solo target (la credencial
         se descifra una vez). Cada tabla se rinde como INSERT idempotente + rollback por PK.
         """
-        adapter = get_adapter(self._build_target(server_id))
+        adapter = get_adapter(self._scoped_target(self._build_target(server_id), database))
         return [
             adapter.dump_table_data(
                 database, t, mode=modes.get(t, "upsert"),

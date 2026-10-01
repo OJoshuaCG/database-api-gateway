@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
+from app.services.db_admin.database_scope import assert_database_in_scope
 from app.core.database import Database
 from app.core.environments import (
     DB_HOST,
@@ -168,6 +169,40 @@ class SchemaComparisonController:
             )
         return md
 
+    @staticmethod
+    def _assert_side_in_scope(server, database_name: str, *, side: str) -> None:
+        """
+        Ninguno de los dos lados puede ser una base de sistema del motor ni la base de
+        metadatos del gateway (``db_admin.database_scope``).
+
+        POR QUÉ LOS DOS Y EN CADA FASE. Con TARGET = la base de metadatos co-alojada y un
+        origen vacío, el diff rendía ``DROP TABLE`` de ``audit_log``/``users``/
+        ``server_users``; ``_assert_live_exists`` no lo frenaba porque ``list_databases``
+        filtra las bases de sistema pero no la del gateway. El ORIGEN también: crear la
+        comparación ya fotografía su estructura. Se re-evalúa en preview/adopt/execute (no solo
+        al crear) para que una comparación persistida antes de este guard no pueda ejecutarse.
+        """
+        assert_database_in_scope(
+            database_name,
+            dialect=engine_value(server),
+            host=server.host,
+            port=server.port,
+            side=side,
+        )
+
+    def _assert_comparison_in_scope(self, session, comp: SchemaComparison) -> None:
+        """Los dos lados de una comparación PERSISTIDA (preview/adopt/execute)."""
+        self._assert_side_in_scope(
+            get_server_or_404(session, comp.source_server_id),
+            comp.source_database_name,
+            side="source",
+        )
+        self._assert_side_in_scope(
+            get_server_or_404(session, comp.target_server_id),
+            comp.target_database_name,
+            side="target",
+        )
+
     def _resolve_side(
         self,
         session,
@@ -175,6 +210,7 @@ class SchemaComparisonController:
         database_id: int | None,
         server_id: int | None,
         database_name: str | None,
+        side: str,
     ) -> _ResolvedSide:
         """
         Resuelve un lado (source|target) a ``_ResolvedSide`` DENTRO de la sesión (la
@@ -193,6 +229,7 @@ class SchemaComparisonController:
         if database_id is not None:
             md = self._db_or_404(session, database_id)
             server = get_server_or_404(session, md.server_id)
+            self._assert_side_in_scope(server, md.name, side=side)
             return _ResolvedSide(
                 server_id=md.server_id,
                 database_name=md.name,
@@ -206,6 +243,7 @@ class SchemaComparisonController:
 
         # Referencia cruda: (server_id + database_name).
         server = get_server_or_404(session, server_id)
+        self._assert_side_in_scope(server, database_name, side=side)
         md = (
             session.query(ManagedDatabase)
             .filter(
@@ -427,12 +465,14 @@ class SchemaComparisonController:
                 database_id=source_database_id,
                 server_id=source_server_id,
                 database_name=source_database_name,
+                side="source",
             )
             tgt = self._resolve_side(
                 session,
                 database_id=target_database_id,
                 server_id=target_server_id,
                 database_name=target_database_name,
+                side="target",
             )
         finally:
             session.close()
@@ -1115,6 +1155,7 @@ class SchemaComparisonController:
         try:
             comp = self._comparison_or_404(session, comparison_id)
             self._assert_not_expired(comp)
+            self._assert_comparison_in_scope(session, comp)
             self._guard_adopt_confirmation(
                 comp,
                 execute_immediately=execute_immediately,
@@ -1484,6 +1525,7 @@ class SchemaComparisonController:
         try:
             comp = self._comparison_or_404(session, comparison_id)
             self._assert_not_expired(comp)
+            self._assert_comparison_in_scope(session, comp)
             # Ref estable (server+nombre, siempre poblado) para el token; el
             # managed_database_id es solo informativo para el frontend (puede ser NULL).
             target_ref = f"{comp.target_server_id}:{comp.target_database_name}"
@@ -1544,6 +1586,7 @@ class SchemaComparisonController:
         try:
             comp = self._comparison_or_404(session, comparison_id)
             self._assert_not_expired(comp)
+            self._assert_comparison_in_scope(session, comp)
             target_server_id = comp.target_server_id
             db_name = comp.target_database_name
             target_engine = comp.target_engine

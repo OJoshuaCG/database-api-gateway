@@ -427,3 +427,50 @@ def test_data_migration_cross_engine_guard_blocks_apply(
     r = admin_client.post(f"/api/v1/managed-databases/{db_id}/migrations/apply")
     assert r.status_code == 422, r.text
     assert "no puede aplicarse" in r.text.lower() or "datos" in r.text.lower()
+
+
+# --------------------------------------------------------------------------- #
+# F-47: snapshot / from-snapshot sobre bases de sistema o la de metadatos        #
+# --------------------------------------------------------------------------- #
+def _pc(r) -> dict:
+    return (r.json().get("detail") or {}).get("public_context") or {}
+
+
+def test_from_snapshot_refuses_an_engine_system_database(admin_client, server_payload, monkeypatch):
+    """
+    REGRESIÓN F-47: ``database="mysql"`` + ``data_tables=["user"]`` extraía los hashes de todas
+    las cuentas del motor como semillas de un blueprint legible por ``viewer``.
+    """
+    sid = _make_server(admin_client, server_payload)
+    fake = _FakeAdapter()
+    _patch(monkeypatch, fake)
+    r = _from_snapshot(
+        admin_client, sid, database="mysql", data_tables=[{"table": "user"}], slug="bp-sys", name="BP sys"
+    )
+    assert r.status_code == 409, r.text
+    assert _pc(r)["code"] == "engine_database.scope_not_allowed"
+    assert _pc(r)["reason"] == "system_database"
+
+
+def test_snapshot_routes_refuse_system_and_gateway_metadata_databases(
+    admin_client, server_payload, monkeypatch
+):
+    import app.services.db_admin.database_scope as ds
+
+    sid = _make_server(admin_client, server_payload)
+    _patch(monkeypatch, _FakeAdapter())
+    for db in ("mysql", "information_schema", "performance_schema", "sys"):
+        r = admin_client.get(f"/api/v1/servers/{sid}/databases/{db}/snapshot")
+        assert r.status_code == 409, (db, r.text)
+        assert _pc(r)["code"] == "engine_database.scope_not_allowed"
+
+    srv = server_payload()
+    monkeypatch.setattr(ds, "DB_HOST", srv["host"])
+    monkeypatch.setattr(ds, "DB_PORT", srv["port"])
+    monkeypatch.setattr(ds, "DB_NAME", "gwmeta")
+    r = admin_client.get(f"/api/v1/servers/{sid}/databases/gwmeta/snapshot")
+    assert r.status_code == 409, r.text
+    assert _pc(r)["reason"] == "gateway_metadata"
+    r = _from_snapshot(admin_client, sid, database="gwmeta", slug="bp-gw", name="BP gw")
+    assert r.status_code == 409, r.text
+    assert _pc(r)["reason"] == "gateway_metadata"

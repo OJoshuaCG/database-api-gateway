@@ -983,3 +983,92 @@ def test_adopt_raw_target_422_use_execute(admin_client, monkeypatch):
     assert r.status_code == 422, r.text
     body = r.text.lower()
     assert "inventario" in body and "execute" in body
+
+
+# --------------------------------------------------------------------------- #
+# F-47: bases de sistema y la de metadatos del gateway, fuera de los dos lados   #
+# --------------------------------------------------------------------------- #
+def _pc(r) -> dict:
+    return (r.json().get("detail") or {}).get("public_context") or {}
+
+
+def _raw_create(admin_client, sid, *, source, target):
+    return admin_client.post(
+        "/api/v1/schema-comparisons",
+        json={
+            "source_server_id": sid,
+            "source_database_name": source,
+            "target_server_id": sid,
+            "target_database_name": target,
+        },
+    )
+
+
+def test_a_system_database_cannot_be_either_side(admin_client, monkeypatch):
+    sid = _server(admin_client, 3471)
+    fake = _FakeAdapter({"app": _snap(db="app"), "mysql": _snap(db="mysql")}, _rendered())
+    monkeypatch.setattr(scc, "get_adapter", lambda target: fake)
+
+    for source, target, side in (("app", "mysql", "target"), ("mysql", "app", "source")):
+        r = _raw_create(admin_client, sid, source=source, target=target)
+        assert r.status_code == 409, r.text
+        pc = _pc(r)
+        assert pc["code"] == "engine_database.scope_not_allowed"
+        assert pc["reason"] == "system_database"
+        assert pc["side"] == side
+
+
+def test_the_gateway_metadata_database_cannot_be_the_target(admin_client, monkeypatch):
+    """
+    REGRESIÓN F-47: con un origen vacío y TARGET = la base de metadatos co-alojada, el diff
+    rendía ``DROP TABLE`` de ``audit_log``/``users``/``server_users``. ``_assert_live_exists``
+    no lo frenaba: ``list_databases`` filtra las de sistema, no la del gateway.
+    """
+    import app.services.db_admin.database_scope as ds
+
+    sid = _server(admin_client, 3472)
+    monkeypatch.setattr(ds, "DB_HOST", "10.0.0.5")
+    monkeypatch.setattr(ds, "DB_PORT", 3472)
+    monkeypatch.setattr(ds, "DB_NAME", "gwmeta")
+    fake = _FakeAdapter({"vacia": _snap(db="vacia"), "gwmeta": _snap(db="gwmeta")}, _rendered())
+    monkeypatch.setattr(scc, "get_adapter", lambda target: fake)
+
+    r = _raw_create(admin_client, sid, source="vacia", target="gwmeta")
+    assert r.status_code == 409, r.text
+    assert _pc(r)["code"] == "engine_database.scope_not_allowed"
+    assert _pc(r)["reason"] == "gateway_metadata"
+
+
+def test_a_persisted_comparison_is_rechecked_before_preview_adopt_and_execute(
+    admin_client, monkeypatch
+):
+    """
+    Una comparación creada ANTES del guard (o cuyo destino pasó a coincidir con la base de
+    metadatos) no puede previsualizarse, adoptarse ni ejecutarse.
+    """
+    import app.services.db_admin.database_scope as ds
+
+    src_id, tgt_id, _, _ = _setup(admin_client, monkeypatch, port=3473)
+    r = _create(admin_client, src_id, tgt_id)
+    assert r.status_code == 201, r.text
+    cid = r.json()["data"]["id"]
+
+    monkeypatch.setattr(ds, "DB_HOST", "10.0.0.5")
+    monkeypatch.setattr(ds, "DB_PORT", 3473)
+    monkeypatch.setattr(ds, "DB_NAME", "tgt_db")
+
+    r = _preview(admin_client, cid, "all")
+    assert r.status_code == 409, r.text
+    assert _pc(r)["code"] == "engine_database.scope_not_allowed"
+    r = admin_client.post(
+        f"/api/v1/schema-comparisons/{cid}/execute",
+        json={"mode": "all", "confirm_target_name": "tgt_db", "confirm_token": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert _pc(r)["code"] == "engine_database.scope_not_allowed"
+    r = admin_client.post(
+        f"/api/v1/schema-comparisons/{cid}/adopt",
+        json={"selected_item_ids": [1], "name": "v"},
+    )
+    assert r.status_code == 409, r.text
+    assert _pc(r)["code"] == "engine_database.scope_not_allowed"
