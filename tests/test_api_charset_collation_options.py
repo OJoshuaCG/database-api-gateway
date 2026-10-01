@@ -117,6 +117,31 @@ def test_create_custom_option_rejects_bad_charset(admin_client):
     assert r.status_code == 422
 
 
+@pytest.mark.parametrize("role", ["viewer", "operator", "owner"])
+def test_patch_requires_catalogs_write_not_just_read(admin_client, role):
+    """
+    Regresión: el PATCH estaba declarado con ``catalogs.read``, que tiene hasta ``viewer``.
+    ``catalogs.write`` solo lo da ``security_officer``, así que ningún rol operativo —ni el más
+    alto— puede editar el catálogo sin esa capacidad global.
+    """
+    from sqlalchemy import text
+
+    from app.core.database import Database
+
+    option_id = admin_client.get("/api/v1/charset-collation-options").json()["data"][0]["id"]
+    with Database().engine.begin() as conn:
+        conn.execute(text("DELETE FROM user_global_capabilities WHERE user_id = 1"))
+        conn.execute(
+            text("UPDATE users SET gateway_role = :r WHERE username = 'admin'"), {"r": role}
+        )
+
+    r = admin_client.patch(
+        f"/api/v1/charset-collation-options/{option_id}", json={"enabled": False}
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["public_context"]["code"] == "access.forbidden"
+
+
 def test_patch_enable_and_default_moves_within_family(admin_client):
     rows = admin_client.get(
         "/api/v1/charset-collation-options", params={"engine_family": "mysql"}

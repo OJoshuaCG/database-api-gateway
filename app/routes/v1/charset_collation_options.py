@@ -65,11 +65,17 @@ def create_charset_collation_option(
 @limiter.limit("20/minute")
 def update_charset_collation_option(
     request: Request,
-    actor: CatalogsRead,
+    actor: CatalogsWrite,
     option_id: int,
     payload: CharsetCollationOptionUpdate,
 ):
-    """Habilita/deshabilita la combinación y/o la marca como default de su familia."""
+    """
+    Habilita/deshabilita la combinación y/o la marca como default de su familia.
+
+    Exige ``catalogs.write`` (solo ``security_officer``), igual que el alta. Estuvo declarada
+    con ``catalogs.read``, que tiene hasta ``viewer``: cualquier usuario del gateway podía
+    deshabilitar la combinación que usa la creación de bases o mover el default de una familia.
+    """
     row = CharsetCollationController().update_option(
         option_id, payload.model_dump(exclude_unset=True), admin=actor
     )
