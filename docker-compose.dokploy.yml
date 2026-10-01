@@ -51,10 +51,18 @@ services:
       - path: .env
         required: false
     environment:
-      # Estas variables se sobrescriben siempre, independiente del entorno externo,
-      # para garantizar que la app use los servicios de este mismo compose.
+      # `environment:` le gana a `env_file:` y a la pestaña Environment de Dokploy, así que
+      # lo que se fija acá no se puede cambiar desde el panel.
+      #
+      # DB_ENGINE queda FIJO: el `entrypoint.sh` espera la BD con pymysql, y dejarlo abierto
+      # haría que un `DB_ENGINE=sqlite` copiado de `.env.example` arranque producción contra un
+      # SQLite vacío dentro del contenedor, sin ningún error.
+      #
+      # DB_HOST es configurable para poder apuntar a una BD de metadatos EXTERNA. Si no se
+      # define, usa el servicio `db` de este compose. OJO: si el panel ya tenía un `DB_HOST`
+      # viejo (p. ej. `localhost`), desde ahora ese valor se usa de verdad.
       DB_ENGINE: mysql+pymysql
-      DB_HOST: db
+      DB_HOST: ${DB_HOST:-db}
       RATE_LIMIT_REDIS_ENABLED: "True"
       RATE_LIMIT_REDIS_URL: redis://valkey:6379
     volumes:

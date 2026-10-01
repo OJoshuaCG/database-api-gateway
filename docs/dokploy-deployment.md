@@ -67,8 +67,12 @@ faltan `SECRET_KEY`, `ADMIN_PASSWORD`, `SESSION_SECRET`, o si `CORS_ORIGINS` sig
 | `DB_PASS` / `DB_ROOT_PASS` | Credenciales de la BD de metadatos (MariaDB)             |
 | `CORS_ORIGINS`    | Dominios exactos permitidos (nunca `*` en producción)            |
 
-`DB_HOST`, `DB_ENGINE`, `RATE_LIMIT_REDIS_ENABLED` y `RATE_LIMIT_REDIS_URL` se sobrescriben
-siempre en `docker-compose.dokploy.yml` — no hace falta (ni sirve) tocarlos en Dokploy.
+`DB_ENGINE`, `RATE_LIMIT_REDIS_ENABLED` y `RATE_LIMIT_REDIS_URL` se sobrescriben siempre en
+`docker-compose.dokploy.yml`: no hace falta (ni sirve) tocarlos en Dokploy.
+
+`DB_HOST` es la excepción. Si no se define, vale `db` (la MariaDB del propio compose); si se
+define, apunta a una BD de metadatos externa. Si el panel tiene un `DB_HOST` de antes, revisalo
+antes de desplegar: ese valor ya no se ignora.
 
 ## 3. Deploy (build)
 
