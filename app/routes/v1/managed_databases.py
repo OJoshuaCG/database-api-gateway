@@ -99,6 +99,22 @@ def create_database(
     payload: ManagedDatabaseCreate,
     provision: bool = Query(False),
 ):
+    """
+    Registra la BD y, con ``provision=true``, la crea en el motor.
+
+    **Con ``apply_migrations=true`` exige además ``blueprints.apply``.** El alta con migración
+    ejecuta el SQL del blueprint en el motor con la credencial pseudo-root: es la misma
+    operación que ``POST /{db_id}/migrations/apply``, que sí la exige. Sin este chequeo,
+    ``databases.write`` (``operator``) alcanzaba: un operador escribía una versión
+    (``blueprints.write``) y la ejecutaba él mismo creando una base nueva, rompiendo el "quien
+    escribe no es quien aplica" del catálogo. Va en la RUTA porque depende del payload y la
+    firma declara una sola capacidad (§6.3 punto 1); se evalúa ANTES de tocar nada.
+
+    No hay capa 2 acá: la base todavía no existe y su entorno lo DECLARA el propio payload, así
+    que un ``assert_scope`` sobre él sería tan fuerte como lo que el creador elija poner.
+    """
+    if payload.apply_migrations:
+        assert_capability(actor, Capability.BLUEPRINTS_APPLY)
     created = ManagedDatabaseController().create_database(
         payload.model_dump(), provision=provision, admin=actor
     )

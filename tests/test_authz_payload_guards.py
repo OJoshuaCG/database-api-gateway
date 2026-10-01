@@ -321,3 +321,75 @@ def test_owner_is_not_blocked_by_the_user_drop_guard(admin_client):
         f"/api/v1/server-users/{user_id}?drop_remote=true&confirm_username=app_user"
     )
     assert r.status_code != 403, r.text
+
+
+# --------------------------------------------------------------------------- #
+# apply_migrations en el alta: la MISMA ejecución que /migrations/apply        #
+# --------------------------------------------------------------------------- #
+
+
+def _server_and_owner(client) -> tuple[int, int]:
+    from app.core.database import Database
+    from app.models.server_user import ServerUser
+
+    srv = client.post("/api/v1/servers", json={
+        "name": "srv-apply", "host": "127.0.0.1", "port": 3398, "engine": "mysql",
+        "root_username": "root", "root_password": "supersecret",
+    })
+    assert srv.status_code == 201, srv.text
+    sid = srv.json()["data"]["id"]
+    session = Database().get_declarative_base_session()
+    try:
+        owner = ServerUser(server_id=sid, username="app_owner", host="%")
+        session.add(owner)
+        session.commit()
+        return sid, owner.id
+    finally:
+        session.close()
+
+
+def test_operator_cannot_create_a_database_with_apply_migrations(operator_client):
+    """
+    REGRESIÓN F-3: ``POST /managed-databases?provision=true`` con ``apply_migrations=true``
+    corría ``ManagedMigrationController().apply`` detrás de ``databases.write`` solamente. El 403
+    llega ANTES de validar el payload o abrir la conexión al motor.
+    """
+    sid, owner_id = _server_and_owner(operator_client)
+    model_id = _model(operator_client, slug="bp-apply")
+    r = operator_client.post(
+        "/api/v1/managed-databases?provision=true",
+        json={
+            "server_id": sid, "owner_id": owner_id, "name": "nueva",
+            "model_id": model_id, "apply_migrations": True,
+        },
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["public_context"]["code"] == "access.forbidden"
+
+
+def test_operator_can_still_create_a_database_without_apply(operator_client):
+    """El piso sigue siendo ``databases.write``: registrar sin migrar no cambia."""
+    sid, owner_id = _server_and_owner(operator_client)
+    r = operator_client.post(
+        "/api/v1/managed-databases",
+        json={"server_id": sid, "owner_id": owner_id, "name": "solo_inventario"},
+    )
+    assert r.status_code == 201, r.text
+
+
+def test_owner_is_not_blocked_by_the_apply_guard(admin_client):
+    """
+    ``owner`` tiene ``blueprints.apply``: el guard no lo frena y el rechazo que llega es el de la
+    validación de negocio (``apply_migrations`` sin ``provision``), no un 403.
+    """
+    sid, owner_id = _server_and_owner(admin_client)
+    model_id = _model(admin_client, slug="bp-apply-owner")
+    r = admin_client.post(
+        "/api/v1/managed-databases",
+        json={
+            "server_id": sid, "owner_id": owner_id, "name": "nueva2",
+            "model_id": model_id, "apply_migrations": True,
+        },
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["public_context"]["code"] == "managed_database.apply_requires_provision"
