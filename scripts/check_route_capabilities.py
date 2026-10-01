@@ -66,8 +66,11 @@ Uso::
 
 from __future__ import annotations
 
+import ast
+import inspect
 import os
 import sys
+import textwrap
 
 # Antes de importar la app: los guards de arranque de `app/core/environments.py` exigen
 # secretos y orígenes CORS explícitos en producción, y este script es una herramienta de
@@ -80,8 +83,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi.routing import APIRoute  # noqa: E402
 
-from app.core.authz import declared_capability  # noqa: E402
-from app.services.capability_catalog import Capability  # noqa: E402
+from app.core.authz import declared_capability, declared_scope  # noqa: E402
+from app.core.scope_targets import _RESOLVERS  # noqa: E402
+from app.services.capability_catalog import (  # noqa: E402
+    Capability,
+    GatewayRole,
+    role_capabilities,
+    spec,
+)
 
 #: Rutas deliberadamente SIN autorización. Lista explícita y corta: la alternativa —una
 #: heurística por prefijo— es cómo `/api/v1/test/*` se quedó sin guard durante meses.
@@ -119,6 +128,122 @@ NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset()
 
 #: Cuántas rutas declaran capacidad. **Solo puede SUBIR.** Ver "EL TRINQUETE".
 MIN_MIGRATED_ROUTES = 168
+
+#: Rutas con capacidad de alcance que NO apuntan a ningún entorno, con el motivo. Es la autoría
+#: de blueprints y los proyectos: escribir una versión no la ejecuta en ninguna BD. Una entrada
+#: sin motivo no tiene sentido, por eso es un dict y no un conjunto.
+SCOPE_EXEMPT: dict[tuple[str, str], str] = {
+    ("POST", "/api/v1/database-models"): (
+        "autoría de blueprint: crear un modelo no apunta a ninguna BD"
+    ),
+    ("PATCH", "/api/v1/database-models/{model_id}"): (
+        "autoría de blueprint: editar metadatos del modelo no toca ninguna BD"
+    ),
+    ("DELETE", "/api/v1/database-models/{model_id}"): (
+        "borrar un modelo es autoría de blueprint: no ejecuta nada en ninguna BD"
+    ),
+    ("POST", "/api/v1/database-models/{model_id}/migrations"): (
+        "autoría de blueprint: escribir una versión no la ejecuta en ninguna BD"
+    ),
+    ("PATCH", "/api/v1/database-models/{model_id}/migrations/{version}"): (
+        "autoría de blueprint: editar una versión no la ejecuta en ninguna BD"
+    ),
+    ("POST", "/api/v1/database-models/{model_id}/migrations/{version}/edit-preview"): (
+        "autoría de blueprint: la vista previa no toca ninguna BD"
+    ),
+    ("POST", "/api/v1/projects"): (
+        "proyectos: agrupación de blueprints, sin destino remoto"
+    ),
+    ("DELETE", "/api/v1/projects/{project_id}"): (
+        "proyectos: agrupación de blueprints, sin destino remoto"
+    ),
+    ("PATCH", "/api/v1/projects/{project_id}"): (
+        "proyectos: agrupación de blueprints, sin destino remoto"
+    ),
+    ("POST", "/api/v1/projects/{project_id}/blueprints"): (
+        "proyectos: agrupación de blueprints, sin destino remoto"
+    ),
+    ("DELETE", "/api/v1/projects/{project_id}/blueprints/{model_id}"): (
+        "proyectos: agrupación de blueprints, sin destino remoto"
+    ),
+}
+
+#: Rutas con capacidad de alcance que todavía NO declaran destino con ``require_at``. **Solo
+#: puede ENCOGER**: el chequeo 6 falla si una ruta migrada sigue acá (entrada vieja) y
+#: ``MAX_SCOPE_PENDING`` impide agregar. Llega a vacío en la última unidad de trabajo.
+SCOPE_PENDING: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("DELETE", "/api/v1/database-models/{model_id}/migrations/{version}"),
+        ("DELETE", "/api/v1/managed-databases/{db_id}/migrations/{version}/select-results"),
+        ("DELETE", "/api/v1/server-users/{user_id}"),
+        ("DELETE", "/api/v1/server-users/{user_id}/grants"),
+        ("DELETE", "/api/v1/servers/{server_id}/databases/{database}"),
+        ("DELETE", "/api/v1/servers/{server_id}/users"),
+        ("GET", "/api/v1/database-exports/{job_id}/content"),
+        ("GET", "/api/v1/database-exports/{job_id}/download"),
+        ("GET", "/api/v1/database-models/{model_id}/migrations/{version}/delete-plan"),
+        ("GET", "/api/v1/managed-databases/{db_id}/migrations/{version}/select-results"),
+        ("PATCH", "/api/v1/managed-databases/{db_id}"),
+        ("PATCH", "/api/v1/server-users/{user_id}"),
+        ("PATCH", "/api/v1/servers/{server_id}/users/password"),
+        ("PATCH", "/api/v1/servers/{server_id}/users/password-all-hosts"),
+        ("POST", "/api/v1/collation-conversions/{job_id}/cancel"),
+        ("POST", "/api/v1/collation-conversions/{job_id}/execute"),
+        ("POST", "/api/v1/collation-conversions/{job_id}/preview"),
+        ("POST", "/api/v1/database-clone-batches"),
+        ("POST", "/api/v1/database-clone-batches/{batch_id}/cancel"),
+        ("POST", "/api/v1/database-clone-batches/{batch_id}/execute"),
+        ("POST", "/api/v1/database-clone-batches/{batch_id}/retry-failed"),
+        ("POST", "/api/v1/database-clones"),
+        ("POST", "/api/v1/database-clones/{job_id}/cancel"),
+        ("POST", "/api/v1/database-clones/{job_id}/execute"),
+        ("POST", "/api/v1/database-clones/{job_id}/preview"),
+        ("POST", "/api/v1/database-exports/{job_id}/cancel"),
+        ("POST", "/api/v1/database-exports/{job_id}/download-ticket"),
+        ("POST", "/api/v1/database-exports/{job_id}/execute"),
+        ("POST", "/api/v1/database-exports/{job_id}/preview"),
+        ("POST", "/api/v1/database-models/from-snapshot"),
+        ("POST", "/api/v1/database-models/{model_id}/collation-conversions"),
+        ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/blueprint-version"),
+        ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/cancel"),
+        ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/execute"),
+        ("POST", "/api/v1/database-models/{model_id}/databases/refresh"),
+        ("POST", "/api/v1/database-models/{model_id}/migrate-version-table"),
+        ("POST", "/api/v1/database-models/{model_id}/migrate-version-table/plan"),
+        ("POST", "/api/v1/database-models/{model_id}/migrations/apply-all"),
+        ("POST", "/api/v1/database-models/{model_id}/rename-slug"),
+        ("POST", "/api/v1/database-models/{model_id}/rename-slug/plan"),
+        ("POST", "/api/v1/managed-databases"),
+        ("POST", "/api/v1/managed-databases/adopt"),
+        ("POST", "/api/v1/managed-databases/{db_id}/migrations/reconcile-partial"),
+        ("POST", "/api/v1/managed-databases/{db_id}/migrations/stamp"),
+        ("POST", "/api/v1/managed-databases/{db_id}/reassign-owner"),
+        ("POST", "/api/v1/schema-comparisons/{comparison_id}/adopt"),
+        ("POST", "/api/v1/schema-comparisons/{comparison_id}/execute"),
+        ("POST", "/api/v1/schema-comparisons/{comparison_id}/execute-preview"),
+        ("POST", "/api/v1/server-users"),
+        ("POST", "/api/v1/server-users/adopt"),
+        ("POST", "/api/v1/server-users/provision"),
+        ("POST", "/api/v1/server-users/{user_id}/apply-profile/{profile_id}"),
+        ("POST", "/api/v1/server-users/{user_id}/apply-profile/{profile_id}/bulk"),
+        ("POST", "/api/v1/server-users/{user_id}/grants"),
+        ("POST", "/api/v1/servers/{server_id}/databases"),
+        ("POST", "/api/v1/servers/{server_id}/databases/{database}/collation-conversions"),
+        ("POST", "/api/v1/servers/{server_id}/databases/{database}/database-exports"),
+        ("POST", "/api/v1/servers/{server_id}/databases/{database}/drop-preview"),
+        ("POST", "/api/v1/servers/{server_id}/query/execute"),
+        ("POST", "/api/v1/servers/{server_id}/query/preview"),
+        ("POST", "/api/v1/servers/{server_id}/users"),
+        ("POST", "/api/v1/servers/{server_id}/users/add-host"),
+        ("POST", "/api/v1/servers/{server_id}/users/adopt-all-hosts"),
+        ("POST", "/api/v1/servers/{server_id}/users/define-password"),
+        ("POST", "/api/v1/servers/{server_id}/users/reveal-password"),
+    }
+)
+
+#: Tope de ``SCOPE_PENDING``. **Solo puede BAJAR.** Mismo trinquete que ``MIN_MIGRATED_ROUTES``,
+#: en la otra dirección: sin él, agregar una ruta a la lista pendiente sería gratis.
+MAX_SCOPE_PENDING = 65
 
 
 def _iter_routes(app, prefix: str = ""):
@@ -164,6 +289,115 @@ def _uses_agent_auth(route: APIRoute) -> bool:
         return any(walk(s) for s in (getattr(dependant, "dependencies", []) or []))
 
     return walk(route.dependant)
+
+
+def _scope_of(route: APIRoute) -> str | None:
+    """El tipo de destino que declara una ruta (``require_at``), recorriendo el árbol resuelto."""
+
+    def walk(dependant) -> str | None:
+        kind = declared_scope(getattr(dependant, "call", None))
+        if kind:
+            return kind
+        for sub in getattr(dependant, "dependencies", []) or []:
+            found = walk(sub)
+            if found:
+                return found
+        return None
+
+    return walk(route.dependant)
+
+
+def _calls_assert_capability(route: APIRoute) -> bool:
+    """
+    ``True`` si el endpoint llama a ``assert_capability(...)``. Se lee el AST del fuente y no el
+    texto: un docstring que mencione el nombre no es una llamada.
+    """
+    try:
+        arbol = ast.parse(textwrap.dedent(inspect.getsource(route.endpoint)))
+    except (OSError, TypeError, SyntaxError):
+        return False
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.Call):
+            f = nodo.func
+            nombre = f.id if isinstance(f, ast.Name) else getattr(f, "attr", None)
+            if nombre == "assert_capability":
+                return True
+    return False
+
+
+def _in_scope(cap: str) -> bool:
+    """Capacidad con eje de alcance y por encima del piso ``viewer``: la que exige destino."""
+    try:
+        c = Capability(cap)
+    except ValueError:
+        return False
+    return (
+        spec(c).scope_axis != "global"
+        and c not in role_capabilities(GatewayRole.VIEWER)
+    )
+
+
+def scope_errors(
+    app,
+    *,
+    pending: frozenset[tuple[str, str]],
+    exempt: dict[tuple[str, str], str],
+    max_pending: int,
+    resolvers: dict | None = None,
+) -> list[str]:
+    """
+    Chequeo 6 (y 6b): toda ruta de alcance declara su destino o está en una lista con nombre.
+
+    Es una función y no un bloque de ``main`` para que el test de cobertura la ejerza con apps
+    sintéticas y listas propias: la prueba de que el chequeo SIRVE no puede depender de que la
+    app real esté rota.
+    """
+    resolvers = _RESOLVERS if resolvers is None else resolvers
+    errores: list[str] = []
+    vivas: set[tuple[str, str]] = set()
+
+    for path, route in _iter_routes(app):
+        cap = _capability_of(route)
+        kind = _scope_of(route)
+        for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
+            clave = (method, path)
+            vivas.add(clave)
+            if kind is not None:
+                if kind not in resolvers:
+                    errores.append(
+                        f"{method} {path} declara el destino '{kind}', que no está registrado."
+                    )
+                # Entrada vieja: la ruta ya migró y la lista sigue nombrándola.
+                if clave in pending or clave in exempt:
+                    errores.append(
+                        f"{method} {path} ya declara destino pero sigue en "
+                        "SCOPE_PENDING/SCOPE_EXEMPT (entrada vieja)."
+                    )
+                # 6b: dentro de una ruta con capa 2, ``assert_capability`` es solo capa 1.
+                if _calls_assert_capability(route):
+                    errores.append(
+                        f"{method} {path} llama a assert_capability() pero tiene destino "
+                        "declarado: usá assert_at() (6b)."
+                    )
+            elif cap is not None and _in_scope(cap):
+                if clave not in pending and clave not in exempt:
+                    errores.append(
+                        f"{method} {path} ({cap}) no declara destino con require_at y no está "
+                        "en SCOPE_EXEMPT ni en SCOPE_PENDING."
+                    )
+
+    fantasmas = (pending | set(exempt)) - vivas
+    if fantasmas:
+        errores.append(
+            "Entradas de SCOPE_PENDING/SCOPE_EXEMPT que no corresponden a ninguna ruta: "
+            + ", ".join(f"{m} {p}" for m, p in sorted(fantasmas))
+        )
+    if len(pending) > max_pending:
+        errores.append(
+            f"SCOPE_PENDING CRECIÓ: {len(pending)} entradas, el máximo es {max_pending}. "
+            "La lista solo puede encoger."
+        )
+    return errores
 
 
 def main() -> int:
@@ -245,7 +479,17 @@ def main() -> int:
             f"{MIN_MIGRATED_ROUTES}. Un revert parcial no puede pasar inadvertido."
         )
 
+    errores.extend(
+        scope_errors(
+            app,
+            pending=SCOPE_PENDING,
+            exempt=SCOPE_EXEMPT,
+            max_pending=MAX_SCOPE_PENDING,
+        )
+    )
+
     if "--list" in sys.argv:
+        print(f"SCOPE_PENDING ({len(SCOPE_PENDING)}), SCOPE_EXEMPT ({len(SCOPE_EXEMPT)})")
         print(f"Migradas ({len(migradas)}):")
         for r in sorted(migradas):
             print(f"  {r}")
@@ -260,7 +504,7 @@ def main() -> int:
     print(
         f"OK: cobertura de autorización sana — {len(migradas)} ruta(s) con capacidad, "
         f"{len(PUBLIC_ROUTES)} públicas declaradas, {len(agente)} de agente, "
-        "0 sin guard, 0 capacidad muerta."
+        f"0 sin guard, 0 capacidad muerta, {len(SCOPE_PENDING)} con destino pendiente."
     )
     return 0
 

@@ -22,44 +22,25 @@ from sqlalchemy import text
 from app.core.actor import admin_actor
 from app.core.database import Database
 from app.core.scope import (
+    ScopePoint,
+    ScopeTarget,
+    assert_at,
+    assert_layer2,
     assert_scope,
     effective_role_at,
     most_protected_environment_id,
+    partition_by_scope,
     resolve_environment_id,
+    role_at_point,
 )
 from app.services.capability_catalog import Capability, GatewayRole
+from tests.scope_helpers import actor_con, env_id, otorgar, sembrar_bd
 
 
-def _env_id(slug: str) -> int:
-    with Database().engine.begin() as conn:
-        fila = conn.execute(
-            text("SELECT id FROM environments WHERE slug = :s"), {"s": slug}
-        ).fetchone()
-    assert fila, f"no existe el entorno {slug}"
-    return fila[0]
-
-
-def _sembrar_bd(server_id: int = 1, environment_id: int | None = None) -> int:
-    """Una BD del inventario, directo por ORM: lo que se mide es la autorización."""
-    from app.models.managed_database import ManagedDatabase
-
-    s = Database().get_declarative_base_session()
-    try:
-        bd = ManagedDatabase(
-            name=f"bd_{environment_id or 'null'}_{server_id}",
-            server_id=server_id,
-            owner_id=1,
-            environment_id=environment_id,
-        )
-        s.add(bd)
-        s.commit()
-        return bd.id
-    finally:
-        s.close()
-
-
-def _actor(base: GatewayRole, grants=()):
-    return admin_actor(user_id=1, username="admin", role=base, grants=list(grants))
+_env_id = env_id
+_sembrar_bd = sembrar_bd
+_actor = actor_con
+_otorgar = otorgar
 
 
 # --------------------------------------------------------------------------- #
@@ -328,18 +309,6 @@ def test_a_restricted_actor_is_denied_at_the_destination(client):
 # --------------------------------------------------------------------------- #
 
 
-def _otorgar(scope_type: str, scope_id: int, role: str) -> None:
-    """Le da al admin sembrado un grant por alcance, directo en la tabla."""
-    with Database().engine.begin() as conn:
-        conn.execute(
-            text(
-                "INSERT INTO access_grants (user_id, scope_type, scope_id, role, created_at) "
-                "VALUES (1, :t, :i, :r, CURRENT_TIMESTAMP)"
-            ),
-            {"t": scope_type, "i": scope_id, "r": role},
-        )
-
-
 def test_the_route_denies_a_drop_in_a_restricted_environment(admin_client, server_payload):
     """
     Extremo a extremo, y es lo que prueba que el guard **está aplicado** y no solo escrito: el
@@ -430,3 +399,153 @@ def test_the_report_uses_the_same_rule_as_the_guard(admin_client, server_payload
     finally:
         s.close()
 
+
+
+# --------------------------------------------------------------------------- #
+# require_at: el mecanismo declarativo (role_at_point, min sobre N puntos)    #
+# --------------------------------------------------------------------------- #
+
+
+def _explotar(*args, **kwargs):
+    raise AssertionError("se tocó la BD sin necesidad")
+
+
+def _fijar_puntos(monkeypatch, puntos):
+    import app.core.scope as scope_mod
+
+    monkeypatch.setattr(scope_mod, "resolve_points", lambda target: list(puntos))
+
+
+def test_role_at_point_is_pure_and_the_grant_replaces_the_base():
+    """Sin BD: el grant del entorno del punto reemplaza al base; fuera de él manda el base."""
+    actor = _actor(GatewayRole.OPERATOR, [("environment", 5, GatewayRole.VIEWER)])
+
+    assert role_at_point(actor, ScopePoint(environment_id=5, server_id=None)) == GatewayRole.VIEWER
+    assert role_at_point(actor, ScopePoint(environment_id=6, server_id=None)) == GatewayRole.OPERATOR
+
+
+def test_role_at_point_takes_the_most_restrictive_of_two_applicable_grants():
+    actor = _actor(
+        GatewayRole.VIEWER,
+        [("environment", 5, GatewayRole.OWNER), ("server", 9, GatewayRole.VIEWER)],
+    )
+    assert role_at_point(actor, ScopePoint(environment_id=5, server_id=9)) == GatewayRole.VIEWER
+
+
+def test_the_role_over_many_points_is_the_minimum(monkeypatch):
+    """
+    Con cuantificador ``all`` el actor necesita la capacidad en CADA punto: un punto prohibido
+    basta para negar, aunque el otro esté permitido.
+    """
+    from app.exceptions import AppHttpException
+
+    actor = _actor(GatewayRole.OPERATOR, [("environment", 2, GatewayRole.VIEWER)])
+    _fijar_puntos(
+        monkeypatch,
+        [ScopePoint(environment_id=1, server_id=None), ScopePoint(environment_id=2, server_id=None)],
+    )
+
+    with pytest.raises(AppHttpException) as exc:
+        assert_layer2(actor, Capability.DATABASES_WRITE, ScopeTarget("x"))
+    assert exc.value.status_code == 403
+    assert exc.value.public_context["code"] == "access.forbidden"
+
+    # ``any``: alcanza con un punto permitido (el controller particiona el resto).
+    assert_layer2(actor, Capability.DATABASES_WRITE, ScopeTarget("x", quantifier="any"))
+
+
+def test_an_empty_point_set_falls_back_to_the_base_role(monkeypatch):
+    """
+    Un blueprint sin BDs no hace ninguna escritura remota: decide el rol BASE. Con base
+    ``operator`` pasa; con base ``viewer`` (aunque la unión sea ``owner``) se niega.
+    """
+    from app.exceptions import AppHttpException
+
+    _fijar_puntos(monkeypatch, [])
+
+    permitido = _actor(GatewayRole.OPERATOR, [("environment", 2, GatewayRole.VIEWER)])
+    assert_layer2(permitido, Capability.DATABASES_WRITE, ScopeTarget("model", (1,)))
+
+    negado = _actor(GatewayRole.VIEWER, [("environment", 2, GatewayRole.OWNER)])
+    assert negado.has(Capability.DATABASES_WRITE)  # la capa 1 (unión) lo deja pasar
+    with pytest.raises(AppHttpException):
+        assert_layer2(negado, Capability.DATABASES_WRITE, ScopeTarget("model", (1,)))
+
+
+def test_a_token_actor_skips_layer_two(monkeypatch):
+    """El alcance por destino de un token es su ``project_id``: la capa 2 no se evalúa."""
+    import dataclasses
+
+    from app.core.actor import token_actor
+
+    token = token_actor(
+        token_pk=1, token_id="t", name="agente", scopes="databases.read", project_id=1
+    )
+    token = dataclasses.replace(
+        token, scope_roles=frozenset({("environment", 1, GatewayRole.VIEWER)})
+    )
+    import app.core.scope as scope_mod
+
+    monkeypatch.setattr(scope_mod, "resolve_points", _explotar)
+    assert_layer2(token, Capability.DATABASES_WRITE, ScopeTarget("x"))
+
+
+def test_no_scope_grants_is_a_no_op_without_touching_the_database(monkeypatch):
+    """El camino rápido de ``require_at``: cero resolución y cero BD para quien no tiene grants."""
+    import app.core.scope as scope_mod
+
+    monkeypatch.setattr(scope_mod, "resolve_points", _explotar)
+    monkeypatch.setattr(scope_mod, "_session", _explotar)
+
+    actor = _actor(GatewayRole.OWNER)
+    assert_at(actor, Capability.DATABASES_DROP, ScopeTarget("database", (1,)))
+    assert_layer2(actor, Capability.DATABASES_DROP, ScopeTarget("database", (1,)))
+
+
+def test_assert_at_runs_layer_one_first_with_the_same_403():
+    from app.exceptions import AppHttpException
+
+    actor = _actor(GatewayRole.VIEWER)
+    with pytest.raises(AppHttpException) as exc:
+        assert_at(actor, Capability.DATABASES_WRITE, ScopeTarget("database", (1,)))
+    assert exc.value.status_code == 403
+    assert exc.value.public_context["code"] == "access.forbidden"
+
+
+def test_partition_by_scope_splits_permitted_and_forbidden():
+    actor = _actor(GatewayRole.OPERATOR, [("environment", 2, GatewayRole.VIEWER)])
+    puntos = [
+        ScopePoint(environment_id=1, server_id=None, item_id=10),
+        ScopePoint(environment_id=2, server_id=None, item_id=20),
+    ]
+    part = partition_by_scope(actor=actor, capability=Capability.DATABASES_WRITE, points=puntos)
+    assert part.permitted == (10,)
+    assert part.forbidden == (20,)
+
+
+def test_partition_by_scope_requires_the_actor_keyword():
+    with pytest.raises(TypeError):
+        partition_by_scope(capability=Capability.DATABASES_WRITE, points=[])  # type: ignore[call-arg]
+
+
+def test_a_nonexistent_target_resolves_to_the_most_protected_environment(client):
+    """Para un actor con restricciones, "no existe" y "no podés" son indistinguibles."""
+    from app.core.scope import resolve_points
+
+    puntos = resolve_points(ScopeTarget("database", (999999,)))
+    assert [p.environment_id for p in puntos] == [most_protected_environment_id()]
+
+
+def test_require_at_stamps_capability_and_scope_and_rejects_unregistered_resolvers():
+    from app.core.authz import declared_capability, declared_scope, require_at
+    from app.core.scope_targets import database
+
+    dep = require_at(Capability.DATABASES_WRITE, target=database)
+    assert declared_capability(dep) == "databases.write"
+    assert declared_scope(dep) == "database"
+
+    def no_registrado(db_id: int) -> ScopeTarget:
+        return ScopeTarget("database", (db_id,))
+
+    with pytest.raises(KeyError):
+        require_at(Capability.DATABASES_WRITE, target=no_registrado)

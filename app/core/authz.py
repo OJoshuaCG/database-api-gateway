@@ -53,6 +53,7 @@ from fastapi import Depends, Request
 
 from app.core import csrf
 from app.core.actor import Actor, admin_actor
+from app.core.scope import ScopeTarget, assert_layer2
 from app.exceptions import AppHttpException
 from app.models.user_model import UserModel
 from app.services.capability_catalog import (
@@ -178,6 +179,24 @@ def assert_not_last_access_admin(user_id: int, *, action: str) -> None:
     )
 
 
+def _authenticate(request: Request, capability: Capability) -> Actor:
+    """
+    Autenticación + CSRF + capa 1. Es el tramo común de ``require`` y ``require_at``: vive en un
+    solo lugar para que las dos fábricas no puedan divergir en el orden ni en la forma del 403.
+    """
+    actor = get_current_actor(request)
+    # CSRF ANTES de la capacidad, y solo para el actor de tipo `admin` (el que se autentica
+    # con una cookie que el navegador adjunta solo). Antes de la capacidad porque un
+    # cross-site detectado no debería recibir un 403 distinto según si tiene o no la
+    # capacidad: eso sería un oráculo sobre la superficie a través de un origen ajeno.
+    if actor.kind == "admin":
+        from app.core.auth import SESSION_SID
+
+        csrf.enforce(request, request.session.get(SESSION_SID) or "")
+    assert_capability(actor, capability)
+    return actor
+
+
 def require(capability: Capability) -> Callable[[Request], Actor]:
     """
     Fábrica de la dependencia que exige una capacidad. Devuelve el ``Actor`` resuelto.
@@ -187,22 +206,48 @@ def require(capability: Capability) -> Callable[[Request], Actor]:
     """
 
     def _dependency(request: Request) -> Actor:
-        actor = get_current_actor(request)
-        # CSRF ANTES de la capacidad, y solo para el actor de tipo `admin` (el que se autentica
-        # con una cookie que el navegador adjunta solo). Antes de la capacidad porque un
-        # cross-site detectado no debería recibir un 403 distinto según si tiene o no la
-        # capacidad: eso sería un oráculo sobre la superficie a través de un origen ajeno.
-        if actor.kind == "admin":
-            from app.core.auth import SESSION_SID
-
-            csrf.enforce(request, request.session.get(SESSION_SID) or "")
-        assert_capability(actor, capability)
-        return actor
+        return _authenticate(request, capability)
 
     # El marcador que hace enumerable la cobertura. Ver el docstring del módulo.
     _dependency.__gw_capability__ = capability.value  # type: ignore[attr-defined]
     _dependency.__name__ = f"require_{capability.value.replace('.', '_')}"
     return _dependency
+
+
+def require_at(
+    capability: Capability, *, target: Callable[..., ScopeTarget]
+) -> Callable[..., Actor]:
+    """
+    Como ``require`` pero con capa 2: exige la capacidad EN el destino que declara ``target``.
+
+    Devuelve el mismo ``Actor`` (no un wrapper): 227 sitios de controller lo reciben como
+    ``admin=actor`` y no tienen que enterarse. ``target`` es un resolvedor puro de
+    ``app.core.scope_targets``; FastAPI lo ejecuta antes que esta dependencia, así que no puede
+    consultar la BD (oráculo previo a la autenticación). Acá, ya autenticado, se resuelve a
+    entornos y solo si el actor tiene grants por alcance: para los demás es un no-op sin BD.
+
+    Estampa ``__gw_capability__`` (los chequeos 1-4 del script y el trinquete siguen valiendo) y
+    ``__gw_scope__`` (el tipo de destino, que exige el chequeo 6). Un resolvedor no registrado
+    en ``TARGET_KINDS`` falla con ``KeyError`` al importar la ruta, no en runtime.
+    """
+    from app.core.scope_targets import TARGET_KINDS
+
+    kind = TARGET_KINDS[target]
+
+    def _dependency(request: Request, t: ScopeTarget = Depends(target)) -> Actor:
+        actor = _authenticate(request, capability)
+        assert_layer2(actor, capability, t)
+        return actor
+
+    _dependency.__gw_capability__ = capability.value  # type: ignore[attr-defined]
+    _dependency.__gw_scope__ = kind  # type: ignore[attr-defined]
+    _dependency.__name__ = f"require_at_{capability.value.replace('.', '_')}_{kind}"
+    return _dependency
+
+
+def declared_scope(dependency: Callable) -> str | None:
+    """El tipo de destino que declara una dependencia (``require_at``), o ``None``."""
+    return getattr(dependency, "__gw_scope__", None)
 
 
 def declared_capability(dependency: Callable) -> str | None:

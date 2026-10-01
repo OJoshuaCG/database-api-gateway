@@ -146,3 +146,166 @@ def test_public_routes_allowlist_is_short_and_explicit(guard):
     for method, path in guard.PUBLIC_ROUTES:
         assert method in {"GET", "POST"}
         assert path.startswith("/")
+
+
+# --------------------------------------------------------------------------- #
+# Chequeo 6: toda ruta de alcance declara su destino                           #
+# --------------------------------------------------------------------------- #
+#
+# Se ejerce ``scope_errors`` sobre apps SINTÉTICAS con listas propias: la prueba de que el
+# chequeo sirve no puede depender de que la app real esté rota.
+
+
+def _scope_app():
+    """Fábrica de apps sintéticas: devuelve ``(app, DatabasesWrite, ScopedWrite)``."""
+    from typing import Annotated
+
+    from fastapi import Depends
+
+    from app.core.actor import Actor
+    from app.core.authz import DatabasesWrite, require_at
+    from app.core.scope_targets import database
+    from app.services.capability_catalog import Capability
+
+    scoped = Annotated[
+        Actor, Depends(require_at(Capability.DATABASES_WRITE, target=database))
+    ]
+    return FastAPI(), DatabasesWrite, scoped
+
+
+def _errors(guard, app, *, pending=frozenset(), exempt=None, max_pending=0):
+    return guard.scope_errors(
+        app, pending=pending, exempt=exempt or {}, max_pending=max_pending
+    )
+
+
+def test_check_6_fails_naming_an_undeclared_scope_route(guard):
+    app, plain, _ = _scope_app()
+
+    @app.post("/sin-destino")
+    def sin_destino(actor: plain):
+        return {}
+
+    errores = _errors(guard, app)
+    assert any("POST /sin-destino" in e for e in errores)
+
+
+def test_check_6_accepts_a_route_that_declares_its_target(guard):
+    app, _, scoped = _scope_app()
+
+    @app.delete("/bd/{db_id}")
+    def borrar(actor: scoped, db_id: int):
+        return {}
+
+    assert _errors(guard, app) == []
+
+
+def test_check_6_accepts_listed_pending_and_exempt_routes(guard):
+    app, plain, _ = _scope_app()
+
+    @app.post("/pendiente")
+    def pendiente(actor: plain):
+        return {}
+
+    @app.post("/exenta")
+    def exenta(actor: plain):
+        return {}
+
+    errores = _errors(
+        guard,
+        app,
+        pending=frozenset({("POST", "/pendiente")}),
+        exempt={("POST", "/exenta"): "autoría"},
+        max_pending=1,
+    )
+    assert errores == []
+
+
+def test_check_6_does_not_ask_a_target_of_viewer_floor_or_global_capabilities(guard):
+    from app.core.authz import DatabasesRead, GatewayAdmin
+
+    app = FastAPI()
+
+    @app.get("/lectura")
+    def lectura(actor: DatabasesRead):
+        return {}
+
+    @app.get("/global")
+    def global_(actor: GatewayAdmin):
+        return {}
+
+    assert _errors(guard, app) == []
+
+
+def test_check_6b_rejects_assert_capability_inside_a_scoped_endpoint(guard):
+    from app.core.authz import assert_capability
+    from app.services.capability_catalog import Capability
+
+    app, _, scoped = _scope_app()
+
+    @app.delete("/bd/{db_id}")
+    def borrar(actor: scoped, db_id: int):
+        assert_capability(actor, Capability.DATABASES_DROP)
+        return {}
+
+    errores = _errors(guard, app)
+    assert any("DELETE /bd/{db_id}" in e and "6b" in e for e in errores)
+
+
+def test_check_6b_ignores_a_docstring_that_only_names_assert_capability(guard):
+    app, _, scoped = _scope_app()
+
+    @app.delete("/bd/{db_id}")
+    def borrar(actor: scoped, db_id: int):
+        """Usa assert_capability( solo en el texto, no la llama."""
+        return {}
+
+    assert _errors(guard, app) == []
+
+
+def test_a_stale_entry_for_an_already_migrated_route_fails(guard):
+    app, _, scoped = _scope_app()
+
+    @app.delete("/bd/{db_id}")
+    def borrar(actor: scoped, db_id: int):
+        return {}
+
+    errores = _errors(
+        guard, app, pending=frozenset({("DELETE", "/bd/{db_id}")}), max_pending=1
+    )
+    assert any("DELETE /bd/{db_id}" in e and "entrada vieja" in e for e in errores)
+
+
+def test_a_ghost_entry_fails(guard):
+    app = FastAPI()
+    errores = _errors(
+        guard,
+        app,
+        pending=frozenset({("POST", "/no-existe")}),
+        exempt={("POST", "/tampoco"): "x"},
+        max_pending=1,
+    )
+    assert any("POST /no-existe" in e and "POST /tampoco" in e for e in errores)
+
+
+def test_the_pending_ratchet_fails_when_the_list_grows(guard):
+    app, plain, _ = _scope_app()
+
+    @app.post("/a")
+    def a(actor: plain):
+        return {}
+
+    @app.post("/b")
+    def b(actor: plain):
+        return {}
+
+    pending = frozenset({("POST", "/a"), ("POST", "/b")})
+    assert any("CRECIÓ" in e for e in _errors(guard, app, pending=pending, max_pending=1))
+    assert _errors(guard, app, pending=pending, max_pending=2) == []
+
+
+def test_the_real_pending_list_respects_its_ratchet_and_exemptions_have_reasons(guard):
+    assert len(guard.SCOPE_PENDING) <= guard.MAX_SCOPE_PENDING
+    assert guard.SCOPE_EXEMPT, "la autoría de blueprints y los proyectos están exentos"
+    assert all(reason.strip() for reason in guard.SCOPE_EXEMPT.values())
+    assert not (guard.SCOPE_PENDING & set(guard.SCOPE_EXEMPT))

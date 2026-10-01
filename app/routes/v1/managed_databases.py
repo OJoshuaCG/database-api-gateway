@@ -10,7 +10,9 @@ Crea/borra BDs reales en el motor destino. Flags y rutas que tocan el motor:
 - ``?provision=true`` en reassign-owner → re-grant / ALTER OWNER en el motor.
 """
 
-from fastapi import APIRouter, Path as FPath, Query, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Path as FPath, Query, Request
 
 from app.controllers.managed_database_controller import ManagedDatabaseController
 from app.controllers.managed_migration_controller import ManagedMigrationController
@@ -22,7 +24,9 @@ from app.core.authz import (
     DatabasesRead,
     DatabasesWrite,
     assert_capability,
+    require_at,
 )
+from app.core.actor import Actor
 from app.core.limiter import limiter
 from app.models.enums import EngineType, ProvisionStatus
 from app.core.authz import GatewayAdmin
@@ -43,12 +47,22 @@ from app.schemas.model_migration import (
     MigrationSelectResultsOut,
     MigrationStatusOut,
 )
-from app.core.scope import assert_scope_for_database
+from app.core.scope import assert_at
+from app.core.scope_targets import database
 from app.services.capability_catalog import Capability
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
 router = APIRouter(prefix="/managed-databases", tags=["Managed Databases"])
+
+# Capa 1 + capa 2 sobre la BD de la ruta (``db_id``). Alias locales y no en ``authz``: el tipo de
+# destino es decisión de cada ruta, y un alias global por (capacidad, destino) se multiplicaría.
+DatabasesWriteAtDb = Annotated[
+    Actor, Depends(require_at(Capability.DATABASES_WRITE, target=database))
+]
+BlueprintsApplyAtDb = Annotated[
+    Actor, Depends(require_at(Capability.BLUEPRINTS_APPLY, target=database))
+]
 
 
 @router.get("", response_model=ApiResponse[list[ManagedDatabaseOut]])
@@ -149,7 +163,7 @@ def update_database(actor: DatabasesWrite, db_id: int, payload: ManagedDatabaseU
 
 @router.delete("/{db_id}", response_model=ApiResponse[None])
 def delete_database(
-    actor: DatabasesWrite,
+    actor: DatabasesWriteAtDb,
     db_id: int,
     drop_remote: bool = Query(False),
     confirm_name: str | None = Query(
@@ -170,15 +184,9 @@ def delete_database(
     puede, la confirmación dice sobre qué.
     """
     if drop_remote:
-        assert_capability(actor, Capability.DATABASES_DROP)
-    # Capa 2: la capacidad se exige de nuevo, ahora EN ESTE destino. La capa 1 usa el rol
-    # UNIÓN (el máximo sobre los alcances) y por eso es más laxa que la política real; esto es
-    # lo que la vuelve no salteable.
-    assert_scope_for_database(
-        actor,
-        Capability.DATABASES_DROP if drop_remote else Capability.DATABASES_WRITE,
-        db_id=db_id,
-    )
+        # Escalamiento por payload: ``assert_at`` y no ``assert_capability``, porque la ruta
+        # tiene capa 2 y la capa 1 sola (rol UNIÓN) dejaría pasar un DROP en producción.
+        assert_at(actor, Capability.DATABASES_DROP, database(db_id))
     ManagedDatabaseController().delete_database(
         db_id, drop_remote=drop_remote, confirm_name=confirm_name, admin=actor
     )
@@ -237,7 +245,7 @@ def reassign_owner(
 @limiter.limit("10/minute")
 def provision_database(
     request: Request,
-    actor: DatabasesWrite,
+    actor: DatabasesWriteAtDb,
     db_id: int,
     allow_recreate: bool = Query(
         False,
@@ -262,7 +270,6 @@ def provision_database(
     409 si la BD ya existe en el motor: adoptar una base preexistente es
     ``POST /managed-databases/adopt``.
     """
-    assert_scope_for_database(actor, Capability.DATABASES_WRITE, db_id=db_id)
     result = ManagedDatabaseController().provision_database(
         db_id, allow_recreate=allow_recreate, admin=actor
     )
@@ -289,7 +296,7 @@ def migration_status(actor: BlueprintsRead, db_id: int):
 @limiter.limit("10/minute")
 def apply_migrations(
     request: Request,
-    actor: BlueprintsApply,
+    actor: BlueprintsApplyAtDb,
     db_id: int,
     version: str | None = Query(
         None,
@@ -340,7 +347,6 @@ def apply_migrations(
     ('allow_result_capture') se retiró. Con 'dry_run=true' no bloquea y el plan informa en
     'will_capture_versions' qué versiones van a capturar.
     """
-    assert_scope_for_database(actor, Capability.BLUEPRINTS_APPLY, db_id=db_id)
     result = ManagedMigrationController().apply(
         db_id, up_to_version=version, force=force, dry_run=dry_run,
         on_failure=on_failure, admin=actor,
@@ -391,7 +397,7 @@ def _apply_message(result: dict, *, dry_run: bool) -> str:
 @limiter.limit("10/minute")
 def rollback_migration(
     request: Request,
-    actor: BlueprintsApply,
+    actor: BlueprintsApplyAtDb,
     db_id: int,
     confirm_version: str = Query(
         ...,
@@ -422,7 +428,6 @@ def rollback_migration(
     'capture_selects=true' sin revisar, sin ejecutar ninguna sentencia de la migración (el
     gateway sí lee antes la versión actual del destino para saber qué camino hay que revertir).
     """
-    assert_scope_for_database(actor, Capability.BLUEPRINTS_APPLY, db_id=db_id)
     result = ManagedMigrationController().rollback(
         db_id,
         confirm_version=confirm_version,

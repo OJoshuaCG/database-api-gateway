@@ -50,6 +50,10 @@ reporte de ``GET /authz/scope-readiness``: se clasifica primero, se otorga despu
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Literal
+
 from app.core.actor import Actor
 from app.exceptions import AppHttpException
 from app.services.capability_catalog import (
@@ -146,6 +150,86 @@ def resolve_environment_id(
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class ScopeTarget:
+    """
+    Destino DECLARADO de una ruta: qué es, no dónde cae. Sin BD y sin autenticación.
+
+    Lo produce un resolvedor puro (``app.core.scope_targets``) que FastAPI ejecuta ANTES que la
+    dependencia padre; por eso no puede tocar la BD: una consulta ahí sería un oráculo de
+    existencia previo a la autenticación y al CSRF. La resolución a entornos la hace
+    ``resolve_points`` y solo después de autenticar.
+
+    ``quantifier``: ``all`` exige la capacidad en CADA punto (jobs de doble extremo, listas
+    explícitas, operaciones de blueprint); ``any`` exige al menos UN punto permitido (lotes
+    implícitos: la dependencia prueba que hay algo que hacer y el controller particiona).
+    """
+
+    kind: str  # vocabulario cerrado: las claves de ``scope_targets._RESOLVERS``
+    params: tuple = ()
+    quantifier: Literal["all", "any"] = "all"
+
+
+@dataclass(frozen=True, slots=True)
+class ScopePoint:
+    """Un punto concreto donde se evalúa la capacidad. ``environment_id`` ya es fail-closed."""
+
+    environment_id: int | None
+    server_id: int | None
+    item_id: int | None = None  # id de la BD gestionada o del ítem del lote, para particionar
+
+
+@dataclass(frozen=True, slots=True)
+class ScopePartition:
+    permitted: tuple[int, ...]
+    forbidden: tuple[int, ...]
+
+
+def resolve_points(target: ScopeTarget) -> list[ScopePoint]:
+    """
+    Resuelve un destino declarado a sus puntos de evaluación (1-2 consultas, sin N+1).
+
+    Una lista vacía solo es posible para blueprints sin ninguna BD (``model``): ahí no hay
+    escritura remota y la decisión cae al rol base. Todo otro tipo, ante un destino inexistente
+    o irresoluble, devuelve el entorno más protegido.
+    """
+    from app.core.scope_targets import resolve_target_points
+
+    return resolve_target_points(target)
+
+
+def role_at_point(actor: Actor, point: ScopePoint) -> GatewayRole:
+    """
+    El rol del actor EN ESTE punto. Función pura: no toca la BD.
+
+    Es ``effective_role_at`` sin la resolución del entorno, extraída para evaluar N puntos ya
+    resueltos. Sin grant aplicable manda el rol BASE (nunca la unión); con dos aplicables, el
+    más restrictivo. Ver el docstring del módulo.
+    """
+    if actor.role is None:
+        # Token: su alcance por destino es el `project_id`, otra frontera.
+        return GatewayRole.VIEWER
+
+    base = actor.base_role if actor.base_role is not None else actor.role
+    aplicables = [
+        role
+        for (scope_type, scope_id, role) in actor.scope_roles
+        if (
+            scope_type == "environment"
+            and point.environment_id is not None
+            and scope_id == point.environment_id
+        )
+        or (
+            scope_type == "server"
+            and point.server_id is not None
+            and scope_id == point.server_id
+        )
+    ]
+    if not aplicables:
+        return base
+    return min(aplicables, key=lambda r: _ROLE_RANK[r])
+
+
 def effective_role_at(
     actor: Actor, *, server_id: int | None, managed_database_id: int | None
 ) -> GatewayRole:
@@ -163,9 +247,6 @@ def effective_role_at(
     tests previos no lo veían porque todos usaban base ≥ grant fuera del alcance del grant.
     """
     if actor.role is None:
-        # Un actor de tipo token no tiene rol: sus capacidades salen de los scopes, ya
-        # intersectados con el techo de agente. El alcance por destino de un token es el
-        # `project_id`, que es otra frontera y no ésta.
         return GatewayRole.VIEWER
 
     base = actor.base_role if actor.base_role is not None else actor.role
@@ -175,16 +256,88 @@ def effective_role_at(
     env_id = resolve_environment_id(
         server_id=server_id, managed_database_id=managed_database_id
     )
+    return role_at_point(actor, ScopePoint(environment_id=env_id, server_id=server_id))
 
-    aplicables = [
-        role
-        for (scope_type, scope_id, role) in actor.scope_roles
-        if (scope_type == "environment" and env_id is not None and scope_id == env_id)
-        or (scope_type == "server" and server_id is not None and scope_id == server_id)
-    ]
-    if not aplicables:
-        return base
-    return min(aplicables, key=lambda r: _ROLE_RANK[r])
+
+def _forbidden() -> AppHttpException:
+    """
+    El 403 único de las dos capas. No dice cuál negó: distinguir "no tenés la capacidad" de "no
+    la tenés acá" le regala a un atacante el mapa de sus propios alcances por fuerza bruta.
+    """
+    return AppHttpException(
+        message="No tienes permiso para esta operación.",
+        status_code=403,
+        public_context={"code": CODE_FORBIDDEN},
+    )
+
+
+def _permits(actor: Actor, role: GatewayRole, capability: Capability) -> bool:
+    # Las capacidades globales (`access_admin`, `security_officer`) no tienen alcance: son
+    # ortogonales a la cadena de roles, así que lo que otorgan no se recorta por destino.
+    from app.services.capability_catalog import GLOBAL_CAPABILITIES
+
+    permitidas = set(role_capabilities(role))
+    for g in actor.global_capabilities:
+        permitidas |= GLOBAL_CAPABILITIES[g]
+    return capability in permitidas
+
+
+def assert_at(actor: Actor, capability: Capability, target: ScopeTarget) -> None:
+    """
+    Capa 1 + capa 2 sobre un destino declarado. 403 ``access.forbidden`` idéntico en ambas.
+
+    Es lo que usan los escalamientos por payload de una ruta con ``require_at``: dentro de una
+    ruta con alcance declarado, ``assert_capability`` (solo capa 1, rol UNIÓN) sería un hueco
+    con forma de chequeo — el check 6b del script lo prohíbe.
+
+    Sin grants por alcance, o con un actor de token, la capa 2 es un no-op y NO toca la BD.
+    """
+    if not actor.has(capability):
+        raise _forbidden()
+    assert_layer2(actor, capability, target)
+
+
+def assert_layer2(actor: Actor, capability: Capability, target: ScopeTarget) -> None:
+    """Solo la capa 2. ``require_at`` la usa tras la capa 1 que ya corrió en ``_authenticate``."""
+    if actor.kind != "admin" or not actor.scope_roles:
+        return
+
+    puntos = resolve_points(target)
+    if not puntos:
+        # Blueprint sin BDs: no hay escritura remota, decide el rol base.
+        base = actor.base_role if actor.base_role is not None else actor.role
+        if not _permits(actor, base, capability):
+            raise _forbidden()
+        return
+
+    permitidos = [_permits(actor, role_at_point(actor, p), capability) for p in puntos]
+    ok = any(permitidos) if target.quantifier == "any" else all(permitidos)
+    if not ok:
+        raise _forbidden()
+
+
+def partition_by_scope(
+    *, actor: Actor, capability: Capability, points: Sequence[ScopePoint]
+) -> ScopePartition:
+    """
+    Parte los ítems de un lote en permitidos y prohibidos, por ``item_id``.
+
+    ``actor`` es keyword-only y sin default: un lote que se olvide de pasarlo falla con
+    ``TypeError`` en vez de particionar con nadie. Los tokens y los actores sin grants por
+    alcance lo ven todo permitido (la capa 2 no les aplica).
+    """
+    permitidos: list[int] = []
+    prohibidos: list[int] = []
+    for p in points:
+        if p.item_id is None:
+            raise ValueError("partition_by_scope exige item_id en cada punto")
+        if actor.kind != "admin" or not actor.scope_roles:
+            permitidos.append(p.item_id)
+        elif _permits(actor, role_at_point(actor, p), capability):
+            permitidos.append(p.item_id)
+        else:
+            prohibidos.append(p.item_id)
+    return ScopePartition(tuple(permitidos), tuple(prohibidos))
 
 
 def assert_scope(
@@ -208,20 +361,8 @@ def assert_scope(
     rol = effective_role_at(
         actor, server_id=server_id, managed_database_id=managed_database_id
     )
-    # Las capacidades globales (`access_admin`, `security_officer`) no tienen alcance: son
-    # ortogonales a la cadena de roles, así que lo que otorgan no se recorta por destino.
-    from app.services.capability_catalog import GLOBAL_CAPABILITIES
-
-    permitidas = set(role_capabilities(rol))
-    for g in actor.global_capabilities:
-        permitidas |= GLOBAL_CAPABILITIES[g]
-
-    if capability not in permitidas:
-        raise AppHttpException(
-            message="No tienes permiso para esta operación.",
-            status_code=403,
-            public_context={"code": CODE_FORBIDDEN},
-        )
+    if not _permits(actor, rol, capability):
+        raise _forbidden()
 
 
 def assert_scope_for_database(actor: Actor, capability: Capability, *, db_id: int) -> None:
