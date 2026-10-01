@@ -489,6 +489,18 @@ class ServerAdapter(ABC):
             context={"dialect": self.dialect},
         )
 
+    def is_privileged_role(self, username: str) -> bool:
+        """
+        ¿La cuenta tiene atributos de administración del servidor que el gateway no debe
+        modificar? Lo consulta ``protected_accounts.assert_not_privileged_role`` antes de
+        cualquier mutación por identidad.
+
+        Default ``False``: en MySQL/MariaDB la protección es por NOMBRE (ver el docstring de
+        ``protected_accounts``). PostgreSQL lo sobreescribe consultando ``pg_roles``, porque
+        ahí un DBA con otro nombre (o un CREATEROLE antes de PG16) sí es alcanzable.
+        """
+        return False
+
     def copy_user_grants(self, username: str, source_host: str, new_host: str) -> int:
         """
         Replica los permisos de ``'user'@'source_host'`` a ``'user'@'new_host'`` (mismo

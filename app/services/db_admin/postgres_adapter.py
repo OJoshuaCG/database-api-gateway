@@ -1128,6 +1128,37 @@ class PostgresAdapter(ServerAdapter):
             extra={"username": username},
         )
 
+    def is_privileged_role(self, username: str) -> bool:
+        """
+        ¿El rol es de administración? SUPERUSER, CREATEROLE, REPLICATION, BYPASSRLS o
+        miembro (directo o heredado) de un rol predefinido de administración
+        (``protected_accounts.PG_ADMIN_ROLES``).
+
+        Por qué atributos y no una lista de nombres: el DBA del cliente se llama como
+        quiera, y antes de PG16 un CREATEROLE puede ``ALTER ROLE`` a cualquier rol no
+        superusuario — tomar su contraseña es tomar el servidor. Un rol inexistente no es
+        privilegiado (``False``): el camino que lo use fallará en el motor por sí solo.
+
+        Los errores del driver se propagan (``map_driver_error``); el guard los convierte
+        en rechazo fail-closed.
+        """
+        from app.services.db_admin.protected_accounts import PG_ADMIN_ROLES
+
+        admin_roles = ", ".join("'" + r + "'" for r in PG_ADMIN_ROLES)  # constantes internas
+        sql = (
+            "SELECT (r.rolsuper OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls "
+            "OR EXISTS (SELECT 1 FROM pg_roles a "
+            f"WHERE a.rolname IN ({admin_roles}) "
+            "AND pg_has_role(r.oid, a.oid, 'MEMBER'))) AS privileged "
+            "FROM pg_roles r WHERE r.rolname = :name"
+        )
+        try:
+            with server_connection(self.target) as conn:
+                value = conn.execute(text(sql), {"name": username}).scalar()
+        except SQLAlchemyError as exc:
+            raise map_driver_error(exc, op="is_privileged_role", target=self.target)
+        return bool(value)
+
     def grant_database(self, username, db_name, host="%", privileges="ALL PRIVILEGES") -> None:
         validate_identifier(username, self.dialect, "usuario")
         validate_identifier(db_name, self.dialect, "base de datos")

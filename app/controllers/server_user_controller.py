@@ -46,6 +46,7 @@ from app.schemas.server_user import (
     ServerUserOut,
 )
 from app.services import audit
+from app.services.db_admin import protected_accounts
 from app.services.db_admin.factory import get_adapter
 
 if TYPE_CHECKING:
@@ -161,6 +162,9 @@ class ServerUserController:
         session = self._session()
         try:
             server = get_server_or_404(session, data["server_id"])
+            dialect = engine_value(server)
+            if provision:
+                self._guard_protected_name(server, data["username"])
             target = build_target(server) if provision else None
             user = ServerUser(
                 server_id=server.id,
@@ -189,7 +193,9 @@ class ServerUserController:
 
         if provision:
             try:
-                get_adapter(target).create_user(username, password, host)
+                adapter = get_adapter(target)
+                self._guard_privileged_role(adapter, dialect, username)
+                adapter.create_user(username, password, host)
             except AppHttpException:
                 # No quedó usuario en el motor: rollback limpio del inventario.
                 self._delete_row(user_id)
@@ -224,6 +230,7 @@ class ServerUserController:
         session = self._session()
         try:
             server = get_server_or_404(session, data["server_id"])
+            self._guard_protected_name(server, data["username"])
             target = build_target(server)  # descifra con la sesión abierta
             username = data["username"]
             host = data.get("host") or "%"
@@ -234,7 +241,8 @@ class ServerUserController:
         # Verificar existencia REAL en el motor (solo lectura). En PostgreSQL no hay
         # host: se matchea por username; en MySQL/MariaDB por (username, host).
         is_pg = target.dialect == "postgresql"
-        live = get_adapter(target).list_users()
+        adapter = get_adapter(target)
+        live = adapter.list_users()
         exists = any(
             u.username == username and (is_pg or (u.host or "%") == host) for u in live
         )
@@ -244,6 +252,7 @@ class ServerUserController:
                 status_code=404,
                 context={"username": username, "host": None if is_pg else host},
             )
+        self._guard_privileged_role(adapter, target.dialect, username)
 
         session = self._session()
         try:
@@ -293,6 +302,9 @@ class ServerUserController:
             user = self._get_or_404(session, user_id)
             server = get_server_or_404(session, user.server_id)
             username, host, server_id = user.username, user.host, user.server_id
+            dialect = engine_value(server)
+            if provision and new_password:
+                self._guard_protected_name(server, username)
             target = build_target(server) if (provision and new_password) else None
         finally:
             session.close()
@@ -300,7 +312,9 @@ class ServerUserController:
         # 2) cambio de password en el motor PRIMERO (si se aprovisiona).
         if provision and new_password:
             try:
-                get_adapter(target).change_password(username, new_password, host)
+                adapter = get_adapter(target)
+                self._guard_privileged_role(adapter, dialect, username)
+                adapter.change_password(username, new_password, host)
             except AppHttpException:
                 audit.record(
                     "server_user.update",
@@ -449,6 +463,9 @@ class ServerUserController:
                     context={"server_user_id": user_id, "owned_databases": owned},
                 )
             username, host, server_id = user.username, user.host, user.server_id
+            dialect = engine_value(server)
+            if drop_remote:
+                self._guard_protected_name(server, username)
             target = build_target(server) if drop_remote else None
         finally:
             session.close()
@@ -465,6 +482,8 @@ class ServerUserController:
                     status_code=422,
                     context={"server_user_id": user_id, "required": "confirm_username == username"},
                 )
+            adapter = get_adapter(target)
+            self._guard_privileged_role(adapter, dialect, username)
             # Auditar la INTENCIÓN antes de la acción irreversible.
             audit.record(
                 "server_user.delete",
@@ -477,7 +496,7 @@ class ServerUserController:
                 detail="DROP USER solicitado (confirmado)",
             )
             try:
-                get_adapter(target).drop_user(username, host)
+                adapter.drop_user(username, host)
             except AppHttpException:
                 audit.record(
                     "server_user.delete",
@@ -517,23 +536,28 @@ class ServerUserController:
             ) from exc
 
     @staticmethod
-    def _guard_not_root(root_username: str | None, username: str) -> None:
+    def _guard_protected_name(server, username: str) -> None:
         """
-        Guard anti auto-lockout: prohíbe operar por identidad sobre la CREDENCIAL
-        pseudo-root del gateway (``Server.root_username``), que normalmente NO es una
-        fila de ``ServerUser`` — por eso el guard de grant_controller no la cubre y hay
-        que replicarlo aquí. Un DROP/ALTER sobre esa cuenta deja al gateway sin control
-        del servidor (irreversible desde el gateway).
+        Guard anti toma de control, parte SIN motor: la credencial pseudo-root del gateway
+        (``Server.root_username``, anti auto-lockout) y los nombres reservados del motor y
+        de la nube administrada. Reemplaza al viejo guard que solo cubría la primera y
+        dejaba ``root``/``postgres``/cualquier DBA al alcance de ``engine_users.write``.
+        El porqué completo está en ``db_admin.protected_accounts``.
         """
-        if root_username and username.lower() == root_username.lower():
-            raise AppHttpException(
-                message=(
-                    "No se puede operar sobre la propia credencial pseudo-root del gateway "
-                    "(riesgo de auto-bloqueo). Para gestionar esa cuenta, hazlo fuera del gateway."
-                ),
-                status_code=409,
-                context={"username": username},
-            )
+        protected_accounts.assert_not_protected_by_name(
+            dialect=engine_value(server), username=username, root_username=server.root_username
+        )
+
+    @staticmethod
+    def _guard_privileged_role(adapter, dialect: str, username: str) -> None:
+        """
+        Guard anti toma de control, parte CON motor (solo PostgreSQL: rol con atributos de
+        administración). Se llama justo antes de la primera mutación en el motor, después
+        de las validaciones locales. Fail-closed si no se puede verificar.
+        """
+        protected_accounts.assert_not_privileged_role(
+            adapter, dialect=dialect, username=username
+        )
 
     def _find_inventory_row(self, session, server_id: int, username: str, host: str, *, is_pg: bool):
         """Fila de inventario que corresponde a la identidad, o None. En PG se ignora host."""
@@ -690,14 +714,16 @@ class ServerUserController:
         session = self._session()
         try:
             server = get_server_or_404(session, server_id)
-            self._guard_not_root(server.root_username, username)
+            self._guard_protected_name(server, username)
             target = build_target(server)
             is_pg = engine_value(server) == "postgresql"
         finally:
             session.close()
 
+        adapter = get_adapter(target)
+        self._guard_privileged_role(adapter, target.dialect, username)
         try:
-            get_adapter(target).create_user(username, password, host)
+            adapter.create_user(username, password, host)
         except AppHttpException:
             audit.record(
                 "server_user.create",
@@ -743,7 +769,7 @@ class ServerUserController:
         session = self._session()
         try:
             server = get_server_or_404(session, server_id)
-            self._guard_not_root(server.root_username, username)
+            self._guard_protected_name(server, username)
             target = build_target(server)
             is_pg = engine_value(server) == "postgresql"
             row = self._find_inventory_row(session, server_id, username, host, is_pg=is_pg)
@@ -751,9 +777,11 @@ class ServerUserController:
         finally:
             session.close()
 
+        adapter = get_adapter(target)
+        self._guard_privileged_role(adapter, target.dialect, username)
         # Motor PRIMERO (no adelantar el inventario al motor).
         try:
-            get_adapter(target).change_password(username, new_password, host)
+            adapter.change_password(username, new_password, host)
         except AppHttpException:
             audit.record(
                 "server_user.update",
@@ -805,7 +833,7 @@ class ServerUserController:
         session = self._session()
         try:
             server = get_server_or_404(session, server_id)
-            self._guard_not_root(server.root_username, username)
+            self._guard_protected_name(server, username)
             target = build_target(server)
             is_pg = engine_value(server) == "postgresql"
             row = self._find_inventory_row(session, server_id, username, host, is_pg=is_pg)
@@ -839,6 +867,8 @@ class ServerUserController:
                 context={"required": "confirm_username == username"},
             )
 
+        adapter = get_adapter(target)
+        self._guard_privileged_role(adapter, target.dialect, username)
         audit.record_intent(
             "server_user.delete",
             admin=admin,
@@ -848,7 +878,7 @@ class ServerUserController:
             detail="DROP USER por identidad solicitado (confirmado)",
         )
         try:
-            get_adapter(target).drop_user(username, host)
+            adapter.drop_user(username, host)
         except AppHttpException:
             audit.record(
                 "server_user.delete",
@@ -893,7 +923,7 @@ class ServerUserController:
         session = self._session()
         try:
             server = get_server_or_404(session, server_id)
-            self._guard_not_root(server.root_username, username)
+            self._guard_protected_name(server, username)
             target = build_target(server)
         finally:
             session.close()
@@ -908,6 +938,7 @@ class ServerUserController:
                 status_code=422,
                 context={"dialect": adapter.dialect},
             )
+        self._guard_privileged_role(adapter, target.dialect, username)
 
         audit.record_intent(
             "server_user.add_host",
@@ -1005,13 +1036,14 @@ class ServerUserController:
         session = self._session()
         try:
             server = get_server_or_404(session, server_id)
-            self._guard_not_root(server.root_username, username)
+            self._guard_protected_name(server, username)
             target = build_target(server)
             is_pg = target.dialect == "postgresql"
         finally:
             session.close()
 
         adapter = get_adapter(target)
+        self._guard_privileged_role(adapter, target.dialect, username)
         hosts = self._live_hosts_for_username(adapter, username, is_pg=is_pg)
         if not hosts:
             raise AppHttpException(
@@ -1087,13 +1119,14 @@ class ServerUserController:
         session = self._session()
         try:
             server = get_server_or_404(session, server_id)
-            self._guard_not_root(server.root_username, username)
+            self._guard_protected_name(server, username)
             target = build_target(server)
             is_pg = target.dialect == "postgresql"
         finally:
             session.close()
 
         adapter = get_adapter(target)
+        self._guard_privileged_role(adapter, target.dialect, username)
         live_hosts = self._live_hosts_for_username(adapter, username, is_pg=is_pg)
         if scope == "all_hosts":
             if not live_hosts:
@@ -1211,13 +1244,14 @@ class ServerUserController:
         session = self._session()
         try:
             server = get_server_or_404(session, server_id)
-            self._guard_not_root(server.root_username, username)
+            self._guard_protected_name(server, username)
             target = build_target(server)
             is_pg = target.dialect == "postgresql"
         finally:
             session.close()
 
         adapter = get_adapter(target)
+        self._guard_privileged_role(adapter, target.dialect, username)
         hosts = self._live_hosts_for_username(adapter, username, is_pg=is_pg)
         if not hosts:
             raise AppHttpException(

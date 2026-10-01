@@ -37,6 +37,7 @@ from app.schemas.grant import (
 )
 from app.services import audit
 from app.services.db_admin import privileges as priv_catalog
+from app.services.db_admin import protected_accounts
 from app.services.db_admin.dtos import EngineUserInfo, GrantInfo, GrantLevel, ObjectRef
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import validate_host, validate_identifier
@@ -102,6 +103,22 @@ class GrantController:
         adapter = get_adapter(target)
         grantee = EngineUserInfo(username=user.username, host=user.host)
         return user, server.id, adapter, grantee, server.root_username
+
+    @staticmethod
+    def _guard_protected(adapter, username: str, grantor: str | None) -> None:
+        """
+        Ningún GRANT/REVOKE/perfil sobre una cuenta PROTEGIDA (credencial del gateway,
+        cuenta reservada del motor o, en PostgreSQL, rol de administración).
+
+        Un REVOKE sobre ``root`` o un GRANT sobre un DBA no escalan por sí mismos, pero sí
+        alteran cuentas que el gateway no administra: son la misma clase de toma de control
+        que la rotación de contraseña (ver ``db_admin.protected_accounts``). El guard
+        anti auto-lockout de ``revoke_object`` se conserva aparte porque su mensaje
+        explica el riesgo concreto de ESE camino.
+        """
+        protected_accounts.assert_not_protected(
+            adapter, dialect=adapter.dialect, username=username, root_username=grantor
+        )
 
     # ------------------------------------------------------------------ #
     # Lectura                                                              #
@@ -194,6 +211,8 @@ class GrantController:
             username = user.username
         finally:
             session.close()
+
+        self._guard_protected(adapter, username, grantor)
 
         # Pre-chequeo: ¿la credencial del gateway puede delegar estos privilegios?
         if not adapter.can_grant(payload.level, payload.object_ref, payload.privileges):
@@ -322,6 +341,8 @@ class GrantController:
                     status_code=422,
                     context={"username": username, "cascade": True},
                 )
+
+        self._guard_protected(adapter, username, grantor)
 
         priv_csv = ",".join(payload.privileges)
         obj_name = _object_name(payload.object_ref)
@@ -465,6 +486,10 @@ class GrantController:
                         "incompatible_items": incompatibles,
                     },
                 )
+
+        # Al final, después de las validaciones locales (404/409/422): cubre ``apply_profile``
+        # y ``apply_profile_bulk`` con el mismo guard.
+        self._guard_protected(adapter, grantee.username, grantor)
 
         return {
             "server_id": server_id,

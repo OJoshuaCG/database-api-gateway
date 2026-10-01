@@ -34,10 +34,10 @@ def test_rewrite_grant_line():
         r("GRANT SELECT ON `s`.* TO 'app'@'%'", ng)
         == "GRANT SELECT ON `s`.* TO 'app'@'10.0.0.9'"
     )
-    # WITH GRANT OPTION se preserva.
+    # WITH GRANT OPTION se QUITA: el gateway nunca delega la capacidad de otorgar al clonar.
     assert (
         r("GRANT SELECT ON `s`.`t` TO `app`@`%` WITH GRANT OPTION", ng)
-        == "GRANT SELECT ON `s`.`t` TO 'app'@'10.0.0.9' WITH GRANT OPTION"
+        == "GRANT SELECT ON `s`.`t` TO 'app'@'10.0.0.9'"
     )
 
 
@@ -59,12 +59,20 @@ def _make_server(admin_client, **ov) -> int:
 class _FakeAdapter:
     """Adapter configurable: usuarios en vivo + registro de llamadas de escritura."""
 
-    def __init__(self, live=(), *, supports_hosts=True, grants=0):
+    def __init__(self, live=(), *, supports_hosts=True, grants=0, privileged=(), probe_error=None):
         self.dialect = "mysql"
         self.supports_hosts = supports_hosts
         self._live = list(live)
         self._grants = grants
+        self._privileged = set(privileged)
+        self._probe_error = probe_error
         self.calls = []
+
+    def is_privileged_role(self, username):
+        # Solo lo consulta el guard en PostgreSQL (ver db_admin.protected_accounts).
+        if self._probe_error is not None:
+            raise self._probe_error
+        return username in self._privileged
 
     def list_users(self):
         return [EngineUserInfo(username=u, host=h) for (u, h) in self._live]
@@ -646,3 +654,276 @@ def test_rotate_password_all_hosts_adopt_if_missing(admin_client, monkeypatch):
     assert r.json()["data"]["results"][0]["adopted"] is True
     inv = admin_client.get(f"/api/v1/server-users?server_id={sid}").json()["data"]
     assert any(u["username"] == "newbie" and u["has_password"] for u in inv)
+
+
+# ------------- F-1: cuentas protegidas (toma de control del motor) --------- #
+from app.services import engine_user_catalog as eu_codes  # noqa: E402
+
+
+def _code(resp) -> str | None:
+    return ((resp.json().get("detail") or {}).get("public_context") or {}).get("code")
+
+
+def _reason(resp) -> str | None:
+    return ((resp.json().get("detail") or {}).get("public_context") or {}).get("reason")
+
+
+def _identity_mutations(sid: int, username: str) -> list[tuple[str, str, dict]]:
+    """Todos los caminos por IDENTIDAD que modifican una cuenta del motor."""
+    base = f"/api/v1/servers/{sid}/users"
+    return [
+        ("POST", base, {"json": {"username": username, "password": "whatever1"}}),
+        ("PATCH", f"{base}/password", {"json": {"username": username, "new_password": "whatever1"}}),
+        (
+            "PATCH",
+            f"{base}/password-all-hosts",
+            {"json": {"username": username, "new_password": "whatever1", "confirm_username": username}},
+        ),
+        (
+            "POST",
+            f"{base}/define-password",
+            {"json": {"username": username, "scope": "all_hosts", "known_password": "whatever1"}},
+        ),
+        (
+            "POST",
+            f"{base}/add-host",
+            {
+                "json": {
+                    "username": username,
+                    "new_host": "%",
+                    "reuse_password": False,
+                    "new_password": "whatever1",
+                    "copy_grants": True,
+                }
+            },
+        ),
+        ("POST", f"{base}/adopt-all-hosts", {"json": {"username": username}}),
+        ("DELETE", base, {"params": {"username": username, "host": "%", "confirm_username": username}}),
+    ]
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("username", ["root", "ROOT", "rdsadmin", "azure_superuser", "cloudsqladmin"])
+def test_reserved_mysql_accounts_are_refused_on_every_identity_path(
+    admin_client, monkeypatch, username
+):
+    """
+    REGRESIÓN F-1: el único guard era la credencial del gateway (``root_username``). Con
+    ``gwadmin`` como credencial, ``root`` quedaba al alcance de ``engine_users.write``:
+    rotar su contraseña o clonarlo a ``%`` con ``copy_grants`` era superusuario directo.
+    """
+    port = 3400 + ["root", "ROOT", "rdsadmin", "azure_superuser", "cloudsqladmin"].index(username)
+    sid = _make_server(admin_client, name=f"eu-prot-{port}", port=port, root_username="gwadmin")
+    fake = _FakeAdapter([(username, "%"), (username, "localhost")])
+    _patch(monkeypatch, fake)
+    for method, url, kwargs in _identity_mutations(sid, username):
+        r = admin_client.request(method, url, **kwargs)
+        assert r.status_code == 409, (method, url, r.text)
+        assert _code(r) == eu_codes.CODE_PROTECTED_ACCOUNT, (method, url)
+        assert _reason(r) == "reserved_account"
+    assert fake.calls == []
+
+
+def test_gateway_credential_keeps_its_own_reason(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-prot-gw", port=3410, root_username="gwadmin")
+    fake = _FakeAdapter([("gwadmin", "%")])
+    _patch(monkeypatch, fake)
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}/users/password",
+        json={"username": "GWADMIN", "new_password": "whatever1"},
+    )
+    assert r.status_code == 409, r.text
+    assert _code(r) == eu_codes.CODE_PROTECTED_ACCOUNT
+    assert _reason(r) == "gateway_credential"
+    assert fake.calls == []
+
+
+def test_non_protected_account_still_works(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="eu-prot-ok", port=3411, root_username="gwadmin")
+    fake = _FakeAdapter([("app_rw", "%")])
+    _patch(monkeypatch, fake)
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}/users/password",
+        json={"username": "app_rw", "new_password": "whatever1"},
+    )
+    assert r.status_code == 200, r.text
+    assert ("change_password", "app_rw", "%") in fake.calls
+
+
+@pytest.mark.parametrize("username", ["postgres", "pg_monitor", "rds_superuser", "azuresu"])
+def test_reserved_postgres_roles_are_refused(admin_client, monkeypatch, username):
+    port = 5500 + ["postgres", "pg_monitor", "rds_superuser", "azuresu"].index(username)
+    sid = _make_server(
+        admin_client, name=f"eu-pgres-{port}", port=port, engine="postgresql", root_username="gw"
+    )
+    fake = _FakeAdapter([(username, None)], supports_hosts=False)
+    _patch(monkeypatch, fake)
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}/users/password",
+        json={"username": username, "new_password": "whatever1"},
+    )
+    assert r.status_code == 409, r.text
+    assert _code(r) == eu_codes.CODE_PROTECTED_ACCOUNT
+    assert fake.calls == []
+
+
+def test_postgres_privileged_role_is_refused_by_attribute(admin_client, monkeypatch):
+    """
+    Un DBA con cualquier nombre (SUPERUSER/CREATEROLE/REPLICATION/BYPASSRLS o miembro de
+    un rol predefinido de administración) se detecta en el motor, no por lista.
+    """
+    sid = _make_server(
+        admin_client, name="eu-pgpriv", port=5510, engine="postgresql", root_username="gw"
+    )
+    fake = _FakeAdapter([("dba_cliente", None)], supports_hosts=False, privileged={"dba_cliente"})
+    _patch(monkeypatch, fake)
+    for method, url, kwargs in _identity_mutations(sid, "dba_cliente"):
+        if url.endswith("/add-host"):
+            continue  # PostgreSQL no tiene hosts: 422 antes de llegar al guard
+        r = admin_client.request(method, url, **kwargs)
+        assert r.status_code == 409, (method, url, r.text)
+        assert _code(r) == eu_codes.CODE_PROTECTED_ACCOUNT, (method, url)
+        assert _reason(r) == "privileged_role"
+    assert fake.calls == []
+
+
+def test_postgres_privilege_probe_failure_fails_closed(admin_client, monkeypatch):
+    sid = _make_server(
+        admin_client, name="eu-pgunv", port=5511, engine="postgresql", root_username="gw"
+    )
+    fake = _FakeAdapter(
+        [("app", None)],
+        supports_hosts=False,
+        probe_error=AppHttpException(message="motor caído", status_code=502),
+    )
+    _patch(monkeypatch, fake)
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}/users/password",
+        json={"username": "app", "new_password": "whatever1"},
+    )
+    assert r.status_code == 409, r.text
+    assert _code(r) == eu_codes.CODE_PROTECTION_UNVERIFIABLE
+    assert "motor caído" not in r.text
+    assert fake.calls == []
+
+
+def test_postgres_non_privileged_role_proceeds(admin_client, monkeypatch):
+    sid = _make_server(
+        admin_client, name="eu-pgok", port=5512, engine="postgresql", root_username="gw"
+    )
+    fake = _FakeAdapter([("app", None)], supports_hosts=False)
+    _patch(monkeypatch, fake)
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}/users/password",
+        json={"username": "app", "new_password": "whatever1"},
+    )
+    assert r.status_code == 200, r.text
+    assert ("change_password", "app", "%") in fake.calls
+
+
+def test_inventory_paths_refuse_protected_accounts(admin_client, monkeypatch):
+    """
+    La fila de inventario de ``root`` se puede registrar (no toca el motor), pero ninguna
+    operación que la lleve al motor pasa: provision, rotación por ``PATCH`` ni DROP.
+    """
+    sid = _make_server(admin_client, name="eu-prot-inv", port=3412, root_username="gwadmin")
+    fake = _FakeAdapter([("root", "%")])
+    _patch(monkeypatch, fake)
+    r = admin_client.post(
+        "/api/v1/server-users?provision=true",
+        json={"server_id": sid, "username": "root", "password": "whatever1"},
+    )
+    assert r.status_code == 409, r.text
+    assert _code(r) == eu_codes.CODE_PROTECTED_ACCOUNT
+
+    uid = admin_client.post(
+        "/api/v1/server-users", json={"server_id": sid, "username": "root"}
+    ).json()["data"]["id"]
+    r = admin_client.patch(
+        f"/api/v1/server-users/{uid}?provision=true", json={"password": "whatever1"}
+    )
+    assert r.status_code == 409, r.text
+    assert _code(r) == eu_codes.CODE_PROTECTED_ACCOUNT
+    r = admin_client.delete(f"/api/v1/server-users/{uid}?drop_remote=true&confirm_username=root")
+    assert r.status_code == 409, r.text
+    assert _code(r) == eu_codes.CODE_PROTECTED_ACCOUNT
+    r = admin_client.post(
+        "/api/v1/server-users/adopt", json={"server_id": sid, "username": "rdsadmin"}
+    )
+    assert r.status_code == 409, r.text
+    assert fake.calls == []
+
+
+def test_grants_and_profiles_refuse_protected_accounts(admin_client, monkeypatch):
+    """GRANT/REVOKE/apply-profile sobre ``root`` (no siendo la credencial del gateway)."""
+    from app.services.db_admin.mysql_adapter import MySQLAdapter
+
+    calls = []
+    monkeypatch.setattr(MySQLAdapter, "can_grant", lambda self, *a, **k: True)
+    monkeypatch.setattr(MySQLAdapter, "grant_object", lambda self, *a, **k: calls.append("grant"))
+    monkeypatch.setattr(MySQLAdapter, "revoke_object", lambda self, *a, **k: calls.append("revoke"))
+    sid = _make_server(admin_client, name="eu-prot-gr", port=3413, root_username="gwadmin")
+    uid = admin_client.post(
+        "/api/v1/server-users", json={"server_id": sid, "username": "root"}
+    ).json()["data"]["id"]
+    body = {"level": "table", "object_ref": {"database": "shop", "table": "t"}, "privileges": ["SELECT"]}
+
+    r = admin_client.post(f"/api/v1/server-users/{uid}/grants", json=body)
+    assert r.status_code == 409, r.text
+    assert _code(r) == eu_codes.CODE_PROTECTED_ACCOUNT
+    r = admin_client.request("DELETE", f"/api/v1/server-users/{uid}/grants", json=body)
+    assert r.status_code == 409, r.text
+    assert _code(r) == eu_codes.CODE_PROTECTED_ACCOUNT
+
+    pid = admin_client.post(
+        "/api/v1/permission-profiles",
+        json={"name": "p-prot", "engine": "mysql", "description": None,
+              "items": [{"level": "table", "privileges": ["SELECT"]}]},
+    ).json()["data"]["id"]
+    mapping = [{"level": "table", "object_ref": {"database": "shop", "table": "t"}}]
+    r = admin_client.post(
+        f"/api/v1/server-users/{uid}/apply-profile/{pid}", json={"object_mappings": mapping}
+    )
+    assert r.status_code == 409, r.text
+    assert _code(r) == eu_codes.CODE_PROTECTED_ACCOUNT
+    assert calls == []
+
+
+def test_copy_grants_drops_every_admin_line():
+    """
+    REGRESIÓN F-1(c): ``copy_user_grants`` replicaba ``SHOW GRANTS`` casi textual, así que
+    ``add-host`` + ``copy_grants`` clonaba ``GRANT ALL ON *.* … WITH GRANT OPTION``.
+    """
+    r = MySQLAdapter._rewrite_grant_line
+    ng = "'dba'@'%'"
+    dropped = [
+        "GRANT ALL PRIVILEGES ON *.* TO `root`@`localhost` WITH GRANT OPTION",
+        "GRANT SELECT, SUPER ON *.* TO `dba`@`%`",
+        "GRANT APPLICATION_PASSWORD_ADMIN,AUDIT_ADMIN ON *.* TO `root`@`localhost`",
+        "GRANT `admin_role`@`%` TO `dba`@`%`",
+        "GRANT `r1`,`r2` TO `dba`@`%`",
+        "GRANT PROXY ON `root`@`%` TO `dba`@`%`",
+        "GRANT SELECT, UPDATE ON `mysql`.* TO `dba`@`%`",
+        "GRANT SELECT ON `mysql`.`user` TO `dba`@`%`",
+        "GRANT SELECT ON `sys`.* TO `dba`@`%`",
+        "GRANT SELECT ON `performance_schema`.* TO `dba`@`%`",
+        "GRANT SELECT ON `information_schema`.* TO `dba`@`%`",
+        "GRANT ALL ON `%`.* TO `dba`@`%`",
+        "GRANT ALL ON `mysq_`.* TO `dba`@`%`",
+        "GRANT FILE ON `shop`.* TO `dba`@`%`",
+    ]
+    for line in dropped:
+        assert r(line, ng) is None, line
+    kept = {
+        "GRANT ALL PRIVILEGES ON `shop`.* TO `dba`@`%` WITH GRANT OPTION":
+            "GRANT ALL PRIVILEGES ON `shop`.* TO 'dba'@'%'",
+        "GRANT SELECT (`id`, `name`), INSERT (`id`) ON `shop`.`t` TO `dba`@`%`":
+            "GRANT SELECT (`id`, `name`), INSERT (`id`) ON `shop`.`t` TO 'dba'@'%'",
+        "GRANT EXECUTE ON PROCEDURE `shop`.`p` TO `dba`@`%`":
+            "GRANT EXECUTE ON PROCEDURE `shop`.`p` TO 'dba'@'%'",
+        "GRANT ALL ON `my\\_db`.* TO `dba`@`%`": "GRANT ALL ON `my\\_db`.* TO 'dba'@'%'",
+    }
+    for line, expected in kept.items():
+        assert r(line, ng) == expected, line

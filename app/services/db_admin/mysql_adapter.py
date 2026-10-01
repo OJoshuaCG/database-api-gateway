@@ -53,17 +53,12 @@ from app.services.db_admin.identifiers import (
     validate_identifier,
     validate_privileges,
 )
+from app.services.db_admin.protected_accounts import MYSQL_SYSTEM_USERS
 from app.services.db_admin.sql_dialect import mask_quoted_spans
 
 _SYSTEM_DATABASES = ("information_schema", "mysql", "performance_schema", "sys")
-_SYSTEM_USERS = (
-    "mysql.sys",
-    "mysql.session",
-    "mysql.infoschema",
-    "root",
-    "mariadb.sys",
-    "debian-sys-maint",
-)
+# Una sola fuente con el guard de cuentas protegidas: lo que no se lista tampoco se toca.
+_SYSTEM_USERS = MYSQL_SYSTEM_USERS
 
 
 def _in_list(values: tuple[str, ...]) -> str:
@@ -1408,11 +1403,11 @@ class MySQLAdapter(ServerAdapter):
         """
         Replica los GRANT de ``'user'@'source_host'`` a ``'user'@'new_host'``.
 
-        Lee ``SHOW GRANTS FOR`` la cuenta origen y reejecuta cada sentencia reescribiendo
-        únicamente el grantee. Es el MISMO servidor y motor que el gateway ya administra
-        con pseudo-root (no se cruza una frontera de confianza nueva). Fail-closed: omite
-        el ``USAGE`` base, los grants ``PROXY`` y cualquier sentencia con credencial
-        embebida (``IDENTIFIED BY`` de motores viejos), que nunca se replica.
+        Lee ``SHOW GRANTS FOR`` la cuenta origen y reejecuta SOLO las líneas que
+        ``_rewrite_grant_line`` acepta, con el grantee reescrito. Antes se reejecutaba la
+        salida casi textual, y con eso ``add-host`` + ``copy_grants`` clonaba una cuenta
+        de administración entera (``GRANT ALL ON *.* … WITH GRANT OPTION``) sin pasar por
+        el catálogo de privilegios: ver ese método para qué se descarta y por qué.
         """
         validate_identifier(username, self.dialect, "usuario", allow_existing=True)
         validate_host(source_host)
@@ -1424,7 +1419,7 @@ class MySQLAdapter(ServerAdapter):
             with server_connection(self.target) as conn:
                 rows = conn.execute(text(f"SHOW GRANTS FOR {source_grantee}")).fetchall()
                 for r in rows:
-                    stmt = self._rewrite_grant_line(str(r[0]), new_grantee)
+                    stmt = self._rewrite_grant_line(str(r[0]), new_grantee, self.dialect)
                     if stmt is None:
                         continue
                     conn.execute(text(stmt))
@@ -1436,31 +1431,128 @@ class MySQLAdapter(ServerAdapter):
             )
         return applied
 
+    # Esquemas del sistema: un grant sobre ellos es administración del servidor (escribir
+    # ``mysql.user`` = superusuario), nunca un permiso de aplicación que valga clonar.
+    _COPY_GRANTS_SYSTEM_SCHEMAS = ("mysql", "sys", "performance_schema", "information_schema")
+
+    _GRANT_LINE_RE = re.compile(
+        r"^GRANT\s+(?P<privs>.+?)\s+ON\s+"
+        r"(?:(?P<kind>PROCEDURE|FUNCTION|TABLE)\s+)?(?P<obj>\S+)\s*$",
+        re.IGNORECASE | re.DOTALL,
+    )
+
     @staticmethod
-    def _rewrite_grant_line(line: str, new_grantee: str) -> str | None:
+    def _split_privileges(privs: str) -> list[str]:
+        """Separa ``SELECT (`a`, `b`), INSERT`` por comas de primer nivel (no las de columnas)."""
+        parts: list[str] = []
+        depth, current = 0, []
+        for ch in privs:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if ch == "," and depth == 0:
+                parts.append("".join(current).strip())
+                current = []
+                continue
+            current.append(ch)
+        parts.append("".join(current).strip())
+        return [p for p in parts if p]
+
+    @classmethod
+    def _schema_pattern_is_risky(cls, schema: str) -> bool:
         """
-        Reescribe una línea de ``SHOW GRANTS`` para apuntar al ``new_grantee``, o None si
-        no debe replicarse. El grantee es lo que sigue al último `` TO``; después puede
-        venir ``WITH GRANT OPTION``. Fail-closed: se omite el ``USAGE`` base (no confiere
-        privilegio), los grants ``PROXY`` (sintaxis especial) y cualquier línea con
-        credencial embebida (``IDENTIFIED BY`` de motores viejos), que nunca se replica.
+        ¿El nombre de BD de un grant alcanza un esquema del sistema?
+
+        ``SHOW GRANTS`` devuelve el PATRÓN tal cual se otorgó: ``%`` y ``_`` sin escapar son
+        comodines de ``LIKE`` (``mysq_`` alcanza a ``mysql``). Un ``%`` se descarta siempre
+        (alcanza a cualquier BD, incluida la de metadatos del gateway si está co-alojada);
+        el resto se descarta si el patrón matchea algún esquema del sistema.
         """
+        if "%" in schema.replace("\\%", ""):
+            return True
+        regex, i = "", 0
+        while i < len(schema):
+            ch = schema[i]
+            if ch == "\\" and i + 1 < len(schema):
+                regex += re.escape(schema[i + 1])
+                i += 2
+                continue
+            regex += "." if ch == "_" else re.escape(ch)
+            i += 1
+        pattern = re.compile(f"^{regex}$", re.IGNORECASE)
+        return any(pattern.match(s) for s in cls._COPY_GRANTS_SYSTEM_SCHEMAS)
+
+    @classmethod
+    def _rewrite_grant_line(
+        cls, line: str, new_grantee: str, dialect: str = "mysql"
+    ) -> str | None:
+        """
+        Reescribe una línea de ``SHOW GRANTS`` para apuntar al ``new_grantee``, o ``None``
+        si NO debe replicarse.
+
+        POR QUÉ ES UNA LISTA DE ACEPTACIÓN Y NO DE EXCLUSIÓN. La versión anterior solo
+        descartaba ``USAGE``, ``PROXY`` e ``IDENTIFIED BY``; todo lo demás se reejecutaba,
+        incluido ``GRANT ALL ON *.* … WITH GRANT OPTION``. Combinado con ``add-host`` eso
+        era la clonación de ``root`` (o de cualquier DBA) a un host nuevo con contraseña
+        elegida por el operador. Ahora se descarta, fail-closed:
+
+        - toda línea sin ``ON`` (membresía de roles de MySQL 8: ``GRANT `r`@`%` TO …``
+          heredaría el rol entero) y toda ``PROXY``;
+        - toda línea ``ON *.*`` (privilegios globales y dinámicos: ``SUPER``, ``*_ADMIN``,
+          ``CREATE USER``, ``FILE``…);
+        - toda línea sobre ``mysql``/``sys``/``performance_schema``/``information_schema``,
+          o con un patrón de BD que los alcance o contenga ``%``;
+        - toda línea con credencial embebida (``IDENTIFIED BY``);
+        - toda línea cuyos privilegios no pasen ``privileges.validate_privileges`` para su
+          nivel (el mismo catálogo ALLOW/DENY que usan los endpoints de grants), o que no
+          se pueda interpretar.
+
+        ``WITH GRANT OPTION`` se QUITA siempre: el gateway nunca delega la capacidad de
+        otorgar a una cuenta que clonó; si hace falta, se otorga explícitamente por el
+        endpoint de grants, que la audita como operación GATE.
+        """
+        from app.services.db_admin import privileges as priv_catalog
+
         idx = line.rfind(" TO ")
         if idx == -1:
             return None
-        head = line[:idx]
-        tail = line[idx + 4:]
-        head_u = head.strip().upper()
-        if head_u == "GRANT USAGE ON *.*" or head_u.startswith("GRANT PROXY ON"):
-            return None
+        head = line[:idx].strip()
         if " IDENTIFIED BY " in line.upper():
             return None
-        suffix = (
-            " WITH GRANT OPTION"
-            if tail.upper().rstrip().endswith("WITH GRANT OPTION")
-            else ""
-        )
-        return f"{head} TO {new_grantee}{suffix}"
+        m = cls._GRANT_LINE_RE.match(head)
+        if m is None:
+            return None  # sin ``ON``: membresía de rol u otra forma no replicable
+        privs_raw, kind, obj = m.group("privs"), m.group("kind"), m.group("obj")
+        if privs_raw.strip().upper().startswith("PROXY"):
+            return None
+
+        schema_part, dot, object_part = obj.partition(".")
+        if not dot:
+            return None
+        schema = schema_part.strip("`'\"")
+        obj_name = object_part.strip("`'\"")
+        if schema == "*":
+            return None  # ON *.*: global
+        if cls._schema_pattern_is_risky(schema):
+            return None
+
+        tokens = cls._split_privileges(privs_raw)
+        has_columns = any("(" in t for t in tokens)
+        if kind and kind.upper() in ("PROCEDURE", "FUNCTION"):
+            level = GrantLevel.ROUTINE
+        elif has_columns:
+            level = GrantLevel.COLUMN
+        elif obj_name == "*":
+            level = GrantLevel.DATABASE
+        else:
+            level = GrantLevel.TABLE
+        plain = [t.split("(", 1)[0].strip() for t in tokens]
+        try:
+            priv_catalog.validate_privileges(plain, dialect, level)
+        except AppHttpException:
+            return None
+        return f"{head} TO {new_grantee}"
 
     def grant_database(self, username, db_name, host="%", privileges="ALL PRIVILEGES") -> None:
         validate_identifier(username, self.dialect, "usuario")

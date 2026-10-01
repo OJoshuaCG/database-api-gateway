@@ -197,7 +197,13 @@ class AddHostIn(BaseModel):
     new_password: str | None = Field(None, min_length=1)
     copy_grants: bool = Field(
         False,
-        description="Si true, replica los permisos de la cuenta origen al nuevo host (best-effort; omite privilegios globales/PROXY).",
+        description=(
+            "Si true, replica al nuevo host los permisos de NIVEL BD/TABLA/COLUMNA/RUTINA de la "
+            "cuenta origen (best-effort). Omite: privilegios globales (ON *.*), grants sobre "
+            "mysql/sys/performance_schema/information_schema o con comodín '%', membresías de "
+            "rol, PROXY y todo privilegio que el catálogo no permita otorgar; y NUNCA copia "
+            "WITH GRANT OPTION. 'grants_copied' cuenta solo lo replicado."
+        ),
     )
     adopt: bool = Field(
         False, description="Si true, registra la nueva identidad en el inventario del gateway."
