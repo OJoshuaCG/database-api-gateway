@@ -703,3 +703,76 @@ def test_call_de_una_rutina_existente_exige_confirmacion_pero_no_se_bloquea(engi
 )
 def test_el_bloqueo_de_rutinas_no_cambia_la_clasificacion_del_resto(engine, sql, expected):
     assert qp.classify(sql, engine=engine).danger == expected
+
+
+# --------------------------------------------------------------------------- #
+# F-43: nombres calificados con OTRA base del servidor                         #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "engine,sql",
+    [
+        (MYSQL, "SELECT * FROM otherdb.t"),
+        (MYSQL, "SELECT hashed_password FROM `gatewaydb`.`users`"),
+        (MYSQL, "SELECT root_password_encrypted FROM gatewaydb.server_users"),
+        (MYSQL, "UPDATE gatewaydb.users SET gateway_role = 'owner' WHERE id = 2"),
+        (MYSQL, "DELETE FROM gatewaydb.audit_log"),
+        (MYSQL, "INSERT INTO otherdb.t VALUES (1)"),
+        (MYSQL, "SELECT * FROM t WHERE x IN (SELECT y FROM otherdb.z)"),
+        (MYSQL, "SELECT * FROM t JOIN otherdb.u ON u.id = t.id"),
+        (MYSQL, "SELECT otherdb.f(1)"),
+        (MYSQL, "CREATE TABLE otherdb.t (a INT)"),
+        # Opacas para sqlglot (``exp.Command``): respaldo textual.
+        (MYSQL, "RENAME TABLE a TO otherdb.a"),
+        (MYSQL, "REPLACE INTO otherdb.t VALUES (1)"),
+        # Escondida en un comentario ejecutable, que el AST no ve.
+        (MYSQL, "SELECT * FROM t /*!50000 , otherdb.u */"),
+        (MARIADB, "SELECT * FROM otherdb.t"),
+        # MySQL sobre Linux distingue mayúsculas en el nombre de la BD: es OTRA base.
+        (MARIADB, "SELECT * FROM Tienda.t"),
+        # PostgreSQL: solo el nombre de tres partes nombra otra base.
+        (PG, "SELECT * FROM gatewaydb.public.users"),
+    ],
+)
+def test_una_referencia_a_otra_base_se_bloquea(engine, sql):
+    """
+    REGRESIÓN F-43: los guards de la base de metadatos y de las bases de sistema miraban solo
+    el parámetro ``database`` de la conexión. Con la consola en una base inocua co-alojada,
+    ``UPDATE gatewaydb.users SET gateway_role='owner'`` salía ``write`` confirmable.
+    """
+    plan = qp.classify(sql, engine=engine, database="tienda")
+    assert plan.is_blocked, [r.code for r in plan.reasons]
+    assert any(r.code == "cross_database_reference" for r in plan.reasons)
+
+
+@pytest.mark.parametrize(
+    "engine,sql,expected",
+    [
+        (MYSQL, "SELECT * FROM tienda.t", qp.READ),
+        (MYSQL, "SELECT * FROM `tienda`.`t`", qp.READ),
+        (MYSQL, "UPDATE tienda.t SET a = 1 WHERE id = 2", qp.WRITE),
+        (MYSQL, "SELECT * FROM t", qp.READ),
+        (MYSQL, "SELECT u.id, o.total FROM users u JOIN orders o ON o.uid = u.id", qp.READ),
+        (MYSQL, "SELECT 1.5, 'otra.tabla' FROM t", qp.READ),
+        # Leer los esquemas del sistema sigue permitido (probar permisos).
+        (MYSQL, "SELECT * FROM mysql.user", qp.READ),
+        (MYSQL, "SELECT * FROM information_schema.tables", qp.READ),
+        # PostgreSQL: esquema.tabla es normal dentro de una base.
+        (PG, "SELECT * FROM public.users", qp.READ),
+        (PG, "SELECT * FROM pg_catalog.pg_class", qp.READ),
+        (PG, "SELECT * FROM tienda.public.users", qp.READ),
+        (PG, "UPDATE otro_esquema.t SET a = 1", qp.WRITE),
+    ],
+)
+def test_la_misma_base_y_lo_no_calificado_siguen_como_antes(engine, sql, expected):
+    assert qp.classify(sql, engine=engine, database="tienda").danger == expected
+
+
+def test_sin_base_de_conexion_no_se_aplica_el_chequeo():
+    """``database=None`` (tests puros, llamadores sin conexión) conserva el comportamiento."""
+    assert qp.classify("SELECT * FROM otherdb.t", engine=MYSQL).danger == qp.READ
+
+
+def test_escribir_un_esquema_del_sistema_calificado_sigue_bloqueado_por_su_regla():
+    plan = qp.classify("UPDATE mysql.user SET x = 1", engine=MYSQL, database="tienda")
+    assert plan.is_blocked
+    assert any(r.code == "system_schema_write" for r in plan.reasons)

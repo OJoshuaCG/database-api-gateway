@@ -433,3 +433,25 @@ def test_historial_pagina_y_filtra_por_base(admin_client, monkeypatch):
     ).json()
     assert len(paged["data"]) == 2
     assert paged["pagination"]["total"] == 3
+
+
+# --------------------------------------------------------------------------- #
+# F-43: la base conectada es la única que la consola alcanza                    #
+# --------------------------------------------------------------------------- #
+def test_execute_de_una_referencia_a_otra_base_403_sin_tocar_el_motor(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="qc-xdb", port=3450)
+    fake = _patch(monkeypatch)
+    r = _execute(admin_client, sid, "SELECT hashed_password FROM gatewaydb.users")
+    assert r.status_code == 403, r.text
+    assert fake.run_calls == []
+    reasons = r.json()["detail"]["public_context"]["reasons"]
+    assert any(rr["code"] == "cross_database_reference" for rr in reasons)
+
+
+def test_preview_con_la_misma_base_calificada_no_se_bloquea(admin_client, monkeypatch):
+    sid = _make_server(admin_client, name="qc-xdb2", port=3451)
+    _patch(monkeypatch)
+    # ``_preview`` conecta a ``tienda``.
+    r = _preview(admin_client, sid, "SELECT * FROM tienda.t")
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["blocked"] is False

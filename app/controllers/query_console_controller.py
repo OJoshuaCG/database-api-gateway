@@ -319,7 +319,9 @@ class QueryConsoleController:
         dialect, target, credential = self._load_context(server_id, database, connection)
         validate_identifier(database, dialect, "base de datos", allow_existing=True)
 
-        plan = query_policy.classify(sql, engine=dialect, max_rows=QUERY_MAX_ROWS)
+        plan = query_policy.classify(
+            sql, engine=dialect, max_rows=QUERY_MAX_ROWS, database=database
+        )
 
         estimates: dict[int, int | None] = {}
         if estimate_impact and not plan.is_blocked:
@@ -469,7 +471,9 @@ class QueryConsoleController:
         effective_rows = min(max_rows or QUERY_MAX_ROWS, QUERY_MAX_ROWS)
         effective_timeout = min(timeout_ms or QUERY_TIMEOUT_MS, QUERY_MAX_TIMEOUT_MS)
 
-        plan = query_policy.classify(sql, engine=dialect, max_rows=effective_rows)
+        plan = query_policy.classify(
+            sql, engine=dialect, max_rows=effective_rows, database=database
+        )
         read_only = plan.danger == query_policy.READ
 
         # Escribir sobre una BD de SISTEMA del motor, aunque el SQL no la nombre: la BD

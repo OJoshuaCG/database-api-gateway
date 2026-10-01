@@ -156,7 +156,7 @@ def _executable_comment_prefix(sql: str, i: int) -> int:
     return 0
 
 
-def _scan_normalize(sql: str, *, engine: str = "mysql") -> str:
+def _scan_normalize(sql: str, *, engine: str = "mysql", upper: bool = True) -> str:
     """
     SQL en MAYÚSCULAS, sin comentarios, con el CONTENIDO de los literales de cadena
     vaciado y el espaciado colapsado. Es la entrada de la blocklist.
@@ -278,7 +278,11 @@ def _scan_normalize(sql: str, *, engine: str = "mysql") -> str:
         out.append(ch)
         i += 1
 
-    return _WS_RE.sub(" ", "".join(out)).strip().upper()
+    collapsed = _WS_RE.sub(" ", "".join(out)).strip()
+    # ``upper=False`` lo usa SOLO el chequeo de nombres calificados entre bases: en MySQL
+    # sobre Linux el nombre de la BD distingue mayúsculas, así que ahí no se puede comparar
+    # sobre el texto en mayúsculas.
+    return collapsed.upper() if upper else collapsed
 
 
 # --------------------------------------------------------------------------- #
@@ -843,8 +847,129 @@ def _blocklist_hits(scanned: str) -> list[Reason]:
     return hits
 
 
+# --------------------------------------------------------------------------- #
+# Nombres calificados con OTRA base de datos                                   #
+# --------------------------------------------------------------------------- #
+
+# Esquemas del sistema de MySQL/MariaDB: LEERLOS calificados se sigue permitiendo (es parte de
+# probar permisos, igual que sin calificar); escribirlos ya lo bloquea ``system_schema_write``.
+_MYSQL_READABLE_SYSTEM_SCHEMAS = frozenset(
+    {"information_schema", "performance_schema", "mysql", "sys"}
+)
+
+_IDENT = r"(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_$][\w$]*)"
+# ``a.b`` (o ``a.b.c``) que NO sea la cola de un nombre más largo ni un número (``1.5``).
+_QUALIFIED_RE = re.compile(
+    rf"(?<![\w$.`\"])(?P<q1>{_IDENT})\s*\.\s*(?P<q2>{_IDENT}|\*)"
+    rf"(?:\s*\.\s*(?P<q3>{_IDENT}|\*))?"
+)
+_EXECUTABLE_BODY_RE = re.compile(r"/\*[Mm]?!\d*(.*?)(?:\*/|$)", re.DOTALL)
+
+
+def _unquote_ident(ident: str) -> str:
+    if len(ident) >= 2 and ident[0] == ident[-1] and ident[0] in "`\"":
+        return ident[1:-1]
+    return ident
+
+
+def _foreign_qualifier(qualifier: str, *, engine: str, database: str) -> bool:
+    """¿Este calificador nombra una base DISTINTA de la conectada (y no permitida)?"""
+    if not qualifier or qualifier == database:
+        return False
+    if engine in ("mysql", "mariadb") and qualifier.lower() in _MYSQL_READABLE_SYSTEM_SCHEMAS:
+        return False
+    return True
+
+
+def _ast_foreign_databases(tree: exp.Expression, *, engine: str, database: str) -> set[str]:
+    """
+    Bases distintas de la conectada que el AST referencia.
+
+    MySQL/MariaDB: la "base" es el ``db`` de la tabla (``otra.t``), de la columna
+    (``otra.t.c``) o el calificador de una función (``otra.f()``). PostgreSQL: el calificador
+    de dos partes es un ESQUEMA de la misma base (normal); solo el de tres partes
+    (``otra.public.t``, el ``catalog`` de sqlglot) nombra otra base.
+    """
+    found: set[str] = set()
+    is_mysql = engine in ("mysql", "mariadb")
+    for node in tree.walk():
+        quals: list[str] = []
+        if isinstance(node, (exp.Table, exp.Column)):
+            quals.append(node.catalog)
+            if is_mysql:
+                quals.append(node.db)
+        elif is_mysql and isinstance(node, exp.Dot) and isinstance(node.expression, exp.Func):
+            quals.append(node.this.name if isinstance(node.this, exp.Expression) else "")
+        for q in quals:
+            if _foreign_qualifier(q, engine=engine, database=database):
+                found.add(q)
+    return found
+
+
+def _text_foreign_databases(text: str, *, engine: str, database: str) -> set[str]:
+    """
+    Respaldo TEXTUAL, para lo que el AST no ve: sentencias opacas (``exp.Command``),
+    ilegibles, y el contenido de comentarios ejecutables de MySQL (sqlglot no lo tokeniza).
+
+    Fail-closed y por eso sobre-bloquea: sin AST no se distingue ``alias.columna`` de
+    ``base.tabla``, así que en esos casos cualquier ``a.b`` con ``a`` ≠ base conectada bloquea.
+    En PostgreSQL solo cuentan los nombres de tres partes.
+    """
+    found: set[str] = set()
+    for m in _QUALIFIED_RE.finditer(text):
+        if engine in ("mysql", "mariadb"):
+            q = _unquote_ident(m.group("q1"))
+        elif m.group("q3"):
+            q = _unquote_ident(m.group("q1"))
+        else:
+            continue
+        if _foreign_qualifier(q, engine=engine, database=database):
+            found.add(q)
+    return found
+
+
+def _cross_database_reason(names: set[str]) -> Reason:
+    return Reason(
+        "cross_database_reference",
+        "La sentencia nombra objetos de otra base de datos del servidor "
+        f"({', '.join(sorted(names))}). La consola opera solo sobre la base elegida en el "
+        "request: elige esa otra base como destino si corresponde.",
+    )
+
+
+def _foreign_databases(
+    sql: str, tree: exp.Expression | None, *, engine: str, database: str
+) -> set[str]:
+    """
+    Bases ajenas que referencia UNA sentencia. Ver ``classify(database=…)`` para el porqué.
+
+    AST cuando lo hay; texto cuando la sentencia es opaca o ilegible; y SIEMPRE el cuerpo de
+    los comentarios ejecutables de MySQL/MariaDB, que el AST no ve.
+    """
+    found: set[str] = set()
+    if tree is not None:
+        found |= _ast_foreign_databases(tree, engine=engine, database=database)
+    if tree is None or isinstance(tree, exp.Command):
+        found |= _text_foreign_databases(
+            _scan_normalize(sql, engine=engine, upper=False), engine=engine, database=database
+        )
+    if engine in ("mysql", "mariadb"):
+        for body in _EXECUTABLE_BODY_RE.findall(sql):
+            found |= _text_foreign_databases(
+                _scan_normalize(body, engine=engine, upper=False),
+                engine=engine,
+                database=database,
+            )
+    return found
+
+
 def classify_statement(
-    sql: str, *, engine: str, seq: int = 0, max_rows: int | None = None
+    sql: str,
+    *,
+    engine: str,
+    seq: int = 0,
+    max_rows: int | None = None,
+    database: str | None = None,
 ) -> StatementPlan:
     """Clasifica UNA sentencia ya separada del lote."""
     scanned = _scan_normalize(sql, engine=engine)
@@ -880,6 +1005,18 @@ def classify_statement(
         tree = sqlglot.parse_one(sql, read=dialect)
     except Exception:  # noqa: BLE001 — sqlglot lanza varias familias de error
         tree = None
+
+    # 3b) Otra base del mismo servidor, por nombre calificado (ver ``classify``).
+    if database is not None:
+        foreign = _foreign_databases(sql, tree, engine=engine, database=database)
+        if foreign:
+            return StatementPlan(
+                seq=seq,
+                sql=sql,
+                kind="blocked",
+                danger=BLOCKED,
+                reasons=(_cross_database_reason(foreign),),
+            )
 
     if tree is None:
         if _READ_FALLBACK_RE.match(scanned):
@@ -959,14 +1096,42 @@ def classify_statement(
     )
 
 
-def classify(sql: str, *, engine: str, max_rows: int | None = None) -> QueryPlan:
+def classify(
+    sql: str, *, engine: str, max_rows: int | None = None, database: str | None = None
+) -> QueryPlan:
     """
     Clasifica un lote SQL completo. El peligro del lote es el **máximo** de sus
     sentencias: una confirmación cubre el lote entero, nunca sentencia por sentencia.
+
+    ``database`` es la base a la que se CONECTA la consola. Con ella, toda referencia
+    calificada con OTRA base se BLOQUEA. Por qué: los guards de "no tocar la base de
+    metadatos del gateway" y "no escribir bases de sistema" miran solo el parámetro
+    ``database`` de la conexión, nunca los nombres dentro del SQL. Con la consola apuntada a
+    una base inocua co-alojada, ``SELECT hashed_password FROM gatewaydb.users`` salía ``read``
+    y ``UPDATE gatewaydb.users SET gateway_role='owner'`` salía ``write`` confirmable: lectura
+    del plano de control, auto-escalada y borrado de auditoría (``DELETE FROM
+    gatewaydb.audit_log``), además de alcanzar cualquier otra base de otro cliente del mismo
+    servidor sin chequeo de entorno.
+
+    Por motor:
+
+    - **MySQL/MariaDB**: ``db.tbl`` / ``` `db`.`tbl` ``` / ``db.f()`` con ``db`` ≠ la base
+      conectada → bloqueado, lectura incluida. Excepción: LEER ``information_schema``,
+      ``performance_schema``, ``mysql`` y ``sys`` sigue permitido (escribirlos ya lo bloquea
+      ``system_schema_write``).
+    - **PostgreSQL**: ``esquema.tabla`` es normal dentro de UNA base y se permite
+      (``pg_catalog``/``information_schema`` incluidos para lectura; su escritura ya está
+      bloqueada). Solo se bloquea el nombre de tres partes ``otra_base.esquema.tabla``: el
+      motor lo rechaza igual, así que es defensa en profundidad.
+
+    ``None`` (el default) no aplica el chequeo: lo usan los tests puros y cualquier llamador
+    que no tenga base de conexión. La consola SIEMPRE la pasa.
     """
     statements = [s for s in split_sql_statements(sql) if s.strip()]
     plans = tuple(
-        classify_statement(stmt, engine=engine, seq=i, max_rows=max_rows)
+        classify_statement(
+            stmt, engine=engine, seq=i, max_rows=max_rows, database=database
+        )
         for i, stmt in enumerate(statements)
     )
     danger = worst(*(p.danger for p in plans)) if plans else READ
