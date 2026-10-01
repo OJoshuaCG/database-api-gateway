@@ -116,3 +116,83 @@ def test_ssl_mode_update(admin_client, server_payload):
     upd = admin_client.patch(f"/api/v1/servers/{sid}", json={"ssl_mode": "verify-full"})
     assert upd.status_code == 200
     assert upd.json()["data"]["ssl_mode"] == "verify-full"
+
+
+# --------------------------------------------------------------------------- #
+# F-20: re-apuntar un servidor exige volver a enviar la credencial               #
+# --------------------------------------------------------------------------- #
+_REBIND_CODE = "server.credential_required_for_rebind"
+
+
+def _pc(r) -> dict:
+    return (r.json().get("detail") or {}).get("public_context") or {}
+
+
+def _new_server(admin_client, server_payload, **ov) -> int:
+    r = admin_client.post("/api/v1/servers", json=server_payload(**ov))
+    assert r.status_code == 201, r.text
+    return r.json()["data"]["id"]
+
+
+def test_repointing_without_password_is_rejected(admin_client, server_payload):
+    """
+    REGRESIÓN F-20: el ``root_password_encrypted`` sobrevivía al cambio de host, y la próxima
+    operación mandaba la credencial pseudo-root al host nuevo (que puede pedirla en claro).
+    """
+    sid = _new_server(admin_client, server_payload, port=3601)
+    for body, field in (
+        ({"host": "10.0.0.9"}, "host"),
+        ({"port": 3602}, "port"),
+        ({"engine": "postgresql"}, "engine"),
+    ):
+        r = admin_client.patch(f"/api/v1/servers/{sid}", json=body)
+        assert r.status_code == 422, (body, r.text)
+        assert _pc(r)["code"] == _REBIND_CODE
+        assert _pc(r)["fields"] == [field]
+    # Nada cambió.
+    data = admin_client.get(f"/api/v1/servers/{sid}").json()["data"]
+    assert (data["host"], data["port"], data["engine"]) == ("127.0.0.1", 3601, "mysql")
+
+
+def test_repointing_with_a_new_password_is_allowed(admin_client, server_payload):
+    sid = _new_server(admin_client, server_payload, port=3603)
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}", json={"host": "10.0.0.9", "root_password": "nueva-clave"}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["host"] == "10.0.0.9"
+
+
+def test_sending_the_same_connection_values_is_not_a_rebind(admin_client, server_payload):
+    sid = _new_server(admin_client, server_payload, port=3604)
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}",
+        json={"host": "127.0.0.1", "port": 3604, "engine": "mysql", "notes": "x"},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_weakening_tls_without_password_is_rejected(admin_client, server_payload):
+    sid = _new_server(admin_client, server_payload, port=3605, ssl_mode="verify-full")
+    for weaker in ("verify-ca", "require", "prefer", "disable", None):
+        r = admin_client.patch(f"/api/v1/servers/{sid}", json={"ssl_mode": weaker})
+        assert r.status_code == 422, (weaker, r.text)
+        assert _pc(r)["code"] == _REBIND_CODE
+        assert _pc(r)["fields"] == ["ssl_mode"]
+    r = admin_client.patch(
+        f"/api/v1/servers/{sid}", json={"ssl_mode": "disable", "root_password": "nueva-clave"}
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_tls_changes_that_do_not_weaken_a_required_mode_are_allowed(admin_client, server_payload):
+    # Endurecer siempre se permite.
+    sid = _new_server(admin_client, server_payload, port=3606, ssl_mode="require")
+    assert admin_client.patch(
+        f"/api/v1/servers/{sid}", json={"ssl_mode": "verify-full"}
+    ).status_code == 200
+    # Un modo que nunca exigió TLS (prefer) puede bajar sin re-enviar la credencial.
+    sid2 = _new_server(admin_client, server_payload, port=3607, ssl_mode="prefer", name="srv-2")
+    assert admin_client.patch(
+        f"/api/v1/servers/{sid2}", json={"ssl_mode": "disable"}
+    ).status_code == 200

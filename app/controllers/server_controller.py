@@ -32,6 +32,7 @@ from app.models.managed_database import ManagedDatabase
 from app.models.server import Server
 from app.models.server_user import ServerUser
 from app.services import audit
+from app.services.server_catalog import CODE_CREDENTIAL_REQUIRED_FOR_REBIND
 from app.services.db_admin.dtos import (
     ConnectionInfo,
     EngineUserInfo,
@@ -192,6 +193,44 @@ class ServerController:
         finally:
             session.close()
 
+    # Fuerza de cada ``ssl_mode`` (``None`` = sin TLS). Solo importa el orden.
+    _SSL_STRENGTH = {
+        None: 0, "disable": 0, "allow": 1, "prefer": 2,
+        "require": 3, "verify-ca": 4, "verify-full": 5,
+    }
+
+    @classmethod
+    def _rebind_fields(cls, server: Server, data: dict) -> list[str]:
+        """
+        Campos del ``PATCH`` que RE-APUNTAN la credencial guardada: ``host``, ``port`` o
+        ``engine`` distintos, o un ``ssl_mode`` más débil que uno que exigía TLS
+        (``require`` o más fuerte).
+
+        POR QUÉ. Sin ``root_password`` en el mismo request, el ``root_password_encrypted``
+        sobrevivía al re-apuntado, y el próximo test-connection u operación se lo mandaba al
+        host NUEVO. Un host controlado por quien edita lo pide en claro sin esfuerzo
+        (PostgreSQL ``AuthenticationCleartextPassword``, que libpq contesta por defecto;
+        MySQL con auth-switch a ``mysql_clear_password``, que PyMySQL contesta), y bajar
+        ``ssl_mode`` en el mismo PATCH le saca además el TLS. ``validate_remote_host`` limita
+        A DÓNDE se apunta, no esto. ``root_username`` no dispara: la credencial sigue yendo
+        al mismo destino.
+        """
+        fields: list[str] = []
+        if data.get("host") is not None and (
+            str(data["host"]).strip().lower() != (server.host or "").strip().lower()
+        ):
+            fields.append("host")
+        if data.get("port") is not None and int(data["port"]) != int(server.port):
+            fields.append("port")
+        if data.get("engine") is not None and EngineType(data["engine"]) != server.engine:
+            fields.append("engine")
+        if "ssl_mode" in data:
+            before = cls._SSL_STRENGTH.get(server.ssl_mode, 0)
+            after = cls._SSL_STRENGTH.get(data["ssl_mode"], 0)
+            if before >= cls._SSL_STRENGTH["require"] and after < before:
+                fields.append("ssl_mode")
+        return fields
+
     def update_server(self, server_id: int, data: dict, *, admin: "dict | Actor | None" = None) -> dict:
         """
         Edita un servidor del inventario.
@@ -212,6 +251,22 @@ class ServerController:
         session = self._session()
         try:
             server = self._get_or_404(session, server_id)
+            rebind = self._rebind_fields(server, data)
+            if rebind and not data.get("root_password"):
+                raise AppHttpException(
+                    message=(
+                        "Cambiar el host, el puerto o el motor del servidor, o debilitar su TLS, "
+                        "exige volver a enviar 'root_password' en el mismo request: la "
+                        "credencial guardada no se envía a un destino distinto del que se "
+                        "registró."
+                    ),
+                    status_code=422,
+                    context={"server_id": server_id},
+                    public_context={
+                        "code": CODE_CREDENTIAL_REQUIRED_FOR_REBIND,
+                        "fields": rebind,
+                    },
+                )
             changed: list[str] = []
             for field in ("name", "host", "port", "notes", "is_active", "root_username", "ssl_mode"):
                 if field in data:
