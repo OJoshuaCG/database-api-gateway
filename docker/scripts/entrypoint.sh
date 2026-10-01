@@ -20,18 +20,55 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Función: esperar a que MariaDB esté lista para conexiones
-# Aunque el healthcheck de Docker Compose ya lo verifica, puede existir una
-# pequeña ventana donde el usuario aún no tiene permisos. Reintentamos aquí.
+# Función: esperar a que la BD de metadatos acepte conexiones
+#
+# Distingue dos clases de fallo, porque reintentar las dos por igual es dañino:
+#
+# - TRANSITORIO (la BD no responde todavía, 2003/2013, red caída): se reintenta.
+#   Es la ventana de arranque de la `db` del compose y los cortes breves de red.
+# - PERMANENTE (credenciales, permisos, base inexistente): sale en el PRIMER
+#   intento. Esperar no lo arregla, y reintentarlo no es inocuo: con el reinicio
+#   en loop de `restart: unless-stopped`, 15 intentos por arranque son unos 19
+#   logins fallidos por minuto, indefinidamente, contra un servidor que puede
+#   ser externo. Si ese servidor tiene `max_password_errors`, BLOQUEA la cuenta
+#   (y la contraseña correcta deja de funcionar hasta un `FLUSH PRIVILEGES`); si
+#   tiene fail2ban, banea la IP del host. Ya pasó un deploy con `DB_PASS` mal
+#   donde el log solo decía "no lista" y el loop siguió golpeando la BD.
+#
+# Clasificar un error como permanente por error cuesta poco: el contenedor sale,
+# Docker lo reinicia y el siguiente arranque vuelve a intentar.
+#
+# El error de pymysql se imprime SIEMPRE (antes se descartaba con 2>/dev/null y
+# un "Access denied" se veía igual que una BD arrancando). Su texto incluye
+# usuario y host, nunca la contraseña.
 # ─────────────────────────────────────────────────────────────────────────────
 wait_for_db() {
     local max_retries=15
     local retry=0
+    local status
 
-    echo "[entrypoint] Esperando conexión a MariaDB (${DB_HOST}:${DB_PORT:-3306})..."
+    echo "[entrypoint] Esperando conexión a la BD de metadatos (${DB_HOST}:${DB_PORT:-3306})..."
 
-    until python - <<'PYEOF' 2>/dev/null
-import pymysql, os, sys
+    while true; do
+        status=0
+        python - <<'PYEOF' || status=$?
+import os, sys
+
+import pymysql
+
+# Códigos de MySQL/MariaDB que esperar no arregla.
+PERMANENT = {
+    # MariaDB responde 1044 (no 1049) a un usuario sin privilegios globales cuando la base
+    # NO EXISTE: no revela si existe. Por eso el mensaje nombra las dos causas.
+    1044: "el usuario no tiene acceso a DB_NAME, o esa base no existe (revisar DB_NAME y el GRANT)",
+    1045: "usuario o contraseña incorrectos (revisar DB_USER / DB_PASS)",
+    1049: "DB_NAME no existe en el servidor",
+    1129: "el servidor bloqueó este host por max_connect_errors (requiere FLUSH HOSTS)",
+    1130: "el usuario no puede conectarse desde la IP de este host (revisar el host del CREATE USER)",
+    1251: "el servidor exige un plugin de autenticación que el cliente no soporta",
+    1698: "acceso denegado por el plugin de autenticación del usuario",
+}
+
 try:
     conn = pymysql.connect(
         host=os.getenv("DB_HOST", "db"),
@@ -43,20 +80,33 @@ try:
     )
     conn.close()
 except Exception as e:
-    print(f"  No disponible: {e}", file=sys.stderr)
+    code = e.args[0] if e.args and isinstance(e.args[0], int) else None
+    print(f"[entrypoint]   {type(e).__name__}: {e}", file=sys.stderr)
+    if code in PERMANENT:
+        print(f"[entrypoint]   Error permanente {code}: {PERMANENT[code]}.", file=sys.stderr)
+        sys.exit(2)
     sys.exit(1)
 PYEOF
-    do
-        retry=$((retry + 1))
-        if [ "$retry" -ge "$max_retries" ]; then
-            echo "[entrypoint] ERROR: No se pudo conectar a MariaDB después de $max_retries intentos."
+        if [ "$status" -eq 0 ]; then
+            break
+        fi
+        if [ "$status" -eq 2 ]; then
+            echo "[entrypoint] ERROR: la BD de metadatos rechazó la conexión. No se reintenta:"
+            echo "[entrypoint] esperar no lo arregla, y repetir logins fallidos puede bloquear"
+            echo "[entrypoint] la cuenta en el servidor. Corregir la variable y volver a desplegar."
             exit 1
         fi
-        echo "[entrypoint] MariaDB no lista (intento $retry/$max_retries). Reintentando en 3s..."
+
+        retry=$((retry + 1))
+        if [ "$retry" -ge "$max_retries" ]; then
+            echo "[entrypoint] ERROR: la BD de metadatos no respondió después de $max_retries intentos."
+            exit 1
+        fi
+        echo "[entrypoint] BD de metadatos no disponible (intento $retry/$max_retries). Reintentando en 3s..."
         sleep 3
     done
 
-    echo "[entrypoint] Conexión a MariaDB establecida."
+    echo "[entrypoint] Conexión a la BD de metadatos establecida."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

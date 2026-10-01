@@ -191,6 +191,21 @@ la app loguea todo a consola, sin archivos de log).
 
 ## Troubleshooting
 
+### El deploy terminó en verde, pero `api` se reinicia en loop
+
+Mirar el log del contenedor `api`, no el del deploy. `wait_for_db` imprime el error real del
+driver y distingue dos casos:
+
+- **`Error permanente <código>: ...`**: credenciales (`1045`), base o permisos (`1044`), base
+  inexistente (`1049`), host no autorizado (`1130`) o host bloqueado (`1129`). Sale en el primer
+  intento a propósito: reintentar logins fallidos en loop puede bloquear la cuenta si el
+  servidor tiene `max_password_errors`, o banear la IP del host si tiene fail2ban. Se arregla
+  corrigiendo la variable en Environment y volviendo a desplegar.
+- **`BD de metadatos no disponible (intento n/15)`** con `2003`: nada responde en
+  `DB_HOST:DB_PORT`. Revisar host, puerto, firewall y el `bind-address` del servidor.
+
+En los dos casos Alembic no llegó a correr: la BD no se tocó.
+
 ### `POST /auth/login` responde 200, pero cualquier otro endpoint da 401 "No autenticado"
 
 **Causa**: se está accediendo por HTTP directo o por IP:puerto en vez del dominio con
