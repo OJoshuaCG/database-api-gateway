@@ -87,6 +87,21 @@ Dispara el deploy desde el panel de Dokploy. Internamente:
 No hay ningún paso manual de migración: ocurre en cada arranque del contenedor `api`, sea el
 primer deploy o uno posterior.
 
+**"Docker Compose Deployed ✅" NO significa que la API arrancó.** El comando por defecto de
+Dokploy es `up -d`, que vuelve con éxito apenas el contenedor `api` *inicia*. La espera de la
+BD, las migraciones y Uvicorn corren después, así que una contraseña mal o una migración rota
+dejan el deploy en verde y el contenedor en loop de reinicios. Para que el deploy falle de
+verdad, en *Advanced → Custom command* del servicio:
+
+```
+compose -p <app-name> -f ./docker-compose.dokploy.yml up -d --build --remove-orphans --wait --wait-timeout 300
+```
+
+`--wait` espera a que los servicios queden `healthy` (el `HEALTHCHECK` de la imagen consulta
+`/health`) y falla si `api` no llega. 300 s cubren la espera de la BD (hasta ~90 s), las
+migraciones y el `start-period` de 60 s. Esto marca el deploy en rojo, pero **no hace
+rollback**: el contenedor anterior ya fue reemplazado.
+
 ## 4. Configurar el dominio (Traefik + TLS de Dokploy)
 
 **Este paso es obligatorio, no opcional**: la autenticación es por cookie de sesión
