@@ -170,9 +170,12 @@ class UserModel:
         grants: list,
         globals_: list[str],
         last_admin_action: str | None = None,
+        base_role: str | None = None,
+        before_write=None,
     ) -> None:
         """
-        Reemplaza TODO el acceso por alcance y las globales del usuario.
+        Reemplaza TODO el acceso por alcance y las globales del usuario (y el rol base, si viene
+        ``base_role``).
 
         Borra y vuelve a insertar en vez de reconciliar: la operación que expone la API es
         "el acceso de esta persona es EXACTAMENTE esto", y reconciliar diferencias abre el
@@ -184,12 +187,24 @@ class UserModel:
         ``last_admin_action``: si viene, el resultado le QUITA ``access_admin`` a ``user_id``
         y el invariante del último administrador se evalúa en esta misma transacción, con las
         filas bloqueadas (ver ``_guard_last_access_admin_locked``).
+
+        ``before_write(conn)``: corre PRIMERO, dentro de la misma transacción. Lo usa la
+        aprobación de una elevación (``access_change_requests``) para reclamar la solicitud con
+        compare-and-set: si lanza, nada de lo de abajo se escribe. Así "aplicada" y "acceso
+        escrito" no pueden divergir.
         """
         from sqlalchemy import text
 
         with self.db.engine.begin() as conn:
+            if before_write is not None:
+                before_write(conn)
             if last_admin_action is not None:
                 self._guard_last_access_admin_locked(conn, user_id, last_admin_action)
+            if base_role is not None:
+                conn.execute(
+                    text("UPDATE users SET gateway_role = :r WHERE id = :id"),
+                    {"r": base_role, "id": user_id},
+                )
             conn.execute(
                 text("DELETE FROM access_grants WHERE user_id = :id AND scope_type <> 'global'"),
                 {"id": user_id},

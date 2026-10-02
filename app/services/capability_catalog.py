@@ -531,10 +531,11 @@ CODE_UNDECLARED_ROUTE = "access.undeclared_route"
 #: desactivarse. Lo tiene que hacer otra persona con ``access.admin``. Ver
 #: ``GatewayUserController._guard_not_self``.
 CODE_SELF_MODIFICATION = "access.self_modification_forbidden"
-#: Se intentó otorgar más de lo que el propio actor tiene: un rol base por encima del suyo,
-#: un rol por alcance por encima de su rol efectivo máximo, o una capacidad global que no
-#: posee. Ver ``GatewayUserController._assert_within_ceiling``.
-CODE_GRANT_CEILING = "access.grant_ceiling_exceeded"
+#: El actor no tiene la función que asigna eso (``ASSIGNABLE_BY``): hoy, no es
+#: ``access_admin``. Reemplaza al viejo techo por TENENCIA (``access.grant_ceiling_exceeded``,
+#: retirado en C3): ya no importa qué tiene quien asigna, sino qué le deja asignar su función.
+#: Las rutas ya exigen ``access.admin``, así que en la práctica solo lo ve un llamador interno. 409.
+CODE_NOT_ASSIGNABLE = "access.not_assignable"
 
 # -- Capacidades puntuales (``capability_grants``) ------------------------------------------ #
 #: La capacidad pedida es del eje global o no existe: no se puede otorgar suelta. 422.
@@ -565,6 +566,20 @@ CODE_GRANT_NOT_FOUND = "access.grant_not_found"
 CODE_SOD_CONFLICT = "access.sod_conflict"
 #: ``sod_override`` mal formado: motivo demasiado corto o duración fuera de rango. 422.
 CODE_SOD_OVERRIDE_INVALID = "access.sod_override_invalid"
+
+# -- Solicitudes de acceso con segundo aprobador (``access_change_requests``, C3) ------------ #
+#: NO es un error: va en ``data.code`` de la respuesta ``202``. La parte del cambio que eleva
+#: (``needs_second_approver``) quedó PENDIENTE de otro ``access_admin``; el resto se aplicó.
+CODE_ELEVATION_PENDING = "access.elevation_pending"
+#: El acceso de la persona cambió desde que se pidió la elevación (``before_hash`` distinto): la
+#: solicitud se cancela y hay que pedirla de nuevo sobre el estado actual. 409.
+CODE_REQUEST_STALE = "access.request_stale"
+#: La solicitud de acceso no existe. 404.
+CODE_REQUEST_NOT_FOUND = "access.request_not_found"
+#: La solicitud ya no está pendiente (aplicada, rechazada, cancelada o vencida). 409.
+CODE_REQUEST_NOT_PENDING = "access.request_not_pending"
+#: Solo quien pidió la elevación puede cancelarla (los demás la rechazan). 409.
+CODE_REQUEST_NOT_REQUESTER = "access.request_not_requester"
 
 #: Reglas de separación de deberes: el valor de ``sod_exceptions.rule``. Vocabulario CERRADO.
 #: ``owner`` cuenta en cualquier forma: rol base, rol ``owner`` por alcance o una capacidad
@@ -601,16 +616,112 @@ def is_grantable(capability: Capability | str) -> bool:
 
 def is_sensitive(capability: Capability | str) -> bool:
     """
-    ¿Exige un segundo aprobador? Divulga datos del cliente o es de nivel ``drop``.
+    ¿Una capacidad puntual exige un segundo aprobador? Si es otorgable y EXCLUSIVA de ``owner``
+    (``OWNER_ONLY_CAPABILITIES``): la regla es "todo lo que solo tiene ``owner`` pide una segunda
+    persona" (``needs_second_approver``).
 
-    Derivado de los ejes del catálogo y no de una lista aparte; un invariante de importación
-    fija que el conjunto resultante sean exactamente las 8 capacidades de la política.
+    Antes eran las que divulgan o son de nivel ``drop`` (8). Al retirar el techo por tenencia
+    (C3), ``blueprints.apply``, ``schema_diff.execute`` y ``collation.execute`` —destructivas y
+    solo de ``owner``— quedaban otorgables por UN solo administrador, porque lo único que las
+    frenaba era que quien otorga tuviera ``owner``. El invariante 8 fija el conjunto (11) y
+    exige que siga conteniendo todo lo que divulga o es ``drop``.
     """
     try:
-        sp = _BY_ID[Capability(capability)]
-    except (KeyError, ValueError):
+        cap = Capability(capability)
+    except ValueError:
         return False
-    return sp.discloses or sp.level == "drop"
+    return is_grantable(cap) and cap in OWNER_ONLY_CAPABILITIES
+
+
+# --------------------------------------------------------------------------- #
+# Política de ASIGNACIÓN (C3): quién puede asignar qué, y qué pide un segundo  #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class Assignable:
+    """Lo que una función puede ASIGNAR a otra cuenta: roles, globales y capacidades puntuales."""
+
+    roles: frozenset[GatewayRole]
+    globals_: frozenset[GlobalCapability]
+    capabilities: frozenset[Capability]
+
+
+#: Función → lo que puede asignar. Reemplaza al techo por TENENCIA ("nunca más de lo que tienes"),
+#: que obligaba a que quien administra accesos tuviera también cada deber que reparte —justo la
+#: combinación que la separación de deberes deshace—. La protección que daba el techo contra el
+#: títere (un admin que se crea un ``owner`` y entra con su invitación) pasa al segundo
+#: aprobador: ``needs_second_approver``. Código y no tabla, por lo mismo que ``ROLE_CAPABILITIES``.
+ASSIGNABLE_BY: Mapping[GlobalCapability, Assignable] = MappingProxyType(
+    {
+        GlobalCapability.ACCESS_ADMIN: Assignable(
+            roles=frozenset(GatewayRole),
+            globals_=frozenset(GlobalCapability),
+            capabilities=frozenset(s.id for s in CAPABILITIES if is_grantable(s.id)),
+        ),
+    }
+)
+
+
+def can_assign(
+    actor_globals,
+    *,
+    role: GatewayRole | str | None = None,
+    global_capability: GlobalCapability | str | None = None,
+    capability: Capability | str | None = None,
+) -> bool:
+    """
+    ¿Alguna de las funciones de ``actor_globals`` asigna esto? Fail-closed: un valor desconocido
+    no es asignable por nadie.
+    """
+    try:
+        r = GatewayRole(role) if role is not None else None
+        g = GlobalCapability(global_capability) if global_capability is not None else None
+        c = Capability(capability) if capability is not None else None
+    except ValueError:
+        return False
+    for fn in actor_globals or ():
+        try:
+            pol = ASSIGNABLE_BY.get(GlobalCapability(fn))
+        except ValueError:
+            continue
+        if pol is None:
+            continue
+        if r is not None and r not in pol.roles:
+            continue
+        if g is not None and g not in pol.globals_:
+            continue
+        if c is not None and c not in pol.capabilities:
+            continue
+        return True
+    return False
+
+
+def needs_second_approver(
+    *,
+    role: GatewayRole | str | None = None,
+    global_capability: GlobalCapability | str | None = None,
+    capability: Capability | str | None = None,
+) -> bool:
+    """
+    ¿Esta asignación es una ELEVACIÓN que pide un segundo ``access_admin``? Lo exclusivo de
+    ``owner``, en cualquiera de sus formas:
+
+    - el rol ``owner`` (base o por alcance);
+    - CUALQUIER capacidad global (``access_admin``, ``security_officer``): son funciones, no
+      niveles, y cada una administra o apaga algo que la otra no debería poder;
+    - una capacidad puntual de ``OWNER_ONLY_CAPABILITIES`` (``is_sensitive``).
+
+    ``operator`` no: es el trabajo diario y no abre nada que ``owner`` reserve. Las bajas
+    (demociones) nunca son elevación.
+    """
+    if role is not None and str(getattr(role, "value", role)) == GatewayRole.OWNER.value:
+        return True
+    if global_capability is not None:
+        return True
+    if capability is not None and is_sensitive(capability):
+        return True
+    return False
 
 
 def _derive_implied_read() -> Mapping[Capability, frozenset[Capability]]:
@@ -743,6 +854,11 @@ _SENSITIVE_POLICY: frozenset[str] = frozenset(
         "sql_console.execute",
         "engine_users.drop",
         "databases.drop",
+        # C3: sin el techo por tenencia, estas tres (destructivas, solo de owner) las otorgaba
+        # un solo administrador. Ver `is_sensitive`.
+        "blueprints.apply",
+        "schema_diff.execute",
+        "collation.execute",
     }
 )
 
@@ -822,11 +938,31 @@ def _assert_invariants() -> None:
             if s.id in ROLE_CAPABILITIES[role]:
                 raise AssertionError(f"{s.id.value} es destructive y está en '{role.value}'.")
 
-    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 8: si el
-    #    catálogo crece y una nueva divulga o es `drop`, esto obliga a decidirlo a propósito.
+    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 11 (owner
+    #    menos operator, otorgables): si el catálogo crece, esto obliga a decidirlo a propósito.
+    #    Y el criterio viejo (divulga o es `drop`) sigue contenido: ninguna otorgable que divulgue
+    #    o borre puede quedar sin segundo aprobador.
     sensibles = {s.id.value for s in CAPABILITIES if is_sensitive(s.id)}
     if sensibles != _SENSITIVE_POLICY:
         raise AssertionError(f"Conjunto sensible fuera de la política: {sorted(sensibles)}")
+    if sensibles != {c.value for c in OWNER_ONLY_CAPABILITIES if is_grantable(c)}:
+        raise AssertionError("Las sensibles tienen que ser exactamente owner − operator otorgables.")
+    for s in CAPABILITIES:
+        if is_grantable(s.id) and (s.discloses or s.level == "drop") and not is_sensitive(s.id):
+            raise AssertionError(f"{s.id.value} divulga o es drop y no pide segundo aprobador.")
+    #    Política de asignación: `access_admin` asigna TODO lo asignable (es la única función que
+    #    administra accesos), y toda capacidad que asigna es otorgable (nunca una global suelta).
+    pol = ASSIGNABLE_BY.get(GlobalCapability.ACCESS_ADMIN)
+    if pol is None or pol.roles != frozenset(GatewayRole) or pol.globals_ != frozenset(
+        GlobalCapability
+    ):
+        raise AssertionError("'access_admin' tiene que poder asignar todos los roles y globales.")
+    for fn, p in ASSIGNABLE_BY.items():
+        if Capability.ACCESS_ADMIN_CAP not in GLOBAL_CAPABILITIES[fn]:
+            raise AssertionError(f"'{fn.value}' asigna accesos sin tener 'access.admin'.")
+        for c in p.capabilities:
+            if not is_grantable(c):
+                raise AssertionError(f"'{fn.value}' asigna {c.value}, que no es otorgable.")
     #    Ninguna capacidad global es otorgable, y toda lectura implícita es de nivel viewer.
     for s in CAPABILITIES:
         if s.scope_axis == "global" and is_grantable(s.id):

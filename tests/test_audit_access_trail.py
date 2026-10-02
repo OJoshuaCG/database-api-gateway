@@ -23,6 +23,7 @@ import pytest
 from app.core.database import Database
 from app.models.audit_log import AuditLog
 from app.models.user_model import UserModel
+from tests.access_request_helpers import settle
 
 
 def _rows(action: str) -> list[AuditLog]:
@@ -34,9 +35,10 @@ def _rows(action: str) -> list[AuditLog]:
 
 
 def _crear(admin_client, username, **extra):
+    """Alta con la elevación (si la hay) aprobada por un segundo access_admin (``settle``)."""
     r = admin_client.post("/api/v1/gateway-users", json={"username": username, **extra})
-    assert r.status_code == 201, r.text
-    return r.json()["data"]
+    assert r.status_code in (201, 202), r.text
+    return settle(r)
 
 
 def _servidor(admin_client, server_payload, name="srv-trail") -> int:
@@ -97,15 +99,22 @@ def test_access_set_records_the_full_before_and_after(admin_client, server_paylo
             "scope_grants": [{"scope_type": "environment", "scope_id": 1, "role": "owner"}],
         },
     )
-    assert r.status_code == 200, r.text
+    # C3: la baja (el alcance del servidor) se aplica ya; la global y el `owner`, al aprobarse.
+    assert r.status_code == 202, r.text
+    inmediata = json.loads(_rows("gateway_user.access_set")[-1].detail)
+    assert inmediata["after"]["scope_grants"] == [
+        {"scope_type": "environment", "scope_id": 1, "role": "operator"}
+    ]
+    assert inmediata["after"]["global_capabilities"] == []
+    settle(r)
 
     fila = _rows("gateway_user.access_set")[-1]
     d = json.loads(fila.detail)
     assert d["username"] == "reconstruible"
+    assert d["approved_by"] is not None and d["request_id"]
     assert d["before"]["global_capabilities"] == []
     assert d["before"]["scope_grants"] == [
         {"scope_type": "environment", "scope_id": 1, "role": "operator"},
-        {"scope_type": "server", "scope_id": sid, "role": "viewer"},
     ]
     assert d["after"]["global_capabilities"] == ["access_admin"]
     assert d["after"]["scope_grants"] == [

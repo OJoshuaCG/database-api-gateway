@@ -91,6 +91,7 @@ class SodExceptionModel:
         reason: str,
         requested_by: int | None,
         expires_at: datetime | None,
+        approved_by: int | None = None,
     ) -> dict:
         session = self._session()
         try:
@@ -100,7 +101,7 @@ class SodExceptionModel:
                 rule=rule,
                 reason=reason,
                 requested_by=requested_by,
-                approved_by=None,
+                approved_by=approved_by,
                 expires_at=expires_at,
                 created_at=now,
                 updated_at=now,

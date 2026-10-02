@@ -23,6 +23,16 @@ ninguna ventana en la que la cuenta sea usable**.
 Con ``access_admin`` en el modelo esto no es solo repudio: sería **la vía de escalada** del §4.4 —
 crear una identidad `owner`, conocer su password, y operar producción con la cara de otro.
 
+LAS ELEVACIONES PIDEN UN SEGUNDO APROBADOR (C3)
+----------------------------------------------
+Alta, ``PATCH`` (rol) y ``PUT /access`` parten cada cambio (``app/core/assignment_policy.split``):
+lo que NO eleva —incluidas siempre las bajas— se aplica en el request y responde como siempre;
+lo que eleva (``owner`` base o por alcance, cualquier global, un ``sod_override``) nace como
+solicitud pendiente de OTRO ``access_admin`` (``access_request_controller``) y la respuesta es
+``202 access.elevation_pending``. El alta de una cuenta que pide ``owner`` o globales la crea
+como ``viewer`` sin globales, con la invitación igual. Reemplaza al techo por tenencia, que
+obligaba a quien administra accesos a tener cada deber que reparte.
+
 EL TOKEN ES DE UN SOLO USO POR ``credential_epoch``, NO POR UNA TABLA
 ---------------------------------------------------------------------
 Se firma sobre ``(user_id, credential_epoch)`` y aceptar la invitación **sube el epoch**, así que
@@ -38,16 +48,16 @@ from app.core.authz import assert_not_last_access_admin
 from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.models.user_model import UserModel
+from app.controllers import access_request_controller as access_requests
 from app.services import audit, confirm_token, sod_service
-from app.core.actor import Actor, identity_of
+from app.core.actor import identity_of
+from app.core.assignment_policy import AccessState, split
 from app.core.separation_of_duties import conflicts as sod_conflicts
 from app.services.capability_catalog import (
-    CODE_GRANT_CEILING,
     CODE_GRANT_SCOPE_NOT_FOUND,
     CODE_SELF_MODIFICATION,
     GatewayRole,
     GlobalCapability,
-    role_at_most,
 )
 from app.utils.security import PASSWORD_MIN_LENGTH, hash_password
 
@@ -219,15 +229,23 @@ class GatewayUserController:
             GatewayRole.VIEWER.value if crudo is None else crudo
         )
         globales = self._validate_globals(data.get("global_capabilities") or [])
-        self._assert_within_ceiling(admin, base_role=rol, new_globals=globales)
+        vacio = AccessState.of(GatewayRole.VIEWER.value, [], [])
+        deseado = AccessState.of(rol.value, [g.value for g in globales], [])
+        self._assert_assignable(admin, vacio, deseado)
         # Separación de deberes sobre el estado RESULTANTE. Una cuenta nueva no tiene
         # excepciones: o la combinación es válida, o viene con `sod_override`.
+        override = data.get("sod_override")
         plan = sod_service.check(
             sod_conflicts(base_role=rol, scope_roles=[], globals_=globales),
             covered=(),
-            override=data.get("sod_override"),
+            override=override,
         )
-        if plan:
+        inmediato, elevaciones = split(vacio, deseado)
+        pendiente = access_requests.must_wait(elevaciones, plan)
+        # Con elevación pendiente la cuenta nace con la parte que NO eleva: `viewer` (u
+        # `operator`) y sin globales. El override viaja con la solicitud.
+        objetivo = inmediato if pendiente else deseado
+        if plan and not pendiente:
             sod_service.record_override_intent(plan, admin=admin, target_id=None, username=username)
 
         user_id = self.users.create(
@@ -240,13 +258,13 @@ class GatewayUserController:
                 "full_name": data.get("full_name"),
                 "notes": data.get("notes"),
                 "is_active": True,
-                "gateway_role": rol.value,
+                "gateway_role": objetivo.base_role,
             }
         )
-        if globales:
-            self.users.grant_global_capabilities(username, [g.value for g in globales])
+        if objetivo.globals_:
+            self.users.grant_global_capabilities(username, sorted(objetivo.globals_))
 
-        if plan:
+        if plan and not pendiente:
             sod_service.apply_override(plan, user_id=user_id, admin=admin, username=username)
 
         token, expira = self._issue_invite(user_id, epoch=0)
@@ -257,13 +275,30 @@ class GatewayUserController:
             target_id=user_id,
             touched_engine=False,
             detail=(
-                f"alta de '{username}' con rol {rol.value} y globales "
-                f"[{','.join(g.value for g in globales) or '—'}]; invitación emitida SIN "
+                f"alta de '{username}' con rol {objetivo.base_role} y globales "
+                f"[{','.join(sorted(objetivo.globals_)) or '—'}]; invitación emitida SIN "
                 "credencial (la password la fija la persona)"
+                + ("; la elevación pedida quedó PENDIENTE de un segundo aprobador"
+                   if pendiente else "")
             ),
         )
-        creado = self._hydrate(self.users.find_by_id(user_id))
-        return {**creado, "invite_token": token, "invite_expires_at": expira}
+        if (elevaciones or plan) and not pendiente:
+            access_requests.record_unapproved(
+                admin=admin, target_id=user_id, username=username,
+                elevations=elevaciones, origin="create", override=override,
+            )
+        creado = {
+            **self._hydrate(self.users.find_by_id(user_id)),
+            "invite_token": token,
+            "invite_expires_at": expira,
+        }
+        if pendiente:
+            solicitud = access_requests.AccessRequestController().create(
+                target_id=user_id, admin=admin, desired=deseado, elevations=elevaciones,
+                override=override, origin="create",
+            )
+            return access_requests.AccessRequestController.pending_response(creado, solicitud)
+        return creado
 
     def reinvite(self, user_id: int, *, admin) -> dict:
         """
@@ -346,18 +381,33 @@ class GatewayUserController:
         cambios: dict = {}
         plan = None
         cambia_rol = False
+        sin_aprobar: tuple | None = None  # ACCESS_FOUR_EYES=False: elevación aplicada sola
 
+        elevacion: tuple | None = None  # (deseado, elevaciones, override) si queda pendiente
         if "gateway_role" in data and data["gateway_role"] is not None:
             nuevo = self._validate_role(data["gateway_role"])
             actual = fila.get("gateway_role") or GatewayRole.VIEWER.value
             if nuevo.value != actual:
                 self._guard_not_self(admin, user_id, action="cambiar tu propio rol")
-                self._assert_within_ceiling(admin, base_role=nuevo)
-                cambia_rol = True
+                estado = access_requests.current_state(user_id, fila)
+                deseado = AccessState(
+                    base_role=nuevo.value, globals_=estado.globals_, grants=estado.grants
+                )
+                self._assert_assignable(admin, estado, deseado)
                 plan = self._assert_sod(
                     user_id, data.get("sod_override"), base_role=nuevo.value
                 )
-            cambios["gateway_role"] = nuevo.value
+                _, elevaciones = split(estado, deseado)
+                if access_requests.must_wait(elevaciones, plan):
+                    # El rol queda pendiente; el resto del PATCH (contacto, estado) se aplica.
+                    elevacion = (deseado, elevaciones, data.get("sod_override"))
+                    plan = None
+                else:
+                    cambia_rol = True
+                    if elevaciones or plan:
+                        sin_aprobar = (elevaciones, data.get("sod_override"))
+            if elevacion is None:
+                cambios["gateway_role"] = nuevo.value
 
         if "is_active" in data and data["is_active"] is not None:
             if not data["is_active"] and fila.get("is_active"):
@@ -415,15 +465,30 @@ class GatewayUserController:
                 )
             if cambios.get("is_active") is False:
                 self._cancel_pending_requests(user_id)
+            if sin_aprobar is not None:
+                access_requests.record_unapproved(
+                    admin=admin, target_id=user_id, username=fila["username"],
+                    elevations=sin_aprobar[0], origin="update", override=sin_aprobar[1],
+                )
 
-        return self._hydrate(self._get_or_404(user_id))
+        actualizado = self._hydrate(self._get_or_404(user_id))
+        if elevacion is not None:
+            deseado, elevaciones, override = elevacion
+            solicitud = access_requests.AccessRequestController().create(
+                target_id=user_id, admin=admin, desired=deseado, elevations=elevaciones,
+                override=override, origin="update",
+            )
+            return access_requests.AccessRequestController.pending_response(
+                actualizado, solicitud
+            )
+        return actualizado
 
     @staticmethod
     def _cancel_pending_requests(user_id: int) -> None:
         """
-        Cancela las capacidades puntuales PENDIENTES que pidió quien pierde ``access_admin`` o
-        queda inactivo (D7). Best-effort: no puede tumbar el cambio de acceso ya aplicado, y
-        ``CapabilityGrantController.approve`` re-verifica al solicitante como respaldo.
+        Cancela las capacidades puntuales y las elevaciones PENDIENTES que pidió quien pierde
+        ``access_admin`` o queda inactivo (D7). Best-effort: no puede tumbar el cambio de acceso
+        ya aplicado, y las dos aprobaciones re-verifican al solicitante como respaldo.
         """
         try:
             from app.controllers.capability_grant_controller import CapabilityGrantController
@@ -431,6 +496,10 @@ class GatewayUserController:
             CapabilityGrantController().cancel_pending_requested_by(user_id)
         except Exception:
             logger.exception("No se pudieron cancelar las solicitudes pendientes de %s", user_id)
+        try:
+            access_requests.AccessRequestController().cancel_pending_requested_by(user_id)
+        except Exception:
+            logger.exception("No se pudieron cancelar las elevaciones pendientes de %s", user_id)
 
     def set_access(self, user_id: int, data: dict, *, admin) -> dict:
         """
@@ -459,30 +528,63 @@ class GatewayUserController:
             grants.append((tipo, int(g["scope_id"]), self._validate_role(g["role"]).value))
         self._assert_scopes_exist(grants)
 
-        # El techo se aplica a lo que se AGREGA, no a lo que la persona ya tenía: un
-        # administrador de accesos sin ``security_officer`` puede seguir editando los alcances
-        # de alguien que sí la tiene sin quitársela, pero no puede otorgarla.
         actual = self.users.find_access_context(user_id)
         antes = self._access_snapshot(fila, actual)
-        ya_globales = set(actual.get("globals") or [])
-        ya_grants = {(t, int(i), r) for (t, i, r) in (actual.get("grants") or [])}
-        self._assert_within_ceiling(
-            admin,
-            new_globals=[g for g in globales if g.value not in ya_globales],
-            new_scope_roles=[
-                GatewayRole(r) for (t, i, r) in grants if (t, i, r) not in ya_grants
-            ],
+        estado = AccessState.of(
+            fila.get("gateway_role") or actual.get("role"),
+            actual.get("globals") or [],
+            actual.get("grants") or [],
         )
+        deseado = AccessState.of(estado.base_role, [g.value for g in globales], grants)
+        self._assert_assignable(admin, estado, deseado)
 
+        override = data.get("sod_override")
         plan = self._assert_sod(
             user_id,
-            data.get("sod_override"),
+            override,
             base_role=actual.get("role"),
             scope_roles=grants,
             globals_=[g.value for g in globales],
         )
+        inmediato, elevaciones = split(estado, deseado)
+        pendiente = access_requests.must_wait(elevaciones, plan)
+        if pendiente:
+            # La parte que NO eleva (bajas incluidas) se aplica ya; la que eleva, y el override,
+            # esperan a otro access_admin. Si no hay parte inmediata, no se escribe nada.
+            plan = None
+            objetivo = inmediato
+        else:
+            objetivo = deseado
 
-        quita_access_admin = GlobalCapability.ACCESS_ADMIN not in globales
+        if not pendiente or objetivo != estado:
+            self._write_access(
+                user_id, fila, objetivo, plan=plan, admin=admin, antes=antes
+            )
+        if (elevaciones or plan) and not pendiente:
+            access_requests.record_unapproved(
+                admin=admin, target_id=user_id, username=fila["username"],
+                elevations=elevaciones, origin="set_access", override=override if plan else None,
+            )
+        actualizado = self._hydrate(self._get_or_404(user_id))
+        if pendiente:
+            solicitud = access_requests.AccessRequestController().create(
+                target_id=user_id, admin=admin, desired=deseado, elevations=elevaciones,
+                override=override, origin="set_access",
+            )
+            return access_requests.AccessRequestController.pending_response(
+                actualizado, solicitud
+            )
+        return actualizado
+
+    def _write_access(
+        self, user_id: int, fila: dict, objetivo: AccessState, *, plan, admin, antes: dict
+    ) -> None:
+        """
+        Escribe globales y alcances de ``objetivo`` (el rol base no: ``PUT /access`` no lo toca),
+        con el candado del último administrador, el override si viene, la auditoría antes/después
+        y el corte de sesiones. Es el ``PUT /access`` de siempre, sobre el estado que corresponde.
+        """
+        quita_access_admin = GlobalCapability.ACCESS_ADMIN.value not in objetivo.globals_
         accion_last_admin = "quitarle 'access_admin' a este usuario"
         if quita_access_admin:
             # Pre-chequeo para fallar temprano; el candado está en `replace_access`.
@@ -494,8 +596,8 @@ class GatewayUserController:
             )
         self.users.replace_access(
             user_id,
-            grants=grants,
-            globals_=[g.value for g in globales],
+            grants=sorted(objetivo.grants),
+            globals_=sorted(objetivo.globals_),
             last_admin_action=accion_last_admin if quita_access_admin else None,
         )
         if plan:
@@ -521,7 +623,6 @@ class GatewayUserController:
         session_store.revoke_all_for_user(user_id, session_store.REASON_ROLE_CHANGE)
         if quita_access_admin:
             self._cancel_pending_requests(user_id)
-        return self._hydrate(self._get_or_404(user_id))
 
     # ------------------------------------------------------------------ #
     # Guards anti auto-escalada                                          #
@@ -599,7 +700,7 @@ class GatewayUserController:
         cuenta lo hace otra persona, igual que el resto de su acceso.
 
         Solo, este guard se esquiva con un títere (crear otra cuenta privilegiada y aceptar su
-        invitación); por eso va SIEMPRE junto con ``_assert_within_ceiling``.
+        invitación); por eso toda elevación pide además un SEGUNDO APROBADOR (C3).
         """
         actor_id, _ = identity_of(admin)
         if actor_id is not None and int(actor_id) == int(user_id):
@@ -613,60 +714,29 @@ class GatewayUserController:
             )
 
     @staticmethod
-    def _assert_within_ceiling(
-        admin,
-        *,
-        base_role: GatewayRole | None = None,
-        new_scope_roles: "list[GatewayRole] | None" = None,
-        new_globals: "list[GlobalCapability] | None" = None,
-    ) -> None:
+    def _assert_assignable(admin, actual: AccessState, deseado: AccessState) -> None:
         """
-        Techo de lo que un actor puede OTORGAR: nunca más de lo que tiene.
+        Política de ASIGNACIÓN (``ASSIGNABLE_BY``): lo que el cambio AGREGA —rol base nuevo,
+        alcances nuevos o con otro rol, globales nuevas— tiene que poder asignarlo la función del
+        actor. Hoy ``access_admin`` asigna todo; quitar no se mide (bajar nunca escala).
 
-        - rol base (alta y ``PATCH``) ≤ el rol BASE del actor (``Actor.base_role``);
-        - rol por alcance ≤ el rol efectivo MÁXIMO del actor (``Actor.role``, la unión);
-        - capacidades globales ⊆ las del actor (un ``access_admin`` no otorga
-          ``security_officer`` si no la tiene).
+        Reemplaza al techo por TENENCIA (``_assert_within_ceiling``, "nunca más de lo que tienes"),
+        que exigía que quien crea un ``owner`` fuera ``owner`` y quien crea un
+        ``security_officer`` lo fuera: la combinación permanente que la separación de deberes
+        prohíbe. Lo que ese techo impedía —el títere privilegiado de F-2— lo impide ahora el
+        segundo aprobador (``needs_second_approver``), no este chequeo.
 
-        POR QUÉ, ADEMÁS DEL GUARD DE AUTO-MODIFICACIÓN. Sin techo, ``_guard_not_self`` se
-        esquiva en dos requests: ``POST /gateway-users {gateway_role: owner}`` devuelve el
-        ``invite_token`` a quien la crea, que la acepta en el endpoint público y entra como
-        ese títere. El techo convierte "crear un owner" en algo que solo puede hacer un owner.
-
-        Fail-closed: un actor que no es ``Actor`` (llamador legado sin roles resueltos) no
-        tiene techo conocido y no otorga nada.
+        Fail-closed: un actor que no es ``Actor`` no asigna nada.
         """
-        if not isinstance(admin, Actor) or admin.role is None:
-            techo_base = techo_alcance = None
-            globales_actor: frozenset = frozenset()
-        else:
-            techo_base = admin.base_role or admin.role
-            techo_alcance = admin.role
-            globales_actor = admin.global_capabilities
-
-        excedidos: list[str] = []
-        if base_role is not None and (
-            techo_base is None or not role_at_most(base_role, techo_base)
-        ):
-            excedidos.append(f"rol base '{base_role.value}'")
-        for rol in new_scope_roles or []:
-            if techo_alcance is None or not role_at_most(rol, techo_alcance):
-                excedidos.append(f"rol por alcance '{rol.value}'")
-                break
-        faltantes = sorted(g.value for g in (new_globals or []) if g not in globales_actor)
-        if faltantes:
-            excedidos.append("capacidades globales [" + ", ".join(faltantes) + "]")
-
-        if excedidos:
-            raise AppHttpException(
-                message=(
-                    "No puedes otorgar más acceso del que tienes: "
-                    + "; ".join(excedidos)
-                    + ". Pídeselo a alguien que tenga ese nivel."
-                ),
-                status_code=409,
-                public_context={"code": CODE_GRANT_CEILING},
-            )
+        agregado: list[dict] = []
+        if deseado.base_role != actual.base_role:
+            agregado.append({"kind": "base_role", "role": deseado.base_role})
+        for g in sorted(deseado.globals_ - actual.globals_):
+            agregado.append({"kind": "global_capability", "global_capability": g})
+        for t, i, r in sorted(deseado.grants - actual.grants):
+            agregado.append({"kind": "scope_grant", "scope_type": t, "scope_id": i, "role": r})
+        if not access_requests.actor_can_assign(admin, agregado):
+            raise access_requests.not_assignable_error()
 
     # ------------------------------------------------------------------ #
     # Helpers                                                            #

@@ -13,8 +13,9 @@ DOS CLASES DE FILA
   puede dejar el gateway sin ``security_officer`` o sin ``owner``, y la persona no se lo puede
   arreglar (la auto-modificación está prohibida). Se reporta en cada arranque.
 - **Break-glass** (``sod_override`` del payload): motivo obligatorio y vencimiento de 7 días
-  como mucho. En C2 se aplica en el acto y se audita (``access.sod_override``); ``approved_by``
-  queda NULL hasta que C3 lo enrute por el segundo aprobador.
+  como mucho. Es una elevación: viaja con la solicitud pendiente y la fila nace recién cuando
+  OTRO ``access_admin`` la aprueba (``approved_by``). Solo con ``ACCESS_FOUR_EYES=False`` se
+  aplica en el acto, con ``approved_by`` NULL. Se audita ``access.sod_override``.
 
 VIVA = ``closed_at IS NULL AND (expires_at IS NULL OR expires_at > now)``. Las filas no se
 borran: cuando la cuenta deja de violar la regla, se cierran (``closed_reason='resolved'``) para

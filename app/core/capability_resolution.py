@@ -191,7 +191,8 @@ def capability_at(
 
 def capability_at_point(actor: "Actor", capability: Capability, point: "ScopePoint") -> bool:
     """
-    ¿Tiene el actor ``capability`` en un punto YA resuelto? Es el techo de quien otorga.
+    ¿Tiene el actor ``capability`` en un punto YA resuelto? Fue el techo de quien otorga hasta
+    C3, que lo reemplazó por la política de asignación (``ASSIGNABLE_BY``): queda como consulta.
 
     Misma regla que ``capability_at`` pero sin resolver el destino: el llamador arma el
     ``ScopePoint`` (``(E, None)`` para un entorno; ``(entorno peor del servidor, S)`` para un

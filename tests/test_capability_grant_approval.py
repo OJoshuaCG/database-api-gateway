@@ -2,7 +2,7 @@
 Capacidades puntuales: aprobación, rechazo, bandeja, vencimiento y cancelación (B4).
 
 Se mide lo que decide el negocio: aprueba OTRO access_admin (ni el solicitante ni el destinatario),
-solo cuenta el techo de quien aprueba, una pendiente vence a los 7 días, aprobar dos veces o
+basta su función (C3: ya no un techo por tenencia), una pendiente vence a los 7 días, aprobar dos veces o
 fuera de término da ``access.grant_not_pending`` y el ganador es uno solo (compare-and-set).
 """
 
@@ -119,12 +119,15 @@ def test_the_grantee_cannot_approve_their_own_capability(admin_client, second):
     assert _full(gid)["status"] == "pending"
 
 
-def test_only_the_approvers_ceiling_is_checked(admin_client, target, pending):
-    """Un access_admin viewer no tiene la capacidad en ese alcance: no puede aprobarla."""
-    _, weak = _admin_como(admin_client, "debil", role="viewer")
-    r = _approve(weak, pending)
-    assert (r.status_code, _code(r)) == (409, "access.grant_ceiling_exceeded")
-    assert _full(pending)["status"] == "pending"
+def test_a_viewer_access_admin_can_approve(admin_client, target, pending):
+    """
+    C3: aprueba la FUNCIÓN, no lo que el aprobador tiene. Un access_admin ``viewer`` aprueba una
+    exclusiva de owner (antes: ``access.grant_ceiling_exceeded``).
+    """
+    _, viewer_aa = _admin_como(admin_client, "debil", role="viewer")
+    r = _approve(viewer_aa, pending)
+    assert r.status_code == 200, r.text
+    assert _full(pending)["status"] == "active"
 
 
 def test_a_non_access_admin_gets_an_opaque_403(admin_client, pending):
@@ -251,10 +254,10 @@ def test_pending_inbox_flags_can_decide_per_actor(admin_client, second, target, 
     assert theirs["can_decide"] is True and theirs["blocked_reason"] is None
 
 
-def test_pending_inbox_blocks_a_weak_approver_by_ceiling(admin_client, pending):
-    _, weak = _admin_como(admin_client, "debil", role="viewer")
-    (row,) = weak.get("/api/v1/capability-grants/pending").json()["data"]
-    assert (row["can_decide"], row["blocked_reason"]) == (False, "access.grant_ceiling_exceeded")
+def test_pending_inbox_lets_a_viewer_access_admin_decide(admin_client, pending):
+    _, viewer_aa = _admin_como(admin_client, "debil", role="viewer")
+    (row,) = viewer_aa.get("/api/v1/capability-grants/pending").json()["data"]
+    assert (row["can_decide"], row["blocked_reason"]) == (True, None)
 
 
 def test_pending_inbox_sweeps_expired_and_hides_decided(admin_client, second, target, pending):

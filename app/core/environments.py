@@ -428,6 +428,13 @@ SESSION_COOKIE_SECURE = (
 # cookie robada a un click del DROP DATABASE de producción ajena. Ver `app/core/step_up.py`.
 STEP_UP_ENFORCED = os.getenv("STEP_UP_ENFORCED", "true").lower() == "true"
 STEP_UP_TTL_SECONDS = int(os.getenv("STEP_UP_TTL_SECONDS", "300"))
+# CUATRO OJOS: toda ELEVACIÓN de acceso (rol `owner`, cualquier global, una capacidad puntual
+# exclusiva de owner, un `sod_override`) queda pendiente hasta que OTRO `access_admin` la apruebe.
+# Es lo que reemplazó al techo de otorgamiento: sin esto, un solo administrador se crea un títere
+# `owner`, recibe su invitación y entra con esa cara. `False` es SOLO para instalaciones de un
+# único administrador: la elevación se aplica en el acto, el arranque avisa y cada una se audita
+# `access.elevation_unapproved`. Ver `app/controllers/access_request_controller.py`.
+ACCESS_FOUR_EYES = os.getenv("ACCESS_FOUR_EYES", "true").lower() == "true"
 
 # ======= Servidor MCP (agentes) ======= #
 # KILL SWITCH del MCP. Nace APAGADO: un endpoint que sirve estructura de bases de terceros a un

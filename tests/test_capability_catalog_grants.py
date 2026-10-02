@@ -19,11 +19,49 @@ SENSITIVE = {
     "sql_console.execute",
     "engine_users.drop",
     "databases.drop",
+    # C3: sin el techo por tenencia, lo exclusivo de owner pide segundo aprobador.
+    "blueprints.apply",
+    "schema_diff.execute",
+    "collation.execute",
 }
 
 
-def test_sensitive_set_is_exactly_the_eight_policy_capabilities():
+def test_sensitive_set_is_exactly_the_eleven_policy_capabilities():
     assert {s.id.value for s in CAPABILITIES if cc.is_sensitive(s.id)} == SENSITIVE
+
+
+def test_sensitive_is_owner_minus_operator_intersected_with_grantable():
+    """La regla de C3, derivada del catálogo: "todo lo exclusivo de owner pide una segunda persona"."""
+    derivado = {c.value for c in cc.OWNER_ONLY_CAPABILITIES if cc.is_grantable(c)}
+    assert derivado == SENSITIVE
+    # Y el criterio anterior (divulga o es drop) sigue contenido.
+    for s in CAPABILITIES:
+        if cc.is_grantable(s.id) and (s.discloses or s.level == "drop"):
+            assert cc.is_sensitive(s.id), s.id.value
+
+
+def test_needs_second_approver_covers_owner_globals_and_sensitive_grants():
+    assert cc.needs_second_approver(role="owner")
+    assert not cc.needs_second_approver(role="operator")
+    assert not cc.needs_second_approver(role="viewer")
+    for g in cc.GlobalCapability:
+        assert cc.needs_second_approver(global_capability=g)
+    for cap in Capability:
+        assert cc.needs_second_approver(capability=cap) is cc.is_sensitive(cap)
+
+
+def test_access_admin_assigns_every_role_global_and_grantable_capability():
+    aa = {cc.GlobalCapability.ACCESS_ADMIN}
+    for r in GatewayRole:
+        assert cc.can_assign(aa, role=r)
+    for g in cc.GlobalCapability:
+        assert cc.can_assign(aa, global_capability=g)
+    for s in CAPABILITIES:
+        assert cc.can_assign(aa, capability=s.id) is cc.is_grantable(s.id)
+    # Nadie más asigna: ni security_officer, ni sin función, ni un valor desconocido.
+    assert not cc.can_assign({cc.GlobalCapability.SECURITY_OFFICER}, role="viewer")
+    assert not cc.can_assign((), role="viewer")
+    assert not cc.can_assign(aa, role="superuser")
 
 
 def test_global_axis_capabilities_are_never_grantable():
@@ -104,6 +142,12 @@ def test_matrix_publishes_the_new_columns_derived_from_the_predicates():
         ("CODE_SELF_APPROVAL", "access.self_approval_forbidden"),
         ("CODE_GRANT_NOT_PENDING", "access.grant_not_pending"),
         ("CODE_GRANT_NOT_FOUND", "access.grant_not_found"),
+        ("CODE_NOT_ASSIGNABLE", "access.not_assignable"),
+        ("CODE_ELEVATION_PENDING", "access.elevation_pending"),
+        ("CODE_REQUEST_STALE", "access.request_stale"),
+        ("CODE_REQUEST_NOT_FOUND", "access.request_not_found"),
+        ("CODE_REQUEST_NOT_PENDING", "access.request_not_pending"),
+        ("CODE_REQUEST_NOT_REQUESTER", "access.request_not_requester"),
     ],
 )
 def test_error_codes_exist_with_the_contract_values(name, value):

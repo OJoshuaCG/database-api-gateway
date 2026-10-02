@@ -60,6 +60,22 @@ cosas, así que `bootstrap_admin` le **hereda** la combinación (`sod_exceptions
 (`access.sod_grandfathered`). Contrato completo en `api-reference-v29.md` §8; la regla, en
 `app/core/separation_of_duties.py`.
 
+**Segundo aprobador para las elevaciones.** Quien administra accesos ya no tiene un techo por
+tenencia ("no das más de lo que tenés"): `access_admin` asigna cualquier rol, global o capacidad
+puntual, sea él `viewer` u `owner`. A cambio, toda **elevación** —rol `owner` (base o por
+alcance), cualquier global, una capacidad puntual exclusiva de `owner` o un `sod_override`— queda
+**pendiente** hasta que OTRO `access_admin` la apruebe (`POST /access-requests/{id}/approve`).
+Lo que no eleva, y siempre las bajas, se aplica en el acto; la respuesta con algo pendiente es
+`202 access.elevation_pending`. Es lo que impide que un solo administrador se cree un títere
+`owner` y entre con su invitación. Con un solo administrador real (y solo entonces),
+`ACCESS_FOUR_EYES=False` deja elevar sin segundo aprobador: el arranque avisa y cada elevación se
+audita `access.elevation_unapproved`. Contrato en `api-reference-v29.md` §9.
+
+> Hoy el admin sembrado es el único `access_admin` de una instalación nueva: hasta crear un
+> segundo `access_admin` (que es en sí una elevación), sus elevaciones esperan. La siembra nueva
+> y la ventana de arranque que lo resuelven son el paso C4; mientras tanto, una instalación de un
+> solo administrador arranca con `ACCESS_FOUR_EYES=False` y lo vuelve a `True` al tener dos.
+
 > `is_superuser` **se retiró**: se escribía en tres lugares y no se leía en ninguno para
 > autorizar, así que no era "todavía no hay permisos" sino un sistema multiusuario sin puerta.
 > Retirarlo no cambió el contrato: `AdminOut` sigue siendo `{id, username}`.

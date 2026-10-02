@@ -15,12 +15,14 @@ usuarios del MOTOR viven en ``/server-users`` y ``/servers/{id}/users``.
 from typing import Literal
 
 from fastapi import APIRouter, Query, Request
+from fastapi.responses import JSONResponse
 
 from app.controllers.authz_controller import AuthzController
 from app.controllers.capability_grant_controller import CapabilityGrantController
 from app.controllers.gateway_user_controller import GatewayUserController
 from app.core.limiter import client_address, limiter
 from app.core.authz import AccessAdmin
+from app.schemas.access_request import GatewayUserCreatedPendingOut, GatewayUserPendingOut
 from app.schemas.authz import EffectiveAccessOut
 from app.schemas.capability_grant import CapabilityGrantCreate, CapabilityGrantOut
 from app.schemas.gateway_user import (
@@ -38,6 +40,28 @@ from app.utils.response import ApiResponse, paginated, success
 
 router = APIRouter(prefix="/gateway-users", tags=["Gateway Users"])
 
+#: Mensaje del ``202``: la parte que eleva espera a OTRO access_admin.
+_PENDING_MESSAGE = (
+    "La elevación quedó pendiente: la tiene que aprobar otra persona con access_admin "
+    "(POST /access-requests/{id}/approve). Lo que no eleva ya se aplicó."
+)
+
+
+def _respond(result: dict, *, pending_model, ok_message: str, ok_status: int = 200):
+    """
+    ``200``/``201`` de siempre si todo se aplicó; ``202 access.elevation_pending`` si una parte
+    quedó pendiente de un segundo aprobador.
+
+    El ``202`` se arma a mano (``JSONResponse``) porque el ``response_model`` de la ruta es el del
+    caso normal y descartaría ``pending_request``. Se valida igual contra ``ApiResponse[...]``, así
+    que la forma es la que declara ``responses``. El caso normal no cambia en nada: ni status ni
+    campos nuevos.
+    """
+    if "pending_request" not in result:
+        return success(data=result, message=ok_message)
+    body = ApiResponse[pending_model](data=result, message=_PENDING_MESSAGE)
+    return JSONResponse(status_code=202, content=body.model_dump(mode="json"))
+
 
 @router.get("", response_model=ApiResponse[list[GatewayUserOut]])
 def list_gateway_users(actor: AccessAdmin, pagination: PaginationDep):
@@ -48,7 +72,13 @@ def list_gateway_users(actor: AccessAdmin, pagination: PaginationDep):
     return paginated(items, total=total, pagination=pagination)
 
 
-@router.post("", response_model=ApiResponse[GatewayUserCreatedOut], status_code=201)
+@router.post(
+    "",
+    response_model=ApiResponse[GatewayUserCreatedOut],
+    status_code=201,
+    responses={202: {"model": ApiResponse[GatewayUserCreatedPendingOut],
+                     "description": "Cuenta creada sin la elevación; elevación pendiente"}},
+)
 def create_gateway_user(actor: AccessAdmin, payload: GatewayUserCreate):
     """
     Crea la cuenta **sin credencial** y devuelve el token de invitación.
@@ -61,10 +91,15 @@ def create_gateway_user(actor: AccessAdmin, payload: GatewayUserCreate):
 
     Con ``access_admin`` en el modelo no es solo repudio: sería la vía de escalada — crear una
     identidad ``owner``, conocer su password y operar producción con la cara de otro.
+
+    **Elevaciones (C3).** Si pide ``owner`` o alguna global (o trae ``sod_override``), la cuenta
+    nace con la parte que NO eleva (``viewer``/``operator``, sin globales), la invitación se emite
+    igual y la respuesta es ``202`` con ``code: access.elevation_pending`` y ``pending_request``.
     """
-    return success(
-        data=GatewayUserController().create_user(payload.model_dump(), admin=actor),
-        message="Usuario creado. Entregale el token de invitación a la persona.",
+    return _respond(
+        GatewayUserController().create_user(payload.model_dump(), admin=actor),
+        pending_model=GatewayUserCreatedPendingOut,
+        ok_message="Usuario creado. Entregale el token de invitación a la persona.",
     )
 
 
@@ -99,7 +134,12 @@ def get_gateway_user(actor: AccessAdmin, user_id: int):
     return success(data=GatewayUserController().get_user(user_id))
 
 
-@router.patch("/{user_id}", response_model=ApiResponse[GatewayUserOut])
+@router.patch(
+    "/{user_id}",
+    response_model=ApiResponse[GatewayUserOut],
+    responses={202: {"model": ApiResponse[GatewayUserPendingOut],
+                     "description": "Cambio de rol a owner pendiente de un segundo aprobador"}},
+)
 def update_gateway_user(actor: AccessAdmin, user_id: int, payload: GatewayUserUpdate):
     """
     Cambia rol, estado y datos de contacto.
@@ -112,16 +152,25 @@ def update_gateway_user(actor: AccessAdmin, user_id: int, payload: GatewayUserUp
     Un cambio de rol o una desactivación **tachan las sesiones** de esa persona. El rol ya se
     relee por request, así que el efecto era inmediato igual; tacharlas es para que el corte
     quede con motivo y la persona entienda por qué volvió al login.
+
+    Pasar a ``owner`` es una elevación (C3): el resto del PATCH se aplica y el rol queda pendiente
+    de otro access_admin (``202 access.elevation_pending``). Bajar de rol se aplica siempre ya.
     """
-    return success(
-        data=GatewayUserController().update_user(
+    return _respond(
+        GatewayUserController().update_user(
             user_id, payload.model_dump(exclude_unset=True), admin=actor
         ),
-        message="Usuario actualizado.",
+        pending_model=GatewayUserPendingOut,
+        ok_message="Usuario actualizado.",
     )
 
 
-@router.put("/{user_id}/access", response_model=ApiResponse[GatewayUserOut])
+@router.put(
+    "/{user_id}/access",
+    response_model=ApiResponse[GatewayUserOut],
+    responses={202: {"model": ApiResponse[GatewayUserPendingOut],
+                     "description": "Lo que no eleva, aplicado; la elevación, pendiente"}},
+)
 def set_gateway_user_access(actor: AccessAdmin, user_id: int, payload: GatewayUserAccessIn):
     """
     Reemplaza el acceso COMPLETO de la persona: globales y alcances.
@@ -134,10 +183,15 @@ def set_gateway_user_access(actor: AccessAdmin, user_id: int, payload: GatewayUs
     con un grant `viewer` sobre producción es lector ahí y operador en el resto. Y antes de
     otorgar el primero conviene mirar ``GET /authz/scope-readiness``: una BD sin entorno se
     trata como el entorno más protegido.
+
+    **Elevaciones (C3).** Agregar una global, un ``owner`` por alcance o un ``sod_override`` no se
+    aplica solo: lo demás (bajas incluidas) se aplica ya y la elevación queda pendiente de otro
+    access_admin (``202 access.elevation_pending`` con ``pending_request``).
     """
-    return success(
-        data=GatewayUserController().set_access(user_id, payload.model_dump(), admin=actor),
-        message="Acceso actualizado.",
+    return _respond(
+        GatewayUserController().set_access(user_id, payload.model_dump(), admin=actor),
+        pending_model=GatewayUserPendingOut,
+        ok_message="Acceso actualizado.",
     )
 
 
@@ -184,7 +238,7 @@ def create_capability_grant(actor: AccessAdmin, user_id: int, payload: Capabilit
     Las 7 capacidades sensibles nacen ``pending`` (necesitan un segundo access_admin y no surten
     efecto hasta entonces); el resto nace ``active``. Errores: 403 ``access.forbidden``, 409
     ``access.self_modification_forbidden`` / ``access.grant_user_inactive`` /
-    ``access.grant_ceiling_exceeded`` / ``access.grant_duplicate``, 422
+    ``access.not_assignable`` / ``access.grant_duplicate``, 422
     ``access.capability_not_grantable``, 404 ``access.grant_scope_not_found``.
     """
     return success(

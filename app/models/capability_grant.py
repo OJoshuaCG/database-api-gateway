@@ -40,6 +40,7 @@ from sqlalchemy import (
     Integer,
     SmallInteger,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -178,6 +179,12 @@ class CapabilityGrant(Base, TimestampMixin):
 
     decision_reason: Mapped[str | None] = mapped_column(
         String(500), nullable=True, comment="Motivo de la decisión (rechazo o revocación)"
+    )
+
+    sod_override_json: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="sod_override pedido junto con la solicitud: se aplica al APROBARLA (C3)",
     )
 
     def __repr__(self) -> str:

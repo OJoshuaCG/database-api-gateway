@@ -15,6 +15,7 @@ Ejemplo:
     __all__ = [..., "NewModel"]
 """
 
+from app.models.access_change_request import AccessChangeRequest
 from app.models.access_grant import AccessGrant, UserGlobalCapability
 from app.models.api_token import ApiToken
 from app.models.gateway_session import GatewaySession
@@ -59,6 +60,7 @@ from app.models.user import User
 __all__ = [
     "Base",
     "TimestampMixin",
+    "AccessChangeRequest",
     "AccessGrant",
     "ApiToken",
     "CapabilityGrant",

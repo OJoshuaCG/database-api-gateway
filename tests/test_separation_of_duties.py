@@ -23,6 +23,7 @@ from app.services.capability_catalog import (
     Capability,
     GlobalCapability,
 )
+from tests.access_request_helpers import APPROVER, settle
 from tests.scope_helpers import env_id
 from tests.test_api_gateway_users import _cliente_como, _code, _crear
 
@@ -151,7 +152,8 @@ def test_owner_only_capability_grant_to_a_security_officer_is_409(admin_client):
     _assert_conflict(r, SOD_RULE_OWNER)
     src = _pc(r)["conflicts"][0]["sources"][0]
     assert src["kind"] == "capability_grant" and src["capability"] == "blueprints.apply"
-    assert [a.status for a in _audits("capability_grant.created")][-1] == "failure"
+    # `blueprints.apply` es sensible desde C3 (exclusiva de owner): su alta es "requested".
+    assert [a.status for a in _audits("capability_grant.requested")][-1] == "failure"
     # Una capacidad que operator ya tiene no es owner en sustancia.
     assert _grant(admin_client, so["id"], "databases.write").status_code == 201
 
@@ -171,20 +173,28 @@ def test_security_officer_on_top_of_a_live_owner_only_grant_is_409(admin_client)
 
 
 def test_override_writes_an_exception_row_and_audits_it(admin_client):
+    """
+    El override es una elevación (C3): viaja con la solicitud pendiente y la excepción nace
+    recién al APROBARLA, con ``approved_by`` = el segundo access_admin.
+    """
     r = admin_client.post(_USERS, json={
         "username": "breakglass", "gateway_role": "owner",
         "global_capabilities": ["security_officer"],
         "sod_override": {"reason": _RAZON, "expires_in_hours": 24},
     })
-    assert r.status_code == 201, r.text
+    assert r.status_code == 202, r.text
     uid = r.json()["data"]["id"]
+    assert r.json()["data"]["pending_request"]["sod_override"]["reason"] == _RAZON
+    assert _exceptions(uid) == [], "sin aprobar, el override no exceptúa nada"
+    assert not _audits("access.sod_override")
+    settle(r)
 
     filas = _exceptions(uid)
     assert len(filas) == 1
     f = filas[0]
     assert f["rule"] == SOD_RULE_OWNER and f["reason"] == _RAZON
     assert f["requested_by"] == _uid("admin")
-    assert f["approved_by"] is None  # C3: el segundo aprobador
+    assert f["approved_by"] == _uid(APPROVER)
     vence = f["expires_at"] if isinstance(f["expires_at"], datetime) else datetime.fromisoformat(
         str(f["expires_at"]))
     assert timedelta(hours=23) < vence - datetime.utcnow() <= timedelta(hours=24)
@@ -194,7 +204,7 @@ def test_override_writes_an_exception_row_and_audits_it(admin_client):
     assert len(ok) == 1 and ok[0].target_id == uid
     d = json.loads(ok[0].detail)
     assert d["rules"] == [SOD_RULE_OWNER] and d["exception_ids"] == [f["id"]]
-    assert d["reason"] == _RAZON
+    assert d["reason"] == _RAZON and d["approved_by"] == _uid(APPROVER)
 
     # La excepción cubre la combinación al LEER: conserva security_officer.
     eff = admin_client.get(f"{_USERS}/{uid}/effective-access").json()["data"]
@@ -215,11 +225,21 @@ def test_override_validation_is_422_with_a_closed_code(admin_client):
     assert not _audits("access.sod_override")
 
 
-def test_override_on_a_capability_grant(admin_client):
+def test_override_on_a_capability_grant(admin_client, aa_client):
+    """La capacidad nace pendiente con el override; la excepción la escribe la APROBACIÓN."""
     so = _crear(admin_client, "so4", global_capabilities=["security_officer"])
     r = _grant(admin_client, so["id"], "blueprints.apply", sod_override={"reason": _RAZON})
     assert r.status_code == 201, r.text
-    assert [f["rule"] for f in _exceptions(so["id"])] == [SOD_RULE_OWNER]
+    g = r.json()["data"]
+    assert g["status"] == "pending" and g["sod_override"]["reason"] == _RAZON
+    assert _exceptions(so["id"]) == []
+
+    r = aa_client.post(f"/api/v1/capability-grants/{g['id']}/approve", json={})
+    assert r.status_code == 200, r.text
+    filas = _exceptions(so["id"])
+    assert [f["rule"] for f in filas] == [SOD_RULE_OWNER]
+    assert filas[0]["approved_by"] == _uid("aa-segundo")
+    assert filas[0]["requested_by"] == _uid("admin")
     assert _audits("access.sod_override", "success")
 
 
@@ -227,7 +247,7 @@ def test_a_resolved_combination_closes_its_exception(admin_client):
     r = admin_client.post(_USERS, json={
         "username": "resuelve", "gateway_role": "owner",
         "global_capabilities": ["security_officer"], "sod_override": {"reason": _RAZON}})
-    uid = r.json()["data"]["id"]
+    uid = settle(r)["id"]
     r = admin_client.patch(f"{_USERS}/{uid}", json={"gateway_role": "viewer"})
     assert r.status_code == 200, r.text
     f = _exceptions(uid)[0]
@@ -270,7 +290,7 @@ def test_an_expired_override_stops_covering(admin_client):
     r = admin_client.post(_USERS, json={
         "username": "vencida", "gateway_role": "owner",
         "global_capabilities": ["security_officer"], "sod_override": {"reason": _RAZON}})
-    uid = r.json()["data"]["id"]
+    uid = settle(r)["id"]
     _sql("UPDATE sod_exceptions SET expires_at = :t WHERE user_id = :u",
          t=datetime.utcnow() - timedelta(minutes=1), u=uid)
     eff = admin_client.get(f"{_USERS}/{uid}/effective-access").json()["data"]
@@ -325,7 +345,7 @@ def test_sod_report_lists_grandfathered_overrides_and_uncovered(admin_client):
     r = admin_client.post(_USERS, json={
         "username": "conover", "gateway_role": "owner",
         "global_capabilities": ["security_officer"], "sod_override": {"reason": _RAZON}})
-    over_id = r.json()["data"]["id"]
+    over_id = settle(r)["id"]
     sin = _crear(admin_client, "sincubrir", global_capabilities=["security_officer"])
     _sql("UPDATE users SET gateway_role = 'owner' WHERE id = :u", u=sin["id"])
 
@@ -339,7 +359,7 @@ def test_sod_report_lists_grandfathered_overrides_and_uncovered(admin_client):
     assert ("admin", SOD_RULE_ACCESS_ADMIN) in por_usuario
     o = por_usuario[("conover", SOD_RULE_OWNER)]
     assert o["kind"] == "override" and o["reason"] == _RAZON and o["expires_at"]
-    assert o["requested_by"]["username"] == "admin" and o["approved_by"] is None
+    assert o["requested_by"]["username"] == "admin" and o["approved_by"]["username"] == APPROVER
     assert o["user"]["id"] == over_id
     assert data["uncovered"] == [
         {"user": {"id": sin["id"], "username": "sincubrir"}, "user_active": True,

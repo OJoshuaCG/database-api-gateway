@@ -2,7 +2,7 @@
 Capacidades puntuales: alta, listado y revocación (``/gateway-users/{id}/capability-grants``).
 
 Lo que se mide son las reglas de negocio: solo ``access_admin`` actúa, nadie se otorga ni se
-revoca a sí mismo, las globales no se otorgan, el techo del que otorga se respeta, las 8
+revoca a sí mismo, las globales no se otorgan, asigna la FUNCIÓN (no lo que tiene quien otorga), las 11
 sensibles nacen ``pending`` sin efecto, revocar es de un solo administrador, y ``PUT /access``
 no toca las capacidades puntuales.
 """
@@ -87,7 +87,7 @@ def _admin_como(admin_client, username, role="operator", extra=("access_admin",)
 
 
 def test_a_plain_capability_is_created_active_and_audited(admin_client, target):
-    r = _grant(admin_client, target, "blueprints.apply", scope_id=env_id(DEV),
+    r = _grant(admin_client, target, "blueprints.write", scope_id=env_id(DEV),
                reason="release del viernes")
     assert r.status_code == 201, r.text
     g = r.json()["data"]
@@ -105,7 +105,7 @@ def test_a_plain_capability_is_created_active_and_audited(admin_client, target):
 
     (a,) = _audits("capability_grant.created")
     assert a.status == "success"
-    assert (a.grantee, a.privilege, a.object_level) == ("destino", "blueprints.apply", "environment")
+    assert (a.grantee, a.privilege, a.object_level) == ("destino", "blueprints.write", "environment")
     assert a.object_name == f"environment:{env_id(DEV)}"
     detail = json.loads(a.detail)
     assert detail["before"] == {"status": None} and detail["after"] == {"status": "active"}
@@ -238,30 +238,25 @@ def test_only_access_admin_may_create(admin_client, target):
     assert "access_admin" not in json.dumps(r.json()["detail"]["public_context"])
 
 
-def test_the_granter_ceiling_is_enforced_per_capability(admin_client, target):
-    """operator + access_admin: puede otorgar lo de operator, no lo exclusivo de owner."""
-    _, alice = _admin_como(admin_client, "alice", role="operator")
-    assert _grant(alice, target, "databases.write").status_code == 201
-    r = _grant(alice, target, "blueprints.apply")
-    assert (r.status_code, _code(r)) == (409, "access.grant_ceiling_exceeded")
-    # Un viewer con access_admin no otorga ni lo de operator.
+def test_a_viewer_access_admin_grants_by_duty_not_by_holdings(admin_client, target):
+    """
+    Política de asignación (C3): lo que cuenta es la FUNCIÓN (``access_admin``), no lo que tiene
+    quien otorga. Un access_admin ``viewer`` otorga ``databases.write`` en el acto; una exclusiva de
+    owner (``blueprints.apply``) también la puede pedir, pero nace pendiente del segundo aprobador.
+    Antes el techo por tenencia rechazaba las dos con ``access.grant_ceiling_exceeded``.
+    """
     _, vera = _admin_como(admin_client, "vera", role="viewer")
     r = _grant(vera, target, "databases.write")
-    assert (r.status_code, _code(r)) == (409, "access.grant_ceiling_exceeded")
-    failure = [a for a in _audits("capability_grant.created") if a.status == "failure"]
-    assert len(failure) == 2
+    assert r.status_code == 201, r.text
+    assert r.json()["data"]["status"] == "active"
+    r = _grant(vera, target, "blueprints.apply", scope_id=env_id(PROD))
+    assert r.status_code == 201, r.text
+    assert r.json()["data"]["status"] == "pending" and r.json()["data"]["sensitive"] is True
+    assert not [a for a in _audits("capability_grant.created") if a.status == "failure"]
 
 
-def test_the_granters_own_capability_grants_count_toward_the_ceiling(admin_client, target):
-    vera_id, vera = _admin_como(admin_client, "vera", role="viewer")
-    _insert_cg(vera_id, "databases.write", "environment", env_id(PROD))
-    assert _grant(vera, target, "databases.write", scope_id=env_id(PROD)).status_code == 201
-    r = _grant(vera, target, "databases.write", scope_id=env_id(DEV))
-    assert (r.status_code, _code(r)) == (409, "access.grant_ceiling_exceeded")
-
-
-def test_a_scoped_role_lowers_the_ceiling_at_that_scope(admin_client, target):
-    """owner@dev pero viewer@prod: el techo es el del alcance, no el máximo."""
+def test_a_scoped_role_does_not_limit_what_an_access_admin_assigns(admin_client, target):
+    """operator@dev y viewer@prod: asigna igual en prod. El alcance del actor ya no es un techo."""
     datos = _crear(admin_client, "mixta", gateway_role="viewer", global_capabilities=["access_admin"])
     r = admin_client.put(
         f"/api/v1/gateway-users/{datos['id']}/access",
@@ -272,8 +267,14 @@ def test_a_scoped_role_lowers_the_ceiling_at_that_scope(admin_client, target):
     assert r.status_code == 200, r.text
     mixta = _cliente_como(datos, "mixta")
     assert _grant(mixta, target, "databases.write", scope_id=env_id(DEV)).status_code == 201
-    r = _grant(mixta, target, "databases.write", scope_id=env_id(PROD))
-    assert (r.status_code, _code(r)) == (409, "access.grant_ceiling_exceeded")
+    assert _grant(mixta, target, "databases.write", scope_id=env_id(PROD)).status_code == 201
+
+
+def test_a_caller_without_the_duty_is_not_assignable():
+    """Fail-closed en el controller: un actor sin ``access_admin`` (llamador interno) no asigna."""
+    from app.controllers.capability_grant_controller import CapabilityGrantController
+
+    assert CapabilityGrantController._assignable(None, "databases.write") is False
 
 
 def test_unauthenticated_requests_are_401(client):
@@ -314,9 +315,9 @@ def test_revoking_a_pending_grant_cancels_it(admin_client, target):
     assert len(_audits("capability_grant.cancelled")) == 1
 
 
-def test_a_single_access_admin_without_ceiling_can_revoke(admin_client, target):
-    """Revocar no pide techo: vera (viewer) revoca algo que ella no podría otorgar."""
-    gid = _grant(admin_client, target, "blueprints.apply").json()["data"]["id"]
+def test_a_single_access_admin_can_revoke(admin_client, target):
+    """Revocar es de un solo administrador, sin segundo aprobador: vera (viewer) revoca."""
+    gid = _grant(admin_client, target, "databases.write").json()["data"]["id"]
     _, vera = _admin_como(admin_client, "vera", role="viewer")
     r = vera.delete(f"/api/v1/gateway-users/{target}/capability-grants/{gid}")
     assert r.status_code == 200, r.text
@@ -402,7 +403,7 @@ def test_list_is_scoped_to_the_user_and_admin_only(admin_client, target):
 def test_put_access_keeps_capability_grants(admin_client, target):
     ids = [
         _grant(admin_client, target, "databases.write").json()["data"]["id"],
-        _grant(admin_client, target, "blueprints.apply", scope_id=env_id(PROD)).json()["data"]["id"],
+        _grant(admin_client, target, "blueprints.write", scope_id=env_id(PROD)).json()["data"]["id"],
     ]
     r = admin_client.put(
         f"/api/v1/gateway-users/{target}/access",

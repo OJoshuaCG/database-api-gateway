@@ -12,6 +12,7 @@ from app.core.authz import actor_from_access_context
 from app.core.capability_resolution import explain
 from app.core.database import Database
 from app.models.user_model import UserModel
+from tests.access_request_helpers import settle
 from tests.scope_helpers import env_id
 from tests.test_api_gateway_users import _cliente_como, _code, _crear
 from tests.test_capability_grant_crud import _admin_como, _grant, _insert_cg
@@ -32,7 +33,9 @@ def _scope_roles(admin_client, user_id, role="viewer", scope_id=None):
             "scope_grants": [{"scope_type": "environment", "scope_id": scope_id, "role": role}],
         },
     )
-    assert r.status_code == 200, r.text
+    # `owner` por alcance es una elevación (C3): la aprueba un segundo access_admin.
+    assert r.status_code in (200, 202), r.text
+    settle(r)
 
 
 def _pairs(data, source):
@@ -48,7 +51,8 @@ def _pairs(data, source):
 def test_viewer_at_prod_plus_grant_is_attributed_to_the_grant(admin_client):
     uid = _crear(admin_client, "destino")["id"]
     _scope_roles(admin_client, uid, "viewer", env_id(PROD))
-    g = _grant(admin_client, uid, "blueprints.apply", scope_id=env_id(PROD)).json()["data"]
+    # `blueprints.write` y no `apply`: desde C3 las exclusivas de owner nacen pendientes.
+    g = _grant(admin_client, uid, "blueprints.write", scope_id=env_id(PROD)).json()["data"]
 
     r = _effective(admin_client, uid)
     assert r.status_code == 200, r.text
@@ -61,18 +65,18 @@ def test_viewer_at_prod_plus_grant_is_attributed_to_the_grant(admin_client):
     assert d["scope_roles"][0]["scope_name"]
     assert d["catalog_version"]
 
-    apply = [e for e in d["capabilities"] if e["capability"] == "blueprints.apply"]
-    assert apply == [{
-        "capability": "blueprints.apply", "source": "capability_grant",
+    write = [e for e in d["capabilities"] if e["capability"] == "blueprints.write"]
+    assert write == [{
+        "capability": "blueprints.write", "source": "capability_grant",
         "scope_type": "environment", "scope_id": env_id(PROD),
-        "scope_name": apply[0]["scope_name"], "grant_id": g["id"],
+        "scope_name": write[0]["scope_name"], "grant_id": g["id"],
         "implied_by": None, "inert": False,
     }]
-    assert apply[0]["scope_name"]
+    assert write[0]["scope_name"]
     # La lectura implícita sale atribuida a la misma puntual, con `implied_by`.
     implied = [e for e in d["capabilities"]
                if e["capability"] == "blueprints.read" and e["source"] == "capability_grant"]
-    assert [(e["grant_id"], e["implied_by"]) for e in implied] == [(g["id"], "blueprints.apply")]
+    assert [(e["grant_id"], e["implied_by"]) for e in implied] == [(g["id"], "blueprints.write")]
     # Y por rol (viewer) aparece su propia fila: una por fuente.
     assert any(e["capability"] == "blueprints.read" and e["source"] in ("role", "scoped_role")
                for e in d["capabilities"])

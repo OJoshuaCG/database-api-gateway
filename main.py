@@ -131,6 +131,21 @@ async def lifespan(app: FastAPI):
         CapabilityGrantController().expire_overdue()
     except Exception:
         logger.exception("Barrido de capacidades puntuales vencidas falló; se sigue.")
+    # Elevaciones de acceso (C3): mismo barrido, misma prolijidad. Y si los cuatro ojos están
+    # apagados, se avisa en cada arranque: un solo administrador puede crear un `owner` y entrar
+    # con su invitación, y eso no puede quedar como un default que nadie ve.
+    try:
+        from app.controllers.access_request_controller import AccessRequestController, four_eyes
+
+        AccessRequestController().expire_overdue()
+        if not four_eyes():
+            logger.warning(
+                "ACCESS_FOUR_EYES=False: las elevaciones de acceso (owner, globales, capacidades "
+                "exclusivas de owner, sod_override) se aplican SIN segundo aprobador. Cada una se "
+                "audita access.elevation_unapproved. Solo para instalaciones de un administrador."
+            )
+    except Exception:
+        logger.exception("Barrido de elevaciones de acceso vencidas falló; se sigue.")
     # Separación de deberes: cada combinación HEREDADA (owner/access_admin + security_officer en
     # una cuenta) se avisa y se audita (`access.sod_grandfathered`) una vez por arranque. Es un
     # reporte: no puede impedir el arranque.

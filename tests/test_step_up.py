@@ -275,7 +275,7 @@ def test_the_exempt_list_is_exactly_the_step_up_cancels():
     """
     cancels = {(m, p) for m, p, _ in _ROUTES if m == "POST" and p.endswith("/cancel")}
     assert cancels == set(_EXEMPT)
-    assert len(_EXEMPT) == 4
+    assert len(_EXEMPT) == 5
     assert all(motivo for motivo in _EXEMPT.values())
 
 

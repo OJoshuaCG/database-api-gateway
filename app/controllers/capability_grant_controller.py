@@ -13,20 +13,24 @@ Quién puede qué (decisiones de negocio, no negociables acá)
   ``access.admin``, es esa ruta la que está mal.
 - Nadie se otorga ni se revoca capacidades a sí mismo (``access.self_modification_forbidden``).
 - Una capacidad puntual SUMA al rol y nunca es de eje global (``is_grantable``).
-- Techo: quien otorga tiene que tener la capacidad EN ese alcance (rol del alcance ∪ globales ∪
-  sus propias capacidades puntuales; las lecturas implícitas cuentan).
-- Las 7 capacidades sensibles nacen ``pending`` y no surten efecto hasta que un SEGUNDO
-  access_admin las apruebe (la aprobación es del B4). El resto nace ``active``.
+- Política de ASIGNACIÓN (C3, ``ASSIGNABLE_BY``): ``access_admin`` asigna cualquier capacidad
+  otorgable. Reemplaza al techo por TENENCIA ("quien otorga tiene que tener la capacidad en ese
+  alcance"), que obligaba a quien administra accesos a tener cada deber que reparte.
+- Las 11 capacidades sensibles (``is_sensitive``: las exclusivas de ``owner``) nacen ``pending`` y
+  no surten efecto hasta que un SEGUNDO access_admin las apruebe. El resto nace ``active``. Con
+  ``ACCESS_FOUR_EYES=False`` nacen ``active`` y se audita ``access.elevation_unapproved``.
 - Revocar lo hace un solo access_admin, sin techo: activa → ``revoked``, pendiente → ``cancelled``.
 - Separación de deberes: a una persona con ``security_officer`` no se le otorga (ni se le aprueba)
   una capacidad exclusiva de ``owner`` sin excepción viva o ``sod_override`` (409
-  ``access.sod_conflict``). Ver ``app/core/separation_of_duties.py``.
+  ``access.sod_conflict``). Ver ``app/core/separation_of_duties.py``. El ``sod_override`` es una
+  elevación: la capacidad nace ``pending`` con el override guardado (``sod_override_json``) y la
+  excepción se escribe al APROBARLA, con ``approved_by``.
 
 Aprobación (B4)
 ---------------
 - Aprueba OTRO access_admin: ni quien la pidió (``access.self_approval_forbidden``) ni la propia
   persona destino (``access.self_modification_forbidden``).
-- Solo se re-verifica el techo de quien APRUEBA (tiene que tener la capacidad en ese alcance); del
+- Quien APRUEBA tiene que poder asignarla (``ASSIGNABLE_BY``; ya no hace falta que la tenga); del
   solicitante solo se exige que siga siendo un access_admin activo. Si dejó de serlo, la solicitud
   se cancela y se responde 409.
 - La decisión es compare-and-set (``status='pending' AND expires_at > now``): con dos aprobadores
@@ -37,14 +41,13 @@ Aprobación (B4)
 
 Auditoría (D11): ``audit.record`` con ``privilege=capacidad``, ``grantee=username``,
 ``object_level=scope_type``, ``object_name="environment:3"`` y un ``detail`` JSON con el diff de
-estado. Los rechazos por auto-otorgamiento y techo se auditan como ``failure``.
+estado. Los rechazos por auto-otorgamiento y asignación se auditan como ``failure``.
 """
 
 import json
 
+from app.controllers import access_request_controller as access_requests
 from app.core.actor import identity_of
-from app.core.capability_resolution import capability_at_point
-from app.core.scope import ScopePoint, resolve_environment_id
 from app.controllers.gateway_user_controller import CODE_NOT_FOUND
 from app.exceptions import AppHttpException
 from app.models.capability_grant_model import CapabilityGrantModel
@@ -52,12 +55,12 @@ from app.models.user_model import UserModel
 from app.services import audit, sod_service
 from app.services.capability_catalog import (
     CODE_CAPABILITY_NOT_GRANTABLE,
-    CODE_GRANT_CEILING,
     CODE_GRANT_DUPLICATE,
     CODE_GRANT_NOT_FOUND,
     CODE_GRANT_NOT_PENDING,
     CODE_GRANT_SCOPE_NOT_FOUND,
     CODE_GRANT_USER_INACTIVE,
+    CODE_NOT_ASSIGNABLE,
     CODE_SELF_APPROVAL,
     CODE_SELF_MODIFICATION,
     CODE_SOD_CONFLICT,
@@ -139,17 +142,6 @@ class CapabilityGrantController:
             status_code=409,
             public_context={"code": CODE_SELF_MODIFICATION},
         )
-
-    @staticmethod
-    def _point_for(scope_type: str, scope_id: int) -> ScopePoint:
-        """
-        El punto contra el que se mide el techo. Entorno: ``(E, None)``. Servidor: el entorno
-        MÁS PROTEGIDO de sus bases (fail-closed, como la capa 2) y el id del servidor.
-        """
-        if scope_type == "environment":
-            return ScopePoint(environment_id=scope_id, server_id=None)
-        env_id = resolve_environment_id(server_id=scope_id, managed_database_id=None)
-        return ScopePoint(environment_id=env_id, server_id=scope_id)
 
     def _audit(
         self,
@@ -253,13 +245,20 @@ class CapabilityGrantController:
         """
         Orden de los chequeos (el primero que falla gana, y los más baratos y menos
         informativos van antes): ``access.admin`` en la ruta (403) → auto-otorgamiento (409) → usuario existe
-        (404) y activo (409) → otorgable (422) → alcance existe (404) → techo (409) → duplicado
+        (404) y activo (409) → otorgable (422) → alcance existe (404) → asignable (409) → duplicado
         (409, con el ``UNIQUE`` de respaldo) → separación de deberes (409 / 422 del override).
+
+        Nace ``pending`` si es sensible o trae un ``sod_override`` (las dos son elevaciones), salvo
+        ``ACCESS_FOUR_EYES=False``.
         """
         capability = data["capability"]
         scope_type, scope_id = data["scope_type"], int(data["scope_id"])
         sensitive = is_sensitive(capability)
-        action = "capability_grant.requested" if sensitive else "capability_grant.created"
+        action = (
+            "capability_grant.requested"
+            if sensitive and access_requests.four_eyes()
+            else "capability_grant.created"
+        )
 
         user = self._user_or_404(user_id)
         username = user["username"]
@@ -291,19 +290,11 @@ class CapabilityGrantController:
                 public_context={"code": CODE_GRANT_SCOPE_NOT_FOUND},
             )
 
-        point = self._point_for(scope_type, scope_id)
-        if not capability_at_point(actor, Capability(capability), point):
+        if not self._assignable(actor, capability):
             self._audit(action, actor, username, capability, scope_type, scope_id,
                         grant_id=None, before=None, after=None, status="failure",
-                        reason="grant_ceiling_exceeded")
-            raise AppHttpException(
-                message=(
-                    "No puedes otorgar más acceso del que tienes en ese alcance. "
-                    "Pídeselo a alguien que tenga ese nivel."
-                ),
-                status_code=409,
-                public_context={"code": CODE_GRANT_CEILING},
-            )
+                        reason="not_assignable")
+            raise access_requests.not_assignable_error()
 
         if self.grants.find_live(user_id, capability, scope_type, scope_id):
             raise AppHttpException(
@@ -327,7 +318,16 @@ class CapabilityGrantController:
                             grant_id=None, before=None, after=None, status="failure",
                             reason="sod_conflict")
             raise
-        if plan:
+        elevaciones = (
+            [{"kind": "capability_grant", "capability": capability,
+              "scope_type": scope_type, "scope_id": scope_id}]
+            if sensitive else []
+        )
+        pending = access_requests.must_wait(elevaciones, plan)
+        if plan and pending:
+            # El override viaja con la solicitud: la excepción nace al APROBARLA.
+            action = "capability_grant.requested"
+        if plan and not pending:
             sod_service.record_override_intent(plan, admin=actor, target_id=user_id,
                                                username=username)
 
@@ -338,15 +338,28 @@ class CapabilityGrantController:
             scope_type=scope_type,
             scope_id=scope_id,
             requested_by=actor_id,
-            pending=sensitive,
+            pending=pending,
             reason=(data.get("reason") or "").strip() or None,
+            sod_override=sod_service.override_payload(data.get("sod_override")) if plan else None,
         )
-        if plan:
+        if plan and not pending:
             sod_service.apply_override(plan, user_id=user_id, admin=actor, username=username)
         self._audit(action, actor, username, capability, scope_type, scope_id,
                     grant_id=row["id"], before=None, after=row["status"],
                     reason=row.get("request_reason"))
+        if (elevaciones or plan) and not pending:
+            access_requests.record_unapproved(
+                admin=actor, target_id=user_id, username=username, elevations=elevaciones,
+                origin="capability_grant", override=data.get("sod_override") if plan else None,
+            )
         return self._serialize(row)
+
+    @staticmethod
+    def _assignable(actor, capability: str) -> bool:
+        """¿La función del actor asigna esta capacidad? (``ASSIGNABLE_BY``; fail-closed)."""
+        return access_requests.actor_can_assign(
+            actor, [{"kind": "capability_grant", "capability": capability}]
+        )
 
     def _sod_conflicts(self, user_id: int, *, extra: tuple | None = None) -> dict:
         """
@@ -372,6 +385,18 @@ class CapabilityGrantController:
         from app.core.separation_of_duties import uncovered
 
         return uncovered(self._sod_conflicts(user_id), sod_service.covered_rules(user_id))
+
+    def _sod_plan(self, row: dict):
+        """
+        Veredicto de separación de deberes al APROBAR, con el ``sod_override`` que viajó con la
+        solicitud: ``None`` si no hay conflicto sin cubrir, el plan si el override lo cubre; lanza
+        409 ``access.sod_conflict`` si no hay override (o 422 si quedó inválido).
+        """
+        return sod_service.check(
+            self._sod_conflicts(row["user_id"]),
+            covered=sod_service.covered_rules(row["user_id"]),
+            override=row.get("sod_override"),
+        )
 
     # ------------------------------------------------------------------ #
     # Revocación                                                         #
@@ -454,14 +479,16 @@ class CapabilityGrantController:
             return CODE_GRANT_NOT_PENDING
         if self.grants.scope_name(row["scope_type"], row["scope_id"]) is None:
             return CODE_GRANT_SCOPE_NOT_FOUND
-        if not is_grantable(row["capability"]) or not capability_at_point(
-            actor, Capability(row["capability"]), self._point_for(row["scope_type"], row["scope_id"])
-        ):
-            return CODE_GRANT_CEILING
+        if not is_grantable(row["capability"]):
+            return CODE_CAPABILITY_NOT_GRANTABLE
+        if not self._assignable(actor, row["capability"]):
+            return CODE_NOT_ASSIGNABLE
         # Re-chequeo de la separación de deberes al aprobar: entre el alta y la aprobación la
         # persona pudo recibir `security_officer`, o vencer el override que cubría la regla. La
-        # solicitud pendiente ya cuenta como viva en el estado.
-        if self._sod_uncovered(row["user_id"]):
+        # solicitud pendiente ya cuenta como viva en el estado; su override, si trajo, cubre.
+        try:
+            self._sod_plan(row)
+        except AppHttpException:
             return CODE_SOD_CONFLICT
         return None
 
@@ -471,7 +498,8 @@ class CapabilityGrantController:
         CODE_SELF_MODIFICATION: ("No puedes aprobarte capacidades a ti mismo.", 409),
         CODE_GRANT_USER_INACTIVE: ("La persona está desactivada: reactívala antes de aprobar.", 409),
         CODE_GRANT_SCOPE_NOT_FOUND: ("El entorno o servidor indicado ya no existe.", 404),
-        CODE_GRANT_CEILING: ("No puedes aprobar más acceso del que tienes en ese alcance.", 409),
+        CODE_NOT_ASSIGNABLE: ("Tu función no permite asignar esa capacidad.", 409),
+        CODE_CAPABILITY_NOT_GRANTABLE: ("Esa capacidad no se puede otorgar de forma puntual.", 422),
     }
 
     def list_pending(self, actor) -> list[dict]:
@@ -524,6 +552,7 @@ class CapabilityGrantController:
                         row["scope_type"], row["scope_id"], grant_id=grant_id,
                         before="pending", after="pending", status="failure", reason=code)
             if code == CODE_SOD_CONFLICT:
+                self._sod_plan(row)  # re-lanza el 409 (o el 422) con reglas y fuentes
                 raise sod_service.conflict_error(self._sod_uncovered(row["user_id"]))
             message, status_code = self._BLOCK_MESSAGES.get(
                 code, ("No se puede aprobar esta solicitud.", 409)
@@ -533,9 +562,17 @@ class CapabilityGrantController:
 
         actor_id, _ = identity_of(actor)
         reason = (reason or "").strip() or None
+        plan = self._sod_plan(row)
+        if plan:
+            sod_service.record_override_intent(plan, admin=actor, target_id=row["user_id"],
+                                               username=username, approved_by=actor_id)
         if not self.grants.decide_pending(grant_id, approve=True, decided_by=actor_id,
                                           reason=reason):
             raise self._not_pending()
+        if plan:
+            sod_service.apply_override(plan, user_id=row["user_id"], admin=actor,
+                                       username=username, requested_by=row["requested_by"],
+                                       approved_by=actor_id)
         self._audit("capability_grant.approved", actor, username, row["capability"],
                     row["scope_type"], row["scope_id"], grant_id=grant_id,
                     before="pending", after="active", reason=reason)

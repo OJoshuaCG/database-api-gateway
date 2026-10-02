@@ -156,6 +156,10 @@ STEP_UP_EXEMPT: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/cancel"): (
         "cancelar un lote de conversión de collation: frenarlo no puede costar más que lanzarlo"
     ),
+    ("POST", "/api/v1/access-requests/{request_id}/cancel"): (
+        "retirar una elevación propia pendiente: nunca da acceso, y frenarla no puede costar "
+        "más que pedirla"
+    ),
 }
 
 

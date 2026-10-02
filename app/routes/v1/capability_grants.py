@@ -35,11 +35,12 @@ def approve_capability_grant(
 ):
     """
     Aprueba una solicitud pendiente (``pending`` → ``active``, efecto inmediato). La tiene que
-    aprobar OTRO access_admin que tenga esa capacidad en ese alcance. Errores: 403
-    ``access.forbidden``, 404 ``access.grant_not_found``, 409 ``access.grant_not_pending`` /
-    ``access.self_approval_forbidden`` / ``access.self_modification_forbidden`` /
-    ``access.grant_user_inactive`` / ``access.grant_ceiling_exceeded``, 404
-    ``access.grant_scope_not_found``.
+    aprobar OTRO access_admin (basta con que su función la asigne: ya no hace falta que la tenga).
+    Si la solicitud trae ``sod_override``, la excepción se escribe acá, con ``approved_by``.
+    Errores: 403 ``access.forbidden``, 404 ``access.grant_not_found``, 409
+    ``access.grant_not_pending`` / ``access.self_approval_forbidden`` /
+    ``access.self_modification_forbidden`` / ``access.grant_user_inactive`` /
+    ``access.not_assignable`` / ``access.sod_conflict``, 404 ``access.grant_scope_not_found``.
     """
     reason = payload.reason if payload else None
     return success(

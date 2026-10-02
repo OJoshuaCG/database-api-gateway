@@ -2745,14 +2745,19 @@ que `security_officer` no tiene (`403`; ver `api-reference-v29.md`). Todo es CSR
 Nadie se otorga ni se revoca capacidades a sí mismo. Las capacidades **globales** (`servers.admin`,
 `catalogs.*`, `environments.*`, `access.admin`, `policy.admin`, `self.read`) no se otorgan nunca.
 
-**Techo.** Quien otorga tiene que tener la capacidad en ese alcance (su rol en el alcance, sus
-globales y sus propias capacidades puntuales). Otorgar escribir/ejecutar trae implícita la lectura
-de su módulo (campo `implies`).
+**Asignación (C3).** Lo que cuenta es la función: `access_admin` asigna cualquier capacidad
+otorgable, tenga o no la capacidad él mismo. Reemplaza al techo por tenencia
+(`access.grant_ceiling_exceeded`, retirado); ver `api-reference-v29.md` §9. Otorgar
+escribir/ejecutar trae implícita la lectura de su módulo (campo `implies`).
 
-**Sensibles (segundo aprobador).** `engine_users.secrets`, `engine_users.credentials`,
-`blueprints.captures`, `clones.execute`, `exports.download`, `sql_console.execute`,
-`engine_users.drop` y `databases.drop` nacen `pending` (vencen a los 7 días, sin ningún efecto hasta que otro
-`access_admin` las apruebe). El resto nace `active`.
+**Sensibles (segundo aprobador).** Las 11 exclusivas de `owner` (owner − operator, otorgables):
+`engine_users.secrets`, `engine_users.credentials`, `blueprints.captures`, `blueprints.apply`,
+`clones.execute`, `collation.execute`, `exports.download`, `schema_diff.execute`,
+`sql_console.execute`, `engine_users.drop` y `databases.drop` nacen `pending` (vencen a los 7
+días, sin ningún efecto hasta que otro `access_admin` las apruebe). El resto nace `active`. Una
+alta con `sod_override` también nace `pending` (el override se aplica al aprobarla y viaja en el
+campo `sod_override` de `CapabilityGrantOut`). Con `ACCESS_FOUR_EYES=False` todas nacen `active`
+y se audita `access.elevation_unapproved`.
 
 ### Objeto `CapabilityGrantOut`
 
@@ -2791,8 +2796,8 @@ Sin body. Un solo `access_admin` alcanza, sin techo y con efecto inmediato. `act
 
 ### Aprobación de sensibles (`/capability-grants`)
 
-Aprueba **otro** `access_admin`: ni quien la pidió ni la persona destino. Solo se re-verifica el
-techo de **quien aprueba** (tiene que tener la capacidad en ese alcance); del solicitante solo se
+Aprueba **otro** `access_admin`: ni quien la pidió ni la persona destino. A quien aprueba le basta
+su función (no hace falta que tenga la capacidad); del solicitante solo se
 exige que siga siendo `access_admin` activo (si no, la solicitud se cancela y el approve da `409
 access.grant_not_pending`). La decisión es atómica (compare-and-set sobre `pending` y no vencida):
 con dos aprobadores simultáneos gana uno y el otro recibe `access.grant_not_pending`. Al aprobar
@@ -2813,8 +2818,8 @@ Pendientes vigentes de todas las personas (de la más vieja a la más nueva). **
 `ApiResponse[PendingCapabilityGrantOut[]]`: `CapabilityGrantOut` + `can_decide: bool` y
 `blocked_reason: string | null` (código `access.*`: `access.self_approval_forbidden`,
 `access.self_modification_forbidden`, `access.grant_user_inactive`,
-`access.grant_ceiling_exceeded`, `access.grant_scope_not_found` o `access.grant_not_pending` si el
-solicitante ya no es access_admin). Para un actor sin `access_admin`: `403`.
+`access.not_assignable`, `access.sod_conflict`, `access.grant_scope_not_found` o
+`access.grant_not_pending` si el solicitante ya no es access_admin). Para un actor sin `access_admin`: `403`.
 
 #### `POST /api/v1/capability-grants/{grant_id}/approve`
 
@@ -2823,13 +2828,14 @@ con `status: "active"`, `decided_by`, `decided_at`, `expires_at: null`.
 
 #### `POST /api/v1/capability-grants/{grant_id}/reject`
 
-Body opcional: `{ "reason": "…" }`. Sin techo ni segundo aprobador (rechazar nunca da acceso).
+Body opcional: `{ "reason": "…" }`. Sin segundo aprobador (rechazar nunca da acceso).
 **Respuesta** `200` — `ApiResponse[CapabilityGrantOut]` con `status: "rejected"`.
 
 Errores de approve/reject: `403 access.forbidden`, `404 access.grant_not_found`, `409
 access.grant_not_pending` (ya decidida, vencida o cancelada); solo approve: `409
 access.self_approval_forbidden`, `409 access.self_modification_forbidden`, `409
-access.grant_user_inactive`, `409 access.grant_ceiling_exceeded`, `404 access.grant_scope_not_found`.
+access.grant_user_inactive`, `409 access.not_assignable`, `409 access.sod_conflict`, `404
+access.grant_scope_not_found`.
 
 ### Vista propia: `GET /api/v1/auth/me` (campo nuevo, aditivo)
 
@@ -2901,7 +2907,7 @@ que hace cumplir `require()` (`explain`), sobre el mismo contexto que acuña el 
 | `access.grant_scope_not_found` | 404 | El entorno o servidor no existe. En `PUT /gateway-users/{id}/access` sale como **422** (el alcance es un campo del payload) con `missing_scopes: [{scope_type, scope_id}]`, y no se escribe nada. |
 | `access.scope_has_grants` | 409 | `DELETE /environments/{id}` o `DELETE /servers/{id}` con accesos que todavía apuntan a ese destino. `public_context` trae `access_grant_count` (roles por alcance) y `capability_grant_count` (puntuales `pending`/`active`). Quitarlos (`PUT /access`) o revocarlos y reintentar. Las puntuales ya terminales no bloquean. |
 | `access.last_admin_protected` | 409 | `PUT /gateway-users/{id}/access` o `PATCH /gateway-users/{id}` (`is_active: false`) dejaría el gateway sin ningún `access_admin` activo. Se evalúa dentro de la transacción de la escritura, con las filas bloqueadas: dos cambios concurrentes no pueden dejarlo en cero. |
-| `access.grant_ceiling_exceeded` | 409 | El actor no tiene esa capacidad en ese alcance. |
+| `access.not_assignable` | 409 | La función del actor no asigna esa capacidad (hoy: no es `access_admin`; en la práctica lo frena antes la ruta). Reemplaza a `access.grant_ceiling_exceeded`, retirado en C3. |
 | `access.grant_duplicate` | 409 | Ya hay una viva (`pending` o `active`) para esa persona, capacidad y alcance. |
 | `access.grant_not_found` | 404 | La capacidad no existe o es de otra persona (revocación). |
 | `access.grant_not_pending` | 409 | La capacidad ya es terminal (revocación). |
@@ -2910,7 +2916,7 @@ Cada alta, decisión y revocación escribe `audit_log`: `capability_grant.create
 `capability_grant.requested` (sensibles), `capability_grant.approved`, `capability_grant.rejected`,
 `capability_grant.revoked`, `capability_grant.cancelled` y `capability_grant.expired`. Vencida y
 cancelada por pérdida de rol del solicitante se auditan con `actor_type="system"` (sin persona).
-Los rechazos por auto-otorgamiento, techo y approve bloqueado quedan con `status` `failure`.
+Los rechazos por auto-otorgamiento, asignación y approve bloqueado quedan con `status` `failure`.
 
 ---
 

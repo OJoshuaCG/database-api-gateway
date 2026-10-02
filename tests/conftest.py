@@ -110,6 +110,41 @@ def admin_client(client):
     return client
 
 
+# --------------------------------------------------------------------------- #
+# Identidades de la separación de deberes (C3)                                 #
+# --------------------------------------------------------------------------- #
+# `admin_client` es la cuenta sembrada COMBINADA (owner + access_admin + security_officer,
+# heredada) y el único access_admin de la BD. Estas fixtures dan cuentas de UNA función, creadas
+# por HTTP con su elevación aprobada por un segundo access_admin (`tests/access_request_helpers`).
+
+
+@pytest.fixture()
+def aa_client(admin_client):
+    """Un SEGUNDO access_admin activo (viewer + access_admin): aprueba lo que pide el admin."""
+    from tests.access_request_helpers import client_as, create_user
+
+    datos = create_user(admin_client, "aa-segundo", global_capabilities=["access_admin"])
+    return client_as(datos, "aa-segundo")
+
+
+@pytest.fixture()
+def owner_client(admin_client):
+    """Un `owner` sin globales: opera, no administra accesos ni política."""
+    from tests.access_request_helpers import client_as, create_user
+
+    datos = create_user(admin_client, "owner-solo", gateway_role="owner")
+    return client_as(datos, "owner-solo")
+
+
+@pytest.fixture()
+def so_client(admin_client):
+    """Un `security_officer` viewer: política, sin operar ni administrar accesos."""
+    from tests.access_request_helpers import client_as, create_user
+
+    datos = create_user(admin_client, "so-solo-fx", global_capabilities=["security_officer"])
+    return client_as(datos, "so-solo-fx")
+
+
 @pytest.fixture()
 def server_payload():
     """Devuelve un builder de payloads de Server con overrides."""

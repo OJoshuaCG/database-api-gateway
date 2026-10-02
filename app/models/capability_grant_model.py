@@ -10,6 +10,7 @@ Las filas no se borran nunca: toda salida de ``live_key`` pasa por acá y lo apa
 ``status``, porque un ``CHECK`` ata los dos (``live_key_status``).
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select, update
@@ -48,7 +49,17 @@ def _public(row: CapabilityGrant) -> dict:
         "expires_at": row.expires_at,
         "request_reason": row.request_reason,
         "decision_reason": row.decision_reason,
+        "sod_override": _override(row.sod_override_json),
     }
+
+
+def _override(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
 
 
 def assert_scope_has_no_grants(session, scope_type: str, scope_id: int) -> None:
@@ -249,6 +260,7 @@ class CapabilityGrantModel:
         requested_by: int | None,
         pending: bool,
         reason: str | None,
+        sod_override: dict | None = None,
     ) -> dict:
         """
         Inserta la fila. ``pending`` (capacidad sensible) vence a los 7 días; el resto nace
@@ -269,6 +281,9 @@ class CapabilityGrantModel:
                 requested_at=now,
                 expires_at=(now + PENDING_TTL) if pending else None,
                 request_reason=reason,
+                sod_override_json=(
+                    json.dumps(sod_override, ensure_ascii=False) if sod_override else None
+                ),
             )
             session.add(row)
             try:

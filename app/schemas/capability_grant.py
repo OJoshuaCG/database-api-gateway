@@ -52,6 +52,9 @@ class CapabilityGrantOut(BaseModel):
     request_reason: str | None = None
     decision_reason: str | None = None
     implies: list[str] = Field(default_factory=list, description="Lecturas que trae implícitas")
+    sod_override: SodOverrideIn | None = Field(
+        None, description="Break-glass que viaja con la solicitud: se aplica al aprobarla"
+    )
 
 
 class PendingCapabilityGrantOut(CapabilityGrantOut):

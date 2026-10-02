@@ -7,8 +7,10 @@ La regla pura vive en ``app/core/separation_of_duties.py``; el lector (neutraliz
 - ``check``: el veredicto de escritura sobre el estado RESULTANTE de una cuenta. Sin conflicto
   no cubierto, ``None``; con conflicto y sin ``sod_override``, 409 ``access.sod_conflict``; con
   override válido, un ``OverridePlan`` que el controller aplica después de escribir.
-- ``record_override_intent`` / ``apply_override``: el break-glass. **En C2 se aplica en el acto**;
-  C3 lo va a enrutar por el segundo aprobador (``approved_by``), igual que las elevaciones.
+- ``record_override_intent`` / ``apply_override``: el break-glass. Es una ELEVACIÓN: viaja dentro
+  de la solicitud pendiente (``access_change_requests`` o la capacidad puntual pendiente) y se
+  aplica al APROBARLA, con ``approved_by`` = el segundo ``access_admin``. Solo con
+  ``ACCESS_FOUR_EYES=False`` se aplica en el acto (``approved_by`` NULL).
 - ``grandfather_user``: la herencia de una combinación preexistente (``bootstrap_admin``).
 - ``reconcile``: cierra las excepciones de reglas que la cuenta ya no viola.
 - ``report_sod_violations`` / ``sod_report`` / ``warnings_for_user``: arranque, reporte y
@@ -186,7 +188,9 @@ def check(
     )
 
 
-def _override_detail(plan: OverridePlan, username: str, **extra) -> str:
+def _override_detail(
+    plan: OverridePlan, username: str, *, approved_by: int | None = None, **extra
+) -> str:
     return json.dumps(
         {
             "username": username,
@@ -194,15 +198,31 @@ def _override_detail(plan: OverridePlan, username: str, **extra) -> str:
             "conflicts": [{"rule": r, "sources": plan.conflicts[r]} for r in plan.rules],
             "reason": plan.reason,
             "expires_at": plan.expires_at.isoformat(),
-            # C2: el override se aplica sin segundo aprobador. C3 lo va a dejar pendiente.
-            "approved_by": None,
+            # El segundo aprobador; NULL solo con ACCESS_FOUR_EYES=False.
+            "approved_by": approved_by,
             **extra,
         },
         ensure_ascii=False,
     )
 
 
-def record_override_intent(plan: OverridePlan, *, admin, target_id: int | None, username: str) -> None:
+def override_payload(override) -> dict | None:
+    """El ``sod_override`` en la forma que se guarda con una solicitud pendiente (o ``None``)."""
+    if not override:
+        return None
+    if hasattr(override, "model_dump"):
+        override = override.model_dump()
+    return {"reason": override.get("reason"), "expires_in_hours": override.get("expires_in_hours")}
+
+
+def record_override_intent(
+    plan: OverridePlan,
+    *,
+    admin,
+    target_id: int | None,
+    username: str,
+    approved_by: int | None = None,
+) -> None:
     """
     Rastro OBLIGATORIO del break-glass, ANTES de escribir. Fail-closed (``record_intent``): si no
     se puede auditar, la escritura no ocurre — un override sin rastro es justo lo que la regla
@@ -214,11 +234,19 @@ def record_override_intent(plan: OverridePlan, *, admin, target_id: int | None, 
         target_type="user",
         target_id=target_id,
         touched_engine=False,
-        detail=_override_detail(plan, username),
+        detail=_override_detail(plan, username, approved_by=approved_by),
     )
 
 
-def apply_override(plan: OverridePlan, *, user_id: int, admin, username: str) -> list[dict]:
+def apply_override(
+    plan: OverridePlan,
+    *,
+    user_id: int,
+    admin,
+    username: str,
+    requested_by: int | None = None,
+    approved_by: int | None = None,
+) -> list[dict]:
     """
     Escribe una fila de ``sod_exceptions`` por regla y audita el éxito.
 
@@ -226,8 +254,9 @@ def apply_override(plan: OverridePlan, *, user_id: int, admin, username: str) ->
     el lector descarta ``security_officer`` (falla cerrado). Al revés, un fallo del acceso dejaría
     una excepción viva cubriendo una combinación que nadie aplicó todavía.
 
-    TODO(C3): enrutar el override por el segundo aprobador: la fila nace sin cubrir nada hasta
-    que otro ``access_admin`` la apruebe (``approved_by``).
+    ``admin`` es quien ejecuta la escritura: el segundo aprobador al aprobar una solicitud
+    (``approved_by`` = su id, ``requested_by`` = quien la pidió), o el propio solicitante con
+    ``ACCESS_FOUR_EYES=False`` (``approved_by`` NULL).
     """
     from app.core.actor import identity_of
     from app.models.sod_exception_model import SodExceptionModel
@@ -239,8 +268,9 @@ def apply_override(plan: OverridePlan, *, user_id: int, admin, username: str) ->
             user_id=user_id,
             rule=rule,
             reason=plan.reason,
-            requested_by=actor_id,
+            requested_by=requested_by if requested_by is not None else actor_id,
             expires_at=plan.expires_at,
+            approved_by=approved_by,
         )
         for rule in plan.rules
     ]
@@ -250,7 +280,9 @@ def apply_override(plan: OverridePlan, *, user_id: int, admin, username: str) ->
         target_type="user",
         target_id=user_id,
         touched_engine=False,
-        detail=_override_detail(plan, username, exception_ids=[f["id"] for f in filas]),
+        detail=_override_detail(
+            plan, username, approved_by=approved_by, exception_ids=[f["id"] for f in filas]
+        ),
     )
     logger.warning(
         "Override de separación de deberes aplicado sobre '%s' (%s), vence %s",

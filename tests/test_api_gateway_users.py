@@ -20,13 +20,19 @@ import pytest
 
 from app.core.database import Database
 from app.models.user_model import UserModel
+from tests.access_request_helpers import settle
 
 
 def _crear(admin_client, username="nueva", **extra):
+    """
+    Alta por HTTP. Si pide una elevación (``owner``, una global, ``sod_override``) responde
+    ``202`` y un segundo ``access_admin`` de test la aprueba (``settle``): el test recibe la
+    cuenta ya elevada, igual que antes de C3. Para medir el ``202`` en sí, llamá a la ruta.
+    """
     payload = {"username": username, "full_name": "Persona Nueva", **extra}
     r = admin_client.post("/api/v1/gateway-users", json=payload)
-    assert r.status_code == 201, r.text
-    return r.json()["data"]
+    assert r.status_code in (201, 202), r.text
+    return settle(r)
 
 
 def _servidor(admin_client, server_payload, name="srv-acc") -> int:
@@ -422,78 +428,99 @@ def test_an_admin_can_still_edit_their_own_contact_data(admin_client):
     assert r.status_code == 200, r.text
 
 
-def test_an_access_admin_cannot_mint_a_privileged_puppet(admin_client):
+def test_an_access_admin_cannot_mint_a_privileged_puppet_alone(admin_client):
     """
-    El bypass del guard anterior: crear una cuenta ``owner`` (o con ``security_officer``),
-    recibir su ``invite_token`` y entrar como ella. El techo lo corta en el alta.
+    El bypass del guard de auto-modificación: crear una cuenta ``owner`` (o con
+    ``security_officer``), recibir su ``invite_token`` y entrar como ella. Antes lo cortaba el techo
+    por tenencia; desde C3 la elevación queda PENDIENTE de otro access_admin: la cuenta nace
+    ``viewer`` sin globales y quien la pidió no puede aprobarla.
     """
     datos = _crear(admin_client, "aa_solo", global_capabilities=["access_admin"])
     aa = _cliente_como(datos, "aa_solo")
 
     r = aa.post("/api/v1/gateway-users", json={"username": "titere", "gateway_role": "owner"})
-    assert r.status_code == 409, r.text
-    assert _code(r) == "access.grant_ceiling_exceeded"
+    assert r.status_code == 202, r.text
+    d = r.json()["data"]
+    assert d["code"] == "access.elevation_pending"
+    assert (d["gateway_role"], d["global_capabilities"]) == ("viewer", [])
+    assert d["invite_token"], "la invitación se emite igual"
+    req = d["pending_request"]
+    assert req["elevations"] == [{"kind": "base_role", "role": "owner"}]
+    assert req["requested_by"]["username"] == "aa_solo"
+
+    r = aa.post(f"/api/v1/access-requests/{req['id']}/approve", json={})
+    assert (r.status_code, _code(r)) == (409, "access.self_approval_forbidden")
+    assert UserModel().find_by_username("titere")["gateway_role"] == "viewer"
+
     r = aa.post(
         "/api/v1/gateway-users",
         json={"username": "titere2", "global_capabilities": ["security_officer"]},
     )
-    assert r.status_code == 409, r.text
-    assert _code(r) == "access.grant_ceiling_exceeded"
-    assert UserModel().find_by_username("titere") is None
-    assert UserModel().find_by_username("titere2") is None
+    assert r.status_code == 202, r.text
+    assert UserModel().find_access_context(r.json()["data"]["id"])["globals"] == []
 
-    # Lo que sí tiene, lo puede otorgar.
-    r = aa.post(
-        "/api/v1/gateway-users",
-        json={"username": "par", "gateway_role": "viewer", "global_capabilities": ["access_admin"]},
-    )
+    # Lo que no eleva se aplica en el acto, aunque quien asigna sea viewer.
+    r = aa.post("/api/v1/gateway-users", json={"username": "par", "gateway_role": "operator"})
     assert r.status_code == 201, r.text
+    assert r.json()["data"]["gateway_role"] == "operator"
 
 
-def test_an_access_admin_cannot_raise_a_role_above_their_own(admin_client):
+def test_a_viewer_access_admin_assigns_by_duty_not_by_holdings(admin_client):
+    """
+    Política de asignación: un access_admin ``viewer`` da ``operator`` en el acto (el techo por
+    tenencia lo rechazaba) y ``owner`` queda pendiente: lo aplica la aprobación de OTRO.
+    """
     otro = _crear(admin_client, "objetivo")
     datos = _crear(admin_client, "aa_rol", global_capabilities=["access_admin"])
     aa = _cliente_como(datos, "aa_rol")
 
     r = aa.patch(f"/api/v1/gateway-users/{otro['id']}", json={"gateway_role": "operator"})
-    assert r.status_code == 409, r.text
-    assert _code(r) == "access.grant_ceiling_exceeded"
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["gateway_role"] == "operator"
+
+    r = aa.patch(f"/api/v1/gateway-users/{otro['id']}", json={"gateway_role": "owner"})
+    assert r.status_code == 202, r.text
+    assert r.json()["data"]["gateway_role"] == "operator"
+    rid = r.json()["data"]["pending_request"]["id"]
+
+    r = admin_client.post(f"/api/v1/access-requests/{rid}/approve", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["status"] == "applied"
+    assert UserModel().find_by_id(otro["id"])["gateway_role"] == "owner"
 
 
-def test_an_access_admin_cannot_grant_above_their_own_reach(admin_client):
+def test_elevating_set_access_payloads_go_pending(admin_client):
+    """``owner`` por alcance y CUALQUIER global agregada son elevaciones; el resto se aplica ya."""
     otro = _crear(admin_client, "objetivo2")
     datos = _crear(admin_client, "aa_acc", global_capabilities=["access_admin"])
     aa = _cliente_como(datos, "aa_acc")
     url = f"/api/v1/gateway-users/{otro['id']}/access"
 
-    r = aa.put(
-        url,
-        json={
-            "global_capabilities": [],
-            "scope_grants": [{"scope_type": "environment", "scope_id": 1, "role": "owner"}],
-        },
-    )
-    assert r.status_code == 409, r.text
-    assert _code(r) == "access.grant_ceiling_exceeded"
-
-    r = aa.put(url, json={"global_capabilities": ["security_officer"], "scope_grants": []})
-    assert r.status_code == 409, r.text
-    assert _code(r) == "access.grant_ceiling_exceeded"
+    for body in (
+        {"global_capabilities": [],
+         "scope_grants": [{"scope_type": "environment", "scope_id": 1, "role": "owner"}]},
+        {"global_capabilities": ["security_officer"], "scope_grants": []},
+        {"global_capabilities": ["access_admin"], "scope_grants": []},
+    ):
+        r = aa.put(url, json=body)
+        assert r.status_code == 202, r.text
+        assert r.json()["data"]["code"] == "access.elevation_pending"
+    ctx = UserModel().find_access_context(otro["id"])
+    assert ctx["globals"] == [] and ctx["grants"] == []
 
     r = aa.put(
         url,
-        json={
-            "global_capabilities": ["access_admin"],
-            "scope_grants": [{"scope_type": "environment", "scope_id": 1, "role": "viewer"}],
-        },
+        json={"global_capabilities": [],
+              "scope_grants": [{"scope_type": "environment", "scope_id": 1, "role": "operator"}]},
     )
     assert r.status_code == 200, r.text
+    assert "code" not in r.json()["data"], "un cambio que no eleva responde como siempre"
 
 
 def test_the_ceiling_applies_to_what_is_added_not_to_what_was_there(admin_client, server_payload):
     """
-    Un ``access_admin`` sin ``security_officer`` puede seguir editando los alcances de quien sí
-    la tiene, siempre que no se la otorgue él.
+    Un ``access_admin`` sin ``security_officer`` edita los alcances de quien sí la tiene, en el
+    acto: conservar una global que ya estaba no es una elevación.
     """
     otro = _crear(admin_client, "con_so", global_capabilities=["security_officer"])
     datos = _crear(admin_client, "aa_edit", global_capabilities=["access_admin"])
@@ -573,8 +600,9 @@ def test_the_scope_type_survives_the_round_trip(admin_client, server_payload):
             ],
         },
     )
-    assert r.status_code == 200, r.text
-    pares = {(g["scope_type"], g["role"]) for g in r.json()["data"]["scope_grants"]}
+    # El `owner` del servidor es una elevación: la aprueba un segundo access_admin.
+    assert r.status_code == 202, r.text
+    pares = {(g["scope_type"], g["role"]) for g in settle(r)["scope_grants"]}
     assert pares == {("environment", "viewer"), ("server", "owner")}
 
 
@@ -598,8 +626,10 @@ def test_changing_the_role_revokes_the_sessions(admin_client):
         json={"username": "degradada", "password": "ContraseñaLarga123"},
     ).status_code == 200
 
+    # `operator` y no `owner`: este test mide el camino INMEDIATO. Que aprobar una elevación
+    # también tacha las sesiones lo mide tests/test_access_requests.py.
     r = admin_client.patch(
-        f"/api/v1/gateway-users/{datos['id']}", json={"gateway_role": "owner"}
+        f"/api/v1/gateway-users/{datos['id']}", json={"gateway_role": "operator"}
     )
     assert r.status_code == 200, r.text
 

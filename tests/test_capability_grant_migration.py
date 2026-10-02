@@ -86,9 +86,10 @@ def test_upgrade_creates_table_matching_the_model(conn):
     insp = sa.inspect(conn)
     assert insp.has_table("capability_grants")
     model = CapabilityGrant.__table__
+    # `sod_override_json` la agrega una migración POSTERIOR (a9c1e3b5d7f0, C3).
     assert {c["name"] for c in insp.get_columns("capability_grants")} == {
         c.name for c in model.columns
-    }
+    } - {"sod_override_json"}
     assert {i["name"] for i in insp.get_indexes("capability_grants")} >= {
         "ix_capability_grants_user_status",
         "ix_capability_grants_status_expires",
