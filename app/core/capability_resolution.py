@@ -29,6 +29,7 @@ que necesita de ``scope`` lo toma de forma diferida.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -46,6 +47,8 @@ from app.services.capability_catalog import (
 if TYPE_CHECKING:  # pragma: no cover
     from app.core.actor import Actor
     from app.core.scope import ScopePoint
+
+logger = logging.getLogger(__name__)
 
 #: Alcances sobre los que se puede otorgar una capacidad puntual (sin global, D2).
 GRANT_SCOPE_TYPES: tuple[str, ...] = ("environment", "server")
@@ -235,9 +238,22 @@ def parse_access_context(ctx: dict) -> ParsedAccess:
     """
     ``find_access_context`` → tipos del dominio. Fail-closed en el lector, en UN solo lugar.
 
-    Un rol o una global desconocidos se ignoran (el rol cae a ``viewer``); un alcance de tipo
-    desconocido se DESCARTA, no se degrada a otro tipo; una capacidad puntual no otorgable se
-    descarta. Lo comparten ``get_current_actor`` y el endpoint de acceso efectivo.
+    Un rol base o una global desconocidos se ignoran (el rol cae a ``viewer``); una capacidad
+    puntual no otorgable se descarta. Lo comparten ``get_current_actor`` y el endpoint de acceso
+    efectivo.
+
+    UN GRANT POR ALCANCE ILEGIBLE NO SE DESCARTA SI PUEDE RESTRINGIR
+    -----------------------------------------------------------------
+    Un grant por alcance puede RESTRINGIR (``viewer`` en producción sobre un base ``owner``).
+    Descartarlo porque su rol no se lee (``'Viewer'`` con mayúscula, un valor legado, un UPDATE a
+    mano, un rollback de deploy) devolvería al usuario a su rol base justo en el alcance que se
+    quería restringir: fail-OPEN. Por eso, con ``scope_type`` conocido y ``scope_id`` legible, un
+    rol ilegible se resuelve a ``viewer`` en ese alcance (mínimo privilegio) y se loguea.
+
+    Lo que sigue descartándose, con warning, es lo que no se puede EMPAREJAR con ningún destino:
+    un ``scope_type`` desconocido (no hay a qué alcance aplicarlo; degradarlo a otro tipo sería
+    inventar un alcance) o un ``scope_id`` ilegible o no positivo. El escritor
+    (``_validate_role``/``_validate_scope`` del controller) impide ambos por la API.
     """
     try:
         base = GatewayRole(ctx["role"])
@@ -247,11 +263,34 @@ def parse_access_context(ctx: dict) -> ParsedAccess:
     scope_roles: list[tuple[str, int, GatewayRole]] = []
     for scope_type, scope_id, role in ctx.get("grants") or []:
         if scope_type not in ("environment", "server"):
+            logger.warning(
+                "Grant por alcance descartado: scope_type desconocido %r (scope_id=%r)",
+                scope_type,
+                scope_id,
+            )
             continue
         try:
-            scope_roles.append((scope_type, int(scope_id), GatewayRole(role)))
+            sid = int(scope_id)
         except (TypeError, ValueError):
+            sid = 0
+        if sid <= 0:
+            logger.warning(
+                "Grant por alcance descartado: scope_id ilegible %r (scope_type=%s)",
+                scope_id,
+                scope_type,
+            )
             continue
+        try:
+            parsed_role = GatewayRole(role)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Grant por alcance con rol ilegible %r en %s:%s; se resuelve a viewer",
+                role,
+                scope_type,
+                sid,
+            )
+            parsed_role = GatewayRole.VIEWER
+        scope_roles.append((scope_type, sid, parsed_role))
 
     globals_: set[GlobalCapability] = set()
     for name in ctx.get("globals") or []:

@@ -341,6 +341,35 @@ def test_reader_drops_unknown_scope_types_and_non_positive_ids():
     assert cr.parse_capability_grants(rows) == [(APPLY, "server", 3, 4)]
 
 
+def test_an_unparseable_restrictive_scope_role_resolves_to_viewer_not_dropped(caplog):
+    """F-15: un ``viewer`` en prod sobre base ``owner`` con rol ilegible NO puede desaparecer."""
+    from app.core.scope import role_at_point
+
+    ctx = {
+        "role": "owner",
+        "grants": [
+            ("environment", 7, "Viewer"),  # mayúscula: valor legado / UPDATE a mano
+            ("server", "3", None),
+            ("galaxy", 9, "viewer"),  # scope_type desconocido: no hay a qué aplicarlo
+            ("environment", "x", "viewer"),  # scope_id ilegible: no empareja con nada
+        ],
+    }
+    with caplog.at_level(logging.WARNING, logger="app.core.capability_resolution"):
+        parsed = cr.parse_access_context(ctx)
+    assert parsed.base == GatewayRole.OWNER
+    assert parsed.scope_roles == (
+        ("environment", 7, GatewayRole.VIEWER),
+        ("server", 3, GatewayRole.VIEWER),
+    )
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 4
+
+    actor = actor_from_access_context(1, "admin", ctx)
+    assert role_at_point(actor, ScopePoint(environment_id=7, server_id=None)) == GatewayRole.VIEWER
+    assert not cr.capability_at_point(actor, APPLY, ScopePoint(environment_id=7, server_id=None))
+    # Fuera del alcance restringido manda el base.
+    assert role_at_point(actor, ScopePoint(environment_id=8, server_id=None)) == GatewayRole.OWNER
+
+
 def test_a_missing_table_yields_no_grants_and_keeps_roles_working(client, caplog):
     """D9 / R12: código sin la tabla no concede nada, no tumba la autenticación y deja ERROR."""
     with Database().engine.begin() as conn:
