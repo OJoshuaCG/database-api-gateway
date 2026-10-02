@@ -217,7 +217,20 @@ class QueryHistoryOut(BaseModel):
     connection_mode: str
     run_as_username: str
     impersonated_role: str | None = None
-    sql_text: str
+    sql_text: str = Field(
+        description=(
+            "El lote enviado (contraseñas redactadas). Si 'sql_masked' es true, cada literal "
+            "es '?' y los comentarios se descartaron: el texto completo solo lo ve quien "
+            "tiene 'sql_console.execute' en ese destino."
+        ),
+    )
+    sql_masked: bool = Field(
+        default=False,
+        description=(
+            "True = 'sql_text' llega con los literales enmascarados porque el lector no tiene "
+            "'sql_console.execute' en ese destino. No se puede re-ejecutar tal cual."
+        ),
+    )
     danger_level: str
     statement_count: int
     status: str
@@ -228,5 +241,12 @@ class QueryHistoryOut(BaseModel):
     rows_affected: int
     duration_ms: int
     error_code: str | None = None
-    error_message: str | None = None
+    error_message: str | None = Field(
+        default=None,
+        description=(
+            "Mensaje SANEADO para todo lector (engine_error_catalog): primera línea, sin "
+            "valores de filas ni literales. El texto nativo completo solo lo recibe quien "
+            "ejecuta, en la respuesta de execute."
+        ),
+    )
     created_at: datetime

@@ -39,6 +39,8 @@ from app.core.environments import (
     QUERY_TIMEOUT_MS,
 )
 from app.core.logger import get_logger
+from app.core.scope import can_at
+from app.core.scope_targets import sql_console_for
 from app.exceptions import AppHttpException
 from app.models.query_execution import (
     STATUS_BLOCKED,
@@ -51,13 +53,15 @@ from app.schemas.query_console import (
     QueryConnectionIn,
     QueryErrorOut,
     QueryExecuteOut,
+    QueryHistoryOut,
     QueryPreviewOut,
     QueryReasonOut,
     QueryStatementPlanOut,
     QueryStatementResultOut,
 )
-from app.services import audit, confirm_token
-from app.services.db_admin import query_policy, query_runner
+from app.services import audit, confirm_token, engine_error_catalog
+from app.services.capability_catalog import Capability
+from app.services.db_admin import query_policy, query_runner, sql_masking
 from app.services.db_admin.identifiers import (
     reserved_database_names,
     validate_identifier,
@@ -747,6 +751,61 @@ class QueryConsoleController:
         server_id: int,
         *,
         database: str | None = None,
+        limit: int,
+        offset: int,
+        reader: "Actor",
+    ) -> tuple[list[QueryHistoryOut], int]:
+        """
+        Página del historial, SANEADA según quién lee. Nada se reescribe en la BD.
+
+        ``sql_console.history`` es de ``viewer``, un rol que no muta NI divulga, y el
+        ``sql_text`` guardado lleva los literales del lote (datos de negocio del tercero). Así
+        que el texto completo va solo a quien tiene ``sql_console.execute`` EN el destino de
+        esa fila —la misma regla de alcance que ``POST …/query/execute``—, que podría correr
+        la consulta igual; al resto le llega con ``sql_masking.mask_literals`` y
+        ``sql_masked=True``. ``reader`` es keyword y sin default: una llamada que se olvide de
+        decir quién lee falla con ``TypeError`` en vez de devolver el texto entero.
+
+        ``error_message`` se sanea para TODOS los lectores con ``engine_error_catalog``: lo
+        guardado es el ``str()`` nativo del motor (``Duplicate entry 'alice@x.com'``,
+        ``Failing row contains (…)``) y quien ejecuta ya lo recibió completo en la respuesta
+        de execute; el historial es un registro, no la consola.
+        """
+        items, total = self._history_rows(
+            server_id, database=database, limit=limit, offset=offset
+        )
+        full_text_at: dict[str | None, bool] = {}
+        out: list[QueryHistoryOut] = []
+        for row in items:
+            if row.database_name not in full_text_at:
+                full_text_at[row.database_name] = can_at(
+                    reader,
+                    Capability.SQL_CONSOLE_EXECUTE,
+                    sql_console_for(row.server_id, row.database_name),
+                )
+            masked = not full_text_at[row.database_name]
+            public_error = engine_error_catalog.from_text(row.error_message)
+            dto = QueryHistoryOut.model_validate(row)
+            out.append(
+                dto.model_copy(
+                    update={
+                        "sql_text": (
+                            sql_masking.mask_literals(row.sql_text, row.engine)
+                            if masked
+                            else row.sql_text
+                        ),
+                        "sql_masked": masked,
+                        "error_message": public_error.message if public_error else None,
+                    }
+                )
+            )
+        return out, total
+
+    def _history_rows(
+        self,
+        server_id: int,
+        *,
+        database: str | None,
         limit: int,
         offset: int,
     ) -> tuple[list[QueryExecution], int]:

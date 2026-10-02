@@ -561,12 +561,18 @@ def list_query_history(
     pagination: PaginationDep,
     database: str | None = Query(default=None, description="Filtra por base de datos."),
 ):
-    """Historial de ejecuciones de la consola (sin las filas devueltas, solo conteos)."""
+    """
+    Historial de ejecuciones de la consola (sin las filas devueltas, solo conteos).
+
+    ``sql_text`` llega completo solo a quien tiene ``sql_console.execute`` en el destino de la
+    fila; al resto, con los literales enmascarados y ``sql_masked=true``. ``error_message``
+    llega saneado para todos. Ver ``QueryConsoleController.list_history``.
+    """
     items, total = QueryConsoleController().list_history(
-        server_id, database=database, limit=pagination.size, offset=pagination.offset
+        server_id,
+        database=database,
+        limit=pagination.size,
+        offset=pagination.offset,
+        reader=actor,
     )
-    return paginated(
-        [QueryHistoryOut.model_validate(i) for i in items],
-        total=total,
-        pagination=pagination,
-    )
+    return paginated(items, total=total, pagination=pagination)

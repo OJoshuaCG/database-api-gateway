@@ -190,6 +190,10 @@ del usuario final.
 martes". Lo que sí se puede es **re-cargar el `sql_text` en el editor y volver a ejecutar**.
 Diseñá el historial como bitácora + atajo de re-ejecución, nunca como caché de resultados.
 
+**Y el `sql_text` puede llegar enmascarado.** Solo quien tiene `sql_console.execute` en el
+destino de la fila lo recibe completo; para el resto llega con `sql_masked: true` y cada literal
+como `?` (ver §7). El atajo de re-ejecución solo tiene sentido con `sql_masked: false`.
+
 ### 2.5 `dry_run` no es confiable para DDL en MySQL/MariaDB
 
 `dry_run: true` ejecuta el lote dentro de una transacción y hace `ROLLBACK` al final. Eso
@@ -622,10 +626,11 @@ Ordenado por id **descendente** (lo más reciente primero).
 | Campo | Nota |
 |---|---|
 | `status` | `success` (todo corrió sin error) · `error` (el motor rechazó alguna sentencia, **incluye falta de permisos**) · `blocked` (la política lo rechazó, **nunca se tocó el motor**) · `preview` (definido en el modelo, hoy no se escribe). |
-| `sql_text` | El lote completo, con cualquier literal de contraseña reemplazado por `'***'`, recortado a 16 KB. Es lo que la UI vuelve a cargar en el editor. |
+| `sql_text` | El lote completo, con cualquier literal de contraseña reemplazado por `'***'`, recortado a 16 KB. Es lo que la UI vuelve a cargar en el editor. **Solo completo para quien tiene `sql_console.execute` en el destino de la fila** (hoy `owner`, o la capacidad puntual otorgada en ese entorno/servidor). Para el resto (`viewer`, `operator`, un `owner` restringido ahí) llega con cada literal —strings, números, hex/bit, fechas, valores de `IN`/`VALUES`— reemplazado por `?`, sin comentarios y reformateado por sqlglot (o, si no parsea, por un escáner léxico conservador). Ej.: `UPDATE pedidos SET estado = ? WHERE creado_en < ?`. |
+| `sql_masked` | `true` = `sql_text` llega enmascarado para este lector. La UI debe explicarlo ("los valores se ocultan: necesitás permiso de ejecución en esta base") y **no ofrecer re-ejecutar** ese texto. Se decide **por fila**: una misma página puede mezclar filas enmascaradas y completas si el lector tiene permisos distintos por base. |
 | `run_as_username` / `connection_mode` | La identidad con la que se ejecutó. Es la columna más valiosa de la tabla: responde "¿con qué usuario probamos esto?". |
 | `admin_username` | Quién lo corrió desde el gateway. Puede ser `null`. |
-| `error_code` / `error_message` | Primer error del lote (o el de conexión). Para las filas `blocked`, `error_message` trae los motivos concatenados. |
+| `error_code` / `error_message` | Primer error del lote (o el de conexión). Para las filas `blocked`, `error_message` trae los motivos concatenados. `error_message` llega **saneado para todo lector** (`engine_error_catalog`): solo la primera línea, en la forma `(<código nativo>) <mensaje>`, con los valores entre comillas como `'?'` salvo nombres de objetos (`key`, `table`, `column`…). Ej.: `(1062) Duplicate entry '?' for key 'clientes.email'`. El texto nativo completo solo viaja en la respuesta de `execute`. |
 
 **Recordatorio:** no hay filas de resultado acá. Ver [§2.4](#24-el-historial-no-guarda-datos-solo-metadatos).
 
@@ -1395,14 +1400,16 @@ interface QueryHistoryOut {
   connection_mode: ConnectionMode;
   run_as_username: string;
   impersonated_role: string | null;
-  sql_text: string;               // contraseñas reemplazadas por '***'
+  sql_text: string;               // contraseñas '***'; literales '?' si sql_masked
+  sql_masked: boolean;            // true = sin sql_console.execute en ese destino
   danger_level: DangerLevel;
   statement_count: number;
   status: HistoryStatus;
   read_only: boolean; dry_run: boolean; committed: boolean;
   rows_returned: number; rows_affected: number;
   duration_ms: number;
-  error_code: string | null; error_message: string | null;
+  error_code: string | null;
+  error_message: string | null;   // saneado (engine_error_catalog) para todo lector
   created_at: string;
 }
 

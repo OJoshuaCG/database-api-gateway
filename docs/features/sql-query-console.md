@@ -271,6 +271,29 @@ las filas devueltas (son datos del usuario final, el gateway no es su custodio) 
 conteos, y que pasa el SQL por `redact_secrets` para que un `IDENTIFIED BY 'x'` no quede
 en claro.
 
+**Lectura del historial: quién ve el SQL completo.** `GET …/query/history` se lee con
+`sql_console.history`, que es de `viewer` (no muta **ni divulga**), pero `sql_text` guarda los
+literales del lote: e-mails, documentos, montos — datos de negocio del tercero. Por eso el
+texto se sanea **al leer** (nada se reescribe en la BD, y las filas viejas quedan cubiertas):
+
+- Quien tiene `sql_console.execute` **en el destino de esa fila** (misma regla de alcance que
+  `POST …/query/execute`: la fila del inventario si existe, si no la regla de servidor) recibe
+  el texto completo y `sql_masked: false`. Podría correr la consulta igual. Hoy es `owner`, o
+  cualquiera con la capacidad puntual otorgada en ese entorno/servidor.
+- El resto (`viewer`, `operator`, un `owner` restringido a `viewer` en ese entorno) recibe
+  `sql_masked: true` y cada literal reemplazado por `?` —strings, números, hex/bit, fechas,
+  los valores de un `IN` y de cada fila de `VALUES`— con palabras clave, identificadores y
+  funciones intactos, y **sin comentarios** (pueden llevar datos). Lo hace
+  `app/services/db_admin/sql_masking.py` con sqlglot por dialecto; si no parsea (texto
+  truncado al tope, sintaxis no modelada) cae a un escáner léxico conservador. **Nunca** se
+  devuelve el texto crudo ante un fallo. Un texto enmascarado no se puede re-ejecutar tal cual.
+- `error_message` se sanea **para todos** con `engine_error_catalog.from_text` (primera línea,
+  sin valores de filas): lo guardado es el texto nativo del motor (`Duplicate entry
+  'alice@x.com'…`), y quien ejecutó ya lo recibió completo en la respuesta de execute.
+
+La decisión se evalúa por fila con `scope.can_at`, el `assert_at` que no levanta ni deja
+rastro en `denial_audit`: un "no" acá decide qué mostrar, no es un intento denegado.
+
 ---
 
 ## 8. El día que exista 2FA

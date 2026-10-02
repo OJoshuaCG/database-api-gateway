@@ -344,28 +344,39 @@ def assert_at_point(actor: Actor, capability: Capability, point: ScopePoint) -> 
         raise _forbidden(actor, capability)
 
 
-def assert_layer2(actor: Actor, capability: Capability, target: ScopeTarget) -> None:
-    """Solo la capa 2. ``require_at`` la usa tras la capa 1 que ya corrió en ``_authenticate``."""
+def can_at(actor: Actor, capability: Capability, target: ScopeTarget) -> bool:
+    """
+    ``assert_at`` sin levantar: ¿capa 1 + capa 2 conceden ``capability`` en ``target``?
+
+    Es para DECIDIR QUÉ MOSTRAR, no para autorizar una operación: el historial de la consola
+    devuelve el SQL completo solo a quien podría ejecutarlo ahí. Por eso no deja rastro en
+    ``denial_audit`` —un "no" acá no es un intento denegado— y no es un ``try/except`` sobre el
+    403 de ``assert_at``, que sí lo dejaría. Misma regla y mismo camino rápido que ``assert_at``.
+    """
+    return actor.has(capability) and _layer2_allows(actor, capability, target)
+
+
+def _layer2_allows(actor: Actor, capability: Capability, target: ScopeTarget) -> bool:
+    """El veredicto de la capa 2, sin efectos. Lo comparten ``assert_layer2`` y ``can_at``."""
     if not needs_target_resolution(actor, capability):
-        return
+        return True
 
     puntos = resolve_points(target)
     if not puntos:
         # Blueprint sin BDs: no hay escritura remota, decide el rol base.
         base = actor.base_role if actor.base_role is not None else actor.role
-        if not _permits(actor, base, capability):
-            raise _forbidden(actor, capability)
-        return
+        return _permits(actor, base, capability)
 
     if target.quantifier == "any":
         # Un ítem con varios puntos (origen y destino de una clonación) se permite solo si TODOS
         # sus puntos se permiten; basta con un ítem permitido para pasar la capa 1 del lote.
-        ok = any(_item_verdicts(actor, capability, puntos).values())
-    else:
-        ok = all(
-            _permits(actor, role_at_point(actor, p), capability, p) for p in puntos
-        )
-    if not ok:
+        return any(_item_verdicts(actor, capability, puntos).values())
+    return all(_permits(actor, role_at_point(actor, p), capability, p) for p in puntos)
+
+
+def assert_layer2(actor: Actor, capability: Capability, target: ScopeTarget) -> None:
+    """Solo la capa 2. ``require_at`` la usa tras la capa 1 que ya corrió en ``_authenticate``."""
+    if not _layer2_allows(actor, capability, target):
         raise _forbidden(actor, capability)
 
 
