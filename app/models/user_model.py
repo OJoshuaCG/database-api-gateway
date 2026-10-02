@@ -502,14 +502,27 @@ class UserModel:
             )
             or []
         )
+        globales = [g["capability"] for g in globals_]
         return {
             "role": (row or {}).get("gateway_role") or "viewer",
             "grants": [(g["scope_type"], g["scope_id"], g["role"]) for g in grants],
-            "globals": [g["capability"] for g in globals_],
+            "globals": globales,
             "capability_grants": self._load_active_capability_grants(
                 user_id, include_inactive_user=include_inert
             ),
+            # Reglas de separación de deberes con excepción VIVA. Solo se consultan si la cuenta
+            # tiene `security_officer` (la única que puede violarlas): para el resto, cero
+            # consultas extra por request. Falla cerrado sin la tabla (``SodExceptionModel``).
+            "sod_exceptions": self._load_sod_exceptions(user_id)
+            if "security_officer" in globales
+            else [],
         }
+
+    @staticmethod
+    def _load_sod_exceptions(user_id: int) -> list[str]:
+        from app.models.sod_exception_model import SodExceptionModel
+
+        return SodExceptionModel().live_rules(user_id)
 
     def _load_active_capability_grants(
         self, user_id: int, *, include_inactive_user: bool = False

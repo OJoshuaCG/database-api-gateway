@@ -131,6 +131,15 @@ async def lifespan(app: FastAPI):
         CapabilityGrantController().expire_overdue()
     except Exception:
         logger.exception("Barrido de capacidades puntuales vencidas falló; se sigue.")
+    # Separación de deberes: cada combinación HEREDADA (owner/access_admin + security_officer en
+    # una cuenta) se avisa y se audita (`access.sod_grandfathered`) una vez por arranque. Es un
+    # reporte: no puede impedir el arranque.
+    try:
+        from app.services.sod_service import report_sod_violations
+
+        report_sod_violations()
+    except Exception:
+        logger.exception("Reporte de separación de deberes falló; se sigue.")
     # Artefactos de exportación: primero se purgan los vencidos y después se barren los
     # HUÉRFANOS (archivos sin fila viva, típicamente de un ``kill -9`` a mitad de la
     # generación). Sin el segundo barrido, un artefacto con los datos del origen en claro se

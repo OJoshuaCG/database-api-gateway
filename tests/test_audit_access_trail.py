@@ -91,7 +91,9 @@ def test_access_set_records_the_full_before_and_after(admin_client, server_paylo
     r = admin_client.put(
         f"/api/v1/gateway-users/{uid}/access",
         json={
-            "global_capabilities": ["security_officer"],
+            # `access_admin` y no `security_officer`: con un `owner` por alcance, este último
+            # viola la separación de deberes (409 `access.sod_conflict`).
+            "global_capabilities": ["access_admin"],
             "scope_grants": [{"scope_type": "environment", "scope_id": 1, "role": "owner"}],
         },
     )
@@ -105,7 +107,7 @@ def test_access_set_records_the_full_before_and_after(admin_client, server_paylo
         {"scope_type": "environment", "scope_id": 1, "role": "operator"},
         {"scope_type": "server", "scope_id": sid, "role": "viewer"},
     ]
-    assert d["after"]["global_capabilities"] == ["security_officer"]
+    assert d["after"]["global_capabilities"] == ["access_admin"]
     assert d["after"]["scope_grants"] == [
         {"scope_type": "environment", "scope_id": 1, "role": "owner"}
     ]

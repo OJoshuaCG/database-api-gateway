@@ -22,6 +22,22 @@ class ScopeGrantIn(BaseModel):
     role: str = Field(..., description="viewer | operator | owner")
 
 
+class SodOverrideIn(BaseModel):
+    """
+    Break-glass de la separación de deberes: permite, AUDITADO y con vencimiento, una cuenta que
+    junta ``security_officer`` con ``owner`` o con ``access_admin``.
+
+    Los límites (motivo de al menos 20 caracteres, de 1 a 168 horas) los valida el controller y
+    no Pydantic, para que el 422 lleve el código cerrado ``access.sod_override_invalid`` en vez
+    del error genérico de validación. Se ignora si el cambio no viola ninguna regla.
+    """
+
+    reason: str = Field(..., description="Motivo (mínimo 20 caracteres)")
+    expires_in_hours: int | None = Field(
+        None, description="Vigencia en horas, de 1 a 168 (7 días). Por defecto, 168"
+    )
+
+
 class GatewayUserCreate(BaseModel):
     """
     Alta de un usuario del gateway. **No hay campo de password, y es a propósito.**
@@ -40,6 +56,7 @@ class GatewayUserCreate(BaseModel):
     global_capabilities: list[str] = Field(
         default_factory=list, description="access_admin | security_officer"
     )
+    sod_override: SodOverrideIn | None = None
 
 
 class GatewayUserUpdate(BaseModel):
@@ -54,6 +71,8 @@ class GatewayUserUpdate(BaseModel):
     notes: str | None = None
     gateway_role: str | None = None
     is_active: bool | None = None
+    #: Solo cuenta si cambia ``gateway_role`` y el resultado viola la separación de deberes.
+    sod_override: SodOverrideIn | None = None
 
 
 class GatewayUserAccessIn(BaseModel):
@@ -67,6 +86,7 @@ class GatewayUserAccessIn(BaseModel):
 
     global_capabilities: list[str] = Field(default_factory=list)
     scope_grants: list[ScopeGrantIn] = Field(default_factory=list)
+    sod_override: SodOverrideIn | None = None
 
 
 class AcceptInviteIn(BaseModel):

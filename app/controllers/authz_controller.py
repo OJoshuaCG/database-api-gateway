@@ -1,5 +1,5 @@
 """
-Controller de la autorización: ``/auth/me`` y ``/authz/catalog``.
+Controller de la autorización: ``/auth/me``, ``/authz/catalog`` y ``/authz/sod-report``.
 
 No toca ningún motor: es todo plano de control. Vive como controller y no en la ruta porque el
 cálculo de ``capabilities`` tiene que salir del MISMO predicado que hace cumplir ``require()``,
@@ -98,7 +98,24 @@ class AuthzController:
             # cuándo vence la ventana para pedir la contraseña ANTES de abrir una confirmación.
             "step_up_enforced": step_up.enforced(),
             "step_up_expires_at": actor.step_up_until if actor.kind == "admin" else None,
+            # Separación de deberes de ESTA persona: combinación heredada, override vigente o
+            # `security_officer` neutralizado. Vacío en el caso normal y en tokens.
+            "sod_warnings": self._own_sod_warnings(actor),
         }
+
+    @staticmethod
+    def _own_sod_warnings(actor: Actor) -> list[dict]:
+        if actor.kind != "admin":
+            return []
+        from app.services.sod_service import warnings_for_user
+
+        return warnings_for_user(actor.id)
+
+    def sod_report(self) -> dict:
+        """``GET /authz/sod-report``: excepciones vivas y combinaciones sin cubrir."""
+        from app.services.sod_service import sod_report
+
+        return sod_report()
 
     @staticmethod
     def _own_live_grants(actor: Actor) -> list[dict]:

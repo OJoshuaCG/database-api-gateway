@@ -233,6 +233,9 @@ class ParsedAccess:
     scope_roles: tuple[tuple[str, int, GatewayRole], ...]
     globals_: frozenset[GlobalCapability]
     capability_grants: tuple[tuple[Capability, str, int, int | None], ...]
+    #: Reglas de separación de deberes que la cuenta viola SIN excepción viva: por ellas se le
+    #: descartó ``security_officer`` (ver ``parse_access_context``). Vacío en el caso normal.
+    sod_neutralized: tuple[str, ...] = ()
 
 
 def parse_access_context(ctx: dict) -> ParsedAccess:
@@ -300,12 +303,51 @@ def parse_access_context(ctx: dict) -> ParsedAccess:
         except ValueError:
             continue
 
+    capability_grants = tuple(parse_capability_grants(ctx.get("capability_grants")))
+    neutralized = _sod_neutralized(base, scope_roles, globals_, capability_grants, ctx)
+    if neutralized:
+        globals_.discard(GlobalCapability.SECURITY_OFFICER)
+
     return ParsedAccess(
         base=base,
         scope_roles=tuple(scope_roles),
         globals_=frozenset(globals_),
-        capability_grants=tuple(parse_capability_grants(ctx.get("capability_grants"))),
+        capability_grants=capability_grants,
+        sod_neutralized=neutralized,
     )
+
+
+def _sod_neutralized(base, scope_roles, globals_, capability_grants, ctx: dict) -> tuple[str, ...]:
+    """
+    Defensa al LEER de la separación de deberes (``app/core/separation_of_duties.py``).
+
+    Si la cuenta junta ``security_officer`` con ``owner`` (en cualquier forma) o con
+    ``access_admin`` y ninguna excepción viva cubre la regla (``ctx["sod_exceptions"]``: las
+    reglas cubiertas), se descarta ``security_officer``. Falla CERRADO: un ``ctx`` sin la clave
+    —armado a mano, o con la tabla ausente— no tiene excepciones. El escritor ya rechaza la
+    combinación; esto cubre lo que no pasó por él (un ``UPDATE`` a mano, una excepción vencida).
+
+    Se descarta la política y no lo otro: quitar ``access_admin`` podría dejar al gateway sin
+    nadie que lo repare, y ``owner`` es el trabajo diario de la persona. Pura: el aviso y la
+    denegación los registra ``get_current_actor``.
+    """
+    if GlobalCapability.SECURITY_OFFICER not in globals_:
+        return ()
+    from app.core.separation_of_duties import conflicts, uncovered
+
+    found = conflicts(
+        base_role=base,
+        scope_roles=scope_roles,
+        globals_=globals_,
+        capabilities=[(c, t, i) for c, t, i, _ in capability_grants],
+    )
+    resto = uncovered(found, ctx.get("sod_exceptions") or ())
+    if resto:
+        logger.warning(
+            "Separación de deberes: se descarta security_officer por %s sin excepción viva",
+            ",".join(sorted(resto)),
+        )
+    return tuple(sorted(resto))
 
 
 def explain(ctx: dict, *, active: bool = True) -> list[Entry]:

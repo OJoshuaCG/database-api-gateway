@@ -18,6 +18,9 @@ Quién puede qué (decisiones de negocio, no negociables acá)
 - Las 7 capacidades sensibles nacen ``pending`` y no surten efecto hasta que un SEGUNDO
   access_admin las apruebe (la aprobación es del B4). El resto nace ``active``.
 - Revocar lo hace un solo access_admin, sin techo: activa → ``revoked``, pendiente → ``cancelled``.
+- Separación de deberes: a una persona con ``security_officer`` no se le otorga (ni se le aprueba)
+  una capacidad exclusiva de ``owner`` sin excepción viva o ``sod_override`` (409
+  ``access.sod_conflict``). Ver ``app/core/separation_of_duties.py``.
 
 Aprobación (B4)
 ---------------
@@ -46,7 +49,7 @@ from app.controllers.gateway_user_controller import CODE_NOT_FOUND
 from app.exceptions import AppHttpException
 from app.models.capability_grant_model import CapabilityGrantModel
 from app.models.user_model import UserModel
-from app.services import audit
+from app.services import audit, sod_service
 from app.services.capability_catalog import (
     CODE_CAPABILITY_NOT_GRANTABLE,
     CODE_GRANT_CEILING,
@@ -57,6 +60,7 @@ from app.services.capability_catalog import (
     CODE_GRANT_USER_INACTIVE,
     CODE_SELF_APPROVAL,
     CODE_SELF_MODIFICATION,
+    CODE_SOD_CONFLICT,
     IMPLIED_READ,
     Capability,
     GlobalCapability,
@@ -250,7 +254,7 @@ class CapabilityGrantController:
         Orden de los chequeos (el primero que falla gana, y los más baratos y menos
         informativos van antes): ``access.admin`` en la ruta (403) → auto-otorgamiento (409) → usuario existe
         (404) y activo (409) → otorgable (422) → alcance existe (404) → techo (409) → duplicado
-        (409, con el ``UNIQUE`` de respaldo).
+        (409, con el ``UNIQUE`` de respaldo) → separación de deberes (409 / 422 del override).
         """
         capability = data["capability"]
         scope_type, scope_id = data["scope_type"], int(data["scope_id"])
@@ -308,6 +312,25 @@ class CapabilityGrantController:
                 public_context={"code": CODE_GRANT_DUPLICATE},
             )
 
+        # Separación de deberes sobre el estado RESULTANTE: lo que la persona tiene más esta
+        # capacidad (aunque nazca pendiente: surte efecto en cuanto se aprueba).
+        found = self._sod_conflicts(user_id, extra=(capability, scope_type, scope_id))
+        try:
+            plan = sod_service.check(
+                found,
+                covered=sod_service.covered_rules(user_id),
+                override=data.get("sod_override"),
+            )
+        except AppHttpException as exc:
+            if (exc.public_context or {}).get("code") == CODE_SOD_CONFLICT:
+                self._audit(action, actor, username, capability, scope_type, scope_id,
+                            grant_id=None, before=None, after=None, status="failure",
+                            reason="sod_conflict")
+            raise
+        if plan:
+            sod_service.record_override_intent(plan, admin=actor, target_id=user_id,
+                                               username=username)
+
         actor_id, _ = identity_of(actor)
         row = self.grants.insert(
             user_id=user_id,
@@ -318,10 +341,37 @@ class CapabilityGrantController:
             pending=sensitive,
             reason=(data.get("reason") or "").strip() or None,
         )
+        if plan:
+            sod_service.apply_override(plan, user_id=user_id, admin=actor, username=username)
         self._audit(action, actor, username, capability, scope_type, scope_id,
                     grant_id=row["id"], before=None, after=row["status"],
                     reason=row.get("request_reason"))
         return self._serialize(row)
+
+    def _sod_conflicts(self, user_id: int, *, extra: tuple | None = None) -> dict:
+        """
+        Reglas de separación de deberes que viola el estado de ``user_id`` con sus capacidades
+        puntuales VIVAS (más ``extra``, la que se está por otorgar). Ver
+        ``app/core/separation_of_duties.py``.
+        """
+        from app.core.separation_of_duties import conflicts
+
+        ctx = self.users.find_access_context(user_id)
+        capacidades = sod_service.live_capability_keys(user_id)
+        if extra is not None:
+            capacidades.append(extra)
+        return conflicts(
+            base_role=ctx.get("role"),
+            scope_roles=ctx.get("grants") or [],
+            globals_=ctx.get("globals") or [],
+            capabilities=capacidades,
+        )
+
+    def _sod_uncovered(self, user_id: int) -> dict:
+        """Lo que ``_sod_conflicts`` encuentra y ninguna excepción viva cubre."""
+        from app.core.separation_of_duties import uncovered
+
+        return uncovered(self._sod_conflicts(user_id), sod_service.covered_rules(user_id))
 
     # ------------------------------------------------------------------ #
     # Revocación                                                         #
@@ -365,6 +415,7 @@ class CapabilityGrantController:
             row["scope_type"], row["scope_id"], grant_id=grant_id, before=previous,
             after=new_status,
         )
+        sod_service.reconcile(user_id)
         return self._serialize(self.grants.get(grant_id))
 
     # ------------------------------------------------------------------ #
@@ -407,6 +458,11 @@ class CapabilityGrantController:
             actor, Capability(row["capability"]), self._point_for(row["scope_type"], row["scope_id"])
         ):
             return CODE_GRANT_CEILING
+        # Re-chequeo de la separación de deberes al aprobar: entre el alta y la aprobación la
+        # persona pudo recibir `security_officer`, o vencer el override que cubría la regla. La
+        # solicitud pendiente ya cuenta como viva en el estado.
+        if self._sod_uncovered(row["user_id"]):
+            return CODE_SOD_CONFLICT
         return None
 
     _BLOCK_MESSAGES = {
@@ -467,6 +523,8 @@ class CapabilityGrantController:
             self._audit("capability_grant.approved", actor, username, row["capability"],
                         row["scope_type"], row["scope_id"], grant_id=grant_id,
                         before="pending", after="pending", status="failure", reason=code)
+            if code == CODE_SOD_CONFLICT:
+                raise sod_service.conflict_error(self._sod_uncovered(row["user_id"]))
             message, status_code = self._BLOCK_MESSAGES.get(
                 code, ("No se puede aprobar esta solicitud.", 409)
             )
@@ -506,4 +564,5 @@ class CapabilityGrantController:
         self._audit("capability_grant.rejected", actor, (grantee or {}).get("username", ""),
                     row["capability"], row["scope_type"], row["scope_id"], grant_id=grant_id,
                     before="pending", after="rejected", reason=reason)
+        sod_service.reconcile(row["user_id"])
         return self._serialize(self.grants.get(grant_id))

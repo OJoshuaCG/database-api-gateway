@@ -51,6 +51,15 @@ capacidades puntuales, tokens) y `security_officer` = `{policy.admin, servers.ad
 catalogs.write, environments.write}`. Un `security_officer` **sin** `access_admin` no administra
 usuarios, y un `access_admin` sin `security_officer` no rota el cifrado (`api-reference-v29.md`).
 
+**Separación de deberes.** `security_officer` no puede convivir con `owner` (en ninguna forma)
+ni con `access_admin` en una cuenta: los escritores responden `409 access.sod_conflict` salvo un
+`sod_override` con motivo (auditado, vence en 7 días como mucho), y el lector descarta
+`security_officer` si la combinación no tiene excepción viva. El admin sembrado junta las tres
+cosas, así que `bootstrap_admin` le **hereda** la combinación (`sod_exceptions`,
+`reason='grandfathered'`) al sembrarlo o revivirlo, y el arranque la reporta
+(`access.sod_grandfathered`). Contrato completo en `api-reference-v29.md` §8; la regla, en
+`app/core/separation_of_duties.py`.
+
 > `is_superuser` **se retiró**: se escribía en tres lugares y no se leía en ninguno para
 > autorizar, así que no era "todavía no hay permisos" sino un sistema multiusuario sin puerta.
 > Retirarlo no cambió el contrato: `AdminOut` sigue siendo `{id, username}`.

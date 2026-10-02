@@ -193,6 +193,7 @@ def bootstrap_admin() -> None:
         # Reparación: se reactiva y se le devuelven las globales. La password NO se toca.
         user_model.update(existente["id"], {"is_active": True})
         user_model.grant_global_capabilities(ADMIN_USERNAME, globales)
+        _grandfather_seeded(existente["id"])
         audit.record(
             "access.bootstrap_recovery",
             admin=None,
@@ -228,4 +229,25 @@ def bootstrap_admin() -> None:
         }
     )
     user_model.grant_global_capabilities(ADMIN_USERNAME, globales)
+    sembrado = user_model.find_by_username(ADMIN_USERNAME)
+    if sembrado:
+        _grandfather_seeded(sembrado["id"])
     logger.info("Administrador '%s' sembrado.", ADMIN_USERNAME)
+
+
+def _grandfather_seeded(user_id: int) -> None:
+    """
+    La cuenta sembrada (o revivida) junta ``owner`` + ``access_admin`` + ``security_officer``, que
+    la separación de deberes prohíbe. Se le HEREDA la combinación (``sod_exceptions`` con
+    ``reason='grandfathered'``), igual que la migración ``f8b0d2e4a6c9`` a las instalaciones
+    existentes: sin esto, el lector le descartaría ``security_officer`` y una instalación nueva
+    quedaría sin quien escriba entornos ni catálogos. C4 cambia la siembra y esto se va.
+
+    Best-effort: si falla, el lector falla cerrado (sin ``security_officer``) y el arranque sigue.
+    """
+    try:
+        from app.services.sod_service import grandfather_user
+
+        grandfather_user(user_id)
+    except Exception:  # noqa: BLE001 — la siembra no puede impedir el arranque
+        logger.exception("No se pudo heredar la combinación del administrador sembrado.")

@@ -33,6 +33,22 @@ class MyCapabilityGrantOut(BaseModel):
     )
 
 
+class SodWarningOut(BaseModel):
+    """Una regla de separación de deberes que la cuenta de la sesión viola, y qué la cubre."""
+
+    rule: str = Field(..., description="owner_security_officer | access_admin_security_officer")
+    status: str = Field(
+        ...,
+        description=(
+            "grandfathered (combinación heredada, sin vencimiento) | override (break-glass "
+            "vigente) | neutralized (sin excepción: security_officer descartado)"
+        ),
+    )
+    reason: str | None = None
+    since: datetime | None = Field(None, description="Desde cuándo rige la excepción (UTC)")
+    expires_at: datetime | None = Field(None, description="Vencimiento del override (UTC)")
+
+
 class MeOut(BaseModel):
     """
     Identidad y capacidades EFECTIVAS del actor de la sesión.
@@ -113,6 +129,13 @@ class MeOut(BaseModel):
     )
     catalog_version: str = Field(
         ..., description="sha256 corto del catálogo, para invalidar caché del cliente"
+    )
+    sod_warnings: list[SodWarningOut] = Field(
+        default_factory=list,
+        description=(
+            "Avisos de separación de deberes de ESTA cuenta. Vacío en el caso normal. Campo "
+            "nuevo: la SPA lo declara .nullish()"
+        ),
     )
 
 
@@ -235,3 +258,41 @@ class EffectiveAccessOut(BaseModel):
     global_capabilities: list[str] = Field(default_factory=list)
     capabilities: list[EffectiveCapabilityOut] = Field(default_factory=list)
     catalog_version: str
+
+
+class SodUserRefOut(BaseModel):
+    id: int
+    username: str
+
+
+class SodExceptionOut(BaseModel):
+    """Una excepción VIVA a la separación de deberes."""
+
+    id: int
+    user: SodUserRefOut
+    user_active: bool | None = Field(
+        None, description="null si la cuenta ya no tiene security_officer"
+    )
+    rule: str = Field(..., description="owner_security_officer | access_admin_security_officer")
+    kind: str = Field(..., description="grandfathered | override")
+    reason: str
+    since: datetime | None = Field(None, description="Alta de la excepción (UTC)")
+    expires_at: datetime | None = Field(None, description="null = heredada, sin vencimiento")
+    requested_by: SodUserRefOut | None = None
+    approved_by: SodUserRefOut | None = Field(
+        None, description="Siempre null hasta que exista el segundo aprobador"
+    )
+    still_violating: bool = Field(..., description="La cuenta sigue violando la regla")
+
+
+class SodUncoveredOut(BaseModel):
+    """Una cuenta que viola una regla SIN excepción: al leer se le descarta security_officer."""
+
+    user: SodUserRefOut
+    user_active: bool
+    rules: list[str]
+
+
+class SodReportOut(BaseModel):
+    exceptions: list[SodExceptionOut] = Field(default_factory=list)
+    uncovered: list[SodUncoveredOut] = Field(default_factory=list)

@@ -74,6 +74,11 @@ def client():
     from app.core.denial_audit import reset_denial_state
 
     reset_denial_state()
+    # Y el reporte de separación de deberes: "una vez por arranque" es un set del proceso, y acá
+    # cada test es un arranque con la BD recién creada (los ids se repiten).
+    from app.services.sod_service import reset_sod_report_state
+
+    reset_sod_report_state()
 
     import main
 

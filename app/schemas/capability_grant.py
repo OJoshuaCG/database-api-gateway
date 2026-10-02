@@ -12,12 +12,17 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.gateway_user import SodOverrideIn
+
 
 class CapabilityGrantCreate(BaseModel):
     capability: str = Field(..., min_length=1, max_length=64)
     scope_type: Literal["environment", "server"]
     scope_id: int = Field(..., ge=1)
     reason: str | None = Field(None, max_length=500, description="Motivo declarado (opcional)")
+    #: Break-glass de la separación de deberes, si la persona tiene ``security_officer`` y la
+    #: capacidad es exclusiva de ``owner``. Ver ``SodOverrideIn``.
+    sod_override: SodOverrideIn | None = None
 
 
 class CapabilityGrantDecision(BaseModel):

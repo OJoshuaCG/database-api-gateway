@@ -510,6 +510,10 @@ GLOBAL_CAPABILITIES: Mapping[GlobalCapability, frozenset[Capability]] = MappingP
     }
 )
 
+#: Lo que ``owner`` tiene y ``operator`` no. Una capacidad puntual de este conjunto es ``owner``
+#: en sustancia, y por eso cuenta para la regla de separación de deberes ``SOD_RULE_OWNER``.
+OWNER_ONLY_CAPABILITIES: frozenset[Capability] = _OWNER - _OPERATOR
+
 #: Techo de lo que puede vivir en los scopes de un token de API (plan 12).
 AGENT_ALLOWED: frozenset[Capability] = frozenset(
     s.id for s in CAPABILITIES if s.agent_allowed
@@ -553,6 +557,23 @@ CODE_SELF_APPROVAL = "access.self_approval_forbidden"
 CODE_GRANT_NOT_PENDING = "access.grant_not_pending"
 #: La capacidad puntual no existe (o no pertenece a ese usuario). 404.
 CODE_GRANT_NOT_FOUND = "access.grant_not_found"
+
+# -- Separación de deberes (``app/core/separation_of_duties.py``) --------------------------- #
+#: El estado RESULTANTE de la cuenta junta ``security_officer`` con ``owner`` (en cualquier
+#: forma) o con ``access_admin``, sin una excepción viva que lo cubra ni ``sod_override``. 409.
+#: ``public_context`` lleva ``rules`` y ``conflicts`` (qué fuente choca con qué).
+CODE_SOD_CONFLICT = "access.sod_conflict"
+#: ``sod_override`` mal formado: motivo demasiado corto o duración fuera de rango. 422.
+CODE_SOD_OVERRIDE_INVALID = "access.sod_override_invalid"
+
+#: Reglas de separación de deberes: el valor de ``sod_exceptions.rule``. Vocabulario CERRADO.
+#: ``owner`` cuenta en cualquier forma: rol base, rol ``owner`` por alcance o una capacidad
+#: puntual exclusiva de ``owner`` (``OWNER_ONLY_CAPABILITIES``): es ``owner`` en sustancia.
+SOD_RULE_OWNER = "owner_security_officer"
+#: ``access_admin`` + ``security_officer`` en una cuenta reconstruye al administrador combinado
+#: que la partición de ``gateway.admin`` vino a deshacer.
+SOD_RULE_ACCESS_ADMIN = "access_admin_security_officer"
+SOD_RULES: tuple[str, ...] = (SOD_RULE_OWNER, SOD_RULE_ACCESS_ADMIN)
 
 # --------------------------------------------------------------------------- #
 # API                                                                          #

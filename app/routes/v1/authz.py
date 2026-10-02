@@ -10,7 +10,7 @@ from fastapi import APIRouter
 
 from app.controllers.authz_controller import AuthzController
 from app.core.authz import AccessAdmin, SelfRead
-from app.schemas.authz import CapabilityRowOut, ScopeReadinessOut
+from app.schemas.authz import CapabilityRowOut, ScopeReadinessOut, SodReportOut
 from app.utils.response import ApiResponse, success
 
 router = APIRouter(prefix="/authz", tags=["Authz"])
@@ -42,3 +42,17 @@ def scope_readiness(actor: AccessAdmin):
     tiene que actuar sobre el resultado. **Cero conexiones al motor.**
     """
     return success(data=AuthzController().scope_readiness())
+
+
+@router.get("/sod-report", response_model=ApiResponse[SodReportOut])
+def sod_report(actor: AccessAdmin):
+    """
+    Separación de deberes: las excepciones vivas —combinaciones HEREDADAS (``grandfathered``, sin
+    vencimiento) y overrides de break-glass (vencen en 7 días como mucho)— y las cuentas que violan
+    una regla SIN excepción, a las que el lector ya les descartó ``security_officer``.
+
+    Detrás de ``access.admin`` porque quien resuelve una combinación es quien administra accesos:
+    crea las cuentas separadas y le quita a la combinada lo que sobra. **Cero conexiones al
+    motor.**
+    """
+    return success(data=AuthzController().sod_report())

@@ -58,7 +58,7 @@ from app.core.scope import ScopeTarget, assert_layer2
 from app.core.step_up import assert_step_up, window_until
 from app.exceptions import AppHttpException
 from app.models.user_model import UserModel
-from app.services.capability_catalog import CODE_FORBIDDEN, Capability
+from app.services.capability_catalog import CODE_FORBIDDEN, CODE_SOD_CONFLICT, Capability
 
 
 def get_current_actor(request: Request) -> Actor:
@@ -79,9 +79,21 @@ def get_current_actor(request: Request) -> Actor:
 
     user, sesion = authenticated_session(request)
     ctx = UserModel().find_access_context(user["id"])
-    return actor_from_access_context(
-        user["id"], user["username"], ctx, step_up_until=window_until(sesion.step_up_at)
+    parsed = parse_access_context(ctx)
+    actor = _actor_from_parsed(
+        user["id"], user["username"], parsed, step_up_until=window_until(sesion.step_up_at)
     )
+    if parsed.sod_neutralized:
+        # Solo acá y no en `actor_from_access_context`: la vista de acceso efectivo también lo
+        # usa, y ahí el actor de la denegación sería la persona MIRADA, no quien mira.
+        record_denial(
+            CODE_SOD_CONFLICT,
+            actor=actor,
+            capability=None,
+            check="sod",
+            extra={"rules": list(parsed.sod_neutralized)},
+        )
+    return actor
 
 
 def actor_from_access_context(
@@ -96,7 +108,12 @@ def actor_from_access_context(
     también. Fail-closed en el lector — el camino de autenticación no puede caerse por una fila
     legada, y tampoco puede resolver a un default permisivo.
     """
-    parsed = parse_access_context(ctx)
+    return _actor_from_parsed(
+        user_id, username, parse_access_context(ctx), step_up_until=step_up_until
+    )
+
+
+def _actor_from_parsed(user_id: int, username: str, parsed, *, step_up_until=None) -> Actor:
     return admin_actor(
         user_id=user_id,
         username=username,

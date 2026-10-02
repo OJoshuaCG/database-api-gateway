@@ -53,6 +53,7 @@ from app.models.schema_comparison_item import SchemaComparisonItem
 from app.models.query_execution import QueryExecution
 from app.models.server import Server
 from app.models.server_user import ServerUser
+from app.models.sod_exception import SodException
 from app.models.user import User
 
 __all__ = [
@@ -61,6 +62,7 @@ __all__ = [
     "AccessGrant",
     "ApiToken",
     "CapabilityGrant",
+    "SodException",
     "GatewaySession",
     "UserGlobalCapability",
     "User",

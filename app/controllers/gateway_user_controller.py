@@ -38,8 +38,9 @@ from app.core.authz import assert_not_last_access_admin
 from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.models.user_model import UserModel
-from app.services import audit, confirm_token
+from app.services import audit, confirm_token, sod_service
 from app.core.actor import Actor, identity_of
+from app.core.separation_of_duties import conflicts as sod_conflicts
 from app.services.capability_catalog import (
     CODE_GRANT_CEILING,
     CODE_GRANT_SCOPE_NOT_FOUND,
@@ -219,6 +220,15 @@ class GatewayUserController:
         )
         globales = self._validate_globals(data.get("global_capabilities") or [])
         self._assert_within_ceiling(admin, base_role=rol, new_globals=globales)
+        # Separación de deberes sobre el estado RESULTANTE. Una cuenta nueva no tiene
+        # excepciones: o la combinación es válida, o viene con `sod_override`.
+        plan = sod_service.check(
+            sod_conflicts(base_role=rol, scope_roles=[], globals_=globales),
+            covered=(),
+            override=data.get("sod_override"),
+        )
+        if plan:
+            sod_service.record_override_intent(plan, admin=admin, target_id=None, username=username)
 
         user_id = self.users.create(
             {
@@ -235,6 +245,9 @@ class GatewayUserController:
         )
         if globales:
             self.users.grant_global_capabilities(username, [g.value for g in globales])
+
+        if plan:
+            sod_service.apply_override(plan, user_id=user_id, admin=admin, username=username)
 
         token, expira = self._issue_invite(user_id, epoch=0)
         audit.record(
@@ -331,6 +344,8 @@ class GatewayUserController:
         # La foto ANTES de validar nada: es lo que el rastro compara contra el después.
         antes = self._access_snapshot(fila)
         cambios: dict = {}
+        plan = None
+        cambia_rol = False
 
         if "gateway_role" in data and data["gateway_role"] is not None:
             nuevo = self._validate_role(data["gateway_role"])
@@ -338,6 +353,10 @@ class GatewayUserController:
             if nuevo.value != actual:
                 self._guard_not_self(admin, user_id, action="cambiar tu propio rol")
                 self._assert_within_ceiling(admin, base_role=nuevo)
+                cambia_rol = True
+                plan = self._assert_sod(
+                    user_id, data.get("sod_override"), base_role=nuevo.value
+                )
             cambios["gateway_role"] = nuevo.value
 
         if "is_active" in data and data["is_active"] is not None:
@@ -351,6 +370,10 @@ class GatewayUserController:
                 cambios[campo] = data[campo]
 
         if cambios:
+            if plan:
+                sod_service.record_override_intent(
+                    plan, admin=admin, target_id=user_id, username=fila["username"]
+                )
             if cambios.get("is_active") is False and fila.get("is_active"):
                 # El pre-chequeo de arriba falla temprano; éste es el candado: cuenta y escribe
                 # en la MISMA transacción con las filas bloqueadas (ver
@@ -360,6 +383,12 @@ class GatewayUserController:
                 )
             else:
                 self.users.update(user_id, cambios)
+            if plan:
+                sod_service.apply_override(
+                    plan, user_id=user_id, admin=admin, username=fila["username"]
+                )
+            elif cambia_rol:
+                sod_service.reconcile(user_id)
             audit.record(
                 "gateway_user.update",
                 admin=admin,
@@ -445,18 +474,36 @@ class GatewayUserController:
             ],
         )
 
+        plan = self._assert_sod(
+            user_id,
+            data.get("sod_override"),
+            base_role=actual.get("role"),
+            scope_roles=grants,
+            globals_=[g.value for g in globales],
+        )
+
         quita_access_admin = GlobalCapability.ACCESS_ADMIN not in globales
         accion_last_admin = "quitarle 'access_admin' a este usuario"
         if quita_access_admin:
             # Pre-chequeo para fallar temprano; el candado está en `replace_access`.
             assert_not_last_access_admin(user_id, action=accion_last_admin)
 
+        if plan:
+            sod_service.record_override_intent(
+                plan, admin=admin, target_id=user_id, username=fila["username"]
+            )
         self.users.replace_access(
             user_id,
             grants=grants,
             globals_=[g.value for g in globales],
             last_admin_action=accion_last_admin if quita_access_admin else None,
         )
+        if plan:
+            sod_service.apply_override(
+                plan, user_id=user_id, admin=admin, username=fila["username"]
+            )
+        else:
+            sod_service.reconcile(user_id)
         audit.record(
             "gateway_user.access_set",
             admin=admin,
@@ -479,6 +526,35 @@ class GatewayUserController:
     # ------------------------------------------------------------------ #
     # Guards anti auto-escalada                                          #
     # ------------------------------------------------------------------ #
+    def _assert_sod(
+        self,
+        user_id: int,
+        override,
+        *,
+        base_role: str | None = None,
+        scope_roles: "list[tuple[str, int, str]] | None" = None,
+        globals_: "list[str] | None" = None,
+    ) -> "sod_service.OverridePlan | None":
+        """
+        Separación de deberes sobre el estado RESULTANTE de ``user_id``: lo que el payload cambia
+        (``base_role`` / ``scope_roles`` / ``globals_``; ``None`` = queda como está) sobre lo que
+        ya tiene, más sus capacidades puntuales VIVAS.
+
+        409 ``access.sod_conflict`` si viola una regla que ninguna excepción viva cubre y no hay
+        ``sod_override``. Una cuenta HEREDADA (el admin sembrado) sigue editable mientras el
+        cambio no agregue una regla nueva: su excepción la cubre. Ver ``sod_service.check``.
+        """
+        actual = self.users.find_access_context(user_id)
+        found = sod_conflicts(
+            base_role=actual.get("role") if base_role is None else base_role,
+            scope_roles=(actual.get("grants") or []) if scope_roles is None else scope_roles,
+            globals_=(actual.get("globals") or []) if globals_ is None else globals_,
+            capabilities=sod_service.live_capability_keys(user_id),
+        )
+        return sod_service.check(
+            found, covered=sod_service.covered_rules(user_id), override=override
+        )
+
     @staticmethod
     def _assert_scopes_exist(grants: list[tuple[str, int, str]]) -> None:
         """
