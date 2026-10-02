@@ -202,3 +202,23 @@ def test_me_expires_overdue_pending_before_listing(admin_client):
         conn.execute(text("UPDATE capability_grants SET expires_at = '2000-01-01 00:00:00' "
                           "WHERE id = :i"), {"i": g["id"]})
     assert ca.get("/api/v1/auth/me").json()["data"]["capability_grants"] == []
+
+
+def test_me_survives_a_grants_table_failure(admin_client, monkeypatch):
+    """
+    Sin la tabla (código desplegado antes que la migración, o tras un downgrade) ``/auth/me``
+    sigue respondiendo con la lista vacía: es lo que arranca la SPA, y el vencimiento
+    perezoso y la lectura de capacidades puntuales son accesorios, no autorización.
+    """
+    from app.controllers.capability_grant_controller import CapabilityGrantController
+    from app.models.capability_grant_model import CapabilityGrantModel
+
+    def _falla(*_args, **_kwargs):
+        raise RuntimeError("no such table: capability_grants")
+
+    monkeypatch.setattr(CapabilityGrantController, "expire_overdue", _falla)
+    monkeypatch.setattr(CapabilityGrantModel, "list_live_for_user", _falla)
+
+    r = admin_client.get("/api/v1/auth/me")
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["capability_grants"] == []

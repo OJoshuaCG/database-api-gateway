@@ -8,10 +8,29 @@ y eso es lógica, no serialización.
 
 import hashlib
 import json
+import logging
 
 from app.core.actor import Actor
 from app.models.user_model import UserModel
 from app.services.capability_catalog import Capability, capability_matrix, spec
+
+logger = logging.getLogger(__name__)
+
+
+def _sweep_expired_grants() -> None:
+    """
+    Vencimiento perezoso (D6) sin poder tumbar la lectura que lo dispara.
+
+    Es mantenimiento, no autorización: si falla —la tabla todavía no existe porque el código
+    llegó antes que la migración, o se hizo un downgrade— se registra y se sigue, igual que el
+    barrido de arranque en ``main.py``. El loader de la autorización ya ignora las vencidas.
+    """
+    from app.controllers.capability_grant_controller import CapabilityGrantController
+
+    try:
+        CapabilityGrantController().expire_overdue()
+    except Exception:
+        logger.exception("Vencimiento perezoso de capacidades puntuales falló; se sigue.")
 
 
 def _catalog_version() -> str:
@@ -85,13 +104,18 @@ class AuthzController:
         """
         if actor.kind != "admin":
             return []
-        from app.controllers.capability_grant_controller import CapabilityGrantController
         from app.models.capability_grant_model import CapabilityGrantModel
 
-        CapabilityGrantController().expire_overdue()
+        _sweep_expired_grants()
         model = CapabilityGrantModel()
-        filas = model.list_live_for_user(actor.id)
-        nombres = model.scope_names([(f["scope_type"], f["scope_id"]) for f in filas])
+        try:
+            filas = model.list_live_for_user(actor.id)
+            nombres = model.scope_names([(f["scope_type"], f["scope_id"]) for f in filas])
+        except Exception:
+            # /auth/me es lo que arranca la SPA: sin la tabla se publica la lista vacía (que es
+            # lo que el loader de la autorización aplica en ese caso) en vez de un 500.
+            logger.exception("No se pudieron leer las capacidades puntuales de la sesión.")
+            return []
         return [
             {
                 "id": f["id"],
@@ -131,9 +155,7 @@ class AuthzController:
                 public_context={"code": CODE_NOT_FOUND},
                 context={"user_id": user_id},
             )
-        from app.controllers.capability_grant_controller import CapabilityGrantController
-
-        CapabilityGrantController().expire_overdue()
+        _sweep_expired_grants()
         activo = bool(usuario.get("is_active"))
         ctx = UserModel().find_access_context(user_id, include_inert=True)
         modelo = actor_from_access_context(user_id, usuario["username"], ctx)
