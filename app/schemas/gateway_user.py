@@ -153,3 +153,23 @@ class InviteOut(BaseModel):
 
 class AcceptInviteOut(BaseModel):
     username: str
+
+
+class GatewayUserSessionOut(BaseModel):
+    """
+    Una sesión VIVA de otra persona, vista por quien administra accesos.
+
+    **Sin el ``sid`` ni su prefijo** (el ``sid`` es la credencial de sesión) y sin el hash del
+    User-Agent. Ver ``session_store.list_unexpired_for_user``.
+    """
+
+    created_at: datetime = Field(..., description="Inicio de la sesión (UTC)")
+    last_seen_at: datetime = Field(..., description="Último request visto (UTC)")
+    expires_at: datetime = Field(
+        ..., description="Vencimiento absoluto (UTC): created_at + SESSION_ABSOLUTE_MAX_HOURS"
+    )
+    ip: str | None = Field(None, description="IP del login")
+
+
+class GatewayUserSessionsRevokedOut(BaseModel):
+    revoked: int = Field(..., description="Cuántas sesiones vivas se cerraron")

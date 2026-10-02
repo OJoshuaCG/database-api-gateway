@@ -243,6 +243,35 @@ Las capacidades marcadas `requires_step_up` en el catálogo (`/authz/catalog`; l
 
 El diseño completo está en el docstring de `app/core/step_up.py`.
 
+## Sesiones
+
+Las sesiones viven del lado del servidor (`gateway_sessions`); la cookie lleva solo el `sid`
+firmado. Vencen por **vida absoluta** (`SESSION_ABSOLUTE_MAX_HOURS`, default 12, contra
+`created_at`) y por **inactividad** (`SESSION_IDLE_MINUTES`, default 60, contra `last_seen_at`).
+Toda revocación tacha la fila con un motivo de vocabulario cerrado (`revoked_reason`) y el
+siguiente request de esa sesión responde `401 auth.session_<motivo>`, con un mensaje propio por
+motivo (`_MENSAJE_401` en `app/core/auth.py`).
+
+| Ruta | Capacidad | Qué hace |
+|---|---|---|
+| `GET /auth/sessions` | `self.read` | Las sesiones vivas propias, con `sid_prefix` (8 caracteres) y `current`. |
+| `POST /auth/sessions/revoke-others` | `self.read` | Cierra las propias **menos la actual** (motivo `admin_revoked`). |
+| `GET /gateway-users/{id}/sessions` | `access.admin` | Las sesiones vivas de OTRA persona: `created_at`, `last_seen_at`, `expires_at`, `ip`. **Sin `sid` ni prefijo.** |
+| `POST /gateway-users/{id}/sessions/revoke` | `access.admin` + step-up | Cierra **todas** las sesiones vivas de otra persona (motivo `access_admin_revoked` → `401 auth.session_access_admin_revoked`). Sobre uno mismo, `409 access.self_modification_forbidden`. Auditado `gateway_user.sessions_revoked` con la cantidad. |
+
+Además cortan sesiones, como efecto: cambiar el rol o desactivar la cuenta (`role_change`),
+cambiar la contraseña propia (`password_change`: todas, y la respuesta abre una sesión nueva), cinco
+fallos seguidos de step-up (`step_up_failed`) y el logout (`logout`).
+
+**Revocar sesiones no toca la contraseña.** Ante una credencial filtrada, la revocación
+administrativa va junto con desactivar la cuenta; si no, quien tiene la contraseña vuelve a
+entrar. Las filas ya vencidas y sin tachar no se cuentan ni se re-etiquetan: conservan el motivo
+real (`idle`/`absolute`) que les pone el próximo intento.
+
+**La auditoría la lee otra función.** Quien corta sesiones (`access_admin`) no lee
+`GET /audit-log`: eso es `policy.admin` (`security_officer`), para que el revisado no se revise a
+sí mismo. Contrato completo de las dos piezas en `api-reference-v29.md` §11.
+
 ## Migración a SSO (futuro)
 
 Como todos los endpoints dependen de `get_current_admin`, sustituir el mecanismo por

@@ -38,6 +38,10 @@ _MENSAJE_401 = {
     session_store.REASON_PASSWORD_CHANGE: "La contraseña cambió: las sesiones se cerraron.",
     session_store.REASON_ROLE_CHANGE: "Tus permisos cambiaron: volvé a iniciar sesión.",
     session_store.REASON_ADMIN_REVOKED: "La sesión fue revocada.",
+    session_store.REASON_ACCESS_ADMIN_REVOKED: (
+        "Un administrador de accesos cerró tus sesiones. Volvé a iniciar sesión; si no lo "
+        "esperabas, consultalo con quien administra los accesos."
+    ),
     session_store.REASON_STEP_UP_FAILED: (
         "La sesión se cerró tras varios intentos fallidos de confirmar la contraseña. "
         "Volvé a iniciar sesión."

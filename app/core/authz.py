@@ -399,5 +399,6 @@ EnvironmentsWrite = Annotated[Actor, Depends(require(Capability.ENVIRONMENTS_WRI
 #: Usuarios del gateway, accesos, capacidades puntuales, tokens y preparación de alcances. Solo
 #: la global ``access_admin``.
 AccessAdmin = Annotated[Actor, Depends(require(Capability.ACCESS_ADMIN_CAP))]
-#: Política del propio gateway: rotación del cifrado. Solo la global ``security_officer``.
+#: Política del propio gateway: rotación del cifrado y lectura de la auditoría. Solo la global
+#: ``security_officer``.
 PolicyAdmin = Annotated[Actor, Depends(require(Capability.POLICY_ADMIN))]

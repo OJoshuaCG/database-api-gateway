@@ -32,6 +32,8 @@ from app.schemas.gateway_user import (
     GatewayUserCreate,
     GatewayUserCreatedOut,
     GatewayUserOut,
+    GatewayUserSessionOut,
+    GatewayUserSessionsRevokedOut,
     GatewayUserUpdate,
     InviteOut,
 )
@@ -270,3 +272,31 @@ def get_effective_access(actor: AccessAdmin, user_id: int):
     MISMO resolvedor que hace cumplir ``require()``. Solo ``access_admin`` (403 opaco si no).
     """
     return success(data=AuthzController().effective_access(user_id, actor))
+
+
+@router.get("/{user_id}/sessions", response_model=ApiResponse[list[GatewayUserSessionOut]])
+def list_gateway_user_sessions(actor: AccessAdmin, user_id: int):
+    """
+    Las sesiones VIVAS de la persona (sin tachar ni vencidas), la más reciente primero.
+
+    **Sin ``sid`` ni prefijo**: el ``sid`` es la credencial de sesión. Para revocarlas no hace
+    falta identificarlas, porque la revocación administrativa cierra todas. 404
+    ``gateway_user.not_found`` si la cuenta no existe.
+    """
+    return success(data=GatewayUserController().list_sessions(user_id))
+
+
+@router.post(
+    "/{user_id}/sessions/revoke", response_model=ApiResponse[GatewayUserSessionsRevokedOut]
+)
+def revoke_gateway_user_sessions(actor: AccessAdmin, user_id: int):
+    """
+    Cierra TODAS las sesiones vivas de OTRA persona. Su próximo request responde ``401
+    auth.session_access_admin_revoked``. No toca la contraseña ni el acceso.
+
+    Pide step-up (``access.admin``, método no seguro). Sobre uno mismo: ``409
+    access.self_modification_forbidden`` (lo propio es ``POST /auth/sessions/revoke-others``).
+    Auditado ``gateway_user.sessions_revoked`` con la cantidad.
+    """
+    data = GatewayUserController().revoke_sessions(user_id, admin=actor)
+    return success(data=data, message=f"{data['revoked']} sesión(es) cerrada(s).")

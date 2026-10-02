@@ -98,7 +98,10 @@ class GatewaySession(Base):
     revoked_reason: Mapped[str | None] = mapped_column(
         String(32),
         nullable=True,
-        comment="logout | password_change | role_change | absolute | idle | admin_revoked",
+        comment=(
+            "logout | password_change | role_change | absolute | idle | admin_revoked | "
+            "access_admin_revoked | step_up_failed"
+        ),
     )
 
     # STEP-UP: la ventana de "sudo mode" vive en la SESIÓN y no en el usuario, porque es una

@@ -497,6 +497,54 @@ class GatewayUserController:
             )
         return actualizado
 
+    # ------------------------------------------------------------------ #
+    # Sesiones de OTRA persona                                           #
+    # ------------------------------------------------------------------ #
+    def list_sessions(self, user_id: int) -> list[dict]:
+        """Las sesiones vivas de la persona, sin ``sid``. 404 si la cuenta no existe."""
+        from app.core import session_store
+
+        self._get_or_404(user_id)
+        return session_store.list_unexpired_for_user(user_id)
+
+    def revoke_sessions(self, user_id: int, *, admin) -> dict:
+        """
+        Cierra TODAS las sesiones vivas de OTRA persona, con motivo ``access_admin_revoked``.
+
+        Es la respuesta a "esta cuenta está comprometida" sin tener que desactivarla ni cambiarle
+        el rol (los dos únicos caminos que antes cortaban sesiones, como efecto secundario). No
+        toca la credencial: quien tenga la contraseña puede volver a entrar, así que ante una
+        contraseña filtrada esto va junto con el cambio de contraseña o la desactivación.
+
+        Sobre uno mismo es 409 ``access.self_modification_forbidden``: para eso está
+        ``POST /auth/sessions/revoke-others``, que conserva la sesión actual (esta ruta echaría a
+        quien la llama de la sesión desde la que actúa). Se audita ``gateway_user.sessions_revoked``
+        con la cantidad, aunque sea 0: el rastro es de la DECISIÓN, no solo de su efecto.
+        """
+        from app.core import session_store
+
+        self._guard_not_self(admin, user_id, action="revocar tus propias sesiones por esta vía")
+        fila = self._get_or_404(user_id)
+        revocadas = session_store.revoke_unexpired_for_user(
+            user_id, session_store.REASON_ACCESS_ADMIN_REVOKED
+        )
+        audit.record(
+            "gateway_user.sessions_revoked",
+            admin=admin,
+            target_type="user",
+            target_id=user_id,
+            touched_engine=False,
+            detail=json.dumps(
+                {
+                    "username": fila["username"],
+                    "revoked": revocadas,
+                    "reason": session_store.REASON_ACCESS_ADMIN_REVOKED,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        return {"revoked": revocadas}
+
     @staticmethod
     def _cancel_pending_requests(user_id: int) -> None:
         """

@@ -79,6 +79,11 @@ REASON_ROLE_CHANGE = "role_change"
 REASON_ABSOLUTE = "absolute"
 REASON_IDLE = "idle"
 REASON_ADMIN_REVOKED = "admin_revoked"
+#: Un ``access_admin`` cerró las sesiones de OTRA persona (``POST /gateway-users/{id}/sessions/
+#: revoke``). Distinto de ``admin_revoked``, que es el genérico de la revocación propia
+#: (``/auth/sessions/revoke-others``), de la cuenta desactivada y del fallback de una fila sin
+#: motivo: quien recibe el 401 tiene que poder distinguir "me echaron" de "se cerró".
+REASON_ACCESS_ADMIN_REVOKED = "access_admin_revoked"
 #: La sesión acumuló ``STEP_UP_MAX_FAILURES`` confirmaciones de contraseña fallidas seguidas: una
 #: cookie robada sin la contraseña tiene que terminar, no seguir probando.
 REASON_STEP_UP_FAILED = "step_up_failed"
@@ -347,6 +352,69 @@ def revoke_all_for_user(user_id: int, reason: str, *, except_sid: str | None = N
     return _write(
         stmt.values(revoked_at=_utcnow(), revoked_reason=reason), best_effort=False
     )
+
+
+def _unexpired(ahora: datetime):
+    """
+    Condiciones de una sesión que sigue viva AHORA: sin tachar y sin vencer por absoluto ni por
+    inactividad. Una fila vencida y todavía sin tachar (el vencimiento se tacha perezosamente, en
+    el próximo ``resolve_session``) NO cuenta: ya no autentica a nadie.
+    """
+    return (
+        GatewaySession.revoked_at.is_(None),
+        GatewaySession.created_at > ahora - timedelta(hours=SESSION_ABSOLUTE_MAX_HOURS),
+        GatewaySession.last_seen_at > ahora - timedelta(minutes=SESSION_IDLE_MINUTES),
+    )
+
+
+def revoke_unexpired_for_user(user_id: int, reason: str) -> int:
+    """
+    Tacha las sesiones VIVAS de OTRO usuario (revocación administrativa). Devuelve cuántas.
+
+    A diferencia de ``revoke_all_for_user``, deja en paz las filas ya vencidas y sin tachar:
+    tacharlas con este motivo reescribiría el verdadero (``idle``/``absolute``), que es lo que
+    el próximo ``resolve_session`` les va a poner, y el conteo que ve quien revoca incluiría
+    sesiones que ya no autenticaban a nadie. Una sola sentencia, sin lectura previa (ver el
+    docstring del módulo).
+    """
+    ahora = _utcnow()
+    return _write(
+        update(GatewaySession)
+        .where(GatewaySession.user_id == user_id, *_unexpired(ahora))
+        .values(revoked_at=ahora, revoked_reason=reason),
+        best_effort=False,
+    )
+
+
+def list_unexpired_for_user(user_id: int) -> list[dict]:
+    """
+    Las sesiones VIVAS de un usuario, para quien administra accesos. La más reciente primero.
+
+    **Sin ningún rastro del ``sid``, ni siquiera el prefijo** que ve el propio usuario: el prefijo
+    existe para que la persona distinga SU sesión actual de las otras, y quien mira las de otro no
+    necesita distinguirlas (la revocación administrativa cierra todas). Tampoco el
+    ``user_agent_hash``. Sí la IP del login: es lo que permite decir "esta sesión no es suya".
+    """
+    ahora = _utcnow()
+    session = _session()
+    try:
+        filas = (
+            session.query(GatewaySession)
+            .filter(GatewaySession.user_id == user_id, *_unexpired(ahora))
+            .order_by(GatewaySession.last_seen_at.desc(), GatewaySession.created_at.desc())
+            .all()
+        )
+        return [
+            {
+                "created_at": f.created_at,
+                "last_seen_at": f.last_seen_at,
+                "expires_at": f.created_at + timedelta(hours=SESSION_ABSOLUTE_MAX_HOURS),
+                "ip": f.ip,
+            }
+            for f in filas
+        ]
+    finally:
+        session.close()
 
 
 def list_for_user(user_id: int, *, current_sid: str | None) -> list[dict]:
