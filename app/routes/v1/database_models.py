@@ -16,13 +16,12 @@ from app.core.authz import (
     BlueprintsRead,
     BlueprintsWrite,
     DatabasesRead,
-    DatabasesWrite,
     require_at,
 )
 from app.core.actor import Actor
 from app.core.limiter import limiter
 from app.core.scope import assert_at
-from app.core.scope_targets import snapshot_source, snapshot_source_for
+from app.core.scope_targets import model, snapshot_source, snapshot_source_for
 from app.schemas.database_model import (
     DatabaseModelCreate,
     DatabaseModelOut,
@@ -42,6 +41,15 @@ from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
 router = APIRouter(prefix="/database-models", tags=["Database Models"])
+
+# Capa 2 de operaciones de blueprint: escriben en CADA BD que lo replica, así que la capacidad se
+# exige en el entorno más protegido de todas (un blueprint sin BDs decide por el rol base).
+BlueprintsWriteModel = Annotated[
+    Actor, Depends(require_at(Capability.BLUEPRINTS_WRITE, target=model))
+]
+DatabasesWriteModel = Annotated[
+    Actor, Depends(require_at(Capability.DATABASES_WRITE, target=model))
+]
 
 # El snapshot LEE la BD de origen (``server_id`` + ``database`` del payload): la capa 2 se evalúa
 # sobre esa fuente. Escribir el blueprint nuevo no apunta a ninguna BD.
@@ -144,7 +152,7 @@ def version_tables_report(request: Request, actor: BlueprintsRead, model_id: int
 )
 @limiter.limit("10/minute")
 def rename_slug_plan(
-    request: Request, actor: BlueprintsWrite, model_id: int, payload: RenameSlugIn
+    request: Request, actor: BlueprintsWriteModel, model_id: int, payload: RenameSlugIn
 ):
     """
     Preflight del renombrado del slug. **No escribe nada**, ni en el gateway ni en un motor.
@@ -171,7 +179,7 @@ def rename_slug_plan(
     response_model=ApiResponse[RenameSlugPlanOut],
 )
 @limiter.limit("10/minute")
-def migrate_version_table_plan(request: Request, actor: BlueprintsWrite, model_id: int):
+def migrate_version_table_plan(request: Request, actor: BlueprintsWriteModel, model_id: int):
     """
     Preflight de la migración de PREFIJO de la tabla de versión. **No escribe nada.**
 
@@ -197,7 +205,7 @@ def migrate_version_table_plan(request: Request, actor: BlueprintsWrite, model_i
 @limiter.limit("3/minute")
 def migrate_version_table(
     request: Request,
-    actor: BlueprintsWrite,
+    actor: BlueprintsWriteModel,
     model_id: int,
     payload: MigrateVersionTableIn,
 ):
@@ -221,7 +229,7 @@ def migrate_version_table(
 @router.post("/{model_id}/rename-slug", response_model=ApiResponse[RenameSlugOut])
 @limiter.limit("3/minute")
 def rename_slug(
-    request: Request, actor: BlueprintsWrite, model_id: int, payload: RenameSlugIn
+    request: Request, actor: BlueprintsWriteModel, model_id: int, payload: RenameSlugIn
 ):
     """
     Cambia el `slug` del blueprint y **renombra su tabla de versión en cada BD gestionada**.
@@ -273,7 +281,9 @@ def list_model_databases(actor: DatabasesRead, model_id: int):
     response_model=ApiResponse[list[ModelDatabaseStatusOut]],
 )
 @limiter.limit("10/minute")
-def refresh_model_databases(request: Request, actor: DatabasesWrite, model_id: int):
+def refresh_model_databases(
+    request: Request, actor: DatabasesWriteModel, model_id: int
+):
     """
     🔌 Relee la versión REAL de cada BD del blueprint y resincroniza la copia del gateway.
 

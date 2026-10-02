@@ -8,7 +8,7 @@ masivo (síncrono, acotado) sobre todas las BDs del blueprint.
 from datetime import date
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Path, Query, Request
+from fastapi import APIRouter, Depends, Path, Query, Request
 
 from app.controllers.managed_migration_controller import ManagedMigrationController
 from app.controllers.model_migration_controller import (
@@ -16,13 +16,16 @@ from app.controllers.model_migration_controller import (
     SEARCH_MIN_LENGTH,
     ModelMigrationController,
 )
+from app.core.actor import Actor
 from app.core.authz import (
     BlueprintsApply,
     BlueprintsRead,
     BlueprintsWrite,
     assert_capability,
+    require_at,
 )
 from app.core.limiter import limiter
+from app.core.scope_targets import model
 from app.schemas.model_migration import (
     ApplyAllOut,
     MigrationDeleteOut,
@@ -42,6 +45,12 @@ from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, paginated, success
 
 router = APIRouter(prefix="/database-models", tags=["Model Migrations"])
+
+# Capa 2: borrar una versión renumera y mueve el puntero de las BDs del blueprint (escritura
+# remota), así que se exige en el entorno más protegido entre ellas. Sin BDs, rol base.
+BlueprintsApplyModel = Annotated[
+    Actor, Depends(require_at(Capability.BLUEPRINTS_APPLY, target=model))
+]
 
 _VERSION_PATH = Path(..., pattern=r"^\d{4,10}$", description="Versión: 0001, 0002…")
 
@@ -325,7 +334,9 @@ def update_migration(
     "/{model_id}/migrations/{version}/delete-plan",
     response_model=ApiResponse[MigrationDeletePlanOut],
 )
-def plan_delete_migration(actor: BlueprintsApply, model_id: int, version: str = _VERSION_PATH):
+def plan_delete_migration(
+    actor: BlueprintsApplyModel, model_id: int, version: str = _VERSION_PATH
+):
     """
     Preview del borrado: qué versiones se renumeran, qué punteros se mueven y qué lo bloquea.
 
@@ -344,7 +355,7 @@ def plan_delete_migration(actor: BlueprintsApply, model_id: int, version: str = 
     response_model=ApiResponse[MigrationDeleteOut],
 )
 def delete_migration(
-    actor: BlueprintsApply,
+    actor: BlueprintsApplyModel,
     model_id: int,
     version: str = _VERSION_PATH,
     confirm_token: str | None = Query(

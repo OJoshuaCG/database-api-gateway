@@ -264,6 +264,8 @@ destino resuelven al más restrictivo.**
 `scope_type` acepta exactamente `"environment"` y `"server"`; `scope_id` es `>= 1`. Antes de
 otorgar el primer grant conviene consultar `GET /authz/scope-readiness` (v23 §8): una base sin
 entorno se trata como el entorno **más protegido**, no como el default.
+El reporte trae además `server_resolution_inventory_only: true` (siempre): la regla a nivel servidor mira
+solo las BDs inventariadas (F-17); una BD del motor fuera del inventario no cuenta.
 
 Igual que el `PATCH`, **este endpoint tacha todas las sesiones** de la persona afectada.
 

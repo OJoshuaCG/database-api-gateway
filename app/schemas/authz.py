@@ -138,3 +138,12 @@ class ScopeReadinessOut(BaseModel):
         None, description="El entorno más protegido: a este resuelve todo lo que no esté clasificado"
     )
     servers: list[ScopeReadinessServerOut] = Field(default_factory=list)
+    server_resolution_inventory_only: bool = Field(
+        True,
+        description=(
+            "Siempre true (F-17). La resolución de entorno a nivel SERVIDOR considera solo las "
+            "BDs del inventario del gateway: una BD que existe en el motor pero no está "
+            "inventariada no cuenta para la regla del entorno más protegido, y el gateway no "
+            "lista el motor durante la autorización. Inventariarla es lo que la incorpora"
+        ),
+    )

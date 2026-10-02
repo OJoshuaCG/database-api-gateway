@@ -275,3 +275,18 @@ alguna vez divergen, el guard es el más estricto, que es la dirección correcta
   entorno era indistinguible de un cambio de `notes`.
 - **`stamp` quedó documentado como la puerta trasera** de cualquier política que se apoye en la
   caché de versión, y su auditoría dice explícitamente que DECLARA sin ejecutar DDL.
+
+## Alcance por destino: operaciones de blueprint y limitación F-17
+
+- **Operaciones de blueprint** (`rename-slug` y su plan, `migrate-version-table` y su plan,
+  `DELETE` de migración y su `delete-plan`, `databases/refresh`, `blueprint-version` de una
+  conversión de collation) escriben en CADA BD que replica el blueprint. La capacidad se exige en
+  el entorno **más protegido** entre ellas: un operador de `development` con lector en
+  `production` no puede renombrar el slug de un blueprint que tiene una BD en producción. Un
+  blueprint **sin BDs** no escribe en ningún motor y decide el rol base del actor. Un blueprint
+  inexistente responde igual que "no podés" (403), no 404.
+- **F-17 (conocida, no resuelta a propósito).** La resolución a nivel SERVIDOR considera solo las
+  BDs **inventariadas**. Una BD que existe en el motor pero no está en el inventario no cuenta
+  para la regla del entorno más protegido, y el gateway no lista el motor durante la
+  autorización (cada autorización abriría conexiones). Inventariar la BD (`adopt`) la incorpora.
+  `GET /authz/scope-readiness` lo declara con `server_resolution_inventory_only: true`, siempre.

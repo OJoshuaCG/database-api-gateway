@@ -41,16 +41,21 @@ tardar horas: por eso las respuestas llevan ``runs_serially`` y el polling trae 
 o la UI no puede distinguir "en cola" de "colgado".
 """
 
-from fastapi import APIRouter, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Request
 
 from app.controllers.collation_conversion_controller import CollationConversionController
 from app.controllers.database_model_controller import DatabaseModelController
+from app.core.actor import Actor
 from app.core.authz import (
     CollationExecute,
     CollationRead,
-    assert_capability,
+    require_at,
 )
 from app.core.limiter import limiter
+from app.core.scope import assert_at
+from app.core.scope_targets import model
 from app.services.capability_catalog import Capability
 from app.schemas.collation_conversion import (
     CollationBatchCreate,
@@ -65,6 +70,12 @@ from app.schemas.database_model import CollationDriftOut
 from app.utils.response import ApiResponse, success
 
 router = APIRouter(prefix="/database-models", tags=["Collation Batches"])
+
+# Capa 2: registrar la versión stampea las N BDs del blueprint, así que se exige en el entorno más
+# protegido entre ellas. Solo el scope: el escalamiento F-6 (blueprints.apply) queda fuera.
+CollationExecuteModel = Annotated[
+    Actor, Depends(require_at(Capability.COLLATION_EXECUTE, target=model))
+]
 
 
 @router.post(
@@ -186,7 +197,7 @@ def cancel_collation_batch(
 @limiter.limit("3/minute")
 def create_collation_blueprint_version(
     request: Request,
-    actor: CollationExecute,
+    actor: CollationExecuteModel,
     model_id: int,
     batch_id: int,
     payload: CollationBlueprintVersionIn,
@@ -212,7 +223,7 @@ def create_collation_blueprint_version(
     si los conjuntos de tablas difieren, si alguna conversión fue parcial, si alguna base está
     en cuarentena, o si el SQL supera el tope por versión.
     """
-    assert_capability(actor, Capability.BLUEPRINTS_WRITE)
+    assert_at(actor, Capability.BLUEPRINTS_WRITE, model(model_id))
     data = CollationConversionController().create_blueprint_version(
         model_id, batch_id, name=payload.name, admin=actor
     )

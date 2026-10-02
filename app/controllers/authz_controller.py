@@ -90,6 +90,10 @@ class AuthzController:
         El plan lo pone como PRECONDICIÓN y no como una pantalla más: se clasifica primero, se
         otorga después. Este reporte es lo que dice cuánto falta.
 
+        **Limitación F-17**: la resolución a nivel servidor mira solo las BDs INVENTARIADAS; una BD
+        del motor fuera del inventario no cuenta para el entorno más protegido. Se informa en
+        ``server_resolution_inventory_only`` (siempre true) en vez de listar el motor.
+
         **Cero conexiones al motor**: se lee el inventario del gateway y nada más. Un reporte de
         preparación que dependa de que N motores respondan es un reporte que no se puede correr
         el día que hace falta.
@@ -155,6 +159,9 @@ class AuthzController:
                 "ready": sin_clasificar == 0,
                 "fallback_environment_slug": env.slug if env else None,
                 "servers": por_servidor,
+                # F-17: documentado y expuesto, no resuelto. Listar el motor al autorizar rompería
+                # la regla de cero conexiones; el reporte avisa que el hueco existe.
+                "server_resolution_inventory_only": True,
             }
         finally:
             session.close()

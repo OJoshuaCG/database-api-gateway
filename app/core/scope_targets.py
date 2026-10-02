@@ -58,6 +58,16 @@ def server_database(server_id: int, database: str) -> ScopeTarget:
     return ScopeTarget("server_database", (server_id, database))
 
 
+def model(model_id: int) -> ScopeTarget:
+    """
+    Un blueprint entero: el entorno MÁS PROTEGIDO entre sus BDs (cuantificador ``all``).
+
+    Las operaciones de blueprint escriben en cada BD que lo replica, así que se evalúan en el
+    peor entorno. Un blueprint sin BDs no escribe en ningún motor: decide el rol base.
+    """
+    return ScopeTarget("model", (model_id,))
+
+
 def server_user(user_id: int) -> ScopeTarget:
     """Un usuario del motor del inventario: el servidor de su fila (``ServerUser.server_id``)."""
     return ScopeTarget("server_user", (user_id,))
@@ -209,6 +219,7 @@ async def clone_create(request: Request) -> ScopeTarget:
 TARGET_KINDS: dict[Callable[..., ScopeTarget], str] = {
     database: "database",
     database_update: "database_update",
+    model: "model",
     server: "server",
     server_database: "server_database",
     server_user: "server_user",
@@ -262,6 +273,38 @@ def _points_database_update(params: tuple) -> list[ScopePoint]:
         if existe and valor != actual:
             return []
     return _points_database((db_id,))
+
+
+def _points_model(params: tuple) -> list[ScopePoint]:
+    from app.models.database_model import DatabaseModel
+    from app.models.managed_database import ManagedDatabase
+
+    (model_id,) = params
+    session = _session()
+    try:
+        existe = session.get(DatabaseModel, model_id) is not None
+        filas = (
+            session.query(
+                ManagedDatabase.id, ManagedDatabase.server_id, ManagedDatabase.environment_id
+            )
+            .filter(ManagedDatabase.model_id == model_id)
+            .all()
+        )
+    finally:
+        session.close()
+    if not existe:
+        # Un blueprint inexistente no es "sin BDs": es indistinguible de "no podés" (fail-closed).
+        return _unresolvable()
+    # Sin BDs devuelve [] a propósito: no hay escritura remota y ``assert_layer2`` cae al rol base.
+    # Una BD sin entorno resuelve al más protegido, igual que en ``_points_database``.
+    return [
+        ScopePoint(
+            environment_id=env if env is not None else most_protected_environment_id(),
+            server_id=sid,
+            item_id=db_id,
+        )
+        for (db_id, sid, env) in filas
+    ]
 
 
 def _points_server(params: tuple) -> list[ScopePoint]:
@@ -508,6 +551,7 @@ def _points_comparison(params: tuple) -> list[ScopePoint]:
 _RESOLVERS: dict[str, Callable[[tuple], list[ScopePoint]]] = {
     "database": _points_database,
     "database_update": _points_database_update,
+    "model": _points_model,
     "server": _points_server,
     "server_database": _points_server_database,
     "server_user": _points_server_user,

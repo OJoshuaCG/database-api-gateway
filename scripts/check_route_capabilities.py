@@ -173,29 +173,21 @@ SCOPE_EXEMPT: dict[tuple[str, str], str] = {
 #: ``MAX_SCOPE_PENDING`` impide agregar. Llega a vacío en la última unidad de trabajo.
 SCOPE_PENDING: frozenset[tuple[str, str]] = frozenset(
     {
-        ("DELETE", "/api/v1/database-models/{model_id}/migrations/{version}"),
-        ("GET", "/api/v1/database-models/{model_id}/migrations/{version}/delete-plan"),
         ("POST", "/api/v1/database-clone-batches"),
         ("POST", "/api/v1/database-clone-batches/{batch_id}/cancel"),
         ("POST", "/api/v1/database-clone-batches/{batch_id}/execute"),
         ("POST", "/api/v1/database-clone-batches/{batch_id}/retry-failed"),
         ("POST", "/api/v1/database-models/{model_id}/collation-conversions"),
-        ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/blueprint-version"),
         ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/cancel"),
         ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/execute"),
-        ("POST", "/api/v1/database-models/{model_id}/databases/refresh"),
-        ("POST", "/api/v1/database-models/{model_id}/migrate-version-table"),
-        ("POST", "/api/v1/database-models/{model_id}/migrate-version-table/plan"),
         ("POST", "/api/v1/database-models/{model_id}/migrations/apply-all"),
-        ("POST", "/api/v1/database-models/{model_id}/rename-slug"),
-        ("POST", "/api/v1/database-models/{model_id}/rename-slug/plan"),
         ("POST", "/api/v1/server-users/{user_id}/apply-profile/{profile_id}/bulk"),
     }
 )
 
 #: Tope de ``SCOPE_PENDING``. **Solo puede BAJAR.** Mismo trinquete que ``MIN_MIGRATED_ROUTES``,
 #: en la otra dirección: sin él, agregar una ruta a la lista pendiente sería gratis.
-MAX_SCOPE_PENDING = 17
+MAX_SCOPE_PENDING = 9
 
 
 def _iter_routes(app, prefix: str = ""):
