@@ -5,7 +5,7 @@ Genera una DEK nueva, **re-cifra todas las credenciales** almacenadas (de la DEK
 actual a la nueva) y marca la DEK nueva como activa, todo en UNA transacción.
 `SECRET_KEY` (la KEK) NO cambia → no hay que tocar el `.env` ni reiniciar.
 
-Columnas re-cifradas: `servers.root_password_encrypted` y
+Columnas re-cifradas: `servers.root_password_encrypted`, `servers.readonly_password_encrypted` y
 `server_users.password_encrypted`.
 
 Limitación: si llega un cifrado concurrente justo durante la rotación podría quedar con
@@ -37,6 +37,11 @@ def rotate_data_key() -> dict:
             if server.root_password_encrypted:
                 plaintext = old.decrypt(server.root_password_encrypted.encode("utf-8"))
                 server.root_password_encrypted = new.encrypt(plaintext).decode("utf-8")
+            # La credencial de solo lectura del MCP usa la MISMA DEK: sin re-cifrarla acá, la
+            # primera rotación la dejaba indescifrable y el servidor salía del MCP sin aviso.
+            if server.readonly_password_encrypted:
+                plaintext = old.decrypt(server.readonly_password_encrypted.encode("utf-8"))
+                server.readonly_password_encrypted = new.encrypt(plaintext).decode("utf-8")
                 servers_reencrypted += 1
 
         users_reencrypted = 0

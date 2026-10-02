@@ -5,6 +5,7 @@ datos de filas de las tablas gestionadas: solo estructura/metadatos.
 """
 
 import enum
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -32,6 +33,9 @@ class ConnectionInfo(BaseModel):
     ok: bool
     dialect: str
     server_version: str | None = None
+    # Solo en ``test-connection?credential=readonly``: cuándo quedó verificada la sonda negativa
+    # de la credencial de solo lectura del MCP. ``None`` en la prueba con la pseudo-root.
+    readonly_verified_at: datetime | None = None
 
 
 class EngineUserInfo(BaseModel):

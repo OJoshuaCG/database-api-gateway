@@ -32,7 +32,11 @@ from app.models.managed_database import ManagedDatabase
 from app.models.server import Server
 from app.models.server_user import ServerUser
 from app.services import audit
-from app.services.server_catalog import CODE_CREDENTIAL_REQUIRED_FOR_REBIND
+from app.services.server_catalog import (
+    CODE_CREDENTIAL_REQUIRED_FOR_REBIND,
+    CODE_READONLY_CREDENTIAL_MISSING,
+    CODE_READONLY_PROBE_FAILED,
+)
 from app.services.db_admin.dtos import (
     ConnectionInfo,
     EngineUserInfo,
@@ -74,6 +78,12 @@ class ServerController:
             "is_active": s.is_active,
             "notes": s.notes,
             "has_root_password": bool(s.root_password_encrypted),
+            # La credencial de solo lectura del MCP: si existe y cuándo se verificó. Nunca el
+            # usuario ni el cifrado (plan 12 §5.2).
+            "has_readonly_credential": bool(
+                s.readonly_username and s.readonly_password_encrypted
+            ),
+            "readonly_verified_at": s.readonly_verified_at,
             "created_at": s.created_at,
             "updated_at": s.updated_at,
         }
@@ -268,6 +278,16 @@ class ServerController:
                     },
                 )
             changed: list[str] = []
+            # Re-apuntar el servidor DESCARTA la credencial de solo lectura del MCP. Es el mismo
+            # agujero que el de ``root_password``: sin esto, la próxima tool del MCP le mandaba
+            # esa credencial al host nuevo. Acá no se exige reenviarla en el mismo PATCH porque
+            # vive en su propio endpoint; se borra (fail-closed) y el servidor sale del MCP hasta
+            # que alguien la vuelva a registrar y verificar contra el destino nuevo.
+            if rebind and (server.readonly_username or server.readonly_password_encrypted):
+                server.readonly_username = None
+                server.readonly_password_encrypted = None
+                server.readonly_verified_at = None
+                changed.append("credencial de solo lectura descartada por re-apuntado")
             for field in ("name", "host", "port", "notes", "is_active", "root_username", "ssl_mode"):
                 if field in data:
                     if getattr(server, field) != data[field]:
@@ -380,7 +400,15 @@ class ServerController:
         finally:
             session.close()
 
-    def test_connection(self, server_id: int) -> ConnectionInfo:
+    def test_connection(
+        self,
+        server_id: int,
+        *,
+        credential: str = "root",
+        admin: "dict | Actor | None" = None,
+    ) -> ConnectionInfo:
+        if credential == "readonly":
+            return self._verify_readonly(server_id, admin=admin)
         adapter = get_adapter(self._build_target(server_id))
         try:
             info = adapter.test_connection()
@@ -389,6 +417,189 @@ class ServerController:
             raise
         self._set_status(server_id, ServerStatus.active)
         return info
+
+    # ------------------------------------------------------------------ #
+    # Credencial de SOLO LECTURA del MCP (plan 12 §5.2)                    #
+    # ------------------------------------------------------------------ #
+    def set_readonly_credential(
+        self, server_id: int, data: dict, *, admin: "dict | Actor | None" = None
+    ) -> dict:
+        """
+        Registra o reemplaza la credencial de solo lectura que usa el MCP para leer catálogos.
+
+        **Borra la verificación** (``readonly_verified_at``) en el mismo paso: la observación de
+        la sonda describe a la credencial ANTERIOR, y heredarla dejaría al MCP confiando en una
+        cuenta que nadie probó. Hasta la próxima ``test-connection?credential=readonly`` el
+        servidor queda fuera del MCP — el gate lo niega con ``mcp.readonly_credential_missing``.
+
+        AUDITADO sin el usuario ni la contraseña: solo que la credencial cambió y sobre qué
+        servidor.
+        """
+        session = self._session()
+        try:
+            server = self._get_or_404(session, server_id)
+            reemplazo = bool(server.readonly_username)
+            server.readonly_username = data["username"]
+            server.readonly_password_encrypted = self._encrypt_password(data["password"])
+            server.readonly_verified_at = None
+            session.commit()
+            session.refresh(server)
+            result = self._serialize(server)
+        finally:
+            session.close()
+        audit.record(
+            "server.readonly_credential.set",
+            admin=admin,
+            target_type="server",
+            target_id=server_id,
+            server_id=server_id,
+            detail=(
+                "credencial de solo lectura reemplazada; verificación borrada"
+                if reemplazo
+                else "credencial de solo lectura registrada; pendiente de verificación"
+            ),
+        )
+        # El cache de engines indexa por usuario y huella de contraseña, así que no reusaría el
+        # engine viejo; se invalida igual para no dejar vivo un pool con la credencial anterior.
+        remote_engine.invalidate_server(server_id)
+        return result
+
+    def clear_readonly_credential(
+        self, server_id: int, *, admin: "dict | Actor | None" = None
+    ) -> dict:
+        """
+        Quita la credencial de solo lectura: el servidor sale del alcance del MCP de inmediato.
+
+        Es la palanca de emergencia granular del plan 12 §8 —corta a UN servidor sin tocar
+        tokens, entornos ni bases— y por eso es idempotente: quitarla dos veces no es un error.
+        """
+        session = self._session()
+        try:
+            server = self._get_or_404(session, server_id)
+            tenia = bool(server.readonly_username or server.readonly_password_encrypted)
+            server.readonly_username = None
+            server.readonly_password_encrypted = None
+            server.readonly_verified_at = None
+            session.commit()
+            session.refresh(server)
+            result = self._serialize(server)
+        finally:
+            session.close()
+        audit.record(
+            "server.readonly_credential.clear",
+            admin=admin,
+            target_type="server",
+            target_id=server_id,
+            server_id=server_id,
+            detail="credencial de solo lectura quitada" if tenia else "no tenía credencial",
+        )
+        remote_engine.invalidate_server(server_id)
+        return result
+
+    def _build_readonly_target(self, server_id: int) -> ServerTarget:
+        """
+        ``ServerTarget`` con la credencial de SOLO LECTURA. **Nunca lee la pseudo-root**: si la
+        credencial no está, falla — no hay fallback, con ningún flag.
+        """
+        session = self._session()
+        try:
+            server = self._get_or_404(session, server_id)
+            if not (server.readonly_username and server.readonly_password_encrypted):
+                raise AppHttpException(
+                    message=(
+                        "El servidor no tiene credencial de solo lectura registrada. Registrala "
+                        "con PUT /servers/{id}/readonly-credential antes de verificarla."
+                    ),
+                    status_code=409,
+                    context={"server_id": server_id},
+                    public_context={"code": CODE_READONLY_CREDENTIAL_MISSING},
+                )
+            try:
+                password = decrypt(server.readonly_password_encrypted)
+            except (CryptoError, CryptoConfigError) as exc:
+                raise AppHttpException(
+                    message="No se pudo descifrar la credencial de solo lectura del servidor.",
+                    status_code=500,
+                    context={"server_id": server_id},
+                ) from exc
+            engine_value = (
+                server.engine.value
+                if isinstance(server.engine, EngineType)
+                else str(server.engine)
+            )
+            return ServerTarget(
+                server_id=server.id,
+                dialect=engine_value,
+                host=server.host,
+                port=server.port,
+                admin_user=server.readonly_username,
+                admin_password=password,
+                ssl_mode=server.ssl_mode if server.ssl_mode is not None else REMOTE_SSL_MODE,
+            )
+        finally:
+            session.close()
+
+    def _verify_readonly(
+        self, server_id: int, *, admin: "dict | Actor | None" = None
+    ) -> ConnectionInfo:
+        """
+        Sonda NEGATIVA (plan 12 §5.2): conecta con la credencial de solo lectura y exige que el
+        motor observe que NO puede escribir. Solo si pasa, fija ``readonly_verified_at``.
+
+        Un fallo **borra** la verificación anterior en vez de dejarla: una credencial que hoy
+        puede escribir no sigue en el MCP porque hace dos semanas no podía. No toca el ``status``
+        del servidor: ese describe la conexión con la pseudo-root, no esta.
+        """
+        from datetime import UTC, datetime
+
+        target = self._build_readonly_target(server_id)
+        adapter = get_adapter(target)
+        info = adapter.test_connection()
+        violaciones = adapter.readonly_violations()
+        session = self._session()
+        try:
+            server = self._get_or_404(session, server_id)
+            if violaciones:
+                server.readonly_verified_at = None
+            else:
+                server.readonly_verified_at = datetime.now(UTC).replace(tzinfo=None)
+            session.commit()
+            verificada = server.readonly_verified_at
+        finally:
+            session.close()
+        if violaciones:
+            audit.record(
+                "server.readonly_credential.verify",
+                status="failure",
+                admin=admin,
+                target_type="server",
+                target_id=server_id,
+                server_id=server_id,
+                touched_engine=True,
+                detail="la credencial puede escribir: " + ", ".join(violaciones),
+            )
+            raise AppHttpException(
+                message=(
+                    "La credencial de solo lectura tiene privilegios de escritura o de más. "
+                    "El servidor queda fuera del MCP hasta corregir sus grants."
+                ),
+                status_code=422,
+                context={"server_id": server_id},
+                public_context={
+                    "code": CODE_READONLY_PROBE_FAILED,
+                    "violations": violaciones,
+                },
+            )
+        audit.record(
+            "server.readonly_credential.verify",
+            admin=admin,
+            target_type="server",
+            target_id=server_id,
+            server_id=server_id,
+            touched_engine=True,
+            detail="sonda negativa superada: el motor no permite escribir con la credencial",
+        )
+        return info.model_copy(update={"readonly_verified_at": verificada})
 
     def list_databases(self, server_id: int) -> list[str]:
         return get_adapter(self._build_target(server_id)).list_databases()

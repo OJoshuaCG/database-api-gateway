@@ -5,7 +5,9 @@ Guarda los datos de conexión y la credencial pseudo-root (CIFRADA con Fernet).
 La credencial nunca se expone en respuestas ni se loguea.
 """
 
-from sqlalchemy import Boolean, Integer, String, Text, UniqueConstraint
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy import Enum as SQLAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -84,6 +86,29 @@ class Server(Base, TimestampMixin):
 
     notes: Mapped[str | None] = mapped_column(
         Text, nullable=True, comment="Notas adicionales sobre el servidor"
+    )
+
+    # ---- Credencial de SOLO LECTURA del MCP (plan 12 §5.2) ---- #
+    # Separada de la pseudo-root a propósito: el MCP nunca habla con el motor como root, ni
+    # siquiera como fallback. Sin estas tres columnas completas y con la sonda reciente, el
+    # servidor queda fuera del alcance de toda tool que lea el motor. Borrarlas es la palanca
+    # de emergencia granular: saca a UN servidor del MCP sin tocar nada más.
+    readonly_username: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        comment="Usuario de SOLO LECTURA para el MCP. NULL = servidor fuera del MCP",
+    )
+
+    readonly_password_encrypted: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Password de solo lectura CIFRADO (Fernet). Nunca se expone ni se loguea",
+    )
+
+    readonly_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+        comment="Última sonda negativa exitosa: el motor rechazó escribir con esta credencial",
     )
 
     def __repr__(self) -> str:

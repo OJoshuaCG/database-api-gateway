@@ -72,8 +72,28 @@ class ServerOut(BaseModel):
     is_active: bool
     notes: str | None = None
     has_root_password: bool = False
+    # Credencial de SOLO LECTURA del MCP: solo si existe y cuándo se verificó. Ni el usuario ni
+    # el cifrado salen nunca (plan 12 §5.2).
+    has_readonly_credential: bool = False
+    readonly_verified_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class ReadonlyCredentialIn(BaseModel):
+    """
+    Alta o reemplazo de la credencial de solo lectura que usa el MCP para leer el catálogo.
+
+    Reemplazarla **borra la verificación**: una credencial nueva no hereda la observación de la
+    anterior, así que hasta que alguien corra ``test-connection?credential=readonly`` el servidor
+    queda fuera del MCP.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(..., min_length=1, max_length=128)
+    # Entra en texto plano; el controller lo cifra antes de persistir.
+    password: str = Field(..., min_length=1)
 
 
 # ─── Reconciliación (drift): plano en vivo vs inventario del gateway ───────── #

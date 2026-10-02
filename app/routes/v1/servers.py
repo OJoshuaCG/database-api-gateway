@@ -5,7 +5,7 @@ CRUD del inventario (solo BD del gateway) + operaciones contra el servidor desti
 (test-connection e introspección de estructura). Todos requieren admin autenticado.
 """
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
 
@@ -16,6 +16,7 @@ from app.controllers.server_database_controller import ServerDatabaseController
 from app.controllers.server_user_controller import ServerUserController
 from app.core.authz import (
     DatabasesRead,
+    assert_capability,
     EngineUsersRead,
     ServersAdmin,
     ServersRead,
@@ -47,7 +48,13 @@ from app.schemas.server_database import (
     DatabaseGranteesOut,
     DropPreviewOut,
 )
-from app.schemas.server import ReconcileResult, ServerCreate, ServerOut, ServerUpdate
+from app.schemas.server import (
+    ReadonlyCredentialIn,
+    ReconcileResult,
+    ServerCreate,
+    ServerOut,
+    ServerUpdate,
+)
 from app.schemas.server_user import (
     AddHostIn,
     AddHostOut,
@@ -140,8 +147,53 @@ def delete_server(actor: ServersAdmin, server_id: int):
 
 # ----------------------- Operaciones en el destino ------------------------ #
 @router.post("/{server_id}/test-connection", response_model=ApiResponse[ConnectionInfo])
-def test_connection(actor: ServersRead, server_id: int):
-    return success(data=ServerController().test_connection(server_id))
+def test_connection(
+    actor: ServersRead,
+    server_id: int,
+    credential: Literal["root", "readonly"] = Query(
+        "root",
+        description=(
+            "``root`` prueba la credencial pseudo-root. ``readonly`` corre la SONDA NEGATIVA de "
+            "la credencial de solo lectura del MCP y, si el motor observa que no puede escribir, "
+            "fija ``readonly_verified_at``."
+        ),
+    ),
+):
+    """
+    Prueba la conexión con el servidor.
+
+    Con ``credential=readonly`` la operación ya no es una lectura: fijar ``readonly_verified_at``
+    es lo que habilita al MCP a leer ese servidor (plan 12 §5.2). Por eso escala a
+    ``servers.admin`` con step-up, igual que registrar la credencial.
+    """
+    if credential == "readonly":
+        assert_capability(actor, Capability.SERVERS_ADMIN)
+    return success(
+        data=ServerController().test_connection(server_id, credential=credential, admin=actor)
+    )
+
+
+@router.put("/{server_id}/readonly-credential", response_model=ApiResponse[ServerOut])
+def set_readonly_credential(actor: ServersAdmin, server_id: int, payload: ReadonlyCredentialIn):
+    """
+    Registra o reemplaza la credencial de SOLO LECTURA que usa el MCP. La respuesta nunca la
+    devuelve: solo ``has_readonly_credential`` y ``readonly_verified_at``, que queda en ``null``
+    hasta correr ``test-connection?credential=readonly``.
+    """
+    updated = ServerController().set_readonly_credential(
+        server_id, payload.model_dump(), admin=actor
+    )
+    return success(
+        data=updated,
+        message="Credencial de solo lectura registrada. Falta verificarla con test-connection.",
+    )
+
+
+@router.delete("/{server_id}/readonly-credential", response_model=ApiResponse[ServerOut])
+def clear_readonly_credential(actor: ServersAdmin, server_id: int):
+    """Quita la credencial de solo lectura: el servidor sale del MCP de inmediato. Idempotente."""
+    updated = ServerController().clear_readonly_credential(server_id, admin=actor)
+    return success(data=updated, message="Credencial de solo lectura quitada.")
 
 
 @router.get("/{server_id}/databases", response_model=ApiResponse[list[str]])

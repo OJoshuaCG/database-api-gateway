@@ -661,6 +661,79 @@ class ServerAdapter(ABC):
                 exc, op="list_tables", target=self.target, extra={"database": database}
             )
 
+    def list_object_names(
+        self, database: str, *, conn: Connection | None = None
+    ) -> dict[str, list[str]]:
+        """
+        Índice BARATO de la base: ``{kind: [nombres]}`` para ``table``, ``view``, ``routine``,
+        ``trigger`` y ``sequence``. Es lo que consume ``list_objects`` del MCP (plan 12 §6.2).
+
+        Existe para no pasar por ``structural_snapshot``, que arma un ``TableSchema`` completo por
+        tabla: el "índice" costaría más que el detalle. Tablas y vistas salen del Inspector (una
+        consulta por colección, cross-dialect). Rutinas, triggers y secuencias reusan los hooks
+        del snapshot y descartan todo salvo el nombre **dentro del proceso**: los cuerpos nunca
+        salen de acá. Es más caro que un ``SELECT name`` por motor, pero no agrega SQL por
+        dialecto que verificar contra tres motores.
+
+        Excluye la contabilidad interna del gateway, igual que ``list_tables``.
+        """
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        schema = self._inspect_schema(database)
+        try:
+            with self._conn_ctx(database, conn) as conn:
+                insp = inspect(conn)
+                return {
+                    "table": exclude_gateway_internal_tables(
+                        sorted(insp.get_table_names(schema=schema))
+                    ),
+                    "view": sorted(insp.get_view_names(schema=schema)),
+                    "routine": sorted(
+                        {r.name for r in self._snapshot_routines(conn, database, schema)}
+                    ),
+                    "trigger": sorted(
+                        {t.name for t in self._snapshot_triggers(conn, database, schema)}
+                    ),
+                    "sequence": sorted(
+                        {s.name for s in self._snapshot_sequences(conn, database, schema)}
+                    ),
+                }
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="list_object_names", target=self.target, extra={"database": database}
+            )
+
+    def column_counts(
+        self, database: str, tables: list[str], *, conn: Connection | None = None
+    ) -> dict[str, int]:
+        """
+        ``{tabla: cantidad de columnas}`` para ``list_objects(include_column_counts=true)``.
+
+        Es el camino CARO del índice (una consulta de catálogo por tabla), y por eso es opt-in y
+        su llamador lo acota antes de llegar acá. Solo cuenta: ningún tipo ni nombre de columna
+        sale de este método.
+        """
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        schema = self._inspect_schema(database)
+        try:
+            with self._conn_ctx(database, conn) as conn:
+                insp = inspect(conn)
+                return {t: len(insp.get_columns(t, schema=schema)) for t in tables}
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="column_counts", target=self.target, extra={"database": database}
+            )
+
+    def readonly_violations(self) -> list[str]:
+        """
+        Sonda NEGATIVA de la credencial de solo lectura (plan 12 §5.2): la lista de motivos por
+        los que esta credencial **podría escribir**. Vacía = el motor observó que no puede.
+
+        Corre con la credencial del ``target`` (la de solo lectura, nunca la pseudo-root). El
+        default es **fail-closed**: un motor sin sonda implementada no se verifica nunca, así que
+        un servidor de ese motor no entra al MCP en vez de entrar sin verificar.
+        """
+        return ["engine_unsupported"]
+
     def list_internal_tables(
         self, database: str, *, conn: Connection | None = None
     ) -> list[str]:
@@ -772,12 +845,16 @@ class ServerAdapter(ABC):
                 extra={"database": database},
             )
 
-    def get_table_schema(self, database: str, table: str) -> TableSchema:
+    def get_table_schema(
+        self, database: str, table: str, *, conn: Connection | None = None
+    ) -> TableSchema:
+        # ``conn`` (plan 12 §6.2): el MCP lee dentro de su sesión de lectura, con sus timeouts y
+        # su ``READ ONLY``. ``None`` conserva el comportamiento histórico (conexión propia).
         validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         validate_identifier(table, self.dialect, "tabla", allow_existing=True)
         schema = self._inspect_schema(database)
         try:
-            with database_connection(self.target, database) as conn:
+            with self._conn_ctx(database, conn) as conn:
                 insp = inspect(conn)
                 try:
                     return self._build_table_schema(insp, conn, database, table, schema)

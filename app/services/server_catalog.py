@@ -12,4 +12,20 @@ Los emite ``ServerController``.
 #: lista qué campos dispararon la exigencia.
 CODE_CREDENTIAL_REQUIRED_FOR_REBIND = "server.credential_required_for_rebind"
 
-ERROR_CODES = frozenset({CODE_CREDENTIAL_REQUIRED_FOR_REBIND})
+#: ``test-connection?credential=readonly`` sobre un servidor sin credencial de solo lectura
+#: registrada. 409: no es un fallo del motor, falta un dato del inventario.
+CODE_READONLY_CREDENTIAL_MISSING = "server.readonly_credential_missing"
+
+#: La sonda negativa observó que la credencial de solo lectura PUEDE escribir (o divulgar más de
+#: lo que el §7.2 del plan 12 permite). ``public_context.violations`` lista los motivos con
+#: códigos cortos (``privilege:insert``, ``role_attribute:rolsuper``, …), nunca el texto del
+#: grant. La verificación queda borrada: el servidor sale del MCP hasta corregir los grants.
+CODE_READONLY_PROBE_FAILED = "server.readonly_probe_failed"
+
+ERROR_CODES = frozenset(
+    {
+        CODE_CREDENTIAL_REQUIRED_FOR_REBIND,
+        CODE_READONLY_CREDENTIAL_MISSING,
+        CODE_READONLY_PROBE_FAILED,
+    }
+)

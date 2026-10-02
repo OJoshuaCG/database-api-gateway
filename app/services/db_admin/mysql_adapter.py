@@ -306,6 +306,27 @@ class MySQLAdapter(ServerAdapter):
         # Conectados a la BD, el Inspector usa el schema = nombre de la BD.
         return database
 
+    def readonly_violations(self) -> list[str]:
+        """
+        Sonda negativa (plan 12 §5.2) para la familia MySQL: clasifica ``SHOW GRANTS`` contra
+        la allowlist de ``readonly_probe``.
+
+        No intenta una escritura de verdad, a diferencia de PostgreSQL: en MySQL el DDL hace
+        commit implícito y es irreversible, así que "probar si puede" sería, en el peor caso,
+        escribir de verdad en el servidor de un tercero. Los grants son la fuente completa: en
+        esta familia no hay otra vía por la que una cuenta adquiera privilegios.
+        """
+        from app.services.db_admin.readonly_probe import mysql_grant_violations
+
+        try:
+            with server_connection(self.target) as conn:
+                lineas = [
+                    str(r[0]) for r in conn.execute(text("SHOW GRANTS FOR CURRENT_USER()"))
+                ]
+        except SQLAlchemyError as exc:
+            raise map_driver_error(exc, op="readonly_violations", target=self.target)
+        return mysql_grant_violations(lineas)
+
     def list_databases(self) -> list[str]:
         sql = (
             "SELECT SCHEMA_NAME AS name FROM INFORMATION_SCHEMA.SCHEMATA "

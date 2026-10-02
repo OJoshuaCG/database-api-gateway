@@ -283,6 +283,88 @@ class PostgresAdapter(ServerAdapter):
     def _inspect_schema(self, database: str) -> str:
         return "public"
 
+    # Roles predefinidos que dan escritura o acceso al sistema de archivos. Se buscan con
+    # `to_regrole` porque no existen en todas las versiones: uno ausente no es miembro de nada.
+    _WRITE_ROLES = (
+        "pg_write_all_data",
+        "pg_write_server_files",
+        "pg_execute_server_program",
+        "pg_read_server_files",
+    )
+
+    def readonly_violations(self) -> list[str]:
+        """
+        Sonda negativa (plan 12 §5.2) para PostgreSQL: atributos del rol, privilegios de
+        creación, roles de escritura y **un intento real de escritura** que el motor tiene que
+        rechazar.
+
+        El intento es un ``CREATE TEMP TABLE`` dentro de una transacción que se revierte SIEMPRE:
+        en PG el DDL es transaccional, así que aun si pasara no queda nada. Con
+        ``default_transaction_read_only = on`` (lo que pide el §7.2) el motor lo rechaza con
+        ``25006``; si NO lo rechaza, la credencial escribe y la sonda falla.
+
+        Se evalúa sobre la base de conexión por defecto. Los privilegios por tabla son por base:
+        lo que vale para las demás lo cubre el ``READ ONLY`` de la sesión del MCP, no esta sonda.
+        """
+        from app.services.db_admin.readonly_probe import postgres_role_violations
+
+        facts: dict = {}
+        try:
+            with server_connection(self.target) as conn:
+                fila = conn.execute(
+                    text(
+                        "SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, "
+                        "rolbypassrls FROM pg_roles WHERE rolname = current_user"
+                    )
+                ).mappings().first()
+                if fila is not None:
+                    facts.update({k: bool(v) for k, v in fila.items()})
+                facts["default_transaction_read_only"] = conn.execute(
+                    text("SELECT current_setting('default_transaction_read_only')")
+                ).scalar()
+                facts["can_create_in_database"] = bool(
+                    conn.execute(
+                        text("SELECT has_database_privilege(current_database(), 'CREATE')")
+                    ).scalar()
+                )
+                facts["can_create_in_public"] = bool(
+                    conn.execute(
+                        text(
+                            "SELECT COALESCE(has_schema_privilege("
+                            "to_regnamespace('public'), 'CREATE'), false)"
+                        )
+                    ).scalar()
+                )
+                facts["write_roles"] = [
+                    r
+                    for r in self._WRITE_ROLES
+                    if conn.execute(
+                        text(
+                            "SELECT COALESCE(pg_has_role(current_user, to_regrole(:r), "
+                            "'MEMBER'), false)"
+                        ),
+                        {"r": r},
+                    ).scalar()
+                ]
+                facts["table_write_privileges"] = conn.execute(
+                    text(
+                        "SELECT count(*) FROM information_schema.table_privileges "
+                        "WHERE grantee = current_user AND privilege_type IN "
+                        "('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')"
+                    )
+                ).scalar()
+                conn.rollback()
+                try:
+                    conn.execute(text("CREATE TEMP TABLE _gw_readonly_probe (x int)"))
+                    facts["temp_write_succeeded"] = True
+                except SQLAlchemyError:
+                    facts["temp_write_succeeded"] = False
+                finally:
+                    conn.rollback()
+        except SQLAlchemyError as exc:
+            raise map_driver_error(exc, op="readonly_violations", target=self.target)
+        return postgres_role_violations(facts)
+
     def list_databases(self) -> list[str]:
         sql = (
             "SELECT datname AS name FROM pg_database "
