@@ -176,7 +176,12 @@ En los tres primeros, **apagar** la captura no pide nada extra: solo encenderla.
 | `catalogs` | `read` | ✅ | ✅ | ✅ | |
 | | `write` | | | | `security_officer` |
 | `environments` | `read` | ✅ | ✅ | ✅ | |
-| `gateway` | `admin` | | | | `access_admin`, `security_officer` |
+| `access` | `admin` | | | | `access_admin` |
+| `policy` | `admin` | | | | `security_officer` |
+
+> **v29:** `gateway.admin` se partió en `access.admin` (usuarios, accesos, capacidades
+> puntuales, tokens, `scope-readiness`) y `policy.admin` (rotación del cifrado). Ver
+> `api-reference-v29.md`.
 
 🔓 = **divulga** (`discloses: true`). 💥 = destructiva marcada solo en esta fila porque cambió de
 rol; la lista completa está en la columna `destructive` del §2.
@@ -320,7 +325,7 @@ al login a mitad de una operación. Conviene avisar antes de que llegue.
 
 ## 8. Alcance por destino (capa 2)
 
-`GET /authz/scope-readiness` (detrás de `gateway.admin`) — **se pide ANTES de otorgar el primer
+`GET /authz/scope-readiness` (detrás de `access.admin`; antes de v29, `gateway.admin`) — **se pide ANTES de otorgar el primer
 acceso por alcance.**
 
 ```jsonc
@@ -353,7 +358,7 @@ cambia ningún resultado, y no toca la BD para decidirlo.
 
 ## 9. Tokens de agente y el servidor MCP (v1 parcial)
 
-### 9.1 `/api-tokens` — detrás de `gateway.admin`
+### 9.1 `/api-tokens` — detrás de `access.admin` (antes de v29, `gateway.admin`)
 
 `POST` devuelve el bearer **una sola vez** (`dbgw.<id>.<secreto>`). Lo que persiste es su HMAC, así
 que **no hay forma de volver a mostrarlo**: si se pierde, se emite otro.
@@ -477,7 +482,7 @@ La condición 2 no estaba y era una **fuga cross-tenant**: `managed_databases` n
 `project_id`, así que el alcance se resolvía por el pivote de blueprints — que es N:M por diseño —
 y un token de un cliente veía nombres, entorno y versión de las bases de otro.
 
-**Cómo se abre** (todo detrás de `gateway.admin`):
+**Cómo se abre** (todo detrás de `environments.write`, solo `security_officer`):
 
 ```
 PATCH /environments/{id}   {"allows_agent_access": true}   + ?confirm_slug=<slug>

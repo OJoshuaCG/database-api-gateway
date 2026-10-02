@@ -4,8 +4,8 @@ Endpoints de los usuarios DEL GATEWAY (``/gateway-users``).
 Es el módulo que hace **usable** el modelo de capacidades: hasta acá había un solo usuario, así
 que roles y alcances existían sin nadie a quien aplicarlos.
 
-Todo detrás de ``gateway.admin`` —que solo tienen las capacidades globales ``access_admin`` y
-``security_officer``, no el rol ``owner``— **menos uno**: aceptar la invitación es público,
+Todo detrás de ``access.admin`` —que solo tiene la capacidad global ``access_admin``: ni el rol
+``owner`` ni ``security_officer``— **menos uno**: aceptar la invitación es público,
 porque quien la usa todavía no puede autenticarse. Eso es justamente el punto del diseño.
 
 OJO CON EL NOMBRE: acá se administran los usuarios que se autentican **contra el gateway**. Los
@@ -20,7 +20,7 @@ from app.controllers.authz_controller import AuthzController
 from app.controllers.capability_grant_controller import CapabilityGrantController
 from app.controllers.gateway_user_controller import GatewayUserController
 from app.core.limiter import client_address, limiter
-from app.core.authz import GatewayAdmin
+from app.core.authz import AccessAdmin
 from app.schemas.authz import EffectiveAccessOut
 from app.schemas.capability_grant import CapabilityGrantCreate, CapabilityGrantOut
 from app.schemas.gateway_user import (
@@ -40,7 +40,7 @@ router = APIRouter(prefix="/gateway-users", tags=["Gateway Users"])
 
 
 @router.get("", response_model=ApiResponse[list[GatewayUserOut]])
-def list_gateway_users(actor: GatewayAdmin, pagination: PaginationDep):
+def list_gateway_users(actor: AccessAdmin, pagination: PaginationDep):
     """Usuarios del gateway con su acceso resuelto. Cero conexiones al motor."""
     items, total = GatewayUserController().list_users(
         limit=pagination.size, offset=pagination.offset
@@ -49,7 +49,7 @@ def list_gateway_users(actor: GatewayAdmin, pagination: PaginationDep):
 
 
 @router.post("", response_model=ApiResponse[GatewayUserCreatedOut], status_code=201)
-def create_gateway_user(actor: GatewayAdmin, payload: GatewayUserCreate):
+def create_gateway_user(actor: AccessAdmin, payload: GatewayUserCreate):
     """
     Crea la cuenta **sin credencial** y devuelve el token de invitación.
 
@@ -95,12 +95,12 @@ def accept_invite(request: Request, payload: AcceptInviteIn):
 
 
 @router.get("/{user_id}", response_model=ApiResponse[GatewayUserOut])
-def get_gateway_user(actor: GatewayAdmin, user_id: int):
+def get_gateway_user(actor: AccessAdmin, user_id: int):
     return success(data=GatewayUserController().get_user(user_id))
 
 
 @router.patch("/{user_id}", response_model=ApiResponse[GatewayUserOut])
-def update_gateway_user(actor: GatewayAdmin, user_id: int, payload: GatewayUserUpdate):
+def update_gateway_user(actor: AccessAdmin, user_id: int, payload: GatewayUserUpdate):
     """
     Cambia rol, estado y datos de contacto.
 
@@ -122,7 +122,7 @@ def update_gateway_user(actor: GatewayAdmin, user_id: int, payload: GatewayUserU
 
 
 @router.put("/{user_id}/access", response_model=ApiResponse[GatewayUserOut])
-def set_gateway_user_access(actor: GatewayAdmin, user_id: int, payload: GatewayUserAccessIn):
+def set_gateway_user_access(actor: AccessAdmin, user_id: int, payload: GatewayUserAccessIn):
     """
     Reemplaza el acceso COMPLETO de la persona: globales y alcances.
 
@@ -142,7 +142,7 @@ def set_gateway_user_access(actor: GatewayAdmin, user_id: int, payload: GatewayU
 
 
 @router.post("/{user_id}/invite", response_model=ApiResponse[InviteOut])
-def reinvite_gateway_user(actor: GatewayAdmin, user_id: int):
+def reinvite_gateway_user(actor: AccessAdmin, user_id: int):
     """
     Reemite la invitación y **mata la anterior** subiendo el ``credential_epoch``.
 
@@ -160,14 +160,14 @@ def reinvite_gateway_user(actor: GatewayAdmin, user_id: int):
     response_model=ApiResponse[list[CapabilityGrantOut]],
 )
 def list_capability_grants(
-    actor: GatewayAdmin,
+    actor: AccessAdmin,
     user_id: int,
     status: Literal["pending", "active", "rejected", "expired", "cancelled", "revoked"]
     | None = Query(None, description="Filtra por estado"),
 ):
     """
     Capacidades puntuales de la persona, de todos los estados (historial incluido). Solo
-    ``access_admin``: ``security_officer`` recibe 403 aunque tenga ``gateway.admin``.
+    ``access_admin`` (``access.admin``): ``security_officer`` recibe 403.
     """
     return success(data=CapabilityGrantController().list_for_user(user_id, actor, status))
 
@@ -177,7 +177,7 @@ def list_capability_grants(
     response_model=ApiResponse[CapabilityGrantOut],
     status_code=201,
 )
-def create_capability_grant(actor: GatewayAdmin, user_id: int, payload: CapabilityGrantCreate):
+def create_capability_grant(actor: AccessAdmin, user_id: int, payload: CapabilityGrantCreate):
     """
     Otorga una capacidad puntual sobre un entorno o servidor. **Suma** al rol de la persona.
 
@@ -197,7 +197,7 @@ def create_capability_grant(actor: GatewayAdmin, user_id: int, payload: Capabili
     "/{user_id}/capability-grants/{grant_id}",
     response_model=ApiResponse[CapabilityGrantOut],
 )
-def revoke_capability_grant(actor: GatewayAdmin, user_id: int, grant_id: int):
+def revoke_capability_grant(actor: AccessAdmin, user_id: int, grant_id: int):
     """
     Revoca una capacidad activa (``revoked``) o cancela una pendiente (``cancelled``). Un solo
     access_admin alcanza y el efecto es inmediato. No se borra la fila: queda como historial.
@@ -209,7 +209,7 @@ def revoke_capability_grant(actor: GatewayAdmin, user_id: int, grant_id: int):
 
 
 @router.get("/{user_id}/effective-access", response_model=ApiResponse[EffectiveAccessOut])
-def get_effective_access(actor: GatewayAdmin, user_id: int):
+def get_effective_access(actor: AccessAdmin, user_id: int):
     """
     Acceso efectivo de la persona CON procedencia: cada capacidad dice si viene del rol base, de
     un rol por alcance, de una global o de una capacidad puntual (``grant_id``). Lo calcula el

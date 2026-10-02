@@ -266,17 +266,36 @@ def _code(r) -> str | None:
     return ((r.json().get("detail") or {}).get("public_context") or {}).get("code")
 
 
+def _actor_access_admin_pendiente(admin_client, username: str):
+    """
+    Un ``Actor`` con ``access_admin`` cuya cuenta está PENDIENTE (sin credencial fijada), así
+    que no cuenta para el invariante del último administrador.
+
+    Por qué no un client HTTP con otra sesión: desde la partición de ``gateway.admin``, la única
+    otra identidad que puede llegar a estas rutas tiene ``access.admin`` y por lo tanto es ELLA
+    MISMA un ``access_admin`` activo, así que por HTTP el sembrado nunca es "el último" frente a
+    un tercero (y frente a sí mismo corta antes ``_guard_not_self``). El pre-chequeo sigue
+    siendo la primera barrera del controller y se prueba acá, sin anularlo.
+    """
+    from app.core.authz import actor_from_access_context
+
+    otro = _crear(admin_client, username, global_capabilities=["access_admin"])
+    return actor_from_access_context(
+        otro["id"], username, UserModel().find_access_context(otro["id"])
+    )
+
+
 def test_deactivating_the_last_access_admin_is_rejected(admin_client):
-    """
-    Lo hace OTRA persona (``security_officer`` también tiene ``gateway.admin``): desactivarse a
-    sí mismo ya lo corta el guard de auto-modificación, antes de llegar a este.
-    """
-    datos = _crear(admin_client, "vigia", global_capabilities=["security_officer"])
-    vigia = _cliente_como(datos, "vigia")
+    """Desactivarse a sí mismo ya lo corta el guard de auto-modificación, antes que este."""
+    from app.controllers.gateway_user_controller import GatewayUserController
+    from app.exceptions import AppHttpException
+
+    actor = _actor_access_admin_pendiente(admin_client, "vigia")
     admin_id = UserModel().find_by_username("admin")["id"]
-    r = vigia.patch(f"/api/v1/gateway-users/{admin_id}", json={"is_active": False})
-    assert r.status_code == 409, r.text
-    assert _code(r) == "access.last_admin_protected"
+    with pytest.raises(AppHttpException) as exc:
+        GatewayUserController().update_user(admin_id, {"is_active": False}, admin=actor)
+    assert exc.value.status_code == 409
+    assert exc.value.public_context["code"] == "access.last_admin_protected"
 
 
 def test_removing_access_admin_from_the_last_one_is_rejected(admin_client):
@@ -284,15 +303,73 @@ def test_removing_access_admin_from_the_last_one_is_rejected(admin_client):
     El otro camino al mismo bloqueo, y el que un guard solo sobre ``is_active`` dejaría abierto:
     quitarle la capacidad global en vez de desactivar la cuenta.
     """
-    datos = _crear(admin_client, "vigia2", global_capabilities=["security_officer"])
-    vigia = _cliente_como(datos, "vigia2")
+    from app.controllers.gateway_user_controller import GatewayUserController
+    from app.exceptions import AppHttpException
+
+    actor = _actor_access_admin_pendiente(admin_client, "vigia2")
     admin_id = UserModel().find_by_username("admin")["id"]
-    r = vigia.put(
-        f"/api/v1/gateway-users/{admin_id}/access",
-        json={"global_capabilities": ["security_officer"], "scope_grants": []},
-    )
-    assert r.status_code == 409, r.text
-    assert _code(r) == "access.last_admin_protected"
+    with pytest.raises(AppHttpException) as exc:
+        GatewayUserController().set_access(
+            admin_id,
+            {"global_capabilities": ["security_officer"], "scope_grants": []},
+            admin=actor,
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.public_context["code"] == "access.last_admin_protected"
+
+
+# --------------------------------------------------------------------------- #
+# Separación de deberes: `access.admin` y `policy.admin` (C1)                 #
+# --------------------------------------------------------------------------- #
+
+#: Una ruta de cada módulo que pasó de ``gateway.admin`` a ``access.admin``.
+_ACCESS_ADMIN_ROUTES = [
+    ("GET", "/api/v1/gateway-users"),
+    ("GET", "/api/v1/gateway-users/1"),
+    ("PATCH", "/api/v1/gateway-users/1"),
+    ("PUT", "/api/v1/gateway-users/1/access"),
+    ("GET", "/api/v1/gateway-users/1/capability-grants"),
+    ("GET", "/api/v1/gateway-users/1/effective-access"),
+    ("GET", "/api/v1/api-tokens"),
+    ("POST", "/api/v1/api-tokens"),
+    ("GET", "/api/v1/capability-grants/pending"),
+    ("POST", "/api/v1/capability-grants/1/approve"),
+    ("GET", "/api/v1/authz/scope-readiness"),
+]
+
+
+@pytest.mark.parametrize(("method", "path"), _ACCESS_ADMIN_ROUTES, ids=lambda v: str(v))
+def test_a_security_officer_alone_does_not_administer_access(admin_client, method, path):
+    """
+    El efecto buscado de la partición: con ``gateway.admin`` en las dos globales, un
+    ``security_officer`` sin ``access_admin`` administraba usuarios, tokens y capacidades
+    puntuales. Ahora recibe el 403 opaco de ``require()``, antes de tocar el body.
+    """
+    datos = _crear(admin_client, "so-solo", global_capabilities=["security_officer"])
+    so = _cliente_como(datos, "so-solo")
+    kwargs = {} if method == "GET" else {"json": {}}
+    r = so.request(method, path, **kwargs)
+    assert r.status_code == 403, r.text
+    assert _code(r) == "access.forbidden"
+
+
+def test_an_access_admin_alone_does_not_rotate_crypto(admin_client):
+    """La otra mitad: rotar el cifrado es ``policy.admin`` (``security_officer``)."""
+    datos = _crear(admin_client, "aa-solo", global_capabilities=["access_admin"])
+    aa = _cliente_como(datos, "aa-solo")
+    r = aa.post("/api/v1/admin/crypto/rotate", json={})
+    assert r.status_code == 403, r.text
+    assert _code(r) == "access.forbidden"
+    # Y sí administra accesos: el GET no pide step-up (no divulga).
+    assert aa.get("/api/v1/gateway-users").status_code == 200
+
+
+def test_a_security_officer_alone_still_reaches_policy_admin(admin_client):
+    """``policy.admin`` pasa la capa de capacidad: lo que frena después es el step-up o el body."""
+    datos = _crear(admin_client, "so-policy", global_capabilities=["security_officer"])
+    so = _cliente_como(datos, "so-policy")
+    r = so.post("/api/v1/admin/crypto/rotate", json={})
+    assert _code(r) != "access.forbidden", r.text
 
 
 def test_with_a_second_active_admin_the_first_can_be_deactivated(admin_client):
@@ -580,10 +657,10 @@ def test_an_invalid_role_is_422(admin_client, rol):
     assert r.status_code == 422, r.text
 
 
-def test_the_module_requires_gateway_admin(admin_client):
+def test_the_module_requires_access_admin(admin_client):
     """
-    Todo el módulo detrás de ``gateway.admin``, que **no** lo tiene el rol ``owner`` — solo las
-    globales. Administrar accesos no es una operación más del operador.
+    Todo el módulo detrás de ``access.admin``, que **no** lo tiene el rol ``owner`` — solo la
+    global ``access_admin``. Administrar accesos no es una operación más del operador.
     """
     from fastapi.testclient import TestClient
     from sqlalchemy import text

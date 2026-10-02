@@ -81,7 +81,7 @@ def test_charset_option_update_attributes_the_actor(admin_client):
 
 
 def test_environment_create_attributes_the_actor(admin_client):
-    """``POST /environments`` ya usa ``GatewayAdmin``."""
+    """``POST /environments`` declara ``EnvironmentsWrite`` (solo ``security_officer``)."""
     resp = admin_client.post("/api/v1/environments", json={"name": "Preprod", "slug": "preprod"})
     assert resp.status_code in (200, 201), resp.text
 

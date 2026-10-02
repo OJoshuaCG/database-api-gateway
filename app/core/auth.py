@@ -214,7 +214,8 @@ def bootstrap_admin() -> None:
     # default de la columna: `users.gateway_role` tiene `server_default='viewer'` a propósito
     # —para que ninguna fila nazca con privilegio— así que sin este bloque se sembraría un
     # administrador que no puede administrar. Y `owner` no alcanza solo: `servers.admin`,
-    # `catalogs.write` y `gateway.admin` viven ÚNICAMENTE en las capacidades globales.
+    # `catalogs.write`, `access.admin` y `policy.admin` viven ÚNICAMENTE en las capacidades
+    # globales.
     user_model.create(
         {
             "username": ADMIN_USERNAME,

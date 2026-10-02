@@ -95,14 +95,16 @@ class GlobalCapability(StrEnum):
     """
     Capacidades globales y ortogonales a la cadena de roles.
 
-    ``ACCESS_ADMIN`` administra usuarios, roles, grants y tokens, y es **explícitamente NO
+    ``ACCESS_ADMIN`` (capacidad ``access.admin``) administra usuarios, roles, grants y tokens,
+    y **nada más** (invariante 10). Es **explícitamente NO
     operativo**: no aplica migraciones, no dropea, no revela contraseñas. Esa separación es la
     mitad de la separación de deberes — sin ella, el único rol que puede operar en producción
     es también el que puede desarmar la política, y en un equipo de tres todos terminan ahí.
 
     ``SECURITY_OFFICER`` escribe **datos de política**: los flags de ``Environment``, los
-    catálogos que deciden qué llega al motor, y el host y la credencial de un ``Server``.
-    Regla general que lo justifica: **toda fila que un guard lee es una frontera de
+    catálogos que deciden qué llega al motor, el host y la credencial de un ``Server``, y la
+    rotación del cifrado (``policy.admin``). **No** administra usuarios: eso es
+    ``access.admin``, y los conjuntos de las dos globales son disjuntos (invariante 9). Regla general que lo justifica: **toda fila que un guard lee es una frontera de
     privilegio**, así que su escritor necesita al menos el privilegio del guard que puede
     apagar.
     """
@@ -182,8 +184,17 @@ class Capability(StrEnum):
     ENVIRONMENTS_READ = "environments.read"
     ENVIRONMENTS_WRITE = "environments.write"
 
-    # -- Administración del propio gateway ---------------------------------- #
-    GATEWAY_ADMIN = "gateway.admin"
+    # -- Administración del acceso y de la política del gateway -------------- #
+    # Eran UNA sola capacidad (``gateway.admin``) y la tenían las dos globales, así que
+    # ``security_officer`` también administraba usuarios: la separación de deberes quedaba
+    # en el papel. Partida en dos, cada global tiene la suya y los conjuntos son disjuntos
+    # (invariantes 9, 10 y 12). ``gateway.admin`` NO se puede reintroducir.
+    #: Usuarios del gateway, sus accesos, las capacidades puntuales, los tokens de API y el
+    #: reporte de preparación de alcances. Solo ``access_admin``.
+    ACCESS_ADMIN_CAP = "access.admin"
+    #: Rotación del cifrado (y, más adelante, la lectura de auditoría). Solo
+    #: ``security_officer``.
+    POLICY_ADMIN = "policy.admin"
 
 
 ScopeAxis = Literal["global", "environment", "server"]
@@ -394,7 +405,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
     # clasificación de cada BD deciden qué barreras se aplican. Quien las escribe no puede ser
     # quien administra el acceso (``access_admin``) ni el rol operativo: solo
     # ``security_officer``. Sin ``security_officer`` asignado, esas escrituras quedan BLOQUEADAS
-    # a propósito; no hay fallback a ``gateway.admin``.
+    # a propósito; no hay fallback a ``access.admin``.
     _spec(
         Capability.ENVIRONMENTS_WRITE,
         "Crear, editar y borrar entornos, abrir BDs a agentes y reclasificarlas",
@@ -403,8 +414,15 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         axis="global",
     ),
     _spec(
-        Capability.GATEWAY_ADMIN,
-        "Administrar el gateway: crypto, usuarios y tokens",
+        Capability.ACCESS_ADMIN_CAP,
+        "Administrar usuarios del gateway, accesos, capacidades puntuales y tokens",
+        mutates=True,
+        step_up=True,
+        axis="global",
+    ),
+    _spec(
+        Capability.POLICY_ADMIN,
+        "Administrar la política del gateway: rotación del cifrado",
         mutates=True,
         step_up=True,
         axis="global",
@@ -446,8 +464,9 @@ _OPERATOR: frozenset[Capability] = _VIEWER | {
     Capability.EXPORTS_EXECUTE,
 }
 
-# `owner` es todo lo OPERATIVO del alcance. NO incluye `servers.admin`, `catalogs.write` ni
-# `gateway.admin`: esas tres son datos de política o la llave del inventario, y van en
+# `owner` es todo lo OPERATIVO del alcance. NO incluye `servers.admin`, `catalogs.write`,
+# `access.admin` ni `policy.admin`: son datos de política, la llave del inventario o la
+# administración del acceso, y van en
 # `security_officer` / `access_admin`. Que el rol operativo pudiera apagar la barrera de
 # producción es exactamente el agujero que la separación existe para cerrar.
 # `clones.execute` está acá y NO en `operator` aunque su nombre lo emparente con los otros
@@ -479,13 +498,13 @@ ROLE_CAPABILITIES: Mapping[GatewayRole, frozenset[Capability]] = MappingProxyTyp
 
 GLOBAL_CAPABILITIES: Mapping[GlobalCapability, frozenset[Capability]] = MappingProxyType(
     {
-        GlobalCapability.ACCESS_ADMIN: frozenset({Capability.GATEWAY_ADMIN}),
+        GlobalCapability.ACCESS_ADMIN: frozenset({Capability.ACCESS_ADMIN_CAP}),
         GlobalCapability.SECURITY_OFFICER: frozenset(
             {
+                Capability.POLICY_ADMIN,
                 Capability.SERVERS_ADMIN,
                 Capability.CATALOGS_WRITE,
                 Capability.ENVIRONMENTS_WRITE,
-                Capability.GATEWAY_ADMIN,
             }
         ),
     }
@@ -505,7 +524,7 @@ CODE_STEP_UP_REQUIRED = "access.step_up_required"
 CODE_NOT_VISIBLE = "access.not_visible"
 CODE_UNDECLARED_ROUTE = "access.undeclared_route"
 #: Un administrador intentó cambiar SU PROPIO rol, su propio acceso (globales o alcances) o
-#: desactivarse. Lo tiene que hacer otra persona con ``gateway.admin``. Ver
+#: desactivarse. Lo tiene que hacer otra persona con ``access.admin``. Ver
 #: ``GatewayUserController._guard_not_self``.
 CODE_SELF_MODIFICATION = "access.self_modification_forbidden"
 #: Se intentó otorgar más de lo que el propio actor tiene: un rol base por encima del suyo,
@@ -549,7 +568,7 @@ def is_grantable(capability: Capability | str) -> bool:
     ¿Se puede otorgar SUELTA, sobre un entorno o servidor? Todo salvo el eje global.
 
     Las globales (``environments.write``, ``catalogs.write``, ``servers.admin``,
-    ``gateway.admin``, ``self.read``, lecturas de política) no tienen un destino al que
+    ``access.admin``, ``policy.admin``, ``self.read``, lecturas de política) no tienen un destino al que
     anclarse, y otorgarlas por separado saltearía la separación de deberes. Una capacidad
     DESCONOCIDA no es otorgable: el lector falla cerrado.
     """
@@ -707,6 +726,11 @@ _SENSITIVE_POLICY: frozenset[str] = frozenset(
 )
 
 
+#: Ids que existieron y NO pueden volver (invariante 12). ``scripts/check_route_capabilities.py``
+#: verifica además que ninguna ruta los declare.
+RETIRED_CAPABILITIES: frozenset[str] = frozenset({"gateway.admin"})
+
+
 def _assert_invariants() -> None:
     # 1. Cada Capability tiene exactamente un spec.
     if len(_BY_ID) != len(Capability):
@@ -747,7 +771,7 @@ def _assert_invariants() -> None:
         if s.id.value != f"{s.module}.{s.level}":
             raise AssertionError(f"{s.id.value} no concuerda con {s.module}.{s.level}")
 
-    # 7. Ninguna capacidad global está en la cadena de roles, y viceversa. Si `gateway.admin`
+    # 7. Ninguna capacidad global está en la cadena de roles, y viceversa. Si `access.admin`
     #    cayera en `owner`, el rol operativo podría apagar la barrera de producción.
     globales = set().union(*GLOBAL_CAPABILITIES.values())
     for cap in globales:
@@ -797,6 +821,34 @@ def _assert_invariants() -> None:
     for s in CAPABILITIES:
         if s.requires_step_up and s.agent_allowed:
             raise AssertionError(f"{s.id.value} exige step-up y es agent_allowed.")
+
+    # 9. Los conjuntos de las globales son DISJUNTOS de a pares. Es la separación de deberes
+    #    hecha forma: si una capacidad viviera en dos globales —como `gateway.admin`, que
+    #    tenían `access_admin` y `security_officer`—, quien tiene solo una de las dos haría
+    #    también el trabajo de la otra.
+    vistas: dict[Capability, GlobalCapability] = {}
+    for g, caps in GLOBAL_CAPABILITIES.items():
+        for cap in caps:
+            if cap in vistas:
+                raise AssertionError(
+                    f"{cap.value} está en dos globales: '{vistas[cap].value}' y '{g.value}'."
+                )
+            vistas[cap] = g
+
+    # 10. `access_admin` es EXACTAMENTE `access.admin`. Es el rol explícitamente NO operativo:
+    #     cualquier capacidad que se le sume (crypto, entornos, catálogos) vuelve a juntar la
+    #     administración del acceso con la política que el acceso no debería poder desarmar.
+    if GLOBAL_CAPABILITIES[GlobalCapability.ACCESS_ADMIN] != frozenset(
+        {Capability.ACCESS_ADMIN_CAP}
+    ):
+        raise AssertionError("'access_admin' tiene que ser exactamente {access.admin}.")
+
+    # 12. `gateway.admin` está RETIRADA. Reintroducirla, aunque sea con otro significado,
+    #     reabre la confusión de quién administra qué y le devuelve sentido a filas viejas de
+    #     `api_tokens.scopes`/`capability_grants` que hoy los lectores descartan.
+    retiradas = {c.value for c in Capability} & RETIRED_CAPABILITIES
+    if retiradas:
+        raise AssertionError(f"Capacidades retiradas reintroducidas: {sorted(retiradas)}")
 
 
 _assert_invariants()

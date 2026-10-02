@@ -171,8 +171,8 @@ def test_the_unique_constraint_backs_up_the_precheck(admin_client, target):
 
 @pytest.mark.parametrize(
     "capability",
-    ["servers.admin", "catalogs.write", "environments.write", "gateway.admin", "self.read",
-     "access_admin", "security_officer", "no.existe"],
+    ["servers.admin", "catalogs.write", "environments.write", "access.admin", "policy.admin",
+     "gateway.admin", "self.read", "access_admin", "security_officer", "no.existe"],
 )
 def test_global_or_unknown_capabilities_are_not_grantable(admin_client, target, capability):
     r = _grant(admin_client, target, capability)
@@ -222,7 +222,11 @@ def test_nobody_grants_capabilities_to_themselves(admin_client):
 
 
 def test_only_access_admin_may_create(admin_client, target):
-    """Un operador y un security_officer (que SÍ tiene ``gateway.admin``) reciben 403 opaco."""
+    """
+    Un operador y un security_officer reciben 403 opaco. Lo da ``require(access.admin)`` en la
+    ruta: ``security_officer`` ya no tiene la capacidad (antes compartían ``gateway.admin`` y el
+    controller re-exigía la global).
+    """
     _, oper = _admin_como(admin_client, "operadora", extra=())
     r = _grant(oper, target)
     assert (r.status_code, _code(r)) == (403, "access.forbidden")

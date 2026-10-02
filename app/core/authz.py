@@ -379,4 +379,8 @@ CatalogsWrite = Annotated[Actor, Depends(require(Capability.CATALOGS_WRITE))]
 EnvironmentsRead = Annotated[Actor, Depends(require(Capability.ENVIRONMENTS_READ))]
 EnvironmentsWrite = Annotated[Actor, Depends(require(Capability.ENVIRONMENTS_WRITE))]
 
-GatewayAdmin = Annotated[Actor, Depends(require(Capability.GATEWAY_ADMIN))]
+#: Usuarios del gateway, accesos, capacidades puntuales, tokens y preparación de alcances. Solo
+#: la global ``access_admin``.
+AccessAdmin = Annotated[Actor, Depends(require(Capability.ACCESS_ADMIN_CAP))]
+#: Política del propio gateway: rotación del cifrado. Solo la global ``security_officer``.
+PolicyAdmin = Annotated[Actor, Depends(require(Capability.POLICY_ADMIN))]

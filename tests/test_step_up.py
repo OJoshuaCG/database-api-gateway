@@ -26,7 +26,7 @@ from tests.step_up_helpers import session_sid
 
 STEP_UP = "/api/v1/auth/step-up"
 ME = "/api/v1/auth/me"
-# Una ruta con step-up (``gateway.admin``, método no seguro) que no toca ningún motor. El cuerpo
+# Una ruta con step-up (``policy.admin``, método no seguro) que no toca ningún motor. El cuerpo
 # vacío da 422 si pasa el step-up y 403 si no: el step-up corre en la dependencia, antes del
 # body.
 SENSIBLE = "/api/v1/admin/crypto/rotate"
@@ -230,7 +230,8 @@ def test_there_are_step_up_routes_to_check():
     assert {cap for _, _, cap in _ROUTES} >= {
         "databases.drop",
         "exports.download",
-        "gateway.admin",
+        "access.admin",
+        "policy.admin",
         "sql_console.execute",
     }
 

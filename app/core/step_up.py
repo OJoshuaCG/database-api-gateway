@@ -23,7 +23,7 @@ Con ``STEP_UP_ENFORCED`` y ``spec(cap).requires_step_up``, y además:
 - la capacidad DIVULGA (``exports/{id}/content``, capturas: un GET que entrega datos), **o**
 - el método es desconocido (llamada fuera de un request): fail-closed.
 
-Así listar usuarios (``gateway.admin``) o versiones de blueprint (``blueprints.apply``) por GET
+Así listar usuarios (``access.admin``) o versiones de blueprint (``blueprints.apply``) por GET
 no interrumpe a nadie, y bajar datos sí.
 
 EL ORDEN, Y POR QUÉ ESTE ES EL ÚLTIMO CHEQUEO

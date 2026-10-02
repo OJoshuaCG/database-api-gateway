@@ -3,13 +3,13 @@ Aprobación de capacidades puntuales sensibles (``/capability-grants``).
 
 La alta y la revocación viven bajo ``/gateway-users/{id}/capability-grants``; acá está lo que NO
 tiene un usuario como recurso padre: la bandeja de pendientes y la decisión. Todas exigen
-``gateway.admin`` en la ruta y la global ``access_admin`` en el controller (D10).
+``access.admin``, que solo tiene la global ``access_admin`` (D10).
 """
 
 from fastapi import APIRouter
 
 from app.controllers.capability_grant_controller import CapabilityGrantController
-from app.core.authz import GatewayAdmin
+from app.core.authz import AccessAdmin
 from app.schemas.capability_grant import (
     CapabilityGrantDecision,
     CapabilityGrantOut,
@@ -21,7 +21,7 @@ router = APIRouter(prefix="/capability-grants", tags=["Capability Grants"])
 
 
 @router.get("/pending", response_model=ApiResponse[list[PendingCapabilityGrantOut]])
-def list_pending_capability_grants(actor: GatewayAdmin):
+def list_pending_capability_grants(actor: AccessAdmin):
     """
     Solicitudes pendientes vigentes de TODAS las personas. Cada una trae ``can_decide`` y, si es
     ``false``, ``blocked_reason`` (código ``access.*``). Las vencidas se barren antes de listar.
@@ -31,7 +31,7 @@ def list_pending_capability_grants(actor: GatewayAdmin):
 
 @router.post("/{grant_id}/approve", response_model=ApiResponse[CapabilityGrantOut])
 def approve_capability_grant(
-    actor: GatewayAdmin, grant_id: int, payload: CapabilityGrantDecision | None = None
+    actor: AccessAdmin, grant_id: int, payload: CapabilityGrantDecision | None = None
 ):
     """
     Aprueba una solicitud pendiente (``pending`` → ``active``, efecto inmediato). La tiene que
@@ -50,7 +50,7 @@ def approve_capability_grant(
 
 @router.post("/{grant_id}/reject", response_model=ApiResponse[CapabilityGrantOut])
 def reject_capability_grant(
-    actor: GatewayAdmin, grant_id: int, payload: CapabilityGrantDecision | None = None
+    actor: AccessAdmin, grant_id: int, payload: CapabilityGrantDecision | None = None
 ):
     """Rechaza una solicitud pendiente (``pending`` → ``rejected``), con motivo opcional."""
     reason = payload.reason if payload else None

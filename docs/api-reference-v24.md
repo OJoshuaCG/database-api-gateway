@@ -60,9 +60,10 @@ Lo que hay que saber para adaptarlo:
 
 ## 2. `/gateway-users` — administración de usuarios del gateway
 
-Siete endpoints. **Todos detrás de `gateway.admin`** —que solo tienen las capacidades globales
-`access_admin` y `security_officer`, no el rol `owner` (v23 §5)— **excepto aceptar la invitación**,
-que es público.
+Siete endpoints. **Todos detrás de `access.admin`** —que solo tiene la capacidad global
+`access_admin`: ni el rol `owner` ni `security_officer` (v23 §5, v29)— **excepto aceptar la
+invitación**, que es público. Antes de v29 era `gateway.admin`, que también tenía
+`security_officer`.
 
 Cuidado con el nombre, porque el gateway tiene dos poblaciones de usuarios y usa las mismas
 palabras para las dos: acá se administran los que se autentican **contra el gateway**. Los usuarios
@@ -350,7 +351,8 @@ qué no hay perpetuos, por qué `DELETE` no se deshace). Acá va la forma.
 | `POST /api/v1/api-tokens` | `success()` **201** | `ApiTokenCreatedOut` |
 | `DELETE /api/v1/api-tokens/{token_pk}` | `success()` | `ApiTokenOut` (la fila ya revocada) |
 
-Todo detrás de `gateway.admin`. El `POST` tiene límite de tasa 10/min.
+Todo detrás de `access.admin` (antes de v29, `gateway.admin`). El `POST` tiene límite de tasa
+10/min.
 
 ```jsonc
 // POST — request

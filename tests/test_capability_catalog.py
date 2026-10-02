@@ -8,7 +8,7 @@ mantener a mano y que envejecen con cada endpoint nuevo. Estos tests recorren el
 que escalan con el vocabulario (28 capacidades) y no con la superficie — y corren en
 milisegundos, sin `TestClient` ni motor.
 
-Los siete invariantes de ``capability_catalog`` se afirman **al importar** el módulo, no acá:
+Los invariantes de ``capability_catalog`` se afirman **al importar** el módulo, no acá:
 fallar al importar es fallar al arrancar, que es lo correcto para un catálogo de autorización.
 Estos tests cubren lo que un invariante de import no puede: que las afirmaciones sigan siendo
 ciertas si alguien las relaja, y el comportamiento de las funciones.
@@ -186,7 +186,7 @@ def test_import_invariants_reject_a_destructive_capability_in_operator(monkeypat
 
 def test_global_capabilities_are_not_in_the_role_chain():
     """
-    Si ``gateway.admin`` cayera en ``owner``, el rol operativo podría apagar
+    Si ``access.admin`` cayera en ``owner``, el rol operativo podría apagar
     ``blocks_destructive_migrations`` — que es exactamente el agujero que la separación entre
     operar y otorgar existe para cerrar.
     """
@@ -208,6 +208,88 @@ def test_access_admin_is_not_operational():
         Capability.SQL_CONSOLE_EXECUTE,
     ):
         assert prohibida not in caps
+
+
+# --------------------------------------------------------------------------- #
+# Separación de deberes: `gateway.admin` partida en `access.admin` + `policy.admin`  #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_global_sets_are_pinned():
+    """
+    Los dos conjuntos, fijados a mano. Un cambio acá es un cambio de POLÍTICA (quién administra
+    qué) y tiene que verse en el diff del test, no solo en el del catálogo.
+    """
+    assert GLOBAL_CAPABILITIES[GlobalCapability.ACCESS_ADMIN] == frozenset(
+        {Capability.ACCESS_ADMIN_CAP}
+    )
+    assert GLOBAL_CAPABILITIES[GlobalCapability.SECURITY_OFFICER] == frozenset(
+        {
+            Capability.POLICY_ADMIN,
+            Capability.SERVERS_ADMIN,
+            Capability.CATALOGS_WRITE,
+            Capability.ENVIRONMENTS_WRITE,
+        }
+    )
+
+
+def test_global_sets_are_pairwise_disjoint():
+    """
+    Invariante 9. Con ``gateway.admin`` en las dos globales, un ``security_officer`` sin
+    ``access_admin`` administraba usuarios igual: la separación de deberes estaba en el papel.
+    """
+    vistas: set[Capability] = set()
+    for caps in GLOBAL_CAPABILITIES.values():
+        assert not (caps & vistas), sorted(c.value for c in caps & vistas)
+        vistas |= caps
+
+
+@pytest.mark.parametrize("cap", [Capability.ACCESS_ADMIN_CAP, Capability.POLICY_ADMIN])
+def test_the_split_capabilities_are_global_mutating_step_up_and_never_agent(cap):
+    s = cc.spec(cap)
+    assert (s.mutates, s.requires_step_up, s.scope_axis) == (True, True, "global")
+    assert not s.discloses and not s.agent_allowed and not s.destructive
+    assert not cc.is_grantable(cap), "una global otorgable saltearía la separación"
+    assert cap not in AGENT_ALLOWED
+
+
+def test_gateway_admin_is_retired():
+    """
+    Invariante 12. ``gateway.admin`` no existe en el enum, no se parsea de ningún lado y está en
+    la lista de retiradas que también lee ``scripts/check_route_capabilities.py``.
+    """
+    assert "gateway.admin" not in {c.value for c in Capability}
+    assert "gateway.admin" in cc.RETIRED_CAPABILITIES
+    assert not cc.is_grantable("gateway.admin")
+    assert cc.parse_scopes("gateway.admin") == frozenset()
+    with pytest.raises(ValueError):
+        Capability("gateway.admin")
+
+
+def test_a_security_officer_viewer_does_not_administer_access():
+    """El efecto buscado de la partición: ``security_officer`` solo ya no administra usuarios."""
+    actor = admin_actor(
+        user_id=1,
+        username="ana",
+        role=GatewayRole.VIEWER,
+        globals_=frozenset({GlobalCapability.SECURITY_OFFICER}),
+    )
+    assert actor.has(Capability.POLICY_ADMIN)
+    assert not actor.has(Capability.ACCESS_ADMIN_CAP)
+
+
+def test_an_access_admin_viewer_does_not_rotate_crypto():
+    actor = admin_actor(
+        user_id=1,
+        username="ana",
+        role=GatewayRole.VIEWER,
+        globals_=frozenset({GlobalCapability.ACCESS_ADMIN}),
+    )
+    assert actor.has(Capability.ACCESS_ADMIN_CAP)
+    assert not actor.has(Capability.POLICY_ADMIN)
+    assert actor.capabilities == (
+        ROLE_CAPABILITIES[GatewayRole.VIEWER] | {Capability.ACCESS_ADMIN_CAP}
+    )
 
 
 def test_an_access_admin_viewer_holds_nothing_beyond_viewer_and_its_globals():
@@ -257,7 +339,8 @@ def test_environments_write_belongs_only_to_security_officer():
     for caps in ROLE_CAPABILITIES.values():
         assert Capability.ENVIRONMENTS_WRITE not in caps
         assert Capability.ENVIRONMENTS_READ in caps
-    assert "entornos" not in cc.spec(Capability.GATEWAY_ADMIN).label
+    assert "entornos" not in cc.spec(Capability.ACCESS_ADMIN_CAP).label
+    assert "entornos" not in cc.spec(Capability.POLICY_ADMIN).label
 
 
 # --------------------------------------------------------------------------- #
@@ -276,7 +359,7 @@ def test_parse_scopes_intersects_with_the_agent_ceiling():
     Una fila de ``api_tokens`` manipulada o legada NO puede otorgar fuera del techo, incluso
     si el string lo dice. Fail-closed en el lector, no solo en el escritor.
     """
-    caps = cc.parse_scopes("databases.read,databases.drop,gateway.admin")
+    caps = cc.parse_scopes("databases.read,databases.drop,access.admin,gateway.admin")
     assert caps == frozenset({Capability.DATABASES_READ})
 
 

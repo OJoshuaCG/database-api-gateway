@@ -322,7 +322,8 @@ def test_reader_ignores_an_active_grant_with_an_elapsed_expiry(client):
 
 
 @pytest.mark.parametrize(
-    "capability", ["gateway.admin", "environments.write", "no.existe", "", "BLUEPRINTS_APPLY"]
+    "capability",
+    ["gateway.admin", "access.admin", "environments.write", "no.existe", "", "BLUEPRINTS_APPLY"],
 )
 def test_reader_drops_non_grantable_or_unknown_rows(client, capability):
     """D3: una fila editada a mano no puede acuñar una capacidad (fail-closed en el lector)."""

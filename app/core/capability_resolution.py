@@ -18,7 +18,8 @@ LAS REGLAS (decisiones de negocio, no negociables acá)
   ``blueprints.apply`` en producción puede aplicar ahí y sigue siendo ``viewer`` en el resto.
 - Solo cuentan las capacidades puntuales ``active`` (el SELECT ya filtra; acá no se re-evalúa).
   El lector descarta además toda fila cuya capacidad sea desconocida o NO otorgable
-  (fail-closed, D3): una fila editada a mano con ``gateway.admin`` no acuña nada.
+  (fail-closed, D3): una fila editada a mano con ``access.admin`` (global) o con la
+  retirada ``gateway.admin`` (desconocida) no acuña nada.
 - Un destino global (sin entorno ni servidor) no coincide con ninguna capacidad puntual.
 - Escribir/ejecutar implica la lectura de su módulo (``IMPLIED_READ``).
 - Los tokens de agente nunca ganan capacidades puntuales: su rama no pasa por acá.

@@ -9,7 +9,7 @@ justamente para no filtrarlo por fuerza bruta. Publicárselo a un anónimo tirar
 from fastapi import APIRouter
 
 from app.controllers.authz_controller import AuthzController
-from app.core.authz import GatewayAdmin, SelfRead
+from app.core.authz import AccessAdmin, SelfRead
 from app.schemas.authz import CapabilityRowOut, ScopeReadinessOut
 from app.utils.response import ApiResponse, success
 
@@ -29,7 +29,7 @@ def capability_catalog(actor: SelfRead):
 
 
 @router.get("/scope-readiness", response_model=ApiResponse[ScopeReadinessOut])
-def scope_readiness(actor: GatewayAdmin):
+def scope_readiness(actor: AccessAdmin):
     """
     Qué pasaría si se empezara a otorgar acceso por alcance, HOY.
 
@@ -38,7 +38,7 @@ def scope_readiness(actor: GatewayAdmin):
     otorgar "lector en producción" también le saca a esa persona el acceso a toda base que nadie
     clasificó. El reporte dice cuántas son y en qué servidores.
 
-    Detrás de ``gateway.admin`` porque su audiencia es quien administra accesos, y es quien
+    Detrás de ``access.admin`` porque su audiencia es quien administra accesos, y es quien
     tiene que actuar sobre el resultado. **Cero conexiones al motor.**
     """
     return success(data=AuthzController().scope_readiness())

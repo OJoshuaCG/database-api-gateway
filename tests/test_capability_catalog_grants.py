@@ -39,7 +39,9 @@ def test_grantable_is_exactly_the_non_global_axes():
         assert cc.is_grantable(s.id) is (s.scope_axis != "global")
 
 
-@pytest.mark.parametrize("raw", ["gateway.admin", "no.existe", "", "ENGINE_USERS_WRITE"])
+@pytest.mark.parametrize(
+    "raw", ["gateway.admin", "access.admin", "policy.admin", "no.existe", "", "ENGINE_USERS_WRITE"]
+)
 def test_unknown_or_global_strings_fail_closed(raw):
     assert cc.is_grantable(raw) is False
     assert cc.is_sensitive(raw) is False

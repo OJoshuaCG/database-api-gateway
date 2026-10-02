@@ -66,7 +66,7 @@ class ApiTokenController:
         """
         ahora = _utcnow()
         # Los scopes EFECTIVOS, no el string crudo de la fila. La diferencia importa cuando la
-        # fila fue manipulada: con `scopes="gateway.admin"` en la BD, el crudo se le mostraba al
+        # fila fue manipulada: con `scopes="access.admin"` en la BD, el crudo se le mostraba al
         # operador como si el token tuviera esa capacidad, mientras el efectivo es vacío. La
         # autorización ya era fail-closed —`parse_scopes` intersecta con el techo de agente— pero
         # la PANTALLA afirmaba otra cosa, y en una revisión de accesos eso es lo que se lee.

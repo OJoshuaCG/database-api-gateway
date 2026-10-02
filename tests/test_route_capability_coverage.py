@@ -137,6 +137,56 @@ def test_the_legacy_guard_no_longer_exists(guard):
     assert hasattr(auth_mod, "authenticated_user")
 
 
+def test_no_route_declares_the_retired_gateway_admin(guard):
+    """
+    Trinquete del invariante 12 sobre la app REAL: ``gateway.admin`` se partió en
+    ``access.admin`` y ``policy.admin`` y ninguna ruta la puede volver a declarar. El alias
+    ``GatewayAdmin`` tampoco existe: copiar una ruta vieja tiene que fallar al importar.
+    """
+    import app.core.authz as authz_mod
+    from main import app
+
+    assert not hasattr(authz_mod, "GatewayAdmin")
+    declaradas = {guard._capability_of(r) for _, r in guard._iter_routes(app)}
+    assert not (declaradas & guard.RETIRED_CAPABILITIES)
+
+
+#: Prefijo → capacidad que TODA ruta bajo él tiene que declarar tras la partición.
+_SPLIT_ROUTES = {
+    "/api/v1/gateway-users": "access.admin",
+    "/api/v1/api-tokens": "access.admin",
+    "/api/v1/capability-grants": "access.admin",
+    "/api/v1/authz/scope-readiness": "access.admin",
+    "/api/v1/admin/crypto": "policy.admin",
+}
+
+
+def test_the_split_routes_declare_the_right_half(guard):
+    """
+    Cada ruta que declaraba ``gateway.admin`` declara ahora la mitad que le corresponde. Aceptar
+    una invitación es la única pública bajo ``/gateway-users`` (ver ``PUBLIC_ROUTES``).
+    """
+    from main import app
+
+    vistas = {prefijo: 0 for prefijo in _SPLIT_ROUTES}
+    for path, route in guard._iter_routes(app):
+        for prefijo, esperada in _SPLIT_ROUTES.items():
+            if not path.startswith(prefijo):
+                continue
+            for method in route.methods - {"HEAD", "OPTIONS"}:
+                if (method, path) in guard.PUBLIC_ROUTES:
+                    continue
+                vistas[prefijo] += 1
+                assert guard._capability_of(route) == esperada, f"{method} {path}"
+    assert vistas == {
+        "/api/v1/gateway-users": 10,
+        "/api/v1/api-tokens": 3,
+        "/api/v1/capability-grants": 3,
+        "/api/v1/authz/scope-readiness": 1,
+        "/api/v1/admin/crypto": 1,
+    }
+
+
 def test_public_routes_allowlist_is_short_and_explicit(guard):
     """
     Corta y explícita, nunca una heurística por prefijo: `/api/v1/test/*` se quedó sin guard
@@ -222,7 +272,7 @@ def test_check_6_accepts_listed_pending_and_exempt_routes(guard):
 
 
 def test_check_6_does_not_ask_a_target_of_viewer_floor_or_global_capabilities(guard):
-    from app.core.authz import DatabasesRead, GatewayAdmin
+    from app.core.authz import AccessAdmin, DatabasesRead
 
     app = FastAPI()
 
@@ -231,7 +281,7 @@ def test_check_6_does_not_ask_a_target_of_viewer_floor_or_global_capabilities(gu
         return {}
 
     @app.get("/global")
-    def global_(actor: GatewayAdmin):
+    def global_(actor: AccessAdmin):
         return {}
 
     assert _errors(guard, app) == []

@@ -252,7 +252,7 @@ def set_agent_access(actor: EnvironmentsWrite, db_id: int, payload: AgentAccessI
     gesto propio y sin rastro distinguible.
 
     Detrás de ``environments.write`` (solo ``security_officer``) y no del rol operativo ni de
-    ``gateway.admin``, porque es **dato de política**: la regla del §4.5 es que toda fila que un
+    ``access.admin``, porque es **dato de política**: la regla del §4.5 es que toda fila que un
     guard lee es una frontera de privilegio, así que su escritor necesita al menos el privilegio
     del guard que puede apagar. Quien administra el acceso no decide qué BDs ven los agentes.
 

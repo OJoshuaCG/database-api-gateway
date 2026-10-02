@@ -3,13 +3,13 @@ Endpoints de los tokens de agente (``/api-tokens``).
 
 Bajo sesión de administrador y REST convencional con ``ApiResponse[T]``: es la SPA la que
 administra tokens, no un agente. Un token **no puede emitir otro token** — eso está garantizado
-por el techo de agente, que excluye `gateway.admin`.
+por el techo de agente, que excluye `access.admin`. Solo `access_admin` los administra.
 """
 
 from fastapi import APIRouter, Request
 
 from app.controllers.api_token_controller import ApiTokenController
-from app.core.authz import GatewayAdmin
+from app.core.authz import AccessAdmin
 from app.core.limiter import limiter
 from app.schemas.api_token import ApiTokenCreate, ApiTokenCreatedOut, ApiTokenOut
 from app.utils.pagination import PaginationDep
@@ -19,7 +19,7 @@ router = APIRouter(prefix="/api-tokens", tags=["API Tokens"])
 
 
 @router.get("", response_model=ApiResponse[list[ApiTokenOut]])
-def list_api_tokens(actor: GatewayAdmin, pagination: PaginationDep):
+def list_api_tokens(actor: AccessAdmin, pagination: PaginationDep):
     """Los tokens emitidos, con su estado. **Sin el secreto**, que no se guarda."""
     items, total = ApiTokenController().list_tokens(
         limit=pagination.size, offset=pagination.offset
@@ -29,7 +29,7 @@ def list_api_tokens(actor: GatewayAdmin, pagination: PaginationDep):
 
 @router.post("", response_model=ApiResponse[ApiTokenCreatedOut], status_code=201)
 @limiter.limit("10/minute")
-def create_api_token(request: Request, actor: GatewayAdmin, payload: ApiTokenCreate):
+def create_api_token(request: Request, actor: AccessAdmin, payload: ApiTokenCreate):
     """
     Emite un token y devuelve el bearer **una sola vez**.
 
@@ -48,7 +48,7 @@ def create_api_token(request: Request, actor: GatewayAdmin, payload: ApiTokenCre
 
 
 @router.delete("/{token_pk}", response_model=ApiResponse[ApiTokenOut])
-def revoke_api_token(actor: GatewayAdmin, token_pk: int):
+def revoke_api_token(actor: AccessAdmin, token_pk: int):
     """
     Revoca el token. **No hay reactivar**: ``revoked_at`` no se deshace.
 

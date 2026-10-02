@@ -514,9 +514,8 @@ class GatewayUserController:
         """
         Nadie cambia su PROPIO rol, su propio acceso ni se desactiva a sí mismo.
 
-        POR QUÉ. ``gateway.admin`` (``access_admin``, y también ``security_officer``) no es
-        operativo, pero administraba a cualquier usuario sin excepción, incluido quien hacía la
-        request: ``PATCH /gateway-users/{yo} {gateway_role: owner}`` o
+        POR QUÉ. ``access.admin`` (la global ``access_admin``) no es operativo, pero
+        administraba a cualquier usuario sin excepción, incluido quien hacía la request: ``PATCH /gateway-users/{yo} {gateway_role: owner}`` o
         ``PUT /gateway-users/{yo}/access {global_capabilities: [security_officer]}`` convertían
         al administrador de accesos en operador de producción en un request, que es justo la
         separación de deberes que ``access_admin`` existe para sostener (docs/plans/13 §4.4:

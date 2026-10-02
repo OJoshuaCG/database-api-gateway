@@ -2740,10 +2740,10 @@ servidor, sin cambiarle el rol. Suma al rol del alcance (nunca resta) y no toca 
 Incluye el alta, el listado, la revocación, la aprobación/rechazo de las sensibles, la vista de
 la propia persona (`/auth/me`) y el acceso efectivo con procedencia.
 
-**Quién actúa.** Solo quien tiene la global `access_admin` (`security_officer` tiene
-`gateway.admin` pero recibe `403`). Todo es CSRF + sesión, como el resto de `/gateway-users`.
+**Quién actúa.** Solo quien tiene la global `access_admin`: las rutas declaran `access.admin`,
+que `security_officer` no tiene (`403`; ver `api-reference-v29.md`). Todo es CSRF + sesión, como el resto de `/gateway-users`.
 Nadie se otorga ni se revoca capacidades a sí mismo. Las capacidades **globales** (`servers.admin`,
-`catalogs.*`, `environments.*`, `gateway.admin`, `self.read`) no se otorgan nunca.
+`catalogs.*`, `environments.*`, `access.admin`, `policy.admin`, `self.read`) no se otorgan nunca.
 
 **Techo.** Quien otorga tiene que tener la capacidad en ese alcance (su rol en el alcance, sus
 globales y sus propias capacidades puntuales). Otorgar escribir/ejecutar trae implícita la lectura

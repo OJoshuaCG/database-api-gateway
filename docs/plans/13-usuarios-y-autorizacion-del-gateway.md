@@ -170,7 +170,13 @@ módulo M".
 | `exports` | `read` · `execute` · `download` | `/database-exports/*` |
 | `sql-console` | `history` · `execute` | `/servers/{sid}/query/*` |
 | `catalogs` | `read` · `write` | `/privileges`, `/permission-profiles`, `/charset-collation-options` |
-| `gateway-admin` | (único) | `/admin/crypto/rotate`, `/environments` mutante, `/gateway-users`, `/api-tokens` |
+| `access` | `admin` | `/gateway-users`, `/api-tokens`, `/capability-grants`, `/authz/scope-readiness` — solo `access_admin` |
+| `policy` | `admin` | `/admin/crypto/rotate` (y la lectura de auditoría cuando exista) — solo `security_officer` |
+| `environments` | `read` · `write` | `/environments` (`write` solo `security_officer`) |
+
+> Esta fila era `gateway-admin` (único), compartida por `access_admin` y `security_officer`; se
+> partió en `access.admin` / `policy.admin` para que los conjuntos de las dos globales sean
+> disjuntos (ver `api-reference-v29.md`).
 
 **Tabla NORMATIVA: cada ruta declara exactamente UNA capacidad** (§6.3 punto 1), así que las
 asignaciones no pueden aparecer dos veces con nombres distintos. Tres que hay que fijar acá y no
@@ -180,10 +186,11 @@ resolver por lectura:
 |---|---|---|
 | `POST/PATCH/DELETE /servers` | `servers.admin` | **solo `security_officer`** — NO `owner` (§4.6: re-apuntar un `server_id` redirige cada operación futura de todo operador) |
 | `PATCH /privileges`, `POST/PATCH /permission-profiles`, `POST/PATCH /charset-collation-options` | `catalogs.write` | **solo `security_officer`** (§4.5: son datos de política) |
-| `POST/PATCH/DELETE /environments` | `gateway-admin` | **solo `security_officer`** |
+| `POST/PATCH/DELETE /environments` | `environments.write` | **solo `security_officer`** |
 
-Lo que queda en `gateway-admin` para `access_admin` es `/gateway-users`, `/api-tokens` y
-`/admin/crypto/rotate`. Sin esta tabla, quien implemente elegiría una de las dos capacidades que el
+Lo que queda para `access_admin` es `access.admin`: `/gateway-users`, `/api-tokens`,
+`/capability-grants` y `/authz/scope-readiness`. `/admin/crypto/rotate` es `policy.admin`
+(`security_officer`). Sin esta tabla, quien implemente elegiría una de las dos capacidades que el
 documento nombraba y la descartada quedaría como **vocabulario muerto que el punto 4 del §6.3 hace
 fallar** — o peor, se cablearía `servers.admin` dentro de `owner` y el requisito del §4.6 se
 perdería en silencio.

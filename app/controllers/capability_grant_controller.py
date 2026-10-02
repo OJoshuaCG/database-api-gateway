@@ -3,9 +3,14 @@ Controller de las CAPACIDADES PUNTUALES: crear, listar y revocar (B3).
 
 Quién puede qué (decisiones de negocio, no negociables acá)
 -----------------------------------------------------------
-- Solo ``access_admin`` actúa (D10). Las rutas siguen declarando ``gateway.admin`` —que también
-  tiene ``security_officer``—, así que el controller exige además la global ``access_admin`` y
-  responde un 403 opaco (``access.forbidden``) si falta.
+- Solo ``access_admin`` actúa (D10). Lo hace cumplir la RUTA: todas declaran ``access.admin``,
+  que solo trae la global ``access_admin`` (invariantes 9 y 10 del catálogo) y que ningún otro
+  camino puede acuñar —es de eje global, así que no es otorgable suelta, y no es
+  ``agent_allowed``, así que ningún token la tiene—. Mientras la capacidad era ``gateway.admin``
+  y también la tenía ``security_officer``, el controller re-exigía la global con un
+  ``assert_access_admin``; con la capacidad partida ese chequeo era idéntico al de la ruta y se
+  retiró. Si alguna vez se llama a este controller desde una ruta que NO declara
+  ``access.admin``, es esa ruta la que está mal.
 - Nadie se otorga ni se revoca capacidades a sí mismo (``access.self_modification_forbidden``).
 - Una capacidad puntual SUMA al rol y nunca es de eje global (``is_grantable``).
 - Techo: quien otorga tiene que tener la capacidad EN ese alcance (rol del alcance ∪ globales ∪
@@ -34,7 +39,7 @@ estado. Los rechazos por auto-otorgamiento y techo se auditan como ``failure``.
 
 import json
 
-from app.core.actor import Actor, identity_of
+from app.core.actor import identity_of
 from app.core.capability_resolution import capability_at_point
 from app.core.scope import ScopePoint, resolve_environment_id
 from app.controllers.gateway_user_controller import CODE_NOT_FOUND
@@ -44,7 +49,6 @@ from app.models.user_model import UserModel
 from app.services import audit
 from app.services.capability_catalog import (
     CODE_CAPABILITY_NOT_GRANTABLE,
-    CODE_FORBIDDEN,
     CODE_GRANT_CEILING,
     CODE_GRANT_DUPLICATE,
     CODE_GRANT_NOT_FOUND,
@@ -59,20 +63,6 @@ from app.services.capability_catalog import (
     is_grantable,
     is_sensitive,
 )
-
-
-def assert_access_admin(actor) -> None:
-    """403 opaco si el actor no tiene la global ``access_admin`` (D10). No dice qué falta."""
-    if not (
-        isinstance(actor, Actor)
-        and actor.kind == "admin"
-        and GlobalCapability.ACCESS_ADMIN in actor.global_capabilities
-    ):
-        raise AppHttpException(
-            message="No tienes permiso para esta operación.",
-            status_code=403,
-            public_context={"code": CODE_FORBIDDEN},
-        )
 
 
 def _object_name(scope_type: str, scope_id: int) -> str:
@@ -248,7 +238,6 @@ class CapabilityGrantController:
     # Lectura                                                            #
     # ------------------------------------------------------------------ #
     def list_for_user(self, user_id: int, actor, status: str | None = None) -> list[dict]:
-        assert_access_admin(actor)
         self.expire_overdue()
         self._user_or_404(user_id)
         return self._serialize_many(self.grants.list_for_user(user_id, status))
@@ -259,11 +248,10 @@ class CapabilityGrantController:
     def create(self, user_id: int, data: dict, actor) -> dict:
         """
         Orden de los chequeos (el primero que falla gana, y los más baratos y menos
-        informativos van antes): access_admin (403) → auto-otorgamiento (409) → usuario existe
+        informativos van antes): ``access.admin`` en la ruta (403) → auto-otorgamiento (409) → usuario existe
         (404) y activo (409) → otorgable (422) → alcance existe (404) → techo (409) → duplicado
         (409, con el ``UNIQUE`` de respaldo).
         """
-        assert_access_admin(actor)
         capability = data["capability"]
         scope_type, scope_id = data["scope_type"], int(data["scope_id"])
         sensitive = is_sensitive(capability)
@@ -344,7 +332,6 @@ class CapabilityGrantController:
         segundo aprobador. Una fila de OTRO usuario o inexistente es 404; una ya terminal, 409
         ``grant_not_pending`` (el vocabulario cerrado no tiene un código mejor).
         """
-        assert_access_admin(actor)
         user = self._user_or_404(user_id)
         if self._is_self(actor, user_id):
             raise self._self_error("revocarte capacidades a ti mismo")
@@ -433,7 +420,6 @@ class CapabilityGrantController:
 
     def list_pending(self, actor) -> list[dict]:
         """Bandeja: solicitudes pendientes vigentes, cada una con ``can_decide`` para ``actor``."""
-        assert_access_admin(actor)
         self.expire_overdue()
         rows = self.grants.list_pending()
         out = self._serialize_many(rows)
@@ -462,7 +448,6 @@ class CapabilityGrantController:
         return row
 
     def approve(self, grant_id: int, actor, reason: str | None = None) -> dict:
-        assert_access_admin(actor)
         self.expire_overdue()
         row = self._pending_or_error(grant_id)
         grantee = self.users.find_by_id(row["user_id"])
@@ -510,7 +495,6 @@ class CapabilityGrantController:
 
     def reject(self, grant_id: int, actor, reason: str | None = None) -> dict:
         """Pendiente → ``rejected``. Sin techo ni segundo aprobador: rechazar nunca da acceso."""
-        assert_access_admin(actor)
         self.expire_overdue()
         row = self._pending_or_error(grant_id)
         grantee = self.users.find_by_id(row["user_id"])

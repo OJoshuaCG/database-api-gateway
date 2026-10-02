@@ -97,7 +97,7 @@ def list_own_sessions(request: Request, actor: SelfRead):
     el ``audit_log``.
 
     Detrás de ``self.read`` y **acotado al propio usuario**, sin parámetro para mirar las de
-    otro: eso es administración de accesos y va con ``gateway.admin``, no acá.
+    otro: eso es administración de accesos y va con ``access.admin``, no acá.
     """
     return success(
         data=session_store.list_for_user(
@@ -114,7 +114,7 @@ def revoke_other_sessions(request: Request, actor: SelfRead):
     La excepción de la actual no es una comodidad: quien pide esto está reaccionando a algo que
     vio en el listado, y echarlo de la sesión desde la que está actuando lo deja sin poder
     seguir. La revocación administrativa —que sí cierra todas— es otra cosa y va con
-    ``gateway.admin``.
+    ``access.admin``.
 
     Se audita porque es el rastro que explica por qué N sesiones terminaron a la misma hora.
     """

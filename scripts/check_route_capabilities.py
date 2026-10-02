@@ -90,6 +90,7 @@ from app.core.authz import (  # noqa: E402
 )
 from app.core.scope_targets import _RESOLVERS  # noqa: E402
 from app.services.capability_catalog import (  # noqa: E402
+    RETIRED_CAPABILITIES,
     Capability,
     GatewayRole,
     role_capabilities,
@@ -430,6 +431,14 @@ def main() -> int:
                 if cap not in validas:
                     errores.append(
                         f"{method} {path} declara '{cap}', que no está en el catálogo."
+                    )
+                # Chequeo 8 (trinquete): ninguna ruta declara una capacidad RETIRADA. Hoy el
+                # chequeo 3 ya la atrapa porque no está en el catálogo; este existe para el día
+                # que alguien la reintroduzca en el enum "para que compile" y lo ponga verde.
+                if cap in RETIRED_CAPABILITIES:
+                    errores.append(
+                        f"{method} {path} declara '{cap}', que está RETIRADA: "
+                        "usá access.admin (accesos) o policy.admin (política)."
                     )
                 continue
 

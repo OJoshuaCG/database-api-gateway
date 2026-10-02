@@ -42,9 +42,14 @@ inicio.
 
 Las tres cosas se fijan EXPLÍCITAMENTE y no se heredan de defaults: `users.gateway_role` tiene
 `server_default='viewer'` a propósito —para que ninguna fila nazca con privilegio— y `owner`
-no alcanza solo, porque `servers.admin`, `catalogs.write` y `gateway.admin` viven **únicamente**
-en las capacidades globales. Sin ellas, el admin recién sembrado no podría dar de alta un
-servidor ni rotar la clave de datos.
+no alcanza solo, porque `servers.admin`, `catalogs.write`, `access.admin` y `policy.admin` viven
+**únicamente** en las capacidades globales. Sin ellas, el admin recién sembrado no podría dar de
+alta un servidor, administrar usuarios ni rotar la clave de datos.
+
+Las dos globales no se solapan: `access_admin` = `{access.admin}` (usuarios, accesos,
+capacidades puntuales, tokens) y `security_officer` = `{policy.admin, servers.admin,
+catalogs.write, environments.write}`. Un `security_officer` **sin** `access_admin` no administra
+usuarios, y un `access_admin` sin `security_officer` no rota el cifrado (`api-reference-v29.md`).
 
 > `is_superuser` **se retiró**: se escribía en tres lugares y no se leía en ninguno para
 > autorizar, así que no era "todavía no hay permisos" sino un sistema multiusuario sin puerta.

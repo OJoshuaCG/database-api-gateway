@@ -141,17 +141,16 @@ class AuthzController:
         Ni una línea de lógica propia: el contexto sale de ``find_access_context`` (el de la
         autorización real), el ``Actor`` de ``actor_from_access_context`` y las filas de
         ``explain``. Un test exige que el conjunto de capacidades no inertes sea igual a
-        ``Actor.capabilities``. Solo ``access_admin`` (ni siquiera ``security_officer``, y nadie
-        lee el de otro por esta vía: la propia persona usa ``/auth/me``).
+        ``Actor.capabilities``. Solo ``access_admin``: la ruta declara ``access.admin``, que
+        ``security_officer`` no tiene (nadie lee el de otro por esta vía: la propia persona usa
+        ``/auth/me``).
         """
-        from app.controllers.capability_grant_controller import assert_access_admin
         from app.controllers.gateway_user_controller import CODE_NOT_FOUND
         from app.core.authz import actor_from_access_context
         from app.core.capability_resolution import explain
         from app.exceptions import AppHttpException
         from app.models.capability_grant_model import CapabilityGrantModel
 
-        assert_access_admin(actor)
         usuario = UserModel().find_by_id(user_id)
         if not usuario:
             raise AppHttpException(
