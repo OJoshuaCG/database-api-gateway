@@ -34,7 +34,7 @@ def _login(client) -> None:
     el ``sid`` **rota en cada login**: el del login anterior ya no valida. Es la misma cosa que
     tiene que hacer la SPA.
     """
-    from tests.conftest import attach_csrf
+    from tests.csrf_helpers import attach_csrf
 
     r = client.post("/api/v1/auth/login", json={"username": "admin", "password": "admin123"})
     assert r.status_code == 200, r.text

@@ -70,21 +70,10 @@ def client():
         yield c
 
 
-def attach_csrf(client) -> None:
-    """
-    Copia el token CSRF de la cookie al header por defecto del client.
-
-    Es lo que hace el JS de la SPA, y va acá —en UN solo lugar— para que los ~44 archivos de
-    tests que usan ``admin_client`` no tengan que saber del token. Lo importante es lo que NO
-    se hizo: el guard **no** está detrás de un flag que los tests apaguen. Un control de
-    seguridad que la suite desactiva es un control que nadie verifica; así, en cambio, un test
-    nuevo que se olvide del header falla con 403 y eso es la señal correcta.
-    """
-    from app.core.csrf import CSRF_HEADER, cookie_name
-
-    token = client.cookies.get(cookie_name())
-    assert token, "el middleware no publicó la cookie de CSRF"
-    client.headers[CSRF_HEADER] = token
+# ``attach_csrf`` vive en un módulo SIN efectos al importarse: los tests que lo necesitan
+# importaban ``tests.conftest`` y eso creaba una segunda instancia de este archivo, con su
+# propio tmpdir y otro DB_NAME (ver test_hay_una_sola_instancia_de_conftest).
+from tests.csrf_helpers import attach_csrf  # noqa: E402
 
 
 @pytest.fixture()

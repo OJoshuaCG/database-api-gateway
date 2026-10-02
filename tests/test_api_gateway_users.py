@@ -187,7 +187,7 @@ def _cliente_como(datos: dict, username: str, password: str = "ContraseñaLarga1
     from fastapi.testclient import TestClient
 
     from main import app
-    from tests.conftest import attach_csrf
+    from tests.csrf_helpers import attach_csrf
 
     otra = TestClient(app)
     assert _aceptar(otra, datos["invite_token"], password=password).status_code == 200
