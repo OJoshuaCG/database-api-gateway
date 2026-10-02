@@ -6,7 +6,12 @@ from app.controllers.auth_controller import AuthController
 from app.core import session_store
 from app.core.auth import SESSION_SID, login_session, logout_session
 from app.core.authz import SelfRead
-from app.core.limiter import limiter
+from app.core.limiter import (
+    LOGIN_IP_RATE_LIMIT,
+    client_address,
+    enforce_login_limits,
+    limiter,
+)
 from app.controllers.authz_controller import AuthzController
 from app.schemas.auth import AdminOut, LoginIn, RevokeOthersOut, SessionOut
 from app.schemas.authz import MeOut
@@ -17,8 +22,18 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 
 
 @router.post("/login", response_model=ApiResponse[AdminOut])
-@limiter.limit("5/minute")
+@limiter.limit(LOGIN_IP_RATE_LIMIT, key_func=client_address)
 def login(request: Request, credentials: LoginIn):
+    """
+    Inicia sesión.
+
+    **El límite NO usa el eje de sesión** (``session_or_address``) y no es un descuido: ese eje
+    lee el ``sid`` de la cookie sin verificar que siga vivo, y en un endpoint público eso es un
+    valor que elige el atacante — con N cookies juntadas tenía 5·N intentos por minuto contra
+    cualquier cuenta. Acá se limita por IP (decorador) y por IP+usuario y usuario
+    (``enforce_login_limits``), antes de verificar la password.
+    """
+    enforce_login_limits(request, credentials.username)
     admin = AuthController().authenticate(credentials.username, credentials.password)
     login_session(request, admin)
     return success(data=admin, message="Sesión iniciada.")

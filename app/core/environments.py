@@ -49,6 +49,12 @@ DOCS_PASSWORD = os.getenv("DOCS_PASSWORD", "")
 RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "100/minute")
 RATE_LIMIT_REDIS_ENABLED = os.getenv("RATE_LIMIT_REDIS_ENABLED", "False").lower() == "true"
 RATE_LIMIT_REDIS_URL = os.getenv("RATE_LIMIT_REDIS_URL", "redis://localhost:6379")
+# Tope de intentos de login POR CUENTA, independiente de la IP: es lo único que frena un ataque
+# distribuido contra una cuenta concreta (cada IP del atacante tiene su propio cupo por IP).
+# El costo es un DoS de bloqueo: quien conozca un username puede gastarle el cupo y dejar a su
+# dueño sin poder entrar hasta que la ventana se vacíe. Vacío lo desactiva — la válvula para
+# cuando ese DoS esté ocurriendo. Ver `app/core/limiter.py`.
+LOGIN_USERNAME_RATE_LIMIT = os.getenv("LOGIN_USERNAME_RATE_LIMIT", "20/hour").strip()
 
 # IPs o CIDRs del proxy reverso en los que se CONFÍA para leer `X-Forwarded-For`.
 #

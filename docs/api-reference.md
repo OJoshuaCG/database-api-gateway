@@ -259,7 +259,10 @@ El gateway usa **sesión por cookie firmada** (httpOnly). El modelo es de **admi
 3. Todos los endpoints bajo `/api/v1` (excepto `login`) requieren la cookie; sin ella
    devuelven `401`.
 
-`POST /api/v1/auth/login` está limitado a **5 peticiones por minuto** por IP. El resto de
+`POST /api/v1/auth/login` está limitado a **20 peticiones por minuto por IP**, **5 por minuto
+por IP + usuario** y **20 por hora por usuario** desde cualquier IP (ver
+[`api-reference-v24.md`](api-reference-v24.md) §7). La cookie de sesión no cuenta para este
+límite. El resto de
 endpoints comparten el rate limit global configurado en el servidor, salvo los
 específicos anotados en cada sección (`grants`, `apply-all`, `apply`/`rollback`/`stamp`,
 `adopt`/`execute` de schema-comparisons).
@@ -318,7 +321,9 @@ una sesión válida, el resto de la API responde `401`.
 
 ### `POST /api/v1/auth/login`
 
-Inicia sesión y emite la cookie de sesión. **Rate limit: 5/minuto.**
+Inicia sesión y emite la cookie de sesión. **Rate limit: 20/min por IP · 5/min por IP + usuario ·
+20/hora por usuario** (el usuario se compara normalizado: `Admin` y `admin` gastan el mismo cupo;
+el límite corre antes de verificar la password).
 
 **Body** (`LoginIn`):
 
@@ -2597,7 +2602,9 @@ Relevantes para quien despliega o consume el gateway (la lista completa está en
 |---|---|
 | `CORS_ORIGINS` | Orígenes permitidos para el frontend que consume la API (coma-separados). |
 | `DOCS_ENABLED` | Habilita `/api/v1/docs` y `/api/v1/redoc`. |
-| `RATE_LIMIT_DEFAULT` | Límite global por IP (p. ej. `100/minute`). El login es fijo `5/minute`. |
+| `RATE_LIMIT_DEFAULT` | Límite global por IP (p. ej. `100/minute`). El login tiene límites propios (ver §5). |
+| `LOGIN_USERNAME_RATE_LIMIT` | Tope de intentos de login por cuenta desde cualquier IP (default `20/hour`; vacío lo desactiva). |
+| `MCP_AUTH_FAILURE_RATE_LIMIT` | Tope de credenciales rechazadas por IP en `/mcp` (default `30/minute`). |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | Credenciales del administrador único (sembrado al arrancar). |
 | `SECRET_KEY` | Deriva la clave Fernet y firma la sesión. Obligatorio en producción. |
 | `REMOTE_CONNECT_TIMEOUT` | Segundos para abrir la conexión a un servidor destino. |

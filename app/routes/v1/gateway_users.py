@@ -19,7 +19,7 @@ from fastapi import APIRouter, Query, Request
 from app.controllers.authz_controller import AuthzController
 from app.controllers.capability_grant_controller import CapabilityGrantController
 from app.controllers.gateway_user_controller import GatewayUserController
-from app.core.limiter import limiter
+from app.core.limiter import client_address, limiter
 from app.core.authz import GatewayAdmin
 from app.schemas.authz import EffectiveAccessOut
 from app.schemas.capability_grant import CapabilityGrantCreate, CapabilityGrantOut
@@ -69,7 +69,9 @@ def create_gateway_user(actor: GatewayAdmin, payload: GatewayUserCreate):
 
 
 @router.post("/invite/accept", response_model=ApiResponse[AcceptInviteOut])
-@limiter.limit("10/minute")
+# Por IP y no por sesión: es público, y el `sid` sin verificar de `session_or_address` sería un
+# cupo nuevo por cada cookie que el cliente junte. Ver el docstring de `app/core/limiter.py`.
+@limiter.limit("10/minute", key_func=client_address)
 def accept_invite(request: Request, payload: AcceptInviteIn):
     """
     Fija la primera contraseña. **Público**, y es el único endpoint público que escribe.
@@ -81,9 +83,10 @@ def accept_invite(request: Request, payload: AcceptInviteIn):
     El ``user_id`` viaja DENTRO del token firmado y no como parámetro: si viniera aparte habría
     que verificar que coincide, y ese es el chequeo que alguien olvida.
 
-    Tiene rate limit propio porque es público y escribe. Y **no distingue** "token inválido" de
-    "usuario inexistente": las dos cosas responden igual, para no convertirlo en un oráculo de
-    qué invitaciones hay pendientes.
+    Tiene rate limit propio porque es público y escribe. Y **no distingue** ningún motivo de
+    fallo del token —firma inválida, vencido, ya usado, usuario inexistente—: todos responden el
+    mismo 422 ``gateway_user.not_found`` con el mismo mensaje, para no convertirlo en un oráculo
+    de qué invitaciones hay pendientes. Ver ``GatewayUserController._verify_invite``.
     """
     return success(
         data=GatewayUserController().accept_invite(payload.token, payload.password),
