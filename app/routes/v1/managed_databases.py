@@ -45,6 +45,7 @@ from app.schemas.model_migration import (
 from app.core.scope import assert_at
 from app.core.scope_targets import (
     database,
+    capability_for_database_update,
     database_update,
     managed_create,
     managed_create_for,
@@ -69,10 +70,20 @@ BlueprintsWriteAtDb = Annotated[
 BlueprintsCapturesAtDb = Annotated[
     Actor, Depends(require_at(Capability.BLUEPRINTS_CAPTURES, target=database))
 ]
-# PATCH de inventario: igual que ``DatabasesWriteAtDb`` salvo que reclasificar se decide por
-# ``environments.write`` (controller) y no por el rol en la BD. Ver ``database_update``.
+# PATCH de inventario: igual que ``DatabasesWriteAtDb`` salvo que un PATCH que trae SOLO
+# ``environment_id`` (reclasificar) exige ``environments.write`` y no ``databases.write``: el
+# ``security_officer`` con rol base ``viewer`` tiene que poder hacerlo. Si toca otro campo
+# además, sigue necesitando ``databases.write`` (y el controller exige también
+# ``environments.write`` si el entorno cambia). Ver ``database_update``.
 DatabasesWriteAtDbUpdate = Annotated[
-    Actor, Depends(require_at(Capability.DATABASES_WRITE, target=database_update))
+    Actor,
+    Depends(
+        require_at(
+            Capability.DATABASES_WRITE,
+            target=database_update,
+            capability_for=capability_for_database_update,
+        )
+    ),
 ]
 # Alta y adopción: el destino sale del PAYLOAD (servidor + entorno declarado u omitido).
 DatabasesWriteAtCreate = Annotated[
@@ -190,8 +201,10 @@ def get_database(actor: DatabasesRead, db_id: int):
 def update_database(actor: DatabasesWriteAtDbUpdate, db_id: int, payload: ManagedDatabaseUpdate):
     """
     Metadatos del inventario. Cambiar ``environment_id`` (reclasificar) exige
-    ``environments.write`` —lo valida el controller contra el valor actual— y NO ``databases.write``
-    en la BD: quien reclasifica es el ``security_officer``, aunque sea lector en ese entorno.
+    ``environments.write`` —lo valida el controller contra el valor actual—. Un PATCH con SOLO
+    ``environment_id`` exige únicamente esa capacidad (sin ``databases.write``): quien reclasifica
+    es el ``security_officer``, aunque su rol base sea ``viewer``. Con otros campos además, exige
+    las dos.
     """
     updated = ManagedDatabaseController().update_database(
         db_id, payload.model_dump(exclude_unset=True), admin=actor

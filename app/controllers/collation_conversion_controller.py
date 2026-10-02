@@ -64,6 +64,8 @@ from app.core.environments import (
 from app.core.context import current_http_identifier
 from app.core.logger import get_logger
 from app.core.remote_engine import ServerTarget
+from app.core.scope import partition_for_batch
+from app.core.scope_targets import points_for_databases
 from app.exceptions import AppHttpException
 from app.models.collation_conversion_batch import (
     BATCH_STATUS_CANCELED,
@@ -100,6 +102,7 @@ from app.models.collation_conversion_job import (
 from app.models.enums import EngineType, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.server import Server
+from app.services.capability_catalog import CODE_FORBIDDEN, Capability
 from app.services import audit, charset_catalog, collation_catalog
 from app.services.db_admin import query_policy
 from app.services.db_admin.dtos import TextForeignKey
@@ -2641,6 +2644,20 @@ class CollationConversionController:
                 )
             model_slug = model.slug
             candidates = self._eligible_databases(session, model_id, environment_id)
+            # Capa 2 POR ÍTEM, antes del tope: las BDs prohibidas no entran al plan, no consumen
+            # ``max_databases`` ni cuentan en ``total_eligible``, y no se persiste nada de ellas.
+            # Sin ninguna permitida es 403. Se reportan solo con su id.
+            partition = partition_for_batch(
+                admin=admin,
+                capability=Capability.COLLATION_EXECUTE,
+                points_fn=lambda: points_for_databases(candidates),
+                explicit=False,
+            )
+            omitted: list[int] = []
+            if partition is not None:
+                omitted = list(partition.forbidden)
+                allowed = set(partition.permitted)
+                candidates = [md for md in candidates if md.id in allowed]
             total_eligible = len(candidates)
             selected = candidates[: max(1, max_databases)]
             capped = total_eligible > len(selected)
@@ -2760,6 +2777,11 @@ class CollationConversionController:
             model_id, (target_charset, target_collation),
             [r for r in resolved if r["ok"]],
         )
+        # Los omitidos van DESPUÉS del token y sin ``batch_seq``: no son parte del lote.
+        resolved.extend(
+            {"managed_database_id": i, "ok": False, "error_code": CODE_FORBIDDEN}
+            for i in omitted
+        )
         session = self._session()
         try:
             batch = session.get(CollationConversionBatch, batch_id)
@@ -2777,6 +2799,7 @@ class CollationConversionController:
             detail=(
                 f"lote {batch_id} planificado sobre {len(refs)}/{total_eligible} BD(s) de "
                 f"'{model_slug}' → {target_charset or '-'}/{target_collation}"
+                + (f" — {len(omitted)} omitidas por scope" if omitted else "")
             ),
         )
         return {

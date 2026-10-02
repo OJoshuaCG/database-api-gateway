@@ -20,13 +20,12 @@ from app.controllers.server_user_controller import ServerUserController
 from app.core.authz import (
     DatabasesRead,
     EngineUsersRead,
-    EngineUsersWrite,
     require_at,
 )
 from app.core.actor import Actor
 from app.core.limiter import limiter
 from app.core.scope import assert_at
-from app.core.scope_targets import payload_server, server_user
+from app.core.scope_targets import bulk_profile, payload_server, server_user
 from app.schemas.grant import ApplyProfileBulkRequest, ApplyProfileBulkResult, ApplyProfileRequest, ApplyProfileResult, GrantInfo, GrantRequest, RevokeRequest
 from app.schemas.managed_database import ManagedDatabaseOut
 from app.schemas.server_user import AdoptUserIn, ServerUserCreate, ServerUserFullCreate, ServerUserFullOut, ServerUserOut, ServerUserUpdate
@@ -37,10 +36,13 @@ from app.utils.response import ApiResponse, empty, paginated, success
 router = APIRouter(prefix="/server-users", tags=["Server Users"])
 
 # Alta/adopción/aprovisionamiento: el destino es el ``server_id`` del payload. Las rutas por
-# ``{user_id}`` resuelven el servidor de la fila del usuario. ``apply-profile/bulk`` NO migra
-# acá: es multi-destino (ítems por BD) y lo cubre la unidad de lotes.
+# ``{user_id}`` resuelven el servidor de la fila del usuario. ``apply-profile/bulk`` nombra sus
+# BDs (conjunto explícito): se exige la capacidad en TODAS y una prohibida niega el lote entero.
 EngineUsersWriteAtPayloadServer = Annotated[
     Actor, Depends(require_at(Capability.ENGINE_USERS_WRITE, target=payload_server))
+]
+EngineUsersWriteAtBulk = Annotated[
+    Actor, Depends(require_at(Capability.ENGINE_USERS_WRITE, target=bulk_profile))
 ]
 EngineUsersWriteAtUser = Annotated[
     Actor, Depends(require_at(Capability.ENGINE_USERS_WRITE, target=server_user))
@@ -215,7 +217,7 @@ def apply_profile(
 @limiter.limit("5/minute")
 def apply_profile_bulk(
     request: Request,
-    actor: EngineUsersWrite,
+    actor: EngineUsersWriteAtBulk,
     user_id: int,
     profile_id: int,
     payload: ApplyProfileBulkRequest,

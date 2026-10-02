@@ -68,9 +68,20 @@ def _owner(admin_client, sid, username="own") -> int:
 
 
 def _managed(admin_client, sid, owner, name, model_id, *, environment_id=None) -> int:
-    body = {"name": name, "server_id": sid, "owner_id": owner, "model_id": model_id}
-    if environment_id is not None:
-        body["environment_id"] = environment_id
+    """
+    Alta de una BD del blueprint. Sin ``environment_id`` explícito se declara ``development``
+    (permisivo): omitirlo la dejaría en el entorno ACTIVO más protegido (producción), que exige
+    re-tipear el nombre en el lote y contaminaría todo test que no prueba eso.
+    """
+    if environment_id is None:
+        environment_id = _env_ids(admin_client)["development"]
+    body = {
+        "name": name,
+        "server_id": sid,
+        "owner_id": owner,
+        "model_id": model_id,
+        "environment_id": environment_id,
+    }
     r = admin_client.post("/api/v1/managed-databases", json=body)
     assert r.status_code == 201, r.text
     return r.json()["data"]["id"]

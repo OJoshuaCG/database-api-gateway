@@ -19,7 +19,9 @@ Ninguna prueba conecta a un motor: la autorización resuelve antes de tocarlo.
 import pytest
 from sqlalchemy import text
 
+from app.core import remote_engine
 from app.core.database import Database
+from app.exceptions import AppHttpException
 from tests.scope_helpers import env_id, otorgar, sembrar_bd
 
 _API = "/api/v1/database-models"
@@ -114,10 +116,19 @@ def test_unclassified_database_counts_as_the_most_protected(admin_client, escena
         assert _forbidden(r), f"{metodo} {path} -> {r.status_code}"
 
 
-def test_development_only_blueprint_passes_layer_two(admin_client, escenario):
+def test_development_only_blueprint_passes_layer_two(admin_client, escenario, monkeypatch):
+    """
+    Pasada la capa 2 varias rutas abren una conexión al motor, que acá no existe. Se corta en
+    ``remote_engine.get_engine`` (el único camino hacia un motor) con el error de "motor no
+    disponible" que la app ya sabe responder: solo importa que no sea el 403 de la capa 2.
+    """
+
+    def _sin_motor(*args, **kwargs):
+        raise AppHttpException("Motor no disponible en la prueba.", 502)
+
+    monkeypatch.setattr(remote_engine, "get_engine", _sin_motor)
     for metodo, path, cuerpo in _rutas(escenario["solo_dev"]):
         r = _llamar(admin_client, metodo, path, cuerpo)
-        # Lo que pase después es del motor (inexistente acá): solo importa que no sea la capa 2.
         assert not _forbidden(r), f"{metodo} {path} -> {r.status_code}: {r.text}"
 
 

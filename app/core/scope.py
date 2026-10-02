@@ -50,7 +50,7 @@ reporte de ``GET /authz/scope-readiness``: se clasifica primero, se otorga despu
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -325,10 +325,31 @@ def assert_layer2(actor: Actor, capability: Capability, target: ScopeTarget) -> 
             raise _forbidden()
         return
 
-    permitidos = [_permits(actor, role_at_point(actor, p), capability) for p in puntos]
-    ok = any(permitidos) if target.quantifier == "any" else all(permitidos)
+    if target.quantifier == "any":
+        # Un ítem con varios puntos (origen y destino de una clonación) se permite solo si TODOS
+        # sus puntos se permiten; basta con un ítem permitido para pasar la capa 1 del lote.
+        ok = any(_item_verdicts(actor, capability, puntos).values())
+    else:
+        ok = all(_permits(actor, role_at_point(actor, p), capability) for p in puntos)
     if not ok:
         raise _forbidden()
+
+
+def _item_verdicts(
+    actor: Actor, capability: Capability, points: Sequence[ScopePoint]
+) -> dict:
+    """
+    ``item_id`` → permitido. Un ítem con varios puntos (los dos extremos de una clonación) exige
+    TODOS. Un punto sin ``item_id`` es un ítem propio. Los tokens y los actores sin grants por
+    alcance lo ven todo permitido: la capa 2 no les aplica.
+    """
+    sin_capa2 = actor.kind != "admin" or not actor.scope_roles
+    veredictos: dict = {}
+    for indice, p in enumerate(points):
+        clave = p.item_id if p.item_id is not None else ("sin_id", indice)
+        ok = sin_capa2 or _permits(actor, role_at_point(actor, p), capability)
+        veredictos[clave] = veredictos.get(clave, True) and ok
+    return veredictos
 
 
 def partition_by_scope(
@@ -339,20 +360,42 @@ def partition_by_scope(
 
     ``actor`` es keyword-only y sin default: un lote que se olvide de pasarlo falla con
     ``TypeError`` en vez de particionar con nadie. Los tokens y los actores sin grants por
-    alcance lo ven todo permitido (la capa 2 no les aplica).
+    alcance lo ven todo permitido (la capa 2 no les aplica). Un ítem con varios puntos (mismo
+    ``item_id``) queda prohibido si CUALQUIERA de ellos lo está.
     """
-    permitidos: list[int] = []
-    prohibidos: list[int] = []
     for p in points:
         if p.item_id is None:
             raise ValueError("partition_by_scope exige item_id en cada punto")
-        if actor.kind != "admin" or not actor.scope_roles:
-            permitidos.append(p.item_id)
-        elif _permits(actor, role_at_point(actor, p), capability):
-            permitidos.append(p.item_id)
-        else:
-            prohibidos.append(p.item_id)
-    return ScopePartition(tuple(permitidos), tuple(prohibidos))
+    veredictos = _item_verdicts(actor, capability, points)
+    return ScopePartition(
+        tuple(k for k, ok in veredictos.items() if ok),
+        tuple(k for k, ok in veredictos.items() if not ok),
+    )
+
+
+def partition_for_batch(
+    *,
+    admin: "dict | Actor | None",
+    capability: Capability,
+    points_fn: Callable[[], Sequence[ScopePoint]],
+    explicit: bool,
+) -> ScopePartition | None:
+    """
+    La regla por ítem de un lote, en un solo lugar para que los cuatro lotes no diverjan.
+
+    - ``None``: la capa 2 no aplica (token, actor sin grants por alcance, o un llamador interno
+      sin ``Actor``). El llamador no filtra nada y ``points_fn`` ni se evalúa: cero BD.
+    - ``explicit`` (el cliente nombró los ítems) con algún prohibido → 403 y no corre nada.
+    - Ítems implícitos: los prohibidos se devuelven para OMITIRLOS; si no queda ninguno
+      permitido → 403. El 403 es el mismo ``access.forbidden`` de las dos capas.
+    """
+    if not isinstance(admin, Actor) or admin.kind != "admin" or not admin.scope_roles:
+        return None
+    puntos = list(points_fn())
+    particion = partition_by_scope(actor=admin, capability=capability, points=puntos)
+    if (explicit and particion.forbidden) or (puntos and not particion.permitted):
+        raise _forbidden()
+    return particion
 
 
 def assert_scope(

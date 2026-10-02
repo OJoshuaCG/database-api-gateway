@@ -489,12 +489,18 @@ class CollationBatchExecuteIn(BaseModel):
 
 
 class CollationBatchDatabaseOut(BaseModel):
-    """Una BD dentro del plan del lote. Misma forma que ApplyAllItemOut, a propósito."""
+    """
+    Una BD dentro del plan del lote. Misma forma que ApplyAllItemOut, a propósito.
+
+    Una BD que la capa 2 omitió viene SOLO como ``{managed_database_id, ok: false, error_code:
+    "access.forbidden"}``: ``server_id``, ``database_name`` y ``batch_seq`` son ``null`` para no
+    filtrar el nombre ni la ubicación de una base que el actor no puede tocar.
+    """
 
     managed_database_id: int
-    server_id: int
-    database_name: str
-    batch_seq: int
+    server_id: int | None = None
+    database_name: str | None = None
+    batch_seq: int | None = None
     job_id: int | None = None
     ok: bool = False
     error: str | None = None

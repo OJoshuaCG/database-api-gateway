@@ -71,17 +71,22 @@ def server_guard(server_id: int) -> threading.Lock:
         return lock
 
 
-def enqueue(batch_id: int) -> None:
-    """Encola el recorrido del lote en el pool de hilos."""
-    _get_executor().submit(_run, batch_id)
+def enqueue(batch_id: int, item_ids: tuple[int, ...] | None = None) -> None:
+    """
+    Encola el recorrido del lote en el pool de hilos.
+
+    ``item_ids`` acota el recorrido a las filas que la capa 2 autorizó al confirmar; ``None`` las
+    recorre todas. El worker no re-evalúa permisos: ejecuta exactamente lo que se le encola.
+    """
+    _get_executor().submit(_run, batch_id, item_ids)
 
 
-def _run(batch_id: int) -> None:
+def _run(batch_id: int, item_ids: tuple[int, ...] | None = None) -> None:
     """Punto de entrada del worker: delega en el controller (importado tarde por los ciclos)."""
     from app.controllers.clone_batch_controller import CloneBatchController
 
     try:
-        CloneBatchController().run_batch(batch_id)
+        CloneBatchController().run_batch(batch_id, item_ids)
     except Exception:  # noqa: BLE001 — el worker nunca debe morir silenciosamente sin log
         logger.error("Lote de clonación %s falló de forma inesperada", batch_id, exc_info=True)
 

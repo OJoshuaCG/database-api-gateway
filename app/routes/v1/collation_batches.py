@@ -49,13 +49,12 @@ from app.controllers.collation_conversion_controller import CollationConversionC
 from app.controllers.database_model_controller import DatabaseModelController
 from app.core.actor import Actor
 from app.core.authz import (
-    CollationExecute,
     CollationRead,
     require_at,
 )
 from app.core.limiter import limiter
 from app.core.scope import assert_at
-from app.core.scope_targets import model
+from app.core.scope_targets import collation_batch, collation_batch_any, model
 from app.services.capability_catalog import Capability
 from app.schemas.collation_conversion import (
     CollationBatchCreate,
@@ -77,6 +76,16 @@ CollationExecuteModel = Annotated[
     Actor, Depends(require_at(Capability.COLLATION_EXECUTE, target=model))
 ]
 
+# Crear el lote recorre las BDs activas del blueprint (conjunto implícito): al menos una permitida
+# y el controller omite las prohibidas. Ejecutar y cancelar son sobre un lote YA persistido: la
+# capacidad se exige en CADA base de sus jobs (el plan solo contiene las que eran permitidas).
+CollationExecuteBatchAny = Annotated[
+    Actor, Depends(require_at(Capability.COLLATION_EXECUTE, target=collation_batch_any))
+]
+CollationExecuteBatch = Annotated[
+    Actor, Depends(require_at(Capability.COLLATION_EXECUTE, target=collation_batch))
+]
+
 
 @router.post(
     "/{model_id}/collation-conversions",
@@ -85,7 +94,7 @@ CollationExecuteModel = Annotated[
 )
 @limiter.limit("10/minute")
 def create_collation_batch(
-    request: Request, actor: CollationExecute, model_id: int, payload: CollationBatchCreate
+    request: Request, actor: CollationExecuteBatchAny, model_id: int, payload: CollationBatchCreate
 ):
     """
     🔌 Planifica el lote: crea y previsualiza un job por cada BD **activa** del blueprint.
@@ -120,7 +129,7 @@ def create_collation_batch(
 @limiter.limit("3/minute")
 def execute_collation_batch(
     request: Request,
-    actor: CollationExecute,
+    actor: CollationExecuteBatch,
     model_id: int,
     batch_id: int,
     payload: CollationBatchExecuteIn,
@@ -174,7 +183,7 @@ def get_collation_batch(request: Request, actor: CollationRead, model_id: int, b
 )
 @limiter.limit("10/minute")
 def cancel_collation_batch(
-    request: Request, actor: CollationExecute, model_id: int, batch_id: int
+    request: Request, actor: CollationExecuteBatch, model_id: int, batch_id: int
 ):
     """
     Cancelación COOPERATIVA del lote.

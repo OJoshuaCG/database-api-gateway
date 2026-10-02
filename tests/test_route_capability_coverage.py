@@ -304,8 +304,18 @@ def test_the_pending_ratchet_fails_when_the_list_grows(guard):
     assert _errors(guard, app, pending=pending, max_pending=2) == []
 
 
-def test_the_real_pending_list_respects_its_ratchet_and_exemptions_have_reasons(guard):
-    assert len(guard.SCOPE_PENDING) <= guard.MAX_SCOPE_PENDING
+def test_the_real_pending_list_is_empty_and_exemptions_have_reasons(guard):
+    # Check 6 estricto: no queda ninguna ruta "para migrar después".
+    assert guard.SCOPE_PENDING == frozenset()
+    assert guard.MAX_SCOPE_PENDING == 0
     assert guard.SCOPE_EXEMPT, "la autoría de blueprints y los proyectos están exentos"
     assert all(reason.strip() for reason in guard.SCOPE_EXEMPT.values())
     assert not (guard.SCOPE_PENDING & set(guard.SCOPE_EXEMPT))
+
+
+def test_main_fails_when_scope_pending_is_not_empty(guard, monkeypatch, capsys):
+    """El chequeo 6 es estricto: UNA entrada pendiente rompe el script, aunque el tope la admita."""
+    monkeypatch.setattr(guard, "SCOPE_PENDING", frozenset({("POST", "/api/v1/projects")}))
+    monkeypatch.setattr(guard, "MAX_SCOPE_PENDING", 1)
+    assert guard.main() == 1
+    assert "SCOPE_PENDING tiene que estar VACÍO" in capsys.readouterr().err

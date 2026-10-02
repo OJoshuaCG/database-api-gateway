@@ -701,3 +701,25 @@ Qué significa para la UI mientras tanto:
 
 Las dos señales existen y están clasificadas; lo que falta es exponerlas. Hasta entonces, ninguna
 pantalla debería prometer integridad estructural.
+
+---
+
+## Lotes con capa 2: ítems omitidos por alcance
+
+Los lotes evalúan el alcance (capa 2) **por ítem**. Reglas, iguales en todos:
+
+- Ítems que el cliente **nombra** (`database_ids` de `apply-all`, `rows` de `POST /database-clone-batches`,
+  `databases` de `apply-profile/bulk`) con **alguno** prohibido: **403** `access.forbidden` y no corre nada.
+- Conjunto **implícito**: los prohibidos se **omiten** (200), vuelven con el id y `error_code =
+  "access.forbidden"`, sin nombre, servidor ni entorno, no se persisten y no consumen `max_databases`.
+- Ningún ítem permitido: **403**.
+
+| Endpoint | Dónde viene el omitido |
+|---|---|
+| `POST /database-models/{id}/migrations/apply-all` | `results[]`: `{managed_database_id, ok: false, error_code}`; `database_name`/`server_id`/`environment_slug` = `null`. No cuenta en `processed` ni `matched_databases`. |
+| `POST /database-models/{id}/collation-conversions` | `databases[]`: `{managed_database_id, ok: false, error_code}`; `server_id`/`database_name`/`batch_seq`/`job_id` = `null`. No cuenta en `total_eligible` ni consume el tope. |
+| `POST /database-clone-batches/{id}/execute` y `/retry-failed` | `skipped[]` en el lote devuelto: `{id, ok: false, error_code}` con el id de la **fila** (`/items`). En execute la fila queda `pending` sin job; en retry no entra al lote nuevo. |
+| `POST /server-users/{id}/apply-profile/{pid}/bulk` | Sin omitidos: las BDs las nombra el cliente, una prohibida da 403 al lote entero. |
+
+`PATCH /managed-databases/{id}` con **solo** `environment_id` exige `environments.write` y no
+`databases.write`; con otros campos además, exige las dos.

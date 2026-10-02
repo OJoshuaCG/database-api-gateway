@@ -32,6 +32,8 @@ from app.core.environments import (
 )
 from app.core.logger import get_logger
 from app.core.remote_engine import UNKNOWN_DATABASE_CODES
+from app.core.scope import partition_for_batch
+from app.core.scope_targets import points_for_databases
 from app.exceptions import AppHttpException
 from app.models.database_migration_history import DatabaseMigrationHistory
 from app.models.database_model import DatabaseModel
@@ -46,6 +48,7 @@ from app.services import audit
 from app.services import environment_catalog as ecodes
 from app.services import migration_capture_catalog as ccodes
 from app.services import provisioning_catalog as pcodes
+from app.services.capability_catalog import CODE_FORBIDDEN, Capability
 from app.services.db_admin import migration_facts, migration_progress, migration_results
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.migration_integrity import compute_checksum, version_sort_key
@@ -2167,6 +2170,7 @@ class ManagedMigrationController:
             scoped = session.query(
                 ManagedDatabase.id, ManagedDatabase.name,
                 ManagedDatabase.server_id, ManagedDatabase.status,
+                ManagedDatabase.environment_id,
             ).filter(ManagedDatabase.model_id == model_id)
             if environment_id is not None:
                 # El filtro va ANTES del ``limit`` de abajo, para que el tope no se consuma con
@@ -2231,8 +2235,23 @@ class ManagedMigrationController:
             # blueprint e ignora los filtros (contrato existente, no se toca porque la SPA lo
             # imprime literal), así que sin este número "3 de 40 procesadas" no dice si sobraron
             # 37 o si en ese entorno solo había 3.
-            matched = scoped.count()
-            db_rows = scoped.order_by(ManagedDatabase.id.asc()).limit(max_databases).all()
+            candidates = scoped.order_by(ManagedDatabase.id.asc()).all()
+            # Capa 2 POR ÍTEM, antes del tope: las BDs prohibidas no consumen ``max_databases`` ni
+            # cuentan en ``processed``. Con ``database_ids`` explícitos una prohibida da 403 y no
+            # corre nada; sin ellos se omiten y se reportan solo con su id.
+            partition = partition_for_batch(
+                admin=admin,
+                capability=Capability.BLUEPRINTS_APPLY,
+                points_fn=lambda: points_for_databases(candidates),
+                explicit=bool(database_ids),
+            )
+            omitted: list[int] = []
+            if partition is not None:
+                omitted = list(partition.forbidden)
+                allowed = set(partition.permitted)
+                candidates = [r for r in candidates if r.id in allowed]
+            matched = len(candidates)
+            db_rows = candidates[:max_databases]
             dbs = [(r.id, r.name, r.server_id, r.status) for r in db_rows]
             # Política de entorno de TODO el lote en una query (anti-N+1), con valores planos:
             # la sesión se cierra unas líneas más abajo, antes del bucle.
@@ -2369,12 +2388,20 @@ class ManagedMigrationController:
                 item["error"] = f"error inesperado: {type(exc).__name__}"
             items.append(item)
 
+        # Ítems omitidos por la capa 2: SOLO el id que mandó el cliente. Sin nombre, servidor ni
+        # entorno, y sin tocar nada: son indistinguibles de un "no podés" genérico.
+        items.extend(
+            {"managed_database_id": i, "ok": False, "error_code": CODE_FORBIDDEN}
+            for i in omitted
+        )
+
         audit.record(
             "migration.apply_all", admin=admin, target_type="database_model",
             target_id=model_id, touched_engine=True,
             detail=f"{len(dbs)}/{total} BDs procesadas"
             + (f" (entorno {environment_id})" if environment_id is not None else "")
             + (f" — {len(denied)} denegadas por entorno" if denied else "")
+            + (f" — {len(omitted)} omitidas por scope" if omitted else "")
             + (" (dry-run)" if dry_run else ""),
         )
         return {

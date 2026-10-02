@@ -102,7 +102,7 @@ def test_security_officer_can_create_patch_and_delete_environments(admin_client)
     created = admin_client.post(_ROUTE, json=_NEW_ENV)
     assert created.status_code == 201, created.text
     eid = created.json()["data"]["id"]
-    assert admin_client.patch(f"{_ROUTE}/{eid}", json={"color": "#00ff00"}).status_code == 200
+    assert admin_client.patch(f"{_ROUTE}/{eid}", json={"color": "success"}).status_code == 200
     assert admin_client.delete(f"{_ROUTE}/{eid}").status_code == 200
 
 
@@ -173,6 +173,54 @@ def test_security_officer_alone_is_enough_to_reclassify(admin_client):
     otorgar("environment", prod, "viewer")
 
     r = admin_client.patch(f"/api/v1/managed-databases/{db_id}", json={"environment_id": dev})
+    assert r.status_code == 200, r.text
+    assert _env_column(db_id) == dev
+
+
+def test_security_officer_with_viewer_base_can_reclassify(admin_client):
+    """
+    La ruta no puede exigir ``databases.write``: con rol base ``viewer`` el oficial no lo tiene y
+    nunca llegaba al controller. Un PATCH con SOLO ``environment_id`` pide ``environments.write``,
+    también contra un grant ``viewer`` sobre la BD de producción (capa 2).
+    """
+    prod, dev = env_id("production"), env_id("development")
+    db_id = sembrar_bd(environment_id=prod)
+    _set_actor("viewer", ("security_officer",))
+    otorgar("environment", prod, "viewer")
+
+    r = admin_client.patch(f"/api/v1/managed-databases/{db_id}", json={"environment_id": dev})
+    assert r.status_code == 200, r.text
+    assert _env_column(db_id) == dev
+
+
+def test_security_officer_with_viewer_base_cannot_edit_other_fields(admin_client):
+    """``environments.write`` no habilita editar notas: eso sigue siendo ``databases.write``."""
+    db_id = sembrar_bd(environment_id=env_id("production"))
+    _set_actor("viewer", ("security_officer",))
+    r = admin_client.patch(f"/api/v1/managed-databases/{db_id}", json={"notes": "n"})
+    assert r.status_code == 403
+    assert r.json()["detail"]["public_context"]["code"] == "access.forbidden"
+
+
+def test_reclassifying_and_editing_other_fields_requires_both_capabilities(admin_client):
+    prod, dev = env_id("production"), env_id("development")
+    db_id = sembrar_bd(environment_id=prod)
+    cuerpo = {"environment_id": dev, "notes": "n"}
+    url = f"/api/v1/managed-databases/{db_id}"
+
+    # Solo ``environments.write``: falta ``databases.write`` (rol base viewer).
+    _set_actor("viewer", ("security_officer",))
+    assert admin_client.patch(url, json=cuerpo).status_code == 403
+    assert _env_column(db_id) == prod
+
+    # Solo ``databases.write``: falta ``environments.write``.
+    _set_actor("operator")
+    assert admin_client.patch(url, json=cuerpo).status_code == 403
+    assert _env_column(db_id) == prod
+
+    # Las dos: pasa.
+    _set_actor("operator", ("security_officer",))
+    r = admin_client.patch(url, json=cuerpo)
     assert r.status_code == 200, r.text
     assert _env_column(db_id) == dev
 

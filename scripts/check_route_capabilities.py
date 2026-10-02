@@ -168,26 +168,14 @@ SCOPE_EXEMPT: dict[tuple[str, str], str] = {
     ),
 }
 
-#: Rutas con capacidad de alcance que todavía NO declaran destino con ``require_at``. **Solo
-#: puede ENCOGER**: el chequeo 6 falla si una ruta migrada sigue acá (entrada vieja) y
-#: ``MAX_SCOPE_PENDING`` impide agregar. Llega a vacío en la última unidad de trabajo.
-SCOPE_PENDING: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("POST", "/api/v1/database-clone-batches"),
-        ("POST", "/api/v1/database-clone-batches/{batch_id}/cancel"),
-        ("POST", "/api/v1/database-clone-batches/{batch_id}/execute"),
-        ("POST", "/api/v1/database-clone-batches/{batch_id}/retry-failed"),
-        ("POST", "/api/v1/database-models/{model_id}/collation-conversions"),
-        ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/cancel"),
-        ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/execute"),
-        ("POST", "/api/v1/database-models/{model_id}/migrations/apply-all"),
-        ("POST", "/api/v1/server-users/{user_id}/apply-profile/{profile_id}/bulk"),
-    }
-)
+#: Rutas con capacidad de alcance que todavía NO declaran destino con ``require_at``. VACÍO desde
+#: la última unidad de trabajo y tiene que seguir así: ``main`` falla (chequeo 6 estricto) si
+#: tiene una sola entrada. Existe, vacío, solo porque ``scope_errors`` lo recibe por parámetro y
+#: los tests la ejercen con apps sintéticas y listas propias.
+SCOPE_PENDING: frozenset[tuple[str, str]] = frozenset()
 
-#: Tope de ``SCOPE_PENDING``. **Solo puede BAJAR.** Mismo trinquete que ``MIN_MIGRATED_ROUTES``,
-#: en la otra dirección: sin él, agregar una ruta a la lista pendiente sería gratis.
-MAX_SCOPE_PENDING = 9
+#: Tope de ``SCOPE_PENDING``: cero. Ya no hay camino para "migrar después".
+MAX_SCOPE_PENDING = 0
 
 
 def _iter_routes(app, prefix: str = ""):
@@ -423,6 +411,14 @@ def main() -> int:
             f"{MIN_MIGRATED_ROUTES}. Un revert parcial no puede pasar inadvertido."
         )
 
+    # Chequeo 6 ESTRICTO: la lista de pendientes no admite ni una entrada. Una ruta de alcance
+    # sin destino y sin motivo en ``SCOPE_EXEMPT`` es un error, sin período de gracia.
+    if SCOPE_PENDING or MAX_SCOPE_PENDING:
+        errores.append(
+            "SCOPE_PENDING tiene que estar VACÍO y MAX_SCOPE_PENDING valer 0: declará el destino "
+            "con require_at o, si no apunta a ninguna BD, ponelo en SCOPE_EXEMPT con su motivo."
+        )
+
     errores.extend(
         scope_errors(
             app,
@@ -448,7 +444,7 @@ def main() -> int:
     print(
         f"OK: cobertura de autorización sana — {len(migradas)} ruta(s) con capacidad, "
         f"{len(PUBLIC_ROUTES)} públicas declaradas, {len(agente)} de agente, "
-        f"0 sin guard, 0 capacidad muerta, {len(SCOPE_PENDING)} con destino pendiente."
+        f"0 sin guard, 0 capacidad muerta, 0 con destino pendiente."
     )
     return 0
 

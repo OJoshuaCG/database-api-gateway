@@ -20,14 +20,19 @@ toca el turno, así que no existe un momento intermedio donde previsualizar. Lo 
 es el CONJUNTO de pares origen→destino, que es lo que ata ``confirm_token``.
 """
 
-from fastapi import APIRouter, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Request
 
 from app.controllers.clone_batch_controller import CloneBatchController
+from app.core.actor import Actor
 from app.core.authz import (
-    ClonesExecute,
     ClonesRead,
+    require_at,
 )
 from app.core.limiter import limiter
+from app.core.scope_targets import clone_batch, clone_batch_any, clone_batch_create
+from app.services.capability_catalog import Capability
 from app.schemas.clone_batch import (
     CloneBatchCreateIn,
     CloneBatchExecuteIn,
@@ -39,6 +44,20 @@ from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, paginated, success
 
 router = APIRouter(prefix="/database-clone-batches", tags=["Database Clone Batches"])
+
+# Capa 2: crear nombra las filas (conjunto explícito, origen y destino de cada una: una prohibida
+# niega el lote). Ejecutar y reintentar parten un lote persistido (filas implícitas: se exige al
+# menos una permitida y el controller omite las prohibidas con ``access.forbidden``). Cancelar es
+# una acción sobre el destino de cada fila.
+ClonesExecuteCreate = Annotated[
+    Actor, Depends(require_at(Capability.CLONES_EXECUTE, target=clone_batch_create))
+]
+ClonesExecuteBatchAny = Annotated[
+    Actor, Depends(require_at(Capability.CLONES_EXECUTE, target=clone_batch_any))
+]
+ClonesExecuteBatchTarget = Annotated[
+    Actor, Depends(require_at(Capability.CLONES_EXECUTE, target=clone_batch))
+]
 
 
 @router.post(
@@ -56,7 +75,9 @@ router = APIRouter(prefix="/database-clone-batches", tags=["Database Clone Batch
     },
 )
 @limiter.limit("10/minute")
-def create_clone_batch_plan(request: Request, actor: ClonesExecute, payload: CloneBatchCreateIn):
+def create_clone_batch_plan(
+    request: Request, actor: ClonesExecuteCreate, payload: CloneBatchCreateIn
+):
     """
     Arma el plan del lote sin fotografiar ninguna base.
 
@@ -103,7 +124,7 @@ def list_clone_batch_items(actor: ClonesRead, batch_id: int, pagination: Paginat
 )
 @limiter.limit("3/minute")
 def execute_clone_batch(
-    request: Request, actor: ClonesExecute, batch_id: int, payload: CloneBatchExecuteIn
+    request: Request, actor: ClonesExecuteBatchAny, batch_id: int, payload: CloneBatchExecuteIn
 ):
     result = CloneBatchController().execute_batch(
         batch_id,
@@ -115,7 +136,7 @@ def execute_clone_batch(
 
 
 @router.post("/{batch_id}/cancel", response_model=ApiResponse[CloneBatchOut])
-def cancel_clone_batch(actor: ClonesExecute, batch_id: int):
+def cancel_clone_batch(actor: ClonesExecuteBatchTarget, batch_id: int):
     """
     Cancela el lote y **también** el job de la fila en curso. Sin esa propagación, cancelar
     solo evitaba que arrancaran las siguientes y la base que se estaba copiando seguía hasta
@@ -144,7 +165,7 @@ def clone_batch_retry_candidates(actor: ClonesRead, batch_id: int):
     responses={422: {"description": "No hay ninguna fila reintentable en este lote."}},
 )
 @limiter.limit("3/minute")
-def retry_clone_batch(request: Request, actor: ClonesExecute, batch_id: int):
+def retry_clone_batch(request: Request, actor: ClonesExecuteBatchAny, batch_id: int):
     """
     Arma un lote NUEVO con las filas reintentables. Vuelve a pasar por la confirmación
     agregada a propósito: el estado de los servidores cambió desde el plan original.

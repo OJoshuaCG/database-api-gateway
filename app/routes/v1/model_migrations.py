@@ -18,14 +18,13 @@ from app.controllers.model_migration_controller import (
 )
 from app.core.actor import Actor
 from app.core.authz import (
-    BlueprintsApply,
     BlueprintsRead,
     BlueprintsWrite,
     assert_capability,
     require_at,
 )
 from app.core.limiter import limiter
-from app.core.scope_targets import model
+from app.core.scope_targets import migration_batch, model
 from app.schemas.model_migration import (
     ApplyAllOut,
     MigrationDeleteOut,
@@ -50,6 +49,12 @@ router = APIRouter(prefix="/database-models", tags=["Model Migrations"])
 # remota), así que se exige en el entorno más protegido entre ellas. Sin BDs, rol base.
 BlueprintsApplyModel = Annotated[
     Actor, Depends(require_at(Capability.BLUEPRINTS_APPLY, target=model))
+]
+
+# Capa 2 del apply masivo: ``database_ids`` explícitos exigen la capacidad en TODOS; sin ellos,
+# en al menos UNA BD, y el controller omite las prohibidas (``error_code = access.forbidden``).
+BlueprintsApplyBatch = Annotated[
+    Actor, Depends(require_at(Capability.BLUEPRINTS_APPLY, target=migration_batch))
 ]
 
 _VERSION_PATH = Path(..., pattern=r"^\d{4,10}$", description="Versión: 0001, 0002…")
@@ -106,7 +111,7 @@ def create_migration(actor: BlueprintsWrite, model_id: int, payload: ModelMigrat
 @limiter.limit("3/minute")
 def apply_all(
     request: Request,
-    actor: BlueprintsApply,
+    actor: BlueprintsApplyBatch,
     model_id: int,
     max_databases: int = Query(10, ge=1, le=100, description="Cota de BDs a procesar"),
     database_ids: list[int] | None = Query(

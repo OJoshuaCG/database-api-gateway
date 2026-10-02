@@ -60,6 +60,8 @@ from app.core.environments import (
     DB_USER,
 )
 from app.core.logger import get_logger
+from app.core.scope import partition_for_batch
+from app.core.scope_targets import clone_item_points
 from app.exceptions import AppHttpException
 from app.models.clone_batch import (
     CLONE_BATCH_CANCELED,
@@ -87,6 +89,7 @@ from app.models.clone_job import (
     CloneJobItem,
 )
 from app.services import audit
+from app.services.capability_catalog import CODE_FORBIDDEN, Capability
 from app.services.db_admin import clone_spec as cspec
 from app.services.db_admin.factory import get_adapter
 
@@ -126,6 +129,14 @@ class CloneBatchController:
         divergir. Se usa igual para los ``counts`` y para el listado de filas.
         """
         return func.coalesce(CloneJob.status, CloneBatchItem.outcome)
+
+    @staticmethod
+    def _skipped(item_ids) -> list[dict]:
+        """
+        Filas omitidas por la capa 2: SOLO el id de la fila y el código. Sin nombres de base ni de
+        servidor, para no filtrar lo que el actor no puede tocar. No se persisten ni se cuentan.
+        """
+        return [{"id": i, "ok": False, "error_code": CODE_FORBIDDEN} for i in item_ids]
 
     @staticmethod
     def batch_token(target_server_id: int, rows: list[dict]) -> str:
@@ -680,9 +691,27 @@ class CloneBatchController:
                     public_context={"code": cspec.CODE_BATCH_TOKEN_MISMATCH},
                 )
             target_server_id = batch.target_server_id
-            ejecutables = sum(1 for r in rows if r.outcome == CLONE_BATCH_ITEM_PENDING)
+            source_server_id = batch.source_server_id
+            pendientes = [
+                (r.id, r.source_database_id, r.source_database_name, r.target_database_name)
+                for r in rows
+                if r.outcome == CLONE_BATCH_ITEM_PENDING
+            ]
         finally:
             session.close()
+
+        # Capa 2 POR FILA (origen Y destino de cada una). Las prohibidas NO se persisten ni se
+        # cuentan: quedan como estaban y el worker recibe solo las permitidas. Sin ninguna
+        # permitida es 403. La confirmación agregada ya validó el conjunto completo de filas.
+        partition = partition_for_batch(
+            admin=admin,
+            capability=Capability.CLONES_EXECUTE,
+            points_fn=lambda: clone_item_points(source_server_id, target_server_id, pendientes),
+            explicit=False,
+        )
+        omitidas = list(partition.forbidden) if partition is not None else []
+        permitidas = tuple(partition.permitted) if partition is not None else None
+        ejecutables = len(pendientes) - len(omitidas)
 
         # Auditoría de INTENCIÓN antes de encolar, fail-closed: si no se puede dejar rastro,
         # el lote no arranca. Autoriza N operaciones sobre bases de terceros.
@@ -692,7 +721,8 @@ class CloneBatchController:
             target_type="clone_batch",
             target_id=batch_id,
             server_id=target_server_id,
-            detail=f"{ejecutables} bases a clonar",
+            detail=f"{ejecutables} bases a clonar"
+            + (f" — {len(omitidas)} omitidas por scope" if omitidas else ""),
         )
 
         # Reclamo ATÓMICO pending → running. El filtro por ``cancel_requested`` es el que hoy
@@ -723,8 +753,11 @@ class CloneBatchController:
                 public_context={"code": cspec.CODE_BATCH_NOT_PENDING},
             )
 
-        clone_batch_runner.enqueue(batch_id)
-        return self.get_batch(batch_id)
+        if permitidas is None:
+            clone_batch_runner.enqueue(batch_id)
+        else:
+            clone_batch_runner.enqueue(batch_id, permitidas)
+        return {**self.get_batch(batch_id), "skipped": self._skipped(omitidas)}
 
     def cancel_batch(self, batch_id: int, *, admin: "dict | Actor | None" = None) -> dict:
         """
@@ -777,7 +810,7 @@ class CloneBatchController:
     # ------------------------------------------------------------------ #
     # Worker: el recorrido en serie                                       #
     # ------------------------------------------------------------------ #
-    def run_batch(self, batch_id: int) -> None:
+    def run_batch(self, batch_id: int, only_item_ids: tuple[int, ...] | None = None) -> None:
         """
         Recorre las filas del lote EN SERIE. Nunca lanza: cada fila registra su desenlace y el
         recorrido sigue con la siguiente.
@@ -791,6 +824,10 @@ class CloneBatchController:
              ``blocking_issues``, la fila queda bloqueada, el job se cierra y el lote SIGUE.
           5. ``run_job`` **sincrónicamente**, no encolado: es lo que garantiza la serie y lo
              que evita consumir el pool de los clones sueltos.
+
+        ``only_item_ids``: las filas que ``execute_batch`` autorizó en la capa 2. Las demás
+        (prohibidas para quien confirmó) quedan intactas. El worker no re-evalúa permisos: solo
+        recorre lo que le dijeron. ``None`` recorre todas las pendientes.
         """
         from app.services import clone_batch_runner
 
@@ -813,15 +850,14 @@ class CloneBatchController:
                 "id": batch.created_by_admin_id,
                 "username": batch.created_by_username,
             }
+            pendientes = session.query(CloneBatchItem.id).filter(
+                CloneBatchItem.batch_id == batch_id,
+                CloneBatchItem.outcome == CLONE_BATCH_ITEM_PENDING,
+            )
+            if only_item_ids is not None:
+                pendientes = pendientes.filter(CloneBatchItem.id.in_(only_item_ids))
             item_ids = [
-                row_id
-                for (row_id,) in session.query(CloneBatchItem.id)
-                .filter(
-                    CloneBatchItem.batch_id == batch_id,
-                    CloneBatchItem.outcome == CLONE_BATCH_ITEM_PENDING,
-                )
-                .order_by(CloneBatchItem.seq.asc())
-                .all()
+                row_id for (row_id,) in pendientes.order_by(CloneBatchItem.seq.asc()).all()
             ]
         finally:
             session.close()
@@ -1259,6 +1295,35 @@ class CloneBatchController:
         session = self._session()
         try:
             batch = self._batch_or_404(session, batch_id)
+            source_server_id, target_server_id = batch.source_server_id, batch.target_server_id
+        finally:
+            session.close()
+
+        # Capa 2 POR FILA sobre lo reintentable (filas implícitas: el cliente no las nombró). Las
+        # prohibidas no entran al lote nuevo y se reportan solo con su id; sin ninguna, 403.
+        partition = partition_for_batch(
+            admin=admin,
+            capability=Capability.CLONES_EXECUTE,
+            points_fn=lambda: clone_item_points(
+                source_server_id,
+                target_server_id,
+                [
+                    (r["id"], r["source_database_id"], r["source_database_name"],
+                     r["target_database_name"])
+                    for r in candidatos["retryable"]
+                ],
+            ),
+            explicit=False,
+        )
+        omitidas: list[int] = []
+        if partition is not None:
+            omitidas = list(partition.forbidden)
+            permitidas = set(partition.permitted)
+            candidatos["retryable"] = [r for r in candidatos["retryable"] if r["id"] in permitidas]
+
+        session = self._session()
+        try:
+            batch = self._batch_or_404(session, batch_id)
             payload = {
                 "source_server_id": batch.source_server_id,
                 "target_server_id": batch.target_server_id,
@@ -1280,7 +1345,7 @@ class CloneBatchController:
             }
         finally:
             session.close()
-        return self.create_batch_plan(payload, admin=admin)
+        return {**self.create_batch_plan(payload, admin=admin), "skipped": self._skipped(omitidas)}
 
     # ------------------------------------------------------------------ #
     # Barrido de arranque                                                 #

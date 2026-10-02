@@ -129,6 +129,19 @@ class CloneBatchExecuteIn(BaseModel):
 # --------------------------------------------------------------------------- #
 # Salida                                                                        #
 # --------------------------------------------------------------------------- #
+class CloneBatchSkippedOut(BaseModel):
+    """
+    Una fila que la capa 2 omitió (execute / retry-failed): SOLO el id de la fila y el código.
+
+    No lleva nombre de base, de servidor ni de entorno. No se persiste ni cuenta en ``counts`` ni
+    en ``total``: la fila queda como estaba (en execute) o no entra al lote nuevo (en retry).
+    """
+
+    id: int = Field(..., description="Id de la fila (CloneBatchItem) tal como lo lista /items.")
+    ok: bool = False
+    error_code: str = Field("access.forbidden", description="Siempre 'access.forbidden'.")
+
+
 class CloneBatchOut(BaseModel):
     """Cabecera + estado del lote. ``counts`` es la respuesta a «¿4 de 12?»."""
 
@@ -164,6 +177,13 @@ class CloneBatchOut(BaseModel):
     expires_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    skipped: list[CloneBatchSkippedOut] = Field(
+        default_factory=list,
+        description=(
+            "Solo en execute y retry-failed: filas omitidas por falta de alcance en su origen o "
+            "destino. Vacío si no se omitió ninguna."
+        ),
+    )
 
 
 class CloneBatchItemOut(BaseModel):

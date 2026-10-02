@@ -179,11 +179,8 @@ def assert_not_last_access_admin(user_id: int, *, action: str) -> None:
     )
 
 
-def _authenticate(request: Request, capability: Capability) -> Actor:
-    """
-    Autenticación + CSRF + capa 1. Es el tramo común de ``require`` y ``require_at``: vive en un
-    solo lugar para que las dos fábricas no puedan divergir en el orden ni en la forma del 403.
-    """
+def _identify(request: Request) -> Actor:
+    """Autenticación + CSRF, sin capacidad. ``require_at`` elige la capacidad recién después."""
     actor = get_current_actor(request)
     # CSRF ANTES de la capacidad, y solo para el actor de tipo `admin` (el que se autentica
     # con una cookie que el navegador adjunta solo). Antes de la capacidad porque un
@@ -193,6 +190,15 @@ def _authenticate(request: Request, capability: Capability) -> Actor:
         from app.core.auth import SESSION_SID
 
         csrf.enforce(request, request.session.get(SESSION_SID) or "")
+    return actor
+
+
+def _authenticate(request: Request, capability: Capability) -> Actor:
+    """
+    Autenticación + CSRF + capa 1. Es el tramo común de ``require`` y ``require_at``: vive en un
+    solo lugar para que las dos fábricas no puedan divergir en el orden ni en la forma del 403.
+    """
+    actor = _identify(request)
     assert_capability(actor, capability)
     return actor
 
@@ -215,7 +221,10 @@ def require(capability: Capability) -> Callable[[Request], Actor]:
 
 
 def require_at(
-    capability: Capability, *, target: Callable[..., ScopeTarget]
+    capability: Capability,
+    *,
+    target: Callable[..., ScopeTarget],
+    capability_for: Callable[[ScopeTarget], Capability] | None = None,
 ) -> Callable[..., Actor]:
     """
     Como ``require`` pero con capa 2: exige la capacidad EN el destino que declara ``target``.
@@ -229,14 +238,27 @@ def require_at(
     Estampa ``__gw_capability__`` (los chequeos 1-4 del script y el trinquete siguen valiendo) y
     ``__gw_scope__`` (el tipo de destino, que exige el chequeo 6). Un resolvedor no registrado
     en ``TARGET_KINDS`` falla con ``KeyError`` al importar la ruta, no en runtime.
+
+    ``capability_for``: elige la capacidad de las capas 1 y 2 según el destino ya leído del
+    payload. Se invoca DESPUÉS de autenticar (y del CSRF), así que puede consultar la fila sin
+    ser un oráculo para quien no tiene sesión. ``capability`` sigue siendo la que se estampa en
+    ``__gw_capability__`` —el piso que ven los chequeos 1-4 y 6—, y ``capability_for`` solo puede
+    devolver otra capacidad del catálogo. Lo usa el PATCH de inventario, donde reclasificar es
+    ``environments.write`` y cualquier otro campo es ``databases.write``.
     """
     from app.core.scope_targets import TARGET_KINDS
 
     kind = TARGET_KINDS[target]
 
     def _dependency(request: Request, t: ScopeTarget = Depends(target)) -> Actor:
-        actor = _authenticate(request, capability)
-        assert_layer2(actor, capability, t)
+        if capability_for is None:
+            exigida = capability
+            actor = _authenticate(request, exigida)
+        else:
+            actor = _identify(request)
+            exigida = capability_for(t)
+            assert_capability(actor, exigida)
+        assert_layer2(actor, exigida, t)
         return actor
 
     _dependency.__gw_capability__ = capability.value  # type: ignore[attr-defined]

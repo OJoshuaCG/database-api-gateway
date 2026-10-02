@@ -22,6 +22,7 @@ cobertura valida: un resolvedor que no esté registrado falla al importar la rut
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Callable
 
 from fastapi import Request
@@ -33,6 +34,7 @@ from app.core.scope import (
     most_protected_environment_id,
     resolve_environment_id,
 )
+from app.services.capability_catalog import Capability
 
 
 # --------------------------------------------------------------------------- #
@@ -106,13 +108,65 @@ async def database_update(db_id: int, request: Request) -> ScopeTarget:
     Reclasificar (``environment_id`` distinto del actual) exige SOLO ``environments.write`` —lo
     valida el controller—, y no ``databases.write`` EN la BD: un ``security_officer`` acotado a
     lector en producción tiene que poder moverla. Que sea un cambio se decide contra la fila, o
-    sea después de autenticar (ver ``_points_database_update``); acá solo se lee el cuerpo.
+    sea después de autenticar (ver ``_is_pure_reclassification``); acá solo se lee el cuerpo.
+
+    ``solo_entorno`` (el cuerpo trae EXCLUSIVAMENTE ``environment_id``) es condición necesaria,
+    no suficiente: un PATCH que además toca otro campo sigue necesitando ``databases.write``, o
+    sea las DOS capacidades si el entorno cambia.
     """
     cuerpo = await _body(request)
     presente = "environment_id" in cuerpo
     return ScopeTarget(
-        "database_update", (db_id, presente, cuerpo.get("environment_id") if presente else None)
+        "database_update",
+        (
+            db_id,
+            presente,
+            cuerpo.get("environment_id") if presente else None,
+            presente and set(cuerpo) == {"environment_id"},
+        ),
     )
+
+
+def _is_pure_reclassification(params: tuple) -> bool:
+    """
+    ¿El PATCH es SOLO un cambio real de entorno? Cuerpo con exclusivamente ``environment_id``,
+    la fila existe y el valor (entero o ``None``) difiere del actual. Consulta la BD: solo se
+    invoca después de autenticar (``require_at`` / ``resolve_target_points``).
+
+    Reenviar el entorno actual NO es reclasificar: sin esta comparación el PATCH
+    ``{"environment_id": <el mismo>}`` elegía ``environments.write`` y salteaba el alcance de la
+    fila (``databases.write`` EN la BD). Un id inexistente tampoco: cae a ``databases.write`` en
+    el entorno más protegido, igual que el resto de las rutas por ``db_id``. Un valor que no es
+    entero ni ``None`` no se interpreta: sigue el camino de ``databases.write``.
+    """
+    from app.models.managed_database import ManagedDatabase
+
+    db_id, presente, valor, solo_entorno = params
+    if not (presente and solo_entorno):
+        return False
+    if valor is not None and _int_or_none(valor) is None:
+        return False
+    session = _session()
+    try:
+        bd = session.get(ManagedDatabase, db_id)
+        return bd is not None and valor != bd.environment_id
+    finally:
+        session.close()
+
+
+def capability_for_database_update(target: ScopeTarget) -> Capability:
+    """
+    La capacidad de capa 1 del PATCH de inventario: una reclasificación pura (ver
+    ``_is_pure_reclassification``) es escribir política (``environments.write``); todo lo demás
+    —incluido reenviar el entorno actual— es ``databases.write`` EN la fila. Sin esto el oficial
+    de seguridad con rol base ``viewer`` no podía reclasificar, porque la ruta exigía
+    ``databases.write`` antes de llegar al controller.
+
+    Consulta la BD: ``require_at`` la invoca DESPUÉS de autenticar, nunca en el resolvedor.
+    """
+    if _is_pure_reclassification(target.params):
+        return Capability.ENVIRONMENTS_WRITE
+    return Capability.DATABASES_WRITE
 
 
 async def payload_server(request: Request) -> ScopeTarget:
@@ -215,6 +269,89 @@ async def clone_create(request: Request) -> ScopeTarget:
     )
 
 
+def _query_ints(request: Request, nombre: str) -> tuple[int, ...]:
+    """Los enteros válidos de un query param repetido, sin duplicados. Lo inválido se ignora."""
+    vistos: set[int] = set()
+    for crudo in request.query_params.getlist(nombre):
+        try:
+            vistos.add(int(crudo))
+        except ValueError:
+            continue
+    return tuple(sorted(vistos))
+
+
+def migration_batch(model_id: int, request: Request) -> ScopeTarget:
+    """
+    El lote de ``apply-all``: ``database_ids`` explícitos (cuantificador ``all``: uno prohibido
+    niega todo) o, sin ellos, las BDs del blueprint (``any``: el controller omite las prohibidas).
+    """
+    ids = _query_ints(request, "database_ids")
+    entorno = _query_ints(request, "environment_id")
+    return ScopeTarget(
+        "migration_batch",
+        (model_id, ids, entorno[0] if entorno else None),
+        "all" if ids else "any",
+    )
+
+
+async def collation_batch_any(model_id: int, request: Request) -> ScopeTarget:
+    """Crear un lote de collation: las BDs activas del blueprint son un conjunto IMPLÍCITO."""
+    cuerpo = await _body(request)
+    return ScopeTarget(
+        "collation_batch_any", (model_id, _int_or_none(cuerpo.get("environment_id"))), "any"
+    )
+
+
+def collation_batch(batch_id: int) -> ScopeTarget:
+    """Un lote de collation persistido: la base de CADA uno de sus jobs (ejecutar y cancelar)."""
+    return ScopeTarget("collation_batch", (batch_id,))
+
+
+async def clone_batch_create(request: Request) -> ScopeTarget:
+    """
+    Alta de un lote de clonación: las filas las NOMBRA el cliente, así que es un conjunto
+    explícito (``all``) con origen y destino de cada fila. El destino va por servidor + nombre.
+    """
+    cuerpo = await _body(request)
+    filas = cuerpo.get("rows")
+    rows = tuple(
+        (
+            _int_or_none(r.get("source_database_id")),
+            _str_or_none(r.get("source_database_name")),
+            _str_or_none(r.get("target_database_name")),
+        )
+        for r in (filas if isinstance(filas, list) else [])
+        if isinstance(r, dict)
+    )
+    return ScopeTarget(
+        "clone_batch_create",
+        (_int_or_none(cuerpo.get("source_server_id")), _int_or_none(cuerpo.get("target_server_id")), rows),
+    )
+
+
+def clone_batch_any(batch_id: int) -> ScopeTarget:
+    """Ejecutar o reintentar un lote persistido: filas IMPLÍCITAS, el controller particiona."""
+    return ScopeTarget("clone_batch_any", (batch_id,), "any")
+
+
+def clone_batch(batch_id: int) -> ScopeTarget:
+    """Cancelar un lote: es una acción sobre el DESTINO de cada fila."""
+    return ScopeTarget("clone_batch", (batch_id,))
+
+
+async def bulk_profile(user_id: int, request: Request) -> ScopeTarget:
+    """
+    ``apply-profile/bulk``: el usuario fija el servidor y ``databases`` son nombres que el
+    cliente NOMBRA (explícito, ``all``): una sola prohibida niega el lote entero.
+    """
+    cuerpo = await _body(request)
+    nombres = cuerpo.get("databases")
+    return ScopeTarget(
+        "bulk_profile",
+        (user_id, tuple(n for n in (nombres if isinstance(nombres, list) else []) if _str_or_none(n))),
+    )
+
+
 #: resolvedor → tipo. Es lo que ``require_at`` consulta para estampar ``__gw_scope__``.
 TARGET_KINDS: dict[Callable[..., ScopeTarget], str] = {
     database: "database",
@@ -233,6 +370,13 @@ TARGET_KINDS: dict[Callable[..., ScopeTarget], str] = {
     export_job: "export_job",
     collation_job: "collation_job",
     comparison: "comparison",
+    migration_batch: "migration_batch",
+    collation_batch_any: "collation_batch_any",
+    collation_batch: "collation_batch",
+    clone_batch_create: "clone_batch_create",
+    clone_batch_any: "clone_batch_any",
+    clone_batch: "clone_batch",
+    bulk_profile: "bulk_profile",
 }
 
 
@@ -256,23 +400,12 @@ def _points_database(params: tuple) -> list[ScopePoint]:
 
 
 def _points_database_update(params: tuple) -> list[ScopePoint]:
-    from app.models.managed_database import ManagedDatabase
-
-    db_id, presente, valor = params
-    if presente:
-        session = _session()
-        try:
-            bd = session.get(ManagedDatabase, db_id)
-            actual = bd.environment_id if bd else None
-            existe = bd is not None
-        finally:
-            session.close()
-        # Reclasificación (la fila existe y el valor cambia): ningún punto, o sea el rol base.
-        # La autoridad la pone ``environments.write`` en el controller. Un id inexistente NO
-        # entra acá: sigue resolviendo al entorno más protegido (fail-closed).
-        if existe and valor != actual:
-            return []
-    return _points_database((db_id,))
+    # Reclasificación PURA: ningún punto, o sea el rol base. La autoridad es
+    # ``environments.write`` (capa 1 y controller). Cualquier otro caso —otro campo, el mismo
+    # entorno, un id inexistente— evalúa ``databases.write`` en la BD como siempre.
+    if _is_pure_reclassification(params):
+        return []
+    return _points_database((params[0],))
 
 
 def _points_model(params: tuple) -> list[ScopePoint]:
@@ -547,6 +680,191 @@ def _points_comparison(params: tuple) -> list[ScopePoint]:
     return _unresolvable() if fila is None else _points_ref(fila[0], fila[1], fila[2])
 
 
+# --------------------------------------------------------------------------- #
+# Lotes: puntos por ítem (los controllers los reusan para particionar)         #
+# --------------------------------------------------------------------------- #
+
+
+def points_for_databases(rows) -> list[ScopePoint]:
+    """
+    Un punto por BD del inventario (``item_id`` = su id), para particionar un lote. Acepta filas
+    de consulta u objetos ORM con ``id``/``server_id``/``environment_id``. Una BD sin entorno
+    resuelve al más protegido, igual que en ``_points_database``.
+    """
+    protegido: int | None = None
+    puntos: list[ScopePoint] = []
+    for r in rows:
+        entorno = r.environment_id
+        if entorno is None:
+            protegido = protegido if protegido is not None else most_protected_environment_id()
+            entorno = protegido
+        puntos.append(ScopePoint(environment_id=entorno, server_id=r.server_id, item_id=r.id))
+    return puntos
+
+
+def clone_item_points(
+    source_server_id: int | None,
+    target_server_id: int | None,
+    items,
+    *,
+    target_only: bool = False,
+) -> list[ScopePoint]:
+    """
+    Los puntos de cada fila de un lote de clonación, con el id de la FILA como ``item_id``: una
+    fila se permite solo si se permiten sus DOS extremos (o solo el destino, al cancelar).
+    ``items``: tuplas ``(item_id, source_database_id, source_database_name, target_database_name)``.
+    """
+    puntos: list[ScopePoint] = []
+    for item_id, src_db, src_name, tgt_name in items:
+        extremos = _points_ref(target_server_id, None, tgt_name)
+        if not target_only:
+            extremos = _points_ref(source_server_id, src_db, src_name) + extremos
+        puntos.extend(replace(p, item_id=item_id) for p in extremos)
+    return puntos
+
+
+def _model_database_rows(
+    model_id: int,
+    *,
+    ids: tuple[int, ...] = (),
+    environment_id: int | None = None,
+    active_only: bool = False,
+):
+    """``(existe, filas)``: las BDs del blueprint con los filtros de un lote, por id ascendente."""
+    from app.models.database_model import DatabaseModel
+    from app.models.enums import ProvisionStatus
+    from app.models.managed_database import ManagedDatabase as MD
+
+    session = _session()
+    try:
+        existe = session.get(DatabaseModel, model_id) is not None
+        q = session.query(MD.id, MD.server_id, MD.environment_id).filter(MD.model_id == model_id)
+        if active_only:
+            q = q.filter(MD.status == ProvisionStatus.active)
+        if ids:
+            q = q.filter(MD.id.in_(ids))
+        elif environment_id is not None:
+            q = q.filter(MD.environment_id == environment_id)
+        return existe, q.order_by(MD.id.asc()).all()
+    finally:
+        session.close()
+
+
+def _points_migration_batch(params: tuple) -> list[ScopePoint]:
+    model_id, ids, entorno = params
+    existe, filas = _model_database_rows(model_id, ids=ids, environment_id=entorno)
+    if not existe:
+        return _unresolvable()
+    puntos = points_for_databases(filas)
+    # Un id explícito que no es del blueprint resuelve al entorno más protegido: un actor
+    # acotado recibe 403 y no el 422 que distinguiría "existe en otro blueprint" de "no podés".
+    for ajeno in sorted(set(ids) - {f.id for f in filas}):
+        puntos.append(replace(_unresolvable()[0], item_id=ajeno))
+    return puntos
+
+
+def _points_collation_batch_any(params: tuple) -> list[ScopePoint]:
+    model_id, entorno = params
+    existe, filas = _model_database_rows(model_id, environment_id=entorno, active_only=True)
+    return points_for_databases(filas) if existe else _unresolvable()
+
+
+def _points_collation_batch(params: tuple) -> list[ScopePoint]:
+    from app.models.collation_conversion_job import CollationConversionJob as Job
+
+    (batch_id,) = params
+    session = _session()
+    try:
+        filas = (
+            session.query(Job.id, Job.server_id, Job.database_id, Job.database_name)
+            .filter(Job.batch_id == batch_id)
+            .all()
+        )
+    finally:
+        session.close()
+    if not filas:
+        return _unresolvable()
+    puntos: list[ScopePoint] = []
+    for f in filas:
+        puntos.extend(
+            replace(p, item_id=f.id) for p in _points_ref(f.server_id, f.database_id, f.database_name)
+        )
+    return puntos
+
+
+def _points_clone_batch_create(params: tuple) -> list[ScopePoint]:
+    src_sid, tgt_sid, rows = params
+    if not rows:
+        return _points_payload_server((src_sid,)) + _points_payload_server((tgt_sid,))
+    puntos: list[ScopePoint] = []
+    for src_db, src_name, tgt_name in rows:
+        puntos += _points_ref(src_sid, src_db, src_name)
+        puntos += _points_ref(tgt_sid, None, tgt_name or src_name)
+    return puntos
+
+
+def _clone_batch_rows(batch_id: int):
+    """``(servers, items)`` de un lote persistido; ``servers`` es ``None`` si no existe."""
+    from app.models.clone_batch import CloneBatch, CloneBatchItem
+
+    session = _session()
+    try:
+        cab = (
+            session.query(CloneBatch.source_server_id, CloneBatch.target_server_id)
+            .filter(CloneBatch.id == batch_id)
+            .first()
+        )
+        items = (
+            session.query(
+                CloneBatchItem.id,
+                CloneBatchItem.source_database_id,
+                CloneBatchItem.source_database_name,
+                CloneBatchItem.target_database_name,
+            )
+            .filter(CloneBatchItem.batch_id == batch_id)
+            .order_by(CloneBatchItem.seq.asc())
+            .all()
+        )
+    finally:
+        session.close()
+    return cab, [tuple(i) for i in items]
+
+
+def _points_clone_batch_any(params: tuple) -> list[ScopePoint]:
+    (batch_id,) = params
+    cab, items = _clone_batch_rows(batch_id)
+    if cab is None or not items:
+        return _unresolvable()
+    return clone_item_points(cab[0], cab[1], items)
+
+
+def _points_clone_batch(params: tuple) -> list[ScopePoint]:
+    (batch_id,) = params
+    cab, items = _clone_batch_rows(batch_id)
+    if cab is None or not items:
+        return _unresolvable()
+    return clone_item_points(cab[0], cab[1], items, target_only=True)
+
+
+def _points_bulk_profile(params: tuple) -> list[ScopePoint]:
+    from app.models.server_user import ServerUser
+
+    user_id, nombres = params
+    session = _session()
+    try:
+        fila = session.query(ServerUser.server_id).filter(ServerUser.id == user_id).first()
+    finally:
+        session.close()
+    if fila is None:
+        return _unresolvable()
+    if not nombres:
+        return _points_server((fila[0],))
+    puntos: list[ScopePoint] = []
+    for nombre in nombres:
+        puntos += _points_server_database((fila[0], nombre))
+    return puntos
+
+
 #: tipo → función de puntos. Sus claves son el vocabulario cerrado de tipos de destino.
 _RESOLVERS: dict[str, Callable[[tuple], list[ScopePoint]]] = {
     "database": _points_database,
@@ -565,6 +883,13 @@ _RESOLVERS: dict[str, Callable[[tuple], list[ScopePoint]]] = {
     "export_job": _points_export_job,
     "collation_job": _points_collation_job,
     "comparison": _points_comparison,
+    "migration_batch": _points_migration_batch,
+    "collation_batch_any": _points_collation_batch_any,
+    "collation_batch": _points_collation_batch,
+    "clone_batch_create": _points_clone_batch_create,
+    "clone_batch_any": _points_clone_batch_any,
+    "clone_batch": _points_clone_batch,
+    "bulk_profile": _points_bulk_profile,
 }
 
 

@@ -190,10 +190,25 @@ def test_create_in_development_on_a_development_server_passes_layer2(admin_clien
     assert r.status_code == 201, r.text
 
 
-def test_a_malformed_create_body_fails_closed(admin_client, escenario):
+def test_a_malformed_create_body_fails_closed(admin_client, escenario, monkeypatch):
+    """
+    Un cuerpo que no es JSON se rechaza con 422 (validación del cuerpo) y no con 403: el 422 no
+    revela nada sobre ningún destino, porque no hay destino que resolver. Lo que importa es que
+    falle cerrado: no se da de alta ninguna BD ni se toca el motor.
+    """
     _restringir(escenario)
+
+    def _sin_motor(target):
+        raise AssertionError("un cuerpo inválido no debe llegar al motor")
+
+    monkeypatch.setattr(mdc, "get_adapter", _sin_motor)
+    with Database().engine.begin() as conn:
+        antes = conn.execute(text("SELECT COUNT(*) FROM managed_databases")).scalar()
     r = admin_client.post(f"{_API}/managed-databases", content=b"not json")
-    assert _forbidden(r)
+    assert r.status_code == 422, r.text
+    with Database().engine.begin() as conn:
+        despues = conn.execute(text("SELECT COUNT(*) FROM managed_databases")).scalar()
+    assert despues == antes
 
 
 # --------------------------------------------------------------------------- #
