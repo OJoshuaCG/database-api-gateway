@@ -130,7 +130,8 @@ NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset()
 MIN_MIGRATED_ROUTES = 168
 
 #: Rutas con capacidad de alcance que NO apuntan a ningún entorno, con el motivo. Es la autoría
-#: de blueprints y los proyectos: escribir una versión no la ejecuta en ninguna BD. Una entrada
+#: de blueprints y los proyectos (escribir una versión no la ejecuta en ninguna BD), más el borrado
+#: de un blueprint que ninguna BD referencia. Una entrada
 #: sin motivo no tiene sentido, por eso es un dict y no un conjunto.
 SCOPE_EXEMPT: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/database-models"): (
@@ -140,7 +141,8 @@ SCOPE_EXEMPT: dict[tuple[str, str], str] = {
         "autoría de blueprint: editar metadatos del modelo no toca ninguna BD"
     ),
     ("DELETE", "/api/v1/database-models/{model_id}"): (
-        "borrar un modelo es autoría de blueprint: no ejecuta nada en ninguna BD"
+        "borrar un modelo exige blueprints.apply y responde 409 si alguna BD lo referencia: "
+        "cuando procede no queda ninguna BD a la que anclar el alcance"
     ),
     ("POST", "/api/v1/database-models/{model_id}/migrations"): (
         "autoría de blueprint: escribir una versión no la ejecuta en ninguna BD"

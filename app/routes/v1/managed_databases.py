@@ -64,9 +64,6 @@ DatabasesWriteAtDb = Annotated[
 BlueprintsApplyAtDb = Annotated[
     Actor, Depends(require_at(Capability.BLUEPRINTS_APPLY, target=database))
 ]
-BlueprintsWriteAtDb = Annotated[
-    Actor, Depends(require_at(Capability.BLUEPRINTS_WRITE, target=database))
-]
 BlueprintsCapturesAtDb = Annotated[
     Actor, Depends(require_at(Capability.BLUEPRINTS_CAPTURES, target=database))
 ]
@@ -285,6 +282,18 @@ def reassign_owner(
     payload: ReassignOwnerIn,
     provision: bool = Query(False),
 ):
+    """
+    Reasigna el usuario del motor dueño de la BD en el inventario.
+
+    Con ``provision=true`` además lo aplica en el motor (re-GRANT, y en PostgreSQL
+    ``ALTER DATABASE ... OWNER TO``). **Eso exige ``databases.drop`` en la BD**, no solo
+    ``databases.write``: en PostgreSQL el dueño de una base puede hacerle ``DROP DATABASE``, y en
+    MySQL/MariaDB el re-GRANT le da ``ALL PRIVILEGES`` sobre ella. Entregar ese control a otro
+    usuario del motor es equivalente a poder borrarla, así que pide la misma capacidad.
+    Sin ``provision`` solo cambia la fila del gateway y basta ``databases.write``.
+    """
+    if provision:
+        assert_at(actor, Capability.DATABASES_DROP, database(db_id))
     updated = ManagedDatabaseController().reassign_owner(
         db_id, payload.owner_id, provision=provision, admin=actor
     )
@@ -647,7 +656,7 @@ def migration_select_results(
     response_model=ApiResponse[None],
 )
 def purge_migration_select_results(
-    actor: BlueprintsWriteAtDb,
+    actor: BlueprintsCapturesAtDb,
     db_id: int,
     version: str = FPath(..., pattern=r"^\d{4,10}$", description="Versión de la migración"),
 ):
@@ -656,6 +665,10 @@ def purge_migration_select_results(
 
     Las capturas expiran solas por TTL (``MIGRATION_CAPTURE_TTL_HOURS``, default 7 días);
     esto es la vía para borrarlas ya, en cuanto el diagnóstico terminó.
+
+    Exige ``blueprints.captures`` (la capacidad que gobierna LEERLAS), no ``blueprints.write``:
+    purgar destruye la evidencia de una migración, y quien no puede verla tampoco puede
+    borrarla.
     """
     deleted = ManagedMigrationController().purge_select_results(db_id, version, admin=actor)
     return empty(f"{deleted} resultado(s) capturado(s) eliminado(s).")

@@ -71,7 +71,8 @@ from app.utils.response import ApiResponse, success
 router = APIRouter(prefix="/database-models", tags=["Collation Batches"])
 
 # Capa 2: registrar la versión stampea las N BDs del blueprint, así que se exige en el entorno más
-# protegido entre ellas. Solo el scope: el escalamiento F-6 (blueprints.apply) queda fuera.
+# protegido entre ellas. La ruta suma ``blueprints.write`` y ``blueprints.apply`` con ``assert_at``
+# sobre el MISMO destino.
 CollationExecuteModel = Annotated[
     Actor, Depends(require_at(Capability.COLLATION_EXECUTE, target=model))
 ]
@@ -214,9 +215,11 @@ def create_collation_blueprint_version(
     """
     🔌 Registra el lote como versión del blueprint y la **stampea** en sus N BDs.
 
-    **Exige ``blueprints.write`` ADEMÁS de ``collation.execute``** (regla del §6.6): crea una
-    versión de blueprint desde otro módulo, y sin esa segunda exigencia el módulo de collation
-    sería una vía para escribir blueprints sin el permiso de escribirlos.
+    **Exige ``blueprints.write`` y ``blueprints.apply`` ADEMÁS de ``collation.execute``** (regla
+    del §6.6): crea una versión de blueprint desde otro módulo —sin ``write`` el módulo de
+    collation sería una vía para escribir blueprints sin el permiso de escribirlos— y la
+    stampea en N BDs, que es mover el puntero de Alembic dentro de bases de terceros: lo mismo
+    que ``/managed-databases/{id}/migrations/stamp``, que pide ``apply``.
 
     La versión es CONTABILIDAD de algo ya ocurrido: se crea y se marca, **no se aplica**. La
     conversión la hizo cada job leyendo su propio inventario, que es lo único que puede recrear
@@ -233,6 +236,7 @@ def create_collation_blueprint_version(
     en cuarentena, o si el SQL supera el tope por versión.
     """
     assert_at(actor, Capability.BLUEPRINTS_WRITE, model(model_id))
+    assert_at(actor, Capability.BLUEPRINTS_APPLY, model(model_id))
     data = CollationConversionController().create_blueprint_version(
         model_id, batch_id, name=payload.name, admin=actor
     )

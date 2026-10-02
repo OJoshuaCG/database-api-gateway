@@ -615,7 +615,8 @@ no la alcanza.
 Es un endpoint de **lectura** que un `operator` deja de poder llamar, y eso es deliberado: devuelve
 **datos de negocio** de la base gestionada —la única excepción del gateway a no almacenar datos—,
 así que pertenece al eje de **divulgación** y no al de lectura (v23 §2). El `DELETE` de purga del
-mismo recurso exige `blueprints.write`.
+mismo recurso exige también `blueprints.captures` (v23 §4.1): quien no puede ver la evidencia
+tampoco puede borrarla.
 
 Consecuencia para la UI: el enlace a los resultados capturados tiene que condicionarse a
 `blueprints.captures` en `capabilities` de `/auth/me`, no a `blueprints.read`.

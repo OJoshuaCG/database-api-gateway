@@ -183,6 +183,31 @@ class DatabaseModelController:
         session = self._session()
         try:
             model = self._get_or_404(session, model_id)
+            # Guard de uso ANTES de tocar nada: el CASCADE se lleva todas las versiones y el
+            # SET NULL deja a cada BD sin blueprint ni ``down_sql`` para revertir. Ver
+            # ``dm_codes.CODE_MODEL_IN_USE``.
+            en_uso = (
+                session.query(ManagedDatabase.id, ManagedDatabase.name)
+                .filter(ManagedDatabase.model_id == model_id)
+                .order_by(ManagedDatabase.id)
+                .all()
+            )
+            if en_uso:
+                raise AppHttpException(
+                    message=(
+                        f"No se puede eliminar el blueprint: {len(en_uso)} base(s) de datos "
+                        "gestionada(s) lo usan. Desasócialas o bórralas primero."
+                    ),
+                    status_code=409,
+                    public_context={
+                        "code": dm_codes.CODE_MODEL_IN_USE,
+                        "managed_database_count": len(en_uso),
+                        "blocking_databases": [
+                            {"id": db_id, "name": name} for db_id, name in en_uso
+                        ],
+                    },
+                    context={"model_id": model_id},
+                )
             # Los vínculos con proyectos se sueltan explícitamente y no por el CASCADE de
             # la FK: SQLite no aplica claves foráneas salvo que se active
             # ``PRAGMA foreign_keys``, así que en test quedarían filas apuntando a un

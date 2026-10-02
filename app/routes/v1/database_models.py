@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, Request
 from app.controllers.database_model_controller import DatabaseModelController
 from app.controllers.model_migration_controller import ModelMigrationController
 from app.core.authz import (
+    BlueprintsApply,
     BlueprintsRead,
     BlueprintsWrite,
     DatabasesRead,
@@ -46,6 +47,13 @@ router = APIRouter(prefix="/database-models", tags=["Database Models"])
 # exige en el entorno más protegido de todas (un blueprint sin BDs decide por el rol base).
 BlueprintsWriteModel = Annotated[
     Actor, Depends(require_at(Capability.BLUEPRINTS_WRITE, target=model))
+]
+# Las dos rutas que RENOMBRAN la tabla de versión en cada BD del blueprint (rename-slug y
+# migrate-version-table) reescriben la contabilidad de Alembic DENTRO de bases de terceros, la
+# misma clase de escritura que ``/migrations/stamp``: exigen ``blueprints.apply``, no ``write``
+# (que es solo autoría). Sus ``/plan`` no escriben nada y siguen en ``write``.
+BlueprintsApplyModel = Annotated[
+    Actor, Depends(require_at(Capability.BLUEPRINTS_APPLY, target=model))
 ]
 DatabasesWriteModel = Annotated[
     Actor, Depends(require_at(Capability.DATABASES_WRITE, target=model))
@@ -205,7 +213,7 @@ def migrate_version_table_plan(request: Request, actor: BlueprintsWriteModel, mo
 @limiter.limit("3/minute")
 def migrate_version_table(
     request: Request,
-    actor: BlueprintsWriteModel,
+    actor: BlueprintsApplyModel,
     model_id: int,
     payload: MigrateVersionTableIn,
 ):
@@ -229,7 +237,7 @@ def migrate_version_table(
 @router.post("/{model_id}/rename-slug", response_model=ApiResponse[RenameSlugOut])
 @limiter.limit("3/minute")
 def rename_slug(
-    request: Request, actor: BlueprintsWriteModel, model_id: int, payload: RenameSlugIn
+    request: Request, actor: BlueprintsApplyModel, model_id: int, payload: RenameSlugIn
 ):
     """
     Cambia el `slug` del blueprint y **renombra su tabla de versión en cada BD gestionada**.
@@ -254,7 +262,21 @@ def rename_slug(
 
 
 @router.delete("/{model_id}", response_model=ApiResponse[None])
-def delete_model(actor: BlueprintsWrite, model_id: int):
+def delete_model(actor: BlueprintsApply, model_id: int):
+    """
+    Borra el blueprint con TODAS sus versiones (y, por CASCADE, sus capturas y lotes).
+
+    **Exige ``blueprints.apply``, no ``write``.** Borrar UNA versión ya pide ``apply`` más el
+    guard de ``version_in_use``; borrarlas todas no puede pedir menos: se pierde el
+    ``down_sql`` con el que se revierte cualquier BD que las tenga aplicadas.
+
+    **409 ``database_model.in_use``** mientras alguna BD gestionada lo referencie: desasociarlas
+    en silencio (``SET NULL``) las dejaría sin blueprint y sin camino de rollback.
+
+    Solo capa 1, sin destino (``SCOPE_EXEMPT``): con el 409, cuando el borrado procede no queda
+    ninguna BD a la que anclar el alcance, y un ``require_at(target=model)`` decidiría por el
+    rol base — o sea, una capacidad puntual de ``apply`` nunca podría autorizarlo.
+    """
     DatabaseModelController().delete_model(model_id, admin=actor)
     return empty("Blueprint eliminado.")
 

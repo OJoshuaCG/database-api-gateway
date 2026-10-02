@@ -95,11 +95,46 @@ enviar:
 | `PATCH /database-models/{id}/migrations/{v}` | `capture_selects: true` | `blueprints.captures` |
 | `DELETE /managed-databases/{id}` | `drop_remote=true` | `databases.drop` |
 | `DELETE /server-users/{id}` | `drop_remote=true` | `engine_users.drop` |
+| `POST /managed-databases/{id}/reassign-owner` | `provision=true` | `databases.drop` (en la BD) |
+
+`reassign-owner?provision=true` pide `databases.drop` porque entrega control equivalente a
+borrarla: en PostgreSQL hace `ALTER DATABASE … OWNER TO` (el dueño puede `DROP DATABASE`) y en
+MySQL/MariaDB re-otorga `ALL PRIVILEGES` sobre la base. Sin `provision` sigue bastando
+`databases.write`.
 
 Y dos que exigen dos capacidades **siempre**, porque crean una versión de blueprint desde otro
-módulo: `POST /schema-comparisons/{id}/adopt` y
-`POST /database-models/{id}/collation-conversions/{batch}/blueprint-version` piden
-`blueprints.write` además de la propia.
+módulo: `POST /schema-comparisons/{id}/adopt` pide `blueprints.write` además de la propia, y
+`POST /database-models/{id}/collation-conversions/{batch}/blueprint-version` pide
+`collation.execute` **más `blueprints.write` y `blueprints.apply`**, las tres en el entorno más
+protegido de las BDs del blueprint: además de crear la versión la **stampea** en cada BD, igual
+que `/managed-databases/{id}/migrations/stamp`.
+
+### 4.1 `blueprints.write` es solo autoría
+
+`blueprints.write` crea y edita blueprints, versiones y proyectos **en la BD del gateway**. Todo
+lo que escribe en las BDs de terceros, o destruye versiones, pide `blueprints.apply`:
+
+| Endpoint | Antes | Ahora | Alcance |
+|---|---|---|---|
+| `POST /database-models/{id}/rename-slug` | `blueprints.write` | `blueprints.apply` | entorno más protegido de sus BDs |
+| `POST /database-models/{id}/migrate-version-table` | `blueprints.write` | `blueprints.apply` | entorno más protegido de sus BDs |
+| `DELETE /database-models/{id}` | `blueprints.write` | `blueprints.apply` + **409 `database_model.in_use`** si alguna BD gestionada lo referencia | sin destino (solo puede borrarse sin BDs) |
+| `DELETE /managed-databases/{id}/migrations/{v}/select-results` | `blueprints.write` | `blueprints.captures` | la BD |
+
+Los `/plan` de `rename-slug` y `migrate-version-table` no escriben nada y siguen en
+`blueprints.write`: un `operator` puede ver el plan, pero el botón de ejecutar se condiciona a
+`blueprints.apply`.
+
+El 409 de `DELETE /database-models/{id}` trae en `public_context` el `code`,
+`managed_database_count` y `blocking_databases` (`[{id, name}]`). Salida: desasociar o borrar
+esas BDs primero.
+
+**Todo lo que se le quitó al rol `operator` se le puede otorgar a una persona puntual** con una
+capacidad puntual (`POST /gateway-users/{id}/capability-grants`, `api-reference.md` §19) sobre un
+entorno o servidor: `blueprints.apply`, `blueprints.captures`, `databases.drop` y
+`collation.execute` son las cuatro otorgables. `blueprints.captures` y `databases.drop` son
+**sensibles** (divulga / nivel `drop`) y piden un segundo aprobador; `blueprints.apply` y
+`collation.execute` no.
 
 En los tres primeros, **apagar** la captura no pide nada extra: solo encenderla.
 

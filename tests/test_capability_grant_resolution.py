@@ -438,9 +438,18 @@ def test_scope_exempt_routes_with_grantable_capabilities_are_explicitly_justifie
     """
     Las rutas de ``SCOPE_EXEMPT`` solo corren la capa 1, y la capa 1 incluye las capacidades
     puntuales de CUALQUIER alcance. Si una exenta exige una capacidad otorgable, un CG la hace
-    alcanzable sin destino. Hoy es solo ``blueprints.write`` (autoría de blueprints y proyectos:
-    escribir no ejecuta nada en ninguna BD). Cualquier otra capacidad otorgable en una ruta
-    exenta tiene que justificarse acá, a propósito.
+    alcanzable sin destino. Cualquier capacidad otorgable en una ruta exenta tiene que
+    justificarse acá, a propósito:
+
+    - ``blueprints.write`` es SOLO AUTORÍA: crear/editar blueprints, versiones y proyectos en la
+      BD del gateway. Todo lo que escribe en BDs de terceros (rename-slug, migrate-version-table,
+      stamp, la versión de un lote de collation) pide ``blueprints.apply`` con destino, y el
+      borrado de un blueprint también pide ``apply``. Así un CG de ``write`` en cualquier alcance
+      no alcanza ningún motor.
+    - ``blueprints.apply`` aparece solo en ``DELETE /database-models/{id}``: responde 409
+      (``database_model.in_use``) mientras alguna BD lo referencie, así que cuando procede no hay
+      destino al que anclar el alcance. Con ``require_at(target=model)`` decidiría el rol base y
+      un CG de ``apply`` nunca podría autorizarlo.
     """
     import importlib.util
     import pathlib
@@ -452,7 +461,10 @@ def test_scope_exempt_routes_with_grantable_capabilities_are_explicitly_justifie
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
 
-    justificadas = {"blueprints.write": "autoría de blueprints/proyectos: no ejecuta en ninguna BD"}
+    justificadas = {
+        "blueprints.write": "solo autoría de blueprints/proyectos: no ejecuta en ninguna BD",
+        "blueprints.apply": "borrar un blueprint sin BDs (409 si alguna lo referencia)",
+    }
     encontradas: set[str] = set()
     for path, route in guard._iter_routes(app):
         for metodo in route.methods:

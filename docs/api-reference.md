@@ -1397,7 +1397,7 @@ usa `reassign-owner`).
 | `GET` | `/api/v1/managed-databases/{db_id}` | — | Detalle. |
 | `PATCH` | `/api/v1/managed-databases/{db_id}` | — | Actualiza metadata. |
 | `DELETE` | `/api/v1/managed-databases/{db_id}` | `drop_remote=false`, `confirm_name?` | Elimina del inventario. Con `drop_remote=true` 🔌 ejecuta `DROP DATABASE`. |
-| `POST` | `/api/v1/managed-databases/{db_id}/reassign-owner` | `provision=false` | Cambia el owner. Con `provision=true` 🔌 revoca/otorga (o `ALTER OWNER` en PG). |
+| `POST` | `/api/v1/managed-databases/{db_id}/reassign-owner` | `provision=false` | Cambia el owner (`databases.write`). Con `provision=true` 🔌 revoca/otorga (o `ALTER OWNER` en PG) y exige además `databases.drop` en la BD (v23 §4). |
 | `POST` | `/api/v1/managed-databases/adopt` | — | 🔌 **(Plan 09)** Adopta una BD que **ya existe** en el motor (sin `CREATE DATABASE`; status `active`, `origin=adopted`). `404` si no existe; `409` si ya está. Ver **stamp-on-adopt** abajo. |
 
 **Crear y aprovisionar una BD** 🔌:

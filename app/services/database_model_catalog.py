@@ -70,8 +70,17 @@ CODE_SLUG_RENAME_PLAN_STALE = "database_model.slug_rename_plan_stale"
 #: **no se tocó**: se actualiza último y solo si todas las bases respondieron bien.
 CODE_SLUG_RENAME_FAILED = "database_model.slug_rename_failed"
 
+#: Se intentó borrar un blueprint al que todavía apuntan BDs gestionadas. Borrarlo se lleva
+#: TODAS sus versiones (y con ellas el ``down_sql`` de cada una) y desasocia esas BDs en
+#: silencio (``SET NULL``): quedarían sin blueprint y sin camino de rollback. Es el mismo
+#: criterio que ``model_migration.version_in_use`` al borrar UNA versión, a nivel blueprint.
+#: Trae ``managed_database_count`` y ``blocking_databases`` (``id`` + ``name``). Salida:
+#: desasociar o borrar esas BDs primero.
+CODE_MODEL_IN_USE = "database_model.in_use"
+
 ERROR_CODES = frozenset(
     {
+        CODE_MODEL_IN_USE,
         CODE_SLUG_IN_USE,
         CODE_NAME_OR_SLUG_TAKEN,
         CODE_SLUG_RENAME_CONFLICT,
