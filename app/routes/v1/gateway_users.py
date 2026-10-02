@@ -16,10 +16,12 @@ from typing import Literal
 
 from fastapi import APIRouter, Query, Request
 
+from app.controllers.authz_controller import AuthzController
 from app.controllers.capability_grant_controller import CapabilityGrantController
 from app.controllers.gateway_user_controller import GatewayUserController
 from app.core.limiter import limiter
 from app.core.authz import GatewayAdmin
+from app.schemas.authz import EffectiveAccessOut
 from app.schemas.capability_grant import CapabilityGrantCreate, CapabilityGrantOut
 from app.schemas.gateway_user import (
     AcceptInviteIn,
@@ -201,3 +203,13 @@ def revoke_capability_grant(actor: GatewayAdmin, user_id: int, grant_id: int):
         data=CapabilityGrantController().revoke(user_id, grant_id, actor),
         message="Capacidad puntual revocada.",
     )
+
+
+@router.get("/{user_id}/effective-access", response_model=ApiResponse[EffectiveAccessOut])
+def get_effective_access(actor: GatewayAdmin, user_id: int):
+    """
+    Acceso efectivo de la persona CON procedencia: cada capacidad dice si viene del rol base, de
+    un rol por alcance, de una global o de una capacidad puntual (``grant_id``). Lo calcula el
+    MISMO resolvedor que hace cumplir ``require()``. Solo ``access_admin`` (403 opaco si no).
+    """
+    return success(data=AuthzController().effective_access(user_id, actor))

@@ -368,7 +368,7 @@ class UserModel:
                 {"username": username, "capability": capability},
             )
 
-    def find_access_context(self, user_id: int) -> dict:
+    def find_access_context(self, user_id: int, *, include_inert: bool = False) -> dict:
         """
         Lo que hace falta para acuñar un ``Actor``: rol base, overrides por alcance y globales.
 
@@ -392,6 +392,10 @@ class UserModel:
         contrato de ``execute_query`` devuelve ``lastrowid``/``rowcount`` —o sea un ``int``—
         cuando ``fetchone`` es ``None``. Omitirlo daba un ``TypeError: 'int' object is not
         iterable`` recién con la tabla vacía, que es el caso normal el día del deploy.
+
+        ``include_inert=True`` es SOLO para la vista de acceso efectivo: trae también las
+        capacidades puntuales de un usuario desactivado, que ``explain`` marca ``inert``. La
+        autenticación nunca lo usa, así que un usuario inactivo no gana nada.
         """
         row = self.db.execute_query(
             "SELECT gateway_role FROM users WHERE id = :id", {"id": user_id}, fetchone=True
@@ -419,10 +423,14 @@ class UserModel:
             "role": (row or {}).get("gateway_role") or "viewer",
             "grants": [(g["scope_type"], g["scope_id"], g["role"]) for g in grants],
             "globals": [g["capability"] for g in globals_],
-            "capability_grants": self._load_active_capability_grants(user_id),
+            "capability_grants": self._load_active_capability_grants(
+                user_id, include_inactive_user=include_inert
+            ),
         }
 
-    def _load_active_capability_grants(self, user_id: int) -> list[dict]:
+    def _load_active_capability_grants(
+        self, user_id: int, *, include_inactive_user: bool = False
+    ) -> list[dict]:
         """
         Capacidades puntuales ACTIVAS del usuario: ``[{id, capability, scope_type, scope_id}]``.
 
@@ -451,11 +459,11 @@ class UserModel:
                         JOIN users u ON u.id = cg.user_id
                         WHERE cg.user_id = :id
                           AND cg.status = 'active'
-                          AND u.is_active = 1
+                          AND (:any_user = 1 OR u.is_active = 1)
                           AND (cg.expires_at IS NULL OR cg.expires_at > :now)
                         """
                     ),
-                    {"id": user_id, "now": _utcnow()},
+                    {"id": user_id, "now": _utcnow(), "any_user": 1 if include_inactive_user else 0},
                 ).fetchall()
                 return [dict(f._mapping) for f in filas]
         except (ProgrammingError, OperationalError):

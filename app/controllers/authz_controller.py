@@ -52,6 +52,7 @@ class AuthzController:
         # `Actor` es identidad y capacidades — dos timestamps de diagnóstico no son ninguna de
         # las dos. `/auth/me` lo llama la SPA al cargar, no por request.
         fila = UserModel().find_by_id(actor.id) or {}
+        propias = self._own_live_grants(actor)
         return {
             "id": actor.id,
             "username": actor.username,
@@ -69,8 +70,105 @@ class AuthzController:
             "step_up_capabilities": sorted(
                 c.value for c in effective if spec(c).requires_step_up
             ),
+            "capability_grants": propias,
             "previous_login_at": fila.get("previous_login_at"),
             "last_failed_at": fila.get("last_failed_at"),
+            "catalog_version": _catalog_version(),
+        }
+
+    @staticmethod
+    def _own_live_grants(actor: Actor) -> list[dict]:
+        """
+        Capacidades puntuales VIVAS de quien pregunta, y solo de él (``actor.id``, nunca un
+        parámetro). Un token de agente no tiene ninguna. Vence perezosamente antes de leer (D6)
+        para no mostrar como pendiente una solicitud ya vencida.
+        """
+        if actor.kind != "admin":
+            return []
+        from app.controllers.capability_grant_controller import CapabilityGrantController
+        from app.models.capability_grant_model import CapabilityGrantModel
+
+        CapabilityGrantController().expire_overdue()
+        model = CapabilityGrantModel()
+        filas = model.list_live_for_user(actor.id)
+        nombres = model.scope_names([(f["scope_type"], f["scope_id"]) for f in filas])
+        return [
+            {
+                "id": f["id"],
+                "capability": f["capability"],
+                "scope_type": f["scope_type"],
+                "scope_id": f["scope_id"],
+                "scope_name": nombres.get((f["scope_type"], f["scope_id"])),
+                "status": f["status"],
+                "expires_at": f["expires_at"],
+            }
+            for f in filas
+        ]
+
+    def effective_access(self, user_id: int, actor: Actor) -> dict:
+        """
+        Acceso efectivo de ``user_id`` con procedencia, para el ``access_admin``.
+
+        Ni una línea de lógica propia: el contexto sale de ``find_access_context`` (el de la
+        autorización real), el ``Actor`` de ``actor_from_access_context`` y las filas de
+        ``explain``. Un test exige que el conjunto de capacidades no inertes sea igual a
+        ``Actor.capabilities``. Solo ``access_admin`` (ni siquiera ``security_officer``, y nadie
+        lee el de otro por esta vía: la propia persona usa ``/auth/me``).
+        """
+        from app.controllers.capability_grant_controller import assert_access_admin
+        from app.controllers.gateway_user_controller import CODE_NOT_FOUND
+        from app.core.authz import actor_from_access_context
+        from app.core.capability_resolution import explain
+        from app.exceptions import AppHttpException
+        from app.models.capability_grant_model import CapabilityGrantModel
+
+        assert_access_admin(actor)
+        usuario = UserModel().find_by_id(user_id)
+        if not usuario:
+            raise AppHttpException(
+                message="Usuario del gateway no encontrado.",
+                status_code=404,
+                public_context={"code": CODE_NOT_FOUND},
+                context={"user_id": user_id},
+            )
+        from app.controllers.capability_grant_controller import CapabilityGrantController
+
+        CapabilityGrantController().expire_overdue()
+        activo = bool(usuario.get("is_active"))
+        ctx = UserModel().find_access_context(user_id, include_inert=True)
+        modelo = actor_from_access_context(user_id, usuario["username"], ctx)
+        entradas = explain(ctx, active=activo)
+        nombres = CapabilityGrantModel().scope_names(
+            [(t, i) for t, i, _ in modelo.scope_roles]
+            + [(e.scope_type, e.scope_id) for e in entradas if e.scope_type and e.scope_id]
+        )
+
+        def nombre(t, i):
+            return nombres.get((t, i)) if t and i else None
+
+        return {
+            "user_id": user_id,
+            "username": usuario["username"],
+            "active": activo,
+            "base_role": modelo.base_role.value if modelo.base_role else None,
+            "scope_roles": [
+                {"scope_type": t, "scope_id": i, "scope_name": nombre(t, i), "role": r.value}
+                for t, i, r in sorted(modelo.scope_roles, key=lambda x: (x[0], x[1]))
+            ],
+            "global_capabilities": sorted(g.value for g in modelo.global_capabilities),
+            "capabilities": [
+                {
+                    "capability": e.capability.value,
+                    "source": e.source,
+                    "scope_type": e.scope_type,
+                    "scope_id": e.scope_id,
+                    "scope_name": nombre(e.scope_type, e.scope_id),
+                    "grant_id": e.grant_id,
+                    "implied_by": e.implied_by.value if e.implied_by else None,
+                    "inert": e.inert,
+                }
+                for e in entradas
+            ],
             "catalog_version": _catalog_version(),
         }
 

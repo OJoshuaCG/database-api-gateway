@@ -114,6 +114,22 @@ class CapabilityGrantModel:
         finally:
             session.close()
 
+    def list_live_for_user(self, user_id: int) -> list[dict]:
+        """``pending`` y ``active`` de UNA persona (lo que ``/auth/me`` muestra de sí misma)."""
+        session = self._session()
+        try:
+            stmt = (
+                select(CapabilityGrant)
+                .where(
+                    CapabilityGrant.user_id == user_id,
+                    CapabilityGrant.status.in_(("pending", "active")),
+                )
+                .order_by(CapabilityGrant.id.asc())
+            )
+            return [_public(r) for r in session.scalars(stmt).all()]
+        finally:
+            session.close()
+
     def list_pending(self) -> list[dict]:
         """Solicitudes pendientes y NO vencidas (la bandeja), de la más vieja a la más nueva."""
         session = self._session()

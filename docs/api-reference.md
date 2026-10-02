@@ -2571,6 +2571,7 @@ alta pendiente.
 | 85 | GET | `/api/v1/capability-grants/pending` | 🔒 `access_admin` | — |
 | 86 | POST | `/api/v1/capability-grants/{grant_id}/approve` | 🔒 `access_admin` | — |
 | 87 | POST | `/api/v1/capability-grants/{grant_id}/reject` | 🔒 `access_admin` | — |
+| 88 | GET | `/api/v1/gateway-users/{user_id}/effective-access` | 🔒 `access_admin` | — |
 
 \* Toca el motor solo cuando el flag (`provision` / `drop_remote` / `execute_immediately`)
 es `true`. Los grants y `provision`/`apply-profile` tocan el motor siempre. Los
@@ -2609,8 +2610,8 @@ Relevantes para quien despliega o consume el gateway (la lista completa está en
 
 Una **capacidad puntual** le suma a una persona del gateway UNA capacidad sobre UN entorno o
 servidor, sin cambiarle el rol. Suma al rol del alcance (nunca resta) y no toca `PUT /access`.
-Hoy están el alta, el listado, la revocación y la aprobación/rechazo de las sensibles;
-`/auth/me` y la vista de acceso efectivo llegan en entregas siguientes.
+Incluye el alta, el listado, la revocación, la aprobación/rechazo de las sensibles, la vista de
+la propia persona (`/auth/me`) y el acceso efectivo con procedencia.
 
 **Quién actúa.** Solo quien tiene la global `access_admin` (`security_officer` tiene
 `gateway.admin` pero recibe `403`). Todo es CSRF + sesión, como el resto de `/gateway-users`.
@@ -2702,6 +2703,63 @@ Errores de approve/reject: `403 access.forbidden`, `404 access.grant_not_found`,
 access.grant_not_pending` (ya decidida, vencida o cancelada); solo approve: `409
 access.self_approval_forbidden`, `409 access.self_modification_forbidden`, `409
 access.grant_user_inactive`, `409 access.grant_ceiling_exceeded`, `404 access.grant_scope_not_found`.
+
+### Vista propia: `GET /api/v1/auth/me` (campo nuevo, aditivo)
+
+`MeOut` suma `capability_grants`: las capacidades puntuales **vivas** (`pending` | `active`) de
+**quien pregunta**, y solo las suyas (nadie ve las de otra persona por acá). Es una lista que
+puede venir vacía; el resto de los campos no cambia. Las `active` ya están sumadas en
+`capabilities` (mismo predicado que `require()`); las `pending` no conceden nada todavía.
+
+```json
+"capability_grants": [
+  { "id": 7, "capability": "databases.write", "scope_type": "environment", "scope_id": 1,
+    "scope_name": "Desarrollo", "status": "active", "expires_at": null },
+  { "id": 9, "capability": "exports.download", "scope_type": "server", "scope_id": 3,
+    "scope_name": "pg-prod", "status": "pending", "expires_at": "2026-10-08T18:00:00" }
+]
+```
+
+### `GET /api/v1/gateway-users/{user_id}/effective-access`
+
+Acceso efectivo de la persona **con procedencia**, para decidir «por rol» vs «puntual». Solo
+`access_admin` (`403 access.forbidden` opaco para el resto, incluido `security_officer`; la propia
+persona usa `/auth/me`). `404 gateway_user.not_found` si no existe. Lo calcula el MISMO resolvedor
+que hace cumplir `require()` (`explain`), sobre el mismo contexto que acuña el `Actor`.
+
+```json
+{
+  "user_id": 2, "username": "destino", "active": true, "base_role": "viewer",
+  "scope_roles": [
+    { "scope_type": "environment", "scope_id": 2, "scope_name": "Producción", "role": "viewer" }
+  ],
+  "global_capabilities": [],
+  "capabilities": [
+    { "capability": "self.read", "source": "role", "scope_type": null, "scope_id": null,
+      "scope_name": null, "grant_id": null, "implied_by": null, "inert": false },
+    { "capability": "databases.read", "source": "scoped_role", "scope_type": "environment",
+      "scope_id": 2, "scope_name": "Producción", "grant_id": null, "implied_by": null,
+      "inert": false },
+    { "capability": "blueprints.apply", "source": "capability_grant", "scope_type": "environment",
+      "scope_id": 2, "scope_name": "Producción", "grant_id": 7, "implied_by": null,
+      "inert": false },
+    { "capability": "blueprints.read", "source": "capability_grant", "scope_type": "environment",
+      "scope_id": 2, "scope_name": "Producción", "grant_id": 7, "implied_by": "blueprints.apply",
+      "inert": false }
+  ],
+  "catalog_version": "ab12cd34ef56"
+}
+```
+
+- `source`: `role` (rol base) | `scoped_role` (rol por alcance) | `global` (`access_admin` /
+  `security_officer`) | `capability_grant` (puntual; trae `grant_id`).
+- Una capacidad con varias fuentes aparece **una vez por fuente y alcance**. La lectura implícita
+  de una puntual sale con `implied_by` = la capacidad puntual que la trae.
+- Solo cuentan las puntuales `active`; las pendientes no aparecen. Si la persona está
+  desactivada (`active: false`) sus puntuales siguen listadas con `inert: true` (retenidas, sin
+  efecto: reactivarla las restaura) y NO cuentan como acceso. `inert` es `false` en el resto.
+- El conjunto de `capability` de las entradas no inertes es exactamente `Actor.capabilities`.
+- `scope_name` es `null` si el entorno o servidor ya no existe.
 
 ### Errores (`detail.public_context.code`)
 

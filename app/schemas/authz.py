@@ -19,6 +19,20 @@ class ScopeRoleOut(BaseModel):
     role: str = Field(..., description="viewer | operator | owner")
 
 
+class MyCapabilityGrantOut(BaseModel):
+    """Una capacidad puntual VIVA (``pending`` | ``active``) de la propia persona."""
+
+    id: int
+    capability: str
+    scope_type: str = Field(..., description="environment | server")
+    scope_id: int
+    scope_name: str | None = Field(None, description="Nombre del entorno o servidor")
+    status: str = Field(..., description="pending | active")
+    expires_at: datetime | None = Field(
+        None, description="Solo las pendientes vencen (UTC); null si ya está activa"
+    )
+
+
 class MeOut(BaseModel):
     """
     Identidad y capacidades EFECTIVAS del actor de la sesión.
@@ -61,6 +75,13 @@ class MeOut(BaseModel):
             "Subconjunto de 'capabilities' que va a exigir reautenticación. Se publica para "
             "que la UI pida la contraseña ANTES de mandar la operación, en vez de descubrirlo "
             "por un error. El mecanismo todavía no está implementado."
+        ),
+    )
+    capability_grants: list[MyCapabilityGrantOut] = Field(
+        default_factory=list,
+        description=(
+            "Capacidades puntuales VIVAS (pending|active) de ESTA persona, y solo las suyas. Las "
+            "activas ya están sumadas en 'capabilities'; las pendientes no conceden nada todavía"
         ),
     )
     previous_login_at: datetime | None = Field(
@@ -147,3 +168,47 @@ class ScopeReadinessOut(BaseModel):
             "lista el motor durante la autorización. Inventariarla es lo que la incorpora"
         ),
     )
+
+
+class EffectiveScopeRoleOut(BaseModel):
+    scope_type: str = Field(..., description="environment | server")
+    scope_id: int
+    scope_name: str | None = None
+    role: str = Field(..., description="viewer | operator | owner")
+
+
+class EffectiveCapabilityOut(BaseModel):
+    """
+    Una capacidad efectiva y de DÓNDE sale. Una capacidad con varias fuentes repite filas (una
+    por fuente y alcance): la UI distingue «por rol» de «puntual» por ``source``.
+    """
+
+    capability: str
+    source: str = Field(..., description="role | scoped_role | capability_grant | global")
+    scope_type: str | None = Field(None, description="environment | server; null si no es por alcance")
+    scope_id: int | None = None
+    scope_name: str | None = None
+    grant_id: int | None = Field(None, description="Id de la capacidad puntual (source=capability_grant)")
+    implied_by: str | None = Field(
+        None, description="Capacidad puntual que la trae implícita (lectura implícita)"
+    )
+    inert: bool = Field(
+        False,
+        description="True: retenida pero sin efecto (persona desactivada); no cuenta como acceso",
+    )
+
+
+class EffectiveAccessOut(BaseModel):
+    """
+    Acceso efectivo de una persona, con procedencia. Lo calcula ``explain`` —el MISMO resolvedor
+    que hace cumplir ``require()``— sobre el MISMO contexto que acuña el ``Actor``.
+    """
+
+    user_id: int
+    username: str
+    active: bool
+    base_role: str | None
+    scope_roles: list[EffectiveScopeRoleOut] = Field(default_factory=list)
+    global_capabilities: list[str] = Field(default_factory=list)
+    capabilities: list[EffectiveCapabilityOut] = Field(default_factory=list)
+    catalog_version: str
