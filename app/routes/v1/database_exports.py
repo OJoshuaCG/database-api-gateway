@@ -45,6 +45,7 @@ from app.core.authz import (
     require_at,
 )
 from app.core.limiter import limiter
+from app.core.scope import assert_at
 from app.core.scope_targets import export_job, server_database
 from app.services.capability_catalog import Capability
 from app.schemas.export import (
@@ -196,6 +197,11 @@ def preview_export(
     Con ``dry_run_only`` valida y reporta sin congelar ni emitir token: es el modo "solo
     advertencias" para que el formulario muestre las consecuencias mientras se elige.
     """
+    if payload.include_sample:
+        # La muestra son filas reales del artefacto: divulgar exige ``exports.download``, no
+        # alcanza con ``exports.execute`` (F-13). Hoy el generador devuelve None, pero el
+        # chequeo tiene que estar antes del día en que deje de hacerlo.
+        assert_at(actor, Capability.EXPORTS_DOWNLOAD, export_job(job_id))
     data = ExportController().preview(
         job_id,
         spec_payload=payload.spec.model_dump(mode="json") if payload.spec else None,

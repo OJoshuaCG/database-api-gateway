@@ -160,6 +160,11 @@ def adopt_comparison(
     Y la escritura no es cosmética: la versión creada la aplican después N bases.
     """
     assert_at(actor, Capability.BLUEPRINTS_WRITE, comparison(comparison_id))
+    if payload.execute_immediately:
+        # Aplicar la versión al target es lo que en su módulo exige ``blueprints.apply``. Hoy
+        # coincide por rol (schema_diff.execute es de owner), pero con capacidades puntuales
+        # alguien puede tener schema_diff.execute sin blueprints.apply en ese alcance (F-7).
+        assert_at(actor, Capability.BLUEPRINTS_APPLY, comparison(comparison_id))
     result = SchemaComparisonController().adopt_comparison(
         comparison_id,
         selected_item_ids=payload.selected_item_ids,

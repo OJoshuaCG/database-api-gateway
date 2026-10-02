@@ -1559,6 +1559,76 @@ def test_preview_is_rejected_once_the_job_ran(admin_client, monkeypatch):
     assert _public(r)["code"] == "export.already_executed"
 
 
+# --------------------------------------------------------------------------- #
+# F-13 — la muestra del preview exige ``exports.download``                      #
+# --------------------------------------------------------------------------- #
+def _operador(admin_client, username):
+    """
+    Un ``operator``: trae ``exports.execute`` por rol y NO ``exports.download`` (divulgar no
+    viene implícito en generar). Devuelve su id y un client autenticado como él.
+    """
+    from app.models.user_model import UserModel
+    from tests.test_api_gateway_users import _cliente_como, _crear
+
+    datos = _crear(admin_client, username, gateway_role="operator")
+    return UserModel().find_by_username(username)["id"], _cliente_como(datos, username)
+
+
+def _code(r) -> str | None:
+    return ((r.json().get("detail") or {}).get("public_context") or {}).get("code")
+
+
+def test_preview_with_sample_requires_exports_download(admin_client, monkeypatch):
+    """
+    F-13: la muestra son filas reales del artefacto, así que pedirla es divulgar. Con
+    ``exports.execute`` pero sin ``exports.download``, ``include_sample=true`` es 403 aunque
+    hoy el generador todavía no devuelva nada.
+    """
+    _install(monkeypatch)
+    sid = _server(admin_client, 3880)
+    job = _plan(admin_client, sid)
+    _, opera = _operador(admin_client, "opera_f13")
+
+    r = opera.post(f"/api/v1/database-exports/{job}/preview", json={"include_sample": True})
+    assert (r.status_code, _code(r)) == (403, "access.forbidden"), r.text
+
+
+def test_preview_without_sample_is_not_stopped_by_the_download_guard(
+    admin_client, monkeypatch
+):
+    """
+    F-13, el lado permitido: el MISMO actor sin ``include_sample`` previsualiza normalmente.
+    El guard nuevo cubre solo la muestra; el preview sigue pidiendo ``exports.execute``.
+    """
+    _install(monkeypatch)
+    sid = _server(admin_client, 3881)
+    job = _plan(admin_client, sid)
+    _, opera = _operador(admin_client, "opera_f13b")
+
+    r = opera.post(f"/api/v1/database-exports/{job}/preview", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["confirm_token"]
+
+
+def test_preview_with_sample_passes_with_an_exports_download_grant(
+    admin_client, monkeypatch
+):
+    """
+    F-13, control positivo: al mismo actor le sumo ``exports.download`` puntual en el servidor
+    del job y la muestra pasa. Prueba que el 403 de arriba lo pone ESA capacidad.
+    """
+    from tests.test_capability_grant_crud import _insert_cg
+
+    _install(monkeypatch)
+    sid = _server(admin_client, 3882)
+    job = _plan(admin_client, sid)
+    uid, opera = _operador(admin_client, "opera_f13c")
+    _insert_cg(uid, "exports.download", "server", sid)
+
+    r = opera.post(f"/api/v1/database-exports/{job}/preview", json={"include_sample": True})
+    assert r.status_code == 200, r.text
+
+
 def test_un_range_que_cubre_todo_consume_el_artefacto(admin_client, monkeypatch):
     """
     R1: ``Range: bytes=0-`` bajaba el archivo ENTERO y no lo consumía — el "un solo uso"

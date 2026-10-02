@@ -528,6 +528,129 @@ def test_adopt_without_executing_does_not_require_confirmation(
     assert r.status_code == 200, r.text
     assert r.json()["data"]["executed"] is False
 
+# --------------------------------------------------------------------------- #
+# F-7 — adoptar Y ejecutar exige también ``blueprints.apply`` en el target      #
+# --------------------------------------------------------------------------- #
+def _operador_con_schema_diff(admin_client, cid, username):
+    """
+    Un ``operator`` (trae ``blueprints.write`` por rol, NO ``blueprints.apply``) más una
+    capacidad puntual de ``schema_diff.execute`` en el servidor del target de la comparación.
+
+    Es exactamente la combinación que el rol solo no puede producir: hoy ``schema_diff.execute``
+    es de ``owner``, que ya trae ``blueprints.apply``. Con capacidades puntuales, sí.
+    """
+    from app.models.user_model import UserModel
+    from tests.test_api_gateway_users import _cliente_como, _crear
+    from tests.test_capability_grant_crud import _insert_cg
+
+    tgt_server = admin_client.get(f"/api/v1/schema-comparisons/{cid}").json()["data"][
+        "target_server_id"
+    ]
+    datos = _crear(admin_client, username, gateway_role="operator")
+    uid = UserModel().find_by_username(username)["id"]
+    _insert_cg(uid, "schema_diff.execute", "server", tgt_server)
+    return uid, tgt_server, _cliente_como(datos, username)
+
+
+def _code(r) -> str | None:
+    return ((r.json().get("detail") or {}).get("public_context") or {}).get("code")
+
+
+def test_adopt_execute_immediately_requires_blueprints_apply(admin_client, monkeypatch):
+    """
+    F-7: con ``schema_diff.execute`` + ``blueprints.write`` pero SIN ``blueprints.apply``,
+    ``execute_immediately=true`` es 403. Aplicar la versión al target es lo que en el módulo de
+    blueprints exige ``blueprints.apply``; el diff no puede ser el atajo para saltearlo.
+    """
+    src_id, tgt_id, model_id, _ = _setup(
+        admin_client, monkeypatch, port=3516, target_has_model=True
+    )
+    cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
+    items = admin_client.get(f"/api/v1/schema-comparisons/{cid}/items").json()["data"]
+    new_t = next(i for i in items if i["object_name"] == "new_t")
+    _, _, opera = _operador_con_schema_diff(admin_client, cid, "opera_f7")
+
+    # Si el guard fallara, el apply NO puede llegar al motor: que explote delata la fuga.
+    def _no_debe_aplicar(self, *a, **k):
+        raise AssertionError("el apply corrió sin blueprints.apply")
+
+    monkeypatch.setattr(MigrationRunner, "get_current_version", lambda self, *a, **k: None)
+    monkeypatch.setattr(MigrationRunner, "apply", _no_debe_aplicar)
+
+    r = opera.post(
+        f"/api/v1/schema-comparisons/{cid}/adopt",
+        json={
+            "selected_item_ids": [new_t["id"]],
+            "name": "sin-apply",
+            "execute_immediately": True,
+            "confirm_target_name": "tgt_db",
+        },
+    )
+    assert (r.status_code, _code(r)) == (403, "access.forbidden"), r.text
+
+    # Y el 403 no dejó una versión huérfana creada a medias en el blueprint.
+    got = admin_client.get(f"/api/v1/database-models/{model_id}/migrations/0001")
+    assert got.status_code == 404, got.text
+
+
+def test_adopt_without_executing_is_not_stopped_by_the_apply_guard(
+    admin_client, monkeypatch
+):
+    """
+    F-7, el lado permitido: el MISMO actor sin ``execute_immediately`` crea la versión. El
+    guard nuevo solo cubre la aplicación; crear la versión sigue pidiendo lo de siempre
+    (``schema_diff.execute`` + ``blueprints.write``).
+    """
+    src_id, tgt_id, _, _ = _setup(
+        admin_client, monkeypatch, port=3517, target_has_model=True
+    )
+    cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
+    items = admin_client.get(f"/api/v1/schema-comparisons/{cid}/items").json()["data"]
+    new_t = next(i for i in items if i["object_name"] == "new_t")
+    _, _, opera = _operador_con_schema_diff(admin_client, cid, "opera_f7b")
+
+    r = opera.post(
+        f"/api/v1/schema-comparisons/{cid}/adopt",
+        json={"selected_item_ids": [new_t["id"]], "name": "solo-version"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["executed"] is False
+
+
+def test_adopt_execute_immediately_passes_with_a_blueprints_apply_grant(
+    admin_client, monkeypatch
+):
+    """
+    F-7, control positivo: al mismo actor le sumo ``blueprints.apply`` puntual en el servidor
+    del target y ejecutar inmediatamente pasa. Prueba que el 403 de arriba lo pone ESA
+    capacidad y no otra cosa del armado del actor.
+    """
+    from tests.test_capability_grant_crud import _insert_cg
+
+    src_id, tgt_id, _, _ = _setup(
+        admin_client, monkeypatch, port=3518, target_has_model=True
+    )
+    cid = _create(admin_client, src_id, tgt_id).json()["data"]["id"]
+    items = admin_client.get(f"/api/v1/schema-comparisons/{cid}/items").json()["data"]
+    new_t = next(i for i in items if i["object_name"] == "new_t")
+    uid, tgt_server, opera = _operador_con_schema_diff(admin_client, cid, "opera_f7c")
+    _insert_cg(uid, "blueprints.apply", "server", tgt_server)
+
+    monkeypatch.setattr(MigrationRunner, "get_current_version", lambda self, *a, **k: None)
+    monkeypatch.setattr(MigrationRunner, "apply", lambda self, *a, **k: [])
+    r = opera.post(
+        f"/api/v1/schema-comparisons/{cid}/adopt",
+        json={
+            "selected_item_ids": [new_t["id"]],
+            "name": "con-apply",
+            "execute_immediately": True,
+            "confirm_target_name": "tgt_db",
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["executed"] is True
+
+
 # =========================================================================== #
 # Fase 6 — execute (Opción B)                                                  #
 # =========================================================================== #
