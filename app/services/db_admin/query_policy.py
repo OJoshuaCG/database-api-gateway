@@ -397,9 +397,17 @@ _BLOCKLIST: tuple[tuple[str, re.Pattern[str], str], ...] = (
             # ``CREATE LANGUAGE`` registra un handler arbitrario y esquiva la lista de
             # nombres conocidos de ``extension_or_untrusted_language``.
             r"|^CREATE\s+(OR\s+REPLACE\s+)?(TRUSTED\s+|PROCEDURAL\s+)*LANGUAGE\b"
+            # INVOCAR la UDF ya instalada (lib_mysqludf_sys): ``SELECT sys_exec('id')`` es un
+            # ``SELECT`` para el AST y corría como ``read`` sin confirmación, y READ ONLY no
+            # frena el efecto en el SO. Instalarla ya estaba bloqueado (``SONAME``); esto cubre
+            # la que ya vino instalada. ``\b`` deja pasar el calificado (``mysql.sys_exec(``)
+            # y el cierre de cita opcional, el citado (`` `sys_exec`( ``), que
+            # ``_scan_normalize`` conserva.
+            r"|\bSYS_(EXEC|EVAL|EXECUTE|BINEVAL)[`\"]?\s*\("
         ),
-        "Cargar una librería nativa (UDF/plugin) o registrar un lenguaje procedural "
-        "ejecuta código arbitrario en el host del servidor de base de datos.",
+        "Cargar una librería nativa (UDF/plugin), registrar un lenguaje procedural o invocar "
+        "una UDF de ejecución de comandos (sys_exec/sys_eval) ejecuta código arbitrario en el "
+        "host del servidor de base de datos.",
     ),
     (
         "outbound_connection",

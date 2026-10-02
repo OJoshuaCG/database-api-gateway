@@ -190,6 +190,31 @@ def test_sentencias_prohibidas(sql, engine, code):
     assert any(r.code == code for r in plan.reasons)
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT sys_exec('id')",
+        "SELECT SYS_EVAL('id')",
+        "select Sys_Execute('id')",
+        "SELECT sys_bineval('x')",
+        "SELECT mysql.sys_exec('id')",
+        "SELECT `mysql`.`sys_exec`('id')",
+        "SELECT sys_exec ('id') FROM dual",
+        "SELECT 1 /*!50000 , sys_eval('id') */",
+    ],
+)
+def test_la_udf_de_ejecucion_de_comandos_se_bloquea(sql):
+    """F-46: la UDF lib_mysqludf_sys ya instalada no puede correr como ``read``."""
+    plan = qp.classify(sql, engine=MYSQL)
+    assert plan.is_blocked
+    assert any(r.code == "native_code_load" for r in plan.reasons)
+
+
+def test_un_identificador_que_solo_empieza_parecido_no_se_bloquea():
+    plan = qp.classify("SELECT my_sys_exec_count FROM t", engine=MYSQL)
+    assert not plan.is_blocked
+
+
 def test_flush_privileges_no_se_detecta_por_el_ast():
     """
     Regresión del motivo por el que la blocklist de TEXTO no es redundante: sqlglot
