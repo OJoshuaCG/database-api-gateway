@@ -5,7 +5,9 @@ CRUD del inventario (solo BD del gateway) + operaciones contra el servidor desti
 (test-connection e introspección de estructura). Todos requieren admin autenticado.
 """
 
-from fastapi import APIRouter, Query, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query, Request
 
 from app.controllers.grant_controller import GrantController
 from app.controllers.query_console_controller import QueryConsoleController
@@ -13,19 +15,17 @@ from app.controllers.server_controller import ServerController
 from app.controllers.server_database_controller import ServerDatabaseController
 from app.controllers.server_user_controller import ServerUserController
 from app.core.authz import (
-    DatabasesDrop,
     DatabasesRead,
-    DatabasesWrite,
-    EngineUsersDrop,
     EngineUsersRead,
-    EngineUsersSecrets,
-    EngineUsersWrite,
     ServersAdmin,
     ServersRead,
-    SqlConsoleExecute,
     SqlConsoleHistory,
+    require_at,
 )
+from app.core.actor import Actor
 from app.core.limiter import limiter
+from app.core.scope_targets import server, server_database, sql_console
+from app.services.capability_catalog import Capability
 from app.schemas.grant import (
     EngineUserGrantsOut,
     GrantableRequest,
@@ -73,6 +73,28 @@ from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
 router = APIRouter(prefix="/servers", tags=["Servers"])
+
+# Capa 1 + capa 2. Los alias de usuarios del motor y de alta de BD apuntan al SERVIDOR entero
+# (el entorno más protegido entre sus BDs inventariadas); drop y consola resuelven por fila de
+# inventario cuando existe. Locales y no en ``authz``: el destino es decisión de cada ruta.
+EngineUsersWriteAtServer = Annotated[
+    Actor, Depends(require_at(Capability.ENGINE_USERS_WRITE, target=server))
+]
+EngineUsersDropAtServer = Annotated[
+    Actor, Depends(require_at(Capability.ENGINE_USERS_DROP, target=server))
+]
+EngineUsersSecretsAtServer = Annotated[
+    Actor, Depends(require_at(Capability.ENGINE_USERS_SECRETS, target=server))
+]
+DatabasesWriteAtServer = Annotated[
+    Actor, Depends(require_at(Capability.DATABASES_WRITE, target=server))
+]
+DatabasesDropAtDatabase = Annotated[
+    Actor, Depends(require_at(Capability.DATABASES_DROP, target=server_database))
+]
+SqlConsoleExecuteAtTarget = Annotated[
+    Actor, Depends(require_at(Capability.SQL_CONSOLE_EXECUTE, target=sql_console))
+]
 
 
 # ----------------------------- CRUD (gateway) ----------------------------- #
@@ -145,7 +167,7 @@ def list_users_grouped(actor: EngineUsersRead, server_id: int):
     response_model=ApiResponse[BatchAdoptOut],
     status_code=201,
 )
-def adopt_engine_user_all_hosts(actor: EngineUsersWrite, server_id: int, payload: AdoptAllHostsIn):
+def adopt_engine_user_all_hosts(actor: EngineUsersWriteAtServer, server_id: int, payload: AdoptAllHostsIn):
     """
     Adopta TODAS las identidades en vivo de un username en una sola operación (nunca
     ejecuta CREATE USER). Con ``known_password`` opcional, la guarda cifrada en todas
@@ -164,7 +186,7 @@ def adopt_engine_user_all_hosts(actor: EngineUsersWrite, server_id: int, payload
     response_model=ApiResponse[EngineUserActionOut],
     status_code=201,
 )
-def create_engine_user(actor: EngineUsersWrite, server_id: int, payload: EngineUserCreateIn):
+def create_engine_user(actor: EngineUsersWriteAtServer, server_id: int, payload: EngineUserCreateIn):
     """Crea un usuario en el motor (CREATE USER). Con ``adopt=true`` lo registra además en el inventario."""
     created = ServerUserController().create_user_by_identity(
         server_id, payload.model_dump(), admin=actor
@@ -176,7 +198,7 @@ def create_engine_user(actor: EngineUsersWrite, server_id: int, payload: EngineU
     "/{server_id}/users/password", response_model=ApiResponse[EngineUserActionOut]
 )
 def change_engine_user_password(
-    actor: EngineUsersWrite, server_id: int, payload: EnginePasswordChangeIn
+    actor: EngineUsersWriteAtServer, server_id: int, payload: EnginePasswordChangeIn
 ):
     """Cambia la contraseña de un usuario en el motor (esté o no adoptado). Si hay fila de inventario, se sincroniza."""
     updated = ServerUserController().set_password_by_identity(
@@ -190,7 +212,7 @@ def change_engine_user_password(
     response_model=ApiResponse[PasswordChangeBatchOut],
 )
 def change_engine_user_password_all_hosts(
-    actor: EngineUsersWrite, server_id: int, payload: EnginePasswordChangeAllHostsIn
+    actor: EngineUsersWriteAtServer, server_id: int, payload: EnginePasswordChangeAllHostsIn
 ):
     """
     Rota la contraseña REAL (ALTER USER/ROLE) en TODOS los hosts en vivo de un
@@ -213,7 +235,7 @@ def change_engine_user_password_all_hosts(
 @limiter.limit("3/minute")
 def reveal_engine_user_password(
     request: Request,
-    actor: EngineUsersSecrets,
+    actor: EngineUsersSecretsAtServer,
     server_id: int,
     payload: EngineRevealPasswordIn,
 ):
@@ -238,7 +260,7 @@ def reveal_engine_user_password(
     response_model=ApiResponse[KnownPasswordSetOut],
 )
 def define_engine_user_known_password(
-    actor: EngineUsersWrite, server_id: int, payload: DefineKnownPasswordIn
+    actor: EngineUsersWriteAtServer, server_id: int, payload: DefineKnownPasswordIn
 ):
     """
     Registra una contraseña YA conocida por el admin humano SIN ejecutar ALTER USER —
@@ -260,7 +282,7 @@ def define_engine_user_known_password(
     response_model=ApiResponse[AddHostOut],
     status_code=201,
 )
-def add_engine_user_host(actor: EngineUsersWrite, server_id: int, payload: AddHostIn):
+def add_engine_user_host(actor: EngineUsersWriteAtServer, server_id: int, payload: AddHostIn):
     """
     Agrega un host a un usuario (clona la cuenta a ``new_host``). Solo MySQL/MariaDB
     (422 en PostgreSQL). ``reuse_password=true`` copia el hash de la cuenta origen;
@@ -306,7 +328,7 @@ def list_engine_user_grants(
 
 @router.delete("/{server_id}/users", response_model=ApiResponse[None])
 def drop_engine_user(
-    actor: EngineUsersDrop,
+    actor: EngineUsersDropAtServer,
     server_id: int,
     username: str = Query(..., description="Username del usuario a eliminar del motor."),
     host: str = Query("%", description="Host de la identidad (ignorado en PostgreSQL)."),
@@ -380,7 +402,7 @@ def get_table_schema(actor: DatabasesRead, server_id: int, database: str, table:
 )
 @limiter.limit("10/minute")
 def create_database(
-    request: Request, actor: DatabasesWrite, server_id: int, payload: DatabaseCreateIn
+    request: Request, actor: DatabasesWriteAtServer, server_id: int, payload: DatabaseCreateIn
 ):
     """Crea una BD en el servidor. Con ``register=true`` (requiere ``owner_id``) además la registra."""
     result = ServerDatabaseController().create_database(
@@ -403,7 +425,7 @@ def create_database(
 )
 @limiter.limit("10/minute")
 def drop_database_preview(
-    request: Request, actor: DatabasesDrop, server_id: int, database: str
+    request: Request, actor: DatabasesDropAtDatabase, server_id: int, database: str
 ):
     """
     Paso 1 del borrado: valida la BD, corre guards y devuelve un ``confirm_token`` firmado
@@ -420,7 +442,7 @@ def drop_database_preview(
 )
 @limiter.limit("3/minute")
 def drop_database(
-    request: Request, actor: DatabasesDrop, server_id: int, database: str, payload: DatabaseDropIn
+    request: Request, actor: DatabasesDropAtDatabase, server_id: int, database: str, payload: DatabaseDropIn
 ):
     """
     Paso 2 del borrado (IRREVERSIBLE): exige ``confirm_target_name`` == nombre real +
@@ -476,7 +498,7 @@ def check_grantable(actor: EngineUsersRead, server_id: int, payload: GrantableRe
 )
 @limiter.limit("30/minute")
 def preview_query(
-    request: Request, actor: SqlConsoleExecute, server_id: int, payload: QueryPreviewIn
+    request: Request, actor: SqlConsoleExecuteAtTarget, server_id: int, payload: QueryPreviewIn
 ):
     """
     Paso 1: clasifica el SQL (lectura / escritura / DDL / prohibido), estima cuántas filas
@@ -501,7 +523,7 @@ def preview_query(
 )
 @limiter.limit("30/minute")
 def execute_query(
-    request: Request, actor: SqlConsoleExecute, server_id: int, payload: QueryExecuteIn
+    request: Request, actor: SqlConsoleExecuteAtTarget, server_id: int, payload: QueryExecuteIn
 ):
     """
     Paso 2: ejecuta el lote. Una consulta de solo lectura corre directo (dentro de una

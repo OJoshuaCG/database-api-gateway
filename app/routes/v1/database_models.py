@@ -6,7 +6,9 @@ rate limit propio: ``/from-snapshot`` (fotografía una BD existente) y
 ``/{id}/databases/refresh`` (relee la versión real de cada BD del blueprint).
 """
 
-from fastapi import APIRouter, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Request
 
 from app.controllers.database_model_controller import DatabaseModelController
 from app.controllers.model_migration_controller import ModelMigrationController
@@ -15,9 +17,12 @@ from app.core.authz import (
     BlueprintsWrite,
     DatabasesRead,
     DatabasesWrite,
-    assert_capability,
+    require_at,
 )
+from app.core.actor import Actor
 from app.core.limiter import limiter
+from app.core.scope import assert_at
+from app.core.scope_targets import snapshot_source, snapshot_source_for
 from app.schemas.database_model import (
     DatabaseModelCreate,
     DatabaseModelOut,
@@ -38,6 +43,12 @@ from app.utils.response import ApiResponse, empty, paginated, success
 
 router = APIRouter(prefix="/database-models", tags=["Database Models"])
 
+# El snapshot LEE la BD de origen (``server_id`` + ``database`` del payload): la capa 2 se evalúa
+# sobre esa fuente. Escribir el blueprint nuevo no apunta a ninguna BD.
+BlueprintsWriteAtSource = Annotated[
+    Actor, Depends(require_at(Capability.BLUEPRINTS_WRITE, target=snapshot_source))
+]
+
 
 @router.get("", response_model=ApiResponse[list[DatabaseModelOut]])
 def list_models(actor: BlueprintsRead, pagination: PaginationDep):
@@ -55,7 +66,9 @@ def create_model(actor: BlueprintsWrite, payload: DatabaseModelCreate):
 
 @router.post("/from-snapshot", response_model=ApiResponse[FromSnapshotOut], status_code=201)
 @limiter.limit("10/minute")
-def create_from_snapshot(request: Request, actor: BlueprintsWrite, payload: FromSnapshotIn):
+def create_from_snapshot(
+    request: Request, actor: BlueprintsWriteAtSource, payload: FromSnapshotIn
+):
     """
     Crea un blueprint NUEVO cuyo baseline (v0001) es el snapshot de una BD existente
     (Plan 09, modo 3). Si incluye objetos procedurales, el baseline queda atado a su motor de
@@ -68,7 +81,13 @@ def create_from_snapshot(request: Request, actor: BlueprintsWrite, payload: From
     la misma capacidad: es la que gobierna que el gateway persista datos de negocio.
     """
     if payload.data_tables:
-        assert_capability(actor, Capability.BLUEPRINTS_CAPTURES)
+        # ``assert_at`` sobre la fuente: la capa 1 sola dejaría extraer filas de producción a
+        # quien es ``owner`` solo en desarrollo.
+        assert_at(
+            actor,
+            Capability.BLUEPRINTS_CAPTURES,
+            snapshot_source_for(payload.server_id, payload.database),
+        )
     result = ModelMigrationController().create_from_snapshot(payload.model_dump(), admin=actor)
     return success(data=result, message="Blueprint baseline creado desde snapshot.")
 

@@ -11,7 +11,9 @@ Flags que tocan el motor:
 - ``?drop_remote=true`` en DELETE → DROP USER en el motor.
 """
 
-from fastapi import APIRouter, Query, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query, Request
 
 from app.controllers.grant_controller import GrantController
 from app.controllers.server_user_controller import ServerUserController
@@ -19,9 +21,12 @@ from app.core.authz import (
     DatabasesRead,
     EngineUsersRead,
     EngineUsersWrite,
-    assert_capability,
+    require_at,
 )
+from app.core.actor import Actor
 from app.core.limiter import limiter
+from app.core.scope import assert_at
+from app.core.scope_targets import payload_server, server_user
 from app.schemas.grant import ApplyProfileBulkRequest, ApplyProfileBulkResult, ApplyProfileRequest, ApplyProfileResult, GrantInfo, GrantRequest, RevokeRequest
 from app.schemas.managed_database import ManagedDatabaseOut
 from app.schemas.server_user import AdoptUserIn, ServerUserCreate, ServerUserFullCreate, ServerUserFullOut, ServerUserOut, ServerUserUpdate
@@ -30,6 +35,16 @@ from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
 router = APIRouter(prefix="/server-users", tags=["Server Users"])
+
+# Alta/adopción/aprovisionamiento: el destino es el ``server_id`` del payload. Las rutas por
+# ``{user_id}`` resuelven el servidor de la fila del usuario. ``apply-profile/bulk`` NO migra
+# acá: es multi-destino (ítems por BD) y lo cubre la unidad de lotes.
+EngineUsersWriteAtPayloadServer = Annotated[
+    Actor, Depends(require_at(Capability.ENGINE_USERS_WRITE, target=payload_server))
+]
+EngineUsersWriteAtUser = Annotated[
+    Actor, Depends(require_at(Capability.ENGINE_USERS_WRITE, target=server_user))
+]
 
 
 @router.get("", response_model=ApiResponse[list[ServerUserOut]])
@@ -46,7 +61,7 @@ def list_server_users(
 
 @router.post("", response_model=ApiResponse[ServerUserOut], status_code=201)
 def create_server_user(
-    actor: EngineUsersWrite, payload: ServerUserCreate, provision: bool = Query(False)
+    actor: EngineUsersWriteAtPayloadServer, payload: ServerUserCreate, provision: bool = Query(False)
 ):
     created = ServerUserController().create_server_user(
         payload.model_dump(), provision=provision, admin=actor
@@ -58,7 +73,7 @@ def create_server_user(
 
 
 @router.post("/adopt", response_model=ApiResponse[ServerUserOut], status_code=201)
-def adopt_server_user(actor: EngineUsersWrite, payload: AdoptUserIn):
+def adopt_server_user(actor: EngineUsersWriteAtPayloadServer, payload: AdoptUserIn):
     """
     Adopta un usuario/rol que YA existe en el motor (Plan 09): registra metadata sin
     CREATE USER ni password. 404 si no existe en el motor; 409 si ya está adoptado.
@@ -74,7 +89,7 @@ def get_server_user(actor: EngineUsersRead, user_id: int):
 
 @router.patch("/{user_id}", response_model=ApiResponse[ServerUserOut])
 def update_server_user(
-    actor: EngineUsersWrite,
+    actor: EngineUsersWriteAtUser,
     user_id: int,
     payload: ServerUserUpdate,
     provision: bool = Query(False),
@@ -87,7 +102,7 @@ def update_server_user(
 
 @router.delete("/{user_id}", response_model=ApiResponse[None])
 def delete_server_user(
-    actor: EngineUsersWrite,
+    actor: EngineUsersWriteAtUser,
     user_id: int,
     drop_remote: bool = Query(False),
     confirm_username: str | None = Query(
@@ -104,7 +119,9 @@ def delete_server_user(
     su ausencia contradecía lo que ``operator`` declara de sí mismo ("no incluye ``*.drop``").
     """
     if drop_remote:
-        assert_capability(actor, Capability.ENGINE_USERS_DROP)
+        # ``assert_at`` y no ``assert_capability``: esta última mira el rol unión y dejaría
+        # borrar en producción a quien solo es ``owner`` en desarrollo.
+        assert_at(actor, Capability.ENGINE_USERS_DROP, server_user(user_id))
     ServerUserController().delete_server_user(
         user_id, drop_remote=drop_remote, confirm_username=confirm_username, admin=actor
     )
@@ -136,7 +153,7 @@ def list_grants(
 
 
 @router.post("/{user_id}/grants", response_model=ApiResponse[dict])
-def grant_object(actor: EngineUsersWrite, user_id: int, payload: GrantRequest):
+def grant_object(actor: EngineUsersWriteAtUser, user_id: int, payload: GrantRequest):
     result = GrantController().grant_object(user_id, payload, admin=actor)
     priv_summary = ", ".join(payload.privileges)
     return success(
@@ -147,7 +164,7 @@ def grant_object(actor: EngineUsersWrite, user_id: int, payload: GrantRequest):
 
 @router.delete("/{user_id}/grants", response_model=ApiResponse[None])
 def revoke_object(
-    actor: EngineUsersWrite,
+    actor: EngineUsersWriteAtUser,
     user_id: int,
     payload: RevokeRequest,
     confirm_grantee: str | None = Query(
@@ -170,7 +187,7 @@ def revoke_object(
     response_model=ApiResponse[ApplyProfileResult],
 )
 def apply_profile(
-    actor: EngineUsersWrite,
+    actor: EngineUsersWriteAtUser,
     user_id: int,
     profile_id: int,
     payload: ApplyProfileRequest,
@@ -239,7 +256,7 @@ def apply_profile_bulk(
     status_code=201,
     summary="Crear usuario + aprovisionar en motor + aplicar grants iniciales",
 )
-def provision_with_grants(actor: EngineUsersWrite, payload: ServerUserFullCreate):
+def provision_with_grants(actor: EngineUsersWriteAtPayloadServer, payload: ServerUserFullCreate):
     """
     Endpoint unificado: crea el usuario en el inventario, lo aprovisiona en el motor
     destino (CREATE USER) y aplica los ``initial_grants`` indicados. Los grants son

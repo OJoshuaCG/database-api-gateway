@@ -174,19 +174,9 @@ SCOPE_EXEMPT: dict[tuple[str, str], str] = {
 SCOPE_PENDING: frozenset[tuple[str, str]] = frozenset(
     {
         ("DELETE", "/api/v1/database-models/{model_id}/migrations/{version}"),
-        ("DELETE", "/api/v1/managed-databases/{db_id}/migrations/{version}/select-results"),
-        ("DELETE", "/api/v1/server-users/{user_id}"),
-        ("DELETE", "/api/v1/server-users/{user_id}/grants"),
-        ("DELETE", "/api/v1/servers/{server_id}/databases/{database}"),
-        ("DELETE", "/api/v1/servers/{server_id}/users"),
         ("GET", "/api/v1/database-exports/{job_id}/content"),
         ("GET", "/api/v1/database-exports/{job_id}/download"),
         ("GET", "/api/v1/database-models/{model_id}/migrations/{version}/delete-plan"),
-        ("GET", "/api/v1/managed-databases/{db_id}/migrations/{version}/select-results"),
-        ("PATCH", "/api/v1/managed-databases/{db_id}"),
-        ("PATCH", "/api/v1/server-users/{user_id}"),
-        ("PATCH", "/api/v1/servers/{server_id}/users/password"),
-        ("PATCH", "/api/v1/servers/{server_id}/users/password-all-hosts"),
         ("POST", "/api/v1/collation-conversions/{job_id}/cancel"),
         ("POST", "/api/v1/collation-conversions/{job_id}/execute"),
         ("POST", "/api/v1/collation-conversions/{job_id}/preview"),
@@ -202,7 +192,6 @@ SCOPE_PENDING: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/database-exports/{job_id}/download-ticket"),
         ("POST", "/api/v1/database-exports/{job_id}/execute"),
         ("POST", "/api/v1/database-exports/{job_id}/preview"),
-        ("POST", "/api/v1/database-models/from-snapshot"),
         ("POST", "/api/v1/database-models/{model_id}/collation-conversions"),
         ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/blueprint-version"),
         ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/cancel"),
@@ -213,37 +202,18 @@ SCOPE_PENDING: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/database-models/{model_id}/migrations/apply-all"),
         ("POST", "/api/v1/database-models/{model_id}/rename-slug"),
         ("POST", "/api/v1/database-models/{model_id}/rename-slug/plan"),
-        ("POST", "/api/v1/managed-databases"),
-        ("POST", "/api/v1/managed-databases/adopt"),
-        ("POST", "/api/v1/managed-databases/{db_id}/migrations/reconcile-partial"),
-        ("POST", "/api/v1/managed-databases/{db_id}/migrations/stamp"),
-        ("POST", "/api/v1/managed-databases/{db_id}/reassign-owner"),
         ("POST", "/api/v1/schema-comparisons/{comparison_id}/adopt"),
         ("POST", "/api/v1/schema-comparisons/{comparison_id}/execute"),
         ("POST", "/api/v1/schema-comparisons/{comparison_id}/execute-preview"),
-        ("POST", "/api/v1/server-users"),
-        ("POST", "/api/v1/server-users/adopt"),
-        ("POST", "/api/v1/server-users/provision"),
-        ("POST", "/api/v1/server-users/{user_id}/apply-profile/{profile_id}"),
         ("POST", "/api/v1/server-users/{user_id}/apply-profile/{profile_id}/bulk"),
-        ("POST", "/api/v1/server-users/{user_id}/grants"),
-        ("POST", "/api/v1/servers/{server_id}/databases"),
         ("POST", "/api/v1/servers/{server_id}/databases/{database}/collation-conversions"),
         ("POST", "/api/v1/servers/{server_id}/databases/{database}/database-exports"),
-        ("POST", "/api/v1/servers/{server_id}/databases/{database}/drop-preview"),
-        ("POST", "/api/v1/servers/{server_id}/query/execute"),
-        ("POST", "/api/v1/servers/{server_id}/query/preview"),
-        ("POST", "/api/v1/servers/{server_id}/users"),
-        ("POST", "/api/v1/servers/{server_id}/users/add-host"),
-        ("POST", "/api/v1/servers/{server_id}/users/adopt-all-hosts"),
-        ("POST", "/api/v1/servers/{server_id}/users/define-password"),
-        ("POST", "/api/v1/servers/{server_id}/users/reveal-password"),
     }
 )
 
 #: Tope de ``SCOPE_PENDING``. **Solo puede BAJAR.** Mismo trinquete que ``MIN_MIGRATED_ROUTES``,
 #: en la otra dirección: sin él, agregar una ruta a la lista pendiente sería gratis.
-MAX_SCOPE_PENDING = 65
+MAX_SCOPE_PENDING = 35
 
 
 def _iter_routes(app, prefix: str = ""):

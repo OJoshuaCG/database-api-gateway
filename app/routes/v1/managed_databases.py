@@ -17,14 +17,9 @@ from fastapi import APIRouter, Depends, Path as FPath, Query, Request
 from app.controllers.managed_database_controller import ManagedDatabaseController
 from app.controllers.managed_migration_controller import ManagedMigrationController
 from app.core.authz import (
-    BlueprintsApply,
-    BlueprintsCaptures,
     BlueprintsRead,
-    BlueprintsWrite,
     DatabasesRead,
-    DatabasesWrite,
     EnvironmentsWrite,
-    assert_capability,
     require_at,
 )
 from app.core.actor import Actor
@@ -48,7 +43,12 @@ from app.schemas.model_migration import (
     MigrationStatusOut,
 )
 from app.core.scope import assert_at
-from app.core.scope_targets import database
+from app.core.scope_targets import (
+    database,
+    database_update,
+    managed_create,
+    managed_create_for,
+)
 from app.services.capability_catalog import Capability
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
@@ -62,6 +62,21 @@ DatabasesWriteAtDb = Annotated[
 ]
 BlueprintsApplyAtDb = Annotated[
     Actor, Depends(require_at(Capability.BLUEPRINTS_APPLY, target=database))
+]
+BlueprintsWriteAtDb = Annotated[
+    Actor, Depends(require_at(Capability.BLUEPRINTS_WRITE, target=database))
+]
+BlueprintsCapturesAtDb = Annotated[
+    Actor, Depends(require_at(Capability.BLUEPRINTS_CAPTURES, target=database))
+]
+# PATCH de inventario: igual que ``DatabasesWriteAtDb`` salvo que reclasificar se decide por
+# ``environments.write`` (controller) y no por el rol en la BD. Ver ``database_update``.
+DatabasesWriteAtDbUpdate = Annotated[
+    Actor, Depends(require_at(Capability.DATABASES_WRITE, target=database_update))
+]
+# Alta y adopción: el destino sale del PAYLOAD (servidor + entorno declarado u omitido).
+DatabasesWriteAtCreate = Annotated[
+    Actor, Depends(require_at(Capability.DATABASES_WRITE, target=managed_create))
 ]
 
 
@@ -109,7 +124,7 @@ def list_databases(
 @limiter.limit("10/minute")
 def create_database(
     request: Request,
-    actor: DatabasesWrite,
+    actor: DatabasesWriteAtCreate,
     payload: ManagedDatabaseCreate,
     provision: bool = Query(False),
 ):
@@ -124,11 +139,17 @@ def create_database(
     escribe no es quien aplica" del catálogo. Va en la RUTA porque depende del payload y la
     firma declara una sola capacidad (§6.3 punto 1); se evalúa ANTES de tocar nada.
 
-    No hay capa 2 acá: la base todavía no existe y su entorno lo DECLARA el propio payload, así
-    que un ``assert_scope`` sobre él sería tan fuerte como lo que el creador elija poner.
+    Capa 2 sobre el PEOR entre el entorno declarado (u omitido: el activo más protegido) y el
+    derivado del servidor, para que declarar ``development`` no sirva de coartada. El
+    escalamiento va con ``assert_at`` sobre el mismo destino y no con ``assert_capability``:
+    esa mira el rol unión y dejaría pasar a quien solo es ``owner`` en desarrollo.
     """
     if payload.apply_migrations:
-        assert_capability(actor, Capability.BLUEPRINTS_APPLY)
+        assert_at(
+            actor,
+            Capability.BLUEPRINTS_APPLY,
+            managed_create_for(payload.server_id, payload.environment_id),
+        )
     created = ManagedDatabaseController().create_database(
         payload.model_dump(), provision=provision, admin=actor
     )
@@ -139,7 +160,7 @@ def create_database(
 
 
 @router.post("/adopt", response_model=ApiResponse[ManagedDatabaseOut], status_code=201)
-def adopt_database(actor: DatabasesWrite, payload: AdoptDatabaseIn):
+def adopt_database(actor: DatabasesWriteAtCreate, payload: AdoptDatabaseIn):
     """
     Adopta una BD que YA existe en el motor (Plan 09): registra metadata sin ejecutar
     CREATE DATABASE. 404 si la BD no existe; 409 si ya está en el inventario.
@@ -151,7 +172,11 @@ def adopt_database(actor: DatabasesWrite, payload: AdoptDatabaseIn):
     un 403 no deja ninguna versión estampada.
     """
     if payload.model_version is not None:
-        assert_capability(actor, Capability.BLUEPRINTS_APPLY)
+        assert_at(
+            actor,
+            Capability.BLUEPRINTS_APPLY,
+            managed_create_for(payload.server_id, payload.environment_id),
+        )
     created = ManagedDatabaseController().adopt_database(payload.model_dump(), admin=actor)
     return success(data=created, message="Base de datos existente adoptada al inventario.")
 
@@ -162,10 +187,11 @@ def get_database(actor: DatabasesRead, db_id: int):
 
 
 @router.patch("/{db_id}", response_model=ApiResponse[ManagedDatabaseOut])
-def update_database(actor: DatabasesWrite, db_id: int, payload: ManagedDatabaseUpdate):
+def update_database(actor: DatabasesWriteAtDbUpdate, db_id: int, payload: ManagedDatabaseUpdate):
     """
-    Metadatos del inventario. Cambiar ``environment_id`` (reclasificar) exige además
-    ``environments.write``: lo valida el controller contra el valor actual.
+    Metadatos del inventario. Cambiar ``environment_id`` (reclasificar) exige
+    ``environments.write`` —lo valida el controller contra el valor actual— y NO ``databases.write``
+    en la BD: quien reclasifica es el ``security_officer``, aunque sea lector en ese entorno.
     """
     updated = ManagedDatabaseController().update_database(
         db_id, payload.model_dump(exclude_unset=True), admin=actor
@@ -241,7 +267,7 @@ def set_agent_access(actor: EnvironmentsWrite, db_id: int, payload: AgentAccessI
     "/{db_id}/reassign-owner", response_model=ApiResponse[ManagedDatabaseOut]
 )
 def reassign_owner(
-    actor: DatabasesWrite,
+    actor: DatabasesWriteAtDb,
     db_id: int,
     payload: ReassignOwnerIn,
     provision: bool = Query(False),
@@ -471,7 +497,7 @@ def _rollback_message(result: dict) -> str:
 @limiter.limit("10/minute")
 def reconcile_partial_migration(
     request: Request,
-    actor: BlueprintsApply,
+    actor: BlueprintsApplyAtDb,
     db_id: int,
     confirm_version: str = Query(
         ...,
@@ -540,7 +566,7 @@ def reconcile_partial_migration(
 @limiter.limit("10/minute")
 def stamp_migration(
     request: Request,
-    actor: BlueprintsApply,
+    actor: BlueprintsApplyAtDb,
     db_id: int,
     version: str = Query(..., pattern=r"^\d{4,10}$", description="Versión a marcar"),
     force: bool = Query(
@@ -581,7 +607,7 @@ def stamp_migration(
 @limiter.limit("20/minute")
 def migration_select_results(
     request: Request,
-    actor: BlueprintsCaptures,
+    actor: BlueprintsCapturesAtDb,
     db_id: int,
     version: str = FPath(..., pattern=r"^\d{4,10}$", description="Versión de la migración"),
 ):
@@ -608,7 +634,7 @@ def migration_select_results(
     response_model=ApiResponse[None],
 )
 def purge_migration_select_results(
-    actor: BlueprintsWrite,
+    actor: BlueprintsWriteAtDb,
     db_id: int,
     version: str = FPath(..., pattern=r"^\d{4,10}$", description="Versión de la migración"),
 ):
