@@ -20,16 +20,21 @@ Todo detrás de ``collation.read`` / ``collation.execute``. Crear y previsualiza
 de la BD del gateway.
 """
 
-from fastapi import APIRouter, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Request
 
 from app.controllers.collation_conversion_controller import (
     CollationConversionController,
 )
+from app.core.actor import Actor
 from app.core.authz import (
-    CollationExecute,
     CollationRead,
+    require_at,
 )
 from app.core.limiter import limiter
+from app.core.scope_targets import collation_job, server_database
+from app.services.capability_catalog import Capability
 from app.schemas.collation_conversion import (
     CollationConversionCreate,
     CollationConversionExecuteIn,
@@ -44,6 +49,15 @@ from app.utils.response import ApiResponse, paginated, success
 
 router = APIRouter(tags=["Collation Conversions"])
 
+# Capa 2 en la BASE que se convierte: crear resuelve por servidor + nombre de la ruta; el resto
+# relee el job persistido, así que ``execute`` usa el entorno ACTUAL de la base, no el del plan.
+CollationExecuteAtDatabase = Annotated[
+    Actor, Depends(require_at(Capability.COLLATION_EXECUTE, target=server_database))
+]
+CollationExecuteJob = Annotated[
+    Actor, Depends(require_at(Capability.COLLATION_EXECUTE, target=collation_job))
+]
+
 
 @router.post(
     "/servers/{server_id}/databases/{database}/collation-conversions",
@@ -53,7 +67,7 @@ router = APIRouter(tags=["Collation Conversions"])
 @limiter.limit("10/minute")
 def create_collation_conversion(
     request: Request,
-    actor: CollationExecute,
+    actor: CollationExecuteAtDatabase,
     server_id: int,
     database: str,
     payload: CollationConversionCreate,
@@ -91,7 +105,7 @@ def list_collation_conversion_objects(request: Request, actor: CollationRead, jo
 )
 @limiter.limit("10/minute")
 def preview_collation_conversion(
-    request: Request, actor: CollationExecute, job_id: int, payload: CollationConversionPreviewIn
+    request: Request, actor: CollationExecuteJob, job_id: int, payload: CollationConversionPreviewIn
 ):
     data = CollationConversionController().preview(
         job_id,
@@ -109,7 +123,7 @@ def preview_collation_conversion(
 )
 @limiter.limit("3/minute")
 def execute_collation_conversion(
-    request: Request, actor: CollationExecute, job_id: int, payload: CollationConversionExecuteIn
+    request: Request, actor: CollationExecuteJob, job_id: int, payload: CollationConversionExecuteIn
 ):
     result = CollationConversionController().execute(
         job_id,
@@ -138,7 +152,7 @@ def list_collation_conversion_items(
     "/collation-conversions/{job_id}/cancel",
     response_model=ApiResponse[CollationConversionSummaryOut],
 )
-def cancel_collation_conversion(actor: CollationExecute, job_id: int):
+def cancel_collation_conversion(actor: CollationExecuteJob, job_id: int):
     return success(
         data=CollationConversionController().cancel(job_id, admin=actor),
         message="Cancelación solicitada.",

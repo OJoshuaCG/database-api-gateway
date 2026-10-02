@@ -18,14 +18,17 @@ execute es la operación más sensible → 3/min. El resto es solo lectura.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from app.controllers.clone_controller import CloneController
+from app.core.actor import Actor
 from app.core.authz import (
-    ClonesExecute,
     ClonesRead,
+    require_at,
 )
 from app.core.limiter import limiter
+from app.core.scope_targets import clone_create, clone_job, clone_job_target
+from app.services.capability_catalog import Capability
 from app.schemas.clone import (
     CloneClosureOut,
     CloneCreate,
@@ -43,10 +46,23 @@ from app.utils.response import ApiResponse, paginated, success
 
 router = APIRouter(prefix="/database-clones", tags=["Database Clones"])
 
+# Capa 2: un clon copia DATOS de un extremo al otro, así que ``clones.execute`` se exige en AMBOS
+# (clonar prod -> dev es exfiltración). Crear lee el cuerpo; preview/execute releen el job
+# persistido, no el estado de un paso anterior. Cancelar solo mira el destino.
+ClonesExecuteCreate = Annotated[
+    Actor, Depends(require_at(Capability.CLONES_EXECUTE, target=clone_create))
+]
+ClonesExecuteJob = Annotated[
+    Actor, Depends(require_at(Capability.CLONES_EXECUTE, target=clone_job))
+]
+ClonesExecuteJobTarget = Annotated[
+    Actor, Depends(require_at(Capability.CLONES_EXECUTE, target=clone_job_target))
+]
+
 
 @router.post("", response_model=ApiResponse[CloneSummaryOut], status_code=201)
 @limiter.limit("10/minute")
-def create_clone_plan(request: Request, actor: ClonesExecute, payload: CloneCreate):
+def create_clone_plan(request: Request, actor: ClonesExecuteCreate, payload: CloneCreate):
     result = CloneController().create_plan(payload.model_dump(), admin=actor)
     return success(data=result, message="Plan de clonación creado.")
 
@@ -141,7 +157,7 @@ def resolve_clone_selection(request: Request, actor: ClonesRead, job_id: int, pa
     },
 )
 @limiter.limit("10/minute")
-def preview_clone(request: Request, actor: ClonesExecute, job_id: int, payload: ClonePreviewIn):
+def preview_clone(request: Request, actor: ClonesExecuteJob, job_id: int, payload: ClonePreviewIn):
     """
     Manda el SPEC, lo congela y devuelve el plan exacto + el ``confirm_token``.
 
@@ -161,7 +177,7 @@ def preview_clone(request: Request, actor: ClonesExecute, job_id: int, payload: 
 
 @router.post("/{job_id}/execute", response_model=ApiResponse[CloneSummaryOut])
 @limiter.limit("3/minute")
-def execute_clone(request: Request, actor: ClonesExecute, job_id: int, payload: CloneExecuteIn):
+def execute_clone(request: Request, actor: ClonesExecuteJob, job_id: int, payload: CloneExecuteIn):
     result = CloneController().execute_clone(
         job_id,
         confirm_target_name=payload.confirm_target_name,
@@ -181,5 +197,5 @@ def list_clone_items(actor: ClonesRead, job_id: int, pagination: PaginationDep):
 
 
 @router.post("/{job_id}/cancel", response_model=ApiResponse[CloneSummaryOut])
-def cancel_clone(actor: ClonesExecute, job_id: int):
+def cancel_clone(actor: ClonesExecuteJobTarget, job_id: int):
     return success(data=CloneController().cancel(job_id), message="Cancelación solicitada.")

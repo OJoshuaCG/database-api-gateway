@@ -17,16 +17,20 @@ alto → 10/min); adopt/execute son las operaciones más sensibles → 3/min (al
 con apply-all).
 """
 
-from fastapi import APIRouter, Query, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import Response
 
 from app.controllers.schema_comparison_controller import SchemaComparisonController
+from app.core.actor import Actor
 from app.core.authz import (
-    SchemaDiffExecute,
     SchemaDiffRead,
-    assert_capability,
+    require_at,
 )
 from app.core.limiter import limiter
+from app.core.scope import assert_at
+from app.core.scope_targets import comparison
 from app.services.capability_catalog import Capability
 from app.schemas.schema_comparison import (
     AdoptComparisonIn,
@@ -45,6 +49,12 @@ from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, paginated, success
 
 router = APIRouter(prefix="/schema-comparisons", tags=["Schema Comparisons"])
+
+# Capa 2 en el DESTINO persistido de la comparación (donde se aplica el DDL). Crear, listar y
+# exportar quedan en el piso de ``schema_diff.read``: leer el esquema no escribe nada.
+SchemaDiffExecuteAtTarget = Annotated[
+    Actor, Depends(require_at(Capability.SCHEMA_DIFF_EXECUTE, target=comparison))
+]
 
 
 @router.post("", response_model=ApiResponse[SchemaComparisonSummaryOut], status_code=201)
@@ -139,7 +149,7 @@ def export_comparison_sql(
 )
 @limiter.limit("3/minute")
 def adopt_comparison(
-    request: Request, actor: SchemaDiffExecute, comparison_id: int, payload: AdoptComparisonIn
+    request: Request, actor: SchemaDiffExecuteAtTarget, comparison_id: int, payload: AdoptComparisonIn
 ):
     """
     Adopta el diff como una versión NUEVA del blueprint del target.
@@ -149,7 +159,7 @@ def adopt_comparison(
     módulo de diff sería una vía para escribir blueprints sin tener el permiso de escribirlos.
     Y la escritura no es cosmética: la versión creada la aplican después N bases.
     """
-    assert_capability(actor, Capability.BLUEPRINTS_WRITE)
+    assert_at(actor, Capability.BLUEPRINTS_WRITE, comparison(comparison_id))
     result = SchemaComparisonController().adopt_comparison(
         comparison_id,
         selected_item_ids=payload.selected_item_ids,
@@ -200,7 +210,7 @@ def resolve_selection(actor: SchemaDiffRead, comparison_id: int, payload: Resolv
     "/{comparison_id}/execute-preview", response_model=ApiResponse[ExecutePreviewOut]
 )
 def preview_execution(
-    actor: SchemaDiffExecute, comparison_id: int, payload: ExecutePreviewIn
+    actor: SchemaDiffExecuteAtTarget, comparison_id: int, payload: ExecutePreviewIn
 ):
     """
     Resuelve un modo/selección SIN ejecutar nada: devuelve las sentencias exactas y el
@@ -221,7 +231,7 @@ def preview_execution(
 @limiter.limit("3/minute")
 def execute_comparison(
     request: Request,
-    actor: SchemaDiffExecute,
+    actor: SchemaDiffExecuteAtTarget,
     comparison_id: int,
     payload: ExecuteComparisonIn,
     force: bool = Query(

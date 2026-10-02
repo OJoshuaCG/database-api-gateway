@@ -174,24 +174,11 @@ SCOPE_EXEMPT: dict[tuple[str, str], str] = {
 SCOPE_PENDING: frozenset[tuple[str, str]] = frozenset(
     {
         ("DELETE", "/api/v1/database-models/{model_id}/migrations/{version}"),
-        ("GET", "/api/v1/database-exports/{job_id}/content"),
-        ("GET", "/api/v1/database-exports/{job_id}/download"),
         ("GET", "/api/v1/database-models/{model_id}/migrations/{version}/delete-plan"),
-        ("POST", "/api/v1/collation-conversions/{job_id}/cancel"),
-        ("POST", "/api/v1/collation-conversions/{job_id}/execute"),
-        ("POST", "/api/v1/collation-conversions/{job_id}/preview"),
         ("POST", "/api/v1/database-clone-batches"),
         ("POST", "/api/v1/database-clone-batches/{batch_id}/cancel"),
         ("POST", "/api/v1/database-clone-batches/{batch_id}/execute"),
         ("POST", "/api/v1/database-clone-batches/{batch_id}/retry-failed"),
-        ("POST", "/api/v1/database-clones"),
-        ("POST", "/api/v1/database-clones/{job_id}/cancel"),
-        ("POST", "/api/v1/database-clones/{job_id}/execute"),
-        ("POST", "/api/v1/database-clones/{job_id}/preview"),
-        ("POST", "/api/v1/database-exports/{job_id}/cancel"),
-        ("POST", "/api/v1/database-exports/{job_id}/download-ticket"),
-        ("POST", "/api/v1/database-exports/{job_id}/execute"),
-        ("POST", "/api/v1/database-exports/{job_id}/preview"),
         ("POST", "/api/v1/database-models/{model_id}/collation-conversions"),
         ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/blueprint-version"),
         ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/cancel"),
@@ -202,18 +189,13 @@ SCOPE_PENDING: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/v1/database-models/{model_id}/migrations/apply-all"),
         ("POST", "/api/v1/database-models/{model_id}/rename-slug"),
         ("POST", "/api/v1/database-models/{model_id}/rename-slug/plan"),
-        ("POST", "/api/v1/schema-comparisons/{comparison_id}/adopt"),
-        ("POST", "/api/v1/schema-comparisons/{comparison_id}/execute"),
-        ("POST", "/api/v1/schema-comparisons/{comparison_id}/execute-preview"),
         ("POST", "/api/v1/server-users/{user_id}/apply-profile/{profile_id}/bulk"),
-        ("POST", "/api/v1/servers/{server_id}/databases/{database}/collation-conversions"),
-        ("POST", "/api/v1/servers/{server_id}/databases/{database}/database-exports"),
     }
 )
 
 #: Tope de ``SCOPE_PENDING``. **Solo puede BAJAR.** Mismo trinquete que ``MIN_MIGRATED_ROUTES``,
 #: en la otra dirección: sin él, agregar una ruta a la lista pendiente sería gratis.
-MAX_SCOPE_PENDING = 35
+MAX_SCOPE_PENDING = 17
 
 
 def _iter_routes(app, prefix: str = ""):

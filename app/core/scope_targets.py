@@ -159,6 +159,52 @@ async def snapshot_source(request: Request) -> ScopeTarget:
     return snapshot_source_for(_int_or_none(cuerpo.get("server_id")), cuerpo.get("database"))
 
 
+def clone_job(job_id: int) -> ScopeTarget:
+    """Un job de clonación persistido: AMBOS extremos (origen y destino) de su fila."""
+    return ScopeTarget("clone_job", (job_id,))
+
+
+def clone_job_target(job_id: int) -> ScopeTarget:
+    """Un job de clonación persistido, solo su DESTINO (cancelar es una acción sobre el destino)."""
+    return ScopeTarget("clone_job_target", (job_id,))
+
+
+def export_job(job_id: int) -> ScopeTarget:
+    """Un job de exportación persistido: la base de origen de su fila."""
+    return ScopeTarget("export_job", (job_id,))
+
+
+def collation_job(job_id: int) -> ScopeTarget:
+    """Un job de conversión de collation persistido: la base de su fila."""
+    return ScopeTarget("collation_job", (job_id,))
+
+
+def comparison(comparison_id: int) -> ScopeTarget:
+    """Una comparación de esquemas persistida: el DESTINO de su fila (donde se aplica el DDL)."""
+    return ScopeTarget("comparison", (comparison_id,))
+
+
+async def clone_create(request: Request) -> ScopeTarget:
+    """
+    Alta de un plan de clonación: origen Y destino del cuerpo.
+
+    El origen es ``source_database_id`` o ``source_server_id`` + ``source_database_name``. El
+    destino va SIEMPRE por servidor + nombre: ``target_database_id`` es informativo y declarar
+    una BD de desarrollo ahí no puede rebajar el entorno de un destino de producción.
+    """
+    cuerpo = await _body(request)
+    return ScopeTarget(
+        "clone_create",
+        (
+            _int_or_none(cuerpo.get("source_database_id")),
+            _int_or_none(cuerpo.get("source_server_id")),
+            _str_or_none(cuerpo.get("source_database_name")),
+            _int_or_none(cuerpo.get("target_server_id")),
+            _str_or_none(cuerpo.get("target_database_name")),
+        ),
+    )
+
+
 #: resolvedor → tipo. Es lo que ``require_at`` consulta para estampar ``__gw_scope__``.
 TARGET_KINDS: dict[Callable[..., ScopeTarget], str] = {
     database: "database",
@@ -170,6 +216,12 @@ TARGET_KINDS: dict[Callable[..., ScopeTarget], str] = {
     managed_create: "managed_create",
     sql_console: "sql_console",
     snapshot_source: "snapshot_source",
+    clone_create: "clone_create",
+    clone_job: "clone_job",
+    clone_job_target: "clone_job_target",
+    export_job: "export_job",
+    collation_job: "collation_job",
+    comparison: "comparison",
 }
 
 
@@ -332,6 +384,126 @@ def _points_sql_console(params: tuple) -> list[ScopePoint]:
     return _points_server_database((server_id, nombre))
 
 
+def _unresolvable() -> list[ScopePoint]:
+    """Destino irresoluble o inexistente: el entorno más protegido (fail-closed)."""
+    return [ScopePoint(environment_id=most_protected_environment_id(), server_id=None)]
+
+
+def _points_ref(
+    server_id: int | None, database_id: int | None, nombre: str | None
+) -> list[ScopePoint]:
+    """
+    Una base referida por la fila de un job o por el cuerpo: ``database_id`` si apunta a una fila
+    viva, si no servidor + nombre (fila del inventario o regla de servidor). Sin servidor ni
+    nombre es irresoluble.
+    """
+    from app.models.managed_database import ManagedDatabase
+
+    if database_id is not None:
+        session = _session()
+        try:
+            bd = session.get(ManagedDatabase, database_id)
+        finally:
+            session.close()
+        if bd is not None:
+            return _points_database((database_id,))
+    if server_id is None or nombre is None:
+        return _unresolvable()
+    return _points_server_database((server_id, nombre))
+
+
+def _points_clone_create(params: tuple) -> list[ScopePoint]:
+    src_db, src_sid, src_name, tgt_sid, tgt_name = params
+    origen = _points_ref(src_sid, src_db, src_name)
+    destino = _points_ref(tgt_sid, None, tgt_name)
+    return origen + destino
+
+
+def _clone_row(job_id: int):
+    from app.models.clone_job import CloneJob
+
+    session = _session()
+    try:
+        return session.query(
+            CloneJob.source_server_id,
+            CloneJob.source_database_id,
+            CloneJob.source_database_name,
+            CloneJob.target_server_id,
+            CloneJob.target_database_name,
+        ).filter(CloneJob.id == job_id).first()
+    finally:
+        session.close()
+
+
+def _points_clone_job(params: tuple) -> list[ScopePoint]:
+    (job_id,) = params
+    fila = _clone_row(job_id)
+    if fila is None:
+        return _unresolvable()
+    s_sid, s_db, s_name, t_sid, t_name = fila
+    return _points_ref(s_sid, s_db, s_name) + _points_ref(t_sid, None, t_name)
+
+
+def _points_clone_job_target(params: tuple) -> list[ScopePoint]:
+    (job_id,) = params
+    fila = _clone_row(job_id)
+    if fila is None:
+        return _unresolvable()
+    return _points_ref(fila[3], None, fila[4])
+
+
+def _points_export_job(params: tuple) -> list[ScopePoint]:
+    from app.models.export_job import ExportJob
+
+    (job_id,) = params
+    session = _session()
+    try:
+        fila = (
+            session.query(ExportJob.server_id, ExportJob.database_id, ExportJob.database_name)
+            .filter(ExportJob.id == job_id)
+            .first()
+        )
+    finally:
+        session.close()
+    return _unresolvable() if fila is None else _points_ref(fila[0], fila[1], fila[2])
+
+
+def _points_collation_job(params: tuple) -> list[ScopePoint]:
+    from app.models.collation_conversion_job import CollationConversionJob as Job
+
+    (job_id,) = params
+    session = _session()
+    try:
+        fila = (
+            session.query(Job.server_id, Job.database_id, Job.database_name)
+            .filter(Job.id == job_id)
+            .first()
+        )
+    finally:
+        session.close()
+    return _unresolvable() if fila is None else _points_ref(fila[0], fila[1], fila[2])
+
+
+def _points_comparison(params: tuple) -> list[ScopePoint]:
+    from app.models.schema_comparison import SchemaComparison
+
+    (comparison_id,) = params
+    session = _session()
+    try:
+        fila = (
+            session.query(
+                SchemaComparison.target_server_id,
+                SchemaComparison.target_database_id,
+                SchemaComparison.target_database_name,
+            )
+            .filter(SchemaComparison.id == comparison_id)
+            .first()
+        )
+    finally:
+        session.close()
+    return _unresolvable() if fila is None else _points_ref(fila[0], fila[1], fila[2])
+
+
 #: tipo → función de puntos. Sus claves son el vocabulario cerrado de tipos de destino.
 _RESOLVERS: dict[str, Callable[[tuple], list[ScopePoint]]] = {
     "database": _points_database,
@@ -343,6 +515,12 @@ _RESOLVERS: dict[str, Callable[[tuple], list[ScopePoint]]] = {
     "managed_create": _points_managed_create,
     "sql_console": _points_sql_console,
     "snapshot_source": _points_sql_console,
+    "clone_create": _points_clone_create,
+    "clone_job": _points_clone_job,
+    "clone_job_target": _points_clone_job_target,
+    "export_job": _points_export_job,
+    "collation_job": _points_collation_job,
+    "comparison": _points_comparison,
 }
 
 

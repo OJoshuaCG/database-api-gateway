@@ -30,19 +30,23 @@ formulario → 30/min; la planificación toca el motor (catálogo y snapshot en 
 ``export`` de schema-comparisons) y la entrega en línea se copia al portapapeles tal cual.
 """
 
-from fastapi import APIRouter, Query, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 from starlette.background import BackgroundTask
 
 from app.controllers.export_controller import ExportController
 from app.core import csrf
 from app.core.auth import SESSION_SID
+from app.core.actor import Actor
 from app.core.authz import (
-    ExportsDownload,
-    ExportsExecute,
     ExportsRead,
+    require_at,
 )
 from app.core.limiter import limiter
+from app.core.scope_targets import export_job, server_database
+from app.services.capability_catalog import Capability
 from app.schemas.export import (
     DownloadTicketOut,
     ExportCapabilitiesOut,
@@ -61,6 +65,20 @@ from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, paginated, success
 
 router = APIRouter(tags=["Database Exports"])
+
+# Capa 2 sobre la BASE DE ORIGEN: planear/generar exigen ``exports.execute`` y retirar el
+# artefacto ``exports.download`` en el entorno de esa base. Planear resuelve por servidor +
+# nombre de la ruta; el resto relee el job persistido (si la base se reclasificó entre el plan
+# y la ejecución, manda el entorno actual).
+ExportsExecuteAtSource = Annotated[
+    Actor, Depends(require_at(Capability.EXPORTS_EXECUTE, target=server_database))
+]
+ExportsExecuteJob = Annotated[
+    Actor, Depends(require_at(Capability.EXPORTS_EXECUTE, target=export_job))
+]
+ExportsDownloadJob = Annotated[
+    Actor, Depends(require_at(Capability.EXPORTS_DOWNLOAD, target=export_job))
+]
 
 
 @router.get(
@@ -86,7 +104,7 @@ def export_capabilities(request: Request, actor: ExportsRead, server_id: int, da
 @limiter.limit("10/minute")
 def create_export_plan(
     request: Request,
-    actor: ExportsExecute,
+    actor: ExportsExecuteAtSource,
     server_id: int,
     database: str,
     payload: ExportCreate,
@@ -170,7 +188,7 @@ def resolve_export_selection(
 )
 @limiter.limit("10/minute")
 def preview_export(
-    request: Request, actor: ExportsExecute, job_id: int, payload: ExportPreviewIn
+    request: Request, actor: ExportsExecuteJob, job_id: int, payload: ExportPreviewIn
 ):
     """
     Valida el spec entero, CONGELA la selección y emite el ``confirm_token``.
@@ -194,7 +212,7 @@ def preview_export(
 )
 @limiter.limit("3/minute")
 def execute_export(
-    request: Request, actor: ExportsExecute, job_id: int, payload: ExportExecuteIn
+    request: Request, actor: ExportsExecuteJob, job_id: int, payload: ExportExecuteIn
 ):
     """
     Confirma el plan congelado y ENCOLA la generación del artefacto.
@@ -252,7 +270,7 @@ def list_export_items(actor: ExportsRead, job_id: int, pagination: PaginationDep
     "/database-exports/{job_id}/cancel",
     response_model=ApiResponse[ExportSummaryOut],
 )
-def cancel_export(actor: ExportsExecute, job_id: int):
+def cancel_export(actor: ExportsExecuteJob, job_id: int):
     """
     Pide la cancelación COOPERATIVA: el worker corta en el próximo punto seguro, cierra la
     transacción contra el origen y descarta el artefacto parcial.
@@ -330,7 +348,7 @@ def _range_covers_whole_file(
     response_model=ApiResponse[DownloadTicketOut],
 )
 @limiter.limit("10/minute")
-def issue_download_ticket(request: Request, actor: ExportsDownload, job_id: int):
+def issue_download_ticket(request: Request, actor: ExportsDownloadJob, job_id: int):
     """
     Emite el ticket que autoriza UNA descarga. Paso 1 de dos.
 
@@ -354,7 +372,7 @@ def issue_download_ticket(request: Request, actor: ExportsDownload, job_id: int)
 @limiter.limit("3/minute")
 def download_export(
     request: Request,
-    actor: ExportsDownload,
+    actor: ExportsDownloadJob,
     job_id: int,
     ticket: str = Query(
         ...,
@@ -425,7 +443,7 @@ def download_export(
 
 @router.get("/database-exports/{job_id}/content")
 @limiter.limit("3/minute")
-def export_content(request: Request, actor: ExportsDownload, job_id: int):
+def export_content(request: Request, actor: ExportsDownloadJob, job_id: int):
     """
     Entrega EN LÍNEA: el artefacto como ``text/plain`` **sin envolver**, para copiarlo al
     portapapeles tal cual.
