@@ -262,8 +262,10 @@ def _bd_alcanzable(admin_client, *, project_id, opt_in=True, blocked=False, env=
     """
     from app.models.managed_database import ManagedDatabase
 
+    # Puerto por proyecto: `servers` es único por host:puerto, y sembrar dos proyectos en un
+    # mismo test (el ajeno de los tests de alcance) chocaba con un 409.
     srv = admin_client.post("/api/v1/servers", json={
-        "name": f"srv-mcp-{project_id}", "host": "127.0.0.1", "port": 3399,
+        "name": f"srv-mcp-{project_id}", "host": "127.0.0.1", "port": 3399 + project_id,
         "engine": "mysql", "root_username": "root", "root_password": "supersecret",
     })
     assert srv.status_code == 201, srv.text
