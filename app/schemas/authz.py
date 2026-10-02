@@ -113,6 +113,9 @@ class CapabilityRowOut(BaseModel):
     requires_step_up: bool
     agent_allowed: bool
     scope_axis: str
+    # Subconjunto de ``mutates``: destruye o cambia de forma irreversible datos o estructura del
+    # tercero. Declarado acá o el ``response_model`` lo descarta y la SPA no lo ve.
+    destructive: bool
     roles: list[str]
     global_capabilities: list[str]
     # Capacidades puntuales: si se pueden otorgar sueltas, si exigen segundo aprobador y qué

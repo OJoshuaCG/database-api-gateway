@@ -17,6 +17,8 @@ OJO CON EL NOMBRE: esto es el plano de CONTROL (capacidades del gateway). Los pr
 MOTOR viven en ``privilege_catalog`` y sus tests son otros.
 """
 
+from types import MappingProxyType
+
 import pytest
 
 from app.core.actor import admin_actor, token_actor
@@ -125,6 +127,56 @@ def test_disclosing_capabilities_are_never_implied_by_a_mutating_one():
             assert s.id not in operator, f"{s.id.value} divulga y llegó a operator por arrastre"
 
 
+def test_import_invariants_reject_a_disclosing_capability_in_operator(monkeypatch):
+    """
+    El test de arriba solo muerde si alguien corre la suite; el invariante 7b muerde al
+    importar. Esto prueba que el invariante existe y no se relajó en silencio.
+    """
+    roles = dict(ROLE_CAPABILITIES)
+    roles[GatewayRole.OPERATOR] = roles[GatewayRole.OPERATOR] | {Capability.ENGINE_USERS_SECRETS}
+    monkeypatch.setattr(cc, "ROLE_CAPABILITIES", MappingProxyType(roles))
+    with pytest.raises(AssertionError, match="operator"):
+        cc._assert_invariants()
+
+
+# --------------------------------------------------------------------------- #
+# Destructivas: subconjunto de `mutates`, solo owner, con step-up             #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_destructive_capabilities_are_the_expected_ones():
+    """
+    Congelado a propósito, como las que divulgan. ``collation.execute`` NO está pese a
+    reescribir tablas: vive en ``operator`` y moverla es una decisión de producto pendiente.
+    """
+    assert {s.id for s in CAPABILITIES if s.destructive} == {
+        Capability.DATABASES_DROP,
+        Capability.ENGINE_USERS_DROP,
+        Capability.BLUEPRINTS_APPLY,
+        Capability.SCHEMA_DIFF_EXECUTE,
+        Capability.CLONES_EXECUTE,
+        Capability.SQL_CONSOLE_EXECUTE,
+    }
+
+
+def test_destructive_capabilities_are_owner_only_and_require_step_up():
+    for s in CAPABILITIES:
+        if s.destructive:
+            assert s.mutates, s.id.value
+            assert s.requires_step_up, s.id.value
+            assert s.id in ROLE_CAPABILITIES[GatewayRole.OWNER], s.id.value
+            assert s.id not in ROLE_CAPABILITIES[GatewayRole.OPERATOR], s.id.value
+            assert s.id not in ROLE_CAPABILITIES[GatewayRole.VIEWER], s.id.value
+
+
+def test_import_invariants_reject_a_destructive_capability_in_operator(monkeypatch):
+    roles = dict(ROLE_CAPABILITIES)
+    roles[GatewayRole.OPERATOR] = roles[GatewayRole.OPERATOR] | {Capability.DATABASES_DROP}
+    monkeypatch.setattr(cc, "ROLE_CAPABILITIES", MappingProxyType(roles))
+    with pytest.raises(AssertionError, match="destructive"):
+        cc._assert_invariants()
+
+
 # --------------------------------------------------------------------------- #
 # Capacidades globales y ortogonales                                          #
 # --------------------------------------------------------------------------- #
@@ -154,6 +206,28 @@ def test_access_admin_is_not_operational():
         Capability.SQL_CONSOLE_EXECUTE,
     ):
         assert prohibida not in caps
+
+
+def test_an_access_admin_viewer_holds_nothing_beyond_viewer_and_its_globals():
+    """
+    El ACTOR efectivo, no solo ``GLOBAL_CAPABILITIES[ACCESS_ADMIN]``: un actor es rol base ∪
+    grants ∪ globales. Un ``viewer`` con ``access_admin`` no puede terminar con ninguna
+    capacidad operativa por el camino del acuñado (implícitas, unión de roles).
+    """
+    actor = admin_actor(
+        user_id=1,
+        username="ana",
+        role=GatewayRole.VIEWER,
+        globals_=frozenset({GlobalCapability.ACCESS_ADMIN}),
+    )
+    permitido = (
+        ROLE_CAPABILITIES[GatewayRole.VIEWER]
+        | GLOBAL_CAPABILITIES[GlobalCapability.ACCESS_ADMIN]
+    )
+    assert actor.capabilities <= permitido, sorted(c.value for c in actor.capabilities - permitido)
+    for cap in actor.capabilities:
+        s = cc.spec(cap)
+        assert not s.destructive and not s.discloses, cap.value
 
 
 def test_servers_admin_belongs_only_to_security_officer():

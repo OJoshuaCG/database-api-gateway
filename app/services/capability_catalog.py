@@ -197,6 +197,12 @@ class CapabilitySpec:
     ``requires_step_up`` es atributo de la CAPACIDAD y no del endpoint: así la SPA puede pedir
     la contraseña *antes* de mandar la operación en vez de descubrirlo por un error.
     ``agent_allowed`` es el techo de lo que puede vivir en los scopes de un token de API.
+
+    ``destructive`` NO es un tercer eje independiente: es un SUBCONJUNTO de ``mutates``. Marca
+    las que destruyen o cambian de forma irreversible datos o estructura **del tercero** (no la
+    BD de metadatos del gateway). Existe para que "destructivo ⇒ solo ``owner`` y con step-up"
+    sea un invariante de import y no una coincidencia de valores: sin el flag,
+    ``databases.drop`` y ``databases.write`` eran indistinguibles para cualquier regla.
     """
 
     id: Capability
@@ -208,6 +214,7 @@ class CapabilitySpec:
     requires_step_up: bool
     agent_allowed: bool
     scope_axis: ScopeAxis
+    destructive: bool = False
 
 
 def _spec(
@@ -219,6 +226,7 @@ def _spec(
     step_up: bool = False,
     agent: bool = False,
     axis: ScopeAxis = "environment",
+    destructive: bool = False,
 ) -> CapabilitySpec:
     module, level = cap.value.split(".", 1)
     return CapabilitySpec(
@@ -231,6 +239,7 @@ def _spec(
         requires_step_up=step_up,
         agent_allowed=agent,
         scope_axis=axis,
+        destructive=destructive,
     )
 
 
@@ -266,6 +275,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         "Borrar usuarios del motor",
         mutates=True,
         step_up=True,
+        destructive=True,
         axis="server",
     ),
     _spec(
@@ -282,6 +292,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         "Borrar bases de datos",
         mutates=True,
         step_up=True,
+        destructive=True,
     ),
     _spec(Capability.BLUEPRINTS_READ, "Ver blueprints y sus versiones", agent=True),
     _spec(Capability.BLUEPRINTS_WRITE, "Crear y editar versiones de blueprint", mutates=True),
@@ -292,6 +303,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         "Aplicar y revertir versiones sobre bases reales",
         mutates=True,
         step_up=True,
+        destructive=True,
     ),
     # Las capturas son DATOS DE NEGOCIO de la base del tercero: divulgación, no lectura.
     _spec(
@@ -306,6 +318,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         "Adoptar o ejecutar el DDL de una comparación",
         mutates=True,
         step_up=True,
+        destructive=True,
     ),
     _spec(Capability.CLONES_READ, "Ver planes de clonado"),
     _spec(
@@ -314,8 +327,13 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         mutates=True,
         discloses=True,
         step_up=True,
+        destructive=True,
     ),
     _spec(Capability.COLLATION_READ, "Ver planes de conversión de collation"),
+    # NO marcada ``destructive`` aunque ``ALTER TABLE ... CONVERT`` reescriba la tabla y el
+    # propio controller la llame "operación irreversible": está en ``operator``, y marcarla
+    # haría fallar el invariante de destructivas al importar. Moverla a ``owner`` es una
+    # decisión de producto pendiente, no un ajuste de flags.
     _spec(
         Capability.COLLATION_EXECUTE,
         "Ejecutar una conversión de collation",
@@ -339,6 +357,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         mutates=True,
         discloses=True,
         step_up=True,
+        destructive=True,
     ),
     _spec(Capability.CATALOGS_READ, "Ver los catálogos de privilegios y charsets", axis="global"),
     # Dato de política: `privileges.is_active` decide qué se puede otorgar y
@@ -628,6 +647,7 @@ def capability_matrix() -> list[dict]:
             "requires_step_up": s.requires_step_up,
             "agent_allowed": s.agent_allowed,
             "scope_axis": s.scope_axis,
+            "destructive": s.destructive,
             "grantable": is_grantable(s.id),
             "sensitive": is_sensitive(s.id),
             "implies": sorted(c.value for c in IMPLIED_READ.get(s.id, ())),
@@ -713,6 +733,26 @@ def _assert_invariants() -> None:
                 raise AssertionError(
                     f"{cap.value} es global y además está en el rol '{role.value}'."
                 )
+
+    # 7b. `operator` no divulga. Las que divulgan no participan del orden acumulativo: si
+    #     `engine_users.secrets` llegara a `operator` por arrastre desde `write`, el rol de
+    #     trabajo diario leería las credenciales del motor del cliente.
+    for cap in ROLE_CAPABILITIES[GatewayRole.OPERATOR]:
+        if _BY_ID[cap].discloses:
+            raise AssertionError(f"'operator' tiene una capacidad que divulga: {cap.value}")
+
+    # 7c. Destructivas: subconjunto de `mutates`, solo en `owner` dentro de la cadena, y con
+    #     step-up. Sin esto, "destructivo ⇒ owner ∧ step-up" valía por coincidencia de valores.
+    for s in CAPABILITIES:
+        if not s.destructive:
+            continue
+        if not s.mutates:
+            raise AssertionError(f"{s.id.value} es destructive y no mutates.")
+        if not s.requires_step_up:
+            raise AssertionError(f"{s.id.value} es destructive y no exige step-up.")
+        for role in (GatewayRole.VIEWER, GatewayRole.OPERATOR):
+            if s.id in ROLE_CAPABILITIES[role]:
+                raise AssertionError(f"{s.id.value} es destructive y está en '{role.value}'.")
 
     # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 7: si el
     #    catálogo crece y una nueva divulga o es `drop`, esto obliga a decidirlo a propósito.

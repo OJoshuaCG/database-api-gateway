@@ -58,6 +58,7 @@ que la UI necesita para una pantalla de administración de accesos:
 | `label` | etiqueta en español, lista para mostrar |
 | `mutates` | si cambia estado |
 | `discloses` | **si expone datos o credenciales** — es un eje INDEPENDIENTE de `mutates` |
+| `destructive` | **subconjunto de `mutates`**: destruye o cambia de forma irreversible datos o estructura del tercero (`databases.drop`, `engine_users.drop`, `blueprints.apply`, `schema_diff.execute`, `clones.execute`, `sql_console.execute`). Siempre `owner` y con step-up. Campo aditivo |
 | `requires_step_up` | si va a pedir reautenticación (ver la advertencia de arriba) |
 | `agent_allowed` | techo de lo que puede vivir en un token del servidor MCP |
 | `scope_axis` | `global` \| `environment` \| `server` |

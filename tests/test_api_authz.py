@@ -143,6 +143,19 @@ def test_catalog_publishes_the_capability_grant_columns_over_http(admin_client):
     assert any(r["implies"] for r in rows)
 
 
+def test_catalog_publishes_the_destructive_column_over_http(admin_client):
+    """
+    Misma trampa que las columnas de grants: si ``CapabilityRowOut`` no declara
+    ``destructive``, el ``response_model`` lo descarta y la SPA trata un DROP como un edit.
+    """
+    rows = admin_client.get("/api/v1/authz/catalog").json()["data"]
+    esperado = {r["id"]: r["destructive"] for r in capability_matrix()}
+    assert {r["id"]: r["destructive"] for r in rows} == esperado
+    por_id = {r["id"]: r for r in rows}
+    assert por_id[Capability.DATABASES_DROP.value]["destructive"] is True
+    assert por_id[Capability.DATABASES_WRITE.value]["destructive"] is False
+
+
 # --------------------------------------------------------------------------- #
 # El marcador que hace enumerable la cobertura                                #
 # --------------------------------------------------------------------------- #
