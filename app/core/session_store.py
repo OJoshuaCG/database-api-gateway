@@ -42,6 +42,7 @@ hay 1020, y el request que llega segundo espera el lock, reevalúa la condición
 Ver ``_write`` para lo que queda de red de seguridad.
 """
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from secrets import token_urlsafe
@@ -78,6 +79,25 @@ REASON_ROLE_CHANGE = "role_change"
 REASON_ABSOLUTE = "absolute"
 REASON_IDLE = "idle"
 REASON_ADMIN_REVOKED = "admin_revoked"
+#: La sesión acumuló ``STEP_UP_MAX_FAILURES`` confirmaciones de contraseña fallidas seguidas: una
+#: cookie robada sin la contraseña tiene que terminar, no seguir probando.
+REASON_STEP_UP_FAILED = "step_up_failed"
+
+#: Fallos CONSECUTIVOS de step-up que revocan la sesión. Ver ``record_step_up_failure``.
+STEP_UP_MAX_FAILURES = 5
+
+
+@dataclass(frozen=True, slots=True)
+class SessionInfo:
+    """
+    Lo que la autenticación necesita de la fila de sesión, leído en la MISMA consulta que la
+    valida. ``step_up_at`` viaja acá para que la ventana de step-up no cueste un SELECT extra
+    por request (ver ``app/core/step_up.py``).
+    """
+
+    sid: str
+    user_id: int
+    step_up_at: datetime | None
 
 
 def _utcnow() -> datetime:
@@ -176,6 +196,11 @@ def create(user_id: int, *, ip: str | None, user_agent: str | None) -> str:
                 user_id=user_id,
                 created_at=ahora,
                 last_seen_at=ahora,
+                # El login ES una confirmación de contraseña: abre la ventana de step-up. Sin
+                # esto, la primera operación sensible tras entrar volvería a pedir la contraseña
+                # que se acaba de tipear.
+                step_up_at=ahora,
+                step_up_failures=0,
                 ip=(ip or None),
                 user_agent_hash=ua_hash(user_agent),
             )
@@ -187,8 +212,14 @@ def create(user_id: int, *, ip: str | None, user_agent: str | None) -> str:
 
 
 def resolve(sid: str) -> tuple[int | None, str | None]:
+    """``(user_id, motivo_de_rechazo)``: ``resolve_session`` reducida al id."""
+    info, motivo = resolve_session(sid)
+    return (info.user_id if info else None), motivo
+
+
+def resolve_session(sid: str) -> tuple[SessionInfo | None, str | None]:
     """
-    ``(user_id, motivo_de_rechazo)``. Exactamente uno de los dos es ``None``.
+    ``(sesión, motivo_de_rechazo)``. Exactamente uno de los dos es ``None``.
 
     Devuelve el motivo en vez de solo ``None`` porque quien llama tiene que poder distinguir
     "sesión desconocida" de "vencida por absoluto" — el primero no merece rastro (es ruido de
@@ -210,6 +241,7 @@ def resolve(sid: str) -> tuple[int | None, str | None]:
             return None, "unknown"
         user_id, created_at, last_seen_at = fila.user_id, fila.created_at, fila.last_seen_at
         revoked_at, revoked_reason = fila.revoked_at, fila.revoked_reason
+        step_up_at = fila.step_up_at
     finally:
         session.close()
 
@@ -237,7 +269,53 @@ def resolve(sid: str) -> tuple[int | None, str | None]:
             .values(last_seen_at=ahora),
             best_effort=True,
         )
-    return user_id, None
+    return SessionInfo(sid=sid, user_id=user_id, step_up_at=step_up_at), None
+
+
+def mark_step_up(sid: str) -> datetime | None:
+    """
+    Abre (o renueva) la ventana de step-up de una sesión VIVA y pone en cero sus fallos.
+    Devuelve el instante registrado, o ``None`` si la sesión ya no estaba viva.
+
+    ``best_effort=False``: una confirmación que se pierde en silencio deja a la persona
+    reintentando una operación que vuelve a pedirle la contraseña, sin saber por qué. El ``sid``
+    NO rota acá (a diferencia del login): rotarlo cambiaría el token CSRF de los requests que la
+    SPA ya tiene en vuelo y los haría fallar con 403.
+    """
+    ahora = _utcnow()
+    filas = _write(
+        update(GatewaySession)
+        .where(GatewaySession.sid == sid, GatewaySession.revoked_at.is_(None))
+        .values(step_up_at=ahora, step_up_failures=0),
+        best_effort=False,
+    )
+    return ahora if filas else None
+
+
+def record_step_up_failure(sid: str) -> int:
+    """
+    Suma un fallo de step-up y devuelve el total de fallos CONSECUTIVOS de la sesión. Al llegar
+    a ``STEP_UP_MAX_FAILURES`` la revoca con ``REASON_STEP_UP_FAILED``.
+
+    El incremento es ``step_up_failures + 1`` dentro del ``UPDATE`` y no leer-sumar-escribir: dos
+    intentos concurrentes no pueden pisarse el contador (ver el docstring del módulo sobre el
+    1020). La lectura posterior va en su propia sesión, DESPUÉS del commit.
+    """
+    _write(
+        update(GatewaySession)
+        .where(GatewaySession.sid == sid, GatewaySession.revoked_at.is_(None))
+        .values(step_up_failures=GatewaySession.step_up_failures + 1),
+        best_effort=False,
+    )
+    session = _session()
+    try:
+        fila = session.get(GatewaySession, sid)
+        fallos = int(fila.step_up_failures or 0) if fila is not None else STEP_UP_MAX_FAILURES
+    finally:
+        session.close()
+    if fallos >= STEP_UP_MAX_FAILURES:
+        _revoke_live(sid, REASON_STEP_UP_FAILED, _utcnow())
+    return fallos
 
 
 def revoke(sid: str, reason: str) -> None:

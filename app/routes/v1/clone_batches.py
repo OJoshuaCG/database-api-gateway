@@ -58,6 +58,12 @@ ClonesExecuteBatchAny = Annotated[
 ClonesExecuteBatchTarget = Annotated[
     Actor, Depends(require_at(Capability.CLONES_EXECUTE, target=clone_batch))
 ]
+# Cancelar NO pide step-up (``step_up=False``): frenar una operación destructiva nunca puede
+# costar más que lanzarla. Las capas 1 y 2 siguen valiendo. Ver ``STEP_UP_EXEMPT`` en
+# ``scripts/check_route_capabilities.py``.
+ClonesCancelBatch = Annotated[
+    Actor, Depends(require_at(Capability.CLONES_EXECUTE, target=clone_batch, step_up=False))
+]
 
 
 @router.post(
@@ -136,7 +142,7 @@ def execute_clone_batch(
 
 
 @router.post("/{batch_id}/cancel", response_model=ApiResponse[CloneBatchOut])
-def cancel_clone_batch(actor: ClonesExecuteBatchTarget, batch_id: int):
+def cancel_clone_batch(actor: ClonesCancelBatch, batch_id: int):
     """
     Cancela el lote y **también** el job de la fila en curso. Sin esa propagación, cancelar
     solo evitaba que arrancaran las siguientes y la base que se estaba copiando seguía hasta

@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 
+from app.core import step_up
 from app.core.actor import Actor
 from app.models.user_model import UserModel
 from app.services.capability_catalog import Capability, capability_matrix, spec
@@ -93,6 +94,10 @@ class AuthzController:
             "previous_login_at": fila.get("previous_login_at"),
             "last_failed_at": fila.get("last_failed_at"),
             "catalog_version": _catalog_version(),
+            # Step-up: si está apagado la SPA no pide nada; si no, ``step_up_expires_at`` le dice
+            # cuándo vence la ventana para pedir la contraseña ANTES de abrir una confirmación.
+            "step_up_enforced": step_up.enforced(),
+            "step_up_expires_at": actor.step_up_until if actor.kind == "admin" else None,
         }
 
     @staticmethod

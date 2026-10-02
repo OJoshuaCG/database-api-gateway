@@ -57,6 +57,13 @@ CollationExecuteAtDatabase = Annotated[
 CollationExecuteJob = Annotated[
     Actor, Depends(require_at(Capability.COLLATION_EXECUTE, target=collation_job))
 ]
+# Cancelar NO pide step-up (``step_up=False``): frenar una operación destructiva nunca puede
+# costar más que lanzarla. Las capas 1 y 2 siguen valiendo. Ver ``STEP_UP_EXEMPT`` en
+# ``scripts/check_route_capabilities.py``.
+CollationCancelJob = Annotated[
+    Actor,
+    Depends(require_at(Capability.COLLATION_EXECUTE, target=collation_job, step_up=False)),
+]
 
 
 @router.post(
@@ -152,7 +159,7 @@ def list_collation_conversion_items(
     "/collation-conversions/{job_id}/cancel",
     response_model=ApiResponse[CollationConversionSummaryOut],
 )
-def cancel_collation_conversion(actor: CollationExecuteJob, job_id: int):
+def cancel_collation_conversion(actor: CollationCancelJob, job_id: int):
     return success(
         data=CollationConversionController().cancel(job_id, admin=actor),
         message="Cancelación solicitada.",

@@ -33,7 +33,7 @@ cambio de password" es exactamente la pregunta que se hace después de un incide
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String
+from sqlalchemy import DateTime, ForeignKey, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -99,6 +99,22 @@ class GatewaySession(Base):
         String(32),
         nullable=True,
         comment="logout | password_change | role_change | absolute | idle | admin_revoked",
+    )
+
+    # STEP-UP: la ventana de "sudo mode" vive en la SESIÓN y no en el usuario, porque es una
+    # prueba de presencia de quien tiene ESTA cookie. Ver `app/core/step_up.py`.
+    step_up_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+        comment="Última confirmación de contraseña (UTC): login o POST /auth/step-up. NULL = ninguna",
+    )
+
+    step_up_failures: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        comment="Fallos CONSECUTIVOS de step-up. Al llegar al tope la sesión se revoca",
     )
 
     def __repr__(self) -> str:

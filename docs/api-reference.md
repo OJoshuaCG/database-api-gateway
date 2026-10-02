@@ -365,7 +365,14 @@ curl -X POST https://<host>/api/v1/auth/logout -b cookies.txt
 
 Devuelve el administrador autenticado. Útil para validar la sesión. **Requiere sesión.**
 
-**Respuesta** `200` — `ApiResponse[AdminOut]`.
+**Respuesta** `200` — `ApiResponse[MeOut]` (identidad, capacidades efectivas y estado del
+step-up). Campos del step-up:
+
+| Campo | Tipo | Significado |
+|---|---|---|
+| `step_up_capabilities` | string[] | Capacidades del actor que exigen step-up. |
+| `step_up_enforced` | bool | `false` si el servidor tiene `STEP_UP_ENFORCED=False`: la SPA no debe pedir contraseña. |
+| `step_up_expires_at` | datetime \| null | Fin (UTC) de la ventana de step-up de **esta** sesión. Puede estar en el pasado; `null` = sin ventana. |
 
 ```bash
 curl https://<host>/api/v1/auth/me -b cookies.txt
@@ -431,6 +438,46 @@ nueva (el `sid` rota, como en el login). Consecuencias para el cliente:
 
 Se audita como `auth.password_changed` (y los fallos de contraseña actual como
 `auth.password_change_failed`). Ninguna fila lleva la contraseña, ni la vieja ni la nueva.
+
+### `POST /api/v1/auth/step-up`
+
+Confirma la contraseña **del propio usuario** y abre la ventana de step-up ("sudo mode") de la
+sesión actual por `STEP_UP_TTL_SECONDS` (300 s). El login ya abre una. **Requiere sesión por
+cookie** (`self.read`) + `X-CSRF-Token`. **Rate limit: 5/min por usuario + IP.** El `sid` **no**
+rota: el token CSRF sigue siendo el mismo.
+
+Las operaciones cuya capacidad exige step-up (`/auth/me` → `step_up_capabilities`) responden,
+con la ventana cerrada y si el método no es seguro o la capacidad divulga:
+
+```json
+{ "detail": { "public_context": { "code": "access.step_up_required", "step_up_ttl_seconds": 300 } } }
+```
+
+con status `403`. El cliente llama a este endpoint y **reintenta una vez** el request original:
+el 403 sale antes de cualquier efecto. A quien le falta la capacidad le llega `403
+access.forbidden`, nunca este código. Las cuatro cancelaciones (`POST .../cancel` de clonados, lotes de clonado,
+conversiones de collation y sus lotes) **no** piden step-up.
+
+**Body** (`StepUpIn`): `{ "password": "<contraseña>" }` (1–200 caracteres).
+
+**Respuesta** `200` — `ApiResponse[StepUpOut]`:
+
+```json
+{ "data": { "step_up_expires_at": "2026-10-02T12:05:00", "step_up_ttl_seconds": 300 }, "message": "Contraseña confirmada." }
+```
+
+**Errores** (código en `detail.public_context.code`):
+
+| Status | Código | Cuándo |
+|---|---|---|
+| `400` | `auth.step_up_failed` | Contraseña incorrecta. Trae `attempts_remaining`. **No** es `401`: la sesión sigue viva. Auditado como `auth.step_up_failed`. |
+| `401` | `auth.session_step_up_failed` | Quinto fallo seguido: la sesión se revocó. Cualquier request posterior con esa cookie recibe el mismo código. |
+| `401` | `auth.session_*` | Sin sesión, o sesión vencida/revocada. |
+| `403` | `auth.csrf_missing` · `auth.csrf_invalid` · `auth.origin_rejected` | CSRF u `Origin`. |
+| `429` | — | Más de 5 intentos por minuto para el mismo usuario e IP. |
+
+Se audita como `auth.step_up`. `STEP_UP_ENFORCED=False` apaga la exigencia (ver
+[authentication](features/authentication.md#step-up-sudo-mode)).
 
 ---
 
@@ -2342,6 +2389,7 @@ de sesión en cada llamada (paso A).
 POST /api/v1/auth/login        → guarda la cookie (Set-Cookie)
 GET  /api/v1/auth/me           → (opcional) valida la sesión
 …                              → usa la cookie en todas las llamadas
+POST /api/v1/auth/step-up      → ante un 403 access.step_up_required; reintentar una vez
 POST /api/v1/auth/logout       → al terminar
 ```
 

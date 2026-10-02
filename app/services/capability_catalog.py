@@ -772,5 +772,12 @@ def _assert_invariants() -> None:
             if r not in _VIEWER or _BY_ID[r].mutates or _BY_ID[r].discloses:
                 raise AssertionError(f"{cap.value} implica {r.value}, que no es lectura viewer.")
 
+    # 11. Step-up ⇒ NO agente. Un token no tiene contraseña que reconfirmar: una capacidad con
+    #     step-up en el techo de agente sería una operación que el agente nunca puede completar
+    #     o, peor, un incentivo a eximir a los tokens del step-up. Ver `app/core/step_up.py`.
+    for s in CAPABILITIES:
+        if s.requires_step_up and s.agent_allowed:
+            raise AssertionError(f"{s.id.value} exige step-up y es agent_allowed.")
+
 
 _assert_invariants()

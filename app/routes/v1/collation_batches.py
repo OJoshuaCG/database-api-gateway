@@ -86,6 +86,13 @@ CollationExecuteBatchAny = Annotated[
 CollationExecuteBatch = Annotated[
     Actor, Depends(require_at(Capability.COLLATION_EXECUTE, target=collation_batch))
 ]
+# Cancelar NO pide step-up (``step_up=False``): frenar una operación destructiva nunca puede
+# costar más que lanzarla. Las capas 1 y 2 siguen valiendo. Ver ``STEP_UP_EXEMPT`` en
+# ``scripts/check_route_capabilities.py``.
+CollationCancelBatch = Annotated[
+    Actor,
+    Depends(require_at(Capability.COLLATION_EXECUTE, target=collation_batch, step_up=False)),
+]
 
 
 @router.post(
@@ -184,7 +191,7 @@ def get_collation_batch(request: Request, actor: CollationRead, model_id: int, b
 )
 @limiter.limit("10/minute")
 def cancel_collation_batch(
-    request: Request, actor: CollationExecuteBatch, model_id: int, batch_id: int
+    request: Request, actor: CollationCancelBatch, model_id: int, batch_id: int
 ):
     """
     Cancelación COOPERATIVA del lote.

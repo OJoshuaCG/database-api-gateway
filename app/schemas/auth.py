@@ -55,3 +55,16 @@ class PasswordChangeOut(BaseModel):
     revoked_sessions: int = Field(
         ..., description="Cuántas sesiones OTRAS que la actual se cerraron"
     )
+
+
+class StepUpIn(BaseModel):
+    """Confirmación de la contraseña del PROPIO usuario para abrir la ventana de step-up."""
+
+    password: str = Field(..., min_length=1, max_length=PASSWORD_MAX_LENGTH)
+
+
+class StepUpOut(BaseModel):
+    step_up_expires_at: datetime = Field(
+        ..., description="Fin de la ventana de step-up (UTC). No se estira con el uso"
+    )
+    step_up_ttl_seconds: int = Field(..., description="Duración de la ventana, en segundos")

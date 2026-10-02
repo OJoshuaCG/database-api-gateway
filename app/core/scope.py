@@ -323,10 +323,16 @@ def assert_at(actor: Actor, capability: Capability, target: ScopeTarget) -> None
     con forma de chequeo — el check 6b del script lo prohíbe.
 
     Sin grants por alcance, o con un actor de token, la capa 2 es un no-op y NO toca la BD.
+
+    Después de las dos capas exige el step-up si la capacidad lo pide (``app.core.step_up``):
+    por eso los escalamientos por payload quedan cubiertos sin código propio.
     """
+    from app.core.step_up import assert_step_up
+
     if not actor.has(capability):
         raise _forbidden(actor, capability)
     assert_layer2(actor, capability, target)
+    assert_step_up(actor, capability)
 
 
 def assert_at_point(actor: Actor, capability: Capability, point: ScopePoint) -> None:
@@ -335,13 +341,17 @@ def assert_at_point(actor: Actor, capability: Capability, point: ScopePoint) -> 
     recién después de resolverlo (alta o adopción sin ``environment_id`` explícito).
 
     Sin grants por alcance, o con un actor de token, no toca la BD. Mismo 403 en ambas capas.
+    El step-up va al final, igual que en ``assert_at``.
     """
+    from app.core.step_up import assert_step_up
+
     if not actor.has(capability):
         raise _forbidden(actor, capability)
-    if not needs_target_resolution(actor, capability):
-        return
-    if not _permits(actor, role_at_point(actor, point), capability, point):
+    if needs_target_resolution(actor, capability) and not _permits(
+        actor, role_at_point(actor, point), capability, point
+    ):
         raise _forbidden(actor, capability)
+    assert_step_up(actor, capability)
 
 
 def can_at(actor: Actor, capability: Capability, target: ScopeTarget) -> bool:

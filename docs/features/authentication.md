@@ -93,6 +93,8 @@ ADMIN_PASSWORD=              # OBLIGATORIO en producción (sin él, no se siembr
 SESSION_SECRET=             # firma de la cookie; si vacío, se deriva de SECRET_KEY
 SESSION_MAX_AGE=28800       # duración de la sesión en segundos (8h)
 SESSION_COOKIE_SECURE=      # vacío = sigue a APP_ENV=="production"; True/False la desacopla
+STEP_UP_ENFORCED=True       # exige contraseña fresca para las capacidades con step-up
+STEP_UP_TTL_SECONDS=300     # duración de la ventana de step-up (login o POST /auth/step-up)
 ```
 
 La cookie es `httpOnly`, `same_site=lax` y `https_only` según `SESSION_COOKIE_SECURE`
@@ -124,6 +126,45 @@ mientras se termina de configurar HTTPS, nunca como configuración final.
   (ver [logging](logging.md)).
 - `same_site=lax` mitiga CSRF en peticiones cross-site; para un frontend en navegador,
   recuerda fijar `CORS_ORIGINS` a orígenes específicos (no `*`).
+
+## Step-up ("sudo mode")
+
+Las capacidades marcadas `requires_step_up` en el catálogo (`/authz/catalog`; las del actor en
+`/auth/me` → `step_up_capabilities`) exigen haber **confirmado la contraseña hace menos de
+`STEP_UP_TTL_SECONDS`** (300 s). Sin eso responden `403` con
+`public_context = {"code": "access.step_up_required", "step_up_ttl_seconds": 300}`.
+
+- **La ventana es de la SESIÓN, por tiempo y no deslizante.** La abre el login (una contraseña
+  recién tipeada cuenta) y la renueva `POST /api/v1/auth/step-up {password}`. Usarla no la
+  estira. No es de un solo uso: cubre los flujos preview → execute sin pedir dos veces.
+- **Cuándo se pide:** método no seguro, **o** capacidad que divulga (`exports/{id}/content`,
+  `download`, capturas de SELECT), **o** método desconocido (fail-closed). Un `GET` que no
+  divulga —listar usuarios del gateway, el `delete-plan` de una versión— no lo pide.
+- **Excepción: cancelar no pide step-up.** Frenar una operación destructiva nunca puede costar
+  más que lanzarla. Son exactamente cuatro rutas, todas `POST .../cancel`: clonado
+  (`/database-clones/{job_id}/cancel`), lote de clonado
+  (`/database-clone-batches/{batch_id}/cancel`), conversión de collation
+  (`/collation-conversions/{job_id}/cancel`) y lote de conversión
+  (`/database-models/{model_id}/collation-conversions/{batch_id}/cancel`). La cancelación de una
+  exportación usa `exports.execute`, que no exige step-up. **Las capas 1 y 2 siguen valiendo**:
+  sin la capacidad en ese destino, `403 access.forbidden`. La exención se declara con
+  `step_up=False` en `require`/`require_at` y tiene que figurar, con su motivo, en
+  `STEP_UP_EXEMPT` de `scripts/check_route_capabilities.py`; el chequeo 7 rechaza una exención
+  sin entrada o que no sea un `POST .../cancel`.
+- **Orden:** capa 1 (`access.forbidden`) → capa 2 → step-up. A quien le falta la capacidad le
+  llega el `403 access.forbidden`, nunca un pedido de contraseña.
+- **Reintento seguro:** el `403` sale de la dependencia o del guard al tope del handler, antes
+  de cualquier efecto. `GET .../content` no consume el artefacto con este 403.
+- **Fallos:** contraseña incorrecta → `400 auth.step_up_failed` (no `401`: no debe disparar el
+  logout de la SPA), con `attempts_remaining`. Al **quinto fallo seguido** la sesión se revoca
+  (`step_up_failed`) y la respuesta es `401 auth.session_step_up_failed`. Límite: 5/min por
+  usuario + IP.
+- **El `sid` no rota** en el step-up: el token CSRF de los requests en vuelo sigue valiendo.
+- **Agentes:** un token nunca tiene una capacidad con step-up (invariante 11 del catálogo).
+- `STEP_UP_ENFORCED=False` lo apaga (el arranque avisa) y `/auth/me` publica
+  `step_up_enforced: false` para que la SPA no pida nada.
+
+El diseño completo está en el docstring de `app/core/step_up.py`.
 
 ## Migración a SSO (futuro)
 

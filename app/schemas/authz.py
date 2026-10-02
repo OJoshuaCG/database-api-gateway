@@ -74,7 +74,22 @@ class MeOut(BaseModel):
         description=(
             "Subconjunto de 'capabilities' que va a exigir reautenticación. Se publica para "
             "que la UI pida la contraseña ANTES de mandar la operación, en vez de descubrirlo "
-            "por un error. El mecanismo todavía no está implementado."
+            "por un error. Ver 'step_up_expires_at' y POST /auth/step-up."
+        ),
+    )
+    step_up_enforced: bool = Field(
+        True,
+        description=(
+            "Si el servidor exige step-up. En false (STEP_UP_ENFORCED=False) la SPA no debe "
+            "pedir la contraseña: ninguna operación va a responder access.step_up_required"
+        ),
+    )
+    step_up_expires_at: datetime | None = Field(
+        None,
+        description=(
+            "Fin de la ventana de step-up de ESTA sesión (UTC), abierta por el login o por POST "
+            "/auth/step-up. null = sin ventana. Puede estar en el pasado: la ventana no se "
+            "estira con el uso"
         ),
     )
     capability_grants: list[MyCapabilityGrantOut] = Field(

@@ -58,6 +58,13 @@ ClonesExecuteJob = Annotated[
 ClonesExecuteJobTarget = Annotated[
     Actor, Depends(require_at(Capability.CLONES_EXECUTE, target=clone_job_target))
 ]
+# Cancelar NO pide step-up (``step_up=False``): frenar una operación destructiva nunca puede
+# costar más que lanzarla. Las capas 1 y 2 siguen valiendo. Ver ``STEP_UP_EXEMPT`` en
+# ``scripts/check_route_capabilities.py``.
+ClonesCancelJob = Annotated[
+    Actor,
+    Depends(require_at(Capability.CLONES_EXECUTE, target=clone_job_target, step_up=False)),
+]
 
 
 @router.post("", response_model=ApiResponse[CloneSummaryOut], status_code=201)
@@ -197,5 +204,5 @@ def list_clone_items(actor: ClonesRead, job_id: int, pagination: PaginationDep):
 
 
 @router.post("/{job_id}/cancel", response_model=ApiResponse[CloneSummaryOut])
-def cancel_clone(actor: ClonesExecuteJobTarget, job_id: int):
+def cancel_clone(actor: ClonesCancelJob, job_id: int):
     return success(data=CloneController().cancel(job_id), message="Cancelación solicitada.")

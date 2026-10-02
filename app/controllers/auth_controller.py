@@ -53,6 +53,9 @@ _DUMMY_HASH = hash_password(token_urlsafe(32))
 CODE_INVALID_CURRENT_PASSWORD = "auth.invalid_current_password"
 CODE_PASSWORD_UNCHANGED = "auth.password_unchanged"
 CODE_SESSION_REQUIRED = "auth.session_required"
+#: Step-up con contraseña incorrecta. 400 y NO 401: la sesión sigue siendo válida, y un 401
+#: dispara el logout global de la SPA por un error de tipeo.
+CODE_STEP_UP_FAILED = "auth.step_up_failed"
 
 
 class AuthController:
@@ -195,3 +198,85 @@ class AuthController:
             detail=f"contraseña cambiada por el propio usuario; {otras} sesión(es) más cerrada(s)",
         )
         return otras
+
+    def step_up(self, actor: Actor, *, password: str, sid: str) -> dict:
+        """
+        Confirma la contraseña del PROPIO actor y abre la ventana de step-up de ESTA sesión.
+
+        - Éxito: ``step_up_at = ahora`` y fallos en cero (``session_store.mark_step_up``). El
+          ``sid`` NO rota, así que el token CSRF de los requests en vuelo sigue valiendo.
+        - Contraseña incorrecta: 400 ``auth.step_up_failed`` con ``attempts_remaining``, y un
+          fallo más en la sesión. Al llegar a ``STEP_UP_MAX_FAILURES`` la sesión se revoca
+          (``step_up_failed``) y la respuesta es el 401 de sesión cerrada: una cookie robada sin
+          la contraseña no puede seguir probando.
+
+        Verifica con el MISMO ``verify_password`` que el login. **Nunca se audita la contraseña**,
+        ni su largo.
+        """
+        if actor.is_agent or not sid:
+            raise AppHttpException(
+                message="Solo una sesión de usuario puede confirmar su contraseña.",
+                status_code=403,
+                public_context={"code": CODE_SESSION_REQUIRED},
+            )
+
+        user = self.user_model.find_by_id(actor.id)
+        hash_actual = (user or {}).get("hashed_password") or _DUMMY_HASH
+        if user and verify_password(password, hash_actual):
+            cuando = session_store.mark_step_up(sid)
+            if cuando is None:
+                # La sesión murió entre la autenticación y acá (logout en otra pestaña, revocación
+                # administrativa): no hay ventana que abrir.
+                raise AppHttpException(
+                    message="La sesión se cerró. Volvé a iniciar sesión.",
+                    status_code=401,
+                    public_context={"code": f"auth.session_{session_store.REASON_LOGOUT}"},
+                )
+            audit.record(
+                "auth.step_up",
+                admin=actor,
+                target_type="user",
+                target_id=actor.id,
+                touched_engine=False,
+            )
+            from app.core.step_up import STEP_UP_TTL_SECONDS, window_until
+
+            return {
+                "step_up_expires_at": window_until(cuando),
+                "step_up_ttl_seconds": STEP_UP_TTL_SECONDS,
+            }
+
+        fallos = session_store.record_step_up_failure(sid)
+        revocada = fallos >= session_store.STEP_UP_MAX_FAILURES
+        audit.record(
+            "auth.step_up_failed",
+            status="failure",
+            admin=actor,
+            target_type="user",
+            target_id=actor.id,
+            touched_engine=False,
+            detail=(
+                f"contraseña incorrecta ({fallos}/{session_store.STEP_UP_MAX_FAILURES})"
+                + ("; sesión revocada" if revocada else "")
+            ),
+        )
+        if revocada:
+            raise AppHttpException(
+                message=_mensaje_step_up_revocada(),
+                status_code=401,
+                public_context={"code": f"auth.session_{session_store.REASON_STEP_UP_FAILED}"},
+            )
+        raise AppHttpException(
+            message="La contraseña no es correcta.",
+            status_code=400,
+            public_context={
+                "code": CODE_STEP_UP_FAILED,
+                "attempts_remaining": session_store.STEP_UP_MAX_FAILURES - fallos,
+            },
+        )
+
+
+def _mensaje_step_up_revocada() -> str:
+    from app.core.auth import _MENSAJE_401
+
+    return _MENSAJE_401[session_store.REASON_STEP_UP_FAILED]

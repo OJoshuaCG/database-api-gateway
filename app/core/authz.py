@@ -34,13 +34,12 @@ eso es lo que hace ENUMERABLE la cobertura: un script puede recorrer ``route.dep
 exigir que toda ruta declare una capacidad del catálogo. Sin el marcador, "ningún endpoint
 quedó sin proteger" no sería una propiedad verificable.
 
-LO QUE ESTA CAPA **NO** HACE TODAVÍA
-------------------------------------
-No exige el step-up de las capacidades que lo piden (``CapabilitySpec.requires_step_up``). El
-mecanismo es la fase 5 y no existe: enforzar la presencia de un token que nadie emite sería un
-guard inerte, que es justo lo que este repo prohíbe. Cuando exista, se enchufa acá —``require``
-ya tiene el spec a mano— y el binding al actor va en el ``verify`` del controller, con el
-destino en la mano. Las dos mitades, ninguna opcional.
+EL STEP-UP ES EL ÚLTIMO ESLABÓN
+-------------------------------
+Las capacidades con ``CapabilitySpec.requires_step_up`` exigen además una contraseña fresca
+(``app/core/step_up.py``). Va DESPUÉS de las capas 1 y 2 en ``require``/``require_at``, en
+``assert_capability`` (por default) y en ``assert_at``/``assert_at_point``: nadie tipea su
+contraseña para enterarse después de que igual no podía.
 
 Ver ``docs/plans/13-usuarios-y-autorizacion-del-gateway.md`` §6.
 """
@@ -56,6 +55,7 @@ from app.core.actor import Actor, admin_actor
 from app.core.capability_resolution import parse_access_context
 from app.core.denial_audit import record_denial
 from app.core.scope import ScopeTarget, assert_layer2
+from app.core.step_up import assert_step_up, window_until
 from app.exceptions import AppHttpException
 from app.models.user_model import UserModel
 from app.services.capability_catalog import CODE_FORBIDDEN, Capability
@@ -75,14 +75,18 @@ def get_current_actor(request: Request) -> Actor:
     descarta. Fail-closed en el lector — el camino de autenticación no puede caerse por una
     fila legada, y tampoco puede resolver a un default permisivo.
     """
-    from app.core.auth import authenticated_user
+    from app.core.auth import authenticated_session
 
-    user = authenticated_user(request)
+    user, sesion = authenticated_session(request)
     ctx = UserModel().find_access_context(user["id"])
-    return actor_from_access_context(user["id"], user["username"], ctx)
+    return actor_from_access_context(
+        user["id"], user["username"], ctx, step_up_until=window_until(sesion.step_up_at)
+    )
 
 
-def actor_from_access_context(user_id: int, username: str, ctx: dict) -> Actor:
+def actor_from_access_context(
+    user_id: int, username: str, ctx: dict, *, step_up_until=None
+) -> Actor:
     """
     ``find_access_context`` → ``Actor``. Extraída de ``get_current_actor`` para que la vista de
     acceso efectivo acuñe el actor con EXACTAMENTE el mismo código que la autorización real.
@@ -100,10 +104,11 @@ def actor_from_access_context(user_id: int, username: str, ctx: dict) -> Actor:
         grants=list(parsed.scope_roles),
         globals_=parsed.globals_,
         capability_grants=[(c, st, sid) for c, st, sid, _ in parsed.capability_grants],
+        step_up_until=step_up_until,
     )
 
 
-def assert_capability(actor: Actor, capability: Capability) -> None:
+def assert_capability(actor: Actor, capability: Capability, *, step_up: bool = True) -> None:
     """
     Exige una capacidad sobre un ``Actor`` ya resuelto. Levanta 403 si no la tiene.
 
@@ -117,6 +122,10 @@ def assert_capability(actor: Actor, capability: Capability) -> None:
     un mensaje como "falta servers.admin" le da a un atacante un mapa de la superficie por
     fuerza bruta de 403. El criterio es el mismo que el de nunca volcar ``str(exc)`` del motor,
     aplicado a nombres de capacidad.
+
+    ``step_up=True`` (default) exige además la ventana de step-up si la capacidad la pide: es lo
+    que cubre sin tocarlas las exigencias por payload de los handlers. Solo ``_authenticate`` lo
+    apaga, porque en las dependencias el step-up va DESPUÉS de la capa 2.
     """
     if not actor.has(capability):
         # El rastro (agregado, best-effort) lleva la capacidad; la respuesta no. Ver
@@ -127,6 +136,8 @@ def assert_capability(actor: Actor, capability: Capability) -> None:
             status_code=403,
             public_context={"code": CODE_FORBIDDEN},
         )
+    if step_up:
+        assert_step_up(actor, capability)
 
 
 CODE_LAST_ADMIN = "access.last_admin_protected"
@@ -199,26 +210,48 @@ def _authenticate(request: Request, capability: Capability) -> Actor:
     """
     Autenticación + CSRF + capa 1. Es el tramo común de ``require`` y ``require_at``: vive en un
     solo lugar para que las dos fábricas no puedan divergir en el orden ni en la forma del 403.
+    Sin step-up: cada fábrica lo exige al final, después de su capa 2.
     """
     actor = _identify(request)
-    assert_capability(actor, capability)
+    assert_capability(actor, capability, step_up=False)
     return actor
 
 
-def require(capability: Capability) -> Callable[[Request], Actor]:
+def _mark_step_up_exempt(dependency: Callable) -> None:
+    """
+    Estampa ``__gw_step_up_exempt__``: la ruta que usa esta dependencia NO pide step-up.
+
+    Es un marcador y no un silencio para que la excepción sea ENUMERABLE: el chequeo 7 de
+    ``scripts/check_route_capabilities.py`` exige que toda ruta marcada esté en
+    ``STEP_UP_EXEMPT`` (con su motivo) y que sea una cancelación. Un ``step_up=False`` nuevo
+    sin entrada en esa lista rompe CI en vez de abrir un hueco callado.
+    """
+    dependency.__gw_step_up_exempt__ = True  # type: ignore[attr-defined]
+
+
+def require(capability: Capability, *, step_up: bool = True) -> Callable[[Request], Actor]:
     """
     Fábrica de la dependencia que exige una capacidad. Devuelve el ``Actor`` resuelto.
 
     Delega el veredicto en ``assert_capability`` para que la forma del 403 —y sobre todo la
     decisión de no nombrar la capacidad faltante— viva en UN solo lugar.
+
+    ``step_up=False`` exime a la ruta del step-up (las capas de capacidad siguen valiendo).
+    Existe SOLO para las cancelaciones: frenar una operación destructiva nunca puede costar más
+    que lanzarla. Ver ``_mark_step_up_exempt``.
     """
 
     def _dependency(request: Request) -> Actor:
-        return _authenticate(request, capability)
+        actor = _authenticate(request, capability)
+        if step_up:
+            assert_step_up(actor, capability, method=request.method)
+        return actor
 
     # El marcador que hace enumerable la cobertura. Ver el docstring del módulo.
     _dependency.__gw_capability__ = capability.value  # type: ignore[attr-defined]
     _dependency.__name__ = f"require_{capability.value.replace('.', '_')}"
+    if not step_up:
+        _mark_step_up_exempt(_dependency)
     return _dependency
 
 
@@ -227,6 +260,7 @@ def require_at(
     *,
     target: Callable[..., ScopeTarget],
     capability_for: Callable[[ScopeTarget], Capability] | None = None,
+    step_up: bool = True,
 ) -> Callable[..., Actor]:
     """
     Como ``require`` pero con capa 2: exige la capacidad EN el destino que declara ``target``.
@@ -247,6 +281,8 @@ def require_at(
     ``__gw_capability__`` —el piso que ven los chequeos 1-4 y 6—, y ``capability_for`` solo puede
     devolver otra capacidad del catálogo. Lo usa el PATCH de inventario, donde reclasificar es
     ``environments.write`` y cualquier otro campo es ``databases.write``.
+
+    ``step_up=False``: igual que en ``require``, solo para cancelaciones (capas 1 y 2 intactas).
     """
     from app.core.scope_targets import TARGET_KINDS
 
@@ -259,19 +295,28 @@ def require_at(
         else:
             actor = _identify(request)
             exigida = capability_for(t)
-            assert_capability(actor, exigida)
+            assert_capability(actor, exigida, step_up=False)
         assert_layer2(actor, exigida, t)
+        if step_up:
+            assert_step_up(actor, exigida, method=request.method)
         return actor
 
     _dependency.__gw_capability__ = capability.value  # type: ignore[attr-defined]
     _dependency.__gw_scope__ = kind  # type: ignore[attr-defined]
     _dependency.__name__ = f"require_at_{capability.value.replace('.', '_')}_{kind}"
+    if not step_up:
+        _mark_step_up_exempt(_dependency)
     return _dependency
 
 
 def declared_scope(dependency: Callable) -> str | None:
     """El tipo de destino que declara una dependencia (``require_at``), o ``None``."""
     return getattr(dependency, "__gw_scope__", None)
+
+
+def declared_step_up_exempt(dependency: Callable) -> bool:
+    """¿La dependencia exime del step-up (``step_up=False``)? Ver ``_mark_step_up_exempt``."""
+    return bool(getattr(dependency, "__gw_step_up_exempt__", False))
 
 
 def declared_capability(dependency: Callable) -> str | None:

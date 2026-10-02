@@ -422,6 +422,12 @@ SESSION_COOKIE_SECURE = (
     if _session_cookie_secure_raw is None
     else _session_cookie_secure_raw.lower() == "true"
 )
+# STEP-UP ("sudo mode"): las capacidades con `requires_step_up` exigen haber confirmado la
+# contraseña en los últimos STEP_UP_TTL_SECONDS, contados desde el login o desde el último
+# `POST /auth/step-up`. La ventana NO se desliza con el uso. Nace PRENDIDO: apagarlo deja una
+# cookie robada a un click del DROP DATABASE de producción ajena. Ver `app/core/step_up.py`.
+STEP_UP_ENFORCED = os.getenv("STEP_UP_ENFORCED", "true").lower() == "true"
+STEP_UP_TTL_SECONDS = int(os.getenv("STEP_UP_TTL_SECONDS", "300"))
 
 # ======= Servidor MCP (agentes) ======= #
 # KILL SWITCH del MCP. Nace APAGADO: un endpoint que sirve estructura de bases de terceros a un
@@ -516,4 +522,11 @@ if APP_ENV == "production" and not SESSION_COOKIE_SECURE:
         "SESSION_COOKIE_SECURE=False en producción: la cookie de sesión viaja SIN el "
         "flag Secure y el navegador la acepta por HTTP sin cifrar. Usar solo mientras "
         "se termina de configurar TLS delante del gateway (ver docs/dokploy-deployment.md)."
+    )
+
+if not STEP_UP_ENFORCED:
+    import logging as _logging
+    _logging.warning(
+        "STEP_UP_ENFORCED=False: las operaciones destructivas y las que divulgan datos NO piden "
+        "confirmar la contraseña. Una cookie de sesión robada alcanza para ejecutarlas."
     )

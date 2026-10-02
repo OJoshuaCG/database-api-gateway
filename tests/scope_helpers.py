@@ -55,4 +55,9 @@ def otorgar(scope_type: str, scope_id: int, role: str) -> None:
 
 
 def actor_con(base: GatewayRole, grants=()):
-    return admin_actor(user_id=1, username="admin", role=base, grants=list(grants))
+    """Actor armado a mano, con la ventana de step-up abierta (ver ``step_up_helpers``)."""
+    from tests.step_up_helpers import OPEN_WINDOW
+
+    return admin_actor(
+        user_id=1, username="admin", role=base, grants=list(grants), step_up_until=OPEN_WINDOW
+    )

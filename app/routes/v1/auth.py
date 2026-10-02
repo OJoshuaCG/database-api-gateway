@@ -11,6 +11,7 @@ from app.core.limiter import (
     client_address,
     enforce_login_limits,
     enforce_password_change_limits,
+    enforce_step_up_limits,
     limiter,
 )
 from app.controllers.authz_controller import AuthzController
@@ -21,7 +22,10 @@ from app.schemas.auth import (
     PasswordChangeOut,
     RevokeOthersOut,
     SessionOut,
+    StepUpIn,
+    StepUpOut,
 )
+from app.exceptions import AppHttpException
 from app.schemas.authz import MeOut
 from app.services import audit
 from app.utils.response import ApiResponse, empty, success
@@ -163,3 +167,35 @@ def change_own_password(request: Request, actor: SelfRead, payload: PasswordChan
         data={"revoked_sessions": otras},
         message="Contraseña cambiada. Se cerraron las demás sesiones.",
     )
+
+
+@router.post("/step-up", response_model=ApiResponse[StepUpOut])
+def step_up(request: Request, actor: SelfRead, payload: StepUpIn):
+    """
+    Confirma la contraseña y abre la ventana de step-up ("sudo mode") de ESTA sesión.
+
+    Las capacidades con ``requires_step_up`` (``/auth/me`` → ``step_up_capabilities``) responden
+    403 ``access.step_up_required`` cuando la ventana está cerrada; la SPA llama a esto y
+    reintenta. El login ya abre la ventana. Ver ``app/core/step_up.py``.
+
+    Detrás de ``self.read``: sesión por cookie + CSRF; un token de agente no llega acá. Límite
+    propio (``enforce_step_up_limits``, 5/min por usuario + IP) antes de pagar Argon2.
+
+    - 200: ``step_up_expires_at``. El ``sid`` NO rota.
+    - 400 ``auth.step_up_failed`` (con ``attempts_remaining``): contraseña incorrecta. 400 y no
+      401 para no disparar el logout de la SPA por un error de tipeo.
+    - 401 ``auth.session_step_up_failed``: era el quinto fallo seguido y la sesión se cerró.
+    """
+    enforce_step_up_limits(request, actor.id)
+    try:
+        data = AuthController().step_up(
+            actor,
+            password=payload.password,
+            sid=request.session.get(SESSION_SID) or "",
+        )
+    except AppHttpException as exc:
+        if exc.status_code == 401:
+            # Sesión tachada: la cookie se limpia igual que en `authenticated_user`.
+            request.session.clear()
+        raise
+    return success(data=data, message="Contraseña confirmada.")

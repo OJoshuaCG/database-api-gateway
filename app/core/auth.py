@@ -38,6 +38,10 @@ _MENSAJE_401 = {
     session_store.REASON_PASSWORD_CHANGE: "La contraseña cambió: las sesiones se cerraron.",
     session_store.REASON_ROLE_CHANGE: "Tus permisos cambiaron: volvé a iniciar sesión.",
     session_store.REASON_ADMIN_REVOKED: "La sesión fue revocada.",
+    session_store.REASON_STEP_UP_FAILED: (
+        "La sesión se cerró tras varios intentos fallidos de confirmar la contraseña. "
+        "Volvé a iniciar sesión."
+    ),
 }
 
 #: La ÚNICA clave que viaja en la cookie. El resto —id, username, rol, capacidades— se resuelve
@@ -85,8 +89,17 @@ def logout_session(request: Request) -> None:
 
 
 def authenticated_user(request: Request) -> dict:
+    """La fila COMPLETA del usuario de la sesión, o 401: ``authenticated_session`` sin la sesión."""
+    return authenticated_session(request)[0]
+
+
+def authenticated_session(request: Request) -> tuple[dict, session_store.SessionInfo]:
     """
-    La fila COMPLETA del usuario de la sesión, o 401. Es la única resolución de sesión.
+    ``(fila COMPLETA del usuario, sesión)``, o 401. Es la única resolución de sesión.
+
+    La sesión viaja junto al usuario porque de ella sale la ventana de step-up
+    (``SessionInfo.step_up_at``), leída en la MISMA consulta que valida la sesión: ningún SELECT
+    extra por request.
 
     Existe extraída y no duplicada porque de acá cuelga ``get_current_actor`` de
     ``app/core/authz.py`` y de acá va a colgar la autenticación por token del servidor MCP. Dos
@@ -101,8 +114,8 @@ def authenticated_user(request: Request) -> dict:
     hash.
     """
     sid = request.session.get(SESSION_SID)
-    user_id, motivo = session_store.resolve(sid or "")
-    if user_id is None:
+    info, motivo = session_store.resolve_session(sid or "")
+    if info is None:
         # La cookie se limpia SIEMPRE, incluso cuando la sesión ya estaba tachada: dejarla
         # puesta hace que el navegador reintente con un `sid` muerto en cada request y que el
         # usuario vea 401 sin entender por qué.
@@ -113,7 +126,7 @@ def authenticated_user(request: Request) -> dict:
             public_context={"code": f"auth.session_{motivo}"} if motivo else None,
         )
 
-    user = UserModel().find_by_id(user_id)
+    user = UserModel().find_by_id(info.user_id)
     if not user or not user.get("is_active"):
         # `is_active` se relee por request y ese es el kill switch que ya funcionaba. Ahora
         # además se tacha la sesión, para que el corte quede con motivo en vez de repetirse.
@@ -122,7 +135,7 @@ def authenticated_user(request: Request) -> dict:
         raise AppHttpException(
             message="Sesión inválida o usuario inactivo.", status_code=401
         )
-    return user
+    return user, info
 
 
 def bootstrap_admin() -> None:

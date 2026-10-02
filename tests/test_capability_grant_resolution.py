@@ -33,6 +33,7 @@ from app.services.capability_catalog import (
     is_grantable,
 )
 from tests.scope_helpers import env_id, sembrar_bd
+from tests.step_up_helpers import OPEN_WINDOW
 
 APPLY = Capability.BLUEPRINTS_APPLY
 EXEC_SQL = Capability.SQL_CONSOLE_EXECUTE
@@ -68,6 +69,8 @@ def _actor(base=GatewayRole.VIEWER, grants=(), cgs=()):
         role=base,
         grants=list(grants),
         capability_grants=list(cgs),
+        # Prueba las capas 1 y 2: la ventana de step-up abierta (ver `step_up_helpers`).
+        step_up_until=OPEN_WINDOW,
     )
 
 

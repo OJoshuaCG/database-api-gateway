@@ -85,6 +85,13 @@ def client():
 # importaban ``tests.conftest`` y eso creaba una segunda instancia de este archivo, con su
 # propio tmpdir y otro DB_NAME (ver test_hay_una_sola_instancia_de_conftest).
 from tests.csrf_helpers import attach_csrf  # noqa: E402
+from tests.step_up_helpers import expire_step_up as _expire_step_up  # noqa: E402
+
+
+@pytest.fixture()
+def expire_step_up():
+    """``expire_step_up(client)``: cierra la ventana de step-up de esa sesión (ver el helper)."""
+    return _expire_step_up
 
 
 @pytest.fixture()

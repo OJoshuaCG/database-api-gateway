@@ -83,7 +83,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi.routing import APIRoute  # noqa: E402
 
-from app.core.authz import declared_capability, declared_scope  # noqa: E402
+from app.core.authz import (  # noqa: E402
+    declared_capability,
+    declared_scope,
+    declared_step_up_exempt,
+)
 from app.core.scope_targets import _RESOLVERS  # noqa: E402
 from app.services.capability_catalog import (  # noqa: E402
     Capability,
@@ -133,6 +137,76 @@ MIN_MIGRATED_ROUTES = 168
 #: de blueprints y los proyectos (escribir una versión no la ejecuta en ninguna BD), más el borrado
 #: de un blueprint que ninguna BD referencia. Una entrada
 #: sin motivo no tiene sentido, por eso es un dict y no un conjunto.
+#: Rutas cuya capacidad exige step-up y que se EXIMEN de él (``step_up=False`` en
+#: ``require``/``require_at``), con el motivo. Chequeo 7: toda ruta marcada tiene que estar acá y
+#: toda entrada tiene que ser una ruta marcada, cuya capacidad pida step-up y que sea un
+#: ``POST .../cancel``. Solo cancelaciones: frenar una operación destructiva nunca puede costar
+#: más que lanzarla. Agregar algo que no sea cancelar es reabrir el step-up.
+STEP_UP_EXEMPT: dict[tuple[str, str], str] = {
+    ("POST", "/api/v1/database-clones/{job_id}/cancel"): (
+        "cancelar un clonado: frenarlo no puede costar más que lanzarlo"
+    ),
+    ("POST", "/api/v1/database-clone-batches/{batch_id}/cancel"): (
+        "cancelar un lote de clonado: frenarlo no puede costar más que lanzarlo"
+    ),
+    ("POST", "/api/v1/collation-conversions/{job_id}/cancel"): (
+        "cancelar una conversión de collation: frenarla no puede costar más que lanzarla"
+    ),
+    ("POST", "/api/v1/database-models/{model_id}/collation-conversions/{batch_id}/cancel"): (
+        "cancelar un lote de conversión de collation: frenarlo no puede costar más que lanzarlo"
+    ),
+}
+
+
+def _is_step_up_exempt(route: APIRoute) -> bool:
+    """¿Alguna dependencia del árbol resuelto exime del step-up?"""
+
+    def walk(dependant) -> bool:
+        if declared_step_up_exempt(getattr(dependant, "call", None)):
+            return True
+        return any(walk(sub) for sub in getattr(dependant, "dependencies", []) or [])
+
+    return walk(route.dependant)
+
+
+def step_up_errors(app, *, exempt: dict[tuple[str, str], str]) -> list[str]:
+    """
+    Chequeo 7: las exenciones de step-up son EXACTAMENTE ``exempt`` y todas son cancelaciones.
+
+    Función aparte (como ``scope_errors``) para que el test la ejerza con apps sintéticas.
+    """
+    errores: list[str] = []
+    marcadas: set[tuple[str, str]] = set()
+    for path, route in _iter_routes(app):
+        if not _is_step_up_exempt(route):
+            continue
+        cap = _capability_of(route)
+        for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
+            clave = (method, path)
+            marcadas.add(clave)
+            if clave not in exempt:
+                errores.append(
+                    f"{method} {path} se exime del step-up (step_up=False) y no está en "
+                    "STEP_UP_EXEMPT."
+                )
+            if method != "POST" or not path.endswith("/cancel"):
+                errores.append(
+                    f"{method} {path} se exime del step-up y no es un POST .../cancel."
+                )
+            if cap is None or not spec(Capability(cap)).requires_step_up:
+                errores.append(
+                    f"{method} {path} se exime del step-up pero su capacidad no lo exige: "
+                    "la entrada sobra."
+                )
+    fantasmas = set(exempt) - marcadas
+    if fantasmas:
+        errores.append(
+            "Entradas de STEP_UP_EXEMPT que no corresponden a ninguna ruta eximida: "
+            + ", ".join(f"{m} {p}" for m, p in sorted(fantasmas))
+        )
+    return errores
+
+
 SCOPE_EXEMPT: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/database-models"): (
         "autoría de blueprint: crear un modelo no apunta a ninguna BD"
@@ -429,6 +503,8 @@ def main() -> int:
             max_pending=MAX_SCOPE_PENDING,
         )
     )
+
+    errores.extend(step_up_errors(app, exempt=STEP_UP_EXEMPT))
 
     if "--list" in sys.argv:
         print(f"SCOPE_PENDING ({len(SCOPE_PENDING)}), SCOPE_EXEMPT ({len(SCOPE_EXEMPT)})")

@@ -46,6 +46,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal
 
 from app.core.capability_resolution import CapabilityGrantKey, layer1_capabilities
@@ -93,6 +94,11 @@ class Actor:
     #: restan); ``capabilities`` ya incluye su ``expand`` para la capa 1 y la capa 2 las empareja
     #: con el destino (``capability_resolution``). Siempre vacío en tokens.
     capability_grants: frozenset[CapabilityGrantKey] = field(default_factory=frozenset)
+    #: Fin de la ventana de step-up de la SESIÓN (UTC naive, como ``gateway_sessions``), o
+    #: ``None`` si no hay ninguna abierta. Solo actores ``admin`` resueltos desde una sesión; un
+    #: actor armado fuera de una sesión no tiene ventana y el step-up le falla cerrado. Ver
+    #: ``app/core/step_up.py``.
+    step_up_until: datetime | None = None
 
     def has(self, capability: Capability) -> bool:
         """La única pregunta que hace el gate de capacidad."""
@@ -111,6 +117,7 @@ def admin_actor(
     grants: "list[tuple[str, int, GatewayRole]] | None" = None,
     globals_: frozenset[GlobalCapability] = frozenset(),
     capability_grants: "Iterable[CapabilityGrantKey] | None" = None,
+    step_up_until: datetime | None = None,
 ) -> Actor:
     """
     Actor de un administrador humano.
@@ -150,6 +157,7 @@ def admin_actor(
         global_capabilities=frozenset(globals_),
         scope_roles=frozenset(gr),
         capability_grants=puntuales,
+        step_up_until=step_up_until,
     )
 
 

@@ -198,6 +198,24 @@ def enforce_password_change_limits(request: Request, user_id: int) -> None:
     )
 
 
+#: Cupo de ``POST /auth/step-up`` por (usuario, IP). Mismo criterio que el del cambio de
+#: password: acota adivinar la contraseña con una cookie robada, y además del tope de fallos
+#: consecutivos que revoca la sesión (``session_store.STEP_UP_MAX_FAILURES``).
+STEP_UP_RATE_LIMIT = "5/minute"
+
+
+def enforce_step_up_limits(request: Request, user_id: int) -> None:
+    """
+    El límite de ``POST /auth/step-up``. DESPUÉS de autenticar y ANTES de pagar Argon2.
+
+    Copia de ``enforce_password_change_limits`` y por los mismos motivos: la clave es el
+    ``user_id`` VERIFICADO más la IP, nunca el ``sid`` (cada login estrenaría cupo). Cuenta todos
+    los intentos, no solo los fallidos (ver ``hit_or_429``).
+    """
+    ip = get_remote_address(request)
+    hit_or_429(limiter, STEP_UP_RATE_LIMIT, "step_up", "user_ip", str(user_id), ip)
+
+
 def agent_token_key(request) -> str:
     """
     Clave del límite de tasa del endpoint MCP: el ``token_id``, y la IP como último recurso.
