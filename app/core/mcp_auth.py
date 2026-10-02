@@ -218,6 +218,10 @@ def _audit_rejection(ip: str, motivo: str, token_id: str | None = None) -> None:
         "mcp.auth",
         status="failure",
         admin=None,
+        # Quien falla la autenticación NO es el token que dice ser: sin esto la fila caía en el
+        # default ``"admin"`` de ``actor_type_of(None)`` y un rechazo leía como una acción de un
+        # administrador anónimo. El ``token_id`` reclamado va en el detalle, no como autor.
+        actor_type="anonymous",
         target_type="api_token",
         touched_engine=False,
         # `token_id` es la parte PÚBLICA del bearer. El secreto no aparece, ni entero ni
@@ -322,20 +326,24 @@ def authenticate_agent(request: Request) -> Actor:
         # El USO también se audita, no solo el fallo. Sin esto, un token robado podía enumerar
         # toda la superficie de tools (`initialize`, `tools/list`, `ping`) sin aparecer nunca en
         # el registro: el `_audit` del dispatch solo cubre `tools/call`.
-        audit.record(
-            "mcp.auth",
-            admin=None,
-            target_type="api_token",
-            target_id=fila.id,
-            touched_engine=False,
-            detail=f"token={fila.token_id} proyecto={fila.project_id}",
-        )
-        return token_actor(
+        actor = token_actor(
             token_pk=fila.id,
             token_id=fila.token_id,
             name=fila.name,
             scopes=fila.scopes,
             project_id=fila.project_id,
         )
+        # Con el actor YA resuelto: la fila queda ``actor_type='api_token'`` y
+        # ``api_token_id=<pk>``. Con ``admin=None`` (la versión anterior) el filtro forense
+        # ``actor_type='api_token'`` no veía ninguna autenticación de agente.
+        audit.record(
+            "mcp.auth",
+            admin=actor,
+            target_type="api_token",
+            target_id=fila.id,
+            touched_engine=False,
+            detail=f"token={fila.token_id} proyecto={fila.project_id}",
+        )
+        return actor
     finally:
         session.close()

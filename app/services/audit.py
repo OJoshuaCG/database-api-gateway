@@ -31,6 +31,31 @@ def _safe_get(ctxvar: ContextVar) -> str | None:
     return value or None
 
 
+def audit_identity(
+    subject: "dict | Actor | None",
+) -> tuple[int | None, str | None, int | None]:
+    """
+    ``(admin_id, admin_username, api_token_id)`` tal como se persisten en ``audit_log``.
+
+    Un token NO va en ``admin_id``: el PK del token y el id de un usuario comparten el espacio de
+    enteros, así que ``WHERE admin_id = 3`` mezclaba al usuario 3 con el token 3. Y su ``name``
+    (texto libre que elige quien lo acuña) tampoco va en ``admin_username``: un token llamado
+    "alice" se leía como filas de la persona alice. Para un token: ``admin_id`` NULL,
+    ``api_token_id`` = PK, y ``admin_username = "token:<token_id>"`` (la parte PÚBLICA del
+    bearer, nunca el secreto), con un prefijo que ningún username real puede imitar sin que se
+    note.
+
+    Es local a la auditoría a propósito: ``identity_of`` lo leen también decisiones de
+    autorización (``_guard_owner`` de exportación) y autoría de otras tablas, que no son lo que
+    este cambio corrige.
+    """
+    if getattr(subject, "kind", None) == "api_token":
+        token_id = getattr(subject, "token_id", None)
+        return None, (f"token:{token_id}" if token_id else None), subject.id
+    admin_id, admin_username = identity_of(subject)
+    return admin_id, admin_username, None
+
+
 def _build(
     action: str,
     *,
@@ -49,11 +74,10 @@ def _build(
     grantor: str | None,
     actor_type: str | None = None,
 ) -> AuditLog:
-    admin_id, admin_username = identity_of(admin)
+    admin_id, admin_username, api_token_id = audit_identity(admin)
     # Override explícito: expiración y cancelación automáticas las hace el SISTEMA, no una
     # persona; sin esto quedarían atribuidas a quien disparó la lectura que las barrió (D11).
     actor_type = actor_type or actor_type_of(admin)
-    api_token_id = admin.id if getattr(admin, "kind", None) == "api_token" else None
     return AuditLog(
         request_id=_safe_get(current_http_identifier),
         admin_id=admin_id,
