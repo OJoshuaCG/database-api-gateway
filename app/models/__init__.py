@@ -20,6 +20,7 @@ from app.models.api_token import ApiToken
 from app.models.gateway_session import GatewaySession
 from app.models.audit_log import AuditLog
 from app.models.base import Base, TimestampMixin
+from app.models.capability_grant import CapabilityGrant
 from app.models.charset_collation_option import CharsetCollationOption
 from app.models.clone_batch import CloneBatch, CloneBatchItem
 from app.models.clone_job import CloneJob, CloneJobItem
@@ -59,6 +60,7 @@ __all__ = [
     "TimestampMixin",
     "AccessGrant",
     "ApiToken",
+    "CapabilityGrant",
     "GatewaySession",
     "UserGlobalCapability",
     "User",

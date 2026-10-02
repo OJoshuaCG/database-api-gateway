@@ -472,6 +472,22 @@ CODE_SELF_MODIFICATION = "access.self_modification_forbidden"
 #: posee. Ver ``GatewayUserController._assert_within_ceiling``.
 CODE_GRANT_CEILING = "access.grant_ceiling_exceeded"
 
+# -- Capacidades puntuales (``capability_grants``) ------------------------------------------ #
+#: La capacidad pedida es del eje global o no existe: no se puede otorgar suelta. 422.
+CODE_CAPABILITY_NOT_GRANTABLE = "access.capability_not_grantable"
+#: Ya hay una capacidad puntual viva (pendiente o activa) para ese usuario, capacidad y alcance. 409.
+CODE_GRANT_DUPLICATE = "access.grant_duplicate"
+#: El entorno o servidor del alcance no existe. 404.
+CODE_GRANT_SCOPE_NOT_FOUND = "access.grant_scope_not_found"
+#: El destinatario está desactivado: no se le otorga nada hasta reactivarlo. 409.
+CODE_GRANT_USER_INACTIVE = "access.grant_user_inactive"
+#: Quien pidió una capacidad sensible no puede aprobarla él mismo. 409.
+CODE_SELF_APPROVAL = "access.self_approval_forbidden"
+#: La solicitud ya no está pendiente (decidida, vencida o cancelada). 409.
+CODE_GRANT_NOT_PENDING = "access.grant_not_pending"
+#: La capacidad puntual no existe (o no pertenece a ese usuario). 404.
+CODE_GRANT_NOT_FOUND = "access.grant_not_found"
+
 # --------------------------------------------------------------------------- #
 # API                                                                          #
 # --------------------------------------------------------------------------- #
@@ -479,6 +495,61 @@ CODE_GRANT_CEILING = "access.grant_ceiling_exceeded"
 
 def spec(capability: Capability) -> CapabilitySpec:
     return _BY_ID[capability]
+
+
+def is_grantable(capability: Capability | str) -> bool:
+    """
+    ¿Se puede otorgar SUELTA, sobre un entorno o servidor? Todo salvo el eje global.
+
+    Las globales (``environments.write``, ``catalogs.write``, ``servers.admin``,
+    ``gateway.admin``, ``self.read``, lecturas de política) no tienen un destino al que
+    anclarse, y otorgarlas por separado saltearía la separación de deberes. Una capacidad
+    DESCONOCIDA no es otorgable: el lector falla cerrado.
+    """
+    try:
+        return _BY_ID[Capability(capability)].scope_axis != "global"
+    except (KeyError, ValueError):
+        return False
+
+
+def is_sensitive(capability: Capability | str) -> bool:
+    """
+    ¿Exige un segundo aprobador? Divulga datos del cliente o es de nivel ``drop``.
+
+    Derivado de los ejes del catálogo y no de una lista aparte; un invariante de importación
+    fija que el conjunto resultante sean exactamente las 7 capacidades de la política.
+    """
+    try:
+        sp = _BY_ID[Capability(capability)]
+    except (KeyError, ValueError):
+        return False
+    return sp.discloses or sp.level == "drop"
+
+
+def _derive_implied_read() -> Mapping[Capability, frozenset[Capability]]:
+    """
+    Capacidad otorgable → la lectura de su módulo que trae implícita.
+
+    Otorgar ``sql_console.execute`` sin ``sql_console.history`` dejaría a la persona
+    ejecutando sin poder ver nada, así que escribir/ejecutar implica la lectura. Es la
+    lectura de NIVEL VIEWER del mismo módulo (no muta ni divulga): nunca escala a otra cosa.
+    """
+    reads: dict[str, Capability] = {}
+    for cap in _VIEWER:
+        sp = _BY_ID[cap]
+        if sp.scope_axis != "global" and not sp.mutates and not sp.discloses:
+            reads[sp.module] = cap
+    return MappingProxyType(
+        {
+            s.id: frozenset({reads[s.module]})
+            for s in CAPABILITIES
+            if is_grantable(s.id) and (s.mutates or s.discloses) and s.module in reads
+        }
+    )
+
+
+#: Capacidad otorgable → lecturas implícitas (ver ``_derive_implied_read``).
+IMPLIED_READ: Mapping[Capability, frozenset[Capability]] = _derive_implied_read()
 
 
 def role_at_most(role: GatewayRole, ceiling: GatewayRole) -> bool:
@@ -551,6 +622,9 @@ def capability_matrix() -> list[dict]:
             "requires_step_up": s.requires_step_up,
             "agent_allowed": s.agent_allowed,
             "scope_axis": s.scope_axis,
+            "grantable": is_grantable(s.id),
+            "sensitive": is_sensitive(s.id),
+            "implies": sorted(c.value for c in IMPLIED_READ.get(s.id, ())),
             "roles": sorted(
                 r.value for r, caps in ROLE_CAPABILITIES.items() if s.id in caps
             ),
@@ -569,6 +643,19 @@ def capability_matrix() -> list[dict]:
 # Al importar y no en un test: fallar al importar es fallar al arrancar, y para un catálogo de
 # autorización eso es lo correcto. Un test alguien puede no correrlo; el proceso no puede no
 # importar el módulo del que depende cada request.
+
+
+_SENSITIVE_POLICY: frozenset[str] = frozenset(
+    {
+        "engine_users.secrets",
+        "blueprints.captures",
+        "clones.execute",
+        "exports.download",
+        "sql_console.execute",
+        "engine_users.drop",
+        "databases.drop",
+    }
+)
 
 
 def _assert_invariants() -> None:
@@ -620,6 +707,20 @@ def _assert_invariants() -> None:
                 raise AssertionError(
                     f"{cap.value} es global y además está en el rol '{role.value}'."
                 )
+
+    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 7: si el
+    #    catálogo crece y una nueva divulga o es `drop`, esto obliga a decidirlo a propósito.
+    sensibles = {s.id.value for s in CAPABILITIES if is_sensitive(s.id)}
+    if sensibles != _SENSITIVE_POLICY:
+        raise AssertionError(f"Conjunto sensible fuera de la política: {sorted(sensibles)}")
+    #    Ninguna capacidad global es otorgable, y toda lectura implícita es de nivel viewer.
+    for s in CAPABILITIES:
+        if s.scope_axis == "global" and is_grantable(s.id):
+            raise AssertionError(f"{s.id.value} es global y otorgable.")
+    for cap, implied in IMPLIED_READ.items():
+        for r in implied:
+            if r not in _VIEWER or _BY_ID[r].mutates or _BY_ID[r].discloses:
+                raise AssertionError(f"{cap.value} implica {r.value}, que no es lectura viewer.")
 
 
 _assert_invariants()
