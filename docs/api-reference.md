@@ -2565,6 +2565,9 @@ alta pendiente.
 | 79 | POST | `/api/v1/schema-comparisons/{id}/execute-preview` | 🔒 | — |
 | 80 | POST | `/api/v1/schema-comparisons/{id}/execute` | 🔒 | 🔌 |
 | 81 | POST | `/api/v1/managed-databases/{db_id}/migrations/reconcile-partial` | 🔒 | 🔌 |
+| 82 | GET | `/api/v1/gateway-users/{user_id}/capability-grants` | 🔒 `access_admin` | — |
+| 83 | POST | `/api/v1/gateway-users/{user_id}/capability-grants` | 🔒 `access_admin` | — |
+| 84 | DELETE | `/api/v1/gateway-users/{user_id}/capability-grants/{grant_id}` | 🔒 `access_admin` | — |
 
 \* Toca el motor solo cuando el flag (`provision` / `drop_remote` / `execute_immediately`)
 es `true`. Los grants y `provision`/`apply-profile` tocan el motor siempre. Los
@@ -2596,6 +2599,84 @@ Relevantes para quien despliega o consume el gateway (la lista completa está en
 | `REMOTE_CONNECT_TIMEOUT` | Segundos para abrir la conexión a un servidor destino. |
 | `REMOTE_STATEMENT_TIMEOUT_MS` | Milisegundos máximos por sentencia en el destino. |
 | `REMOTE_SSL_MODE` | `ssl_mode` por defecto si un servidor no define el suyo. |
+
+---
+
+## 19. Capacidades puntuales (`/gateway-users/{id}/capability-grants`)
+
+Una **capacidad puntual** le suma a una persona del gateway UNA capacidad sobre UN entorno o
+servidor, sin cambiarle el rol. Suma al rol del alcance (nunca resta) y no toca `PUT /access`.
+Hoy están el alta, el listado y la revocación; la aprobación de las sensibles, `/auth/me` y
+la vista de acceso efectivo llegan en entregas siguientes.
+
+**Quién actúa.** Solo quien tiene la global `access_admin` (`security_officer` tiene
+`gateway.admin` pero recibe `403`). Todo es CSRF + sesión, como el resto de `/gateway-users`.
+Nadie se otorga ni se revoca capacidades a sí mismo. Las capacidades **globales** (`servers.admin`,
+`catalogs.*`, `environments.*`, `gateway.admin`, `self.read`) no se otorgan nunca.
+
+**Techo.** Quien otorga tiene que tener la capacidad en ese alcance (su rol en el alcance, sus
+globales y sus propias capacidades puntuales). Otorgar escribir/ejecutar trae implícita la lectura
+de su módulo (campo `implies`).
+
+**Sensibles (segundo aprobador).** `engine_users.secrets`, `blueprints.captures`,
+`clones.execute`, `exports.download`, `sql_console.execute`, `engine_users.drop` y
+`databases.drop` nacen `pending` (vencen a los 7 días, sin ningún efecto hasta que otro
+`access_admin` las apruebe). El resto nace `active`.
+
+### Objeto `CapabilityGrantOut`
+
+```json
+{
+  "id": 7, "user_id": 2, "username": "destino",
+  "capability": "databases.write", "scope_type": "environment", "scope_id": 1,
+  "scope_name": "Desarrollo", "status": "active", "sensitive": false,
+  "requested_by": { "id": 1, "username": "admin" }, "requested_at": "2026-10-01T18:00:00",
+  "decided_by": null, "decided_at": null, "expires_at": null,
+  "request_reason": "release del viernes", "decision_reason": null,
+  "implies": ["databases.read"]
+}
+```
+
+`status`: `pending | active | rejected | expired | cancelled | revoked`. `scope_type`:
+`environment | server`. `requested_by` / `decided_by` son `null` si el usuario se borró.
+
+### `GET /api/v1/gateway-users/{user_id}/capability-grants`
+
+Todas las capacidades de la persona, historial incluido, de la más nueva a la más vieja. Filtro
+opcional `?status=<estado>` (valor inválido: `422`). **Respuesta** `200` — `ApiResponse[CapabilityGrantOut[]]`
+(sin paginar).
+
+### `POST /api/v1/gateway-users/{user_id}/capability-grants`
+
+Body: `{ "capability": "databases.write", "scope_type": "environment", "scope_id": 1, "reason": "…" }`
+(`reason` opcional, máx. 500; `scope_id` ≥ 1; `scope_type` distinto de `environment|server`: `422`).
+**Respuesta** `201` — `ApiResponse[CapabilityGrantOut]` (`status` `active` o `pending`).
+
+### `DELETE /api/v1/gateway-users/{user_id}/capability-grants/{grant_id}`
+
+Sin body. Un solo `access_admin` alcanza, sin techo y con efecto inmediato. `active` pasa a
+`revoked`, `pending` pasa a `cancelled`; la fila queda como historial. **Respuesta** `200` —
+`ApiResponse[CapabilityGrantOut]`.
+
+### Errores (`detail.public_context.code`)
+
+| Código | HTTP | Cuándo |
+|---|---|---|
+| `access.forbidden` | 403 | El actor no es `access_admin` (cuerpo opaco, no dice qué falta). |
+| `gateway_user.not_found` | 404 | La persona no existe. |
+| `access.self_modification_forbidden` | 409 | El actor es la persona destino (alta o revocación). |
+| `access.grant_user_inactive` | 409 | La persona está desactivada (alta). |
+| `access.capability_not_grantable` | 422 | Capacidad global o desconocida. |
+| `access.grant_scope_not_found` | 404 | El entorno o servidor no existe. |
+| `access.grant_ceiling_exceeded` | 409 | El actor no tiene esa capacidad en ese alcance. |
+| `access.grant_duplicate` | 409 | Ya hay una viva (`pending` o `active`) para esa persona, capacidad y alcance. |
+| `access.grant_not_found` | 404 | La capacidad no existe o es de otra persona (revocación). |
+| `access.grant_not_pending` | 409 | La capacidad ya es terminal (revocación). |
+
+Cada alta y revocación escribe `audit_log`: `capability_grant.created` (no sensibles),
+`capability_grant.requested` (sensibles), `capability_grant.revoked` y
+`capability_grant.cancelled`. Los rechazos por auto-otorgamiento y techo quedan con `status`
+`failure`.
 
 ---
 

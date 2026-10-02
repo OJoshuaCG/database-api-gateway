@@ -12,11 +12,15 @@ OJO CON EL NOMBRE: acá se administran los usuarios que se autentican **contra e
 usuarios del MOTOR viven en ``/server-users`` y ``/servers/{id}/users``.
 """
 
-from fastapi import APIRouter, Request
+from typing import Literal
 
+from fastapi import APIRouter, Query, Request
+
+from app.controllers.capability_grant_controller import CapabilityGrantController
 from app.controllers.gateway_user_controller import GatewayUserController
 from app.core.limiter import limiter
 from app.core.authz import GatewayAdmin
+from app.schemas.capability_grant import CapabilityGrantCreate, CapabilityGrantOut
 from app.schemas.gateway_user import (
     AcceptInviteIn,
     AcceptInviteOut,
@@ -143,4 +147,57 @@ def reinvite_gateway_user(actor: GatewayAdmin, user_id: int):
     return success(
         data=GatewayUserController().reinvite(user_id, admin=actor),
         message="Invitación reemitida. La anterior quedó inválida.",
+    )
+
+
+@router.get(
+    "/{user_id}/capability-grants",
+    response_model=ApiResponse[list[CapabilityGrantOut]],
+)
+def list_capability_grants(
+    actor: GatewayAdmin,
+    user_id: int,
+    status: Literal["pending", "active", "rejected", "expired", "cancelled", "revoked"]
+    | None = Query(None, description="Filtra por estado"),
+):
+    """
+    Capacidades puntuales de la persona, de todos los estados (historial incluido). Solo
+    ``access_admin``: ``security_officer`` recibe 403 aunque tenga ``gateway.admin``.
+    """
+    return success(data=CapabilityGrantController().list_for_user(user_id, actor, status))
+
+
+@router.post(
+    "/{user_id}/capability-grants",
+    response_model=ApiResponse[CapabilityGrantOut],
+    status_code=201,
+)
+def create_capability_grant(actor: GatewayAdmin, user_id: int, payload: CapabilityGrantCreate):
+    """
+    Otorga una capacidad puntual sobre un entorno o servidor. **Suma** al rol de la persona.
+
+    Las 7 capacidades sensibles nacen ``pending`` (necesitan un segundo access_admin y no surten
+    efecto hasta entonces); el resto nace ``active``. Errores: 403 ``access.forbidden``, 409
+    ``access.self_modification_forbidden`` / ``access.grant_user_inactive`` /
+    ``access.grant_ceiling_exceeded`` / ``access.grant_duplicate``, 422
+    ``access.capability_not_grantable``, 404 ``access.grant_scope_not_found``.
+    """
+    return success(
+        data=CapabilityGrantController().create(user_id, payload.model_dump(), actor),
+        message="Capacidad puntual registrada.",
+    )
+
+
+@router.delete(
+    "/{user_id}/capability-grants/{grant_id}",
+    response_model=ApiResponse[CapabilityGrantOut],
+)
+def revoke_capability_grant(actor: GatewayAdmin, user_id: int, grant_id: int):
+    """
+    Revoca una capacidad activa (``revoked``) o cancela una pendiente (``cancelled``). Un solo
+    access_admin alcanza y el efecto es inmediato. No se borra la fila: queda como historial.
+    """
+    return success(
+        data=CapabilityGrantController().revoke(user_id, grant_id, actor),
+        message="Capacidad puntual revocada.",
     )

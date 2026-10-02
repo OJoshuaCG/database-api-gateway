@@ -45,6 +45,7 @@ from app.services.capability_catalog import (
 
 if TYPE_CHECKING:  # pragma: no cover
     from app.core.actor import Actor
+    from app.core.scope import ScopePoint
 
 #: Alcances sobre los que se puede otorgar una capacidad puntual (sin global, D2).
 GRANT_SCOPE_TYPES: tuple[str, ...] = ("environment", "server")
@@ -181,6 +182,22 @@ def capability_at(
         server_id=server_id, managed_database_id=managed_database_id
     )
     point = ScopePoint(environment_id=env_id, server_id=server_id)
+    return _permits(actor, role_at_point(actor, point), capability, point)
+
+
+def capability_at_point(actor: "Actor", capability: Capability, point: "ScopePoint") -> bool:
+    """
+    ¿Tiene el actor ``capability`` en un punto YA resuelto? Es el techo de quien otorga.
+
+    Misma regla que ``capability_at`` pero sin resolver el destino: el llamador arma el
+    ``ScopePoint`` (``(E, None)`` para un entorno; ``(entorno peor del servidor, S)`` para un
+    servidor). Rol del alcance ∪ globales ∪ capacidades puntuales del propio actor, con las
+    lecturas implícitas contando. Un token (sin rol) nunca llega acá.
+    """
+    from app.core.scope import _permits, role_at_point
+
+    if actor.role is None:
+        return False
     return _permits(actor, role_at_point(actor, point), capability, point)
 
 

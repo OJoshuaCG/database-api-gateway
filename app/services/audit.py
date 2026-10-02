@@ -47,9 +47,12 @@ def _build(
     object_name: str | None,
     with_grant_option: bool | None,
     grantor: str | None,
+    actor_type: str | None = None,
 ) -> AuditLog:
     admin_id, admin_username = identity_of(admin)
-    actor_type = actor_type_of(admin)
+    # Override explícito: expiración y cancelación automáticas las hace el SISTEMA, no una
+    # persona; sin esto quedarían atribuidas a quien disparó la lectura que las barrió (D11).
+    actor_type = actor_type or actor_type_of(admin)
     api_token_id = admin.id if getattr(admin, "kind", None) == "api_token" else None
     return AuditLog(
         request_id=_safe_get(current_http_identifier),
@@ -90,6 +93,7 @@ def record(
     object_name: str | None = None,
     with_grant_option: bool | None = None,
     grantor: str | None = None,
+    actor_type: str | None = None,
 ) -> None:
     """Registra una entrada de auditoría. Nunca lanza: ante error, solo loguea."""
     try:
@@ -112,6 +116,7 @@ def record(
                     object_name=object_name,
                     with_grant_option=with_grant_option,
                     grantor=grantor,
+                    actor_type=actor_type,
                 )
             )
             session.commit()
