@@ -45,6 +45,7 @@ from app.models.model_migration_statement import ModelMigrationStatement
 from app.core.actor import actor_type_of, identity_of
 from app.core.context import current_http_identifier
 from app.services import audit
+from app.services import engine_error_catalog
 from app.services import environment_catalog as ecodes
 from app.services import migration_capture_catalog as ccodes
 from app.services import provisioning_catalog as pcodes
@@ -1040,6 +1041,7 @@ class ManagedMigrationController:
             "unconfirmed_reverses": plan["unconfirmed"],
             "unreversible_statements": plan["unreversible"],
             "error": next((r.error for r in undo if r.status == "failed"), None),
+            "error_code": next((r.error_code for r in undo if r.status == "failed"), None),
         }
 
     @staticmethod
@@ -2109,6 +2111,7 @@ class ManagedMigrationController:
                     "seq": r.index,
                     "status": r.status,
                     "error": r.error,
+                    "error_code": r.error_code,
                     "execution_ms": r.execution_ms,
                 }
                 for r in results
@@ -2443,8 +2446,14 @@ class ManagedMigrationController:
                 .offset(offset)
                 .all()
             )
-            items = [
-                {
+            items = []
+            for h, version in rows:
+                # Saneado al LEER, no solo al escribir: las filas previas a
+                # ``engine_error_catalog`` guardaron el texto crudo del motor (con valores de
+                # filas) y no se reescriben con una migración. ``from_text`` es idempotente,
+                # así que sobre una fila ya saneada no cambia nada.
+                pub = engine_error_catalog.from_text(h.error)
+                items.append({
                     "id": h.id,
                     "managed_database_id": h.managed_database_id,
                     "model_migration_id": h.model_migration_id,
@@ -2454,7 +2463,8 @@ class ManagedMigrationController:
                     "version": h.applied_version or version,
                     "applied_at": h.applied_at,
                     "status": h.status.value if hasattr(h.status, "value") else h.status,
-                    "error": h.error,
+                    "error": pub.message if pub else None,
+                    "error_code": pub.code if pub else None,
                     "execution_ms": h.execution_ms,
                     "direction": h.direction,
                     "applied_checksum": h.applied_checksum,
@@ -2462,9 +2472,7 @@ class ManagedMigrationController:
                     "actor_id": h.actor_id,
                     "actor_username": h.actor_username,
                     "request_id": h.request_id,
-                }
-                for h, version in rows
-            ]
+                })
             return items, total
         finally:
             session.close()
@@ -2651,6 +2659,7 @@ class ManagedMigrationController:
             "version": r.version,
             "status": r.status,
             "error": r.error,
+            "error_code": r.error_code,
             "execution_ms": r.execution_ms,
             # Checkpoint por sentencia: para que el frontend distinga un resume de un
             # intento desde cero, y sepa en qué sentencia murió (sin exponer SQL crudo).

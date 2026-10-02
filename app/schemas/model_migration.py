@@ -379,6 +379,13 @@ class MigrationReconcileStatementOut(BaseModel):
     status: str | None = None  # applied | failed (ausente en dry_run)
     sql: str | None = None  # solo en dry_run
     error: str | None = None
+    error_code: str | None = Field(
+        None,
+        description=(
+            "Código estable del vocabulario 'engine.*' (engine_error_catalog) cuando el motor "
+            "rechazó la sentencia. 'error' es el texto SANEADO: sin valores de filas."
+        ),
+    )
     execution_ms: int | None = None
 
 
@@ -432,6 +439,13 @@ class MigrationResultOut(BaseModel):
     version: str
     status: str  # applied | failed
     error: str | None = None
+    error_code: str | None = Field(
+        None,
+        description=(
+            "Código estable del vocabulario 'engine.*' (engine_error_catalog) cuando el motor "
+            "rechazó la sentencia. 'error' es el texto SANEADO: sin valores de filas."
+        ),
+    )
     execution_ms: int
     resumed: bool = Field(
         False, description="True si este intento retomó desde un checkpoint parcial previo"
@@ -476,6 +490,13 @@ class MigrationAutoReconcileOut(BaseModel):
         description="Sentencias aplicadas sin reverso: siguen en la BD",
     )
     error: str | None = None
+    error_code: str | None = Field(
+        None,
+        description=(
+            "Código estable del vocabulario 'engine.*' (engine_error_catalog) cuando el motor "
+            "rechazó la sentencia. 'error' es el texto SANEADO: sin valores de filas."
+        ),
+    )
 
 
 class MigrationApplyOut(BaseModel):
@@ -704,7 +725,21 @@ class MigrationHistoryOut(BaseModel):
     )
     applied_at: datetime
     status: str
-    error: str | None = None
+    error: str | None = Field(
+        None,
+        description=(
+            "Texto del error SANEADO al leer (también en filas guardadas antes del saneado): "
+            "sin valores de filas, usuario ni host. El crudo está en el log del gateway, por "
+            "request_id."
+        ),
+    )
+    error_code: str | None = Field(
+        None,
+        description=(
+            "Código estable del vocabulario 'engine.*' (engine_error_catalog) cuando el motor "
+            "rechazó la sentencia. 'error' es el texto SANEADO: sin valores de filas."
+        ),
+    )
     execution_ms: int | None = None
     direction: str | None = Field(
         None,

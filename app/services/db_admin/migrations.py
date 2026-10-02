@@ -25,6 +25,7 @@ Diseño:
 
 from __future__ import annotations
 
+import logging
 import re
 import tempfile
 import threading
@@ -50,6 +51,7 @@ from app.core.remote_engine import (
 )
 from app.exceptions import AppHttpException
 from app.models.enums import EngineType
+from app.services import engine_error_catalog
 from app.services.db_admin import migration_progress, migration_results
 from app.services.db_admin.identifiers import GATEWAY_TABLE_PREFIXES, quote_identifier
 from app.services.db_admin.migration_integrity import validate_version, version_sort_key
@@ -146,6 +148,10 @@ class MigrationResult:
     # un ``COUNT``— porque la tabla acumula las capturas de corridas anteriores y ese conteo
     # afirmaría escrituras que no ocurrieron.
     captured_results: int = 0
+    # Código del vocabulario cerrado ``engine_error_catalog`` (``engine.*``) cuando
+    # ``status == "failed"``. ``error`` es el texto SANEADO (sin valores de filas); el crudo
+    # queda solo en el log con el Request ID.
+    error_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +163,7 @@ class StatementResult:
     error: str | None
     execution_ms: int
     executed_at: datetime
+    error_code: str | None = None  # ver ``MigrationResult.error_code``
 
 
 # Prefijo de la tabla de versión, tomado de la lista de objetos internos del gateway
@@ -1167,9 +1174,10 @@ class MigrationRunner:
                 if post and post.migration_checksum == spec.checksum
                 else None
             )
+            pub = _public_error(exc, where=f"apply {spec.version}")
             return MigrationResult(
                 migration_id=spec.id, version=spec.version, status="failed",
-                error=_clean_error(exc), execution_ms=ms,
+                error=pub.message, error_code=pub.code, execution_ms=ms,
                 applied_at=datetime.now(timezone.utc),
                 resumed=resumed_from is not None, resumed_from_statement=resumed_from,
                 statement_total=statement_total, failed_at_statement_index=failed_at,
@@ -1252,9 +1260,10 @@ class MigrationRunner:
                         if post and spec and post.migration_checksum == spec.checksum
                         else None
                     )
+                    pub = _public_error(exc, where=f"rollback {current}")
                     results.append(MigrationResult(
                         migration_id=mig_id, version=current, status="failed",
-                        error=_clean_error(exc), execution_ms=ms,
+                        error=pub.message, error_code=pub.code, execution_ms=ms,
                         applied_at=datetime.now(timezone.utc),
                         resumed=resumed_from is not None, resumed_from_statement=resumed_from,
                         statement_total=down_total, failed_at_statement_index=failed_at,
@@ -1351,9 +1360,13 @@ class MigrationRunner:
                                     "Reconciliación parcial de %s: falló el reverso de la "
                                     "sentencia %d: %s", spec.version, seq, exc, exc_info=True,
                                 )
+                                pub = _public_error(
+                                    exc, where=f"reconcile {spec.version} seq={seq}"
+                                )
                                 results.append(StatementResult(
-                                    index=seq, status="failed", error=_clean_error(exc),
-                                    execution_ms=ms, executed_at=datetime.now(timezone.utc),
+                                    index=seq, status="failed", error=pub.message,
+                                    error_code=pub.code, execution_ms=ms,
+                                    executed_at=datetime.now(timezone.utc),
                                 ))
                                 aborted = True
                                 break
@@ -1561,7 +1574,7 @@ class MigrationRunner:
         Reutiliza las primitivas ya probadas del runner: conexión en AUTOCOMMIT
         (``database_connection``), advisory lock por BD (``_acquire_lock``/
         ``_release_lock``) para evitar dos ejecuciones concurrentes sobre la misma
-        BD, y ``map_driver_error``/``_clean_error`` para no filtrar secretos.
+        BD, y ``map_driver_error``/``_public_error`` para no filtrar secretos ni valores.
 
         DIFERENCIA con ``apply``: NO usa Alembic, NO genera archivos de revisión, NO
         toca la tabla de versión ``_gw_v_{slug}`` ni ``database_migration_history``.
@@ -1609,10 +1622,17 @@ class MigrationRunner:
                                     "execute_adhoc: la sentencia %d falló (reintentable): %s",
                                     i, exc,
                                 )
+                            # Reintentable (stop_on_error=False) ⇒ DEBUG, mismo criterio que el
+                            # log de arriba: un fallo de orden no debe alarmar.
+                            pub = _public_error(
+                                exc, where=f"execute_adhoc seq={i}",
+                                level=logging.WARNING if stop_on_error else logging.DEBUG,
+                            )
                             results.append(
                                 StatementResult(
-                                    index=i, status="failed", error=_clean_error(exc),
-                                    execution_ms=ms, executed_at=datetime.now(timezone.utc),
+                                    index=i, status="failed", error=pub.message,
+                                    error_code=pub.code, execution_ms=ms,
+                                    executed_at=datetime.now(timezone.utc),
                                 )
                             )
                             if stop_on_error:
@@ -1653,8 +1673,17 @@ class MigrationRunner:
         return current
 
 
-def _clean_error(exc: Exception) -> str:
-    """Mensaje de error compacto y sin secretos para el historial."""
-    orig = getattr(exc, "orig", None)
-    msg = str(orig) if orig is not None else str(exc)
-    return msg[:500]
+def _public_error(
+    exc: Exception, *, where: str, level: int = logging.WARNING
+) -> engine_error_catalog.PublicEngineError:
+    """
+    Código + mensaje SANEADO de un fallo, que es lo único que entra al historial y a la API.
+
+    Antes esto era ``str(exc.orig)[:500]``: el texto nativo del motor incrusta VALORES de filas
+    (``Duplicate entry 'alice@x.com'…``, ``Key (email)=(…)``, ``… at row 12``) y el historial
+    se lee con ``blueprints.read`` (viewer y agentes). El crudo va SOLO al log, con el Request
+    ID; las reglas de saneado viven en ``engine_error_catalog``.
+    """
+    pub = engine_error_catalog.from_exception(exc)
+    engine_error_catalog.log_raw(logger, exc, pub, where=where, level=level)
+    return pub
