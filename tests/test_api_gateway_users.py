@@ -171,7 +171,65 @@ def test_the_accept_endpoint_does_not_reveal_which_invites_exist(client):
     """
     r = _aceptar(client, "0000000000.deadbeef")
     assert r.status_code == 422
-    assert "no es válida o ya se usó" in r.text
+    assert "no es válida, venció o ya se usó" in r.text
+
+
+def _firma(r) -> tuple:
+    """Lo que el cliente puede observar de un rechazo: status, código y mensaje."""
+    cuerpo = r.json()["detail"]
+    return r.status_code, cuerpo.get("public_context", {}).get("code"), cuerpo.get("msg")
+
+
+def _invitacion_vencida(datos: dict) -> str:
+    """Un token AUTÉNTICO (firma válida, epoch vigente) pero vencido."""
+    from app.controllers.gateway_user_controller import INVITE_OPERATION
+    from app.services import confirm_token
+
+    fila = UserModel().find_by_id(datos["id"])
+    token, _ = confirm_token.issue(
+        INVITE_OPERATION,
+        0,
+        str(datos["id"]),
+        ttl_seconds=-60,
+        subject=str(fila.get("credential_epoch") or 0),
+    )
+    return token
+
+
+def test_expired_and_forged_invites_are_indistinguishable(client, admin_client):
+    """
+    **El test que fija F-33.** Vencida, firma inválida, ya usada y basura responden el MISMO 422
+    con el mismo código y el mismo texto. Antes un vencido era 410, y como la expiración se
+    miraba antes que la firma, ``"1.x"`` daba 410 si y solo si existía alguna cuenta pendiente.
+    """
+    datos = _crear(admin_client, "pendiente-oraculo")
+    exp, mac = datos["invite_token"].split(".", 1)
+
+    vencida = _aceptar(client, _invitacion_vencida(datos))
+    forjada = _aceptar(client, f"{exp}.{'0' * len(mac)}")
+    forjada_vieja = _aceptar(client, "1.xxxxxxxxxx")
+    basura = _aceptar(client, "no-es-un-token")
+
+    esperado = (422, "gateway_user.not_found", "La invitación no es válida, venció o ya se usó.")
+    assert _firma(vencida) == esperado, vencida.text
+    assert _firma(forjada) == esperado, forjada.text
+    assert _firma(forjada_vieja) == esperado, forjada_vieja.text
+    assert _firma(basura) == esperado, basura.text
+
+    # Y la cuenta sigue pendiente: ningún rechazo fijó nada.
+    assert UserModel().find_by_username("pendiente-oraculo")["hashed_password"] == ""
+
+    usada = _aceptar(client, datos["invite_token"])
+    assert usada.status_code == 200, usada.text
+    assert _firma(_aceptar(client, datos["invite_token"])) == esperado
+
+
+def test_a_forged_old_token_does_not_reveal_pending_accounts(client, admin_client):
+    """El mismo token basura con y sin cuentas pendientes: respuesta idéntica."""
+    sin_pendientes = _aceptar(client, "1.xxxxxxxxxx")
+    _crear(admin_client, "pendiente-uno")
+    con_pendientes = _aceptar(client, "1.xxxxxxxxxx")
+    assert _firma(sin_pendientes) == _firma(con_pendientes)
 
 
 # --------------------------------------------------------------------------- #

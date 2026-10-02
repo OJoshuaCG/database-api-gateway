@@ -193,11 +193,15 @@ POST /api/v1/gateway-users/invite/accept      // sin cookie de sesión, sin X-CS
 - **TTL de 48 h** y **un solo uso**. El token es un HMAC sobre `(user_id, credential_epoch)`, y
   aceptar la invitación **sube el epoch**: en cuanto se usa, deja de validar. No hace falta una
   tabla de tokens consumidos.
-- **No distingue "token inválido" de "usuario inexistente" de "ya se usó".** Los tres casos
-  responden **422 `gateway_user.not_found`**, para no convertir el endpoint en un oráculo de qué
-  invitaciones hay pendientes. El copy tiene que cubrir los tres con un solo mensaje y ofrecer
-  "solicitar una invitación nueva a quien administra accesos".
-- Un token **vencido** responde distinto: **410, y sin código** (§6).
+- **No distingue NINGÚN motivo de fallo del token**: firma inválida, **vencido**, ya usado o
+  usuario inexistente responden todos **422 `gateway_user.not_found`** con el mismo mensaje
+  ("La invitación no es válida, venció o ya se usó."), para no convertir el endpoint en un oráculo
+  de qué invitaciones hay pendientes. El copy tiene que cubrir los cuatro casos con un solo
+  mensaje y ofrecer "solicitar una invitación nueva a quien administra accesos".
+- **El vencido ya no es 410.** Antes respondía 410 sin código, y como la expiración se evaluaba
+  antes que la firma, un token basura como `1.x` daba 410 si y solo si existía al menos una cuenta
+  pendiente. Un cliente que tenga una rama para el 410 en esta pantalla puede borrarla: no llega
+  más.
 - Límite de tasa **10/min**, porque es público y escribe.
 - Después del 200 hay que llevar a la persona al login normal. **No** hay sesión automática.
 
@@ -308,7 +312,7 @@ Todos en `detail.public_context.code`.
 |---|---|---|---|
 | `access.last_admin_protected` | 409 | `PATCH` con `is_active: false`; `PUT /access` sin `access_admin` | "Es el último administrador de accesos activo. Hay que otorgar `access_admin` a otro usuario activo primero." **No reintentar.** |
 | `gateway_user.not_found` | **404** | `GET`, `PATCH`, `PUT /access`, `POST /{id}/invite` | Volver al listado y refrescar. |
-| `gateway_user.not_found` | **422** | `POST /invite/accept` | "La invitación no es válida o ya se usó." Pedir una nueva. |
+| `gateway_user.not_found` | **422** | `POST /invite/accept` | "La invitación no es válida, venció o ya se usó." Pedir una nueva. Cubre también el vencido. |
 | `gateway_user.username_taken` | 409 | `POST` | Pedir otro `username`. **No reintentar igual.** |
 | `gateway_user.credential_already_set` | 409 | `POST /{id}/invite` | La cuenta ya tiene contraseña: ocultar el botón cuando `credential_set` es `true`. |
 | `gateway_user.invalid_role` | 422 | `POST`, `PATCH`, y el `role` de cada grant en `PUT /access` | Trae `public_context.allowed[]` con los roles válidos: es la fuente del selector. |
@@ -503,7 +507,6 @@ respuesta.
 |---|---|---|
 | `POST /auth/login` con credenciales inválidas | 401 | `msg: "Credenciales inválidas."`, sin `public_context` |
 | Sesión de un usuario desactivado, en cualquier endpoint | 401 | `msg: "Sesión inválida o usuario inactivo."`, sin `public_context` |
-| `POST /gateway-users/invite/accept` con invitación vencida | 410 | sin `public_context` |
 | `GET /database-exports/{id}/download` con ticket ajeno o malformado | 422 | sin `public_context` |
 | `GET /database-exports/{id}/download` con ticket vencido | 410 | sin `public_context` |
 | **Cualquier** 429 por límite de tasa | 429 | `{"msg": "Demasiadas solicitudes. Límite: …", "type": "RateLimitExceeded"}` |
@@ -529,20 +532,33 @@ Cuatro consecuencias concretas:
 
 ## 7. Límites de tasa concretos
 
-v23 explica el **eje** (por sesión y no por IP; el login sigue por IP porque todavía no hay sesión)
-pero no publica ningún número. Estos son los que están en las rutas:
+v23 explica el **eje** (por sesión y no por IP) pero no publica ningún número. Los dos endpoints
+públicos —login e invitación— **no usan el eje de sesión**: el `sid` de la cookie no se verifica en
+el limitador, así que en un endpoint sin sesión cada cookie juntada sería un cupo nuevo. Estos son
+los números que están en las rutas:
 
 | Endpoint | Límite |
 |---|---|
-| `POST /auth/login` | 5/min (por IP) |
-| `POST /gateway-users/invite/accept` | 10/min |
+| `POST /auth/login` | 20/min por IP · **5/min por IP + usuario** · 20/hora por usuario, desde cualquier IP (`LOGIN_USERNAME_RATE_LIMIT`) |
+| `POST /gateway-users/invite/accept` | 10/min por IP |
 | `POST /servers/{id}/users/reveal-password` | **3/min** |
 | `POST /database-exports/{id}/download-ticket` | 10/min |
 | `GET /database-exports/{id}/download` | 3/min |
 | `POST /api-tokens` | 10/min |
 | `POST /schema-comparisons/{id}/adopt` | 3/min |
 | `GET /managed-databases/{id}/migrations/{v}/select-results` | 20/min |
-| `POST /mcp` | 120/min **por token** |
+| `POST /mcp` | 120/min **por token** · 30 **credenciales rechazadas**/min por IP (`MCP_AUTH_FAILURE_RATE_LIMIT`) |
+
+**Login: el usuario se normaliza** (`strip` + minúsculas) antes de contar, así que `Admin` y
+`admin ` gastan el mismo cupo. Cuentan **todos** los intentos, también los exitosos, y el límite
+corre antes de verificar la password: con el cupo agotado, ni la password correcta entra. El tope
+por usuario es un **DoS de bloqueo** aceptado —quien conozca un username puede dejar a su dueño
+afuera hasta una hora—; no es un lockout persistido ni hay desbloqueo manual, y vaciar
+`LOGIN_USERNAME_RATE_LIMIT` lo apaga.
+
+**MCP: el tope por IP es de rechazos.** Cada 401 consume un cupo de la IP; agotado, **todo**
+request de esa IP —también uno con un token válido— recibe 429 sin tocar la BD hasta que la
+ventana se vacíe. Los requests autenticados no gastan ese cupo.
 
 El escalón de 3/min es el de **divulgación**: cada llamada entrega una credencial en claro o un
 artefacto con datos del cliente. Bajó desde el default de 100/min, que alcanzaba para vaciar el

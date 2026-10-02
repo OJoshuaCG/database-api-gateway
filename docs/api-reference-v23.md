@@ -458,11 +458,16 @@ y **no tiene override**: ni `force`, ni nada.
 | bytes de la respuesta, después de serializar | 512 KiB | — |
 | cuerpo del request | 256 KiB | `MCP_MAX_BODY_KIB` |
 | tasa, **por token** | 120/min | `MCP_RATE_LIMIT` |
+| credenciales **rechazadas**, por IP | 30/min | `MCP_AUTH_FAILURE_RATE_LIMIT` |
 
 Los topes de tamaño **cortan con un error y nunca truncan**: una lista cortada le haría creer al
 agente que no hay más, y un JSON cortado que parsea a medias le haría creer que el esquema es más
 chico de lo que es. El límite de tasa es **por token y no por IP** porque un agente en CI comparte
-IP con todos los demás jobs.
+IP con todos los demás jobs. Pero el `token_id` se lee antes de verificar el HMAC, así que ese
+límite solo acota a quien tiene un token real: los bearers inválidos los frena el tope de
+rechazos **por IP**, que agotado devuelve `429` a toda esa IP —incluido un agente legítimo que la
+comparta— hasta que la ventana se vacíe. Los rechazos se auditan **agregados**: como mucho una
+fila `mcp.auth` por IP por minuto y por proceso, con `agregados=N` en el `detail`.
 
 ### 9.5 Lo que el MCP nunca va a hacer
 

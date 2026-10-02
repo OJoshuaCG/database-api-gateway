@@ -230,7 +230,11 @@ class GatewayUserController:
         # público — distinguir los dos casos lo convertiría en un oráculo de qué invitaciones
         # hay pendientes.
         user_id = self._verify_invite(token)
-        fila = self._get_or_404(user_id)
+        # No `_get_or_404`: si la fila desaparece entre la verificación y acá (un admin la
+        # borró), un 404 sería un motivo distinguible más. Sale el mismo 422 que todo lo demás.
+        fila = self.users.find_by_id(user_id)
+        if not fila:
+            raise self._invite_invalid()
         if len(password or "") < PASSWORD_MIN_LENGTH:
             raise AppHttpException(
                 message=f"La contraseña tiene que tener al menos {PASSWORD_MIN_LENGTH} caracteres.",
@@ -541,6 +545,13 @@ class GatewayUserController:
         actual. Suena caro y no lo es: son las invitaciones pendientes, que en este sistema son
         unidades. La alternativa —mandar el ``user_id`` como parámetro— obliga a verificar que
         coincida con el del token, y ese es exactamente el chequeo que alguien olvida.
+
+        **Todo fallo es el mismo 422** (``_invite_invalid``): firma inválida, vencida, ya usada o
+        usuario inexistente. Antes un 410 "expiró" se propagaba en el primer candidato, y como
+        ``verify`` miraba la expiración antes que la firma, ``"1.x"`` respondía 410 si y solo si
+        existía al menos una cuenta pendiente — un oráculo público sobre justo las cuentas que se
+        toman con el token. Distinguir "vencida" le sirve a la persona invitada, pero el mensaje
+        único ya le dice qué hacer (pedir otra), y eso no vale un oráculo.
         """
         candidatos = self.users.find_without_credential()
         for fila in candidatos:
@@ -552,15 +563,23 @@ class GatewayUserController:
                     str(fila["id"]),
                     subject=str(fila.get("credential_epoch") or 0),
                 )
-                return fila["id"]
-            except AppHttpException as exc:
-                # 410 es "expiró", y eso no depende de CUÁL usuario sea: se propaga tal cual en
-                # vez de seguir probando, para que el mensaje diga la verdad.
-                if exc.status_code == 410:
-                    raise
+            except AppHttpException:
+                # Sin ramas por status: un 410 de un candidato es tan "no válida" como un 422.
                 continue
-        raise AppHttpException(
-            message="La invitación no es válida o ya se usó.",
+            return fila["id"]
+        raise self._invite_invalid()
+
+    @staticmethod
+    def _invite_invalid() -> AppHttpException:
+        """
+        EL rechazo de la invitación pública: un solo status, un solo código, un solo texto.
+
+        El código es ``gateway_user.not_found`` por compatibilidad: la SPA ya lo enruta en la
+        pantalla de invitación. Cualquier rama nueva de fallo de ``accept_invite`` tiene que
+        salir por acá; un mensaje o status distinto por motivo reabre el oráculo.
+        """
+        return AppHttpException(
+            message="La invitación no es válida, venció o ya se usó.",
             status_code=422,
             public_context={"code": CODE_NOT_FOUND},
         )

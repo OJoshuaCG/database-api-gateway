@@ -62,6 +62,13 @@ def verify(
 ) -> None:
     """
     Valida el token. Lanza 422 si es inválido/no corresponde a esta BD, 410 si expiró.
+
+    **La firma se verifica ANTES que la expiración**, y el orden es de seguridad, no de estilo:
+    con la expiración primero, ``"1.x"`` respondía 410 sin haber probado nada, así que el 410
+    no significaba "tu token venció" sino "pasaste un número chico". En la invitación pública
+    eso era un oráculo de cuentas pendientes. Ahora un 410 solo sale para un token AUTÉNTICO
+    vencido —que es lo que los flujos autenticados (preview → execute) necesitan distinguir para
+    decir "volvé a pedir el preview"—, y cualquier token forjado es 422 sin importar su ``exp``.
     """
     if not token or "." not in token:
         raise AppHttpException(
@@ -76,12 +83,6 @@ def verify(
         raise AppHttpException(
             message="Token de confirmación malformado.", status_code=422, context={}
         ) from exc
-    if int(datetime.now(timezone.utc).timestamp()) > exp:
-        raise AppHttpException(
-            message="El token de confirmación expiró; vuelve a solicitar el preview.",
-            status_code=410,
-            context={},
-        )
     expected = _sign(operation, server_id, db_name, exp, subject)
     if not hmac.compare_digest(mac, expected):
         raise AppHttpException(
@@ -92,5 +93,11 @@ def verify(
                 else "El token de confirmación no corresponde a esta base de datos."
             ),
             status_code=422,
+            context={},
+        )
+    if int(datetime.now(timezone.utc).timestamp()) > exp:
+        raise AppHttpException(
+            message="El token de confirmación expiró; vuelve a solicitar el preview.",
+            status_code=410,
             context={},
         )
