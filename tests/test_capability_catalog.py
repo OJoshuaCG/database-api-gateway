@@ -146,10 +146,11 @@ def test_import_invariants_reject_a_disclosing_capability_in_operator(monkeypatc
 
 def test_the_destructive_capabilities_are_the_expected_ones():
     """
-    Congelado a propósito, como las que divulgan. ``collation.execute`` NO está pese a
-    reescribir tablas: vive en ``operator`` y moverla es una decisión de producto pendiente.
+    Congelado a propósito, como las que divulgan. ``collation.execute`` entró al pasar a
+    ``owner``: ``ALTER TABLE ... CONVERT`` reescribe la tabla y es irreversible.
     """
     assert {s.id for s in CAPABILITIES if s.destructive} == {
+        Capability.COLLATION_EXECUTE,
         Capability.DATABASES_DROP,
         Capability.ENGINE_USERS_DROP,
         Capability.BLUEPRINTS_APPLY,

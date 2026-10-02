@@ -58,7 +58,7 @@ que la UI necesita para una pantalla de administración de accesos:
 | `label` | etiqueta en español, lista para mostrar |
 | `mutates` | si cambia estado |
 | `discloses` | **si expone datos o credenciales** — es un eje INDEPENDIENTE de `mutates` |
-| `destructive` | **subconjunto de `mutates`**: destruye o cambia de forma irreversible datos o estructura del tercero (`databases.drop`, `engine_users.drop`, `blueprints.apply`, `schema_diff.execute`, `clones.execute`, `sql_console.execute`). Siempre `owner` y con step-up. Campo aditivo |
+| `destructive` | **subconjunto de `mutates`**: destruye o cambia de forma irreversible datos o estructura del tercero (`databases.drop`, `engine_users.drop`, `blueprints.apply`, `schema_diff.execute`, `clones.execute`, `sql_console.execute`, `collation.execute`). Siempre `owner` y con step-up. Campo aditivo |
 | `requires_step_up` | si va a pedir reautenticación (ver la advertencia de arriba) |
 | `agent_allowed` | techo de lo que puede vivir en un token del servidor MCP |
 | `scope_axis` | `global` \| `environment` \| `server` |
@@ -126,7 +126,7 @@ En los tres primeros, **apagar** la captura no pide nada extra: solo encenderla.
 | `clones` | `read` | ✅ | ✅ | ✅ | |
 | | `execute` 🔓 | | | ✅ | |
 | `collation` | `read` | ✅ | ✅ | ✅ | |
-| | `execute` | | ✅ | ✅ | |
+| | `execute` 💥 | | | ✅ | |
 | `exports` | `read` | ✅ | ✅ | ✅ | |
 | | `execute` | | ✅ | ✅ | |
 | | `download` 🔓 | | | ✅ | |
@@ -137,7 +137,13 @@ En los tres primeros, **apagar** la captura no pide nada extra: solo encenderla.
 | `environments` | `read` | ✅ | ✅ | ✅ | |
 | `gateway` | `admin` | | | | `access_admin`, `security_officer` |
 
-🔓 = **divulga** (`discloses: true`).
+🔓 = **divulga** (`discloses: true`). 💥 = destructiva marcada solo en esta fila porque cambió de
+rol; la lista completa está en la columna `destructive` del §2.
+
+**`collation.execute` es solo `owner`.** `ALTER TABLE … CONVERT` reescribe la tabla del tercero y
+es irreversible. Con ella se van del `operator` el alta del plan, el preview, la ejecución y la
+cancelación de una conversión (suelta o en lote). Las lecturas (`GET` del job, sus objetos, sus
+pasos, el estado del lote y el drift) siguen en `collation.read`, que tienen los tres roles.
 
 **Tres asignaciones que sorprenden y son deliberadas:**
 
@@ -149,7 +155,7 @@ En los tres primeros, **apagar** la captura no pide nada extra: solo encenderla.
   corre: **toda fila que un guard lee es una frontera de privilegio**, así que su escritor
   necesita al menos el privilegio del guard que puede apagar.
 - **`clones.execute` está en `owner` y no en `operator`** aunque su nombre lo emparente con
-  `collation.execute`: un clon **copia DATOS**, y meter la base de producción de un cliente en un
+  `exports.execute`: un clon **copia DATOS**, y meter la base de producción de un cliente en un
   entorno de desarrollo es divulgación.
 
 ## 6. Lo que este addendum NO trae todavía

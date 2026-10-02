@@ -295,6 +295,9 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         destructive=True,
     ),
     _spec(Capability.BLUEPRINTS_READ, "Ver blueprints y sus versiones", agent=True),
+    # Solo AUTORÍA: crear y editar blueprints y versiones en la BD del gateway. Todo lo que
+    # escribe en las BDs de terceros (renombrar o migrar la tabla de versión, stampear,
+    # borrar un blueprint con versiones) es `apply`.
     _spec(Capability.BLUEPRINTS_WRITE, "Crear y editar versiones de blueprint", mutates=True),
     # `write` ≠ `apply`: autor de la migración y ejecutor sobre producción son dos personas.
     # Es la separación que el TODO.md del repo ya pide por escrito.
@@ -330,15 +333,15 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         destructive=True,
     ),
     _spec(Capability.COLLATION_READ, "Ver planes de conversión de collation"),
-    # NO marcada ``destructive`` aunque ``ALTER TABLE ... CONVERT`` reescriba la tabla y el
-    # propio controller la llame "operación irreversible": está en ``operator``, y marcarla
-    # haría fallar el invariante de destructivas al importar. Moverla a ``owner`` es una
-    # decisión de producto pendiente, no un ajuste de flags.
+    # Destructiva: ``ALTER TABLE ... CONVERT`` reescribe la tabla del tercero y el propio
+    # controller la llama "operación irreversible". Por eso solo ``owner``; a otra persona se
+    # le otorga suelta (capacidad puntual) sobre un entorno o servidor.
     _spec(
         Capability.COLLATION_EXECUTE,
         "Ejecutar una conversión de collation",
         mutates=True,
         step_up=True,
+        destructive=True,
     ),
     _spec(Capability.EXPORTS_READ, "Ver planes de exportación y su estado"),
     _spec(Capability.EXPORTS_EXECUTE, "Generar el artefacto de una exportación", mutates=True),
@@ -417,13 +420,13 @@ _VIEWER: frozenset[Capability] = frozenset(
 )
 
 # `operator` acumula sobre `viewer` la escritura NO destructiva y NO divulgante. No incluye
-# `*.drop`, `blueprints.apply`, `sql_console.execute` ni ninguna capacidad que divulgue.
+# `*.drop`, `blueprints.apply`, `sql_console.execute`, `collation.execute` ni ninguna capacidad
+# que divulgue. Lo que se le niega por rol se le puede otorgar suelto (``capability_grants``).
 _OPERATOR: frozenset[Capability] = _VIEWER | {
     Capability.ENGINE_USERS_WRITE,
     Capability.DATABASES_WRITE,
     Capability.BLUEPRINTS_WRITE,
     Capability.EXPORTS_EXECUTE,
-    Capability.COLLATION_EXECUTE,
 }
 
 # `owner` es todo lo OPERATIVO del alcance. NO incluye `servers.admin`, `catalogs.write` ni
@@ -445,6 +448,7 @@ _OWNER: frozenset[Capability] = _OPERATOR | {
     Capability.SCHEMA_DIFF_EXECUTE,
     Capability.EXPORTS_DOWNLOAD,
     Capability.SQL_CONSOLE_EXECUTE,
+    Capability.COLLATION_EXECUTE,
 }
 
 ROLE_CAPABILITIES: Mapping[GatewayRole, frozenset[Capability]] = MappingProxyType(
