@@ -28,7 +28,9 @@ La feature tenía **tres llaves**: opt-in por versión (`capture_selects`), apro
    BDs de dueños potencialmente distintos, y quien aplica sobre UNA tiene que saber»*. Esos dueños
    son los usuarios **del motor** de cada base destino; el gateway es **single-admin**, sin roles
    ni permisos por usuario. La misma persona activa la captura, la aprueba y la aplica: no había
-   un segundo par de ojos, solo un segundo momento.
+   un segundo par de ojos, solo un segundo momento. *(Premisa de la fecha de este addendum: hoy el
+   gateway es multiusuario y aplicar exige `blueprints.apply`; ver `TODO.md`
+   `T-260824-lz-captura-multiusuario` y `features/authorization.md`.)*
 2. **No dejaba rastro.** Pasar el flag no se registraba en `audit_log`. Lo único auditado es la
    escritura efectiva, que ocurre con o sin el gate. Era fricción sin evidencia forense.
 3. **`apply-all` ya lo contradecía.** Un único query param autorizaba N bases de entornos

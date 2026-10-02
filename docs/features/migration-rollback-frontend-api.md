@@ -1,5 +1,10 @@
 # Confirmar y ejecutar rollback de migraciones — Documentación de API para Frontend
 
+> **Histórico — describe el estado al 2026-07-24; el modelo vigente está en [`docs/features/authorization.md`](authorization.md).**
+> El contrato está consolidado en `docs/api-reference.md` §8–§9. Lo que dice abajo sobre `AdminDep`
+> y "single-admin" ya no vale: ejecutar el rollback exige `blueprints.apply` (solo `owner`, con
+> step-up) con alcance en la base, y confirmar el `down_sql` es autoría (`blueprints.write`).
+
 > El gateway soporta desde el Plan 02 el rollback de migraciones de blueprint, pero el
 > frontend nunca implementó la pantalla para **confirmar el `down_sql`** de una versión
 > (requisito previo obligatorio) ni el panel para **ejecutar el rollback** con la doble
@@ -36,10 +41,10 @@ desarrollo (ver sección de errores).
 - **Envelope de error**: `{ "detail": { "msg": "...", "type": "AppHttpException", ... } }`.
   El status HTTP real viene en el status code de la respuesta (404/409/422/429/500), no
   hay que parsearlo del body.
-- **Autenticación**: sesión de admin por cookie (`AdminDep`). Sin sesión válida → 401 en
+- **Autenticación** *[histórico]*: sesión de admin por cookie (`AdminDep`). Sin sesión válida → 401 en
   cualquier endpoint.
 - **Prefijo**: todos los paths cuelgan de `/api/v1`.
-- **Single-admin**: no hay roles ni multi-tenant. No hace falta ocultar acciones por
+- **Single-admin** *[histórico]*: no hay roles ni multi-tenant. No hace falta ocultar acciones por
   permisos de usuario.
 - **Versiones**: strings de 4 a 10 dígitos (`"0008"`, `"0009"`...). Se comparan y
   ordenan **numéricamente**, nunca lexicográficamente (`"0010"` > `"0009"`).

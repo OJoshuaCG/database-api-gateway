@@ -1,5 +1,10 @@
 # 11 — Organización lógica, copia de datos, releases y acceso para agentes
 
+> **Histórico — describe el estado al 2026-08-21; el modelo de autorización vigente está en [`docs/features/authorization.md`](../features/authorization.md).**
+> Las features 1 (entornos) y 2 (proyectos) están implementadas, la 3 parcialmente en el módulo de
+> clon, y el §6 (MCP) lo reemplazó el plan 12. Las menciones a `get_current_admin` y al
+> administrador único describen el gateway de esa fecha.
+>
 > **Estado**: propuesta, sin implementar. Fecha de relevamiento: **2026-08-21**.
 > Head de Alembic al momento de escribir: `c7d8e9f0a1b2`.
 

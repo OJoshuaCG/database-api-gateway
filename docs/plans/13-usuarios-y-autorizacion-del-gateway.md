@@ -1,6 +1,16 @@
 # 13 — Usuarios y autorización del gateway
 
-> **Estado**: propuesta, sin implementar. Relevamiento: **2026-09-09**.
+> **Histórico — describe el estado al 2026-09-09; el modelo vigente está en [`docs/features/authorization.md`](../features/authorization.md).**
+> **Implementado y extendido.** Los pasos 0–9 se entregaron (`TODO.md`,
+> `T-260909-ojoshuac-autorizacion-por-capacidades` y `T-260909-ojoshuac-sesiones-usuarios-y-mcp`), y
+> después el modelo creció más allá de este plan: alcance por destino en toda ruta, capacidades
+> puntuales, `gateway.admin` partida en `access.admin`/`policy.admin`, separación de deberes,
+> segundo aprobador en lugar del techo por tenencia, siembra `viewer` + `access_admin` con
+> ventana de arranque, step-up exigido y lectura de auditoría (`api-reference-v29.md`). Se conserva
+> como **registro del razonamiento de diseño**; ante una contradicción, manda el código y
+> `authorization.md`.
+>
+> **Estado original**: propuesta, sin implementar. Relevamiento: **2026-09-09**.
 > Head de Alembic al momento de escribir: **`b7c8d9e0f1a2`** (30 revisiones, head único).
 >
 > Nace del §7.6 del plan 12, que declaró este trabajo fuera de su alcance y explicó por qué el

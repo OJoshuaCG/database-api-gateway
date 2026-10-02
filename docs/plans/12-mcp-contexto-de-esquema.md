@@ -1,6 +1,15 @@
 # 12 — Servidor MCP de contexto de esquema para agentes de IA
 
-> **Estado**: propuesta, sin implementar. Relevamiento: **2026-09-09**.
+> **Estado (2026-10-02)**: **implementado parcialmente (MCP v1)**: tokens de agente
+> (`/api-tokens`), `POST /mcp`, el gate por base (`allows_agent_access` / `agent-access`) y el techo
+> de agente (`databases.read`, `blueprints.read`, `schema_diff.read`). Faltan las tools que leen el
+> catálogo del motor (`list_objects`, `get_schema`, `check_freshness`), bloqueadas por falta de
+> verificación contra motores reales (`TODO.md` `T-260909-ojoshuac-mcp-tools-motor`). Contrato en
+> `api-reference-v23.md` §9 y `v24.md` §3; autorización vigente en
+> [`docs/features/authorization.md`](../features/authorization.md). Las menciones a
+> `get_current_admin`/`AdminDep` de abajo describen el gateway de la fecha de relevamiento.
+>
+> **Estado original**: propuesta, sin implementar. Relevamiento: **2026-09-09**.
 > Head de Alembic al momento de escribir: **`b7c8d9e0f1a2`** (30 revisiones, head único).
 >
 > **Este documento REEMPLAZA la sección 6 del plan 11.** No la complementa: cuatro de sus

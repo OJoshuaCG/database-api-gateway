@@ -288,7 +288,8 @@ que `mysqldump --single-transaction`).
 
 ## 3. Los 12 endpoints
 
-Todos bajo sesión admin (`AdminDep`). Todos devuelven `ApiResponse[T]` **salvo `download` y
+Todos bajo sesión admin (`AdminDep`). *(Histórico: `AdminDep` se retiró; hoy cada ruta exige su
+capacidad `exports.*` y, si tiene destino, el alcance en él. Ver `features/authorization.md`.)* Todos devuelven `ApiResponse[T]` **salvo `download` y
 `content`**, que son entregas de archivo/texto y lo dicen abajo.
 
 | # | Método y ruta | Límite | Toca el motor |

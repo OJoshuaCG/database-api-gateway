@@ -8,15 +8,19 @@ El módulo de permisos granulares permite otorgar, revocar y consultar privilegi
 
 ## Endpoints
 
-| Método   | Path                                                        | Auth requerida | Descripción                                                               |
+La columna "Capacidad" es la **capacidad del gateway** que exige la ruta (no un privilegio del
+motor). Con destino, se exige además en ese servidor (capa 2). Ver
+[authorization.md](authorization.md).
+
+| Método   | Path                                                        | Capacidad | Descripción                                                               |
 |----------|-------------------------------------------------------------|----------------|---------------------------------------------------------------------------|
-| `GET`    | `/api/v1/server-users/{user_id}/grants`                     | Sesión admin   | Lista los permisos actuales del usuario en el motor.                     |
-| `POST`   | `/api/v1/server-users/{user_id}/grants`                     | Sesión admin   | Otorga privilegios sobre un objeto (GRANT).                              |
-| `DELETE` | `/api/v1/server-users/{user_id}/grants`                     | Sesión admin   | Revoca privilegios sobre un objeto (REVOKE). Body opcional `cascade`; query `confirm_grantee` si `cascade=true`. |
-| `POST`   | `/api/v1/server-users/{user_id}/apply-profile/{profile_id}` | Sesión admin   | Aplica un perfil de permisos preconfigurado al usuario (best-effort). `409` si el perfil está desactivado; `422` si el motor no es aplicable o si no se aplicó ningún grant. |
-| `POST`   | `/api/v1/server-users/{user_id}/apply-profile/{profile_id}/bulk` | Sesión admin | Aplica el mismo perfil sobre N bases de datos en una llamada (best-effort, `5/minute`). |
-| `POST`   | `/api/v1/server-users/provision`                            | Sesión admin   | Crea usuario en el inventario + provisiona en el motor + grants iniciales.|
-| `POST`   | `/api/v1/servers/{server_id}/grantable`                     | Sesión admin   | Verifica si el admin de conexión puede otorgar los privilegios dados.    |
+| `GET`    | `/api/v1/server-users/{user_id}/grants`                     | `engine_users.read`   | Lista los permisos actuales del usuario en el motor.                     |
+| `POST`   | `/api/v1/server-users/{user_id}/grants`                     | `engine_users.write`   | Otorga privilegios sobre un objeto (GRANT).                              |
+| `DELETE` | `/api/v1/server-users/{user_id}/grants`                     | `engine_users.write`   | Revoca privilegios sobre un objeto (REVOKE). Body opcional `cascade`; query `confirm_grantee` si `cascade=true`. |
+| `POST`   | `/api/v1/server-users/{user_id}/apply-profile/{profile_id}` | `engine_users.write`   | Aplica un perfil de permisos preconfigurado al usuario (best-effort). `409` si el perfil está desactivado; `422` si el motor no es aplicable o si no se aplicó ningún grant. |
+| `POST`   | `/api/v1/server-users/{user_id}/apply-profile/{profile_id}/bulk` | `engine_users.write` | Aplica el mismo perfil sobre N bases de datos en una llamada (best-effort, `5/minute`). |
+| `POST`   | `/api/v1/server-users/provision`                            | `engine_users.credentials` (step-up)  | Crea usuario en el inventario + provisiona en el motor + grants iniciales. Fija una contraseña, por eso no alcanza `engine_users.write`.|
+| `POST`   | `/api/v1/servers/{server_id}/grantable`                     | `engine_users.read`   | Verifica si el admin de conexión puede otorgar los privilegios dados.    |
 
 ---
 

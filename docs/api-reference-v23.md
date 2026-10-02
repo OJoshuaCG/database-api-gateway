@@ -1,11 +1,20 @@
 # Contrato de autorización: capacidades, `/auth/me` y el 403
 
+> **Histórico — describe el estado al 2026-09-09; el modelo vigente está en [`docs/features/authorization.md`](features/authorization.md).**
+> Sigue siendo la fuente de varios contratos (el 403, `/authz/catalog`, CSRF, sesiones, la capa 2,
+> los tokens de agente y el MCP), pero varias afirmaciones quedaron viejas y están marcadas en
+> línea con **[Histórico]**. Lo que cambió después: el step-up se exige, toda ruta con destino
+> pasa por la capa 2, `gateway.admin` se partió (`api-reference-v29.md`), las sensibles son 11 y
+> la siembra nueva es `viewer` + `access_admin`. Hoy hay **32** capacidades.
+
 Addendum sobre **toda** la API v1. Antes, un endpoint solo exigía **sesión válida**: quien entraba
 podía hacer todo. Ahora **cada endpoint declara una capacidad** de un vocabulario cerrado, y el
 servidor la exige.
 
 **No hay cambios incompatibles para el administrador sembrado**: nace con rol `owner` y las dos
-capacidades globales, o sea las 29 capacidades. Todo lo que la SPA hace hoy sigue funcionando
+capacidades globales, o sea las 29 capacidades. **[Histórico]** Una instalación nueva hoy siembra
+`viewer` + `access_admin` con una ventana de arranque de 72 h (`api-reference-v29.md` §10), y el
+catálogo tiene 32 capacidades. Todo lo que la SPA hace hoy sigue funcionando
 igual. Lo que cambia es que ahora **existe** una respuesta 403 donde antes no podía haberla, y
 que `/auth/me` publica con qué decidir la UI.
 
@@ -46,6 +55,8 @@ login es el que está en curso. Ese campo sí existe en `GatewayUserOut` (ver `a
   contraseña *antes* de mandar la operación en vez de descubrirlo por un error; el mecanismo de
   reautenticación es una fase posterior. **No construyas un flujo que dependa de que el servidor
   rechace por falta de step-up: hoy no lo hace.**
+  **[Histórico]** El step-up **se exige** desde `eb49132`: `403 access.step_up_required` y
+  `POST /auth/step-up` (`api-reference.md` §5, `features/authorization.md` §6).
 
 ## 2. `GET /api/v1/authz/catalog` — el vocabulario completo
 
@@ -139,7 +150,8 @@ capacidad puntual (`POST /gateway-users/{id}/capability-grants`, `api-reference.
 entorno o servidor: `blueprints.apply`, `blueprints.captures`, `databases.drop` y
 `collation.execute` son las cuatro otorgables. `blueprints.captures` y `databases.drop` son
 **sensibles** (divulga / nivel `drop`) y piden un segundo aprobador; `blueprints.apply` y
-`collation.execute` no.
+`collation.execute` no. **[Histórico]** Hoy las **11** capacidades exclusivas de `owner` son
+sensibles, incluidas `blueprints.apply` y `collation.execute` (`api-reference.md` §19).
 
 En los tres primeros, **apagar** la captura no pide nada extra: solo encenderla.
 
@@ -214,7 +226,8 @@ pasos, el estado del lote y el drift) siguen en `collation.read`, que tienen los
 
 ## 6. Lo que este addendum NO trae todavía
 
-- **Step-up.** Ver §1. Es lo único de esta lista que sigue sin implementarse.
+- **Step-up.** Ver §1. Es lo único de esta lista que sigue sin implementarse. **[Histórico]**
+  Implementado y exigido (`api-reference.md` §5).
 
 > **Nota de corrección.** Una versión anterior de este §6 también declaraba fuera de alcance el
 > **alcance por destino** y la **administración de usuarios y tokens**. Las tres cosas se
@@ -350,6 +363,11 @@ la tenés *acá*" le regala a un atacante el mapa de sus propios alcances por fu
 borrado, el aprovisionamiento, el apply y el rollback. `reconcile` y `stamp` **no** pasan por la
 capa 2 aunque también tocan el motor. No asumas que la restricción por alcance cubre todo lo que
 cuelga de esa ruta.
+
+> **[Histórico]** Ya no. **Toda** ruta con destino declara `require_at` y pasa por la capa 2:
+> `SCOPE_PENDING` está vacío y `scripts/check_route_capabilities.py` lo exige en CI. Las únicas
+> exentas son las de autoría de blueprints y proyectos (`SCOPE_EXEMPT`). Ver
+> `features/authorization.md` §2.
 
 Mientras nadie tenga grants por alcance —el estado de un despliegue recién migrado— la capa 2 no
 cambia ningún resultado, y no toca la BD para decidirlo.

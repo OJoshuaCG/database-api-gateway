@@ -27,11 +27,28 @@
 > | `v14` | Una versión de blueprint se descongela al revertirla |
 > | `v15` | Editar una versión de blueprint que ya está aplicada |
 > | `v16` | Proyectos: agrupación de blueprints |
+> | `v17` | Conversión de collation en lote, versión de contabilidad y deriva |
+> | `v18` | Eliminar una versión intermedia de un blueprint |
+> | `v19` | Clonar N bases de un servidor a otro en un gesto (lotes de clonado) |
+> | `v20` | Los dos relojes de una fila de lote de clonado |
+> | `v21` | El alta de una BD gestionada ejecuta las migraciones en vez de declararlas |
+> | `v22` | Orden del catálogo de versiones y punta autoritativa |
+> | `v23` | **Autorización**: capacidades, `/auth/me`, el 403, alcance por destino y tokens de agente (parcialmente histórico: ver su banner) |
+> | `v24` | **Identidades**: `/gateway-users`, tokens de agente y confirmaciones (parcialmente histórico: ver su banner) |
+> | `v25` | Slug de blueprint renombrable, contabilidad de versiones huérfana e historial con actor |
+> | `v26` | Búsqueda de texto en el SQL de las versiones de un blueprint |
+> | `v27` | Cuántas BDs tienen aplicada cada versión del blueprint |
+> | `v28` | Autor de una versión del blueprint |
+> | `v29` | **Separación de deberes**: `access.admin`/`policy.admin`, `sod_override`, segundo aprobador, ventana de arranque, lectura de auditoría |
+>
+> El modelo de autorización **vigente**, de punta a punta, está resumido en
+> [`features/authorization.md`](features/authorization.md); la §20 de este documento dice dónde
+> está el contrato de cada endpoint de autorización.
 >
 > Si consolidás alguno acá, sacalo de esta tabla en el mismo cambio: una tabla que
 > miente sobre qué falta leer es peor que no tenerla.
 
-**Versión de la API:** `v1` · **Base URL:** `https://<host>/api/v1` · **Estado:** Iteraciones 1 y 2 + migraciones de blueprints (Plan 02) + adopción/reconciliación/snapshot (Plan 09) + gestión agrupada de usuarios del motor + comparación de esquemas entre BDs (con cierre de dependencias y reconciliación de aplicaciones parciales) implementadas (ver [§15](#15-estado-del-proyecto)).
+**Versión de la API:** `v1` · **Base URL:** `https://<host>/api/v1` · **Estado:** inventario y aprovisionamiento, migraciones de blueprints, adopción/reconciliación/snapshot, usuarios del motor, comparación de esquemas, clonado, exportación, consola SQL, conversión de collation, proyectos y entornos, servidor MCP v1 parcial y autorización multiusuario (roles, capacidades, alcance por destino, separación de deberes, step-up y auditoría) implementados (ver [§15](#15-estado-del-proyecto)).
 
 ---
 
@@ -55,6 +72,8 @@
 16. [Flujos de integración (orden de llamadas)](#16-flujos-de-integración-orden-de-llamadas)
 17. [Apéndice: tabla resumen de endpoints](#17-apéndice-tabla-resumen-de-endpoints)
 18. [Apéndice: variables de entorno del integrador](#18-apéndice-variables-de-entorno-del-integrador)
+19. [Capacidades puntuales (`/gateway-users/{id}/capability-grants`)](#19-capacidades-puntuales-gateway-usersidcapability-grants)
+20. [Autorización: dónde está cada contrato](#20-autorización-dónde-está-cada-contrato)
 
 ---
 
@@ -249,15 +268,19 @@ para construir flujos guiados de recuperación de error, nunca `context`.
 
 ### Autenticación
 
-El gateway usa **sesión por cookie firmada** (httpOnly). El modelo es de **administrador
-único**.
+El gateway usa **sesión server-side** con una cookie httpOnly firmada que lleva solo el `sid`. Es
+**multiusuario**: cada persona tiene un rol (`viewer`/`operator`/`owner`, también por entorno o
+servidor), puede tener las capacidades globales `access_admin` o `security_officer`, y cada endpoint
+exige una capacidad. Sin ella responde `403 access.forbidden`. Modelo completo en
+[`features/authorization.md`](features/authorization.md).
 
 1. `POST /api/v1/auth/login` con usuario y contraseña → el servidor responde con
    `Set-Cookie` (sesión firmada).
 2. En cada petición posterior, **envía la cookie**. Con `curl`, usa un *cookie jar*:
    `-c cookies.txt` para guardarla y `-b cookies.txt` para enviarla.
-3. Todos los endpoints bajo `/api/v1` (excepto `login`) requieren la cookie; sin ella
-   devuelven `401`.
+3. Todos los endpoints bajo `/api/v1` (excepto `login` y la aceptación de invitación) requieren
+   la cookie; sin ella devuelven `401`. Todo método no seguro exige además el header
+   `X-CSRF-Token` (ver `api-reference-v23.md`).
 
 `POST /api/v1/auth/login` está limitado a **20 peticiones por minuto por IP**, **5 por minuto
 por IP + usuario** y **20 por hora por usuario** desde cualquier IP (ver
@@ -316,7 +339,7 @@ Las marcas de tiempo (`created_at`, `updated_at`) son `datetime` en formato ISO 
 
 ## 5. Autenticación (`/auth`)
 
-Gestiona el ciclo de sesión del administrador. Es el punto de entrada obligatorio: sin
+Gestiona la sesión de cada usuario del gateway. Es el punto de entrada obligatorio: sin
 una sesión válida, el resto de la API responde `401`.
 
 ### `POST /api/v1/auth/login`
@@ -363,10 +386,13 @@ curl -X POST https://<host>/api/v1/auth/logout -b cookies.txt
 
 ### `GET /api/v1/auth/me`
 
-Devuelve el administrador autenticado. Útil para validar la sesión. **Requiere sesión.**
+Devuelve el usuario autenticado, sus capacidades efectivas y el estado de sus controles. Útil
+para validar la sesión y decidir la UI (es una pista: **decide el servidor**). **Requiere sesión.**
 
 **Respuesta** `200` — `ApiResponse[MeOut]` (identidad, capacidades efectivas y estado del
-step-up). Campos del step-up:
+step-up). Los campos de autorización están en `api-reference-v23.md` §1, las capacidades puntuales
+en la [§19](#19-capacidades-puntuales-gateway-usersidcapability-grants), `sod_warnings` en
+`api-reference-v29.md` §8.5 y `bootstrap_window` en `v29` §10.4. Campos del step-up:
 
 | Campo | Tipo | Significado |
 |---|---|---|
@@ -378,9 +404,30 @@ step-up). Campos del step-up:
 curl https://<host>/api/v1/auth/me -b cookies.txt
 ```
 
-```json
-{ "data": { "id": 1, "username": "admin" } }
+```jsonc
+{
+  "data": {
+    "id": 4,
+    "username": "mlopez",
+    "role": "owner",                         // efectivo: máximo sobre los alcances
+    "base_role": "operator",                 // rige donde ningún scope_role aplica
+    "capabilities": ["databases.read", "databases.drop", "..."],
+    "global_capabilities": [],               // access_admin | security_officer
+    "scope_roles": [{ "scope_type": "environment", "scope_id": 1, "role": "owner" }],
+    "step_up_capabilities": ["databases.drop", "..."],
+    "step_up_enforced": true,
+    "step_up_expires_at": "2026-10-02T12:05:00",
+    "capability_grants": [],                 // las vivas (pending|active) de esta persona
+    "previous_login_at": "2026-10-01T09:41:03",
+    "last_failed_at": null,
+    "catalog_version": "9f2c1a…",
+    "sod_warnings": [],
+    "bootstrap_window": null                 // solo para quien tiene access.admin
+  }
+}
 ```
+
+La SPA hace `safeParse` del envelope completo: todo campo nuevo se declara `.nullish()`.
 
 ### `POST /api/v1/auth/password`
 
@@ -455,8 +502,9 @@ con la ventana cerrada y si el método no es seguro o la capacidad divulga:
 
 con status `403`. El cliente llama a este endpoint y **reintenta una vez** el request original:
 el 403 sale antes de cualquier efecto. A quien le falta la capacidad le llega `403
-access.forbidden`, nunca este código. Las cuatro cancelaciones (`POST .../cancel` de clonados, lotes de clonado,
-conversiones de collation y sus lotes) **no** piden step-up.
+access.forbidden`, nunca este código. Las cinco cancelaciones (`POST .../cancel` de clonados, lotes de clonado,
+conversiones de collation, sus lotes y `/access-requests/{id}/cancel`) **no** piden step-up
+(`STEP_UP_EXEMPT` en `scripts/check_route_capabilities.py`).
 
 **Body** (`StepUpIn`): `{ "password": "<contraseña>" }` (1–200 caracteres).
 
@@ -2320,8 +2368,8 @@ curl -b cookies.txt -X POST https://<host>/api/v1/permission-profiles \
 
 ## 13. Administración: cifrado (`/admin/crypto`)
 
-Operaciones de administración del cifrado de credenciales. Requiere sesión. No toca los
-motores destino (opera sobre la BD de metadatos).
+Operaciones de administración del cifrado de credenciales. Requiere `policy.admin` (solo la global
+`security_officer`) y step-up. No toca los motores destino (opera sobre la BD de metadatos).
 
 ### `POST /api/v1/admin/crypto/rotate`
 
@@ -2384,8 +2432,14 @@ o `503` si no.
 | **Gestión de usuarios del motor** | ✅ Completada | Vista agrupada por username (`adopted`/`unmanaged`/`orphan`, `supports_hosts`), CRUD por identidad física (adoptados y no), agregar host (MySQL/MariaDB), revelar/definir contraseña, endpoints batch por username completo. |
 | **Comparación de esquemas** | ✅ Completada | Diff estructural entre dos BDs (mismo motor o MySQL↔MariaDB), adopción como versión de blueprint u ejecución directa, orden topológico de ejecución, cierre de dependencias de una selección parcial, linter de invariantes del plan. |
 | **Reconciliación de aplicaciones parciales** | ✅ Completada | DDL transaccional en PostgreSQL (elimina el estado parcial de raíz), auto-reconciliación configurable al fallar un `apply` en MySQL/MariaDB, endpoint dedicado de reconciliación manual. |
-| **Clonado de bases de datos** | ✅ Completada (backend) | Clonado de estructura y datos entre servidores/motores. **Sin guía de API para frontend todavía** — ver `docs/features/database-clone.md`. |
-| **Siguiente** | ⏳ Pendiente | Aprovisionamiento de servidores (Terraform/SSH), observabilidad/SSO, CI/CD, *production readiness*. Ver `docs/plans/`. |
+| **Clonado de bases de datos** | ✅ Completada | Clonado de estructura y datos entre servidores/motores, y lotes de N bases (`api-reference-v19.md`). Ver `docs/features/database-clone.md`. |
+| **Exportación** | ✅ Completada | Estructura y/o datos, multiformato, descarga en dos pasos (`api-reference-v10.md`). e2e contra motores reales pendiente (`TODO.md` P-01). |
+| **Consola SQL** | ✅ Completada | SQL ad-hoc con el usuario del motor elegido, historial con literales enmascarados para quien no puede ejecutar (`api-reference-v6.md`). |
+| **Collation** | ✅ Completada | Catálogo de charsets, conversión de una BD y en lote (`v7`, `v8`, `v17`). |
+| **Proyectos y entornos** | ✅ Completada | Agrupación de blueprints (`v16`) y entornos con política (`docs/features/environments.md`). |
+| **Servidor MCP** | 🟡 Parcial (v1) | Tokens de agente con techo de solo lectura; faltan las tools que leen el catálogo del motor (`api-reference-v23.md` §9). |
+| **Autorización multiusuario** | ✅ Completada | Roles y 32 capacidades, alcance por destino, capacidades puntuales, separación de deberes, segundo aprobador, ventana de arranque, step-up, lectura de auditoría y revocación de sesiones. Ver [§20](#20-autorización-dónde-está-cada-contrato) y `docs/features/authorization.md`. |
+| **Siguiente** | ⏳ Pendiente | Aprovisionamiento de servidores (Terraform/SSH), 2FA y SSO, cola durable de jobs, verificación e2e contra motores reales, *production readiness*. Ver `docs/plans/` y `TODO.md`. |
 
 > Los endpoints `/api/v1/test/*` que pueda exponer la app son **ejemplos de demostración
 > del template** y no forman parte de la API funcional del gateway; no están documentados
@@ -2919,6 +2973,36 @@ Cada alta, decisión y revocación escribe `audit_log`: `capability_grant.create
 `capability_grant.revoked`, `capability_grant.cancelled` y `capability_grant.expired`. Vencida y
 cancelada por pérdida de rol del solicitante se auditan con `actor_type="system"` (sin persona).
 Los rechazos por auto-otorgamiento, asignación y approve bloqueado quedan con `status` `failure`.
+
+---
+
+## 20. Autorización: dónde está cada contrato
+
+Esta sección **no repite** los contratos: dice dónde está cada uno. El modelo (roles, capacidades,
+capas, separación de deberes, step-up) está explicado en
+[`features/authorization.md`](features/authorization.md), que es el punto de partida.
+
+| Endpoints | Capacidad | Contrato |
+|---|---|---|
+| `GET /auth/me` | `self.read` | [§5](#get-apiv1authme); campos de autorización en `api-reference-v23.md` §1; `sod_warnings` en `api-reference-v29.md` §8.5; `bootstrap_window` en `v29` §10.4 |
+| `POST /auth/step-up`, `POST /auth/password` | `self.read` | [§5](#5-autenticación-auth) |
+| `GET /auth/sessions`, `POST /auth/sessions/revoke-others` | `self.read` | `api-reference-v23.md` §7.4 |
+| `GET /authz/catalog` | `self.read` | `api-reference-v23.md` §2 (campos `grantable`, `sensitive`, `implies` en la [§19](#19-capacidades-puntuales-gateway-usersidcapability-grants)) |
+| `GET /authz/scope-readiness` | `access.admin` | `api-reference-v23.md` §8 |
+| `GET /authz/sod-report` | `access.admin` | `api-reference-v29.md` §8.6 |
+| `/gateway-users` (listar, crear, detalle, `PATCH`, `PUT /{id}/access`, reinvitar) | `access.admin` | `api-reference-v24.md` §2; respuesta `202 access.elevation_pending` en `api-reference-v29.md` §9.3 |
+| `POST /gateway-users/invite/accept` | público | `api-reference-v24.md` §2.4 |
+| `GET /gateway-users/{id}/effective-access` | `access.admin` | [§19](#19-capacidades-puntuales-gateway-usersidcapability-grants) |
+| `GET /gateway-users/{id}/sessions`, `POST /gateway-users/{id}/sessions/revoke` | `access.admin` | `api-reference-v29.md` §11.5–§11.6 |
+| `/gateway-users/{id}/capability-grants`, `/capability-grants/pending`, `…/approve`, `…/reject` | `access.admin` | [§19](#19-capacidades-puntuales-gateway-usersidcapability-grants) |
+| `/access-requests/pending`, `/{id}`, `/{id}/approve`, `/{id}/reject`, `/{id}/cancel` | `access.admin` | `api-reference-v29.md` §9.4 |
+| `/api-tokens` (listar, crear, revocar) | `access.admin` | `api-reference-v24.md` §3 (y techo de agente en `api-reference-v23.md` §9) |
+| `GET /audit-log`, `GET /audit-log/{id}` | `policy.admin` | `api-reference-v29.md` §11.3–§11.4 |
+| `POST /admin/crypto/rotate` | `policy.admin` | [§13](#13-administración-cifrado-admincrypto) |
+
+Todas las rutas de esta tabla que no son `GET` piden step-up (salvo `…/cancel` y las de
+`self.read`, cuya capacidad no lo exige). `v23` y `v24` tienen pasajes **históricos** marcados en
+línea: ante una contradicción con `v29` o con `features/authorization.md`, mandan estos.
 
 ---
 

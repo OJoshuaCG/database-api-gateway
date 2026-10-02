@@ -463,8 +463,9 @@ revierte solo si nadie escribió por qué:
 
 - **La premisa era falsa acá.** El docstring lo justificaba con "un blueprint se replica sobre N BDs
   de dueños potencialmente distintos, y quien aplica sobre UNA tiene que saber". Esos dueños son los
-  `ServerUser` de las bases DESTINO; a nivel gateway hay un **administrador único**
-  (`app/core/auth.py`: "no gestiona múltiples usuarios", sin roles, sin `users.router` expuesto). La
+  `ServerUser` de las bases DESTINO; a nivel gateway había entonces un **administrador único**
+  (sin roles, sin `users.router` expuesto). *(Hoy el gateway es multiusuario: ver
+  `docs/features/authorization.md` y `TODO.md` `T-260824-lz-captura-multiusuario`.)* La
   misma persona activa `capture_selects`, aprueba `reviewed` y dispara el apply: no era un segundo
   par de ojos, solo un segundo momento.
 - **No dejaba rastro.** Pasar el flag **no se auditaba en ninguna parte**. Lo único auditado es la

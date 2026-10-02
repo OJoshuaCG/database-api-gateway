@@ -114,7 +114,8 @@ Tests: `tests/test_ssrf_guard.py`.
 
 ## Lo que está SÓLIDO (no re-litigar)
 Anti-inyección de identificadores (doble capa); no fuga de credenciales
-(`map_driver_error`, `ServerOut`); Argon2 + login `5/minute` + 401 genérico; guards de
+(`map_driver_error`, `ServerOut`); Argon2 + login `5/minute` (*hoy 20/min por IP, 5/min por IP +
+usuario y 20/h por usuario*) + 401 genérico; guards de
 arranque en prod para SECRET_KEY/ADMIN_PASSWORD/CORS; DROP con doble confirmación;
 readiness probe `/health/ready`; catálogo de privilegios validado (whitelist cerrada);
 251 tests verdes; cadena Alembic con una sola cabeza. **Grants granulares verificados

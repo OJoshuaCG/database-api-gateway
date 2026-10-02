@@ -62,7 +62,8 @@ no "4 de 12" se lee como lentitud en vez de como el diseño.
 
 ## 2. Endpoints
 
-Todos bajo `AdminDep`, envueltos en `ApiResponse[T]`.
+Todos envueltos en `ApiResponse[T]`. Cada ruta exige su capacidad `clones.*` y, si tiene destino, el
+alcance en él (antes `AdminDep`, retirado; ver `features/authorization.md`).
 
 | Método | Ruta | Límite | Qué hace |
 |---|---|---|---|

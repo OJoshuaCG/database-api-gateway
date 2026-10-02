@@ -192,7 +192,8 @@ Se aplica tanto al crear como al borrar (preview y delete).
 
 ## Seguridad
 
-- **Auth** obligatoria (`AdminDep`) y **rate limiting** en todos (create/preview 10/min,
+- **Capacidad** obligatoria con alcance en el servidor ([authorization.md](authorization.md);
+  borrar exige `databases.drop`, con step-up) y **rate limiting** en todos (create/preview 10/min,
   delete 3/min, users 30/min).
 - Todo identificador pasa por `validate_identifier` + `quote_identifier`; los valores
   (encoding/locale) por `quote_string_literal`; `datname`/`DB` en las lecturas van como

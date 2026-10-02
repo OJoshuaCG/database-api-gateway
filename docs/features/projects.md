@@ -52,8 +52,9 @@ destructivos del gateway: acá no se pierde nada que no se recupere con dos llam
 
 ## Endpoints
 
-Todos requieren sesión de admin (`AdminDep`) y ninguno toca un motor destino: es CRUD sobre
-la BD de metadatos del gateway.
+Leer exige `blueprints.read` y escribir `blueprints.write`; ninguno toca un motor destino: es CRUD
+sobre la BD de metadatos del gateway, por eso están en `SCOPE_EXEMPT` (sin capa 2). Ver
+[authorization.md](authorization.md).
 
 | Método | Ruta | Qué hace |
 | --- | --- | --- |

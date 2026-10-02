@@ -497,9 +497,17 @@ existe (`/api/v1/charset-collation-options?family=…`).
 
 ## Seguridad
 
-### Autorización: hay que decirlo con todas las letras
+### Autorización
 
-**El gateway no tiene autorización por objeto.** Hay una sola identidad —un admin único sembrado
+> **Vigente.** El gateway es multiusuario y autoriza por capacidad y por alcance
+> ([authorization.md](authorization.md)). Planear y ver es `exports.read`; generar el artefacto,
+> `exports.execute` (`operator` y `owner`); **descargar los datos en claro es `exports.download`**:
+> solo `owner` (o una capacidad puntual sensible, con segundo aprobador), con step-up, y con
+> alcance en el destino del export. Sobre eso, `_guard_owner` limita la descarga y el manifiesto
+> al autor del job (**403 `export.not_owner`**). Los párrafos que siguen explican el diseño
+> original, escrito cuando había un solo administrador; se conservan como registro.
+
+*(Histórico, al 2026-08-16:)* **El gateway no tiene autorización por objeto.** Hay una sola identidad —un admin único sembrado
 en el `lifespan`— y `AdminDep` es el único guard de todo el proyecto. `owner_id` de
 `ManagedDatabase` **no es un principal de acceso**: es un FK a `server_users`, o sea una cuenta
 del **motor**.

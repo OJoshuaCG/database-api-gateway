@@ -130,7 +130,8 @@ adoptada a medias). Omitir `model_version` = la BD llega "en ceros" (modo 1).
 
 ## Seguridad
 
-- Todos los endpoints exigen `AdminDep`; los identificadores pasan por validación anti-inyección
+- Cada endpoint exige su capacidad del gateway y, si tiene destino, el alcance en él
+  ([authorization.md](authorization.md); adoptar con stamp y aplicar exigen `blueprints.apply`); los identificadores pasan por validación anti-inyección
   antes de cualquier `SHOW CREATE`/consulta de catálogo; el `DEFINER` se sanea en el dump.
 - La adopción no ejecuta DDL de creación y audita con `touched_engine=false`.
 - Anti-SSRF: el host se revalida **al conectar** (no solo al registrar) — ver [conexión remota](remote-connections.md).

@@ -545,6 +545,9 @@ fallo grave: el epílogo es obligatorio cuando hay preámbulo.
 
 ### 9.1 Autorización: hay que decirlo con todas las letras (§13)
 
+> **Histórico — describe el estado al 2026-08-16; el modelo vigente está en [`docs/features/authorization.md`](../features/authorization.md).**
+> Hoy descargar es `exports.download` (solo `owner`, con step-up y alcance), además de `_guard_owner`.
+
 **El gateway no tiene autorización por objeto.** Hay una sola identidad —un admin único sembrado
 en el `lifespan`— y `AdminDep` es el único guard de todo el proyecto. `owner_id` de
 `ManagedDatabase` **no es un principal de acceso**: es un FK a `server_users`, o sea una cuenta
@@ -712,7 +715,7 @@ origen, `structure_drift_detected`, `deterministic` por objeto, y el **reporte d
 
 ## 11. Contratos de API
 
-Todos bajo `admin: AdminDep`. Todos devuelven `ApiResponse[T]` **salvo** `download` y `content`,
+Todos bajo `admin: AdminDep` (*histórico: hoy cada ruta exige su capacidad `exports.*`*). Todos devuelven `ApiResponse[T]` **salvo** `download` y `content`,
 que son descargas y lo dicen en su docstring (precedente: el `export` de schema-comparisons).
 
 | # | Método y ruta | Límite | Entrada → Salida |

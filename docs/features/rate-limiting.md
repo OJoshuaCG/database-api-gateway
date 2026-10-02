@@ -99,13 +99,17 @@ Para sobrescribir el límite global en un endpoint específico, se usa `@limiter
 
 > **Requisito**: el endpoint debe recibir `request: Request` como parámetro. SlowAPI lo necesita para leer la IP.
 
+> El login **no** usa solo un decorador: tiene 20/min por IP en el decorador y, dentro de la ruta,
+> 5/min por IP + usuario y 20/hora por usuario (`enforce_login_limits` en `app/core/limiter.py`).
+> Ver [authentication.md](authentication.md#seguridad).
+
 ```python
 from fastapi import Request
 from app.core.limiter import limiter
 
-@router.post("/login")
+@router.post("/ejemplo-sensible")
 @limiter.limit("5/minute")          # Más estricto: solo 5 intentos por minuto
-async def login(request: Request, credentials: LoginSchema):
+async def ejemplo_sensible(request: Request, payload: EjemploSchema):
     ...
 
 @router.get("/public-stats")

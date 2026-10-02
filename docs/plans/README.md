@@ -3,6 +3,13 @@
 Planes a futuro del proyecto. Cada documento es autocontenido: contexto, alcance,
 modelo de datos/endpoints, decisiones, riesgos, pasos y verificación.
 
+> **Estado a 2026-10-02:** además de lo que sigue, están implementados el clonado (plan 05), la
+> exportación (10), entornos y proyectos (11, features 1 y 2), el MCP v1 parcial (12) y la
+> autorización multiusuario (13, extendida: separación de deberes, segundo aprobador, step-up y
+> lectura de auditoría; ver [`docs/features/authorization.md`](../features/authorization.md)). La
+> tabla de abajo está al día; el párrafo siguiente es el estado a 2026-06-12 y se conserva como
+> registro.
+>
 > Estado a **2026-06-12**: **Iteraciones 1 y 2 completadas**. Iteración 1 (infra,
 > cifrado, capa de conexión remota multi-motor, adaptadores, modelo `Server`, auth de
 > sesión + admin, API de servers + introspección). Iteración 2 (inventario completo:
@@ -33,15 +40,15 @@ modelo de datos/endpoints, decisiones, riesgos, pasos y verificación.
 | 02 | [Migraciones de modelos (blueprints versionados)](02-migraciones-de-modelos.md) | 01 | ✅ Completado (implementado + auditoría remediada; e2e MySQL 8 / MariaDB 11 / PostgreSQL 16) |
 | 03 | [Aprovisionamiento de servidores (API/Terraform)](03-aprovisionamiento-servidores.md) | 01 | Pendiente |
 | 04 | [Instalación de motor vía SSH](04-instalacion-motor-ssh.md) | 03 | Pendiente |
-| 05 | [Clonado de bases de datos entre servidores](05-clonado-de-bases-de-datos.md) | 01, 02 | Pendiente |
+| 05 | [Clonado de bases de datos entre servidores](05-clonado-de-bases-de-datos.md) | 01, 02 | ✅ Implementado (clon de estructura y datos, y lotes de N bases; ver `docs/features/database-clone.md` y `api-reference-v19.md`) |
 | 06 | [Operación: seguridad, auditoría y observabilidad](06-operacion-seguridad-observabilidad.md) | transversal | 🟡 Continuo (auditoría base ✅) |
 | 07 | [Gestión granular de permisos (GRANT/REVOKE cross-engine)](07-gestion-granular-de-permisos.md) | 01 | ✅ Fase 1 completa (GRANT/REVOKE/LIST/GRANTABLE/PROVISION + perfiles + auditoría DCL granular + anti-lockout + CASCADE) — Fase 2/3 pendiente |
 | 08 | [Production readiness: estado y bloqueantes](08-production-readiness.md) | transversal | 🔴 NO listo (ver bloqueantes) |
 | 09 | [Adopción de BDs/usuarios existentes, reconciliación (drift) y snapshot estructural](09-adopcion-reconciliacion-y-snapshot.md) | 01, 02 | ✅ Implementado (F1–F4; 329 tests, seguridad sin bloqueantes) |
 | 10 | [Exportación de bases de datos (estructura y/o datos, multiformato)](10-exportacion-de-bases-de-datos.md) | 01, 09 | ✅ Implementado (F1–F6) — 🔴 **e2e contra motores reales escrito pero NUNCA ejecutado** (sin Docker) |
 | 11 | [Organización lógica (proyectos/entornos), copia de datos, releases y acceso para agentes (MCP)](11-organizacion-copia-de-datos-releases-y-mcp.md) | 01, 02, 05 | 📋 Propuesta parcial — features 1 (entornos) y 2 (proyectos) **ya implementadas**; la 3 parcialmente en el módulo de clon; **el §6 (MCP) está SUPERADO por el plan 12** |
-| 12 | [Servidor MCP de contexto de esquema para agentes de IA](12-mcp-contexto-de-esquema.md) | 11 (features 1 y 2, ya hechas) | 📋 Propuesta — sin implementar. Reemplaza al §6 del plan 11. Incluye 3 **bugs vivos** a arreglar antes (fuga de credenciales en `dump_structure`, `_safe_fetch` de PG, guard de metadatos ausente en `drop_database`) |
-| 13 | [Usuarios y autorización del gateway](13-usuarios-y-autorizacion-del-gateway.md) | — (lo fuerza el 12) | 📋 Propuesta — sin implementar. Incluye **5 huecos vivos** a arreglar antes: `test.py` con 7 endpoints sin autenticar (2 suben archivos), `server_controller` sin auditoría, `schema-comparisons/adopt` sin confirmación, `reveal-password` sin rate limit, `/manifest` sin `_guard_owner` |
+| 12 | [Servidor MCP de contexto de esquema para agentes de IA](12-mcp-contexto-de-esquema.md) | 11 (features 1 y 2, ya hechas) | 🟡 MCP v1 parcial: tokens, `POST /mcp`, gate por base y techo de solo lectura. Faltan las tools que leen el catálogo del motor (bloqueadas por Docker). Reemplaza al §6 del plan 11. Los 3 bugs previos que lista su §3 no se reverificaron en esta actualización |
+| 13 | [Usuarios y autorización del gateway](13-usuarios-y-autorizacion-del-gateway.md) | — (lo fuerza el 12) | ✅ Implementado y extendido (C1–C4, step-up, auditoría). El documento es histórico: el modelo vigente está en [`docs/features/authorization.md`](../features/authorization.md) |
 
 ## Diagrama de dependencias
 

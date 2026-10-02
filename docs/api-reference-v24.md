@@ -1,5 +1,11 @@
 # Administración de identidades: `/gateway-users`, tokens de agente y confirmaciones
 
+> **Histórico — describe el estado al 2026-09-14; el modelo vigente está en [`docs/features/authorization.md`](features/authorization.md).**
+> Sigue siendo el contrato de `/gateway-users` y `/api-tokens`, pero lo posterior está en
+> `api-reference-v29.md`: separación de deberes (409 `access.sod_conflict`), elevaciones con
+> segundo aprobador (`202 access.elevation_pending`), ventana de arranque, sesiones de otra persona
+> y lectura de auditoría. Los pasajes que cambiaron están marcados **[Histórico]**.
+
 Addendum hermano de `api-reference-v23.md`. Aquel publicó el **modelo** de capacidades —qué
 existe, quién lo tiene, cómo llega el 403— y cerró diciendo que `/gateway-users` y `/api-tokens`
 todavía no existían. Este documento cubre justamente eso: los módulos que hacen **usable** ese
@@ -60,7 +66,8 @@ Lo que hay que saber para adaptarlo:
 
 ## 2. `/gateway-users` — administración de usuarios del gateway
 
-Siete endpoints. **Todos detrás de `access.admin`** —que solo tiene la capacidad global
+Siete endpoints (**[Histórico]** hoy son más: capacidades puntuales, acceso efectivo y sesiones;
+ver `api-reference.md` §20). **Todos detrás de `access.admin`** —que solo tiene la capacidad global
 `access_admin`: ni el rol `owner` ni `security_officer` (v23 §5, v29)— **excepto aceptar la
 invitación**, que es público. Antes de v29 era `gateway.admin`, que también tenía
 `security_officer`.
@@ -224,7 +231,8 @@ como editable y fallar después es peor que no ofrecerlo.
 Dos efectos secundarios que la pantalla tiene que anticipar:
 
 - **Cambiar el rol o desactivar tacha las sesiones de esa persona.** Si un administrador se edita
-  a sí mismo el rol, vuelve al login. Conviene advertirlo antes de enviar.
+  a sí mismo el rol, vuelve al login. Conviene advertirlo antes de enviar. **[Histórico]** Hoy
+  nadie cambia su propio rol, acceso ni estado: `409 access.self_modification_forbidden`.
 - **Desactivar al último `access_admin` activo devuelve 409** (§2.9).
 
 ### 2.6 ⚠️ `PUT /{user_id}/access` — reemplazo TOTAL, no incremental
@@ -245,6 +253,11 @@ Es la trampa más cara del documento.
 > enviarlo vacío REVOCA todo.** No hay diferencia entre "no lo mandé" y "quiero que quede sin
 > nada": un `PUT` con `{"global_capabilities": ["access_admin"]}` y sin `scope_grants` **borra
 > todos los alcances de la persona**, en silencio y con 200.
+>
+> **[Histórico]** Lo del reemplazo total sigue valiendo, pero la respuesta ya no es siempre `200`:
+> si el cambio **eleva** (rol `owner`, una global), la parte que eleva queda pendiente de un
+> segundo `access_admin` y la respuesta es `202 access.elevation_pending` (`api-reference-v29.md`
+> §9.3). Las bajas se aplican siempre en el acto.
 >
 > La única forma segura de usar este endpoint es **leer el estado actual, modificarlo entero y
 > reenviarlo completo**. Un formulario que envíe solo la sección que el usuario tocó destruye la

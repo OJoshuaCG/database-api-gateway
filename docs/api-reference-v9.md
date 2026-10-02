@@ -102,6 +102,10 @@ migración una vez no es lo mismo que autorizar la extracción de filas de *esta
 
 **Actor:** el admin único del gateway (sesión admin por cookie). No hay roles ni multi-tenant.
 
+> **Nota (vigente):** el gateway ya es multiusuario. Cada endpoint de este addendum exige una
+> capacidad del catálogo y, si tiene destino, el alcance en ese destino. Ver
+> [`features/authorization.md`](features/authorization.md).
+
 ---
 
 ## 1. Alcance: qué cubre y qué NO cubre

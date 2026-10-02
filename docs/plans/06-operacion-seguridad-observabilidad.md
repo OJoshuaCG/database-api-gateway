@@ -21,7 +21,7 @@ aprovisionar, clonar) debe quedar registrada de forma inmutable.
 | Campo | Notas |
 |---|---|
 | `id`, `created_at` | |
-| `actor` | admin que ejecutó (de `get_current_admin`) |
+| `actor` | admin que ejecutó (de `get_current_admin`; hoy el `Actor` de la ruta, persona o token) |
 | `action` | `server.create`, `db.drop`, `user.grant`, `migration.apply`, ... |
 | `target_type` / `target_id` | recurso afectado |
 | `server_id` | servidor destino (si aplica) |
@@ -47,6 +47,10 @@ Las operaciones largas (migraciones masivas, aprovisionamiento, instalación SSH
   Ya existe la variable `RATE_LIMIT_REDIS_*`; Redis podría reutilizarse.
 
 ## 3. Autenticación: migración a OIDC/SSO (cuando la empresa lo requiera)
+
+> **Histórico — describe el estado al 2026-06-12; el modelo vigente está en [`docs/features/authorization.md`](../features/authorization.md).**
+> Ya hay usuarios nominales, roles y capacidades; `get_current_admin` se retiró y la resolución de
+> sesión es `authenticated_session()` (`app/core/auth.py`). SSO sigue pendiente.
 
 La auth actual (sesión + admin único) está detrás de `get_current_admin`. Para SSO:
 - Integrar **Authlib** con el IdP corporativo (Google Workspace / Entra ID / Authentik / Keycloak).

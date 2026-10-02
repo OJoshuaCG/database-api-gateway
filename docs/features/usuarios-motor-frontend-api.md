@@ -1,5 +1,10 @@
 # Gestión de usuarios del motor — Documentación de API para Frontend
 
+> **Histórico — describe el estado al 2026-07-20; el modelo vigente está en [`docs/features/authorization.md`](authorization.md).**
+> El contrato de estos endpoints está consolidado en `docs/api-reference.md` §7. Lo que dice abajo
+> sobre "single-admin" ya no vale: cada acción exige una capacidad (`engine_users.read`, `.write`,
+> `.drop`, `.secrets`, `.credentials`) en el servidor destino, y la UI decide con `/auth/me`.
+
 > Vista agrupada + CRUD por identidad física de los usuarios de un servidor de base de
 > datos gestionado por el gateway. Esta guía está orientada al equipo **frontend**:
 > explica **qué cambió**, **por qué**, el **contrato** de cada endpoint y el **flujo**
@@ -63,7 +68,7 @@ el frontend debería **migrar a la vista agrupada** para el listado principal.
 - **Autenticación**: sesión de **admin** por cookie. Login en `POST /api/v1/auth/login`.
   Sin sesión válida → **401** en cualquier endpoint.
 - **Prefijo**: todos los paths cuelgan de `/api/v1`.
-- **Modelo de usuario único (single-admin)**: no hay roles ni multi-tenant. Cualquier admin
+- **Modelo de usuario único (single-admin)** *[histórico]*: no hay roles ni multi-tenant. Cualquier admin
   autenticado tiene acceso pleno; no hay que ocultar acciones por permisos de usuario.
 
 ---
@@ -836,8 +841,8 @@ flowchart TD
 - **Paginación** — `GET /users/grouped` devuelve el conjunto agrupado del servidor (no
   paginado). Si un servidor tuviera muchísimos usuarios, considera filtrado/búsqueda en
   cliente. El inventario (`GET /server-users`) sí es paginado (`?page=&size=`, offset).
-- **Permisos** — single-admin: no hay que ocultar acciones por rol de usuario; todo admin
-  autenticado puede ejecutarlas.
+- **Permisos** *[histórico]* — single-admin: no hay que ocultar acciones por rol de usuario; todo admin
+  autenticado puede ejecutarlas. Hoy: ver el banner del principio.
 
 ### Consideraciones de UX para operaciones **batch** (adopt-all-hosts / define-password / password-all-hosts)
 

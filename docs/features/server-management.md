@@ -47,7 +47,10 @@ routes/v1/servers.py  →  controllers/server_controller.py  →  ORM (Server)  
 
 ## Endpoints
 
-> Todos requieren sesión de administrador (dependencia `AdminDep`).
+> Cada ruta exige una capacidad del gateway ([authorization.md](authorization.md)): leer el
+> inventario y probar la conexión es `servers.read`; registrar, editar y dar de baja un servidor es
+> `servers.admin`, que solo tiene la global `security_officer` (con step-up). La introspección usa
+> la lectura del módulo que expone (`databases.read`, `engine_users.read`).
 
 ### CRUD (solo BD del gateway)
 

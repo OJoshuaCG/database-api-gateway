@@ -542,7 +542,9 @@ destino dentro del proceso; las fases DDL usan el advisory lock del motor
 
 ## Seguridad
 
-- Todo detrás de `AdminDep`. Identificadores validados+quoteados; valores de datos siempre
+- Cada ruta exige `clones.read` o `clones.execute` (solo `owner`, divulga y con step-up), con
+  alcance en **los dos extremos** al crear y ejecutar ([authorization.md](authorization.md)).
+  Cancelar no pide step-up. Identificadores validados+quoteados; valores de datos siempre
   parametrizados. `confirm_token` (SHA256 del plan exacto) + `confirm_target_name` +
   anti-TOCTOU (`source_fingerprint`). `record_intent` fail-closed ANTES de tocar el motor.
   Credenciales pseudo-root solo en memoria (`ServerTarget`), nunca logueadas; errores limpiados

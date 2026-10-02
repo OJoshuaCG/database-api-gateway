@@ -70,7 +70,7 @@ El sistema separa dos planos:
 | **Multi-motor** | Adaptadores para MySQL, MariaDB y PostgreSQL tras una interfaz común |
 | **Seguridad SQL** | Validación + quoting de identificadores (anti-inyección); valores parametrizados o escapados |
 | **Credenciales** | Cifrado en reposo con Fernet derivado de `SECRET_KEY` |
-| **Autenticación** | Sesión httpOnly firmada + administrador único, detrás de `get_current_admin` |
+| **Autenticación y autorización** | Multiusuario: sesiones server-side con cookie httpOnly firmada, CSRF, roles (`viewer`/`operator`/`owner`) y 32 capacidades con alcance por entorno o servidor, separación de deberes, segundo aprobador, step-up y auditoría. Ver [Autorización](docs/features/authorization.md) |
 | **Base (template)** | `ApiResponse[T]`, `AppHttpException`, middlewares, rate limiting, paginación, logging con Request ID |
 
 > Ya implementado además de la Iteración 1: inventario de usuarios/BDs/blueprints,
@@ -121,8 +121,11 @@ uv run alembic upgrade head          # crea las tablas del inventario + admin
 uv run uvicorn main:app --reload
 ```
 
-Al arrancar se **siembra el administrador** desde `ADMIN_USERNAME`/`ADMIN_PASSWORD`
-si no existe.
+En una instalación **vacía**, el arranque siembra `ADMIN_USERNAME`/`ADMIN_PASSWORD` como
+**administrador de accesos** (`viewer` + `access_admin`): no opera bases ni edita servidores.
+Durante la ventana de arranque (72 h) crea el `security_officer`, el `owner` y un segundo
+`access_admin`. Con usuarios ya creados no siembra ni repara nada (ver
+[Autenticación](docs/features/authentication.md#primer-arranque-la-ventana-de-arranque)).
 
 ### 4. Usar la API
 
@@ -152,13 +155,15 @@ curl -b cookies.txt http://localhost:8000/api/v1/servers/1/databases
 
 ## API v1
 
-Todos los endpoints (salvo `login`) requieren sesión de administrador.
+Todos los endpoints (salvo `login` y la aceptación de invitación) requieren sesión, y cada uno
+exige una **capacidad** del gateway ([Autorización](docs/features/authorization.md)). Tabla
+parcial; la referencia completa es [`docs/api-reference.md`](docs/api-reference.md).
 
 | Método | Ruta | Descripción | Toca el motor |
 |---|---|---|---|
-| POST | `/api/v1/auth/login` | Inicia sesión (rate-limit 5/min) | — |
+| POST | `/api/v1/auth/login` | Inicia sesión (20/min por IP · 5/min por IP + usuario · 20/h por usuario) | — |
 | POST | `/api/v1/auth/logout` | Cierra sesión | — |
-| GET | `/api/v1/auth/me` | Admin actual | — |
+| GET | `/api/v1/auth/me` | Usuario actual, capacidades efectivas y estado del step-up | — |
 | GET | `/api/v1/servers` | Lista servidores (paginado) | no |
 | POST | `/api/v1/servers` | Registra un servidor | no |
 | GET | `/api/v1/servers/{id}` | Detalle (sin credencial) | no |
@@ -209,7 +214,8 @@ database-api-gateway/
 │   ├── core/
 │   │   ├── crypto.py          ✚ Cifrado Fernet de credenciales
 │   │   ├── remote_engine.py   ✚ Conexión dinámica a servidores destino
-│   │   ├── auth.py            ✚ Sesión + get_current_admin + bootstrap admin
+│   │   ├── auth.py            ✚ Sesión server-side + siembra/recuperación del admin de accesos
+│   │   ├── authz.py / scope.py / step_up.py   Capacidades, alcance por destino y step-up
 │   │   ├── database.py          Conexión a la BD de metadatos del gateway (singleton)
 │   │   ├── environments.py      Variables de entorno centralizadas
 │   │   ├── limiter.py / logger.py / context.py / versioned_app.py
@@ -263,7 +269,8 @@ introspección contra MySQL/PostgreSQL reales debe validarse en tu entorno
 - [Gestión de servidores e introspección](docs/features/server-management.md)
 - [Capa de conexión remota y adaptadores](docs/features/remote-connections.md)
 - [Cifrado de credenciales](docs/features/encryption.md)
-- [Autenticación (sesión + admin)](docs/features/authentication.md)
+- [Autenticación (sesiones, arranque y step-up)](docs/features/authentication.md)
+- [Autorización (roles, capacidades y controles)](docs/features/authorization.md)
 
 ### Base (template)
 - [Inicio Rápido](docs/getting-started.md) · [Estructura](docs/project-structure.md)

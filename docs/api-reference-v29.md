@@ -83,6 +83,9 @@ globales: no acuña nada.
 El techo de otorgamiento, el usuario sembrado y los flujos de aprobación siguen exactamente igual.
 La regla de separación de deberes llega en C2 (sección 8).
 
+> **Vale solo hasta C3/C4.** El techo de otorgamiento se retiró en C3 (§9) y la siembra cambió en
+> C4 (§10). Estado vigente en [`features/authorization.md`](features/authorization.md).
+
 ## 8. C2 — Regla de separación de deberes
 
 ### 8.1 La regla
@@ -186,6 +189,9 @@ una regla sin excepción. Sin step-up (es un `GET` que no divulga). `security_of
 
 La siembra (sigue `owner` + las dos globales, heredada). El techo de otorgamiento y los flujos de
 aprobación cambian en C3 (§9); la siembra nueva, C4.
+
+> **Vale solo hasta C3/C4.** Hoy no hay techo por tenencia (§9) y una instalación nueva siembra
+> `viewer` + `access_admin` (§10); la cuenta combinada sobrevive solo como herencia.
 
 ## 9. C3 — Política de asignación y segundo aprobador
 

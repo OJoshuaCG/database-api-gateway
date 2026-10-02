@@ -1,5 +1,7 @@
 # Plan de Frontend — Snapshot selectivo (blueprint desde una BD existente)
 
+> **Histórico — describe el estado al 2026-07-13; el modelo vigente está en [`docs/features/authorization.md`](../features/authorization.md).** Las menciones a «admin único» o «single-admin» ya no valen: el gateway es multiusuario y la UI habilita cada acción según las capacidades de `/auth/me`.
+
 > Plan de implementación de frontend **tecnológicamente neutro**. No contiene código,
 > frameworks, librerías ni decisiones de arquitectura frontend. Describe **qué** construir,
 > **qué** validar, **qué** estados manejar y **cómo** navegar. El contrato de API es

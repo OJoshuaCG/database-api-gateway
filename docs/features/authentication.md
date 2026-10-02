@@ -1,22 +1,31 @@
-# Autenticación (sesión + administrador)
+# Autenticación (sesiones, arranque y step-up)
 
-El gateway es una herramienta **interna**: no gestiona múltiples usuarios, a lo sumo un
-**administrador** único. La autenticación usa una **cookie de sesión httpOnly firmada**
-y toda la lógica de "quién está autenticado" pasa por una única dependencia,
-`get_current_admin`, para poder migrar a SSO en el futuro sin tocar los endpoints.
+El gateway es **multiusuario**: cada persona tiene un rol (`viewer`/`operator`/`owner`, también por
+entorno o servidor), puede tener las globales `access_admin` o `security_officer`, y cada endpoint
+exige una capacidad. Este documento cubre la **autenticación** (quién es): sesión, siembra,
+ventana de arranque, recuperación, step-up y sesiones. La **autorización** (qué puede hacer) está
+resumida en [authorization.md](authorization.md).
 
-Módulos: `app/core/auth.py`, `app/utils/security.py`, `app/routes/v1/auth.py`,
+La sesión vive del lado del servidor (`gateway_sessions`) y la cookie httpOnly firmada lleva solo
+el `sid`. Toda resolución de sesión pasa por `authenticated_session()` (`app/core/auth.py`), y de
+ahí cuelgan `get_current_actor` (`app/core/authz.py`) para las rutas y la autenticación por token
+del MCP: un solo punto, para que dos chequeos de sesión no diverjan.
+
+Módulos: `app/core/auth.py`, `app/core/session_store.py`, `app/core/step_up.py`,
+`app/core/limiter.py`, `app/utils/security.py`, `app/routes/v1/auth.py`,
 `app/controllers/auth_controller.py`.
 
 ## Piezas
 
 | Pieza | Rol |
 |---|---|
-| `SessionMiddleware` (Starlette) | Cookie de sesión firmada con `itsdangerous`. Se añade en `create_versioned_app()`. |
+| `SessionMiddleware` (Starlette) | Cookie firmada con `itsdangerous` que transporta solo el `sid`. Se añade en `create_versioned_app()`. |
+| `app/core/session_store.py` | Sesiones server-side (`gateway_sessions`): alta, resolución, vencimiento, revocación con motivo y ventana de step-up. |
 | `app/utils/security.py` | Hashing de password con **Argon2id** (`hash_password`, `verify_password`). |
 | `bootstrap_admin()` | Siembra el administrador de accesos de una instalación vacía (lifespan) desde `ADMIN_USERNAME`/`ADMIN_PASSWORD`; con `ADMIN_RECOVERY=1`, lo recupera. |
 | `app/services/bootstrap_window.py` | Ventana de arranque: el único `access_admin` eleva sin segundo aprobador hasta que exista otro. |
-| `get_current_admin` | Dependencia que exige sesión válida; devuelve `{id, username}`. |
+| `authenticated_session()` | Resuelve la cookie a `(usuario, sesión)` o `401 auth.session_<motivo>`. Relee el usuario en cada request: desactivarlo corta en el acto. |
+| `get_current_actor` / `require()` (`app/core/authz.py`) | Arman el `Actor` (rol, globales, alcances, capacidades) y exigen la capacidad. **No hay dependencia que solo verifique sesión**: `AdminDep` y `get_current_admin` se retiraron. |
 | `AuthController` | Verifica credenciales contra la tabla `users`. |
 
 ## Flujo
@@ -25,12 +34,13 @@ Módulos: `app/core/auth.py`, `app/utils/security.py`, `app/routes/v1/auth.py`,
 POST /auth/login ──▶ AuthController.authenticate (Argon2 verify)
                        │ éxito
                        ▼
-                 login_session(request, admin)   → request.session["admin_id"] = id
-                       │
-        cookie "gw_session" (httpOnly, firmada)  ◀── se envía al cliente
+                 login_session(request, user)   → fila nueva en gateway_sessions
+                       │                          request.session["sid"] = sid (rota)
+        cookie de sesión (httpOnly, firmada, solo el sid)  ◀── se envía al cliente
 
-GET /servers (con cookie) ──▶ get_current_admin lee la sesión, recarga el usuario,
-                              verifica is_active → 401 si algo falla
+GET /servers (con cookie) ──▶ require(servers.read): authenticated_session resuelve el sid,
+                              relee el usuario (is_active), arma el Actor y exige la
+                              capacidad → 401 sin sesión válida, 403 sin la capacidad
 ```
 
 ### Bootstrap del administrador
@@ -124,27 +134,33 @@ arranque que deja a una instalación nueva crear su segundo `access_admin`, en �
 > autorizar, así que no era "todavía no hay permisos" sino un sistema multiusuario sin puerta.
 > Retirarlo no cambió el contrato: `AdminOut` sigue siendo `{id, username}`.
 
-### La dependencia `get_current_admin`
+### Cómo se protege un endpoint
+
+No hay una dependencia "solo sesión": se retiró (`AdminDep`) para que un endpoint copiado de uno
+viejo **falle al importar** en vez de nacer autenticado y sin autorizar. Cada ruta declara una
+capacidad con los alias de `app/core/authz.py`:
 
 ```python
-from app.core.auth import AdminDep   # = Annotated[dict, Depends(get_current_admin)]
+from app.core.authz import ServersRead
 
 @router.get("/algo")
-def endpoint(admin: AdminDep):
-    # admin == {"id": 1, "username": "admin"}
+def endpoint(actor: ServersRead):   # = Depends(require(Capability.SERVERS_READ))
     ...
 ```
 
-- Lee `request.session["admin_id"]`; si no hay → `AppHttpException(401)`.
-- Recarga el usuario de la BD y verifica `is_active` (revocación efectiva: desactivar
-  el usuario invalida la sesión en el siguiente request).
+Las rutas con destino usan `require_at(...)` (capa 2). `scripts/check_route_capabilities.py`
+exige que toda ruta declare una capacidad. Detalle en [authorization.md](authorization.md).
 
 ## Endpoints
 
 ```http
-POST /api/v1/auth/login     # {username, password} → set-cookie; rate-limit 5/min
-POST /api/v1/auth/logout    # limpia la sesión
-GET  /api/v1/auth/me        # admin actual
+POST /api/v1/auth/login                  # {username, password} → set-cookie; límites abajo
+POST /api/v1/auth/logout                 # tacha la sesión y borra la cookie
+GET  /api/v1/auth/me                     # identidad, capacidades efectivas, step-up, avisos
+POST /api/v1/auth/password               # cambiar la propia contraseña
+POST /api/v1/auth/step-up                # confirmar la contraseña (abre la ventana)
+GET  /api/v1/auth/sessions               # las sesiones vivas propias
+POST /api/v1/auth/sessions/revoke-others # cierra las propias menos la actual
 ```
 
 **Login:**
@@ -165,7 +181,10 @@ no revelar si el usuario existe.
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=              # OBLIGATORIO en producción (sin él, no se siembra admin)
 SESSION_SECRET=             # firma de la cookie; si vacío, se deriva de SECRET_KEY
-SESSION_MAX_AGE=28800       # duración de la sesión en segundos (8h)
+SESSION_MAX_AGE=28800       # max_age de la cookie en segundos (8h)
+SESSION_ABSOLUTE_MAX_HOURS=12  # vida absoluta de la sesión server-side
+SESSION_IDLE_MINUTES=60     # vencimiento por inactividad
+LOGIN_USERNAME_RATE_LIMIT=20/hour  # tope por cuenta desde cualquier IP; vacío lo apaga
 SESSION_COOKIE_SECURE=      # vacío = sigue a APP_ENV=="production"; True/False la desacopla
 STEP_UP_ENFORCED=True       # exige contraseña fresca para las capacidades con step-up
 STEP_UP_TTL_SECONDS=300     # duración de la ventana de step-up (login o POST /auth/step-up)
@@ -196,8 +215,14 @@ mientras se termina de configurar HTTPS, nunca como configuración final.
 
 ## Seguridad
 
-- **Hashing Argon2id** (recomendado por OWASP) para el password del admin.
-- **Rate limiting** en `login` (`@limiter.limit("5/minute")`) contra fuerza bruta.
+- **Hashing Argon2id** (recomendado por OWASP) para las contraseñas de los usuarios del gateway.
+- **Rate limiting de login en tres ejes** (`app/core/limiter.py`): 20/min por IP (decorador de la
+  ruta), **5/min por IP + usuario normalizado** y 20/hora por usuario desde cualquier IP
+  (`LOGIN_USERNAME_RATE_LIMIT`). Cuentan todos los intentos y el límite corre antes de verificar
+  la contraseña. Nunca por `sid`: rotar cookies no da cupo nuevo. El tope por cuenta es un DoS de
+  bloqueo aceptado y declarado en el docstring de `enforce_login_limits`.
+- **CSRF**: todo método no seguro con cookie exige `X-CSRF-Token` derivado del `sid` y un `Origin`
+  permitido (`app/core/csrf.py`).
 - **No-fuga en logs:** el body de `/auth/login` se oculta por completo en el
   `LoggerMiddleware`, y los campos sensibles se enmascaran en cualquier otro endpoint
   (ver [logging](logging.md)).
@@ -218,11 +243,12 @@ Las capacidades marcadas `requires_step_up` en el catálogo (`/authz/catalog`; l
   `download`, capturas de SELECT), **o** método desconocido (fail-closed). Un `GET` que no
   divulga —listar usuarios del gateway, el `delete-plan` de una versión— no lo pide.
 - **Excepción: cancelar no pide step-up.** Frenar una operación destructiva nunca puede costar
-  más que lanzarla. Son exactamente cuatro rutas, todas `POST .../cancel`: clonado
-  (`/database-clones/{job_id}/cancel`), lote de clonado
+  más que lanzarla. Son las rutas de `STEP_UP_EXEMPT` —hoy **cinco**, todas `POST .../cancel`—:
+  clonado (`/database-clones/{job_id}/cancel`), lote de clonado
   (`/database-clone-batches/{batch_id}/cancel`), conversión de collation
-  (`/collation-conversions/{job_id}/cancel`) y lote de conversión
-  (`/database-models/{model_id}/collation-conversions/{batch_id}/cancel`). La cancelación de una
+  (`/collation-conversions/{job_id}/cancel`), lote de conversión
+  (`/database-models/{model_id}/collation-conversions/{batch_id}/cancel`) y retirar una elevación
+  propia pendiente (`/access-requests/{request_id}/cancel`, que nunca da acceso). La cancelación de una
   exportación usa `exports.execute`, que no exige step-up. **Las capas 1 y 2 siguen valiendo**:
   sin la capacidad en ese destino, `403 access.forbidden`. La exención se declara con
   `step_up=False` en `require`/`require_at` y tiene que figurar, con su motivo, en
@@ -274,15 +300,17 @@ sí mismo. Contrato completo de las dos piezas en `api-reference-v29.md` §11.
 
 ## Migración a SSO (futuro)
 
-Como todos los endpoints dependen de `get_current_admin`, sustituir el mecanismo por
-**OIDC/SSO corporativo** (Authlib + IdP) o añadir roles no requiere cambiar los
-endpoints. Ver [plan 06](../plans/06-operacion-seguridad-observabilidad.md).
+Toda resolución de sesión pasa por `authenticated_session()`, así que sustituir el login por
+**OIDC/SSO corporativo** (Authlib + IdP) se concentra ahí y en `login_session`: los endpoints
+declaran capacidades y no dependen de cómo se autenticó la persona. Habría que mapear identidades
+del IdP a filas de `users` (rol, globales y alcances siguen siendo del gateway). Ver
+[plan 06](../plans/06-operacion-seguridad-observabilidad.md).
 
 ## Pruebas
 
 `tests/test_api_auth.py` (login/logout/me, 401 sin sesión, credenciales inválidas,
-validación) y `tests/test_security.py` (Argon2). El rate-limit se verifica en vivo
-(5 × 200 → 429).
+validación), `tests/test_security.py` (Argon2), `tests/test_session_lifecycle.py` (sesiones
+server-side) y `tests/test_step_up.py` (step-up).
 
 ---
 

@@ -56,7 +56,10 @@ routes/v1/managed_databases.py    →  controllers/managed_migration_controller.
 
 ## Endpoints
 
-> Todos requieren sesión de administrador (`AdminDep`).
+> Cada ruta exige su capacidad del gateway ([authorization.md](authorization.md)): leer es
+> `blueprints.read`; escribir versiones (autoría) es `blueprints.write`; aplicar, revertir,
+> stampear o reconciliar sobre una base real es `blueprints.apply` (solo `owner`, con step-up), con
+> alcance en esa base.
 
 ### Migraciones del blueprint (solo BD del gateway)
 
@@ -865,10 +868,11 @@ importa, porque "agregar una confirmación más" siempre suena a mejora:
 
 - **La premisa no aplicaba.** Se justificaba con *"un blueprint se replica sobre N BDs de dueños
   potencialmente distintos, y quien aplica sobre UNA tiene que saber"*. Esos dueños son los
-  `ServerUser` de las bases **destino**; a nivel gateway hay un **administrador único**
-  (`app/core/auth.py`: "no gestiona múltiples usuarios", sin roles ni permisos). La misma
-  persona activa la captura, aprueba `reviewed` y dispara el apply: no era un segundo par de
-  ojos, solo un segundo momento.
+  `ServerUser` de las bases **destino**; a nivel gateway había entonces un **administrador único**
+  (sin roles ni permisos). La misma persona activa la captura, aprueba `reviewed` y dispara el
+  apply: no era un segundo par de ojos, solo un segundo momento. *(Premisa histórica: hoy el
+  gateway es multiusuario —[authorization.md](authorization.md)— y la reintroducción de un gate
+  está anotada en `TODO.md` `T-260824-lz-captura-multiusuario`.)*
 - **No dejaba rastro.** Pasar el flag **no se auditaba**. Lo único auditado es la escritura
   efectiva, que ocurre con o sin gate — o sea, fricción sin evidencia forense. (El guard de
   entorno, en cambio, sí registra `migration.environment_denied` al rechazar.)

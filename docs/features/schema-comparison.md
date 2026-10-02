@@ -369,7 +369,9 @@ confirma. Un índice **no único** redefinido se confirma; uno único no.
 
 ## Endpoints
 
-> Todos requieren sesión de administrador (`AdminDep`). 🔌 = tocan el motor destino
+> Cada ruta exige su capacidad del gateway: comparar y ver es `schema_diff.read`; adoptar o
+> ejecutar el DDL es `schema_diff.execute` (solo `owner`, con step-up), con alcance en ambas bases
+> ([authorization.md](authorization.md)). 🔌 = tocan el motor destino
 > (solo lectura salvo `adopt`/`execute`).
 
 | Método | Ruta | Qué hace |
