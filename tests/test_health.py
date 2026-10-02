@@ -51,10 +51,9 @@ def test_health_endpoints_send_cors_header(client):
         # no su codificación: son dos formas válidas de lo mismo y cuál sale depende de la
         # config, no del middleware.
         #
-        # Con `CORS_ORIGINS="*"` —el default de `environments.py` y lo que hay en el
-        # entorno de test, que no lo fija— Starlette responde `*`; con una lista EXPLÍCITA
-        # refleja el origin. La aserción original exigía el reflejo, así que estaba roja
-        # con la única config bajo la que corre. No se puede cubrir la otra forma acá: el
+        # Con `CORS_ORIGINS="*"` —el default de `environments.py`— Starlette responde `*`;
+        # con una lista EXPLÍCITA (la que fija `tests/conftest.py`) refleja el origin.
+        # No se puede cubrir la otra forma acá: el
         # middleware se construye al importar `main` con el valor ya leído, así que
         # cambiar la variable después no lo afecta.
         #

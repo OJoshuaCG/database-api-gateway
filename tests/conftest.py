@@ -21,6 +21,12 @@ os.environ.update(
         "ADMIN_USERNAME": "admin",
         "ADMIN_PASSWORD": "admin123",
         "APP_ENV": "development",
+        # Lista EXPLÍCITA de orígenes, igual que en producción. Sin fijarla, CORS_ORIGINS cae
+        # al default "*" de environments.py (o a lo que traiga el .env local de cada uno, que
+        # load_dotenv no pisa sobre os.environ), y con "*" el chequeo de Origin del CSRF y del
+        # MCP no tiene lista contra la que validar: los tests de "origen ajeno → 403" quedaban
+        # verdes o rojos según la máquina. localhost:5173 es la SPA en desarrollo.
+        "CORS_ORIGINS": "http://localhost:5173",
         "LOGGER_MIDDLEWARE_ENABLED": "False",
         "LOGGER_EXCEPTIONS_ENABLED": "False",
         # Los tests registran servidores con 127.0.0.1 como dummy; el guard anti-SSRF
