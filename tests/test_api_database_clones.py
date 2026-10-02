@@ -691,3 +691,21 @@ def test_el_asistente_de_a_una_NO_cachea_el_snapshot_del_origen(admin_client, mo
     assert fake.snapshot_calls.count("src_db") >= 1, (
         "preview volvió a usar una foto vieja: la caché del lote se filtró al asistente de a una"
     )
+
+
+def test_clone_job_error_is_sanitized_before_persisting():
+    """El error del job y de cada sentencia se persiste: no puede llevar valores de filas."""
+    import pymysql
+    from sqlalchemy.exc import IntegrityError
+
+    from app.controllers.clone_controller import CloneController
+
+    exc = IntegrityError(
+        "INSERT INTO usuarios …", {},
+        pymysql.err.IntegrityError(
+            1062, "Duplicate entry 'alice@example.com' for key 'usuarios.email'"
+        ),
+    )
+    msg = CloneController._clean_error(exc)
+    assert "alice@example.com" not in msg
+    assert "usuarios.email" in msg

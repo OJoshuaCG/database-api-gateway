@@ -72,7 +72,7 @@ from app.models.clone_job import (
 from app.models.enums import EngineType, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.server_user import ServerUser
-from app.services import audit, charset_catalog
+from app.services import audit, charset_catalog, engine_error_catalog
 from app.services.db_admin import clone_dependencies as cdeps
 from app.services.db_admin import clone_spec as cspec
 from app.services.db_admin import export_spec as espec
@@ -2101,8 +2101,15 @@ class CloneController:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _clean_error(exc: Exception) -> str:
-        orig = getattr(exc, "orig", None)
-        return str(orig if orig is not None else exc)[:500]
+        """
+        Mensaje SANEADO que se persiste en el job y en el resultado de cada sentencia.
+
+        El texto nativo del motor incrusta valores de filas (``Duplicate entry 'alice@x.com'…``);
+        el crudo va SOLO al log, con el Request ID. Las reglas viven en ``engine_error_catalog``.
+        """
+        pub = engine_error_catalog.from_exception(exc)
+        engine_error_catalog.log_raw(logger, exc, pub, where="clone")
+        return pub.message
 
     def abort_pending_job(self, job_id: int, *, reason: str) -> bool:
         """

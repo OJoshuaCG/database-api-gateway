@@ -103,7 +103,7 @@ from app.models.enums import EngineType, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
 from app.models.server import Server
 from app.services.capability_catalog import CODE_FORBIDDEN, Capability
-from app.services import audit, charset_catalog, collation_catalog
+from app.services import audit, charset_catalog, collation_catalog, engine_error_catalog
 from app.services.db_admin import query_policy
 from app.services.db_admin.dtos import TextForeignKey
 from app.services.db_admin.factory import get_adapter
@@ -1548,8 +1548,16 @@ class CollationConversionController:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _clean_error(exc: Exception) -> str:
-        orig = getattr(exc, "orig", None)
-        return str(orig if orig is not None else exc)[:500]
+        """
+        Mensaje SANEADO que se persiste en ``job.error`` (lo lee ``collation.read``).
+
+        Antes era ``str(exc.orig)[:500]``: el texto nativo del motor incrusta valores de filas
+        (``Duplicate entry 'alice@x.com'…``, ``Incorrect string value … at row 12``). El crudo va
+        SOLO al log, con el Request ID; las reglas viven en ``engine_error_catalog``.
+        """
+        pub = engine_error_catalog.from_exception(exc)
+        engine_error_catalog.log_raw(logger, exc, pub, where="collation_conversion")
+        return pub.message
 
     def _set_status(self, job_id, status, *, phase=None, error=None, finished=False):
         session = self._session()

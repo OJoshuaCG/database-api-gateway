@@ -1184,3 +1184,23 @@ def test_cancelar_SIN_staging_conserva_el_conteo_parcial():
         )
 
     assert counter[0] >= 0
+
+
+def test_clean_error_sanitizes_engine_row_values():
+    """El error por tabla no puede llevar valores de filas: el crudo va solo al log."""
+    import pymysql
+    from sqlalchemy.exc import IntegrityError
+
+    from app.exceptions import AppHttpException
+
+    exc = IntegrityError(
+        "INSERT INTO users …", {},
+        pymysql.err.IntegrityError(1062, "Duplicate entry 'alice@x.com' for key 'users.email'"),
+    )
+    msg = dc._clean_error(exc)
+    assert "alice@x.com" not in msg
+    assert "users.email" in msg
+    # El texto propio del gateway pasa tal cual.
+    assert dc._clean_error(AppHttpException("Identificador inválido", 422)) == (
+        "Identificador inválido"
+    )

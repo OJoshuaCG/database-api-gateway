@@ -26,7 +26,7 @@ SEGURIDAD: identificadores vía ``validate_identifier``/``quote_identifier``; lo
 de fila NUNCA se interpolan como literales SQL (INSERT parametrizado, o serializados y
 escapados byte a byte para COPY/LOAD DATA, jamás concatenados en el texto de un statement);
 credenciales viven solo en ``ServerTarget`` y jamás se loguean; los mensajes de error se
-truncan y limpian de secretos (``_clean_error``).
+sanean con ``engine_error_catalog`` (``_clean_error``): sin secretos ni valores de filas.
 
 Aislamiento por tabla (best-effort): una tabla que falla se marca ``failed`` con su
 ``error`` y el bucle CONTINÚA con la siguiente (el chequeo de FKs está apagado, así que
@@ -60,6 +60,7 @@ from app.core.remote_engine import (
     pooled_source_scope,
 )
 from app.exceptions import AppHttpException
+from app.services import engine_error_catalog
 from app.services.db_admin.identifiers import quote_identifier, validate_identifier
 
 logger = get_logger(__name__)
@@ -177,10 +178,19 @@ class _Canceled(Exception):
 # Helpers de error / valores / cancelación                                     #
 # --------------------------------------------------------------------------- #
 def _clean_error(exc: Exception) -> str:
-    """Mensaje compacto y SIN secretos (misma estrategia que migrations._clean_error)."""
-    orig = getattr(exc, "orig", None)
-    msg = str(orig) if orig is not None else str(exc)
-    return msg[:500]
+    """
+    Mensaje SANEADO del fallo de una tabla: es lo que entra a ``TableCopyResult.error``.
+
+    Antes era ``str(exc.orig)[:500]``: el texto nativo del motor incrusta VALORES de filas
+    (``Duplicate entry 'alice@x.com'…``, ``Key (email)=(…)``, ``… at row 12``), y copiar datos es
+    justo donde más aparecen. Un ``AppHttpException`` es texto del gateway y pasa tal cual; el
+    resto se sanea con ``engine_error_catalog`` y el crudo va SOLO al log, con el Request ID.
+    """
+    if isinstance(exc, AppHttpException):
+        return exc.message[:500]
+    pub = engine_error_catalog.from_exception(exc)
+    engine_error_catalog.log_raw(logger, exc, pub, where="data_copy")
+    return pub.message
 
 
 def _is_canceled(cancel_cb: Callable[[], bool] | None) -> bool:

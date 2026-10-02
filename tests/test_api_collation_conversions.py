@@ -1084,3 +1084,22 @@ def test_mariadb_unreadable_fks_converts_nothing(admin_client, monkeypatch):
     items = [i for i in _items(admin_client, job_id) if i["object_type"] == "table"]
     assert items and all(i["status"] == "error" for i in items)
     assert all("FKs" in i["error"] for i in items)
+
+
+def test_job_error_is_sanitized_before_persisting():
+    """``job.error`` lo lee ``collation.read``: no puede llevar valores de filas del motor."""
+    import pymysql
+    from sqlalchemy.exc import OperationalError
+
+    from app.controllers.collation_conversion_controller import CollationConversionController
+
+    exc = OperationalError(
+        "ALTER TABLE t …", {},
+        pymysql.err.OperationalError(
+            1366, "Incorrect string value: '\\xF0\\x9F' for column 'nombre' at row 12"
+        ),
+    )
+    msg = CollationConversionController._clean_error(exc)
+    assert "row 12" not in msg
+    assert "\\xF0" not in msg
+    assert "nombre" in msg
