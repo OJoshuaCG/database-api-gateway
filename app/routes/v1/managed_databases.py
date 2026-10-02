@@ -23,13 +23,13 @@ from app.core.authz import (
     BlueprintsWrite,
     DatabasesRead,
     DatabasesWrite,
+    EnvironmentsWrite,
     assert_capability,
     require_at,
 )
 from app.core.actor import Actor
 from app.core.limiter import limiter
 from app.models.enums import EngineType, ProvisionStatus
-from app.core.authz import GatewayAdmin
 from app.schemas.managed_database import (
     AgentAccessIn,
     AdoptDatabaseIn,
@@ -143,7 +143,15 @@ def adopt_database(actor: DatabasesWrite, payload: AdoptDatabaseIn):
     """
     Adopta una BD que YA existe en el motor (Plan 09): registra metadata sin ejecutar
     CREATE DATABASE. 404 si la BD no existe; 409 si ya está en el inventario.
+
+    **Con ``model_version`` exige además ``blueprints.apply``.** Declarar la versión hace
+    ``stamp`` en el motor y escribe la caché de versión aplicada, que es lo que lee cualquier
+    gate de promoción: es la misma decisión que ``POST /{db_id}/migrations/stamp``, que sí la
+    exige. Va en la RUTA porque depende del payload y se evalúa ANTES de tocar nada, así que
+    un 403 no deja ninguna versión estampada.
     """
+    if payload.model_version is not None:
+        assert_capability(actor, Capability.BLUEPRINTS_APPLY)
     created = ManagedDatabaseController().adopt_database(payload.model_dump(), admin=actor)
     return success(data=created, message="Base de datos existente adoptada al inventario.")
 
@@ -155,6 +163,10 @@ def get_database(actor: DatabasesRead, db_id: int):
 
 @router.patch("/{db_id}", response_model=ApiResponse[ManagedDatabaseOut])
 def update_database(actor: DatabasesWrite, db_id: int, payload: ManagedDatabaseUpdate):
+    """
+    Metadatos del inventario. Cambiar ``environment_id`` (reclasificar) exige además
+    ``environments.write``: lo valida el controller contra el valor actual.
+    """
     updated = ManagedDatabaseController().update_database(
         db_id, payload.model_dump(exclude_unset=True), admin=actor
     )
@@ -194,7 +206,7 @@ def delete_database(
 
 
 @router.put("/{db_id}/agent-access", response_model=ApiResponse[ManagedDatabaseOut])
-def set_agent_access(actor: GatewayAdmin, db_id: int, payload: AgentAccessIn):
+def set_agent_access(actor: EnvironmentsWrite, db_id: int, payload: AgentAccessIn):
     """
     Abre o cierra esta BD para los agentes (MCP). Es el **opt-in por base**.
 
@@ -203,9 +215,10 @@ def set_agent_access(actor: GatewayAdmin, db_id: int, payload: AgentAccessIn):
     campo de `ManagedDatabaseUpdate` se movería junto con un cambio de nombre o de entorno, sin
     gesto propio y sin rastro distinguible.
 
-    Detrás de ``gateway.admin`` —no del rol operativo— porque es **dato de política**: la regla
-    del §4.5 es que toda fila que un guard lee es una frontera de privilegio, así que su escritor
-    necesita al menos el privilegio del guard que puede apagar.
+    Detrás de ``environments.write`` (solo ``security_officer``) y no del rol operativo ni de
+    ``gateway.admin``, porque es **dato de política**: la regla del §4.5 es que toda fila que un
+    guard lee es una frontera de privilegio, así que su escritor necesita al menos el privilegio
+    del guard que puede apagar. Quien administra el acceso no decide qué BDs ven los agentes.
 
     Se audita con ``record_intent`` **fail-closed** cuando ABRE: si el rastro no se puede
     persistir, la apertura no ocurre. Cerrar se audita best-effort — negar acceso no necesita

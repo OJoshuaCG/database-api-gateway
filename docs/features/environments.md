@@ -126,11 +126,13 @@ DOS defaults sin ningún error, igual en REPEATABLE READ que en READ COMMITTED. 
 > Nota: `charset_catalog.update_option` tiene esta misma carrera **sin cerrar**, y su docstring
 > afirma un invariante que el mecanismo no garantiza. No es un precedente a copiar.
 
-### El default es el entorno más permisivo
+### Alta y adopción sin `environment_id`: el entorno activo más protegido
 
-El seed marca `development` como `is_default`, así que una base nueva **nace clasificada pero no
-nace protegida**. La red de seguridad para encontrar lo que quedó mal clasificado es el filtro
-`only_unassigned` del listado y el `database_count` de cada entorno, no el default.
+El seed marca `development` como `is_default` —el entorno MÁS permisivo—, pero **`is_default` ya
+no decide dónde cae una base sin `environment_id`**: `POST /managed-databases` y `/adopt` la
+asignan al entorno **activo** de mayor `rank` (desempate por `id`), saltando los inactivos. Quien
+quiere un entorno más laxo lo declara, y esa declaración la autoriza la capa 2 (un operador
+acotado a desarrollo que omite el campo recibe 403, porque cae en producción).
 
 Un caso concreto donde eso importaba y se corrigió: el **auto-adopt del clon** creaba la fila del
 destino propagando el blueprint y la versión pero no el entorno, así que un clon completo de una
@@ -165,6 +167,16 @@ menú y el docstring de su migración dice que divergir "no hace daño"; **acá 
 política**, y un top-up tiene tres modos de fallo — resucitar un `production` borrado a propósito
 sin restaurar el `environment_id` de sus bases, duplicar el default, y dejar dos políticas
 distintas según cómo se provisionó el gateway.
+
+## Quién puede escribir: `environments.write`
+
+`POST`/`PATCH`/`DELETE /environments`, `PUT /managed-databases/{id}/agent-access` y cambiar el
+`environment_id` de una BD (`PATCH /managed-databases/{id}`) exigen **`environments.write`**, que
+tiene **solo `security_officer`**. `access_admin` conserva la lectura (`environments.read`).
+Reenviar el mismo `environment_id` no es un cambio. Basta `environments.write`: no se exige
+además `databases.write` en la BD. `POST /managed-databases/adopt` con `model_version` exige
+`blueprints.apply`. **Sin `security_officer` asignado estas escrituras quedan bloqueadas**
+(sin fallback ni bootstrap-admin) hasta que alguien con `access_admin` lo asigne.
 
 ## API
 

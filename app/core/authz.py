@@ -307,5 +307,6 @@ CatalogsRead = Annotated[Actor, Depends(require(Capability.CATALOGS_READ))]
 CatalogsWrite = Annotated[Actor, Depends(require(Capability.CATALOGS_WRITE))]
 
 EnvironmentsRead = Annotated[Actor, Depends(require(Capability.ENVIRONMENTS_READ))]
+EnvironmentsWrite = Annotated[Actor, Depends(require(Capability.ENVIRONMENTS_WRITE))]
 
 GatewayAdmin = Annotated[Actor, Depends(require(Capability.GATEWAY_ADMIN))]

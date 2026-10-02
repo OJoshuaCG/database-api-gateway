@@ -167,6 +167,23 @@ def test_servers_admin_belongs_only_to_security_officer():
         assert Capability.SERVERS_ADMIN not in caps
 
 
+def test_environments_write_belongs_only_to_security_officer():
+    """
+    Escribir entornos, abrir BDs a agentes y reclasificarlas es dato de política. ``access_admin``
+    conserva LEER (``environments.read`` viene de ``viewer``) pero no escribir, y ningún rol
+    operativo lo tiene.
+    """
+    spec = cc.spec(Capability.ENVIRONMENTS_WRITE)
+    assert (spec.mutates, spec.requires_step_up, spec.scope_axis) == (True, True, "global")
+    assert not spec.discloses and not spec.agent_allowed
+    assert Capability.ENVIRONMENTS_WRITE in GLOBAL_CAPABILITIES[GlobalCapability.SECURITY_OFFICER]
+    assert Capability.ENVIRONMENTS_WRITE not in GLOBAL_CAPABILITIES[GlobalCapability.ACCESS_ADMIN]
+    for caps in ROLE_CAPABILITIES.values():
+        assert Capability.ENVIRONMENTS_WRITE not in caps
+        assert Capability.ENVIRONMENTS_READ in caps
+    assert "entornos" not in cc.spec(Capability.GATEWAY_ADMIN).label
+
+
 # --------------------------------------------------------------------------- #
 # Techo de agente (plan 12)                                                   #
 # --------------------------------------------------------------------------- #

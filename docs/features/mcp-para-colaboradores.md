@@ -14,8 +14,9 @@ persona) y lo que hace **cada colaborador** en su propia máquina.
 
 ## Parte A — Quien administra: preparar el gateway (una sola vez)
 
-Hace falta una sesión con **`gateway.admin`**, que solo tienen las capacidades globales
-`access_admin` y `security_officer` — el rol `owner` no la tiene.
+Hace falta una sesión con **`environments.write`**, que solo tiene la capacidad global
+`security_officer` — ni el rol `owner` ni `access_admin` la tienen. Sin ningún `security_officer`
+asignado no se puede abrir una base a agentes: no hay fallback.
 
 ### A.1 Encender el servidor
 

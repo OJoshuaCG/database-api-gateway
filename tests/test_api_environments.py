@@ -327,7 +327,14 @@ def test_delete_with_databases_is_409(admin_client, server_payload):
 # ─── asignación y filtros ─────────────────────────────────────────────────── #
 
 
-def test_new_database_gets_the_default_environment(admin_client, server_payload):
+def test_new_database_gets_the_most_protected_active_environment(
+    admin_client, server_payload
+):
+    """
+    Sin ``environment_id`` la BD NO cae en ``is_default`` (``development``, el más permisivo)
+    sino en el entorno activo más protegido: omitir el campo no puede ser la vía para esquivar
+    la frontera de producción.
+    """
     envs = _envs(admin_client)
     sid = _server(admin_client, server_payload)
     oid = _owner(admin_client, sid)
@@ -336,7 +343,7 @@ def test_new_database_gets_the_default_environment(admin_client, server_payload)
         json={"name": "defdb", "server_id": sid, "owner_id": oid},
     )
     assert r.status_code == 201, r.text
-    assert r.json()["data"]["environment_id"] == envs["development"]["id"]
+    assert r.json()["data"]["environment_id"] == envs["production"]["id"]
 
 
 def test_inactive_environment_cannot_be_assigned(admin_client, server_payload):

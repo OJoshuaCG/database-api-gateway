@@ -11,6 +11,10 @@ negar la operación. De ahí dos cosas que no son las de un CRUD normal:
 - **``DELETE`` sin ``force``.** Exige cero BDs asignadas (409 con el conteo si no). La vía de
   retiro de un entorno que todavía tiene BDs es ``is_active=false``.
 
+Escribir (POST/PATCH/DELETE) exige ``environments.write``, que solo tiene ``security_officer``:
+cada fila es política y quien administra el acceso no debe poder apagar la barrera. Sin
+``security_officer`` asignado esas escrituras quedan bloqueadas (no hay fallback).
+
 Se pagina como ``/projects`` aunque sean pocas filas: el helper del frontend que consume
 listados exige el bloque ``pagination``, y "traer todo" ya se resuelve pidiendo el tamaño
 máximo de página.
@@ -19,7 +23,7 @@ máximo de página.
 from fastapi import APIRouter, Query
 
 from app.controllers.environment_controller import EnvironmentController
-from app.core.authz import EnvironmentsRead, GatewayAdmin
+from app.core.authz import EnvironmentsRead, EnvironmentsWrite
 from app.schemas.environment import EnvironmentCreate, EnvironmentOut, EnvironmentUpdate
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
@@ -53,7 +57,7 @@ def list_environments(
 
 
 @router.post("", response_model=ApiResponse[EnvironmentOut], status_code=201)
-def create_environment(actor: GatewayAdmin, payload: EnvironmentCreate):
+def create_environment(actor: EnvironmentsWrite, payload: EnvironmentCreate):
     created = EnvironmentController().create_environment(
         payload.model_dump(), admin=actor
     )
@@ -67,7 +71,7 @@ def get_environment(actor: EnvironmentsRead, environment_id: int):
 
 @router.patch("/{environment_id}", response_model=ApiResponse[EnvironmentOut])
 def update_environment(
-    actor: GatewayAdmin,
+    actor: EnvironmentsWrite,
     environment_id: int,
     payload: EnvironmentUpdate,
     confirm_slug: str | None = Query(None, max_length=60, description=_CONFIRM_SLUG_DESC),
@@ -89,7 +93,7 @@ def update_environment(
 
 @router.delete("/{environment_id}", response_model=ApiResponse[None])
 def delete_environment(
-    actor: GatewayAdmin,
+    actor: EnvironmentsWrite,
     environment_id: int,
     confirm_slug: str | None = Query(None, max_length=60, description=_CONFIRM_SLUG_DESC),
 ):

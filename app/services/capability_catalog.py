@@ -179,6 +179,7 @@ class Capability(StrEnum):
 
     # -- Entornos ----------------------------------------------------------- #
     ENVIRONMENTS_READ = "environments.read"
+    ENVIRONMENTS_WRITE = "environments.write"
 
     # -- Administración del propio gateway ---------------------------------- #
     GATEWAY_ADMIN = "gateway.admin"
@@ -350,9 +351,21 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         axis="global",
     ),
     _spec(Capability.ENVIRONMENTS_READ, "Ver los entornos y su política", axis="global"),
+    # Dato de política: ``blocks_destructive_migrations``, ``allows_agent_access`` y la
+    # clasificación de cada BD deciden qué barreras se aplican. Quien las escribe no puede ser
+    # quien administra el acceso (``access_admin``) ni el rol operativo: solo
+    # ``security_officer``. Sin ``security_officer`` asignado, esas escrituras quedan BLOQUEADAS
+    # a propósito; no hay fallback a ``gateway.admin``.
+    _spec(
+        Capability.ENVIRONMENTS_WRITE,
+        "Crear, editar y borrar entornos, abrir BDs a agentes y reclasificarlas",
+        mutates=True,
+        step_up=True,
+        axis="global",
+    ),
     _spec(
         Capability.GATEWAY_ADMIN,
-        "Administrar el gateway: entornos, crypto, usuarios y tokens",
+        "Administrar el gateway: crypto, usuarios y tokens",
         mutates=True,
         step_up=True,
         axis="global",
@@ -427,7 +440,12 @@ GLOBAL_CAPABILITIES: Mapping[GlobalCapability, frozenset[Capability]] = MappingP
     {
         GlobalCapability.ACCESS_ADMIN: frozenset({Capability.GATEWAY_ADMIN}),
         GlobalCapability.SECURITY_OFFICER: frozenset(
-            {Capability.SERVERS_ADMIN, Capability.CATALOGS_WRITE, Capability.GATEWAY_ADMIN}
+            {
+                Capability.SERVERS_ADMIN,
+                Capability.CATALOGS_WRITE,
+                Capability.ENVIRONMENTS_WRITE,
+                Capability.GATEWAY_ADMIN,
+            }
         ),
     }
 )

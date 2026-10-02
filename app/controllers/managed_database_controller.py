@@ -47,6 +47,30 @@ from app.services.db_admin.identifiers import (
 if TYPE_CHECKING:
     from app.core.actor import Actor
 
+def _assert_scope_at_env(
+    admin: "dict | Actor | None", env_id: int | None, server_id: int
+) -> None:
+    """
+    ``databases.write`` en el entorno YA RESUELTO de una BD nueva (alta o adopción).
+
+    Existe porque ``environment_id`` omitido resuelve al entorno ACTIVO más protegido: sin esta
+    comprobación, la capa 2 de la ruta (que no conoce la fila todavía) no vería el destino real.
+    Un operador acotado a desarrollo que omite el entorno cae en producción y recibe 403.
+    Sin grants por alcance, o sin ``Actor`` (llamadas internas), no hace nada.
+    """
+    from app.core.actor import Actor
+    from app.core.scope import ScopePoint, assert_at_point
+    from app.services.capability_catalog import Capability
+
+    if not isinstance(admin, Actor):
+        return
+    assert_at_point(
+        admin,
+        Capability.DATABASES_WRITE,
+        ScopePoint(environment_id=env_id, server_id=server_id),
+    )
+
+
 #: Marca del bloque de diagnóstico que escribe el gateway dentro de ``notes``. Todo lo que NO
 #: empieza con esto es del operador y no se toca.
 _GW_NOTE_MARK = "[gateway]"
@@ -399,6 +423,7 @@ class ManagedDatabaseController:
             env_id = EnvironmentController.resolve_for_assignment(
                 session, data.get("environment_id")
             )
+            _assert_scope_at_env(admin, env_id, server.id)
 
             md = ManagedDatabase(
                 name=data["name"],
@@ -547,6 +572,12 @@ class ManagedDatabaseController:
                     status_code=422,
                     context={"model_id": data["model_id"], "model_version": adopt_version},
                 )
+            # El entorno se resuelve y se autoriza ANTES de tocar el motor: un 403 por alcance
+            # no puede depender de qué existe en el servidor remoto.
+            env_id = EnvironmentController.resolve_for_assignment(
+                session, data.get("environment_id")
+            )
+            _assert_scope_at_env(admin, env_id, server.id)
             db_name, server_id = data["name"], server.id
             target = build_target(server)  # descifra mientras la sesión sigue abierta
         finally:
@@ -563,9 +594,6 @@ class ManagedDatabaseController:
 
         session = self._session()
         try:
-            env_id = EnvironmentController.resolve_for_assignment(
-                session, data.get("environment_id")
-            )
             md = ManagedDatabase(
                 name=db_name,
                 server_id=server_id,
@@ -822,6 +850,22 @@ class ManagedDatabaseController:
                     status_code=422,
                     context={"model_id": data["model_id"]},
                 )
+            # Reclasificar es escribir política: mover una BD de producción a desarrollo le
+            # quita las barreras. Exige SOLO ``environments.write`` (``security_officer``); no
+            # se pide además ``databases.write`` en la BD. Reenviar el mismo valor (el form de
+            # la SPA lo hace) NO es un cambio. Se evalúa antes de mutar nada.
+            if "environment_id" in data and data["environment_id"] != md.environment_id:
+                from app.core.actor import Actor
+                from app.core.authz import assert_capability
+                from app.services.capability_catalog import Capability
+
+                if not isinstance(admin, Actor):
+                    raise AppHttpException(
+                        message="No tienes permiso para esta operación.",
+                        status_code=403,
+                        public_context={"code": "access.forbidden"},
+                    )
+                assert_capability(admin, Capability.ENVIRONMENTS_WRITE)
             # ``environment_id`` se valida como en el alta (existe + activo), y ``None``
             # explícito DESCLASIFICA. Que esté en esta tupla es lo que hace posible
             # desclasificar: la asignación va por presencia de clave y la ruta usa

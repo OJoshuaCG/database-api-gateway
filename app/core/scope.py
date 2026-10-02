@@ -297,6 +297,21 @@ def assert_at(actor: Actor, capability: Capability, target: ScopeTarget) -> None
     assert_layer2(actor, capability, target)
 
 
+def assert_at_point(actor: Actor, capability: Capability, point: ScopePoint) -> None:
+    """
+    Capa 1 + capa 2 sobre un punto YA resuelto. Para los controllers que conocen el entorno
+    recién después de resolverlo (alta o adopción sin ``environment_id`` explícito).
+
+    Sin grants por alcance, o con un actor de token, no toca la BD. Mismo 403 en ambas capas.
+    """
+    if not actor.has(capability):
+        raise _forbidden()
+    if actor.kind != "admin" or not actor.scope_roles:
+        return
+    if not _permits(actor, role_at_point(actor, point), capability):
+        raise _forbidden()
+
+
 def assert_layer2(actor: Actor, capability: Capability, target: ScopeTarget) -> None:
     """Solo la capa 2. ``require_at`` la usa tras la capa 1 que ya corrió en ``_authenticate``."""
     if actor.kind != "admin" or not actor.scope_roles:

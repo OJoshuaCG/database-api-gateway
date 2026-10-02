@@ -481,22 +481,25 @@ class EnvironmentController:
     @staticmethod
     def resolve_for_assignment(session, environment_id: int | None) -> int | None:
         """
-        Valida el entorno que se va a asignar a una BD, o resuelve el default.
+        Valida el entorno que se va a asignar a una BD, o resuelve el entorno por omisión.
 
         Se recibe la ``session`` en vez de abrir una propia porque los llamadores
         (``ManagedDatabaseController.create_database`` / ``adopt_database``) validan dentro de
         su propia transacción, igual que ya hacen con la validación owner↔server.
 
-        ``environment_id=None`` NO es un error: cae en el entorno marcado ``is_default``, y si
-        no hay ninguno queda en ``None`` (sin clasificar). OJO con lo que eso significa: el
-        default sembrado es ``development``, el entorno MÁS PERMISIVO, así que una BD nueva
-        "nace clasificada" pero no "nace protegida". La red de seguridad para encontrar lo que
-        quedó mal clasificado es el filtro ``only_unassigned`` del listado.
+        ``environment_id=None`` NO es un error: cae en el entorno ACTIVO más protegido (mayor
+        ``rank``, desempate por ``id``), y si no hay ninguno activo queda en ``None``. NO es el
+        marcado ``is_default``: el default sembrado es ``development``, el MÁS permisivo, y que
+        una BD nueva naciera ahí le permitía a un operador acotado a desarrollo crear bases
+        sin declarar entorno y esquivar la frontera de producción. Quien quiere un entorno más
+        laxo lo declara, y esa declaración la valida la capa 2 del llamador. Los entornos
+        inactivos se saltan: no son asignables.
         """
         if environment_id is None:
             row = (
                 session.query(Environment.id)
-                .filter(Environment.is_default.is_(True), Environment.is_active.is_(True))
+                .filter(Environment.is_active.is_(True))
+                .order_by(Environment.rank.desc(), Environment.id.desc())
                 .first()
             )
             return row[0] if row else None
