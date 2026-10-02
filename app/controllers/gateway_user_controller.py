@@ -31,6 +31,7 @@ barrido de expirados: el mecanismo es el mismo contador que ya sirve para revoca
 (re-invitar sube el epoch y mata la anterior).
 """
 
+import json
 from datetime import datetime
 
 from app.core.authz import assert_not_last_access_admin
@@ -63,6 +64,11 @@ CODE_ALREADY_ACTIVE = "gateway_user.credential_already_set"
 CODE_INVALID_ROLE = "gateway_user.invalid_role"
 CODE_INVALID_CAPABILITY = "gateway_user.invalid_global_capability"
 CODE_WEAK_PASSWORD = "gateway_user.weak_password"
+
+#: Tope de alcances que se copian a CADA lado (antes/después) del ``detail`` de auditoría. Por
+#: encima se recorta y se declara el total: ``detail`` es un ``TEXT`` y una fila de auditoría no
+#: puede crecer con el tamaño del acceso de una persona.
+AUDIT_MAX_GRANTS = 200
 
 
 def assert_password_policy(password: str) -> None:
@@ -131,6 +137,46 @@ class GatewayUserController:
                 context={"user_id": user_id},
             )
         return fila
+
+    def _access_snapshot(self, fila: dict, ctx: dict | None = None) -> dict:
+        """
+        El estado de AUTORIZACIÓN de una cuenta, tal como se audita antes y después de cambiarlo.
+
+        Existe porque el rastro anterior no permitía reconstruir nada: ``gateway_user.update``
+        guardaba solo los NOMBRES de los campos y ``gateway_user.access_set`` las globales
+        DESPUÉS y la CANTIDAD de alcances. Y ``replace_access`` borra y re-inserta los grants,
+        así que ``access_grants`` tampoco guarda historia: la única respuesta a "¿quién le dio
+        ``owner`` en producción, y qué tenía antes?" es esta foto en ``audit_log``.
+
+        Forma (la misma de los dos lados, y la misma idea ``{before, after}`` que las capacidades
+        puntuales): rol base, estado, globales y la lista COMPLETA de ``(scope_type, scope_id,
+        role)`` ordenada, recortada a ``AUDIT_MAX_GRANTS`` con el total declarado.
+        """
+        if ctx is None:
+            ctx = self.users.find_access_context(fila["id"])
+        grants = sorted(
+            (str(t), int(i), str(r)) for (t, i, r) in (ctx.get("grants") or [])
+        )
+        snap = {
+            "gateway_role": fila.get("gateway_role") or GatewayRole.VIEWER.value,
+            "is_active": bool(fila.get("is_active")),
+            "global_capabilities": sorted(ctx.get("globals") or []),
+            "scope_grants": [
+                {"scope_type": t, "scope_id": i, "role": r}
+                for (t, i, r) in grants[:AUDIT_MAX_GRANTS]
+            ],
+            "scope_grants_total": len(grants),
+        }
+        if len(grants) > AUDIT_MAX_GRANTS:
+            snap["scope_grants_truncated"] = True
+        return snap
+
+    @staticmethod
+    def _access_detail(username: str, before: dict, after: dict, **extra) -> str:
+        return json.dumps(
+            {"username": username, **extra, "before": before, "after": after},
+            ensure_ascii=False,
+        )
 
     def list_users(self, *, limit: int, offset: int) -> tuple[list[dict], int]:
         filas = self.users.find_all(limit=limit, offset=offset)
@@ -282,6 +328,8 @@ class GatewayUserController:
         reescribiría el significado de las filas viejas.
         """
         fila = self._get_or_404(user_id)
+        # La foto ANTES de validar nada: es lo que el rastro compara contra el después.
+        antes = self._access_snapshot(fila)
         cambios: dict = {}
 
         if "gateway_role" in data and data["gateway_role"] is not None:
@@ -318,7 +366,14 @@ class GatewayUserController:
                 target_type="user",
                 target_id=user_id,
                 touched_engine=False,
-                detail=f"{fila['username']}: " + ", ".join(sorted(cambios)),
+                # Los VALORES de contacto (email, notas) no se copian: son datos personales y no
+                # autorización. Basta con nombrarlos en `changed`.
+                detail=self._access_detail(
+                    fila["username"],
+                    antes,
+                    self._access_snapshot(self._get_or_404(user_id)),
+                    changed=sorted(cambios),
+                ),
             )
             # Un cambio de rol o de estado tiene que surtir efecto YA. El rol se relee por
             # request, así que eso ya pasa; las sesiones se tachan igual para que el corte
@@ -360,7 +415,7 @@ class GatewayUserController:
         payload: quitarse `access_admin` a sí mismo y agregárselo a alguien inactivo es dos
         cambios que por separado parecen inofensivos.
         """
-        self._get_or_404(user_id)
+        fila = self._get_or_404(user_id)
         self._guard_not_self(admin, user_id, action="cambiar tu propio acceso")
         globales = self._validate_globals(data.get("global_capabilities") or [])
         grants = []
@@ -379,6 +434,7 @@ class GatewayUserController:
         # administrador de accesos sin ``security_officer`` puede seguir editando los alcances
         # de alguien que sí la tiene sin quitársela, pero no puede otorgarla.
         actual = self.users.find_access_context(user_id)
+        antes = self._access_snapshot(fila, actual)
         ya_globales = set(actual.get("globals") or [])
         ya_grants = {(t, int(i), r) for (t, i, r) in (actual.get("grants") or [])}
         self._assert_within_ceiling(
@@ -407,9 +463,10 @@ class GatewayUserController:
             target_type="user",
             target_id=user_id,
             touched_engine=False,
-            detail=(
-                f"globales=[{','.join(g.value for g in globales) or '—'}] "
-                f"alcances={len(grants)}"
+            detail=self._access_detail(
+                fila["username"],
+                antes,
+                self._access_snapshot(self._get_or_404(user_id)),
             ),
         )
         from app.core import session_store
