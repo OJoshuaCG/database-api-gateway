@@ -217,6 +217,7 @@ Vocabulario cerrado en `app/services/environment_catalog.py`.
 | `environment.not_found` | 404 |
 | `environment.inactive` | 422 |
 | `environment.has_databases` (+ `database_count`) | 409 |
+| `access.scope_has_grants` (+ `access_grant_count`, `capability_grant_count`) — DELETE con accesos que apuntan al entorno | 409 |
 | `environment.name_taken` / `environment.slug_taken` | 409 |
 | `environment.default_must_be_active` | 422 |
 | `environment.default_required` | 409 |

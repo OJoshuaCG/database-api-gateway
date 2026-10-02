@@ -41,6 +41,7 @@ from app.services import audit, confirm_token
 from app.core.actor import Actor, identity_of
 from app.services.capability_catalog import (
     CODE_GRANT_CEILING,
+    CODE_GRANT_SCOPE_NOT_FOUND,
     CODE_SELF_MODIFICATION,
     GatewayRole,
     GlobalCapability,
@@ -364,6 +365,7 @@ class GatewayUserController:
                     public_context={"code": CODE_INVALID_CAPABILITY},
                 )
             grants.append((tipo, int(g["scope_id"]), self._validate_role(g["role"]).value))
+        self._assert_scopes_exist(grants)
 
         # El techo se aplica a lo que se AGREGA, no a lo que la persona ya tenía: un
         # administrador de accesos sin ``security_officer`` puede seguir editando los alcances
@@ -411,6 +413,36 @@ class GatewayUserController:
     # ------------------------------------------------------------------ #
     # Guards anti auto-escalada                                          #
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _assert_scopes_exist(grants: list[tuple[str, int, str]]) -> None:
+        """
+        422 ``access.grant_scope_not_found`` si algún alcance apunta a un entorno o servidor que
+        NO existe. Mismo chequeo (``CapabilityGrantModel.scope_names``) que las capacidades
+        puntuales.
+
+        ``scope_id`` no tiene FK (es polimórfico), así que sin esto se podía otorgar un rol sobre
+        un id futuro, que regiría sobre el próximo objeto creado con ese id. 422 y no el 404 de
+        ``capability_grants``: acá el alcance es un campo del payload, no el recurso de la URL.
+        """
+        if not grants:
+            return
+        from app.models.capability_grant_model import CapabilityGrantModel
+
+        claves = sorted({(t, i) for (t, i, _) in grants})
+        existentes = CapabilityGrantModel().scope_names(claves)
+        faltantes = [k for k in claves if k not in existentes]
+        if faltantes:
+            raise AppHttpException(
+                message="Algún entorno o servidor de los alcances indicados no existe.",
+                status_code=422,
+                public_context={
+                    "code": CODE_GRANT_SCOPE_NOT_FOUND,
+                    "missing_scopes": [
+                        {"scope_type": t, "scope_id": i} for (t, i) in faltantes
+                    ],
+                },
+            )
+
     @staticmethod
     def _guard_not_self(admin, user_id: int, *, action: str) -> None:
         """

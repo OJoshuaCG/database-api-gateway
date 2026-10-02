@@ -401,7 +401,8 @@ class EnvironmentController:
         admin: "dict | Actor | None" = None,
     ) -> None:
         """
-        Borra un entorno. **Exige que no tenga ninguna BD asignada.**
+        Borra un entorno. **Exige que no tenga ninguna BD asignada ni accesos otorgados**
+        (409 ``access.scope_has_grants``, ver ``assert_scope_has_no_grants``).
 
         Deliberadamente NO hay un ``?force=true`` que desclasifique en masa. Tres razones:
 
@@ -442,6 +443,9 @@ class EnvironmentController:
                     },
                     context={"environment_id": env.id},
                 )
+            from app.models.capability_grant_model import assert_scope_has_no_grants
+
+            assert_scope_has_no_grants(session, "environment", env.id)
             # Borrar el default deja al sistema sin default: las BDs nuevas nacerían sin
             # clasificar. Mismo criterio que el PATCH.
             if env.is_default:

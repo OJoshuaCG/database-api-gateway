@@ -485,7 +485,7 @@ actualizan los enviados; `root_password` omitido ⇒ no cambia.
 | `POST` | `/api/v1/servers` | Registra un servidor (`201`). |
 | `GET` | `/api/v1/servers/{server_id}` | Detalle de un servidor. |
 | `PATCH` | `/api/v1/servers/{server_id}` | Actualiza parcialmente. |
-| `DELETE` | `/api/v1/servers/{server_id}` | Elimina del inventario. |
+| `DELETE` | `/api/v1/servers/{server_id}` | Elimina del inventario. `409 access.scope_has_grants` si todavía hay accesos sobre ese servidor. |
 
 **Crear un servidor:**
 
@@ -2835,7 +2835,9 @@ que hace cumplir `require()` (`explain`), sobre el mismo contexto que acuña el 
 | `access.self_modification_forbidden` | 409 | El actor es la persona destino (alta o revocación). |
 | `access.grant_user_inactive` | 409 | La persona está desactivada (alta). |
 | `access.capability_not_grantable` | 422 | Capacidad global o desconocida. |
-| `access.grant_scope_not_found` | 404 | El entorno o servidor no existe. |
+| `access.grant_scope_not_found` | 404 | El entorno o servidor no existe. En `PUT /gateway-users/{id}/access` sale como **422** (el alcance es un campo del payload) con `missing_scopes: [{scope_type, scope_id}]`, y no se escribe nada. |
+| `access.scope_has_grants` | 409 | `DELETE /environments/{id}` o `DELETE /servers/{id}` con accesos que todavía apuntan a ese destino. `public_context` trae `access_grant_count` (roles por alcance) y `capability_grant_count` (puntuales `pending`/`active`). Quitarlos (`PUT /access`) o revocarlos y reintentar. Las puntuales ya terminales no bloquean. |
+| `access.last_admin_protected` | 409 | `PUT /gateway-users/{id}/access` o `PATCH /gateway-users/{id}` (`is_active: false`) dejaría el gateway sin ningún `access_admin` activo. Se evalúa dentro de la transacción de la escritura, con las filas bloqueadas: dos cambios concurrentes no pueden dejarlo en cero. |
 | `access.grant_ceiling_exceeded` | 409 | El actor no tiene esa capacidad en ese alcance. |
 | `access.grant_duplicate` | 409 | Ya hay una viva (`pending` o `active`) para esa persona, capacidad y alcance. |
 | `access.grant_not_found` | 404 | La capacidad no existe o es de otra persona (revocación). |

@@ -318,7 +318,8 @@ class ServerController:
 
     def delete_server(self, server_id: int, *, admin: "dict | Actor | None" = None) -> None:
         """
-        Borra un servidor del inventario. NO toca el motor.
+        Borra un servidor del inventario. NO toca el motor. 409 ``access.scope_has_grants``
+        si todavía hay accesos que apuntan a él (ver ``assert_scope_has_no_grants``).
 
         AUDITADO: el borrado se lleva con él la credencial pseudo-root cifrada y, por
         ``CASCADE``, el inventario de BDs y usuarios que colgaban de ese servidor. Se registra
@@ -328,6 +329,9 @@ class ServerController:
         session = self._session()
         try:
             server = self._get_or_404(session, server_id)
+            from app.models.capability_grant_model import assert_scope_has_no_grants
+
+            assert_scope_has_no_grants(session, "server", server.id)
             name = server.name
             session.delete(server)
             session.commit()

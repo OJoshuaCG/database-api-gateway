@@ -29,6 +29,13 @@ def _crear(admin_client, username="nueva", **extra):
     return r.json()["data"]
 
 
+def _servidor(admin_client, server_payload, name="srv-acc") -> int:
+    """Un servidor real: ``set_access`` rechaza alcances que apuntan a ids inexistentes."""
+    r = admin_client.post("/api/v1/servers", json=server_payload(name=name))
+    assert r.status_code == 201, r.text
+    return r.json()["data"]["id"]
+
+
 def _aceptar(client, token, password="ContraseñaLarga123"):
     return client.post(
         "/api/v1/gateway-users/invite/accept", json={"token": token, "password": password}
@@ -406,7 +413,7 @@ def test_an_access_admin_cannot_grant_above_their_own_reach(admin_client):
     assert r.status_code == 200, r.text
 
 
-def test_the_ceiling_applies_to_what_is_added_not_to_what_was_there(admin_client):
+def test_the_ceiling_applies_to_what_is_added_not_to_what_was_there(admin_client, server_payload):
     """
     Un ``access_admin`` sin ``security_officer`` puede seguir editando los alcances de quien sí
     la tiene, siempre que no se la otorgue él.
@@ -414,12 +421,13 @@ def test_the_ceiling_applies_to_what_is_added_not_to_what_was_there(admin_client
     otro = _crear(admin_client, "con_so", global_capabilities=["security_officer"])
     datos = _crear(admin_client, "aa_edit", global_capabilities=["access_admin"])
     aa = _cliente_como(datos, "aa_edit")
+    sid = _servidor(admin_client, server_payload)
 
     r = aa.put(
         f"/api/v1/gateway-users/{otro['id']}/access",
         json={
             "global_capabilities": ["security_officer"],
-            "scope_grants": [{"scope_type": "server", "scope_id": 2, "role": "viewer"}],
+            "scope_grants": [{"scope_type": "server", "scope_id": sid, "role": "viewer"}],
         },
     )
     assert r.status_code == 200, r.text
@@ -431,13 +439,14 @@ def test_the_ceiling_applies_to_what_is_added_not_to_what_was_there(admin_client
 # --------------------------------------------------------------------------- #
 
 
-def test_setting_access_replaces_instead_of_adding(admin_client):
+def test_setting_access_replaces_instead_of_adding(admin_client, server_payload):
     """
     Es un reemplazo, no un incremento: la pregunta que responde una pantalla de accesos es "qué
     acceso tiene", y con endpoints por grant el estado final depende del orden de N llamadas.
     """
     datos = _crear(admin_client, "conalcance")
     uid = datos["id"]
+    sid = _servidor(admin_client, server_payload)
 
     r = admin_client.put(
         f"/api/v1/gateway-users/{uid}/access",
@@ -445,7 +454,7 @@ def test_setting_access_replaces_instead_of_adding(admin_client):
             "global_capabilities": [],
             "scope_grants": [
                 {"scope_type": "environment", "scope_id": 1, "role": "operator"},
-                {"scope_type": "server", "scope_id": 2, "role": "viewer"},
+                {"scope_type": "server", "scope_id": sid, "role": "viewer"},
             ],
         },
     )
@@ -467,20 +476,23 @@ def test_setting_access_replaces_instead_of_adding(admin_client):
     assert grants[0]["role"] == "viewer"
 
 
-def test_the_scope_type_survives_the_round_trip(admin_client):
+def test_the_scope_type_survives_the_round_trip(admin_client, server_payload):
     """
     El defecto que tenía el lector: perdía el ``scope_type`` y un grant de servidor se leía
     como uno de entorno. Se verifica con **el mismo número** en los dos, que es la forma exacta
     en que se manifestaba.
     """
     uid = _crear(admin_client, "mismonum")["id"]
+    sid = _servidor(admin_client, server_payload)
+    # El catálogo siembra entornos 1..4, así que el id del servidor existe también como entorno.
+    assert 1 <= sid <= 4
     r = admin_client.put(
         f"/api/v1/gateway-users/{uid}/access",
         json={
             "global_capabilities": [],
             "scope_grants": [
-                {"scope_type": "environment", "scope_id": 3, "role": "viewer"},
-                {"scope_type": "server", "scope_id": 3, "role": "owner"},
+                {"scope_type": "environment", "scope_id": sid, "role": "viewer"},
+                {"scope_type": "server", "scope_id": sid, "role": "owner"},
             ],
         },
     )
@@ -587,3 +599,90 @@ def test_the_module_requires_gateway_admin(admin_client):
         conn.execute(text("DELETE FROM user_global_capabilities WHERE user_id = 1"))
     r = admin_client.get("/api/v1/gateway-users")
     assert r.status_code == 403, r.text
+
+
+# --------------------------------------------------------------------------- #
+# F-16: alcances que apuntan a objetos inexistentes                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_set_access_rejects_a_scope_that_does_not_exist(admin_client):
+    uid = _crear(admin_client, "fantasma")["id"]
+    r = admin_client.put(
+        f"/api/v1/gateway-users/{uid}/access",
+        json={
+            "global_capabilities": [],
+            "scope_grants": [
+                {"scope_type": "environment", "scope_id": 1, "role": "viewer"},
+                {"scope_type": "server", "scope_id": 9999, "role": "viewer"},
+            ],
+        },
+    )
+    assert r.status_code == 422, r.text
+    ctx = r.json()["detail"]["public_context"]
+    assert ctx["code"] == "access.grant_scope_not_found"
+    assert ctx["missing_scopes"] == [{"scope_type": "server", "scope_id": 9999}]
+    # Nada se escribió: el acceso sigue vacío.
+    assert UserModel().find_access_context(uid)["grants"] == []
+
+
+def test_deleting_a_server_with_access_grants_is_a_409(admin_client, server_payload):
+    uid = _crear(admin_client, "conserver")["id"]
+    sid = _servidor(admin_client, server_payload, name="srv-del")
+    r = admin_client.put(
+        f"/api/v1/gateway-users/{uid}/access",
+        json={
+            "global_capabilities": [],
+            "scope_grants": [{"scope_type": "server", "scope_id": sid, "role": "viewer"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    r = admin_client.delete(f"/api/v1/servers/{sid}")
+    assert r.status_code == 409, r.text
+    ctx = r.json()["detail"]["public_context"]
+    assert ctx["code"] == "access.scope_has_grants"
+    assert (ctx["access_grant_count"], ctx["capability_grant_count"]) == (1, 0)
+
+    # Quitado el acceso, el borrado procede.
+    admin_client.put(
+        f"/api/v1/gateway-users/{uid}/access",
+        json={"global_capabilities": [], "scope_grants": []},
+    )
+    assert admin_client.delete(f"/api/v1/servers/{sid}").status_code == 200
+
+
+def test_deleting_an_environment_with_a_live_capability_grant_is_a_409(admin_client):
+    from sqlalchemy import text
+
+    r = admin_client.post(
+        "/api/v1/environments", json={"slug": "efimero", "name": "Efímero"}
+    )
+    assert r.status_code == 201, r.text
+    eid = r.json()["data"]["id"]
+    uid = _crear(admin_client, "conpuntual")["id"]
+    with Database().engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO capability_grants (user_id, capability, scope_type, scope_id, "
+                "status, live_key, requested_at, created_at, updated_at) VALUES (:u, "
+                "'blueprints.apply', 'environment', :e, 'active', 1, CURRENT_TIMESTAMP, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"u": uid, "e": eid},
+        )
+
+    r = admin_client.delete(f"/api/v1/environments/{eid}")
+    assert r.status_code == 409, r.text
+    ctx = r.json()["detail"]["public_context"]
+    assert ctx["code"] == "access.scope_has_grants"
+    assert (ctx["access_grant_count"], ctx["capability_grant_count"]) == (0, 1)
+
+    # Una capacidad puntual ya revocada es historia: no bloquea.
+    with Database().engine.begin() as conn:
+        conn.execute(
+            text("UPDATE capability_grants SET status = 'revoked', live_key = NULL "
+                 "WHERE scope_id = :e"),
+            {"e": eid},
+        )
+    assert admin_client.delete(f"/api/v1/environments/{eid}").status_code == 200

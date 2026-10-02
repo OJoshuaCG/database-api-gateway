@@ -12,16 +12,17 @@ Las filas no se borran nunca: toda salida de ``live_key`` pasa por acá y lo apa
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import Database
 from app.exceptions import AppHttpException
+from app.models.access_grant import AccessGrant
 from app.models.capability_grant import CapabilityGrant
 from app.models.environment import Environment
 from app.models.server import Server
 from app.models.user import User
-from app.services.capability_catalog import CODE_GRANT_DUPLICATE
+from app.services.capability_catalog import CODE_GRANT_DUPLICATE, CODE_SCOPE_HAS_GRANTS
 
 #: Vigencia de una solicitud pendiente (R3).
 PENDING_TTL = timedelta(days=7)
@@ -48,6 +49,53 @@ def _public(row: CapabilityGrant) -> dict:
         "request_reason": row.request_reason,
         "decision_reason": row.decision_reason,
     }
+
+
+def assert_scope_has_no_grants(session, scope_type: str, scope_id: int) -> None:
+    """
+    409 ``access.scope_has_grants`` si algún acceso apunta todavía a este entorno/servidor.
+
+    ``scope_id`` no tiene FK (es polimórfico: entorno o servidor), así que el motor no impide
+    borrar el destino. Sin este chequeo el grant SOBREVIVE a su destino y se pega al próximo
+    objeto que reutilice el id (SQLite reutiliza; MySQL < 8 recalcula ``AUTO_INCREMENT`` tras
+    un reinicio): un ``viewer`` en el entorno 3 borrado pasaría a regir sobre un entorno 3 nuevo
+    que nadie le otorgó. Se rechaza en vez de borrar en cascada porque quitar accesos es una
+    decisión de quien administra accesos, no un efecto colateral de ordenar el inventario.
+
+    Cuenta ``access_grants`` y las capacidades puntuales VIVAS (``pending``/``active``, las que
+    tienen ``live_key``); las decididas, revocadas o vencidas son historia y no bloquean. Corre
+    en la ``session`` del borrado, justo antes del ``DELETE``.
+    """
+    roles = (
+        session.query(func.count(AccessGrant.id))
+        .filter(AccessGrant.scope_type == scope_type, AccessGrant.scope_id == scope_id)
+        .scalar()
+        or 0
+    )
+    puntuales = (
+        session.query(func.count(CapabilityGrant.id))
+        .filter(
+            CapabilityGrant.scope_type == scope_type,
+            CapabilityGrant.scope_id == scope_id,
+            CapabilityGrant.live_key.is_not(None),
+        )
+        .scalar()
+        or 0
+    )
+    if roles or puntuales:
+        destino = "El entorno" if scope_type == "environment" else "El servidor"
+        raise AppHttpException(
+            message=(
+                f"{destino} tiene accesos otorgados ({roles} por alcance, {puntuales} "
+                "capacidades puntuales vivas). Quitalos o revocalos antes de borrarlo."
+            ),
+            status_code=409,
+            public_context={
+                "code": CODE_SCOPE_HAS_GRANTS,
+                "access_grant_count": roles,
+                "capability_grant_count": puntuales,
+            },
+        )
 
 
 class CapabilityGrantModel:

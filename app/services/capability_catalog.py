@@ -477,8 +477,14 @@ CODE_GRANT_CEILING = "access.grant_ceiling_exceeded"
 CODE_CAPABILITY_NOT_GRANTABLE = "access.capability_not_grantable"
 #: Ya hay una capacidad puntual viva (pendiente o activa) para ese usuario, capacidad y alcance. 409.
 CODE_GRANT_DUPLICATE = "access.grant_duplicate"
-#: El entorno o servidor del alcance no existe. 404.
+#: El entorno o servidor del alcance no existe. 404 en ``capability_grants``; 422 en el PUT de
+#: accesos (``set_access``), donde es un campo inválido del payload.
 CODE_GRANT_SCOPE_NOT_FOUND = "access.grant_scope_not_found"
+#: Borrar un entorno o servidor al que todavía apuntan accesos por alcance (``access_grants``)
+#: o capacidades puntuales vivas (``pending``/``active``). ``scope_id`` no tiene FK (es
+#: polimórfico), así que sin este 409 el grant sobreviviría a su destino y se pegaría al
+#: próximo objeto que reutilice el id. 409.
+CODE_SCOPE_HAS_GRANTS = "access.scope_has_grants"
 #: El destinatario está desactivado: no se le otorga nada hasta reactivarlo. 409.
 CODE_GRANT_USER_INACTIVE = "access.grant_user_inactive"
 #: Quien pidió una capacidad sensible no puede aprobarla él mismo. 409.
