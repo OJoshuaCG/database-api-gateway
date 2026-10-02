@@ -127,6 +127,22 @@ def test_catalog_marks_the_two_axes_separately(admin_client):
     assert escritura["discloses"] is False
 
 
+def test_catalog_publishes_the_capability_grant_columns_over_http(admin_client):
+    """
+    ``grantable``, ``sensitive`` e ``implies`` tienen que llegar por HTTP, no solo existir en
+    ``capability_matrix()``: el ``response_model`` descarta en silencio todo campo que el schema
+    no declare, y la SPA vería todo como no otorgable.
+    """
+    rows = admin_client.get("/api/v1/authz/catalog").json()["data"]
+    esperado = {r["id"]: r for r in capability_matrix()}
+    for row in rows:
+        for campo in ("grantable", "sensitive", "implies"):
+            assert row[campo] == esperado[row["id"]][campo], (row["id"], campo)
+    assert any(r["grantable"] for r in rows)
+    assert any(r["sensitive"] for r in rows)
+    assert any(r["implies"] for r in rows)
+
+
 # --------------------------------------------------------------------------- #
 # El marcador que hace enumerable la cobertura                                #
 # --------------------------------------------------------------------------- #

@@ -115,6 +115,11 @@ class CapabilityRowOut(BaseModel):
     scope_axis: str
     roles: list[str]
     global_capabilities: list[str]
+    # Capacidades puntuales: si se pueden otorgar sueltas, si exigen segundo aprobador y qué
+    # lectura implica cada escritura. Sin declararlas acá, response_model las descartaba.
+    grantable: bool
+    sensitive: bool
+    implies: list[str]
 
 
 class ScopeReadinessServerOut(BaseModel):
