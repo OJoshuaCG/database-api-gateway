@@ -463,7 +463,9 @@ def export_content(request: Request, actor: ExportsDownloadJob, job_id: int):
     # con `fetch` (necesita el cuerpo para el portapapeles), así que puede mandar el header y
     # no le hace falta la exención por método — a diferencia de `/download`, que se abre como
     # navegación y por eso usa un ticket.
-    csrf.enforce_regardless_of_method(request, request.session.get(SESSION_SID) or "")
+    csrf.enforce_regardless_of_method(
+        request, request.session.get(SESSION_SID) or "", actor=actor
+    )
     info = ExportController().read_inline(job_id, admin=actor)
     return PlainTextResponse(
         content=info["text"],

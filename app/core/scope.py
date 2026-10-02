@@ -264,11 +264,18 @@ def effective_role_at(
     return role_at_point(actor, ScopePoint(environment_id=env_id, server_id=server_id))
 
 
-def _forbidden() -> AppHttpException:
+def _forbidden(actor: "Actor | dict | None", capability: Capability) -> AppHttpException:
     """
     El 403 único de las dos capas. No dice cuál negó: distinguir "no tenés la capacidad" de "no
     la tenés acá" le regala a un atacante el mapa de sus propios alcances por fuerza bruta.
+
+    ``actor`` y ``capability`` son para el RASTRO (``app.core.denial_audit``, agregado y
+    best-effort), nunca para la respuesta: construir el 403 ya deja la fila, así que ningún
+    camino de denegación de esta capa queda sin rastro.
     """
+    from app.core.denial_audit import record_denial
+
+    record_denial(CODE_FORBIDDEN, actor=actor, capability=capability, check="scope")
     return AppHttpException(
         message="No tienes permiso para esta operación.",
         status_code=403,
@@ -318,7 +325,7 @@ def assert_at(actor: Actor, capability: Capability, target: ScopeTarget) -> None
     Sin grants por alcance, o con un actor de token, la capa 2 es un no-op y NO toca la BD.
     """
     if not actor.has(capability):
-        raise _forbidden()
+        raise _forbidden(actor, capability)
     assert_layer2(actor, capability, target)
 
 
@@ -330,11 +337,11 @@ def assert_at_point(actor: Actor, capability: Capability, point: ScopePoint) -> 
     Sin grants por alcance, o con un actor de token, no toca la BD. Mismo 403 en ambas capas.
     """
     if not actor.has(capability):
-        raise _forbidden()
+        raise _forbidden(actor, capability)
     if not needs_target_resolution(actor, capability):
         return
     if not _permits(actor, role_at_point(actor, point), capability, point):
-        raise _forbidden()
+        raise _forbidden(actor, capability)
 
 
 def assert_layer2(actor: Actor, capability: Capability, target: ScopeTarget) -> None:
@@ -347,7 +354,7 @@ def assert_layer2(actor: Actor, capability: Capability, target: ScopeTarget) -> 
         # Blueprint sin BDs: no hay escritura remota, decide el rol base.
         base = actor.base_role if actor.base_role is not None else actor.role
         if not _permits(actor, base, capability):
-            raise _forbidden()
+            raise _forbidden(actor, capability)
         return
 
     if target.quantifier == "any":
@@ -359,7 +366,7 @@ def assert_layer2(actor: Actor, capability: Capability, target: ScopeTarget) -> 
             _permits(actor, role_at_point(actor, p), capability, p) for p in puntos
         )
     if not ok:
-        raise _forbidden()
+        raise _forbidden(actor, capability)
 
 
 def _item_verdicts(
@@ -421,7 +428,7 @@ def partition_for_batch(
     puntos = list(points_fn())
     particion = partition_by_scope(actor=admin, capability=capability, points=puntos)
     if (explicit and particion.forbidden) or (puntos and not particion.permitted):
-        raise _forbidden()
+        raise _forbidden(admin, capability)
     return particion
 
 
@@ -449,7 +456,7 @@ def assert_scope(
         server_id=server_id,
         managed_database_id=managed_database_id,
     ):
-        raise _forbidden()
+        raise _forbidden(actor, capability)
 
 
 def assert_scope_for_database(actor: Actor, capability: Capability, *, db_id: int) -> None:

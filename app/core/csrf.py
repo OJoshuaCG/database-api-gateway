@@ -111,7 +111,7 @@ def _origin_permitido(origin: str) -> bool:
     return any(norm(permitido) == objetivo for permitido in CORS_ORIGINS)
 
 
-def enforce(request: Request, sid: str) -> None:
+def enforce(request: Request, sid: str, *, actor=None) -> None:
     """
     Exige token y ``Origin`` aceptable en un método no seguro. Llamar SOLO con actor ``admin``.
 
@@ -121,10 +121,20 @@ def enforce(request: Request, sid: str) -> None:
     """
     if request.method.upper() in SAFE_METHODS:
         return
-    enforce_regardless_of_method(request, sid)
+    enforce_regardless_of_method(request, sid, actor=actor)
 
 
-def enforce_regardless_of_method(request: Request, sid: str) -> None:
+def _deny(code: str, actor, **extra) -> None:
+    """
+    Rastro agregado y best-effort del rechazo (``app.core.denial_audit``). El ``Origin`` va al
+    ``detail`` —es lo que dice desde dónde viene una campaña cross-site— y nunca a la respuesta.
+    """
+    from app.core.denial_audit import record_denial
+
+    record_denial(code, actor=actor, check="csrf", extra=extra or None)
+
+
+def enforce_regardless_of_method(request: Request, sid: str, *, actor=None) -> None:
     """
     Lo mismo, **sin la exención por método**. Para un GET que muta y que el cliente sí puede
     llamar con un header.
@@ -142,6 +152,7 @@ def enforce_regardless_of_method(request: Request, sid: str) -> None:
         # `context` (solo en desarrollo) lleva el origin; `public_context` NO, porque
         # devolverle al atacante qué origen mandó no le dice nada que no sepa, pero
         # devolvérselo a un log de terceros sí.
+        _deny(CODE_ORIGIN_REJECTED, actor, origin=origin)
         raise AppHttpException(
             message="Origen no permitido para esta operación.",
             status_code=403,
@@ -151,6 +162,7 @@ def enforce_regardless_of_method(request: Request, sid: str) -> None:
 
     enviado = request.headers.get(CSRF_HEADER)
     if not enviado:
+        _deny(CODE_CSRF_MISSING, actor)
         raise AppHttpException(
             message=(
                 "Falta el token CSRF. Se lee de la cookie de CSRF y se manda en el header "
@@ -163,6 +175,7 @@ def enforce_regardless_of_method(request: Request, sid: str) -> None:
     # `compare_digest` y no `==`: la comparación de strings corta en el primer byte distinto y
     # eso es un oráculo de timing sobre el token. Es el mismo criterio que el del login.
     if not compare_digest(enviado, token_for(sid)):
+        _deny(CODE_CSRF_INVALID, actor)
         raise AppHttpException(
             message="Token CSRF inválido.",
             status_code=403,

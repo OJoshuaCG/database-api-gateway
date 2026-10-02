@@ -54,6 +54,7 @@ from fastapi import Depends, Request
 from app.core import csrf
 from app.core.actor import Actor, admin_actor
 from app.core.capability_resolution import parse_access_context
+from app.core.denial_audit import record_denial
 from app.core.scope import ScopeTarget, assert_layer2
 from app.exceptions import AppHttpException
 from app.models.user_model import UserModel
@@ -118,6 +119,9 @@ def assert_capability(actor: Actor, capability: Capability) -> None:
     aplicado a nombres de capacidad.
     """
     if not actor.has(capability):
+        # El rastro (agregado, best-effort) lleva la capacidad; la respuesta no. Ver
+        # ``app.core.denial_audit``.
+        record_denial(CODE_FORBIDDEN, actor=actor, capability=capability, check="capability")
         raise AppHttpException(
             message="No tienes permiso para esta operación.",
             status_code=403,
@@ -187,7 +191,7 @@ def _identify(request: Request) -> Actor:
     if actor.kind == "admin":
         from app.core.auth import SESSION_SID
 
-        csrf.enforce(request, request.session.get(SESSION_SID) or "")
+        csrf.enforce(request, request.session.get(SESSION_SID) or "", actor=actor)
     return actor
 
 

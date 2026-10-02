@@ -139,9 +139,9 @@ def test_the_kill_switch_rejection_is_aggregated_too(client):
 
 def test_the_aggregator_memory_is_bounded():
     """Un bloque IPv6 rotando no puede hacer crecer el agregador sin cota."""
-    from app.core.mcp_auth import _RejectionAudit
+    from app.core.audit_aggregator import WindowedAggregator
 
-    agg = _RejectionAudit(window=60, max_ips=3)
+    agg = WindowedAggregator(window=60, max_keys=3)
     for i in range(10):
         assert agg.admit(f"2001:db8::{i}") == 0
-    assert len(agg._ips) == 3
+    assert len(agg) == 3

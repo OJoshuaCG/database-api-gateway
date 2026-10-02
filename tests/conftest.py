@@ -69,6 +69,11 @@ def client():
     from app.core.mcp_auth import reset_rejection_state
 
     reset_rejection_state()
+    # Mismo motivo para el agregador de denegaciones (`access.denied`): sin esto, el 403 de un
+    # test se come la fila del mismo (actor, código, ruta) en el siguiente.
+    from app.core.denial_audit import reset_denial_state
+
+    reset_denial_state()
 
     import main
 
