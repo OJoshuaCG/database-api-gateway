@@ -32,6 +32,8 @@ otros dos, porque nadie los había pensado. Una auditoría lo midió:
 
 La clave del límite es el **token**, no la IP: un agente en CI comparte IP con todos los demás
 jobs, así que por IP el límite sería colectivo y el primero en gastarlo dejaría afuera al resto.
+Pero ese límite solo acota a quien tiene un token real (un ``token_id`` inventado estrena cupo):
+los bearers inválidos los frena el tope de rechazos POR IP de ``mcp_auth.authenticate_agent``.
 """
 
 from fastapi import Depends, FastAPI, Request, Response

@@ -440,6 +440,10 @@ MCP_MAX_BODY_KIB = int(os.getenv("MCP_MAX_BODY_KIB", "256"))
 # Límite de tasa del endpoint MCP, por TOKEN. Por IP no sirve: un agente en CI comparte IP con
 # todos los demás jobs.
 MCP_RATE_LIMIT = os.getenv("MCP_RATE_LIMIT", "120/minute")
+# Tope de credenciales RECHAZADAS por IP en el endpoint MCP. El límite por token no frena a quien
+# inventa un token_id distinto por request (cada uno es un cupo nuevo); este sí. Superado, la IP
+# recibe 429 sin tocar la BD de metadatos hasta que la ventana se vacíe. Ver `app/core/mcp_auth.py`.
+MCP_AUTH_FAILURE_RATE_LIMIT = os.getenv("MCP_AUTH_FAILURE_RATE_LIMIT", "30/minute")
 
 # ======= Startup validation ======= #
 if not SECRET_KEY:

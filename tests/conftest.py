@@ -63,6 +63,12 @@ def client():
     crypto.reset_dek_cache()
 
     limiter.enabled = False
+    # El `mcp_limiter` queda PRENDIDO (los tests del MCP prueban sus límites), así que se vacían
+    # sus cupos y el agregador de rechazos: el storage en memoria vive lo que el proceso, y sin
+    # esto los 401 de un test le gastan el tope de rechazos por IP a los siguientes.
+    from app.core.mcp_auth import reset_rejection_state
+
+    reset_rejection_state()
 
     import main
 

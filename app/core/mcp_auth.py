@@ -28,9 +28,25 @@ registraba, y la credencial con más probabilidad de terminar commiteada en el r
 era la única cuyo uso no dejaba huella. No se podía responder "¿alguien está probando tokens?"
 ni "¿desde cuándo se usa este token que acabo de revocar?".
 
-Ahora cada camino escribe una fila. Y la distinción que hay que preservar: **el ``detail`` lleva
+Ahora todo camino deja rastro. Y la distinción que hay que preservar: **el ``detail`` lleva
 el motivo interno** —inexistente, hmac, revocado, expirado— mientras la **respuesta** sigue
 siendo el único código opaco. El oráculo se le niega al atacante, no al operador.
+
+LOS RECHAZOS SE LIMITAN POR IP Y SE AUDITAN AGREGADOS
+-----------------------------------------------------
+"Una fila por rechazo" era una escritura gratis en ``audit_log`` para cualquiera sin
+credencial: el límite por token del ``mcp_limiter`` no frena a quien inventa un ``token_id``
+distinto por request (cada uno estrena un cupo), así que cada request basura pagaba una lectura
+a la BD de metadatos, un HMAC y un INSERT — el DoS sobre la BD compartida que la sub-app decía
+haber cerrado, más el registro real enterrado bajo ruido. Dos piezas lo cierran:
+
+- **Tope de rechazos por IP** (``MCP_AUTH_FAILURE_RATE_LIMIT``): cada rechazo consume un cupo de
+  la IP, y con el cupo agotado la IP recibe 429 **antes** de tocar la BD. El costo, declarado: un
+  agente legítimo detrás de la misma IP que el atacante (un runner de CI compartido) también
+  recibe 429 mientras dure la ventana. Se acepta porque es acotado y se disuelve solo; la
+  alternativa es que cualquiera sature la BD de metadatos.
+- **Auditoría agregada** (``_RejectionAudit``): como mucho una fila por IP por ventana, y esa
+  fila lleva cuántos rechazos de la IP quedaron sin fila desde la anterior.
 
 POR QUÉ HMAC Y NO ARGON2
 ------------------------
@@ -41,15 +57,21 @@ constante, para no filtrar existencia por tiempo — el mismo criterio que el ``
 login.
 """
 
+import threading
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from hmac import compare_digest, new as hmac_new
 from hashlib import sha256
+from time import monotonic
 
 from fastapi import Request
+from limits import parse
+from slowapi.util import get_remote_address
 
 from app.core.actor import Actor, token_actor
 from app.core.crypto import api_token_pepper
-from app.core.environments import MCP_ENABLED
+from app.core.environments import MCP_AUTH_FAILURE_RATE_LIMIT, MCP_ENABLED
+from app.core.limiter import hit_or_429, mcp_limiter
 from app.exceptions import AppHttpException
 from app.models.api_token import ApiToken
 
@@ -98,17 +120,98 @@ def mint() -> tuple[str, str, str]:
     return token_id, secret, f"{TOKEN_PREFIX}.{token_id}.{secret}"
 
 
-def _reject(motivo: str, *, token_id: str | None = None) -> AppHttpException:
-    """
-    El 401 opaco, con el motivo en la AUDITORÍA y no en la respuesta.
+#: Ventana de agregación de la auditoría de rechazos: como mucho una fila por IP por ventana.
+_AUDIT_WINDOW_SECONDS = 60.0
+#: Tope de IPs que el agregador recuerda. Sin tope, un atacante con un bloque IPv6 haría crecer
+#: el diccionario sin límite: el agregador que existe para acotar un recurso sería otro sin cota.
+_AUDIT_MAX_IPS = 10_000
 
-    ``motivo`` es vocabulario cerrado (``sin_bearer``, ``malformado``, ``inexistente``,
-    ``hmac``, ``revocado``, ``expirado``) porque se lee en un incidente y un texto libre por
-    sitio de llamada lo vuelve inagrupable.
 
-    Best-effort: un fallo al auditar no puede convertirse en un fallo al rechazar. Lo
-    fail-closed está reservado a lo que divulga datos, y acá no se divulga nada.
+class _RejectionAudit:
     """
+    Agregador EN PROCESO de la auditoría de rechazos: decide si un rechazo escribe fila o solo
+    suma al contador de su IP.
+
+    El primer rechazo de una IP en una ventana escribe fila, con ``agregados=N``: los rechazos de
+    esa IP que quedaron sin fila desde la anterior (incluidos los cortados con 429). Los demás
+    de la ventana solo cuentan.
+
+    LÍMITES, DECLARADOS:
+
+    - **Es por proceso.** Con N workers son hasta N filas por IP por ventana. Sigue acotado —la
+      cota pasa de ∞ a N—, y llevarlo a Redis sería sumar un round-trip a cada rechazo para
+      ganar un factor constante. El tope de rechazos por IP sí es compartido: usa el storage del
+      ``mcp_limiter``.
+    - **La cuenta de la última ventana se escribe recién con el próximo rechazo de esa IP.** Si
+      el ataque termina, esa cola no llega a ``audit_log``: lo que sí quedó es la fila que abrió
+      la ventana, que es lo que dice que hubo un ataque y desde dónde.
+    - Si se supera ``_AUDIT_MAX_IPS`` se olvida la IP más vieja con su cuenta pendiente. Se
+      prefiere perder un contador a dejar crecer la memoria.
+    """
+
+    def __init__(self, window: float = _AUDIT_WINDOW_SECONDS, max_ips: int = _AUDIT_MAX_IPS):
+        self._window = window
+        self._max_ips = max_ips
+        self._lock = threading.Lock()
+        # ip -> [inicio de la ventana, rechazos sin fila desde la última]
+        self._ips: OrderedDict[str, list[float | int]] = OrderedDict()
+
+    def admit(self, ip: str) -> int | None:
+        """
+        Cuenta un rechazo de ``ip``. Devuelve ``None`` si NO corresponde escribir fila, o la
+        cantidad de rechazos previos que esa fila tiene que declarar como agregados.
+        """
+        ahora = monotonic()
+        with self._lock:
+            entrada = self._ips.get(ip)
+            if entrada is not None and ahora - entrada[0] < self._window:
+                entrada[1] += 1
+                return None
+            pendientes = int(entrada[1]) if entrada is not None else 0
+            self._ips[ip] = [ahora, 0]
+            self._ips.move_to_end(ip)
+            while len(self._ips) > self._max_ips:
+                self._ips.popitem(last=False)
+            return pendientes
+
+    def reset(self) -> None:
+        with self._lock:
+            self._ips.clear()
+
+
+_rejection_audit = _RejectionAudit()
+
+
+def reset_rejection_state() -> None:
+    """
+    Olvida el agregador y los cupos del ``mcp_limiter``. Para los tests: el storage en memoria
+    vive lo que el proceso, y sin esto los rechazos de un test le gastan el cupo al siguiente.
+    """
+    _rejection_audit.reset()
+    mcp_limiter.reset()
+
+
+def _client_ip(request: Request) -> str:
+    return get_remote_address(request) or "desconocida"
+
+
+def _failure_quota_exhausted(ip: str) -> bool:
+    """
+    ¿La IP ya gastó su cupo de rechazos? ``test`` y no ``hit``: consultar no consume. El
+    consumo lo hace ``_reject``, uno por rechazo real.
+    """
+    if not mcp_limiter.enabled:
+        return False
+    return not mcp_limiter.limiter.test(
+        parse(MCP_AUTH_FAILURE_RATE_LIMIT), "mcp_auth_failure", ip
+    )
+
+
+def _audit_rejection(ip: str, motivo: str, token_id: str | None = None) -> None:
+    """La fila de rechazo, solo si el agregador la admite. Best-effort, como toda auditoría."""
+    agregados = _rejection_audit.admit(ip)
+    if agregados is None:
+        return
     from app.services import audit
 
     audit.record(
@@ -119,8 +222,33 @@ def _reject(motivo: str, *, token_id: str | None = None) -> AppHttpException:
         touched_engine=False,
         # `token_id` es la parte PÚBLICA del bearer. El secreto no aparece, ni entero ni
         # recortado: un prefijo de secreto en un log es un secreto en un log.
-        detail=f"rechazo={motivo}" + (f" token={token_id}" if token_id else ""),
+        detail=(
+            f"rechazo={motivo}"
+            + (f" token={token_id}" if token_id else "")
+            + f" ip={ip} agregados={agregados}"
+        ),
     )
+
+
+def _reject(
+    request: Request, motivo: str, *, token_id: str | None = None
+) -> AppHttpException:
+    """
+    El 401 opaco, con el motivo en la AUDITORÍA y no en la respuesta.
+
+    ``motivo`` es vocabulario cerrado (``sin_bearer``, ``malformado``, ``inexistente``,
+    ``hmac``, ``revocado``, ``expirado``) porque se lee en un incidente y un texto libre por
+    sitio de llamada lo vuelve inagrupable.
+
+    Consume un cupo de rechazos de la IP; si ese era el último, el que levanta es el 429 y no
+    el 401 (los dos revelan lo mismo: que la credencial no sirvió).
+
+    Best-effort: un fallo al auditar no puede convertirse en un fallo al rechazar. Lo
+    fail-closed está reservado a lo que divulga datos, y acá no se divulga nada.
+    """
+    ip = _client_ip(request)
+    _audit_rejection(ip, motivo, token_id)
+    hit_or_429(mcp_limiter, MCP_AUTH_FAILURE_RATE_LIMIT, "mcp_auth_failure", ip)
     return AppHttpException(
         message="Credencial de agente inválida.",
         status_code=401,
@@ -137,19 +265,12 @@ def authenticate_agent(request: Request) -> Actor:
     exención de CSRF que tienen los agentes —correcta, porque un bearer no es ambiental— se
     volvería el bypass.
     """
+    ip = _client_ip(request)
     if not MCP_ENABLED:
-        from app.services import audit
-
         # También se audita el rechazo por kill switch: si alguien lo apagó y los agentes siguen
-        # intentando, eso es información operativa que hay que poder ver.
-        audit.record(
-            "mcp.auth",
-            status="failure",
-            admin=None,
-            target_type="api_token",
-            touched_engine=False,
-            detail="rechazo=deshabilitado",
-        )
+        # intentando, eso es información operativa que hay que poder ver. Agregado como los
+        # demás: con el servidor apagado, una fila por request seguía siendo escritura gratis.
+        _audit_rejection(ip, "deshabilitado")
         # 503 y no 404: el operador que lo prendió y no anda necesita saber que está apagado,
         # no buscar un endpoint que "no existe". Y no revela nada: el kill switch es config, no
         # un secreto.
@@ -159,12 +280,18 @@ def authenticate_agent(request: Request) -> Actor:
             public_context={"code": CODE_DISABLED},
         )
 
+    if _failure_quota_exhausted(ip):
+        # Antes de leer la BD y antes del HMAC: es lo que hace que el tope sea un tope de COSTO y
+        # no solo de filas. Se cuenta en el agregador para que la fila siguiente diga el volumen.
+        _audit_rejection(ip, "limite_ip")
+        hit_or_429(mcp_limiter, MCP_AUTH_FAILURE_RATE_LIMIT, "mcp_auth_failure", ip)
+
     crudo = request.headers.get("authorization") or ""
     if not crudo.lower().startswith("bearer "):
-        raise _reject("sin_bearer")
+        raise _reject(request, "sin_bearer")
     partes = crudo[7:].strip().split(".")
     if len(partes) != 3 or partes[0] != TOKEN_PREFIX:
-        raise _reject("malformado")
+        raise _reject(request, "malformado")
     _, token_id, secreto = partes
 
     ahora = _utcnow()
@@ -177,14 +304,14 @@ def authenticate_agent(request: Request) -> Actor:
             # Se paga el HMAC igual: achica la señal de tiempo. El argumento de seguridad, sin
             # embargo, es la entropía del identificador — ver el docstring del módulo.
             token_hmac(secreto)
-            raise _reject("inexistente", token_id=token_id)
+            raise _reject(request, "inexistente", token_id=token_id)
 
         if not compare_digest(fila.secret_hmac, token_hmac(secreto)):
-            raise _reject("hmac", token_id=token_id)
+            raise _reject(request, "hmac", token_id=token_id)
         if fila.revoked_at is not None:
-            raise _reject("revocado", token_id=token_id)
+            raise _reject(request, "revocado", token_id=token_id)
         if fila.expires_at <= ahora:
-            raise _reject("expirado", token_id=token_id)
+            raise _reject(request, "expirado", token_id=token_id)
 
         if fila.last_used_at is None or ahora - fila.last_used_at >= _LAST_USED_RESOLUTION:
             fila.last_used_at = ahora
