@@ -14,6 +14,19 @@ Quién puede qué (decisiones de negocio, no negociables acá)
   access_admin las apruebe (la aprobación es del B4). El resto nace ``active``.
 - Revocar lo hace un solo access_admin, sin techo: activa → ``revoked``, pendiente → ``cancelled``.
 
+Aprobación (B4)
+---------------
+- Aprueba OTRO access_admin: ni quien la pidió (``access.self_approval_forbidden``) ni la propia
+  persona destino (``access.self_modification_forbidden``).
+- Solo se re-verifica el techo de quien APRUEBA (tiene que tener la capacidad en ese alcance); del
+  solicitante solo se exige que siga siendo un access_admin activo. Si dejó de serlo, la solicitud
+  se cancela y se responde 409.
+- La decisión es compare-and-set (``status='pending' AND expires_at > now``): con dos aprobadores
+  simultáneos gana uno solo y el otro recibe ``access.grant_not_pending``.
+- Vencimiento perezoso (D6): ``expire_overdue`` corre en cada lectura/decisión y una vez al
+  arrancar. Los eventos automáticos (vencida, cancelada por pérdida de rol) se auditan con
+  ``actor_type="system"``.
+
 Auditoría (D11): ``audit.record`` con ``privilege=capacidad``, ``grantee=username``,
 ``object_level=scope_type``, ``object_name="environment:3"`` y un ``detail`` JSON con el diff de
 estado. Los rechazos por auto-otorgamiento y techo se auditan como ``failure``.
@@ -38,6 +51,7 @@ from app.services.capability_catalog import (
     CODE_GRANT_NOT_PENDING,
     CODE_GRANT_SCOPE_NOT_FOUND,
     CODE_GRANT_USER_INACTIVE,
+    CODE_SELF_APPROVAL,
     CODE_SELF_MODIFICATION,
     IMPLIED_READ,
     Capability,
@@ -175,11 +189,67 @@ class CapabilityGrantController:
             detail=json.dumps(detail, ensure_ascii=False),
         )
 
+    def _audit_system(self, action: str, row: dict, *, before: str, after: str,
+                      reason: str) -> None:
+        """Evento automático: sin persona, ``actor_type='system'`` (D11)."""
+        names = self.grants.usernames({row["user_id"]})
+        detail = {"before": {"status": before}, "after": {"status": after},
+                  "grant_id": row["id"], "reason": reason}
+        audit.record(
+            action,
+            admin=None,
+            actor_type="system",
+            target_type="capability_grant",
+            target_id=row["id"],
+            touched_engine=False,
+            grantee=names.get(row["user_id"]),
+            privilege=row["capability"],
+            object_level=row["scope_type"],
+            object_name=_object_name(row["scope_type"], row["scope_id"]),
+            detail=json.dumps(detail, ensure_ascii=False),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Vencimiento y cancelación automáticos                               #
+    # ------------------------------------------------------------------ #
+    def expire_overdue(self) -> int:
+        """
+        Pasa a ``expired`` las pendientes vencidas (D6). Compare-and-set por fila: si otro
+        request la aprobó o canceló entre el SELECT y el UPDATE, no se pisa. Devuelve cuántas
+        venció ESTA llamada (y solo esas se auditan).
+        """
+        n = 0
+        for row in self.grants.list_overdue():
+            if self.grants.close_live(
+                row["id"], expected_status="pending", new_status="expired", decided_by=None
+            ):
+                self._audit_system("capability_grant.expired", row, before="pending",
+                                   after="expired", reason="expired")
+                n += 1
+        return n
+
+    def cancel_pending_requested_by(self, user_id: int, *, reason: str = "requester_lost_access") -> int:
+        """
+        Cancela las solicitudes pendientes que pidió ``user_id`` (perdió ``access_admin`` o fue
+        desactivado). Sin efecto sobre las activas: una aprobación ya dada no depende de quien
+        la pidió.
+        """
+        n = 0
+        for row in self.grants.list_pending_requested_by(user_id):
+            if self.grants.close_live(
+                row["id"], expected_status="pending", new_status="cancelled", decided_by=None
+            ):
+                self._audit_system("capability_grant.cancelled", row, before="pending",
+                                   after="cancelled", reason=reason)
+                n += 1
+        return n
+
     # ------------------------------------------------------------------ #
     # Lectura                                                            #
     # ------------------------------------------------------------------ #
     def list_for_user(self, user_id: int, actor, status: str | None = None) -> list[dict]:
         assert_access_admin(actor)
+        self.expire_overdue()
         self._user_or_404(user_id)
         return self._serialize_many(self.grants.list_for_user(user_id, status))
 
@@ -308,4 +378,148 @@ class CapabilityGrantController:
             row["scope_type"], row["scope_id"], grant_id=grant_id, before=previous,
             after=new_status,
         )
+        return self._serialize(self.grants.get(grant_id))
+
+    # ------------------------------------------------------------------ #
+    # Aprobación (B4)                                                    #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _not_pending() -> AppHttpException:
+        return AppHttpException(
+            message="La solicitud ya no está pendiente (fue decidida, venció o se canceló).",
+            status_code=409,
+            public_context={"code": CODE_GRANT_NOT_PENDING},
+        )
+
+    def _requester_is_active_access_admin(self, requested_by: int | None) -> bool:
+        if requested_by is None:
+            return False
+        fila = self.users.find_by_id(requested_by)
+        if not fila or not fila.get("is_active"):
+            return False
+        ctx = self.users.find_access_context(requested_by)
+        return GlobalCapability.ACCESS_ADMIN.value in (ctx.get("globals") or [])
+
+    def _block_reason(self, actor, row: dict, grantee: dict | None, requester_ok: bool) -> str | None:
+        """
+        Código ``access.*`` por el que ``actor`` NO puede decidir sobre ``row``, o ``None``.
+        Es la única fuente de las reglas de aprobación: ``approve`` y la bandeja la comparten.
+        """
+        actor_id, _ = identity_of(actor)
+        if row["requested_by"] is not None and row["requested_by"] == actor_id:
+            return CODE_SELF_APPROVAL
+        if row["user_id"] == actor_id:
+            return CODE_SELF_MODIFICATION
+        if not grantee or not grantee.get("is_active"):
+            return CODE_GRANT_USER_INACTIVE
+        if not requester_ok:
+            return CODE_GRANT_NOT_PENDING
+        if self.grants.scope_name(row["scope_type"], row["scope_id"]) is None:
+            return CODE_GRANT_SCOPE_NOT_FOUND
+        if not is_grantable(row["capability"]) or not capability_at_point(
+            actor, Capability(row["capability"]), self._point_for(row["scope_type"], row["scope_id"])
+        ):
+            return CODE_GRANT_CEILING
+        return None
+
+    _BLOCK_MESSAGES = {
+        CODE_SELF_APPROVAL: ("No puedes aprobar una solicitud que pediste tú: la tiene que "
+                             "aprobar otra persona con permiso de administración de accesos.", 409),
+        CODE_SELF_MODIFICATION: ("No puedes aprobarte capacidades a ti mismo.", 409),
+        CODE_GRANT_USER_INACTIVE: ("La persona está desactivada: reactívala antes de aprobar.", 409),
+        CODE_GRANT_SCOPE_NOT_FOUND: ("El entorno o servidor indicado ya no existe.", 404),
+        CODE_GRANT_CEILING: ("No puedes aprobar más acceso del que tienes en ese alcance.", 409),
+    }
+
+    def list_pending(self, actor) -> list[dict]:
+        """Bandeja: solicitudes pendientes vigentes, cada una con ``can_decide`` para ``actor``."""
+        assert_access_admin(actor)
+        self.expire_overdue()
+        rows = self.grants.list_pending()
+        out = self._serialize_many(rows)
+        requesters: dict = {}
+        for raw, ser in zip(rows, out):
+            rid = raw["requested_by"]
+            if rid not in requesters:
+                requesters[rid] = self._requester_is_active_access_admin(rid)
+            reason = self._block_reason(
+                actor, raw, self.users.find_by_id(raw["user_id"]), requesters[rid]
+            )
+            ser["can_decide"] = reason is None
+            ser["blocked_reason"] = reason
+        return out
+
+    def _pending_or_error(self, grant_id: int) -> dict:
+        row = self.grants.get(grant_id)
+        if not row:
+            raise AppHttpException(
+                message="Capacidad puntual no encontrada.",
+                status_code=404,
+                public_context={"code": CODE_GRANT_NOT_FOUND},
+            )
+        if row["status"] != "pending":
+            raise self._not_pending()
+        return row
+
+    def approve(self, grant_id: int, actor, reason: str | None = None) -> dict:
+        assert_access_admin(actor)
+        self.expire_overdue()
+        row = self._pending_or_error(grant_id)
+        grantee = self.users.find_by_id(row["user_id"])
+        username = (grantee or {}).get("username", "")
+
+        requester_ok = self._requester_is_active_access_admin(row["requested_by"])
+        if not requester_ok and self._self_check(actor, row) is None:
+            # Deriva de estado que se coló por los hooks (D7): se cancela y se avisa.
+            if self.grants.close_live(grant_id, expected_status="pending",
+                                      new_status="cancelled", decided_by=None):
+                self._audit_system("capability_grant.cancelled", row, before="pending",
+                                   after="cancelled", reason="requester_lost_access")
+            raise self._not_pending()
+
+        code = self._block_reason(actor, row, grantee, requester_ok)
+        if code is not None:
+            self._audit("capability_grant.approved", actor, username, row["capability"],
+                        row["scope_type"], row["scope_id"], grant_id=grant_id,
+                        before="pending", after="pending", status="failure", reason=code)
+            message, status_code = self._BLOCK_MESSAGES.get(
+                code, ("No se puede aprobar esta solicitud.", 409)
+            )
+            raise AppHttpException(message=message, status_code=status_code,
+                                   public_context={"code": code})
+
+        actor_id, _ = identity_of(actor)
+        reason = (reason or "").strip() or None
+        if not self.grants.decide_pending(grant_id, approve=True, decided_by=actor_id,
+                                          reason=reason):
+            raise self._not_pending()
+        self._audit("capability_grant.approved", actor, username, row["capability"],
+                    row["scope_type"], row["scope_id"], grant_id=grant_id,
+                    before="pending", after="active", reason=reason)
+        return self._serialize(self.grants.get(grant_id))
+
+    @staticmethod
+    def _self_check(actor, row: dict) -> str | None:
+        """Self-approval / self-grantee tienen prioridad sobre el drift del solicitante."""
+        actor_id, _ = identity_of(actor)
+        if row["requested_by"] is not None and row["requested_by"] == actor_id:
+            return CODE_SELF_APPROVAL
+        if row["user_id"] == actor_id:
+            return CODE_SELF_MODIFICATION
+        return None
+
+    def reject(self, grant_id: int, actor, reason: str | None = None) -> dict:
+        """Pendiente → ``rejected``. Sin techo ni segundo aprobador: rechazar nunca da acceso."""
+        assert_access_admin(actor)
+        self.expire_overdue()
+        row = self._pending_or_error(grant_id)
+        grantee = self.users.find_by_id(row["user_id"])
+        actor_id, _ = identity_of(actor)
+        reason = (reason or "").strip() or None
+        if not self.grants.decide_pending(grant_id, approve=False, decided_by=actor_id,
+                                          reason=reason):
+            raise self._not_pending()
+        self._audit("capability_grant.rejected", actor, (grantee or {}).get("username", ""),
+                    row["capability"], row["scope_type"], row["scope_id"], grant_id=grant_id,
+                    before="pending", after="rejected", reason=reason)
         return self._serialize(self.grants.get(grant_id))

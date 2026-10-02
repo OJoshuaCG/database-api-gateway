@@ -20,6 +20,10 @@ class CapabilityGrantCreate(BaseModel):
     reason: str | None = Field(None, max_length=500, description="Motivo declarado (opcional)")
 
 
+class CapabilityGrantDecision(BaseModel):
+    reason: str | None = Field(None, max_length=500, description="Motivo de la decisión (opcional)")
+
+
 class UserRef(BaseModel):
     id: int
     username: str
@@ -43,3 +47,10 @@ class CapabilityGrantOut(BaseModel):
     request_reason: str | None = None
     decision_reason: str | None = None
     implies: list[str] = Field(default_factory=list, description="Lecturas que trae implícitas")
+
+
+class PendingCapabilityGrantOut(CapabilityGrantOut):
+    can_decide: bool = Field(..., description="¿Puede el actor aprobar o rechazar esta solicitud?")
+    blocked_reason: str | None = Field(
+        None, description="Código ``access.*`` que explica por qué no (solo si can_decide=false)"
+    )

@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.routes.v1 import (
     api_tokens,
     authz,
+    capability_grants,
     gateway_users,
     auth,
     charset_collation_options,
@@ -30,6 +31,7 @@ router.include_router(auth.router)
 router.include_router(authz.router)
 router.include_router(api_tokens.router)
 router.include_router(gateway_users.router)
+router.include_router(capability_grants.router)
 router.include_router(servers.router)
 router.include_router(server_users.router)
 router.include_router(database_models.router)

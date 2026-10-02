@@ -34,6 +34,7 @@ barrido de expirados: el mecanismo es el mismo contador que ya sirve para revoca
 from datetime import datetime
 
 from app.core.authz import assert_not_last_access_admin
+from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.models.user_model import UserModel
 from app.services import audit, confirm_token
@@ -46,6 +47,8 @@ from app.services.capability_catalog import (
     role_at_most,
 )
 from app.utils.security import PASSWORD_MIN_LENGTH, hash_password
+
+logger = get_logger(__name__)
 
 #: Operación con la que se firma la invitación. Constante compartida por emisor y verificador:
 #: si divergen, el token no valida nunca y el fallo se ve recién en runtime.
@@ -300,8 +303,24 @@ class GatewayUserController:
                 session_store.revoke_all_for_user(
                     user_id, session_store.REASON_ROLE_CHANGE
                 )
+            if cambios.get("is_active") is False:
+                self._cancel_pending_requests(user_id)
 
         return self._hydrate(self._get_or_404(user_id))
+
+    @staticmethod
+    def _cancel_pending_requests(user_id: int) -> None:
+        """
+        Cancela las capacidades puntuales PENDIENTES que pidió quien pierde ``access_admin`` o
+        queda inactivo (D7). Best-effort: no puede tumbar el cambio de acceso ya aplicado, y
+        ``CapabilityGrantController.approve`` re-verifica al solicitante como respaldo.
+        """
+        try:
+            from app.controllers.capability_grant_controller import CapabilityGrantController
+
+            CapabilityGrantController().cancel_pending_requested_by(user_id)
+        except Exception:
+            logger.exception("No se pudieron cancelar las solicitudes pendientes de %s", user_id)
 
     def set_access(self, user_id: int, data: dict, *, admin) -> dict:
         """
@@ -368,6 +387,8 @@ class GatewayUserController:
         from app.core import session_store
 
         session_store.revoke_all_for_user(user_id, session_store.REASON_ROLE_CHANGE)
+        if quita_access_admin:
+            self._cancel_pending_requests(user_id)
         return self._hydrate(self._get_or_404(user_id))
 
     # ------------------------------------------------------------------ #

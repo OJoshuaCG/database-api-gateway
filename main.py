@@ -122,6 +122,15 @@ async def lifespan(app: FastAPI):
     clone_batch_runner.sweep_interrupted()
     collation_conversion_runner.sweep_interrupted()
     export_runner.sweep_interrupted()
+    # Capacidades puntuales: las solicitudes pendientes vencidas pasan a 'expired' (D6). Es solo
+    # prolijidad —una pendiente nunca surte efecto—, así que un fallo (p. ej. la tabla todavía
+    # no migrada) NO puede impedir el arranque.
+    try:
+        from app.controllers.capability_grant_controller import CapabilityGrantController
+
+        CapabilityGrantController().expire_overdue()
+    except Exception:
+        logger.exception("Barrido de capacidades puntuales vencidas falló; se sigue.")
     # Artefactos de exportación: primero se purgan los vencidos y después se barren los
     # HUÉRFANOS (archivos sin fila viva, típicamente de un ``kill -9`` a mitad de la
     # generación). Sin el segundo barrido, un artefacto con los datos del origen en claro se

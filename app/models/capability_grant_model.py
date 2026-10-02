@@ -114,6 +114,46 @@ class CapabilityGrantModel:
         finally:
             session.close()
 
+    def list_pending(self) -> list[dict]:
+        """Solicitudes pendientes y NO vencidas (la bandeja), de la más vieja a la más nueva."""
+        session = self._session()
+        try:
+            stmt = (
+                select(CapabilityGrant)
+                .where(
+                    CapabilityGrant.status == "pending",
+                    CapabilityGrant.expires_at > utcnow(),
+                )
+                .order_by(CapabilityGrant.id.asc())
+            )
+            return [_public(r) for r in session.scalars(stmt).all()]
+        finally:
+            session.close()
+
+    def list_overdue(self) -> list[dict]:
+        """Pendientes cuyo ``expires_at`` ya pasó: candidatas a ``expired`` (D6)."""
+        session = self._session()
+        try:
+            stmt = select(CapabilityGrant).where(
+                CapabilityGrant.status == "pending",
+                CapabilityGrant.expires_at <= utcnow(),
+            )
+            return [_public(r) for r in session.scalars(stmt).all()]
+        finally:
+            session.close()
+
+    def list_pending_requested_by(self, user_id: int) -> list[dict]:
+        """Pendientes que pidió ``user_id`` (vencidas o no): se cancelan si pierde el rol."""
+        session = self._session()
+        try:
+            stmt = select(CapabilityGrant).where(
+                CapabilityGrant.status == "pending",
+                CapabilityGrant.requested_by == user_id,
+            )
+            return [_public(r) for r in session.scalars(stmt).all()]
+        finally:
+            session.close()
+
     def find_live(
         self, user_id: int, capability: str, scope_type: str, scope_id: int
     ) -> dict | None:
@@ -207,6 +247,44 @@ class CapabilityGrantModel:
                     decided_at=utcnow(),
                     decision_reason=reason,
                 )
+            )
+            session.commit()
+            return res.rowcount == 1
+        finally:
+            session.close()
+
+    def decide_pending(
+        self, grant_id: int, *, approve: bool, decided_by: int | None, reason: str | None
+    ) -> bool:
+        """
+        Compare-and-set de una solicitud PENDIENTE y NO VENCIDA (D5). ``True`` si esta llamada
+        ganó; con dos aprobadores simultáneos solo uno ve ``rowcount = 1``.
+
+        Aprobar deja ``live_key = 1`` y BORRA ``expires_at``: el lector de capacidades activas
+        descarta toda fila con ``expires_at`` vencido, así que conservar los 7 días de la
+        solicitud haría caducar la capacidad recién aprobada. Rechazar apaga ``live_key`` (el
+        ``CHECK`` lo ata al estado terminal).
+        """
+        values = {
+            "status": "active" if approve else "rejected",
+            "live_key": 1 if approve else None,
+            "decided_by": decided_by,
+            "decided_at": utcnow(),
+            "decision_reason": reason,
+        }
+        if approve:
+            values["expires_at"] = None
+        session = self._session()
+        try:
+            res = session.execute(
+                update(CapabilityGrant)
+                .where(
+                    CapabilityGrant.id == grant_id,
+                    CapabilityGrant.status == "pending",
+                    CapabilityGrant.live_key == 1,
+                    CapabilityGrant.expires_at > utcnow(),
+                )
+                .values(**values)
             )
             session.commit()
             return res.rowcount == 1
