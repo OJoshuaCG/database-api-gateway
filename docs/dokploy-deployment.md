@@ -63,7 +63,7 @@ faltan `SECRET_KEY`, `ADMIN_PASSWORD`, `SESSION_SECRET`, o si `CORS_ORIGINS` sig
 | `SECRET_KEY`      | Deriva la clave de cifrado (Fernet) de credenciales de servidores destino |
 | `SESSION_SECRET`  | Firma la cookie de sesión; debe ser independiente de `SECRET_KEY` |
 | `CRYPTO_KEY_SALT` | Sal única por despliegue para la derivación de clave (HKDF)     |
-| `ADMIN_PASSWORD`  | Contraseña del admin único sembrado al primer arranque          |
+| `ADMIN_PASSWORD`  | Contraseña del administrador de accesos (`viewer` + `access_admin`) sembrado al primer arranque |
 | `DB_PASS` / `DB_ROOT_PASS` | Credenciales de la BD de metadatos (MariaDB)             |
 | `CORS_ORIGINS`    | Dominios exactos permitidos (nunca `*` en producción)            |
 

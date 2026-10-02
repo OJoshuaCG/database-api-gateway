@@ -151,7 +151,7 @@ def _admin_client() -> TestClient:
     sin sembrar explícitamente, el login devuelve 401 y el script muere antes de empezar.
     """
     import main
-    from app.core.auth import bootstrap_admin
+    from tests.bootstrap_helpers import seed_existing_install_admin
     from app.services.charset_catalog import seed_charset_options
     from app.services.environment_catalog import seed_environments
     from app.services.privilege_catalog import seed_privileges
@@ -159,7 +159,9 @@ def _admin_client() -> TestClient:
     limiter.enabled = False
     Base.metadata.drop_all(Database().engine)
     Base.metadata.create_all(Database().engine)
-    bootstrap_admin()
+    # No `bootstrap_admin`: desde C4 siembra viewer + access_admin, que no opera. El script
+    # necesita la cuenta combinada de una instalación existente, la misma que usan los tests.
+    seed_existing_install_admin()
     seed_privileges()
     seed_charset_options()
     seed_environments()

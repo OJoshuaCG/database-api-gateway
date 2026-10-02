@@ -97,6 +97,11 @@ async def lifespan(app: FastAPI):
     # operador; hacen falta acá además de en la migración porque un esquema creado con
     # ``Base.metadata.create_all`` (tests, dev rápido) no pasa por Alembic.
     bootstrap_admin()
+    # Ventana de arranque de los accesos (C4): la abre el primer arranque, la cierra el plazo o
+    # un segundo access_admin, y avisa con su vencimiento mientras siga abierta. No lanza.
+    from app.services import bootstrap_window
+
+    bootstrap_window.startup()
     seed_privileges()
     seed_charset_options()
     seed_environments()

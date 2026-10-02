@@ -435,6 +435,18 @@ STEP_UP_TTL_SECONDS = int(os.getenv("STEP_UP_TTL_SECONDS", "300"))
 # único administrador: la elevación se aplica en el acto, el arranque avisa y cada una se audita
 # `access.elevation_unapproved`. Ver `app/controllers/access_request_controller.py`.
 ACCESS_FOUR_EYES = os.getenv("ACCESS_FOUR_EYES", "true").lower() == "true"
+# VENTANA DE ARRANQUE (C4): mientras está abierta y hay UN solo `access_admin` activo con
+# credencial, sus elevaciones se aplican en el acto (auditadas `access.bootstrap_assignment`). Es
+# lo que deja a una instalación nueva crear su `security_officer`, su `owner` y su segundo
+# `access_admin`. Se cierra para siempre cuando un segundo `access_admin` acepta su invitación o al
+# vencer estas horas, contadas desde el primer arranque. Ver `app/services/bootstrap_window.py`.
+ACCESS_BOOTSTRAP_WINDOW_HOURS = int(os.getenv("ACCESS_BOOTSTRAP_WINDOW_HOURS", "72"))
+# RECUPERACIÓN (F-24): SOLO con esto en `1`, el arranque reactiva la cuenta de `ADMIN_USERNAME`,
+# le devuelve `access_admin` (nunca `security_officer` ni `owner`), reabre la ventana de arranque
+# y audita `access.admin_recovery`. Sin el flag, el arranque NUNCA revive ni re-eleva una cuenta
+# existente. El ancla de confianza es el acceso al servidor: quien puede fijar variables de
+# entorno y reiniciar el proceso ya controla el gateway. Quitarlo después de recuperar.
+ADMIN_RECOVERY = os.getenv("ADMIN_RECOVERY", "").strip().lower() in ("1", "true")
 
 # ======= Servidor MCP (agentes) ======= #
 # KILL SWITCH del MCP. Nace APAGADO: un endpoint que sirve estructura de bases de terceros a un

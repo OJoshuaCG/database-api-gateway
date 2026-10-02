@@ -49,6 +49,25 @@ class SodWarningOut(BaseModel):
     expires_at: datetime | None = Field(None, description="Vencimiento del override (UTC)")
 
 
+class BootstrapWindowOut(BaseModel):
+    """La ventana de arranque de los accesos (C4), tal como la ve un ``access_admin``."""
+
+    open: bool = Field(
+        ...,
+        description=(
+            "true = la ventana está abierta: el ÚNICO access_admin activo con credencial eleva "
+            "sin segundo aprobador (auditado access.bootstrap_assignment). Con dos o más, las "
+            "elevaciones quedan pendientes aunque la ventana siga abierta"
+        ),
+    )
+    closes_at: datetime | None = Field(
+        None,
+        description=(
+            "Vencimiento (UTC). Se cierra antes si un segundo access_admin acepta su invitación"
+        ),
+    )
+
+
 class MeOut(BaseModel):
     """
     Identidad y capacidades EFECTIVAS del actor de la sesión.
@@ -135,6 +154,13 @@ class MeOut(BaseModel):
         description=(
             "Avisos de separación de deberes de ESTA cuenta. Vacío en el caso normal. Campo "
             "nuevo: la SPA lo declara .nullish()"
+        ),
+    )
+    bootstrap_window: BootstrapWindowOut | None = Field(
+        None,
+        description=(
+            "Ventana de arranque de los accesos, SOLO para quien tiene access.admin; null para el "
+            "resto. Para el banner de la SPA. Campo nuevo: la SPA lo declara .nullish()"
         ),
     )
 

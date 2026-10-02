@@ -14,7 +14,8 @@ Módulos: `app/core/auth.py`, `app/utils/security.py`, `app/routes/v1/auth.py`,
 |---|---|
 | `SessionMiddleware` (Starlette) | Cookie de sesión firmada con `itsdangerous`. Se añade en `create_versioned_app()`. |
 | `app/utils/security.py` | Hashing de password con **Argon2id** (`hash_password`, `verify_password`). |
-| `bootstrap_admin()` | Siembra el admin al arrancar (lifespan) desde `ADMIN_USERNAME`/`ADMIN_PASSWORD`. |
+| `bootstrap_admin()` | Siembra el administrador de accesos de una instalación vacía (lifespan) desde `ADMIN_USERNAME`/`ADMIN_PASSWORD`; con `ADMIN_RECOVERY=1`, lo recupera. |
+| `app/services/bootstrap_window.py` | Ventana de arranque: el único `access_admin` eleva sin segundo aprobador hasta que exista otro. |
 | `get_current_admin` | Dependencia que exige sesión válida; devuelve `{id, username}`. |
 | `AuthController` | Verifica credenciales contra la tabla `users`. |
 
@@ -34,17 +35,65 @@ GET /servers (con cookie) ──▶ get_current_admin lee la sesión, recarga el
 
 ### Bootstrap del administrador
 
-En el `lifespan` de `main.py` se llama `bootstrap_admin()`: si no existe el usuario
-`ADMIN_USERNAME`, lo crea con el password **hasheado con Argon2**, con
-`gateway_role='owner'` y con las dos capacidades globales (`access_admin` y
-`security_officer`). Es idempotente. En producción, arrancar sin `ADMIN_PASSWORD` aborta el
-inicio.
+En el `lifespan` de `main.py` se llama `bootstrap_admin()`. En una instalación **vacía** (tabla
+`users` sin filas) crea `ADMIN_USERNAME` con el password **hasheado con Argon2**, con
+`gateway_role='viewer'` y **solo** la global `access_admin`: administra accesos y nada más. No es
+`owner` ni `security_officer`. En producción, arrancar sin `ADMIN_PASSWORD` aborta el inicio.
 
-Las tres cosas se fijan EXPLÍCITAMENTE y no se heredan de defaults: `users.gateway_role` tiene
-`server_default='viewer'` a propósito —para que ninguna fila nazca con privilegio— y `owner`
-no alcanza solo, porque `servers.admin`, `catalogs.write`, `access.admin` y `policy.admin` viven
-**únicamente** en las capacidades globales. Sin ellas, el admin recién sembrado no podría dar de
-alta un servidor, administrar usuarios ni rotar la clave de datos.
+Con usuarios ya creados **no siembra ni repara nada**, aunque no quede ningún `access_admin`
+utilizable: lo dice en el log y pide `ADMIN_RECOVERY=1` (ver "Recuperación" abajo). Si el
+arranque reparara solo, desactivar al administrador sería reversible por reinicio.
+
+> **Instalaciones existentes.** El cambio de siembra aplica solo a instalaciones **nuevas**. Una
+> instalación que se actualiza conserva su cuenta sembrada antes, que junta `owner` +
+> `access_admin` + `security_officer` con la combinación **heredada** (`sod_exceptions`,
+> `reason='grandfathered'`). No se parte sola: se reparte creando cuentas de una función (ver
+> `api-reference-v29.md` §8.4 y §10).
+
+### Primer arranque: la ventana de arranque
+
+Toda elevación (rol `owner`, cualquier global, una capacidad exclusiva de `owner`) espera a un
+**segundo** `access_admin`, y una instalación nueva tiene uno solo. Por eso el primer arranque
+abre una **ventana de arranque**: mientras está abierta y hay un solo `access_admin` activo con
+credencial, sus elevaciones se aplican en el acto y cada una se audita
+`access.bootstrap_assignment`. El arranque loguea un warning con el vencimiento mientras siga
+abierta, y `/auth/me.bootstrap_window` (`{open, closes_at}`, solo para `access_admin`) alimenta el
+banner de la SPA.
+
+El procedimiento esperado, con el administrador sembrado:
+
+1. Entrar como `ADMIN_USERNAME`.
+2. Crear un usuario con la global `security_officer` (servidores, catálogos, entornos, cifrado).
+3. Crear un usuario `owner` (opera: bases, migraciones, exportaciones, consola SQL).
+4. Crear el **segundo** `access_admin` y entregarle su invitación.
+5. Cuando esa persona acepta la invitación, la ventana **se cierra para siempre**
+   (`closed_reason='second_admin'`). Desde ahí, toda elevación queda pendiente y la aprueba el
+   otro `access_admin`.
+
+Si nadie completa el paso 5, la ventana se cierra igual al vencer `ACCESS_BOOTSTRAP_WINDOW_HOURS`
+(72 h por defecto, `closed_reason='deadline'`). Las instalaciones que ya tenían dos o más
+`access_admin` al migrar la reciben cerrada (`multiple_admins_at_upgrade`). Una instalación que
+de verdad va a tener un solo administrador sigue usando `ACCESS_FOUR_EYES=False`.
+
+### Recuperación (`ADMIN_RECOVERY=1`)
+
+Si una instalación se queda sin ningún `access_admin` utilizable (desactivado por SQL a mano, la
+única cuenta perdió la global), se arranca **una vez** con `ADMIN_RECOVERY=1`. Ese arranque:
+
+- reactiva la cuenta `ADMIN_USERNAME` (o la crea como `viewer` + `access_admin` si no existe);
+- le devuelve **solo** `access_admin`: nunca `security_officer` ni `owner`, y no le quita lo que ya
+  tenía;
+- **no toca la contraseña** (recupera a quien la tiene; no es un reseteo);
+- reabre la ventana de arranque con plazo nuevo, para que esa cuenta pueda recomponer el resto;
+- audita `access.admin_recovery` y loguea un warning.
+
+Después hay que **quitar el flag**: cada arranque con él vuelve a reabrir la ventana. Si ya hay
+otro `access_admin` con credencial, la ventana se vuelve a cerrar en el mismo arranque.
+
+**El ancla de confianza es el acceso al servidor.** Quien puede fijar variables de entorno y
+reiniciar el proceso ya controla el gateway: lee `SECRET_KEY`, la BD de metadatos y las
+credenciales cifradas. El flag no le da nada que no tenga; lo que garantiza es que la recuperación
+sea un acto explícito, acotado y auditado, y que un reinicio común nunca reviva una cuenta.
 
 Las dos globales no se solapan: `access_admin` = `{access.admin}` (usuarios, accesos,
 capacidades puntuales, tokens) y `security_officer` = `{policy.admin, servers.admin,
@@ -54,10 +103,9 @@ usuarios, y un `access_admin` sin `security_officer` no rota el cifrado (`api-re
 **Separación de deberes.** `security_officer` no puede convivir con `owner` (en ninguna forma)
 ni con `access_admin` en una cuenta: los escritores responden `409 access.sod_conflict` salvo un
 `sod_override` con motivo (auditado, vence en 7 días como mucho), y el lector descarta
-`security_officer` si la combinación no tiene excepción viva. El admin sembrado junta las tres
-cosas, así que `bootstrap_admin` le **hereda** la combinación (`sod_exceptions`,
-`reason='grandfathered'`) al sembrarlo o revivirlo, y el arranque la reporta
-(`access.sod_grandfathered`). Contrato completo en `api-reference-v29.md` §8; la regla, en
+`security_officer` si la combinación no tiene excepción viva. El admin sembrado ANTES de C4 junta
+las tres cosas; la migración `f8b0d2e4a6c9` le **heredó** la combinación (`sod_exceptions`,
+`reason='grandfathered'`) y el arranque la reporta (`access.sod_grandfathered`). Contrato completo en `api-reference-v29.md` §8; la regla, en
 `app/core/separation_of_duties.py`.
 
 **Segundo aprobador para las elevaciones.** Quien administra accesos ya no tiene un techo por
@@ -69,12 +117,8 @@ Lo que no eleva, y siempre las bajas, se aplica en el acto; la respuesta con alg
 `202 access.elevation_pending`. Es lo que impide que un solo administrador se cree un títere
 `owner` y entre con su invitación. Con un solo administrador real (y solo entonces),
 `ACCESS_FOUR_EYES=False` deja elevar sin segundo aprobador: el arranque avisa y cada elevación se
-audita `access.elevation_unapproved`. Contrato en `api-reference-v29.md` §9.
-
-> Hoy el admin sembrado es el único `access_admin` de una instalación nueva: hasta crear un
-> segundo `access_admin` (que es en sí una elevación), sus elevaciones esperan. La siembra nueva
-> y la ventana de arranque que lo resuelven son el paso C4; mientras tanto, una instalación de un
-> solo administrador arranca con `ACCESS_FOUR_EYES=False` y lo vuelve a `True` al tener dos.
+audita `access.elevation_unapproved`. Contrato en `api-reference-v29.md` §9; la ventana de
+arranque que deja a una instalación nueva crear su segundo `access_admin`, en §10.
 
 > `is_superuser` **se retiró**: se escribía en tres lugares y no se leía en ninguno para
 > autorizar, así que no era "todavía no hay permisos" sino un sistema multiusuario sin puerta.
@@ -125,6 +169,9 @@ SESSION_MAX_AGE=28800       # duración de la sesión en segundos (8h)
 SESSION_COOKIE_SECURE=      # vacío = sigue a APP_ENV=="production"; True/False la desacopla
 STEP_UP_ENFORCED=True       # exige contraseña fresca para las capacidades con step-up
 STEP_UP_TTL_SECONDS=300     # duración de la ventana de step-up (login o POST /auth/step-up)
+ACCESS_FOUR_EYES=True       # elevaciones con segundo aprobador
+ACCESS_BOOTSTRAP_WINDOW_HOURS=72  # ventana de arranque: horas desde el primer arranque
+ADMIN_RECOVERY=             # 1 SOLO para recuperar el administrador de accesos; quitar después
 ```
 
 La cookie es `httpOnly`, `same_site=lax` y `https_only` según `SESSION_COOKIE_SECURE`

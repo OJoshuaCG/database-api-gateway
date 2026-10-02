@@ -101,7 +101,16 @@ class AuthzController:
             # Separación de deberes de ESTA persona: combinación heredada, override vigente o
             # `security_officer` neutralizado. Vacío en el caso normal y en tokens.
             "sod_warnings": self._own_sod_warnings(actor),
+            # Ventana de arranque (C4): solo para access_admin, para el banner. Leerla la cierra
+            # si le tocaba, así que el banner nunca muestra abierta una ventana vencida.
+            "bootstrap_window": self._bootstrap_window(actor),
         }
+
+    @staticmethod
+    def _bootstrap_window(actor: Actor) -> dict | None:
+        from app.services.bootstrap_window import state_for
+
+        return state_for(actor)
 
     @staticmethod
     def _own_sod_warnings(actor: Actor) -> list[dict]:

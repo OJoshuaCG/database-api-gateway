@@ -38,6 +38,12 @@ REGLAS DE LA APROBACIÓN (las mismas que las capacidades puntuales)
 
 ``ACCESS_FOUR_EYES=False`` (instalaciones de un solo administrador): las elevaciones se aplican en
 el acto y cada una se audita ``access.elevation_unapproved``. El arranque avisa.
+
+VENTANA DE ARRANQUE (C4): con los cuatro ojos prendidos, mientras la ventana está abierta y quien
+pide es el ÚNICO ``access_admin`` activo con credencial, sus elevaciones también se aplican en el
+acto, auditadas ``access.bootstrap_assignment`` (``app/services/bootstrap_window.py``). Es lo que
+deja a una instalación nueva crear su segundo ``access_admin``. ``decide`` es el único lugar que
+elige entre las tres salidas.
 """
 
 from __future__ import annotations
@@ -79,14 +85,33 @@ ACTION_UNAPPROVED = "access.elevation_unapproved"
 ORIGINS = ("create", "update", "set_access")
 
 
+#: Salidas de ``decide``. ``None`` = no hay nada que eleve.
+MODE_WAIT = "wait"  # queda pendiente de un segundo access_admin
+MODE_BOOTSTRAP = "bootstrap"  # ventana de arranque: se aplica ya, access.bootstrap_assignment
+MODE_UNAPPROVED = "unapproved"  # ACCESS_FOUR_EYES=False: se aplica ya, access.elevation_unapproved
+
+
 def four_eyes() -> bool:
     """El valor vigente de ``ACCESS_FOUR_EYES``. Los tests lo cambian con ``monkeypatch``."""
     return bool(ACCESS_FOUR_EYES)
 
 
-def must_wait(elevations: list[dict], plan) -> bool:
-    """¿Esta parte del cambio espera a un segundo aprobador? Elevaciones u override, con 4 ojos."""
-    return bool(elevations or plan) and four_eyes()
+def decide(elevations: list[dict], plan, actor) -> str | None:
+    """
+    Qué pasa con la parte que eleva (elevaciones u override) de un cambio pedido por ``actor``.
+
+    Se decide UNA vez por request y el resultado viaja hasta la auditoría (``record_unapproved``):
+    re-evaluar la ventana al auditar podría contar una historia distinta de la que se aplicó.
+    """
+    if not (elevations or plan):
+        return None
+    if not four_eyes():
+        return MODE_UNAPPROVED
+    from app.services import bootstrap_window
+
+    if bootstrap_window.applies_to(actor):
+        return MODE_BOOTSTRAP
+    return MODE_WAIT
 
 
 def actor_can_assign(actor, elevations: list[dict]) -> bool:
@@ -132,15 +157,24 @@ def current_state(user_id: int, fila: dict | None = None) -> AccessState:
 
 
 def record_unapproved(
-    *, admin, target_id: int, username: str, elevations: list[dict], origin: str, override=None
+    *, admin, target_id: int, username: str, elevations: list[dict], origin: str, override=None,
+    mode: str = MODE_UNAPPROVED,
 ) -> None:
     """
-    ``ACCESS_FOUR_EYES=False``: la elevación se aplicó SIN segundo aprobador. Fail-closed
-    (``record_intent``) no: la escritura ya ocurrió. Se audita igual, con ``status=success``, y se
-    loguea warning para que no pase en silencio.
+    La elevación se aplicó SIN segundo aprobador: ``ACCESS_FOUR_EYES=False``
+    (``access.elevation_unapproved``) o la ventana de arranque (``mode=MODE_BOOTSTRAP``,
+    ``access.bootstrap_assignment``). Fail-closed (``record_intent``) no: la escritura ya ocurrió.
+    Se audita igual, con ``status=success``, y se loguea warning para que no pase en silencio.
     """
+    bootstrap = mode == MODE_BOOTSTRAP
+    if bootstrap:
+        from app.services.bootstrap_window import ACTION_ASSIGNMENT
+
+        action = ACTION_ASSIGNMENT
+    else:
+        action = ACTION_UNAPPROVED
     audit.record(
-        ACTION_UNAPPROVED,
+        action,
         admin=admin,
         target_type="user",
         target_id=target_id,
@@ -152,13 +186,15 @@ def record_unapproved(
                 "origin": origin,
                 "elevations": elevations,
                 "sod_override": sod_service.override_payload(override),
-                "four_eyes": False,
+                "four_eyes": bootstrap,
+                "bootstrap_window": bootstrap,
             },
             ensure_ascii=False,
         ),
     )
     logger.warning(
-        "Elevación de acceso SIN segundo aprobador (ACCESS_FOUR_EYES=False) sobre '%s': %s",
+        "Elevación de acceso SIN segundo aprobador (%s) sobre '%s': %s",
+        "ventana de arranque" if bootstrap else "ACCESS_FOUR_EYES=False",
         username,
         ", ".join(e.get("kind", "?") for e in elevations) or "sod_override",
     )

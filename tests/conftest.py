@@ -43,12 +43,8 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 
-@pytest.fixture()
-def client():
-    """
-    TestClient con esquema fresco (drop+create) y admin sembrado por el lifespan.
-    Rate limiting desactivado para evitar 429 entre pruebas.
-    """
+def _reset_schema_and_state() -> None:
+    """Esquema fresco (drop+create) y estado de proceso limpio, sin sembrar nada."""
     from app.core import crypto
     from app.core.database import Database
     from app.core.limiter import limiter
@@ -79,6 +75,35 @@ def client():
     from app.services.sod_service import reset_sod_report_state
 
     reset_sod_report_state()
+
+
+@pytest.fixture()
+def client():
+    """
+    TestClient con esquema fresco y la cuenta ``admin`` de una INSTALACIÓN EXISTENTE: ``owner`` +
+    ``access_admin`` + ``security_officer`` heredada y la ventana de arranque cerrada. La siembra
+    de producción NO crea eso (desde C4 es ``viewer`` + ``access_admin``): se pre-siembra antes del
+    ``lifespan``, que entonces no hace nada. Ver ``tests/bootstrap_helpers.py``.
+    Rate limiting desactivado para evitar 429 entre pruebas.
+    """
+    _reset_schema_and_state()
+    from tests.bootstrap_helpers import seed_existing_install_admin
+
+    seed_existing_install_admin()
+
+    import main
+
+    with TestClient(main.app) as c:
+        yield c
+
+
+@pytest.fixture()
+def fresh_client():
+    """
+    TestClient sobre una instalación NUEVA: esquema vacío y el ``lifespan`` de producción tal
+    cual (``bootstrap_admin`` siembra ``viewer`` + ``access_admin`` y abre la ventana).
+    """
+    _reset_schema_and_state()
 
     import main
 
@@ -113,8 +138,9 @@ def admin_client(client):
 # --------------------------------------------------------------------------- #
 # Identidades de la separación de deberes (C3)                                 #
 # --------------------------------------------------------------------------- #
-# `admin_client` es la cuenta sembrada COMBINADA (owner + access_admin + security_officer,
-# heredada) y el único access_admin de la BD. Estas fixtures dan cuentas de UNA función, creadas
+# `admin_client` es la cuenta COMBINADA de una instalación existente (owner + access_admin +
+# security_officer, heredada; pre-sembrada por `client`, NO por la siembra de producción) y el
+# único access_admin de la BD. Estas fixtures dan cuentas de UNA función, creadas
 # por HTTP con su elevación aprobada por un segundo access_admin (`tests/access_request_helpers`).
 
 

@@ -2725,7 +2725,9 @@ Relevantes para quien despliega o consume el gateway (la lista completa está en
 | `RATE_LIMIT_DEFAULT` | Límite global por IP (p. ej. `100/minute`). El login tiene límites propios (ver §5). |
 | `LOGIN_USERNAME_RATE_LIMIT` | Tope de intentos de login por cuenta desde cualquier IP (default `20/hour`; vacío lo desactiva). |
 | `MCP_AUTH_FAILURE_RATE_LIMIT` | Tope de credenciales rechazadas por IP en `/mcp` (default `30/minute`). |
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | Credenciales del administrador único (sembrado al arrancar). |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | Credenciales del administrador de accesos sembrado en una instalación vacía (`viewer` + `access_admin`; ver `api-reference-v29.md` §10). |
+| `ACCESS_BOOTSTRAP_WINDOW_HOURS` | Horas de la ventana de arranque en que el único `access_admin` eleva sin segundo aprobador (default `72`). |
+| `ADMIN_RECOVERY` | `1` solo para recuperar el administrador de accesos al arrancar (F-24); quitarlo después. |
 | `SECRET_KEY` | Deriva la clave Fernet y firma la sesión. Obligatorio en producción. |
 | `REMOTE_CONNECT_TIMEOUT` | Segundos para abrir la conexión a un servidor destino. |
 | `REMOTE_STATEMENT_TIMEOUT_MS` | Milisegundos máximos por sentencia en el destino. |

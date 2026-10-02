@@ -241,7 +241,8 @@ class GatewayUserController:
             override=override,
         )
         inmediato, elevaciones = split(vacio, deseado)
-        pendiente = access_requests.must_wait(elevaciones, plan)
+        modo = access_requests.decide(elevaciones, plan, admin)
+        pendiente = modo == access_requests.MODE_WAIT
         # Con elevación pendiente la cuenta nace con la parte que NO eleva: `viewer` (u
         # `operator`) y sin globales. El override viaja con la solicitud.
         objetivo = inmediato if pendiente else deseado
@@ -282,10 +283,10 @@ class GatewayUserController:
                    if pendiente else "")
             ),
         )
-        if (elevaciones or plan) and not pendiente:
+        if modo and not pendiente:
             access_requests.record_unapproved(
                 admin=admin, target_id=user_id, username=username,
-                elevations=elevaciones, origin="create", override=override,
+                elevations=elevaciones, origin="create", override=override, mode=modo,
             )
         creado = {
             **self._hydrate(self.users.find_by_id(user_id)),
@@ -364,6 +365,15 @@ class GatewayUserController:
             touched_engine=False,
             detail="la persona fijó su primera contraseña desde la invitación",
         )
+        # Si era un segundo `access_admin`, la ventana de arranque se cierra ACÁ y no en la
+        # próxima decisión: así `closed_at` dice cuándo pasó de verdad. Best-effort: el cierre
+        # perezoso de cada decisión es el respaldo.
+        try:
+            from app.services import bootstrap_window
+
+            bootstrap_window.refresh()
+        except Exception:  # noqa: BLE001
+            logger.exception("No se pudo reevaluar la ventana de arranque tras la invitación.")
         return {"username": fila["username"]}
 
     # ------------------------------------------------------------------ #
@@ -381,7 +391,9 @@ class GatewayUserController:
         cambios: dict = {}
         plan = None
         cambia_rol = False
-        sin_aprobar: tuple | None = None  # ACCESS_FOUR_EYES=False: elevación aplicada sola
+        # Elevación aplicada sin segundo aprobador (ACCESS_FOUR_EYES=False o ventana de arranque):
+        # (elevaciones, override, modo) para auditarla con la salida que se decidió.
+        sin_aprobar: tuple | None = None
 
         elevacion: tuple | None = None  # (deseado, elevaciones, override) si queda pendiente
         if "gateway_role" in data and data["gateway_role"] is not None:
@@ -398,14 +410,15 @@ class GatewayUserController:
                     user_id, data.get("sod_override"), base_role=nuevo.value
                 )
                 _, elevaciones = split(estado, deseado)
-                if access_requests.must_wait(elevaciones, plan):
+                modo = access_requests.decide(elevaciones, plan, admin)
+                if modo == access_requests.MODE_WAIT:
                     # El rol queda pendiente; el resto del PATCH (contacto, estado) se aplica.
                     elevacion = (deseado, elevaciones, data.get("sod_override"))
                     plan = None
                 else:
                     cambia_rol = True
-                    if elevaciones or plan:
-                        sin_aprobar = (elevaciones, data.get("sod_override"))
+                    if modo:
+                        sin_aprobar = (elevaciones, data.get("sod_override"), modo)
             if elevacion is None:
                 cambios["gateway_role"] = nuevo.value
 
@@ -469,6 +482,7 @@ class GatewayUserController:
                 access_requests.record_unapproved(
                     admin=admin, target_id=user_id, username=fila["username"],
                     elevations=sin_aprobar[0], origin="update", override=sin_aprobar[1],
+                    mode=sin_aprobar[2],
                 )
 
         actualizado = self._hydrate(self._get_or_404(user_id))
@@ -547,7 +561,8 @@ class GatewayUserController:
             globals_=[g.value for g in globales],
         )
         inmediato, elevaciones = split(estado, deseado)
-        pendiente = access_requests.must_wait(elevaciones, plan)
+        modo = access_requests.decide(elevaciones, plan, admin)
+        pendiente = modo == access_requests.MODE_WAIT
         if pendiente:
             # La parte que NO eleva (bajas incluidas) se aplica ya; la que eleva, y el override,
             # esperan a otro access_admin. Si no hay parte inmediata, no se escribe nada.
@@ -560,10 +575,11 @@ class GatewayUserController:
             self._write_access(
                 user_id, fila, objetivo, plan=plan, admin=admin, antes=antes
             )
-        if (elevaciones or plan) and not pendiente:
+        if modo and not pendiente:
             access_requests.record_unapproved(
                 admin=admin, target_id=user_id, username=fila["username"],
                 elevations=elevaciones, origin="set_access", override=override if plan else None,
+                mode=modo,
             )
         actualizado = self._hydrate(self._get_or_404(user_id))
         if pendiente:

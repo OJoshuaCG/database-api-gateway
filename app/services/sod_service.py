@@ -10,8 +10,9 @@ La regla pura vive en ``app/core/separation_of_duties.py``; el lector (neutraliz
 - ``record_override_intent`` / ``apply_override``: el break-glass. Es una ELEVACIÓN: viaja dentro
   de la solicitud pendiente (``access_change_requests`` o la capacidad puntual pendiente) y se
   aplica al APROBARLA, con ``approved_by`` = el segundo ``access_admin``. Solo con
-  ``ACCESS_FOUR_EYES=False`` se aplica en el acto (``approved_by`` NULL).
-- ``grandfather_user``: la herencia de una combinación preexistente (``bootstrap_admin``).
+  ``ACCESS_FOUR_EYES=False`` o dentro de la ventana de arranque (C4) se aplica en el acto
+  (``approved_by`` NULL).
+- ``grandfather_user``: la herencia de una combinación preexistente.
 - ``reconcile``: cierra las excepciones de reglas que la cuenta ya no viola.
 - ``report_sod_violations`` / ``sod_report`` / ``warnings_for_user``: arranque, reporte y
   ``/auth/me``.
@@ -324,9 +325,10 @@ def grandfather_user(user_id: int) -> list[dict]:
     Hereda la combinación ACTUAL de ``user_id``: una fila ``grandfathered`` por regla violada
     sin excepción viva. Idempotente.
 
-    La llama ``bootstrap_admin`` al sembrar o revivir la cuenta combinada (``owner`` +
-    ``access_admin`` + ``security_officer``): sin esto, la instalación nueva —y cada test— nacería
-    con el administrador neutralizado al leer. C4 cambia la siembra y esto deja de hacer falta.
+    Desde C4 la siembra ya no crea la cuenta combinada (``owner`` + ``access_admin`` +
+    ``security_officer``), así que el código de producción no la llama: las combinaciones de las
+    instalaciones existentes las heredó la migración ``f8b0d2e4a6c9``. La usan los tests, cuya
+    cuenta ``admin`` reproduce esa instalación existente (``tests/bootstrap_helpers.py``).
     """
     from app.models.sod_exception_model import SodExceptionModel
 

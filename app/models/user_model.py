@@ -124,8 +124,8 @@ class UserModel:
         ----------------------------------------------------------------------
         Contar y escribir en transacciones distintas es check-then-write: dos ``PUT /access``
         concurrentes, cada uno quitándole ``access_admin`` al otro, ven "queda uno" y los dos
-        escriben, y el gateway queda con CERO (y en el próximo arranque ``bootstrap_admin``
-        revive la cuenta dormida con su credencial vieja).
+        escriben, y el gateway queda con CERO (y solo sale con ``ADMIN_RECOVERY=1``, que revive
+        la cuenta de ``ADMIN_USERNAME`` con su credencial vieja).
 
         Se bloquean con ``SELECT … FOR UPDATE`` las filas de TODOS los ``access_admin``
         activos —incluido ``user_id``—, en orden de ``user_id``. Así dos escrituras

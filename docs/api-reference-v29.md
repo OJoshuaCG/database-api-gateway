@@ -151,7 +151,8 @@ aprobación), `approved_by` e ids de excepción. Escribe una fila de `sod_except
 - **Herencia.** La migración `f8b0d2e4a6c9` crea `sod_exceptions` e inserta una fila
   `reason='grandfathered'`, `expires_at=null` por cada combinación que ya existe. El admin
   sembrado (`owner` + `access_admin` + `security_officer`) queda heredado en las dos reglas y **no
-  pierde nada**; `bootstrap_admin` hace lo mismo al sembrarlo o revivirlo.
+  pierde nada**. Desde C4 la siembra ya no crea esa cuenta (§10), así que esta herencia solo
+  aplica a instalaciones existentes.
 - **Arranque.** Cada fila heredada viva se loguea (warning) y se audita `access.sod_grandfathered`
   (`actor_type: system`) una vez por arranque.
 
@@ -335,11 +336,11 @@ aplican en el acto, sin solicitud, el arranque loguea un warning y cada una se a
 `access.elevation_unapproved` (`detail`: `origin` = `create` | `update` | `set_access` |
 `capability_grant`, `elevations`, `sod_override`).
 
-> **Instalaciones con un solo `access_admin` (incluido el admin sembrado de una instalación
-> nueva).** Con `ACCESS_FOUR_EYES=True` y nadie más que pueda aprobar, toda elevación queda
-> pendiente — incluida la de crear el segundo `access_admin`. Hasta que C4 traiga la ventana de
-> arranque, el camino es arrancar con `ACCESS_FOUR_EYES=False`, crear el segundo `access_admin` y
-> volver a `True`. Lo que no eleva (operadores, lectores, bajas) funciona igual.
+> **Instalaciones con un solo `access_admin`.** Con `ACCESS_FOUR_EYES=True` y nadie más que pueda
+> aprobar, la **ventana de arranque** de C4 (§10) deja que ese único `access_admin` eleve solo
+> hasta que exista el segundo. Fuera de la ventana, toda elevación queda pendiente.
+> `ACCESS_FOUR_EYES=False` gana sobre la ventana: con él, todo se audita
+> `access.elevation_unapproved`.
 
 ### 9.6 Capacidades puntuales
 
@@ -362,3 +363,107 @@ aplican en el acto, sin solicitud, el arranque loguea un warning y cada una se a
   `access.grant_ceiling_exceeded`.
 - `sensitive` en el catálogo cambia para tres capacidades (refrescar con `catalog_version`).
 
+## 10. C4 — Siembra nueva, ventana de arranque y `ADMIN_RECOVERY`
+
+### 10.1 Por qué
+
+C3 exige un segundo `access_admin` para toda elevación, y crear el segundo `access_admin` es en sí
+una elevación. Sin C4, una instalación con un solo `access_admin` no puede completar ninguna salvo
+con `ACCESS_FOUR_EYES=False`. C4 es lo que hace publicable C3: **publicarlos juntos**.
+
+### 10.2 La siembra: `viewer` + `access_admin`
+
+`bootstrap_admin` siembra `ADMIN_USERNAME` **solo en una instalación vacía** (`users` sin filas) y
+con `gateway_role='viewer'` + la global `access_admin`. Ya no es `owner` ni `security_officer`, y
+no tiene fila en `sod_exceptions`. Al sembrar, abre la ventana de arranque.
+
+### 10.3 La ventana de arranque
+
+Tabla nueva `access_bootstrap`, de una sola fila (`opened_at`, `closes_at`, `closed_at`,
+`closed_reason`). Mientras la ventana está **abierta** y quien pide es el **único** `access_admin`
+activo con credencial, sus elevaciones (en `POST /gateway-users`, `PATCH /gateway-users/{id}`,
+`PUT /gateway-users/{id}/access` y las capacidades puntuales sensibles) se aplican en el acto:
+
+- la respuesta es la de siempre (`201` / `200`), **no** `202`; no se crea ninguna solicitud;
+- una capacidad sensible nace `active`;
+- cada una se audita `access.bootstrap_assignment` (`detail`: `origin` = `create` | `update` |
+  `set_access` | `capability_grant`, `elevations`, `sod_override`, `bootstrap_window: true`);
+- `ACCESS_FOUR_EYES=False` gana sobre la ventana: en ese caso se audita
+  `access.elevation_unapproved`, como en §9.5.
+
+Se cierra **para siempre** con lo primero que pase:
+
+| `closed_reason` | Cuándo |
+|---|---|
+| `second_admin` | Un segundo `access_admin` activo **aceptó su invitación** (tiene credencial). Con la invitación pendiente no cuenta: no puede aprobar nada. |
+| `deadline` | Venció `ACCESS_BOOTSTRAP_WINDOW_HOURS` (default `72`) desde que se abrió. |
+| `multiple_admins_at_upgrade` | La instalación ya tenía 2 o más `access_admin` con credencial al migrar. |
+
+El cierre se evalúa perezosamente (en cada decisión de elevación, en `/auth/me`, al aceptar una
+invitación y al arrancar) con un `UPDATE` condicional, y se audita
+`access.bootstrap_window_closed` (`actor_type: system`). La apertura se audita
+`access.bootstrap_window_opened`. Mientras está abierta, el arranque loguea un warning con
+`closes_at`.
+
+**Migración `b1d3f5a7c9e2`.** Con ≤ 1 `access_admin` activo con credencial deja la fila **por
+abrir**: la abre el primer arranque posterior, y el plazo corre desde ese arranque. Con más, la
+inserta cerrada (`multiple_admins_at_upgrade`). No toca ninguna cuenta.
+
+**Falla cerrado.** Sin la tabla o ante un error de lectura, la ventana no existe: las elevaciones
+quedan pendientes (C3) y `bootstrap_window` es `null`.
+
+### 10.4 `/auth/me`: `bootstrap_window`
+
+Campo nuevo. **Declararlo `.nullish()` en la SPA.** Solo para quien tiene `access.admin`; `null`
+para el resto (y sin tabla).
+
+```json
+"bootstrap_window": {"open": true, "closes_at": "2026-10-05T17:00:00"}
+```
+
+`open: true` significa que la ventana está abierta; las elevaciones se aplican solas solo si
+además quien pide es el único `access_admin` con credencial. `closes_at` puede ser `null` en una
+ventana que nunca se abrió (`multiple_admins_at_upgrade`). `GET /access-requests/pending` no
+cambia.
+
+### 10.5 `ADMIN_RECOVERY=1` (F-24)
+
+Sin el flag, el arranque **nunca** revive ni re-eleva una cuenta existente (antes, con cero
+`access_admin` activos, reactivaba la cuenta y le devolvía `access_admin` + `security_officer`).
+Con `ADMIN_RECOVERY=1`, cada arranque:
+
+- reactiva `ADMIN_USERNAME` (o la crea como `viewer` + `access_admin` si no existe) y le devuelve
+  **solo** `access_admin`, sin quitarle nada ni tocar su contraseña;
+- reabre la ventana con plazo nuevo (se vuelve a cerrar en el acto si ya hay otro `access_admin`
+  con credencial);
+- audita `access.admin_recovery` (`actor_type: system`) y loguea un warning.
+
+El ancla de confianza es el acceso al servidor (variables de entorno + reinicio). Reemplaza a la
+acción `access.bootstrap_recovery`, que ya no se emite.
+
+### 10.6 Variables de entorno
+
+| Variable | Default | Qué hace |
+|---|---|---|
+| `ACCESS_BOOTSTRAP_WINDOW_HOURS` | `72` | Duración de la ventana desde que se abre. |
+| `ADMIN_RECOVERY` | vacío | `1` = recuperar el administrador de accesos en este arranque. Quitar después. |
+
+### 10.7 Lo que la SPA tiene que cambiar
+
+- `MeOut.bootstrap_window` (`.nullish()`): banner "Ventana de arranque abierta hasta
+  {closes_at}: tus elevaciones se aplican sin segundo aprobador. Se cierra cuando un segundo
+  administrador de accesos acepte su invitación."
+- En la ventana, crear un `owner`/`security_officer` responde `201`, no `202`.
+
+### 10.8 Nota de versión: la siembra cambia solo para instalaciones nuevas
+
+- **Instalaciones nuevas:** el administrador sembrado es `viewer` + `access_admin`. No opera ni
+  fija política. Procedimiento del primer arranque: crear un `security_officer`, crear un
+  `owner` y crear el segundo `access_admin`; cuando este acepta su invitación, la ventana se
+  cierra (`docs/features/authentication.md`).
+- **Instalaciones existentes:** nada cambia en las cuentas. El administrador sembrado antes
+  conserva `owner` + `access_admin` + `security_officer`, heredado (§8.4). Con dos o más
+  `access_admin` la ventana nace cerrada; con uno, se abre en el primer arranque después de
+  actualizar y dura `ACCESS_BOOTSTRAP_WINDOW_HOURS`.
+- **Cambio de comportamiento del arranque:** ya no repara solo una instalación sin `access_admin`
+  activo. Hace falta `ADMIN_RECOVERY=1` (§10.5).

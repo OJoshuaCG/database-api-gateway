@@ -15,7 +15,7 @@ lleva capacidad.
 
 from fastapi import Request
 
-from app.core.environments import ADMIN_PASSWORD, ADMIN_USERNAME
+from app.core.environments import ADMIN_PASSWORD, ADMIN_RECOVERY, ADMIN_USERNAME
 from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.services.capability_catalog import GatewayRole, GlobalCapability
@@ -140,83 +140,66 @@ def authenticated_session(request: Request) -> tuple[dict, session_store.Session
 
 def bootstrap_admin() -> None:
     """
-    Garantiza que exista **al menos un administrador de accesos activo**. Idempotente.
+    Siembra la cuenta inicial en una instalación VACÍA y, solo con ``ADMIN_RECOVERY=1``, la
+    recupera. Idempotente. Corre en el ``lifespan`` de cada pod.
 
-    ANCLADO AL INVARIANTE, NO AL USERNAME
-    -------------------------------------
-    La versión anterior hacía ``if find_by_username(ADMIN_USERNAME): return``, y con eso **no
-    reparaba nada** en el caso que importa: si al administrador se lo renombra o se lo
-    desactiva, la fila con ese username ya no existe o no sirve, pero el seed encuentra *algo*
-    —o no encuentra nada y siembra un duplicado— en vez de mirar la condición que hace
-    funcionar al sistema.
+    LA SIEMBRA ES ``viewer`` + ``access_admin``, NADA MÁS (C4)
+    --------------------------------------------------------
+    Antes sembraba ``owner`` + ``access_admin`` + ``security_officer``: una cuenta que junta los
+    tres deberes que la separación de funciones vino a separar. Ahora la cuenta inicial solo
+    administra accesos, y dentro de la VENTANA DE ARRANQUE (``app/services/bootstrap_window.py``)
+    crea sola a quien opera (``owner``), a quien fija política (``security_officer``) y al segundo
+    ``access_admin``, que al aceptar su invitación cierra la ventana. Las instalaciones que ya
+    existían conservan su cuenta combinada, heredada (``sod_exceptions``, C2): esto no la parte.
 
-    El criterio nuevo es la condición misma: **si hay CERO usuarios activos con
-    ``access_admin``**, sembrar o reparar. Misma idempotencia, keyed en lo que importa.
+    Se siembra **solo si la tabla ``users`` está vacía**. Con usuarios y sin ningún
+    ``access_admin`` utilizable, el arranque NO crea uno: eso sería ganar privilegio cambiando
+    una variable y reiniciando. Lo dice en el log y pide ``ADMIN_RECOVERY=1``.
 
-    LO QUE NUNCA HACE, Y ES LO QUE LO SEPARA DE UN BYPASS
-    ----------------------------------------------------
-    **Nunca toca la password ni el rol de un administrador existente.** Ésa es la línea entre
-    una reparación y "la variable de entorno siempre gana", que es lo que este diseño rechaza:
-    si el arranque re-afirmara rol y password, **desactivar a alguien sería reversible por
-    reinicio** — y el reinicio es la operación más común del mundo. El control dejaría de
-    existir y nadie se daría cuenta.
+    SIN ``ADMIN_RECOVERY`` NUNCA REVIVE NI RE-ELEVA
+    ----------------------------------------------
+    **Nunca toca la contraseña, el estado, el rol ni las globales de una cuenta existente.** Si
+    el arranque reparara solo, desactivar al administrador o quitarle ``access_admin`` sería
+    reversible por reinicio —la operación más común del mundo— y el control dejaría de existir
+    sin que nadie lo note. La versión anterior reparaba sola cuando había cero ``access_admin``
+    activos; ahora esa reparación exige el flag explícito.
 
-    Por eso hay dos caminos y no uno: si el usuario de ``ADMIN_USERNAME`` **no existe**, se
-    siembra completo; si existe pero el invariante está roto, se **reactiva y se le devuelven
-    las globales**, sin tocar su credencial. Quien tenga la password sigue siendo quien la
-    tenía.
-
-    Y se audita como ``access.bootstrap_recovery`` cuando repara —no cuando siembra un
-    despliegue nuevo, que no es una recuperación—, porque una reparación de privilegio hecha
-    por el arranque es exactamente el evento que alguien tiene que poder ver después.
+    CON ``ADMIN_RECOVERY=1`` (F-24)
+    ------------------------------
+    Ver ``_recover``. El ancla de confianza es el ACCESO AL SERVIDOR: quien puede fijar variables
+    de entorno y reiniciar el proceso ya controla el gateway (lee ``SECRET_KEY``, la BD de
+    metadatos, las credenciales cifradas). El flag no le da nada que no tenga; lo que agrega es
+    que la recuperación sea un acto explícito, acotado (solo ``access_admin``) y auditado.
     """
-    if not ADMIN_PASSWORD:
-        logger.warning(
-            "ADMIN_PASSWORD no está definido; no se sembró ningún administrador."
-        )
+    user_model = UserModel()
+    if ADMIN_RECOVERY:
+        _recover(user_model)
         return
 
-    user_model = UserModel()
     if user_model.count_active_access_admins() > 0:
         # El invariante se cumple: no hay nada que hacer, ni siquiera si el username de la
         # variable de entorno no coincide con nadie. Que el administrador se llame distinto de
         # `ADMIN_USERNAME` es una situación NORMAL, no algo que el arranque deba "corregir".
         return
 
-    existente = user_model.find_by_username(ADMIN_USERNAME)
-    globales = [
-        GlobalCapability.ACCESS_ADMIN.value,
-        GlobalCapability.SECURITY_OFFICER.value,
-    ]
-
-    if existente:
-        # Reparación: se reactiva y se le devuelven las globales. La password NO se toca.
-        user_model.update(existente["id"], {"is_active": True})
-        user_model.grant_global_capabilities(ADMIN_USERNAME, globales)
-        _grandfather_seeded(existente["id"])
-        audit.record(
-            "access.bootstrap_recovery",
-            admin=None,
-            target_type="user",
-            target_id=existente["id"],
-            touched_engine=False,
-            detail=(
-                f"invariante roto (0 access_admin activos): se reactivó '{ADMIN_USERNAME}' y "
-                "se le restauraron las capacidades globales. La contraseña NO se modificó"
-            ),
-        )
-        logger.warning(
-            "Recuperación de arranque: no había ningún access_admin activo; se reparó '%s'.",
+    if user_model.count() > 0:
+        logger.error(
+            "No hay ningún access_admin activo con credencial y el arranque NO repara cuentas "
+            "existentes. Para recuperar el acceso, arrancar UNA vez con ADMIN_RECOVERY=1 "
+            "(reactiva '%s' y le devuelve access_admin) y quitarlo después.",
             ADMIN_USERNAME,
         )
         return
 
-    # Despliegue nuevo. El rol y las globales se fijan EXPLÍCITAMENTE y no se heredan del
-    # default de la columna: `users.gateway_role` tiene `server_default='viewer'` a propósito
-    # —para que ninguna fila nazca con privilegio— así que sin este bloque se sembraría un
-    # administrador que no puede administrar. Y `owner` no alcanza solo: `servers.admin`,
-    # `catalogs.write`, `access.admin` y `policy.admin` viven ÚNICAMENTE en las capacidades
-    # globales.
+    if not ADMIN_PASSWORD:
+        logger.warning(
+            "ADMIN_PASSWORD no está definido; no se sembró ningún administrador."
+        )
+        return
+
+    # Instalación nueva. El rol se fija EXPLÍCITAMENTE en `viewer` y no se hereda del default de
+    # la columna, aunque coincidan: la siembra dice qué cuenta crea, no confía en un default.
+    # `access.admin` vive ÚNICAMENTE en la global `access_admin`.
     user_model.create(
         {
             "username": ADMIN_USERNAME,
@@ -225,29 +208,103 @@ def bootstrap_admin() -> None:
             "full_name": "Administrador",
             "notes": None,
             "is_active": True,
-            "gateway_role": GatewayRole.OWNER.value,
+            "gateway_role": GatewayRole.VIEWER.value,
         }
     )
-    user_model.grant_global_capabilities(ADMIN_USERNAME, globales)
-    sembrado = user_model.find_by_username(ADMIN_USERNAME)
-    if sembrado:
-        _grandfather_seeded(sembrado["id"])
-    logger.info("Administrador '%s' sembrado.", ADMIN_USERNAME)
+    user_model.grant_global_capabilities(ADMIN_USERNAME, [GlobalCapability.ACCESS_ADMIN.value])
+    _open_window("seed")
+    logger.info("Administrador de accesos '%s' sembrado (viewer + access_admin).", ADMIN_USERNAME)
 
 
-def _grandfather_seeded(user_id: int) -> None:
+def _recover(user_model: UserModel) -> None:
     """
-    La cuenta sembrada (o revivida) junta ``owner`` + ``access_admin`` + ``security_officer``, que
-    la separación de deberes prohíbe. Se le HEREDA la combinación (``sod_exceptions`` con
-    ``reason='grandfathered'``), igual que la migración ``f8b0d2e4a6c9`` a las instalaciones
-    existentes: sin esto, el lector le descartaría ``security_officer`` y una instalación nueva
-    quedaría sin quien escriba entornos ni catálogos. C4 cambia la siembra y esto se va.
+    ``ADMIN_RECOVERY=1``: reactiva la cuenta de ``ADMIN_USERNAME`` y le devuelve
+    ``access_admin``; si no existe, la crea como la siembra (``viewer`` + ``access_admin``).
+    Reabre la ventana de arranque con plazo nuevo y audita ``access.admin_recovery``.
 
-    Best-effort: si falla, el lector falla cerrado (sin ``security_officer``) y el arranque sigue.
+    - **Solo ``access_admin``**: nunca agrega ``security_officer`` ni ``owner``. Tampoco QUITA lo
+      que la cuenta ya tenía (una cuenta combinada heredada sigue combinada): la recuperación
+      devuelve la capacidad de administrar accesos, no rehace la cuenta. Si la cuenta tenía
+      ``security_officer`` sin una excepción que cubra ``access_admin`` + ``security_officer``,
+      el lector le descarta ``security_officer`` (falla cerrado): reparar eso es una decisión de
+      una persona, no del arranque.
+    - **No toca la contraseña.** Recupera a quien la tiene; no es un reseteo de credencial.
+    - Corre en CADA arranque con el flag puesto (cada uno reabre la ventana), por eso el aviso
+      pide quitarlo. Si ya hay un segundo ``access_admin`` con credencial, la ventana se vuelve
+      a cerrar sola en el mismo arranque (``bootstrap_window.startup``).
     """
+    existente = user_model.find_by_username(ADMIN_USERNAME)
+    if existente:
+        user_model.update(existente["id"], {"is_active": True})
+        user_model.grant_global_capabilities(
+            ADMIN_USERNAME, [GlobalCapability.ACCESS_ADMIN.value]
+        )
+        user_id = existente["id"]
+        detalle = (
+            f"ADMIN_RECOVERY=1: se reactivó '{ADMIN_USERNAME}' y se le restauró access_admin "
+            "(solo access_admin). La contraseña NO se modificó"
+        )
+        if not existente.get("hashed_password"):
+            logger.warning(
+                "ADMIN_RECOVERY: '%s' no tiene credencial (invitación pendiente); la "
+                "recuperación no la fija.",
+                ADMIN_USERNAME,
+            )
+    else:
+        if not ADMIN_PASSWORD:
+            logger.error(
+                "ADMIN_RECOVERY=1 pero '%s' no existe y ADMIN_PASSWORD no está definido: no se "
+                "recuperó nada.",
+                ADMIN_USERNAME,
+            )
+            return
+        user_model.create(
+            {
+                "username": ADMIN_USERNAME,
+                "email": f"{ADMIN_USERNAME}@gateway.local",
+                "hashed_password": hash_password(ADMIN_PASSWORD),
+                "full_name": "Administrador",
+                "notes": None,
+                "is_active": True,
+                "gateway_role": GatewayRole.VIEWER.value,
+            }
+        )
+        user_model.grant_global_capabilities(
+            ADMIN_USERNAME, [GlobalCapability.ACCESS_ADMIN.value]
+        )
+        # Releída por username y no por `lastrowid`, que no todos los motores devuelven.
+        user_id = (user_model.find_by_username(ADMIN_USERNAME) or {}).get("id")
+        detalle = (
+            f"ADMIN_RECOVERY=1: '{ADMIN_USERNAME}' no existía; se creó como viewer + "
+            "access_admin"
+        )
+    ventana = _open_window("admin_recovery")
+    closes_at = (ventana or {}).get("closes_at")
+    audit.record(
+        "access.admin_recovery",
+        admin=None,
+        actor_type="system",
+        target_type="user",
+        target_id=user_id,
+        touched_engine=False,
+        detail=(
+            f"{detalle}; ventana de arranque reabierta hasta "
+            f"{closes_at.isoformat(timespec='seconds') if closes_at else '—'} UTC"
+        ),
+    )
+    logger.warning(
+        "ADMIN_RECOVERY=1: se recuperó '%s' (access_admin) y se reabrió la ventana de arranque. "
+        "QUITAR el flag: cada arranque con él la vuelve a abrir.",
+        ADMIN_USERNAME,
+    )
+
+
+def _open_window(reason: str) -> dict | None:
+    """Reabre la ventana de arranque. Best-effort: sin ella, las elevaciones quedan pendientes."""
     try:
-        from app.services.sod_service import grandfather_user
+        from app.services import bootstrap_window
 
-        grandfather_user(user_id)
-    except Exception:  # noqa: BLE001 — la siembra no puede impedir el arranque
-        logger.exception("No se pudo heredar la combinación del administrador sembrado.")
+        return bootstrap_window.reopen(reason=reason)
+    except Exception:  # noqa: BLE001 — la ventana no puede impedir el arranque
+        logger.exception("No se pudo abrir la ventana de arranque (%s).", reason)
+        return None

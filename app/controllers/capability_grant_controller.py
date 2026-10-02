@@ -18,7 +18,8 @@ Quién puede qué (decisiones de negocio, no negociables acá)
   alcance"), que obligaba a quien administra accesos a tener cada deber que reparte.
 - Las 11 capacidades sensibles (``is_sensitive``: las exclusivas de ``owner``) nacen ``pending`` y
   no surten efecto hasta que un SEGUNDO access_admin las apruebe. El resto nace ``active``. Con
-  ``ACCESS_FOUR_EYES=False`` nacen ``active`` y se audita ``access.elevation_unapproved``.
+  ``ACCESS_FOUR_EYES=False`` nacen ``active`` y se audita ``access.elevation_unapproved``; dentro
+  de la ventana de arranque (C4) también, auditadas ``access.bootstrap_assignment``.
 - Revocar lo hace un solo access_admin, sin techo: activa → ``revoked``, pendiente → ``cancelled``.
 - Separación de deberes: a una persona con ``security_officer`` no se le otorga (ni se le aprueba)
   una capacidad exclusiva de ``owner`` sin excepción viva o ``sod_override`` (409
@@ -323,10 +324,11 @@ class CapabilityGrantController:
               "scope_type": scope_type, "scope_id": scope_id}]
             if sensitive else []
         )
-        pending = access_requests.must_wait(elevaciones, plan)
-        if plan and pending:
-            # El override viaja con la solicitud: la excepción nace al APROBARLA.
-            action = "capability_grant.requested"
+        modo = access_requests.decide(elevaciones, plan, actor)
+        pending = modo == access_requests.MODE_WAIT
+        # La acción se fija con la salida decidida: una sensible que la ventana de arranque aplica
+        # en el acto nace `active` y se audita como creada, no como pedida.
+        action = "capability_grant.requested" if pending else "capability_grant.created"
         if plan and not pending:
             sod_service.record_override_intent(plan, admin=actor, target_id=user_id,
                                                username=username)
@@ -347,10 +349,11 @@ class CapabilityGrantController:
         self._audit(action, actor, username, capability, scope_type, scope_id,
                     grant_id=row["id"], before=None, after=row["status"],
                     reason=row.get("request_reason"))
-        if (elevaciones or plan) and not pending:
+        if modo and not pending:
             access_requests.record_unapproved(
                 admin=actor, target_id=user_id, username=username, elevations=elevaciones,
                 origin="capability_grant", override=data.get("sod_override") if plan else None,
+                mode=modo,
             )
         return self._serialize(row)
 
