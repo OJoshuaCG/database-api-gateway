@@ -67,7 +67,8 @@ que la UI necesita para una pantalla de administración de accesos:
 `catalog_version` de `/auth/me` cambia cuando cambia el catálogo: úsalo como clave de caché.
 
 **Los dos ejes son independientes y eso importa para la UI.** `exports.download`,
-`engine_users.secrets` y `blueprints.captures` **no destruyen nada** pero divulgan: una pantalla
+`engine_users.secrets`, `engine_users.credentials` y `blueprints.captures` **no destruyen
+nada** pero divulgan: una pantalla
 que agrupe por "peligrosidad" mirando solo `mutates` las va a pintar como inofensivas.
 
 ## 3. El 403
@@ -84,7 +85,7 @@ parsear qué faltó — usá `capabilities` de `/auth/me` para no llegar hasta a
 
 ## 4. Rutas donde un PARÁMETRO sube el requisito
 
-Cinco endpoints piden **más** capacidad según el payload. Son los que la UI tiene que reflejar
+Estos endpoints piden **más** capacidad según el payload. Son los que la UI tiene que reflejar
 deshabilitando el control, porque el usuario ya está en la pantalla y el 403 llega recién al
 enviar:
 
@@ -95,6 +96,10 @@ enviar:
 | `PATCH /database-models/{id}/migrations/{v}` | `capture_selects: true` | `blueprints.captures` |
 | `DELETE /managed-databases/{id}` | `drop_remote=true` | `databases.drop` |
 | `DELETE /server-users/{id}` | `drop_remote=true` | `engine_users.drop` |
+| `POST /server-users` | `password` presente (con o sin `provision`) | `engine_users.credentials` |
+| `PATCH /server-users/{id}` | `password` presente (con o sin `provision`) | `engine_users.credentials` |
+| `POST /servers/{id}/users/adopt-all-hosts` | `known_password` presente | `engine_users.credentials` |
+| `POST /servers/{id}/users/add-host` | `reuse_password: false` (`new_password`) | `engine_users.credentials` |
 | `POST /managed-databases/{id}/reassign-owner` | `provision=true` | `databases.drop` (en la BD) |
 
 `reassign-owner?provision=true` pide `databases.drop` porque entrega control equivalente a
@@ -149,6 +154,7 @@ En los tres primeros, **apagar** la captura no pide nada extra: solo encenderla.
 | | `write` | | ✅ | ✅ | |
 | | `drop` | | | ✅ | |
 | | `secrets` 🔓 | | | ✅ | |
+| | `credentials` 🔓 | | | ✅ | |
 | `databases` | `read` | ✅ | ✅ | ✅ | |
 | | `write` | | ✅ | ✅ | |
 | | `drop` | | | ✅ | |
@@ -192,6 +198,14 @@ pasos, el estado del lote y el drift) siguen en `collation.read`, que tienen los
 - **`clones.execute` está en `owner` y no en `operator`** aunque su nombre lo emparente con
   `exports.execute`: un clon **copia DATOS**, y meter la base de producción de un cliente en un
   entorno de desarrollo es divulgación.
+- **Elegir la contraseña de un usuario del motor es `engine_users.credentials`, no `write`.**
+  Quien elige la credencial la conoce y entra al motor por fuera del gateway, así que divulga
+  igual que revelarla (`secrets`): solo `owner`, con step-up, y sensible si se otorga suelta.
+  Siempre la piden `POST /server-users/provision`, `POST /servers/{id}/users`,
+  `PATCH /servers/{id}/users/password`, `PATCH /servers/{id}/users/password-all-hosts` y
+  `POST /servers/{id}/users/define-password`; las del §4 solo cuando el payload trae la
+  contraseña. `operator` conserva el alta de inventario sin contraseña, la adopción, los grants,
+  los perfiles y agregar un host copiando el hash (`reuse_password: true`).
 
 ## 6. Lo que este addendum NO trae todavía
 

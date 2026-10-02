@@ -9,6 +9,11 @@ Flags que tocan el motor:
 - ``?provision=true`` en POST  → CREATE USER en el motor.
 - ``?provision=true`` en PATCH → ALTER USER (solo si se envía nuevo password).
 - ``?drop_remote=true`` en DELETE → DROP USER en el motor.
+
+Contraseña elegida por el actor → ``engine_users.credentials``, no ``write``: quien elige la
+credencial de una cuenta del motor la conoce, y eso equivale a revelarla. POST y PATCH sin
+``password`` siguen en ``write``; con ``password``, el handler escala con ``assert_at`` (que
+aplica el step-up). ``/provision`` siempre fija una contraseña, así que la declara de entrada.
 """
 
 from typing import Annotated
@@ -25,7 +30,7 @@ from app.core.authz import (
 from app.core.actor import Actor
 from app.core.limiter import limiter
 from app.core.scope import assert_at
-from app.core.scope_targets import bulk_profile, payload_server, server_user
+from app.core.scope_targets import bulk_profile, payload_server, server, server_user
 from app.schemas.grant import ApplyProfileBulkRequest, ApplyProfileBulkResult, ApplyProfileRequest, ApplyProfileResult, GrantInfo, GrantRequest, RevokeRequest
 from app.schemas.managed_database import ManagedDatabaseOut
 from app.schemas.server_user import AdoptUserIn, ServerUserCreate, ServerUserFullCreate, ServerUserFullOut, ServerUserOut, ServerUserUpdate
@@ -47,6 +52,9 @@ EngineUsersWriteAtBulk = Annotated[
 EngineUsersWriteAtUser = Annotated[
     Actor, Depends(require_at(Capability.ENGINE_USERS_WRITE, target=server_user))
 ]
+EngineUsersCredentialsAtPayloadServer = Annotated[
+    Actor, Depends(require_at(Capability.ENGINE_USERS_CREDENTIALS, target=payload_server))
+]
 
 
 @router.get("", response_model=ApiResponse[list[ServerUserOut]])
@@ -65,6 +73,9 @@ def list_server_users(
 def create_server_user(
     actor: EngineUsersWriteAtPayloadServer, payload: ServerUserCreate, provision: bool = Query(False)
 ):
+    if payload.password is not None:
+        # Elegir la contraseña (aprovisionada o solo guardada para revelarla) es divulgación.
+        assert_at(actor, Capability.ENGINE_USERS_CREDENTIALS, server(payload.server_id))
     created = ServerUserController().create_server_user(
         payload.model_dump(), provision=provision, admin=actor
     )
@@ -96,6 +107,8 @@ def update_server_user(
     payload: ServerUserUpdate,
     provision: bool = Query(False),
 ):
+    if payload.password is not None:
+        assert_at(actor, Capability.ENGINE_USERS_CREDENTIALS, server_user(user_id))
     updated = ServerUserController().update_server_user(
         user_id, payload.model_dump(exclude_unset=True), provision=provision, admin=actor
     )
@@ -258,11 +271,16 @@ def apply_profile_bulk(
     status_code=201,
     summary="Crear usuario + aprovisionar en motor + aplicar grants iniciales",
 )
-def provision_with_grants(actor: EngineUsersWriteAtPayloadServer, payload: ServerUserFullCreate):
+def provision_with_grants(
+    actor: EngineUsersCredentialsAtPayloadServer, payload: ServerUserFullCreate
+):
     """
     Endpoint unificado: crea el usuario en el inventario, lo aprovisiona en el motor
     destino (CREATE USER) y aplica los ``initial_grants`` indicados. Los grants son
     best-effort: un fallo en un grant no revierte la creación del usuario.
+
+    ``engine_users.credentials`` y no ``write``: aprovisionar siempre exige una contraseña
+    elegida por el actor (sin ella, 422), así que no hay variante que se quede en ``write``.
     """
     result = ServerUserController().provision_with_grants(
         payload.model_dump(exclude={"initial_grants"}),

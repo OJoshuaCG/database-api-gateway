@@ -140,6 +140,7 @@ class Capability(StrEnum):
     ENGINE_USERS_WRITE = "engine_users.write"
     ENGINE_USERS_DROP = "engine_users.drop"
     ENGINE_USERS_SECRETS = "engine_users.secrets"
+    ENGINE_USERS_CREDENTIALS = "engine_users.credentials"
 
     # -- Bases de datos ----------------------------------------------------- #
     DATABASES_READ = "databases.read"
@@ -264,8 +265,9 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         mutates=True,
         axis="server",
     ),
-    # `secrets` NO implica `write`: rotar una contraseña es rutina, LEERLA en claro es
-    # divulgación y quien opera no la necesita. Son riesgos incomparables.
+    # `secrets` NO implica `write`: reescribir privilegios es rutina, LEER una contraseña en
+    # claro es divulgación y quien opera no la necesita. Son riesgos incomparables. (ELEGIRLA
+    # también divulga: es `credentials`, más abajo.)
     # Existe por SIMETRÍA con `databases.drop`, y porque su ausencia contradecía el criterio
     # que `operator` declara en su propio comentario ("no incluye `*.drop`"): sin este nivel,
     # DROP USER caía en `engine_users.write` y un operator podía dejar sin acceso a la
@@ -281,6 +283,21 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
     _spec(
         Capability.ENGINE_USERS_SECRETS,
         "Revelar contraseñas de usuarios del motor",
+        discloses=True,
+        step_up=True,
+        axis="server",
+    ),
+    # `credentials`: el ACTOR ELIGE la contraseña de una cuenta del motor (crearla con contraseña,
+    # rotarla, definir la conocida, agregar un host con contraseña nueva). Elegir la credencial
+    # equivale a revelarla —quien la eligió la sabe y entra al motor por fuera del gateway, sin
+    # export, consola, step-up ni auditoría—, así que `discloses=True` y por eso solo `owner`,
+    # con step-up y segundo aprobador si se otorga suelta. `write` conserva todo lo que NO pone
+    # una credencial elegida por el actor: alta de inventario sin contraseña, adopción, grants,
+    # perfiles y agregar host copiando el hash de la cuenta origen.
+    _spec(
+        Capability.ENGINE_USERS_CREDENTIALS,
+        "Elegir o definir contraseñas de usuarios del motor",
+        mutates=True,
         discloses=True,
         step_up=True,
         axis="server",
@@ -442,6 +459,7 @@ _OWNER: frozenset[Capability] = _OPERATOR | {
     Capability.CLONES_EXECUTE,
     Capability.ENGINE_USERS_DROP,
     Capability.ENGINE_USERS_SECRETS,
+    Capability.ENGINE_USERS_CREDENTIALS,
     Capability.DATABASES_DROP,
     Capability.BLUEPRINTS_APPLY,
     Capability.BLUEPRINTS_CAPTURES,
@@ -546,7 +564,7 @@ def is_sensitive(capability: Capability | str) -> bool:
     ¿Exige un segundo aprobador? Divulga datos del cliente o es de nivel ``drop``.
 
     Derivado de los ejes del catálogo y no de una lista aparte; un invariante de importación
-    fija que el conjunto resultante sean exactamente las 7 capacidades de la política.
+    fija que el conjunto resultante sean exactamente las 8 capacidades de la política.
     """
     try:
         sp = _BY_ID[Capability(capability)]
@@ -678,6 +696,7 @@ def capability_matrix() -> list[dict]:
 _SENSITIVE_POLICY: frozenset[str] = frozenset(
     {
         "engine_users.secrets",
+        "engine_users.credentials",
         "blueprints.captures",
         "clones.execute",
         "exports.download",
@@ -758,7 +777,7 @@ def _assert_invariants() -> None:
             if s.id in ROLE_CAPABILITIES[role]:
                 raise AssertionError(f"{s.id.value} es destructive y está en '{role.value}'.")
 
-    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 7: si el
+    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 8: si el
     #    catálogo crece y una nueva divulga o es `drop`, esto obliga a decidirlo a propósito.
     sensibles = {s.id.value for s in CAPABILITIES if is_sensitive(s.id)}
     if sensibles != _SENSITIVE_POLICY:

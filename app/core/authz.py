@@ -346,6 +346,7 @@ EngineUsersRead = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_READ)
 EngineUsersWrite = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_WRITE))]
 EngineUsersDrop = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_DROP))]
 EngineUsersSecrets = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_SECRETS))]
+EngineUsersCredentials = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_CREDENTIALS))]
 
 DatabasesRead = Annotated[Actor, Depends(require(Capability.DATABASES_READ))]
 DatabasesWrite = Annotated[Actor, Depends(require(Capability.DATABASES_WRITE))]

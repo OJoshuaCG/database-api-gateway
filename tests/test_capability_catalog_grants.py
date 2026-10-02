@@ -12,6 +12,7 @@ from app.services.capability_catalog import CAPABILITIES, Capability, GatewayRol
 
 SENSITIVE = {
     "engine_users.secrets",
+    "engine_users.credentials",
     "blueprints.captures",
     "clones.execute",
     "exports.download",
@@ -21,7 +22,7 @@ SENSITIVE = {
 }
 
 
-def test_sensitive_set_is_exactly_the_seven_policy_capabilities():
+def test_sensitive_set_is_exactly_the_eight_policy_capabilities():
     assert {s.id.value for s in CAPABILITIES if cc.is_sensitive(s.id)} == SENSITIVE
 
 

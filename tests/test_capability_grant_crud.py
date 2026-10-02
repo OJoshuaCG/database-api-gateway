@@ -2,7 +2,7 @@
 Capacidades puntuales: alta, listado y revocación (``/gateway-users/{id}/capability-grants``).
 
 Lo que se mide son las reglas de negocio: solo ``access_admin`` actúa, nadie se otorga ni se
-revoca a sí mismo, las globales no se otorgan, el techo del que otorga se respeta, las 7
+revoca a sí mismo, las globales no se otorgan, el techo del que otorga se respeta, las 8
 sensibles nacen ``pending`` sin efecto, revocar es de un solo administrador, y ``PUT /access``
 no toca las capacidades puntuales.
 """
@@ -120,10 +120,11 @@ def test_the_new_capability_is_active_for_the_grantee(admin_client, target):
 
 @pytest.mark.parametrize(
     "capability",
-    ["engine_users.secrets", "blueprints.captures", "clones.execute", "exports.download",
-     "sql_console.execute", "engine_users.drop", "databases.drop"],
+    ["engine_users.secrets", "engine_users.credentials", "blueprints.captures",
+     "clones.execute", "exports.download", "sql_console.execute", "engine_users.drop",
+     "databases.drop"],
 )
-def test_the_seven_sensitive_capabilities_are_created_pending_without_effect(
+def test_the_eight_sensitive_capabilities_are_created_pending_without_effect(
     admin_client, target, capability
 ):
     r = _grant(admin_client, target, capability)

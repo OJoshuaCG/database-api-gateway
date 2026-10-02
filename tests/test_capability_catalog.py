@@ -105,6 +105,7 @@ def test_the_disclosing_capabilities_are_the_expected_ones():
     """
     assert {s.id for s in CAPABILITIES if s.discloses} == {
         Capability.ENGINE_USERS_SECRETS,
+        Capability.ENGINE_USERS_CREDENTIALS,
         Capability.BLUEPRINTS_CAPTURES,
         Capability.CLONES_EXECUTE,
         Capability.EXPORTS_DOWNLOAD,

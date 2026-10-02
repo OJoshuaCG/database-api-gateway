@@ -24,6 +24,7 @@ from app.core.authz import (
 )
 from app.core.actor import Actor
 from app.core.limiter import limiter
+from app.core.scope import assert_at
 from app.core.scope_targets import server, server_database, sql_console
 from app.services.capability_catalog import Capability
 from app.schemas.grant import (
@@ -85,6 +86,12 @@ EngineUsersDropAtServer = Annotated[
 ]
 EngineUsersSecretsAtServer = Annotated[
     Actor, Depends(require_at(Capability.ENGINE_USERS_SECRETS, target=server))
+]
+# Contraseña ELEGIDA por el actor: quien la elige la conoce, así que divulga (owner + step-up).
+# Las rutas donde es opcional (adopt-all-hosts, add-host) quedan en ``write`` y escalan en el
+# handler con ``assert_at`` solo cuando el payload trae la contraseña.
+EngineUsersCredentialsAtServer = Annotated[
+    Actor, Depends(require_at(Capability.ENGINE_USERS_CREDENTIALS, target=server))
 ]
 DatabasesWriteAtServer = Annotated[
     Actor, Depends(require_at(Capability.DATABASES_WRITE, target=server))
@@ -172,7 +179,11 @@ def adopt_engine_user_all_hosts(actor: EngineUsersWriteAtServer, server_id: int,
     Adopta TODAS las identidades en vivo de un username en una sola operación (nunca
     ejecuta CREATE USER). Con ``known_password`` opcional, la guarda cifrada en todas
     las filas adoptadas para habilitar reveal-password (tampoco ejecuta ALTER USER).
+    ``known_password`` exige ``engine_users.credentials``: definir la credencial que el
+    gateway revelará después es elegirla.
     """
+    if payload.known_password is not None:
+        assert_at(actor, Capability.ENGINE_USERS_CREDENTIALS, server(server_id))
     result = ServerUserController().adopt_user_all_hosts(
         server_id, payload.model_dump(), admin=actor
     )
@@ -186,7 +197,7 @@ def adopt_engine_user_all_hosts(actor: EngineUsersWriteAtServer, server_id: int,
     response_model=ApiResponse[EngineUserActionOut],
     status_code=201,
 )
-def create_engine_user(actor: EngineUsersWriteAtServer, server_id: int, payload: EngineUserCreateIn):
+def create_engine_user(actor: EngineUsersCredentialsAtServer, server_id: int, payload: EngineUserCreateIn):
     """Crea un usuario en el motor (CREATE USER). Con ``adopt=true`` lo registra además en el inventario."""
     created = ServerUserController().create_user_by_identity(
         server_id, payload.model_dump(), admin=actor
@@ -198,7 +209,7 @@ def create_engine_user(actor: EngineUsersWriteAtServer, server_id: int, payload:
     "/{server_id}/users/password", response_model=ApiResponse[EngineUserActionOut]
 )
 def change_engine_user_password(
-    actor: EngineUsersWriteAtServer, server_id: int, payload: EnginePasswordChangeIn
+    actor: EngineUsersCredentialsAtServer, server_id: int, payload: EnginePasswordChangeIn
 ):
     """Cambia la contraseña de un usuario en el motor (esté o no adoptado). Si hay fila de inventario, se sincroniza."""
     updated = ServerUserController().set_password_by_identity(
@@ -212,7 +223,7 @@ def change_engine_user_password(
     response_model=ApiResponse[PasswordChangeBatchOut],
 )
 def change_engine_user_password_all_hosts(
-    actor: EngineUsersWriteAtServer, server_id: int, payload: EnginePasswordChangeAllHostsIn
+    actor: EngineUsersCredentialsAtServer, server_id: int, payload: EnginePasswordChangeAllHostsIn
 ):
     """
     Rota la contraseña REAL (ALTER USER/ROLE) en TODOS los hosts en vivo de un
@@ -260,7 +271,7 @@ def reveal_engine_user_password(
     response_model=ApiResponse[KnownPasswordSetOut],
 )
 def define_engine_user_known_password(
-    actor: EngineUsersWriteAtServer, server_id: int, payload: DefineKnownPasswordIn
+    actor: EngineUsersCredentialsAtServer, server_id: int, payload: DefineKnownPasswordIn
 ):
     """
     Registra una contraseña YA conocida por el admin humano SIN ejecutar ALTER USER —
@@ -287,7 +298,11 @@ def add_engine_user_host(actor: EngineUsersWriteAtServer, server_id: int, payloa
     Agrega un host a un usuario (clona la cuenta a ``new_host``). Solo MySQL/MariaDB
     (422 en PostgreSQL). ``reuse_password=true`` copia el hash de la cuenta origen;
     ``false`` exige ``new_password``. Con ``copy_grants=true`` replica sus permisos.
+    Copiar el hash no le da al actor ninguna credencial (``write``); ``new_password`` sí
+    (``engine_users.credentials``).
     """
+    if not payload.reuse_password:
+        assert_at(actor, Capability.ENGINE_USERS_CREDENTIALS, server(server_id))
     result = ServerUserController().add_host(server_id, payload.model_dump(), admin=actor)
     return success(
         data=result, message=f"Host '{payload.new_host}' agregado a '{payload.username}'."

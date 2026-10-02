@@ -736,6 +736,21 @@ que conviven:
 
 **Todos requieren sesión.** El password se cifra y nunca se devuelve.
 
+**Capacidad: elegir una contraseña es `engine_users.credentials`, no `write`.** Quien elige la
+credencial de una cuenta del motor la conoce, así que divulga igual que revelarla: solo `owner`
+(o una capacidad puntual sensible), con step-up (`403 access.step_up_required`). El gateway
+**nunca genera** contraseñas: toda contraseña que guarda la tipeó el actor.
+
+| Operación | Capacidad |
+|---|---|
+| `POST /server-users/provision`, `POST /servers/{id}/users`, `PATCH /servers/{id}/users/password`, `PATCH /servers/{id}/users/password-all-hosts`, `POST /servers/{id}/users/define-password` | `engine_users.credentials` siempre |
+| `POST /server-users`, `PATCH /server-users/{id}` | `engine_users.write`; con `password` en el body, además `engine_users.credentials` |
+| `POST /servers/{id}/users/adopt-all-hosts` | `engine_users.write`; con `known_password`, además `engine_users.credentials` |
+| `POST /servers/{id}/users/add-host` | `engine_users.write`; con `reuse_password: false`, además `engine_users.credentials` |
+| `POST /server-users/adopt`, grants, perfiles | `engine_users.write` |
+| `POST /servers/{id}/users/reveal-password` | `engine_users.secrets` |
+| `DELETE` con `drop_remote=true` / `DELETE /servers/{id}/users` | `engine_users.drop` |
+
 ### 7.1 Por qué existen dos formas (leer antes de diseñar la UI)
 
 En **MySQL/MariaDB** un usuario **no es una entidad única**: `'alice'@'localhost'` y
@@ -2734,9 +2749,9 @@ Nadie se otorga ni se revoca capacidades a sí mismo. Las capacidades **globales
 globales y sus propias capacidades puntuales). Otorgar escribir/ejecutar trae implícita la lectura
 de su módulo (campo `implies`).
 
-**Sensibles (segundo aprobador).** `engine_users.secrets`, `blueprints.captures`,
-`clones.execute`, `exports.download`, `sql_console.execute`, `engine_users.drop` y
-`databases.drop` nacen `pending` (vencen a los 7 días, sin ningún efecto hasta que otro
+**Sensibles (segundo aprobador).** `engine_users.secrets`, `engine_users.credentials`,
+`blueprints.captures`, `clones.execute`, `exports.download`, `sql_console.execute`,
+`engine_users.drop` y `databases.drop` nacen `pending` (vencen a los 7 días, sin ningún efecto hasta que otro
 `access_admin` las apruebe). El resto nace `active`.
 
 ### Objeto `CapabilityGrantOut`
