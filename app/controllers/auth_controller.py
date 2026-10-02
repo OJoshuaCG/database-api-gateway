@@ -24,8 +24,12 @@ presupuesto de tiempo fijo por request, que trae su propio modo de fallo (una ca
 convierte en un límite de tasa involuntario).
 """
 
+from hmac import compare_digest
 from secrets import token_urlsafe
 
+from app.controllers.gateway_user_controller import assert_password_policy
+from app.core import session_store
+from app.core.actor import Actor
 from app.exceptions import AppHttpException
 from app.models.user_model import UserModel
 from app.services import audit
@@ -43,6 +47,12 @@ from app.utils.security import hash_password, verify_password
 #: Cuesta un hash en el arranque (decenas de ms, una vez). Diferirlo al primer login movería ese
 #: costo al primer intento, que es justo el request donde la diferencia se mide.
 _DUMMY_HASH = hash_password(token_urlsafe(32))
+
+#: Códigos del cambio de password propio. ``gateway_user.weak_password`` NO está acá: es el de
+#: la política compartida con la invitación (``assert_password_policy``).
+CODE_INVALID_CURRENT_PASSWORD = "auth.invalid_current_password"
+CODE_PASSWORD_UNCHANGED = "auth.password_unchanged"
+CODE_SESSION_REQUIRED = "auth.session_required"
 
 
 class AuthController:
@@ -111,3 +121,77 @@ class AuthController:
                 else ("cuenta inactiva" if user is not None else "usuario inexistente")
             ),
         )
+
+    def change_password(
+        self, actor: Actor, *, current_password: str, new_password: str, current_sid: str
+    ) -> int:
+        """
+        Cambia la password del PROPIO actor y cierra TODAS sus sesiones, incluida la actual.
+        Devuelve cuántas sesiones OTRAS que la actual se cerraron.
+
+        La actual se cierra también —y la ruta abre una nueva acto seguido— porque es la
+        rotación de ``sid`` que el login ya hace: quien cambia la password suele estar
+        reaccionando a una credencial filtrada, y si la cookie actual también se filtró, dejarla
+        viva anula el cambio. El orden (revocar, después abrir la nueva) falla hacia el lado
+        seguro: si la sesión nueva no se puede crear, la persona queda deslogueada, nunca con
+        una sesión vieja viva.
+
+        La password actual se verifica con el MISMO ``verify_password`` que el login (Argon2id,
+        tiempo constante en la comparación). Un fallo es ``422`` y no ``401``: la sesión es
+        válida, y un 401 haría que la SPA mande a la persona al login.
+
+        **Nunca se registra ninguna password**, ni su largo, en el detalle de auditoría.
+        """
+        if actor.is_agent:
+            # Inalcanzable hoy (la API solo autentica por cookie), y escrito igual: si mañana un
+            # bearer llega a `/api/v1`, un token de agente no puede reescribir la credencial de
+            # una persona.
+            raise AppHttpException(
+                message="Solo una sesión de usuario puede cambiar su contraseña.",
+                status_code=403,
+                public_context={"code": CODE_SESSION_REQUIRED},
+            )
+
+        user = self.user_model.find_by_id(actor.id)
+        hash_actual = (user or {}).get("hashed_password") or _DUMMY_HASH
+        if not (user and verify_password(current_password, hash_actual)):
+            audit.record(
+                "auth.password_change_failed",
+                status="failure",
+                admin=actor,
+                target_type="user",
+                target_id=actor.id,
+                touched_engine=False,
+                detail="contraseña actual incorrecta",
+            )
+            raise AppHttpException(
+                message="La contraseña actual no es correcta.",
+                status_code=422,
+                public_context={"code": CODE_INVALID_CURRENT_PASSWORD},
+            )
+
+        assert_password_policy(new_password)
+        if compare_digest(new_password.encode("utf-8"), current_password.encode("utf-8")):
+            raise AppHttpException(
+                message="La contraseña nueva tiene que ser distinta de la actual.",
+                status_code=422,
+                public_context={"code": CODE_PASSWORD_UNCHANGED},
+            )
+
+        self.user_model.set_credential(actor.id, hash_password(new_password))
+        otras = session_store.revoke_all_for_user(
+            actor.id, session_store.REASON_PASSWORD_CHANGE, except_sid=current_sid
+        )
+        if current_sid:
+            session_store.revoke(current_sid, session_store.REASON_PASSWORD_CHANGE)
+        # `record` y no `record_intent`: la password YA cambió, y abortar por un fallo al auditar
+        # dejaría a la persona sin saber cuál de las dos vale.
+        audit.record(
+            "auth.password_changed",
+            admin=actor,
+            target_type="user",
+            target_id=actor.id,
+            touched_engine=False,
+            detail=f"contraseña cambiada por el propio usuario; {otras} sesión(es) más cerrada(s)",
+        )
+        return otras

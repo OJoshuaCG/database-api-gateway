@@ -63,6 +63,27 @@ CODE_INVALID_ROLE = "gateway_user.invalid_role"
 CODE_INVALID_CAPABILITY = "gateway_user.invalid_global_capability"
 CODE_WEAK_PASSWORD = "gateway_user.weak_password"
 
+
+def assert_password_policy(password: str) -> None:
+    """
+    La política de una password que elige una persona. **Una sola**, para todo camino que fije
+    una: aceptar la invitación y el cambio de password propio (``AuthController``).
+
+    Vive extraída porque dos copias del chequeo son dos políticas el día que alguien suba el
+    mínimo en una sola, y el código ``gateway_user.weak_password`` que lee la SPA quedaría
+    significando cosas distintas según la pantalla.
+    """
+    if len(password or "") < PASSWORD_MIN_LENGTH:
+        raise AppHttpException(
+            message=f"La contraseña tiene que tener al menos {PASSWORD_MIN_LENGTH} caracteres.",
+            status_code=422,
+            public_context={
+                "code": CODE_WEAK_PASSWORD,
+                "min_length": PASSWORD_MIN_LENGTH,
+            },
+        )
+
+
 class GatewayUserController:
     def __init__(self):
         self.users = UserModel()
@@ -235,15 +256,7 @@ class GatewayUserController:
         fila = self.users.find_by_id(user_id)
         if not fila:
             raise self._invite_invalid()
-        if len(password or "") < PASSWORD_MIN_LENGTH:
-            raise AppHttpException(
-                message=f"La contraseña tiene que tener al menos {PASSWORD_MIN_LENGTH} caracteres.",
-                status_code=422,
-                public_context={
-                    "code": CODE_WEAK_PASSWORD,
-                    "min_length": PASSWORD_MIN_LENGTH,
-                },
-            )
+        assert_password_policy(password)
 
         self.users.set_credential(user_id, hash_password(password))
         # `record` y no `record_intent`: la password YA se fijó, así que un fallo al auditar no

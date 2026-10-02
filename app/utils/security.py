@@ -25,6 +25,10 @@ _hasher = PasswordHasher()
 #: empujan a `Password1!` y bajan la entropía real. Largo mínimo alto y nada más.
 PASSWORD_MIN_LENGTH = 12
 
+#: Largo máximo. Acota el costo de Argon2 sobre un input arbitrario del cliente; es el mismo
+#: tope que tenía el schema de la invitación, ahora compartido con el cambio de password.
+PASSWORD_MAX_LENGTH = 200
+
 
 def hash_password(password: str) -> str:
     """Devuelve el hash Argon2id de un password en texto plano."""

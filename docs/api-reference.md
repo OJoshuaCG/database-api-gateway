@@ -375,6 +375,63 @@ curl https://<host>/api/v1/auth/me -b cookies.txt
 { "data": { "id": 1, "username": "admin" } }
 ```
 
+### `POST /api/v1/auth/password`
+
+Cambia la contraseña **del propio usuario**. No hay parámetro para cambiar la de otro.
+**Requiere sesión por cookie** (capacidad `self.read`) y, como todo método no seguro con
+cookie, el header `X-CSRF-Token` y un `Origin` permitido. Un `Authorization: Bearer` de agente
+no autentica en `/api/v1`: responde `401`. **Rate limit: 5/min por usuario + IP**, contando
+todos los intentos y antes de verificar la contraseña actual (la clave es el usuario ya
+autenticado, nunca el `sid`: abrir otra sesión no da cupo nuevo).
+
+**Body** (`PasswordChangeIn`):
+
+| Campo | Tipo | Requerido | Validación |
+|---|---|---|---|
+| `current_password` | string | sí | mínimo 1 carácter |
+| `new_password` | string | sí | 1–200 caracteres en el schema; el mínimo real (`PASSWORD_MIN_LENGTH` = 12) lo aplica la política compartida con la invitación y responde con código estable |
+
+**Respuesta** `200` — `ApiResponse[PasswordChangeOut]` (`PasswordChangeOut` = `{revoked_sessions}`:
+cuántas sesiones **otras** que la actual se cerraron).
+
+```bash
+curl -X POST https://<host>/api/v1/auth/password \
+  -H "Content-Type: application/json" \
+  -H "X-CSRF-Token: <token de la cookie gw_csrf>" \
+  -b cookies.txt -c cookies.txt \
+  -d '{"current_password": "s3cr3t-actual-12", "new_password": "otra-password-larga"}'
+```
+
+```json
+{ "data": { "revoked_sessions": 2 }, "message": "Contraseña cambiada. Se cerraron las demás sesiones." }
+```
+
+**Efecto sobre las sesiones.** Al éxito se cierran **todas** las sesiones del usuario con motivo
+`password_change`, **incluida la actual**, y la misma respuesta trae la cookie de una sesión
+nueva (el `sid` rota, como en el login). Consecuencias para el cliente:
+
+- La sesión desde la que se cambió **sigue funcionando** sin volver a loguearse, pero el token
+  CSRF cambió: la respuesta re-emite la cookie `gw_csrf` (`__Host-gw_csrf` con TLS) y el
+  cliente tiene que **releerla** antes del próximo método no seguro; con el token viejo responde
+  `403 auth.csrf_invalid`.
+- Las demás sesiones reciben `401` con `public_context.code = "auth.session_password_change"`
+  en su próximo request.
+
+**Errores** (código en `detail.public_context.code`):
+
+| Status | Código | Cuándo |
+|---|---|---|
+| `401` | `auth.session_missing` / `auth.session_*` | Sin sesión por cookie (incluye un request solo con bearer de agente). |
+| `403` | `auth.csrf_missing` · `auth.csrf_invalid` · `auth.origin_rejected` | Falta o no valida el token CSRF, o el `Origin` es ajeno. |
+| `422` | `auth.invalid_current_password` | La contraseña actual no es correcta. No cierra la sesión (no es un `401`) y queda auditado como `auth.password_change_failed`. |
+| `422` | `gateway_user.weak_password` | `new_password` más corta que el mínimo. Trae `public_context.min_length`. Es el mismo código que la aceptación de invitación. |
+| `422` | `auth.password_unchanged` | `new_password` es igual a la actual. |
+| `422` | *(sin código)* | Error de validación de Pydantic (campo faltante, `new_password` > 200). |
+| `429` | — | Más de 5 intentos por minuto para el mismo usuario e IP. |
+
+Se audita como `auth.password_changed` (y los fallos de contraseña actual como
+`auth.password_change_failed`). Ninguna fila lleva la contraseña, ni la vieja ni la nueva.
+
 ---
 
 ## 6. Servidores (`/servers`)

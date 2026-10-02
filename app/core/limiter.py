@@ -175,6 +175,29 @@ def enforce_login_limits(request: Request, username: str) -> None:
         hit_or_429(limiter, LOGIN_USERNAME_RATE_LIMIT, "login", "user", usuario)
 
 
+#: Cupo de cambio de password por (usuario, IP). Cuenta TODOS los intentos —igual que el login y
+#: por el mismo motivo (ver ``hit_or_429``)—, y es lo que acota adivinar la password actual con
+#: una sesión robada: sin él, una cookie secuestrada es un oráculo de la password sin techo.
+PASSWORD_CHANGE_RATE_LIMIT = "5/minute"
+
+
+def enforce_password_change_limits(request: Request, user_id: int) -> None:
+    """
+    El límite de ``POST /auth/password``. Se llama DESPUÉS de autenticar y ANTES de verificar la
+    password actual.
+
+    La clave es el ``user_id`` ya VERIFICADO por la dependencia de sesión, y nunca el ``sid``:
+    el ``sid`` crudo de la cookie es justamente lo que ``session_or_address`` no verifica, y
+    cada login emite uno nuevo, así que con él quien tenga la password de la cuenta estrenaría
+    cupo con cada sesión. Más la IP para que un usuario detrás de una NAT no comparta el cupo
+    con nadie más que consigo mismo.
+    """
+    ip = get_remote_address(request)
+    hit_or_429(
+        limiter, PASSWORD_CHANGE_RATE_LIMIT, "password_change", "user_ip", str(user_id), ip
+    )
+
+
 def agent_token_key(request) -> str:
     """
     Clave del límite de tasa del endpoint MCP: el ``token_id``, y la IP como último recurso.

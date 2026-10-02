@@ -10,10 +10,18 @@ from app.core.limiter import (
     LOGIN_IP_RATE_LIMIT,
     client_address,
     enforce_login_limits,
+    enforce_password_change_limits,
     limiter,
 )
 from app.controllers.authz_controller import AuthzController
-from app.schemas.auth import AdminOut, LoginIn, RevokeOthersOut, SessionOut
+from app.schemas.auth import (
+    AdminOut,
+    LoginIn,
+    PasswordChangeIn,
+    PasswordChangeOut,
+    RevokeOthersOut,
+    SessionOut,
+)
 from app.schemas.authz import MeOut
 from app.services import audit
 from app.utils.response import ApiResponse, empty, success
@@ -121,4 +129,37 @@ def revoke_other_sessions(request: Request, actor: SelfRead):
     return success(
         data={"revoked": revocadas},
         message=f"{revocadas} sesión(es) cerrada(s).",
+    )
+
+
+@router.post("/password", response_model=ApiResponse[PasswordChangeOut])
+def change_own_password(request: Request, actor: SelfRead, payload: PasswordChangeIn):
+    """
+    Cambia la contraseña del PROPIO usuario. Sin parámetro para cambiar la de otro: eso es
+    administración de accesos.
+
+    Detrás de ``self.read`` como el resto de las rutas propias (``logout``,
+    ``sessions/revoke-others``): la dependencia exige sesión por cookie y el CSRF de todo método
+    no seguro. Además exige la password ACTUAL, que es lo que separa "tengo la cookie" de "soy
+    la persona": sin ella, una sesión robada alcanzaría para apropiarse de la cuenta.
+
+    Límite propio (``enforce_password_change_limits``): 5/min por usuario verificado + IP,
+    antes de pagar Argon2. Nunca por ``sid``.
+
+    Al terminar, TODAS las sesiones del usuario quedan cerradas con motivo
+    ``password_change`` y esta respuesta trae la cookie de una sesión NUEVA (``sid`` rotado):
+    el token CSRF cambia con ella, y el ``CsrfCookieMiddleware`` publica el nuevo en esta misma
+    respuesta.
+    """
+    enforce_password_change_limits(request, actor.id)
+    otras = AuthController().change_password(
+        actor,
+        current_password=payload.current_password,
+        new_password=payload.new_password,
+        current_sid=request.session.get(SESSION_SID) or "",
+    )
+    login_session(request, {"id": actor.id})
+    return success(
+        data={"revoked_sessions": otras},
+        message="Contraseña cambiada. Se cerraron las demás sesiones.",
     )

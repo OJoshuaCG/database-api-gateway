@@ -98,6 +98,10 @@ class UserModel:
         """
         Fija la credencial **y sube el epoch en la misma sentencia**.
 
+        Dos llamadores: aceptar la invitación y el cambio de password propio
+        (``AuthController.change_password``). En el segundo, subir el epoch invalida además
+        cualquier token de invitación que hubiera quedado emitido para la cuenta.
+
         Las dos cosas juntas y no en dos llamadas: si el epoch se subiera aparte y esa segunda
         escritura fallara, el token de invitación seguiría siendo válido sobre una cuenta que ya
         tiene password — o sea que quien lo tenga podría reescribirla.

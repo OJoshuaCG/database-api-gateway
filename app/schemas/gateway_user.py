@@ -9,7 +9,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.utils.security import PASSWORD_MIN_LENGTH
+from app.utils.security import PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH
 
 _USERNAME = r"^[a-z0-9]([a-z0-9._-]{1,38}[a-z0-9])?$"
 
@@ -79,7 +79,7 @@ class AcceptInviteIn(BaseModel):
     """
 
     token: str = Field(..., min_length=8)
-    password: str = Field(..., min_length=PASSWORD_MIN_LENGTH, max_length=200)
+    password: str = Field(..., min_length=PASSWORD_MIN_LENGTH, max_length=PASSWORD_MAX_LENGTH)
 
 
 class ScopeGrantOut(BaseModel):

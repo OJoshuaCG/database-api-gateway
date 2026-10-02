@@ -4,6 +4,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app.utils.security import PASSWORD_MAX_LENGTH
+
 
 class LoginIn(BaseModel):
     username: str = Field(..., min_length=1, max_length=128)
@@ -33,3 +35,23 @@ class SessionOut(BaseModel):
 
 class RevokeOthersOut(BaseModel):
     revoked: int = Field(..., description="Cuántas sesiones se cerraron (la actual NO se cuenta)")
+
+
+class PasswordChangeIn(BaseModel):
+    """
+    Cambio de la password propia.
+
+    ``new_password`` NO lleva ``min_length`` en el schema a propósito: el largo mínimo lo exige
+    ``assert_password_policy``, que responde el código estable ``gateway_user.weak_password``
+    con el ``min_length``. Un ``min_length`` acá cortaría antes con un 422 de Pydantic sin
+    código, y la SPA no podría distinguirlo de cualquier otro error de validación.
+    """
+
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=1, max_length=PASSWORD_MAX_LENGTH)
+
+
+class PasswordChangeOut(BaseModel):
+    revoked_sessions: int = Field(
+        ..., description="Cuántas sesiones OTRAS que la actual se cerraron"
+    )
