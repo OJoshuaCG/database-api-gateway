@@ -6,7 +6,7 @@ una entrada. NUNCA almacena credenciales ni datos de negocio: solo qué acción,
 qué objeto, por quién, desde qué request/IP y con qué resultado.
 """
 
-from sqlalchemy import Boolean, Integer, String, Text
+from sqlalchemy import Boolean, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -14,7 +14,16 @@ from app.models.base import Base, TimestampMixin
 
 class AuditLog(Base, TimestampMixin):
     __tablename__ = "audit_log"
-    __table_args__ = ({"comment": "Auditoría de operaciones sensibles del gateway"},)
+    # Los tres índices los pide la lectura (``GET /audit-log``, ``AuditLogController``): rango
+    # de fechas, "qué hizo esta persona" y "qué le hicieron a este objeto". La tabla crece con
+    # cada operación (y con cada rechazo del MCP), así que sin ellos cada filtro es un scan
+    # completo. Los crea la migración ``c2e4a6b8d0f1``.
+    __table_args__ = (
+        Index("ix_audit_log_created_at", "created_at"),
+        Index("ix_audit_log_admin_id", "admin_id"),
+        Index("ix_audit_log_target", "target_type", "target_id"),
+        {"comment": "Auditoría de operaciones sensibles del gateway"},
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 

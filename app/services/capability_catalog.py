@@ -103,7 +103,7 @@ class GlobalCapability(StrEnum):
 
     ``SECURITY_OFFICER`` escribe **datos de política**: los flags de ``Environment``, los
     catálogos que deciden qué llega al motor, el host y la credencial de un ``Server``, y la
-    rotación del cifrado (``policy.admin``). **No** administra usuarios: eso es
+    rotación del cifrado, y **lee la auditoría** (las dos, ``policy.admin``). **No** administra usuarios: eso es
     ``access.admin``, y los conjuntos de las dos globales son disjuntos (invariante 9). Regla general que lo justifica: **toda fila que un guard lee es una frontera de
     privilegio**, así que su escritor necesita al menos el privilegio del guard que puede
     apagar.
@@ -192,8 +192,9 @@ class Capability(StrEnum):
     #: Usuarios del gateway, sus accesos, las capacidades puntuales, los tokens de API y el
     #: reporte de preparación de alcances. Solo ``access_admin``.
     ACCESS_ADMIN_CAP = "access.admin"
-    #: Rotación del cifrado (y, más adelante, la lectura de auditoría). Solo
-    #: ``security_officer``.
+    #: Rotación del cifrado y LECTURA de la auditoría (``GET /audit-log``). Solo
+    #: ``security_officer``: quien revisa el rastro no puede ser quien hace los cambios de acceso
+    #: que el rastro registra (``access_admin``).
     POLICY_ADMIN = "policy.admin"
 
 
@@ -422,7 +423,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
     ),
     _spec(
         Capability.POLICY_ADMIN,
-        "Administrar la política del gateway: rotación del cifrado",
+        "Administrar la política del gateway: rotación del cifrado y lectura de la auditoría",
         mutates=True,
         step_up=True,
         axis="global",

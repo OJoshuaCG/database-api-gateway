@@ -132,7 +132,7 @@ AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
 NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset()
 
 #: Cuántas rutas declaran capacidad. **Solo puede SUBIR.** Ver "EL TRINQUETE".
-MIN_MIGRATED_ROUTES = 168
+MIN_MIGRATED_ROUTES = 193
 
 #: Rutas con capacidad de alcance que NO apuntan a ningún entorno, con el motivo. Es la autoría
 #: de blueprints y los proyectos (escribir una versión no la ejecuta en ninguna BD), más el borrado

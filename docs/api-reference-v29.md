@@ -17,7 +17,7 @@ dos, cada global tiene la suya y los conjuntos son disjuntos.
 | Id | Qué cubre | La tiene | `mutates` | `requires_step_up` | `scope_axis` | `agent_allowed` |
 |---|---|---|:--:|:--:|---|:--:|
 | `access.admin` | `/gateway-users` (todo menos aceptar la invitación), `/api-tokens`, `/capability-grants`, `GET /authz/scope-readiness` | solo `access_admin` | ✅ | ✅ | `global` | ❌ |
-| `policy.admin` | `POST /admin/crypto/rotate` (y la lectura de auditoría cuando exista) | solo `security_officer` | ✅ | ✅ | `global` | ❌ |
+| `policy.admin` | `POST /admin/crypto/rotate`, `GET /audit-log`, `GET /audit-log/{id}` (§11) | solo `security_officer` | ✅ | ✅ | `global` | ❌ |
 | ~~`gateway.admin`~~ | **retirada** | — | | | | |
 
 Las capacidades globales quedan así:
@@ -467,3 +467,148 @@ acción `access.bootstrap_recovery`, que ya no se emite.
   actualizar y dura `ACCESS_BOOTSTRAP_WINDOW_HOURS`.
 - **Cambio de comportamiento del arranque:** ya no repara solo una instalación sin `access_admin`
   activo. Hace falta `ADMIN_RECOVERY=1` (§10.5).
+
+## 11. D — Lectura de auditoría y revocación administrativa de sesiones (F-25)
+
+### 11.1 Por qué
+
+Toda escalada de un solo actor queda en `audit_log`, pero ninguna ruta lo leía: el rastro existía
+sin nadie que pudiera revisarlo. Y un administrador solo podía cortar las sesiones de otra persona
+como efecto secundario de cambiarle el rol o desactivarla. D agrega las dos piezas, cada una del
+lado de la separación de deberes que le toca: **lee el rastro quien no hace los cambios de
+acceso** (`policy.admin`, `security_officer`), y **corta sesiones quien administra accesos**
+(`access.admin`, `access_admin`).
+
+### 11.2 Capacidades
+
+Ninguna capacidad nueva. `policy.admin` cambia su `label` a "Administrar la política del gateway:
+rotación del cifrado y lectura de la auditoría" (`GET /authz/catalog`). Sigue `discloses: false`:
+la auditoría dice quién hizo qué, no entrega datos del tercero (el caso límite, el SQL redactado de
+`query_console.execute`, es lo mismo que `sql_console.history` ya le muestra a `viewer`). Por eso
+**los `GET /audit-log` no piden step-up**; los `POST` de sesiones sí (método no seguro).
+
+| Ruta | Capacidad | Step-up |
+|---|---|:--:|
+| `GET /audit-log` | `policy.admin` | ❌ |
+| `GET /audit-log/{id}` | `policy.admin` | ❌ |
+| `GET /gateway-users/{id}/sessions` | `access.admin` | ❌ |
+| `POST /gateway-users/{id}/sessions/revoke` | `access.admin` | ✅ |
+
+`access_admin` sin `security_officer` recibe `403 access.forbidden` en `/audit-log`; `viewer`
+también. `security_officer` sin `access_admin` recibe `403 access.forbidden` en las dos rutas de
+sesiones.
+
+### 11.3 `GET /audit-log`
+
+Paginado con `?page=&size=` (como el resto), **las más nuevas primero** por `id` descendente
+(estable entre páginas). Todos los filtros son opcionales y se combinan con AND:
+
+| Query | Tipo | Semántica |
+|---|---|---|
+| `action` | string ≤ 65 | Exacto, o **prefijo** si termina en `*` (`access.*`, `gateway_user.*`). `%` y `_` se toman literales. |
+| `admin_id` | int ≥ 1 | Usuario del gateway que actuó. |
+| `admin_username` | string ≤ 128 | Exacto. Un token aparece como `token:<token_id>`. |
+| `actor_type` | `admin` \| `api_token` \| `system` \| `anonymous` | Clase de actor. Otro valor → 422. |
+| `api_token_id` | int ≥ 1 | PK del token de agente. |
+| `target_type` | string ≤ 64 | Exacto (`user`, `server`, `managed_database`, …). |
+| `target_id` | int | Exacto. Tiene sentido junto con `target_type`. |
+| `server_id` | int ≥ 1 | Exacto. |
+| `status` | string ≤ 20 | Exacto. Vocabulario abierto: `success`, `failure`, `error`, `attempt`, `denied`, … |
+| `request_id` | string ≤ 32 | Exacto: todo lo que dejó un mismo request. |
+| `from` | ISO 8601 | `created_at >=` (inclusive). Sin zona = UTC; con zona se convierte a UTC. |
+| `to` | ISO 8601 | `created_at <` (**exclusive**). |
+
+`from >= to` → `422 audit.invalid_range`.
+
+```json
+{
+  "data": [
+    {
+      "id": 812,
+      "created_at": "2026-10-02T17:04:11",
+      "request_id": "4f0c…",
+      "actor_type": "admin",
+      "admin_id": 3,
+      "admin_username": "ana",
+      "api_token_id": null,
+      "action": "gateway_user.access_set",
+      "target_type": "user",
+      "target_id": 9,
+      "server_id": null,
+      "touched_engine": false,
+      "status": "success",
+      "detail": "{\"username\": \"beto\", \"before\": {…}, \"after\": {…}}",
+      "detail_json": {"username": "beto", "before": {}, "after": {}},
+      "ip": "10.0.0.4",
+      "grantee": null,
+      "privilege": null,
+      "object_level": null,
+      "object_name": null,
+      "with_grant_option": null,
+      "grantor": null
+    }
+  ],
+  "pagination": {"page": 1, "size": 20, "total": 1, "pages": 1, "has_next": false, "has_prev": false}
+}
+```
+
+- `detail` viaja **tal cual se guardó**. `detail_json` es ese mismo texto parseado si es un objeto
+  o una lista JSON, y `null` si es texto libre (muchas acciones guardan texto). **Declarar
+  `detail_json` como `unknown().nullable()` en la SPA**: su forma depende de la acción.
+- Ninguna columna lleva secretos: `detail` se escribe sin credenciales, `api_token_id` es el PK del
+  token (nunca el bearer), `grantor`/`grantee` son nombres de cuentas. No viaja `updated_at`.
+- Los campos `grantee`…`grantor` solo vienen llenos en acciones de DCL (GRANT/REVOKE).
+
+### 11.4 `GET /audit-log/{id}`
+
+`200` con una entrada (misma forma que cada ítem de la lista). `404 audit.not_found` si no existe.
+
+### 11.5 `GET /gateway-users/{id}/sessions`
+
+Las sesiones **vivas** de la persona (sin tachar y sin vencer por absoluto ni por inactividad), la
+más reciente primero. **Sin `sid` ni prefijo** —el `sid` es la credencial de sesión, y la
+revocación administrativa cierra todas, así que no hace falta identificarlas— y sin el hash del
+User-Agent.
+
+```json
+{"data": [{"created_at": "2026-10-02T15:00:00", "last_seen_at": "2026-10-02T15:40:12",
+           "expires_at": "2026-10-03T03:00:00", "ip": "10.0.0.7"}]}
+```
+
+`expires_at` es el vencimiento **absoluto** (`created_at + SESSION_ABSOLUTE_MAX_HOURS`); la
+sesión puede caer antes por inactividad. `404 gateway_user.not_found` si la cuenta no existe.
+
+### 11.6 `POST /gateway-users/{id}/sessions/revoke`
+
+Sin body. Cierra **todas** las sesiones vivas de OTRA persona. No toca su contraseña ni su acceso:
+si la contraseña está comprometida, esto va junto con desactivar la cuenta.
+
+| Respuesta | Cuándo |
+|---|---|
+| `200 {"data": {"revoked": N}, "message": "N sesión(es) cerrada(s)."}` | `N` = sesiones vivas que se cerraron (puede ser `0`). Las filas ya vencidas no se cuentan ni se re-etiquetan. |
+| `403 access.step_up_required` | Ventana de step-up vencida. Reintentar tras `POST /auth/step-up`: no hubo ningún efecto. |
+| `403 access.forbidden` | Sin `access.admin`. |
+| `404 gateway_user.not_found` | La cuenta no existe. |
+| `409 access.self_modification_forbidden` | `{id}` es quien llama. Lo propio es `POST /auth/sessions/revoke-others`, que conserva la sesión actual. |
+
+El próximo request de la persona afectada responde **`401 auth.session_access_admin_revoked`**
+("Un administrador de accesos cerró tus sesiones. Volvé a iniciar sesión; …"). Es un motivo nuevo
+(`gateway_sessions.revoked_reason = access_admin_revoked`), distinto de `auth.session_admin_revoked`,
+que sigue siendo el de `revoke-others`, la cuenta desactivada y el fallback.
+
+Se audita `gateway_user.sessions_revoked` (`target_type: user`, `target_id: {id}`), también con
+`N = 0`, con `detail` JSON `{"username", "revoked": N, "reason": "access_admin_revoked"}`.
+
+### 11.7 Datos
+
+Migración `c2e4a6b8d0f1` (head): tres índices sobre `audit_log` para los filtros —
+`ix_audit_log_created_at`, `ix_audit_log_admin_id`, `ix_audit_log_target (target_type,
+target_id)`—. Idempotente; sin cambios de columnas.
+
+### 11.8 Lo que la SPA tiene que cambiar
+
+- Pantalla de auditoría para quien tiene `policy.admin` (`/auth/me` → `capabilities`).
+- En el detalle de un usuario (`access.admin`): listado de sesiones y botón "Cerrar todas las
+  sesiones", con step-up. Ocultarlo en la fila propia (409).
+- Mapear `auth.session_access_admin_revoked` en el manejo del 401 con su propio texto.
+

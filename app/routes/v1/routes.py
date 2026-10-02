@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.routes.v1 import (
     access_requests,
     api_tokens,
+    audit_log,
     authz,
     capability_grants,
     gateway_users,
@@ -52,6 +53,7 @@ router.include_router(environments.router)
 router.include_router(charset_collation_options.router)
 router.include_router(permission_profiles.router)
 router.include_router(crypto.router)
+router.include_router(audit_log.router)
 
 # app/routes/v1/test.py NO se monta: son endpoints de demostración del template
 # (`api-reference.md` los declara fuera de la API funcional) y NINGUNO exige sesión, así que
