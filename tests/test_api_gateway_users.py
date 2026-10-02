@@ -686,3 +686,73 @@ def test_deleting_an_environment_with_a_live_capability_grant_is_a_409(admin_cli
             {"e": eid},
         )
     assert admin_client.delete(f"/api/v1/environments/{eid}").status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# F-24: el invariante del último access_admin vive en la transacción           #
+# --------------------------------------------------------------------------- #
+
+
+def _solo_admin_activo(admin_client) -> int:
+    """El admin sembrado (id 1) es el único access_admin activo."""
+    assert UserModel().count_active_access_admins() == 1
+    return 1
+
+
+def test_the_last_admin_lock_holds_even_if_the_precheck_is_bypassed(admin_client, monkeypatch):
+    """
+    El pre-chequeo de afuera es check-then-write; el candado de ``replace_access`` /
+    ``deactivate_guarded`` cuenta DENTRO de la transacción. Se anula el pre-chequeo para
+    simular la carrera (otra transacción ya pasó el suyo) y el invariante igual se sostiene.
+    """
+    from app.controllers import gateway_user_controller as guc
+    from app.exceptions import AppHttpException
+
+    monkeypatch.setattr(guc, "assert_not_last_access_admin", lambda *a, **k: None)
+    admin_id = _solo_admin_activo(admin_client)
+    um = UserModel()
+
+    with pytest.raises(AppHttpException) as exc:
+        um.replace_access(
+            admin_id, grants=[], globals_=[], last_admin_action="quitarle 'access_admin'"
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.public_context["code"] == "access.last_admin_protected"
+    assert "access_admin" in UserModel().find_access_context(admin_id)["globals"]
+
+    with pytest.raises(AppHttpException) as exc:
+        um.deactivate_guarded(
+            admin_id, {"is_active": False}, last_admin_action="desactivar este usuario"
+        )
+    assert exc.value.public_context["code"] == "access.last_admin_protected"
+    assert UserModel().find_by_id(admin_id)["is_active"]
+
+
+def test_the_controller_paths_use_the_lock(admin_client, monkeypatch):
+    """Por los dos caminos del controller (PUT /access y desactivar) llega el candado."""
+    from app.controllers import gateway_user_controller as guc
+    from app.controllers.gateway_user_controller import GatewayUserController
+    from app.exceptions import AppHttpException
+
+    monkeypatch.setattr(guc, "assert_not_last_access_admin", lambda *a, **k: None)
+    admin_id = _solo_admin_activo(admin_client)
+    # Otro access_admin hace los cambios; después se desactiva para que el sembrado quede solo.
+    from app.core.authz import actor_from_access_context
+
+    # Pendiente (sin credencial): no cuenta para el invariante, así que el sembrado sigue solo.
+    otro = _crear(admin_client, "aa_actor", global_capabilities=["access_admin"])
+    actor = actor_from_access_context(
+        otro["id"], "aa_actor", UserModel().find_access_context(otro["id"])
+    )
+    ctrl = GatewayUserController()
+
+    with pytest.raises(AppHttpException) as exc:
+        ctrl.set_access(
+            admin_id, {"global_capabilities": [], "scope_grants": []}, admin=actor
+        )
+    assert exc.value.public_context["code"] == "access.last_admin_protected"
+
+    with pytest.raises(AppHttpException) as exc:
+        ctrl.update_user(admin_id, {"is_active": False}, admin=actor)
+    assert exc.value.public_context["code"] == "access.last_admin_protected"
+    assert UserModel().find_by_id(admin_id)["is_active"]

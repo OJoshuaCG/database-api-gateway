@@ -150,12 +150,24 @@ def assert_not_last_access_admin(user_id: int, *, action: str) -> None:
 
     ``action`` va al mensaje para que el 409 diga qué se estaba intentando: "no se puede
     desactivar" y "no se puede revocar" mandan a la persona a lugares distintos.
+
+    ESTE CHEQUEO ES UN PRE-CHEQUEO, NO EL CANDADO
+    ---------------------------------------------
+    Cuenta fuera de la transacción de la escritura, así que por sí solo es check-then-write.
+    Los caminos que escriben (``UserModel.replace_access(last_admin_action=…)`` y
+    ``UserModel.deactivate_guarded``) repiten el invariante DENTRO de su transacción con las
+    filas bloqueadas; ése es el que vale bajo concurrencia.
     """
     from app.models.user_model import UserModel
 
     if UserModel().count_active_access_admins(exclude_user_id=user_id) > 0:
         return
-    raise AppHttpException(
+    raise last_access_admin_error(action)
+
+
+def last_access_admin_error(action: str) -> AppHttpException:
+    """El 409 ``access.last_admin_protected``: UNA forma, la usen el pre-chequeo o el candado."""
+    return AppHttpException(
         message=(
             f"No se puede {action}: es el último administrador de accesos activo. "
             "Otorgale 'access_admin' a otro usuario activo primero."

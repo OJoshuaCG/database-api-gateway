@@ -113,7 +113,64 @@ class UserModel:
             commit=True,
         )
 
-    def replace_access(self, user_id: int, *, grants: list, globals_: list[str]) -> None:
+    @staticmethod
+    def _guard_last_access_admin_locked(conn, user_id: int, action: str) -> None:
+        """
+        El invariante "siempre queda un ``access_admin`` activo", DENTRO de la transacción
+        de la escritura y con las filas bloqueadas. Levanta el 409 de
+        ``authz.last_access_admin_error`` si sacar a ``user_id`` dejaría cero.
+
+        POR QUÉ NO ALCANZA CON ``assert_not_last_access_admin`` ANTES DE ESCRIBIR
+        ----------------------------------------------------------------------
+        Contar y escribir en transacciones distintas es check-then-write: dos ``PUT /access``
+        concurrentes, cada uno quitándole ``access_admin`` al otro, ven "queda uno" y los dos
+        escriben, y el gateway queda con CERO (y en el próximo arranque ``bootstrap_admin``
+        revive la cuenta dormida con su credencial vieja).
+
+        Se bloquean con ``SELECT … FOR UPDATE`` las filas de TODOS los ``access_admin``
+        activos —incluido ``user_id``—, en orden de ``user_id``. Así dos escrituras
+        concurrentes se serializan sobre la primera fila común en vez de bloquear cada una la
+        fila del otro (que sería un deadlock): la segunda espera, y al despertar su lectura
+        bloqueante ve el estado ya confirmado (MySQL/MariaDB leen la última versión
+        confirmada en lecturas con lock; PostgreSQL re-evalúa la fila bloqueada) y el conteo
+        da cero → 409. El conteo se hace en Python porque PostgreSQL no admite ``FOR UPDATE``
+        con un agregado.
+
+        SQLite (los tests) no tiene ``FOR UPDATE`` y el dialecto lo omite: ahí la garantía la
+        da el propio motor, que serializa las transacciones de escritura con un lock de base
+        entera. La carrera no se prueba con hilos porque no se puede reproducir de forma
+        determinista en SQLite; lo que sí se prueba es que el chequeo vive en la transacción.
+        """
+        from sqlalchemy import select
+
+        from app.models.access_grant import UserGlobalCapability
+        from app.models.user import User
+
+        stmt = (
+            select(UserGlobalCapability.user_id)
+            .join(User, User.id == UserGlobalCapability.user_id)
+            .where(
+                UserGlobalCapability.capability == "access_admin",
+                User.is_active.is_(True),
+                User.hashed_password != "",
+            )
+            .order_by(UserGlobalCapability.user_id)
+            .with_for_update()
+        )
+        otros = [uid for (uid,) in conn.execute(stmt).all() if uid != user_id]
+        if not otros:
+            from app.core.authz import last_access_admin_error
+
+            raise last_access_admin_error(action)
+
+    def replace_access(
+        self,
+        user_id: int,
+        *,
+        grants: list,
+        globals_: list[str],
+        last_admin_action: str | None = None,
+    ) -> None:
         """
         Reemplaza TODO el acceso por alcance y las globales del usuario.
 
@@ -123,10 +180,16 @@ class UserModel:
 
         Las dos tablas se tocan en la MISMA transacción por el mismo motivo: dejar las globales
         viejas con los alcances nuevos es un acceso que no corresponde a ninguna decisión.
+
+        ``last_admin_action``: si viene, el resultado le QUITA ``access_admin`` a ``user_id``
+        y el invariante del último administrador se evalúa en esta misma transacción, con las
+        filas bloqueadas (ver ``_guard_last_access_admin_locked``).
         """
         from sqlalchemy import text
 
         with self.db.engine.begin() as conn:
+            if last_admin_action is not None:
+                self._guard_last_access_admin_locked(conn, user_id, last_admin_action)
             conn.execute(
                 text("DELETE FROM access_grants WHERE user_id = :id AND scope_type <> 'global'"),
                 {"id": user_id},
@@ -328,6 +391,22 @@ class UserModel:
 
         # Retorna número de filas afectadas
         return self.db.execute_query(query, params)
+
+    def deactivate_guarded(self, user_id: int, user_data: dict, *, last_admin_action: str) -> None:
+        """
+        ``update`` de un cambio que DESACTIVA a ``user_id``, con el invariante del último
+        ``access_admin`` evaluado en la MISMA transacción y con las filas bloqueadas. Ver
+        ``_guard_last_access_admin_locked``: contar antes y escribir después es una carrera.
+        """
+        from sqlalchemy import text
+
+        set_clause = ", ".join([f"{key} = :{key}" for key in user_data.keys()])
+        with self.db.engine.begin() as conn:
+            self._guard_last_access_admin_locked(conn, user_id, last_admin_action)
+            conn.execute(
+                text(f"UPDATE users SET {set_clause} WHERE id = :id"),
+                {**user_data, "id": user_id},
+            )
 
     def delete(self, user_id: int) -> int:
         """

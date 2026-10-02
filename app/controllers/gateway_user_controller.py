@@ -303,7 +303,15 @@ class GatewayUserController:
                 cambios[campo] = data[campo]
 
         if cambios:
-            self.users.update(user_id, cambios)
+            if cambios.get("is_active") is False and fila.get("is_active"):
+                # El pre-chequeo de arriba falla temprano; éste es el candado: cuenta y escribe
+                # en la MISMA transacción con las filas bloqueadas (ver
+                # ``UserModel._guard_last_access_admin_locked``).
+                self.users.deactivate_guarded(
+                    user_id, cambios, last_admin_action="desactivar este usuario"
+                )
+            else:
+                self.users.update(user_id, cambios)
             audit.record(
                 "gateway_user.update",
                 admin=admin,
@@ -382,15 +390,16 @@ class GatewayUserController:
         )
 
         quita_access_admin = GlobalCapability.ACCESS_ADMIN not in globales
+        accion_last_admin = "quitarle 'access_admin' a este usuario"
         if quita_access_admin:
-            assert_not_last_access_admin(
-                user_id, action="quitarle 'access_admin' a este usuario"
-            )
+            # Pre-chequeo para fallar temprano; el candado está en `replace_access`.
+            assert_not_last_access_admin(user_id, action=accion_last_admin)
 
         self.users.replace_access(
             user_id,
             grants=grants,
             globals_=[g.value for g in globales],
+            last_admin_action=accion_last_admin if quita_access_admin else None,
         )
         audit.record(
             "gateway_user.access_set",
