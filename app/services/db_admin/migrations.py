@@ -294,7 +294,9 @@ def modernize_accounting(conn: Connection, slug: str, engine: "EngineType") -> s
 
 def version_table_name(slug: str) -> str:
     """
-    Nombre de la tabla de versión Alembic en la BD destino: ``_gw_v_{slug}``.
+    Nombre VIGENTE de la tabla de versión Alembic en la BD destino: ``_datum_version_{slug}``.
+    Las bases viejas pueden tener la histórica (``legacy_version_table_name``); por eso se lee con
+    ``resolve_version_table`` y no asumiendo este nombre.
 
     Truncado a 63 chars: es el límite de identificador de PostgreSQL (NAMEDATALEN-1);
     MySQL/MariaDB admiten 64, así que 63 es seguro en los tres motores y evita que

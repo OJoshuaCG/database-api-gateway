@@ -23,6 +23,7 @@ from app.services.db_admin import migration_progress
 from app.services.db_admin.migrations import (
     MigrationRunner,
     MigrationSpec,
+    legacy_version_table_name,
     version_table_name,
 )
 
@@ -62,9 +63,16 @@ def _no_checkpoint():
 # Building blocks                                                              #
 # --------------------------------------------------------------------------- #
 def test_version_table_name_sanitizes_slug():
-    assert version_table_name("whatsapp") == "_gw_v_whatsapp"
-    assert version_table_name("my-model") == "_gw_v_my_model"
-    assert version_table_name("UP-CASE") == "_gw_v_up_case"
+    # El prefijo vigente es ``_datum_version_``; ``_gw_v_`` es el histórico, que se sigue
+    # resolviendo en las bases viejas (``resolve_version_table``) pero ya no se crea.
+    assert version_table_name("whatsapp") == "_datum_version_whatsapp"
+    assert version_table_name("my-model") == "_datum_version_my_model"
+    assert version_table_name("UP-CASE") == "_datum_version_up_case"
+
+
+def test_legacy_version_table_name_keeps_the_historical_prefix():
+    assert legacy_version_table_name("whatsapp") == "_gw_v_whatsapp"
+    assert legacy_version_table_name("my-model") == "_gw_v_my_model"
 
 
 def test_select_up_sql_prefers_override():
