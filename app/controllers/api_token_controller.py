@@ -15,11 +15,15 @@ en el papel y no en la práctica. Por eso ``name`` es obligatorio y describe el 
 
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy.exc import IntegrityError
+
 from app.core.environments import MCP_TOKEN_MAX_TTL_DAYS
 from app.core.mcp_auth import mint, token_hmac
 from app.exceptions import AppHttpException
 from app.models.api_token import ApiToken
+from app.models.project import Project
 from app.services import audit
+from app.services import project_catalog as project_codes
 from app.services.capability_catalog import AGENT_ALLOWED, Capability, parse_scopes
 
 CODE_NOT_FOUND = "api_token.not_found"
@@ -31,6 +35,20 @@ CODE_ALREADY_REVOKED = "api_token.already_revoked"
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _project_not_found(project_id: int) -> AppHttpException:
+    """
+    422 y no 404: el recurso de la ruta es el token; el proyecto es un CAMPO inválido del
+    payload. Reusa ``project.not_found`` para que la SPA lo clasifique igual que en
+    ``/projects``. Sin esto, la FK ``RESTRICT`` de ``api_tokens.project_id`` reventaba el
+    ``INSERT`` y el operador recibía un 500 sin código.
+    """
+    return AppHttpException(
+        message="El proyecto del token no existe.",
+        status_code=422,
+        public_context={"code": project_codes.CODE_NOT_FOUND, "project_id": project_id},
+    )
 
 
 class ApiTokenController:
@@ -142,6 +160,8 @@ class ApiTokenController:
         admin_id, _ = identity_of(admin)
         session = self._session()
         try:
+            if session.get(Project, int(project_id)) is None:
+                raise _project_not_found(int(project_id))
             fila = ApiToken(
                 token_id=token_id,
                 secret_hmac=token_hmac(secreto),
@@ -153,7 +173,15 @@ class ApiTokenController:
                 note=data.get("note"),
             )
             session.add(fila)
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError:
+                # Carrera: el proyecto se borró entre el chequeo y el INSERT. Solo se traduce
+                # si de verdad es eso; cualquier otra violación sigue siendo un 500 honesto.
+                session.rollback()
+                if session.get(Project, int(project_id)) is None:
+                    raise _project_not_found(int(project_id)) from None
+                raise
             session.refresh(fila)
             salida = self._serialize(fila)
         finally:

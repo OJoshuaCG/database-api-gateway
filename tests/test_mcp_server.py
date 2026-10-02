@@ -437,6 +437,20 @@ def test_a_token_without_a_project_is_rejected(admin_client):
     assert r.status_code == 422
 
 
+def test_a_token_for_an_unknown_project_is_a_422_not_a_500(admin_client):
+    """
+    La FK ``RESTRICT`` de ``api_tokens.project_id`` reventaba el ``INSERT`` con un 500 sin
+    código. Es un campo inválido del payload: 422 con el mismo código que ``/projects``.
+    """
+    r = admin_client.post("/api/v1/api-tokens", json={"name": "fantasma", "project_id": 999999})
+    assert r.status_code == 422, r.text
+    ctx = r.json()["detail"]["public_context"]
+    assert ctx["code"] == "project.not_found"
+    assert ctx["project_id"] == 999999
+    listado = admin_client.get("/api/v1/api-tokens?size=50").json()["data"]
+    assert not any(t["name"] == "fantasma" for t in listado)
+
+
 def test_a_ttl_over_the_cap_is_rejected(admin_client):
     """Sin tokens perpetuos: vive en un `.mcp.json` del repo de otra gente."""
     pid = _proyecto(admin_client)

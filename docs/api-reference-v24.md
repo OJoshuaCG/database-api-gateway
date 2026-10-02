@@ -402,6 +402,7 @@ Códigos, todos en `public_context.code`:
 | `code` | HTTP | Cuándo | Qué mostrar |
 |---|---|---|---|
 | `api_token.project_required` | 422 | Falta `project_id` | Pedir el proyecto. Un token sin proyecto no alcanzaría ninguna base. |
+| `project.not_found` | 422 | `project_id` no existe (o se borró mientras se creaba el token) | Trae `public_context.project_id`. Refrescar el selector de proyectos. Mismo código que `/projects`, pero 422: es un campo inválido del payload, no el recurso de la ruta. |
 | `api_token.ttl_too_long` | 422 | `expires_in_days` fuera de rango | Trae `public_context.max_days` (90): usarlo como tope del control. |
 | `api_token.scope_not_allowed` | 422 | Un scope fuera del techo de agente | Trae `public_context.allowed[]` con el **techo completo**. |
 | `api_token.not_found` | 404 | `DELETE` sobre un id inexistente | Refrescar el listado. |
