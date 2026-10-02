@@ -472,3 +472,41 @@ def test_the_tool_result_carries_structured_content_and_text(client, admin_clien
     resultado = r.json()["result"]
     assert resultado["isError"] is False
     assert json.loads(resultado["content"][0]["text"]) == resultado["structuredContent"]
+
+
+def test_the_dispatcher_enforces_the_tool_scope_before_the_handler(client, monkeypatch):
+    """F-32: ``ToolSpec.scope`` se exige en ``handle()``, no solo dentro de cada handler."""
+    import dataclasses
+
+    from app.core.actor import token_actor
+    from app.mcp import dispatch
+    from app.models.audit_log import AuditLog
+
+    llamado = []
+    spec = dataclasses.replace(
+        dispatch.BY_NAME["list_databases"],
+        name="probe_scoped",
+        handler=lambda ctx, args: llamado.append(1) or {"ok": True},
+    )
+    monkeypatch.setitem(dispatch.BY_NAME, "probe_scoped", spec)
+    # Token válido pero SIN el scope de la tool (no lleva `blueprints.read`).
+    actor = token_actor(token_pk=99, token_id="tid_scope", name="t", scopes="", project_id=1)
+
+    resp = dispatch.handle(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+         "params": {"name": "probe_scoped", "arguments": {}}},
+        actor,
+        {},
+    )
+
+    assert llamado == []
+    result = resp.body["result"]
+    assert result["isError"] is True
+    assert result["structuredContent"]["error"]["code"] == "mcp.scope_denied"
+    s = Database().get_declarative_base_session()
+    try:
+        fila = s.query(AuditLog).filter(AuditLog.action == "mcp.probe_scoped").one()
+        assert fila.status == "failure"
+        assert "mcp.scope_denied" in (fila.detail or "")
+    finally:
+        s.close()

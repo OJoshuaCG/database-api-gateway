@@ -205,6 +205,20 @@ def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Resp
                 ),
             )
 
+    # El scope de la tool se exige ACÁ, en el choke point, y no dentro de cada handler. Antes
+    # solo `reachable_databases` lo chequeaba (hardcodeado a `blueprints.read`), así que una
+    # tool con otro scope —o una que no pasara por ahí— corría para cualquier token válido sin
+    # importar sus scopes. Va antes del handler para que ni siquiera se lea la BD.
+    from app.services.capability_catalog import Capability
+    from app.services.mcp_catalog import CODE_SCOPE_DENIED
+
+    if not actor.has(Capability(spec.scope)):
+        _audit(spec.name, actor, ok=False, detail=f"denegado: {CODE_SCOPE_DENIED}")
+        return _ok(
+            rid,
+            jsonrpc.tool_error_result(CODE_SCOPE_DENIED, "El token no tiene el scope necesario."),
+        )
+
     try:
         resultado = spec.handler(ToolContext(actor=actor), argumentos)
     except AppHttpException as exc:
