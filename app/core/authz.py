@@ -53,15 +53,11 @@ from fastapi import Depends, Request
 
 from app.core import csrf
 from app.core.actor import Actor, admin_actor
+from app.core.capability_resolution import parse_access_context
 from app.core.scope import ScopeTarget, assert_layer2
 from app.exceptions import AppHttpException
 from app.models.user_model import UserModel
-from app.services.capability_catalog import (
-    CODE_FORBIDDEN,
-    Capability,
-    GatewayRole,
-    GlobalCapability,
-)
+from app.services.capability_catalog import CODE_FORBIDDEN, Capability
 
 
 def get_current_actor(request: Request) -> Actor:
@@ -82,37 +78,27 @@ def get_current_actor(request: Request) -> Actor:
 
     user = authenticated_user(request)
     ctx = UserModel().find_access_context(user["id"])
+    return actor_from_access_context(user["id"], user["username"], ctx)
 
-    try:
-        base = GatewayRole(ctx["role"])
-    except ValueError:
-        base = GatewayRole.VIEWER
 
-    grants: list[tuple[str, int, GatewayRole]] = []
-    for scope_type, scope_id, role in ctx["grants"] or []:
-        # Un alcance de tipo desconocido se DESCARTA, no se degrada a otro tipo: si mañana
-        # aparece un `scope_type` que este código no conoce, tratarlo como entorno sería
-        # aplicar una restricción —o un permiso— sobre un objeto equivocado.
-        if scope_type not in ("environment", "server"):
-            continue
-        try:
-            grants.append((scope_type, int(scope_id), GatewayRole(role)))
-        except (TypeError, ValueError):
-            continue
+def actor_from_access_context(user_id: int, username: str, ctx: dict) -> Actor:
+    """
+    ``find_access_context`` → ``Actor``. Extraída de ``get_current_actor`` para que la vista de
+    acceso efectivo acuñe el actor con EXACTAMENTE el mismo código que la autorización real.
 
-    globals_: set[GlobalCapability] = set()
-    for name in ctx["globals"] or []:
-        try:
-            globals_.add(GlobalCapability(name))
-        except ValueError:
-            continue
-
+    La lectura es tolerante y vive en ``parse_access_context`` (un solo lugar): un rol, una global
+    o un alcance desconocidos se descartan, y una capacidad puntual desconocida o no otorgable
+    también. Fail-closed en el lector — el camino de autenticación no puede caerse por una fila
+    legada, y tampoco puede resolver a un default permisivo.
+    """
+    parsed = parse_access_context(ctx)
     return admin_actor(
-        user_id=user["id"],
-        username=user["username"],
-        role=base,
-        grants=grants,
-        globals_=frozenset(globals_),
+        user_id=user_id,
+        username=username,
+        role=parsed.base,
+        grants=list(parsed.scope_roles),
+        globals_=parsed.globals_,
+        capability_grants=[(c, st, sid) for c, st, sid, _ in parsed.capability_grants],
     )
 
 

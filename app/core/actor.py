@@ -44,9 +44,11 @@ Ver ``docs/plans/13-usuarios-y-autorizacion-del-gateway.md`` §6.2 y §7.1.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Literal
 
+from app.core.capability_resolution import CapabilityGrantKey, layer1_capabilities
 from app.services.capability_catalog import (
     AGENT_ALLOWED,
     Capability,
@@ -87,6 +89,10 @@ class Actor:
     #: Grants por alcance, TIPADOS: ``(scope_type, scope_id, role)``. La capa 2 los usa para
     #: resolver el destino, y ahí el tipo importa — el entorno 3 y el servidor 3 son distintos.
     scope_roles: frozenset[tuple[str, int, GatewayRole]] = field(default_factory=frozenset)
+    #: Capacidades puntuales ACTIVAS: ``(capacidad, scope_type, scope_id)``. SUMAN al rol (nunca
+    #: restan); ``capabilities`` ya incluye su ``expand`` para la capa 1 y la capa 2 las empareja
+    #: con el destino (``capability_resolution``). Siempre vacío en tokens.
+    capability_grants: frozenset[CapabilityGrantKey] = field(default_factory=frozenset)
 
     def has(self, capability: Capability) -> bool:
         """La única pregunta que hace el gate de capacidad."""
@@ -104,6 +110,7 @@ def admin_actor(
     role: GatewayRole,
     grants: "list[tuple[str, int, GatewayRole]] | None" = None,
     globals_: frozenset[GlobalCapability] = frozenset(),
+    capability_grants: "Iterable[CapabilityGrantKey] | None" = None,
 ) -> Actor:
     """
     Actor de un administrador humano.
@@ -129,6 +136,10 @@ def admin_actor(
 
     for g in globals_:
         caps |= GLOBAL_CAPABILITIES[g]
+    # Las capacidades puntuales SUMAN (con su lectura implícita) en la capa 1; la capa 2 decide
+    # en qué destino valen. Ver ``capability_resolution``.
+    puntuales = frozenset(capability_grants or ())
+    caps = set(layer1_capabilities(caps, puntuales))
     return Actor(
         kind="admin",
         id=user_id,
@@ -138,6 +149,7 @@ def admin_actor(
         base_role=role,
         global_capabilities=frozenset(globals_),
         scope_roles=frozenset(gr),
+        capability_grants=puntuales,
     )
 
 

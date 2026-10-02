@@ -55,6 +55,11 @@ from dataclasses import dataclass
 from typing import Literal
 
 from app.core.actor import Actor
+from app.core.capability_resolution import (
+    capability_at,
+    grants_allow,
+    needs_target_resolution,
+)
 from app.exceptions import AppHttpException
 from app.services.capability_catalog import (
     CODE_FORBIDDEN,
@@ -271,15 +276,35 @@ def _forbidden() -> AppHttpException:
     )
 
 
-def _permits(actor: Actor, role: GatewayRole, capability: Capability) -> bool:
-    # Las capacidades globales (`access_admin`, `security_officer`) no tienen alcance: son
-    # ortogonales a la cadena de roles, así que lo que otorgan no se recorta por destino.
+def _permits(
+    actor: Actor,
+    role: GatewayRole,
+    capability: Capability,
+    point: ScopePoint | None = None,
+) -> bool:
+    """
+    ¿``role`` más las globales y las capacidades puntuales EN ``point`` conceden ``capability``?
+
+    Las capacidades globales (`access_admin`, `security_officer`) no tienen alcance: son
+    ortogonales a la cadena de roles, así que lo que otorgan no se recorta por destino. Las
+    capacidades puntuales SUMAN al rol y solo valen si su alcance coincide con el ``point``; sin
+    ``point`` (destino global) no coincide ninguna.
+    """
     from app.services.capability_catalog import GLOBAL_CAPABILITIES
 
     permitidas = set(role_capabilities(role))
     for g in actor.global_capabilities:
         permitidas |= GLOBAL_CAPABILITIES[g]
-    return capability in permitidas
+    if capability in permitidas:
+        return True
+    if point is None:
+        return False
+    return grants_allow(
+        actor,
+        capability,
+        environment_id=point.environment_id,
+        server_id=point.server_id,
+    )
 
 
 def assert_at(actor: Actor, capability: Capability, target: ScopeTarget) -> None:
@@ -306,15 +331,15 @@ def assert_at_point(actor: Actor, capability: Capability, point: ScopePoint) -> 
     """
     if not actor.has(capability):
         raise _forbidden()
-    if actor.kind != "admin" or not actor.scope_roles:
+    if not needs_target_resolution(actor, capability):
         return
-    if not _permits(actor, role_at_point(actor, point), capability):
+    if not _permits(actor, role_at_point(actor, point), capability, point):
         raise _forbidden()
 
 
 def assert_layer2(actor: Actor, capability: Capability, target: ScopeTarget) -> None:
     """Solo la capa 2. ``require_at`` la usa tras la capa 1 que ya corrió en ``_authenticate``."""
-    if actor.kind != "admin" or not actor.scope_roles:
+    if not needs_target_resolution(actor, capability):
         return
 
     puntos = resolve_points(target)
@@ -330,7 +355,9 @@ def assert_layer2(actor: Actor, capability: Capability, target: ScopeTarget) -> 
         # sus puntos se permiten; basta con un ítem permitido para pasar la capa 1 del lote.
         ok = any(_item_verdicts(actor, capability, puntos).values())
     else:
-        ok = all(_permits(actor, role_at_point(actor, p), capability) for p in puntos)
+        ok = all(
+            _permits(actor, role_at_point(actor, p), capability, p) for p in puntos
+        )
     if not ok:
         raise _forbidden()
 
@@ -343,11 +370,11 @@ def _item_verdicts(
     TODOS. Un punto sin ``item_id`` es un ítem propio. Los tokens y los actores sin grants por
     alcance lo ven todo permitido: la capa 2 no les aplica.
     """
-    sin_capa2 = actor.kind != "admin" or not actor.scope_roles
+    sin_capa2 = not needs_target_resolution(actor, capability)
     veredictos: dict = {}
     for indice, p in enumerate(points):
         clave = p.item_id if p.item_id is not None else ("sin_id", indice)
-        ok = sin_capa2 or _permits(actor, role_at_point(actor, p), capability)
+        ok = sin_capa2 or _permits(actor, role_at_point(actor, p), capability, p)
         veredictos[clave] = veredictos.get(clave, True) and ok
     return veredictos
 
@@ -389,7 +416,7 @@ def partition_for_batch(
     - Ítems implícitos: los prohibidos se devuelven para OMITIRLOS; si no queda ninguno
       permitido → 403. El 403 es el mismo ``access.forbidden`` de las dos capas.
     """
-    if not isinstance(admin, Actor) or admin.kind != "admin" or not admin.scope_roles:
+    if not isinstance(admin, Actor) or not needs_target_resolution(admin, capability):
         return None
     puntos = list(points_fn())
     particion = partition_by_scope(actor=admin, capability=capability, points=puntos)
@@ -416,10 +443,12 @@ def assert_scope(
     El 403 **no dice cuál de las dos capas negó**: distinguir "no tenés la capacidad" de "no la
     tenés acá" le regala a un atacante el mapa de sus propios alcances por fuerza bruta.
     """
-    rol = effective_role_at(
-        actor, server_id=server_id, managed_database_id=managed_database_id
-    )
-    if not _permits(actor, rol, capability):
+    if not capability_at(
+        actor,
+        capability,
+        server_id=server_id,
+        managed_database_id=managed_database_id,
+    ):
         raise _forbidden()
 
 

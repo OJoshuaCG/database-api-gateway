@@ -7,10 +7,13 @@ Es llamado desde el UserController siguiendo el patrón MVC.
 Patrón: Routes → Controllers → Models → Database
 """
 
+import logging
 from datetime import UTC, datetime
 
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -375,7 +378,8 @@ class UserModel:
         revocar, porque el ``SessionMiddleware`` re-firma en cada respuesta y una sesión activa
         no expira nunca.
 
-        Devuelve ``{"role": str, "grants": [(scope_type, scope_id, role)], "globals": [str]}``.
+        Devuelve ``{"role": str, "grants": [(scope_type, scope_id, role)], "globals": [str],
+        "capability_grants": [{id, capability, scope_type, scope_id}]}`` (la 4ª consulta, D3/D9).
         Un usuario sin filas devuelve listas vacías, que es el lado seguro: el rol base manda.
 
         **``grants`` conserva el ``scope_type``, y eso no es un detalle.** La versión anterior
@@ -415,7 +419,51 @@ class UserModel:
             "role": (row or {}).get("gateway_role") or "viewer",
             "grants": [(g["scope_type"], g["scope_id"], g["role"]) for g in grants],
             "globals": [g["capability"] for g in globals_],
+            "capability_grants": self._load_active_capability_grants(user_id),
         }
+
+    def _load_active_capability_grants(self, user_id: int) -> list[dict]:
+        """
+        Capacidades puntuales ACTIVAS del usuario: ``[{id, capability, scope_type, scope_id}]``.
+
+        Solo ``status = 'active'`` (pendientes, rechazadas, vencidas, canceladas y revocadas no
+        conceden nada), de un usuario ACTIVO, y con vencimiento perezoso: una fila con
+        ``expires_at`` vencido se ignora aunque el barrido aún no la haya marcado (hoy solo las
+        pendientes vencen; el filtro es el lado seguro si eso cambia).
+
+        FAIL-CLOSED CON LA TABLA AUSENTE (D9). Código que corre sin la migración —un rollback del
+        esquema, o el deploy del código antes que el ``upgrade``— no puede quedarse sin
+        autenticación: ``ProgrammingError``/``OperationalError`` se registran en ERROR y devuelven
+        ``[]``, así que los roles siguen funcionando y no se concede nada. Va por sesión directa y
+        no por ``execute_query`` porque este último convierte TODO error en ``AppHttpException``
+        y el tipo original se pierde. Cualquier otro error propaga: no se esconde un fallo real.
+        """
+        from sqlalchemy import text
+        from sqlalchemy.exc import OperationalError, ProgrammingError
+
+        try:
+            with self.db.get_session() as session:
+                filas = session.execute(
+                    text(
+                        """
+                        SELECT cg.id, cg.capability, cg.scope_type, cg.scope_id
+                        FROM capability_grants cg
+                        JOIN users u ON u.id = cg.user_id
+                        WHERE cg.user_id = :id
+                          AND cg.status = 'active'
+                          AND u.is_active = 1
+                          AND (cg.expires_at IS NULL OR cg.expires_at > :now)
+                        """
+                    ),
+                    {"id": user_id, "now": _utcnow()},
+                ).fetchall()
+                return [dict(f._mapping) for f in filas]
+        except (ProgrammingError, OperationalError):
+            logger.error(
+                "capability_grants no está disponible: se ignoran las capacidades puntuales",
+                exc_info=True,
+            )
+            return []
     def count(self, is_active: bool | None = None) -> int:
         """
         Contar usuarios con filtros opcionales
