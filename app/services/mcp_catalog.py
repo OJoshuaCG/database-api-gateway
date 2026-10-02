@@ -34,6 +34,31 @@ CODE_BLOCKED = "mcp.database_blocked"
 #: creer al agente que no hay más, que es peor que un fallo.
 CODE_TOO_MANY_OBJECTS = "mcp.too_many_objects"
 
+#: La sesión de lectura superó ``MCP_SESSION_MAX_SECONDS``. Se corta y se reporta: una sesión
+#: larga retiene undo (MySQL) o frena el VACUUM (PG) en la base de un tercero.
+CODE_SESSION_TIMEOUT = "mcp.session_timeout"
+
+#: Un argumento con forma válida pero valor inaceptable (un ``kind`` desconocido, una lista
+#: vacía, dos veces la misma base en un diff). Error de TOOL y no de protocolo: el agente puede
+#: corregirlo, que es lo que el código le dice.
+CODE_INVALID_ARGUMENT = "mcp.invalid_argument"
+
+#: --- Warnings (viajan en la respuesta, nunca solo en el log) --------------- #
+#: La base está en cuarentena (``status == error``): su esquema no corresponde a ninguna versión
+#: declarada. No se deniega —esconderlo justo cuando un humano diagnostica es peor— pero se avisa.
+WARN_DATABASE_QUARANTINED = "mcp.warn.database_quarantined"
+#: PostgreSQL: el gateway introspecciona solo el schema ``public``.
+WARN_PG_PUBLIC_SCHEMA_ONLY = "mcp.warn.pg_public_schema_only"
+#: MySQL/MariaDB: el catálogo no participa del snapshot MVCC; un ``ALTER`` concurrente se ve.
+WARN_MYSQL_STRUCTURE_NOT_ATOMIC = "mcp.warn.mysql_structure_not_atomic"
+#: El motor rechazó una directiva de sesión (``session.degradations``).
+WARN_SESSION_DIRECTIVE_REJECTED = "mcp.warn.session_directive_rejected"
+#: ``kinds`` o ``name_prefix`` dejaron afuera objetos del índice.
+WARN_OBJECTS_OMITTED_BY_FILTER = "mcp.warn.objects_omitted_by_filter"
+#: Los cuerpos de vistas, rutinas y triggers no se entregan en la v1 (scope ``inspect:bodies``
+#: apagado por diseño, plan 12 §4).
+WARN_BODIES_UNAVAILABLE = "mcp.warn.bodies_unavailable"
+
 #: --- Referencias ---------------------------------------------------------- #
 #: v1 NO acepta referencia cruda (`server_id` + nombre) y se rechaza ANTES de cualquier lookup.
 #: La referencia cruda existe para flujos de adopción y legado de la SPA; para un agente es puro

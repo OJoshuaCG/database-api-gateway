@@ -20,7 +20,7 @@ from app.core.actor import Actor
 from app.exceptions import AppHttpException
 from app.mcp import jsonrpc, protocol
 from app.mcp.context import ToolContext
-from app.mcp.registry import BY_NAME, TOOLS
+from app.mcp.registry import BY_NAME, tools_for
 from app.services import audit
 
 #: Tope de bytes de la respuesta de una tool, **después** de serializar. El tope de objetos
@@ -136,7 +136,9 @@ def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Resp
         return _ok(rid, {})
 
     if metodo == "tools/list":
-        return _ok(rid, {"tools": [_tool_descriptor(t) for t in TOOLS]})
+        # Solo lo que ESTE token puede llamar. Publicar las demás no le sirve al agente (cada
+        # llamada volvería `mcp.scope_denied`) y le muestra superficie que su token no tiene.
+        return _ok(rid, {"tools": [_tool_descriptor(t) for t in tools_for(actor)]})
 
     if metodo != "tools/call":
         # 404 y no 200: es lo que la spec pide para un método que el servidor no implementa, y
@@ -220,7 +222,9 @@ def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Resp
         )
 
     try:
-        resultado = spec.handler(ToolContext(actor=actor), argumentos)
+        resultado = spec.handler(
+            ToolContext(actor=actor, capability=Capability(spec.scope)), argumentos
+        )
     except AppHttpException as exc:
         # LA traducción que este módulo existe para hacer: la negación del gate viaja como
         # contenido de TOOL, con su código del vocabulario cerrado. Un error de tool en el campo

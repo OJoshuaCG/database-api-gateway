@@ -352,7 +352,10 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         step_up=True,
         destructive=True,
     ),
-    _spec(Capability.CLONES_READ, "Ver planes de clonado"),
+    # Techo de agente (`list_clones` del MCP): solo ESTADO de los clonados que tocan una base que
+    # el token alcanza. Ni plan, ni selección, ni `confirm_token`: lo que divulga es
+    # `clones.execute`, que sigue fuera del techo.
+    _spec(Capability.CLONES_READ, "Ver planes de clonado", agent=True),
     _spec(
         Capability.CLONES_EXECUTE,
         "Ejecutar un clonado de estructura y datos",
@@ -372,7 +375,9 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         step_up=True,
         destructive=True,
     ),
-    _spec(Capability.EXPORTS_READ, "Ver planes de exportación y su estado"),
+    # Techo de agente (`list_exports` del MCP): estado y fechas, nunca artefacto ni contenido. La
+    # divulgación vive en `exports.download`, que sigue fuera del techo.
+    _spec(Capability.EXPORTS_READ, "Ver planes de exportación y su estado", agent=True),
     _spec(Capability.EXPORTS_EXECUTE, "Generar el artefacto de una exportación", mutates=True),
     # `download` NO implica `execute`: planear y generar no divulga nada mientras el artefacto
     # no se entregue. `_guard_owner` ya reconoce esa frontera en el código.
@@ -391,7 +396,15 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         step_up=True,
         destructive=True,
     ),
-    _spec(Capability.CATALOGS_READ, "Ver los catálogos de privilegios y charsets", axis="global"),
+    # Techo de agente (`list_catalogs` del MCP): datos de REFERENCIA globales del gateway
+    # (privilegios, charsets, plantillas de perfil). Ninguna fila nombra servidores, bases ni
+    # usuarios del motor; la escritura (`catalogs.write`) sigue fuera del techo.
+    _spec(
+        Capability.CATALOGS_READ,
+        "Ver los catálogos de privilegios y charsets",
+        axis="global",
+        agent=True,
+    ),
     # Dato de política: `privileges.is_active` decide qué se puede otorgar y
     # `permission_profiles` es la plantilla de GRANTs. Solo `security_officer`.
     _spec(
@@ -401,7 +414,14 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         step_up=True,
         axis="global",
     ),
-    _spec(Capability.ENVIRONMENTS_READ, "Ver los entornos y su política", axis="global"),
+    # Techo de agente (`list_environments` del MCP): la política de los entornos de las bases que
+    # el token alcanza, y solo de esos — nunca la lista completa de entornos del gateway.
+    _spec(
+        Capability.ENVIRONMENTS_READ,
+        "Ver los entornos y su política",
+        axis="global",
+        agent=True,
+    ),
     # Dato de política: ``blocks_destructive_migrations``, ``allows_agent_access`` y la
     # clasificación de cada BD deciden qué barreras se aplican. Quien las escribe no puede ser
     # quien administra el acceso (``access_admin``) ni el rol operativo: solo

@@ -183,6 +183,7 @@ def export_session(
     max_duration_seconds: int = EXPORT_MAX_DURATION_SECONDS,
     statement_timeout_ms: int = EXPORT_STATEMENT_TIMEOUT_MS,
     idle_timeout_ms: int = EXPORT_IDLE_TRANSACTION_TIMEOUT_MS,
+    snapshot_data: bool = True,
 ) -> Iterator[ExportSession]:
     """
     Abre la conexión dedicada del job y su transacción de lectura; la cierra SIEMPRE.
@@ -196,6 +197,12 @@ def export_session(
     la mata a mano. El ``rollback`` explícito antes del ``close`` es deliberado: la
     exportación no escribe nada, así que revertir es semánticamente correcto y además libera
     el snapshot ANTES de devolver la conexión, sin depender de que el driver lo haga.
+
+    ``snapshot_data=False`` (lo que pide el MCP, plan 12 §5.3): en MySQL/MariaDB la sesión queda
+    en ``REPEATABLE READ`` + ``READ ONLY`` **sin** ``START TRANSACTION WITH CONSISTENT
+    SNAPSHOT``. El read-view de InnoDB es MVCC de FILAS y el diccionario no participa, así que
+    para una lectura que solo toca el catálogo el snapshot no compra nada y sí cuesta retención
+    de undo en la base de un tercero. PostgreSQL queda idéntico: ahí sí da catálogo atómico.
     """
     deadline = (
         time.monotonic() + max_duration_seconds if max_duration_seconds > 0 else None
@@ -211,7 +218,9 @@ def export_session(
             consistent_structure=engine in _CONSISTENT_STRUCTURE_ENGINES,
         )
         try:
-            _begin_read_transaction(session, idle_timeout_ms=idle_timeout_ms)
+            _begin_read_transaction(
+                session, idle_timeout_ms=idle_timeout_ms, snapshot_data=snapshot_data
+            )
             yield session
         finally:
             # Nada de lo que pase acá puede tapar la excepción original del cuerpo: si el
@@ -226,7 +235,9 @@ def export_session(
                 )
 
 
-def _begin_read_transaction(session: ExportSession, *, idle_timeout_ms: int) -> None:
+def _begin_read_transaction(
+    session: ExportSession, *, idle_timeout_ms: int, snapshot_data: bool = True
+) -> None:
     """Abre la transacción de lectura según la tabla del §6.1."""
     conn = session.conn
     engine = session.engine
@@ -262,7 +273,10 @@ def _begin_read_transaction(session: ExportSession, *, idle_timeout_ms: int) -> 
             # ``WITH CONSISTENT SNAPSHOT`` toma el read-view de InnoDB en este preciso
             # instante, no en la primera lectura. Solo cubre InnoDB: una tabla MyISAM del
             # origen se lee sin ninguna garantía de instante (límite del motor).
-            conn.exec_driver_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+            # Sin ``snapshot_data`` (MCP): la transacción implícita de la primera lectura
+            # hereda el ``READ ONLY`` de la sesión, que es la garantía que importa acá.
+            if snapshot_data:
+                conn.exec_driver_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT")
         else:
             # Motor no cubierto (SQLite en las pruebas locales): no se abre ninguna
             # transacción especial y NO se afirma consistencia. Fail-closed.

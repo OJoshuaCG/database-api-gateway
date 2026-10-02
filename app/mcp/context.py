@@ -11,14 +11,20 @@ Es la diferencia con confiar en un tipo "recibo del gate": un ``@dataclass(froze
 ``__init__`` público y ``dataclasses.replace`` devuelve un objeto válido con el gate ya pasado. Un
 contexto que no expone la credencial no tiene ese problema, porque no hay nada que reescribir.
 
-Las tools que leen el catálogo del motor van a recibir acá un ``open_readonly(database_id)`` que
-resuelve, gatea y devuelve **la sesión ya abierta** — nunca la credencial. Todavía no existe: llega
-con el façade de solo lectura.
+Las tools que leen el catálogo del motor usan ``open_readonly(database_id)``, que resuelve, gatea
+y rinde **el façade ya abierto** sobre la credencial de solo lectura — nunca la credencial.
+
+LA CAPACIDAD LA FIJA EL DISPATCHER, NO LA TOOL
+----------------------------------------------
+``capability`` es el ``ToolSpec.scope`` de la tool que se está ejecutando. Las dos puertas de
+abajo la usan para el eje 2 del gate, así que un handler no puede elegir una capacidad más débil
+que la que declaró: no hay parámetro para hacerlo.
 """
 
 from dataclasses import dataclass
 
 from app.core.actor import Actor
+from app.services.capability_catalog import Capability
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +37,7 @@ class ToolContext:
     """
 
     actor: Actor
+    capability: Capability
 
     @property
     def project_id(self) -> int:
@@ -46,4 +53,16 @@ class ToolContext:
         """
         from app.controllers.target_resolution import reachable_databases
 
-        return reachable_databases(self.actor)
+        return reachable_databases(self.actor, self.capability)
+
+    def open_readonly(self, database_id: int):
+        """
+        Context manager: gate completo de UNA base, credencial de solo lectura y sesión de
+        lectura. Rinde ``(base_resuelta, facade)`` y cierra la sesión al salir.
+
+        El façade solo tiene métodos de lectura (composición, no herencia): ver
+        ``app/services/db_admin/readonly_introspector.py``.
+        """
+        from app.controllers.target_resolution import open_readonly
+
+        return open_readonly(self.actor, database_id, self.capability)

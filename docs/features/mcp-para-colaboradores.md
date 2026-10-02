@@ -121,6 +121,65 @@ Para que una base aparezca en `list_databases`, **todas**:
 Si falta cualquiera, la base **no aparece** — y el listado **no dice que existe**. Eso es a
 propósito: enumerar lo negado sería decirle al agente qué hay del otro lado.
 
+### A.6 La credencial de solo lectura del servidor (para leer estructura)
+
+`list_databases`, `list_environments`, `list_exports`, `list_clones` y `list_catalogs` leen el
+inventario del gateway y **no tocan ningún motor**. Las tools que sí leen el catálogo
+—`list_objects`, `check_freshness`, `get_schema` y `diff_schemas`— exigen además una **credencial de SOLO LECTURA** registrada y
+**verificada** en el servidor de la base. El MCP **nunca** usa la pseudo-root, ni como fallback.
+
+**1. Crear la cuenta en el motor** (lo hace el DBA del servidor; grants mínimos del plan 12 §7.2):
+
+```sql
+-- MySQL 8.0.20+
+CREATE USER 'mcp_ro'@'10.0.0.%' IDENTIFIED BY '…';
+GRANT SELECT, SHOW VIEW, TRIGGER, EVENT ON `la_base`.* TO 'mcp_ro'@'10.0.0.%';
+GRANT SHOW_ROUTINE ON *.* TO 'mcp_ro'@'10.0.0.%';
+
+-- PostgreSQL
+CREATE ROLE mcp_ro LOGIN PASSWORD '…' NOSUPERUSER NOCREATEDB NOCREATEROLE
+  NOINHERIT NOREPLICATION NOBYPASSRLS;
+ALTER ROLE mcp_ro SET default_transaction_read_only = on;
+GRANT CONNECT ON DATABASE la_base TO mcp_ro;
+GRANT USAGE ON SCHEMA public TO mcp_ro;
+```
+
+**2. Registrarla en el gateway** (`servers.admin`, con step-up):
+
+```bash
+curl -s -b cookies.txt -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
+  -X PUT "$BASE/api/v1/servers/3/readonly-credential" \
+  -d '{"username":"mcp_ro","password":"…"}'
+```
+
+**3. Verificarla** — la sonda negativa. El gateway conecta con esa cuenta y exige que el motor
+observe que **no puede escribir**: en MySQL/MariaDB clasifica `SHOW GRANTS` contra la lista
+permitida; en PostgreSQL revisa los atributos del rol, `default_transaction_read_only`, los
+privilegios de creación y además **intenta** un `CREATE TEMP TABLE`, que tiene que fallar.
+
+```bash
+curl -s -b cookies.txt -H "X-CSRF-Token: $CSRF" \
+  -X POST "$BASE/api/v1/servers/3/test-connection?credential=readonly"
+```
+
+Si pasa, la respuesta trae `readonly_verified_at`. Si no, `422 server.readonly_probe_failed` con
+`violations` (por ejemplo `privilege:insert` o `role_attribute:rolsuper`): corregí los grants y
+volvé a verificar.
+
+Tres reglas:
+
+- **La verificación vence** a los `MCP_READONLY_MAX_AGE_DAYS` (30 por default). Pasado el plazo,
+  las tools que leen el motor niegan con `mcp.readonly_credential_missing` hasta re-verificar.
+- **Cambiar la credencial borra la verificación**, y **re-apuntar el servidor** (host, puerto,
+  motor o un TLS más débil) **descarta la credencial entera**: nunca viaja a un destino distinto
+  del que se verificó.
+- **Quitarla** (`DELETE /api/v1/servers/3/readonly-credential`) saca a ese servidor del MCP al
+  instante. Es la palanca de emergencia más granular.
+
+> **El límite honesto:** la credencial es **por servidor**, no por base. Alcanza todas las bases de
+> ese servidor, incluidas las de otros proyectos. El límite entre proyectos lo pone el gateway (el
+> gate de §A.5), no el motor.
+
 ---
 
 ## Parte B — Quien administra: dar de alta a una persona
@@ -146,6 +205,34 @@ Respuesta (recortada):
     "expires_at": "2026-10-09T12:00:00"
 } }
 ```
+
+Por default el token sale con `blueprints.read`, que alcanza **solo** para `list_databases`.
+Para el resto, pedí los scopes al emitirlo: `"scopes": ["blueprints.read", "databases.read"]`.
+`tools/list` publica únicamente las tools que el token puede llamar.
+
+| Scope | Tools |
+|---|---|
+| `blueprints.read` | `list_databases` |
+| `databases.read` | `list_objects`, `check_freshness`, `get_schema` |
+| `schema_diff.read` | `diff_schemas` |
+| `environments.read` | `list_environments` |
+| `exports.read` | `list_exports` |
+| `clones.read` | `list_clones` |
+| `catalogs.read` | `list_catalogs` |
+
+Notas por tool:
+
+- **`list_objects`** acepta `include_column_counts: true` para sumar `column_count` a cada tabla.
+  Es el camino caro: con más de `MCP_MAX_OBJECTS_PER_CALL` tablas en el filtro responde
+  `mcp.too_many_objects` antes de contar.
+- **`check_freshness`** no devuelve estructura: dice la versión que la base declara
+  (`applied_version`), si el gateway puede probar que corrió (`trust`: `applied`, `declared` o
+  `unknown`) y si hay una aplicación a medias. Una versión igual **no** prueba que el esquema
+  siga igual: con `trust` distinto de `applied`, revalidar con `list_objects`.
+- **`list_catalogs`** devuelve privilegios, charsets/collations habilitados y las plantillas de
+  perfil (nivel → privilegios), sin sus descripciones.
+
+Ninguno muta ni divulga: es un invariante del catálogo que se verifica al arrancar.
 
 Tres reglas que no son burocracia:
 
@@ -281,6 +368,11 @@ propio resultado lo dice en su campo `note`. Es el estado normal el primer día.
 | `Missing environment variable: GATEWAY_MCP_TOKEN` | La variable no está en el entorno de esa terminal | Terminal nueva, o `source` del perfil (C.1) |
 | `⏸ Pending approval` en `claude mcp list` | El `.mcp.json` del repo no fue aprobado | Abrir Claude Code en ese repo y aceptar |
 | La lista viene vacía | Ninguna base cumple las cinco condiciones | Revisar A.4 y A.5. **No es un error** |
+| `mcp.scope_denied` | El token no tiene el scope de esa tool | Emitir un token con el scope (B.1) |
+| `mcp.readonly_credential_missing` | El servidor no tiene credencial de solo lectura verificada, o venció | A.6: registrarla y verificarla |
+| `mcp.not_found` | La base no existe o no es del proyecto del token | Es **el mismo código para los dos**, a propósito |
+| `mcp.too_many_objects` | El resultado supera el tope | Acotar con `kinds`/`name_prefix`, o pedir menos objetos por llamada. Nunca se trunca |
+| `mcp.session_timeout` | La lectura del catálogo superó `MCP_SESSION_MAX_SECONDS` | Pedir menos objetos por llamada |
 
 Del lado del gateway, todo intento de autenticación deja una fila:
 
@@ -313,7 +405,10 @@ El `detail` de un rechazo dice el motivo (`rechazo=inexistente|hmac|revocado|exp
   datos, la vía son tools **parametrizados**.
 - **No escribe nada.** El techo de capacidades de un token excluye todo lo que mute o divulgue, y
   la intersección se aplica dos veces: al emitir y al autenticar.
-- **No usa la credencial pseudo-root.** Cuando lleguen las tools que leen el catálogo, van con una
-  credencial de solo lectura propia del servidor.
+- **No usa la credencial pseudo-root.** Las tools que leen el catálogo van con la credencial de
+  solo lectura del servidor (A.6), verificada por el motor, y con la sesión en `READ ONLY`.
+- **No devuelve cuerpos** de vistas, rutinas ni triggers, ni SQL de un diff: salen como
+  `body_omitted_reason: "scope_disabled"`. `diff_schemas` dice QUÉ difiere y nada más; no guarda
+  la comparación ni emite un `confirm_token`.
 
 El contrato técnico completo está en `docs/api-reference-v23.md` §9.

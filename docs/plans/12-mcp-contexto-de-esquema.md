@@ -307,6 +307,21 @@ peor que no tenerla.
 **Por qué no un `analyze` "recortado":** cuesta el trabajo de recortarlo y deja la creencia de
 que el nivel está resuelto. Si más adelante hace falta, se diseña con su propio análisis.
 
+> **Desvío aprobado por el usuario el 2026-10-02: `diff_schemas`, con scope `schema_diff.read`.**
+> No es el `analyze` de la tabla de arriba, y la diferencia es justamente lo que lo hace seguro:
+>
+> - **En memoria.** El diff se calcula con `diff_snapshots` (función pura) sobre dos snapshots
+>   leídos en la sesión de solo lectura. **No se persiste ninguna `SchemaComparison`**, así que no
+>   existe un plan ejecutable que confirmar.
+> - **Sin SQL ni token.** No se llama a `render_diff`: no hay `sql`, `down_sql` ni
+>   `confirm_token`. La proyección (`target_resolution.structural_changes`) se queda con tipo,
+>   nombre, tabla padre, tipo de cambio, atributos que difieren y `destructive`; **sin payloads,
+>   cuerpos ni valores por defecto**. El DTO de salida no tiene campos donde puedan caer.
+> - **Los dos lados con el gate completo** del §5.2, cada uno con su credencial de solo lectura
+>   verificada. Una base de otro proyecto responde `mcp.not_found`, como en las demás tools.
+>
+> Lo que sigue fuera de la v1 es exactamente lo que el §2.1 cuestiona: el preview REST y su token.
+
 El alcance chico no es prudencia genérica: **alinear el alcance con la necesidad real elimina
 cuatro de los cinco bloqueantes de un saque.** El §6 fue diseñado para un agente de diagnóstico;
 lo que hace falta es contexto de esquema para programar.

@@ -469,6 +469,17 @@ MCP_RATE_LIMIT = os.getenv("MCP_RATE_LIMIT", "120/minute")
 # inventa un token_id distinto por request (cada uno es un cupo nuevo); este sí. Superado, la IP
 # recibe 429 sin tocar la BD de metadatos hasta que la ventana se vacíe. Ver `app/core/mcp_auth.py`.
 MCP_AUTH_FAILURE_RATE_LIMIT = os.getenv("MCP_AUTH_FAILURE_RATE_LIMIT", "30/minute")
+# Antigüedad máxima de la sonda negativa de la credencial de solo lectura (plan 12 §5.2). El gate
+# confía en una OBSERVACIÓN del motor y no en la promesa del DBA, y una observación vieja ya no
+# describe los grants de hoy. Ver `app/controllers/target_resolution.py`.
+MCP_READONLY_MAX_AGE_DAYS = int(os.getenv("MCP_READONLY_MAX_AGE_DAYS", "30"))
+# Tope de objetos por llamada a `get_schema`, evaluado ANTES de abrir la conexión (plan 12 §6.3).
+MCP_MAX_OBJECTS_PER_CALL = int(os.getenv("MCP_MAX_OBJECTS_PER_CALL", "50"))
+# Duración máxima y timeout de sentencia de la sesión de lectura del MCP (plan 12 §5.3). Mucho más
+# chicos que los del export: una tool alimenta un contexto con alguien esperando del otro lado, y
+# una transacción abierta en la base de un tercero retiene undo (MySQL) o frena el VACUUM (PG).
+MCP_SESSION_MAX_SECONDS = int(os.getenv("MCP_SESSION_MAX_SECONDS", "60"))
+MCP_STATEMENT_TIMEOUT_MS = int(os.getenv("MCP_STATEMENT_TIMEOUT_MS", "10000"))
 
 # ======= Startup validation ======= #
 if not SECRET_KEY:
