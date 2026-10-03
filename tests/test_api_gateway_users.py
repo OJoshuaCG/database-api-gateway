@@ -338,6 +338,7 @@ _ACCESS_ADMIN_ROUTES = [
     ("GET", "/api/v1/gateway-users/1/effective-access"),
     ("GET", "/api/v1/api-tokens"),
     ("POST", "/api/v1/api-tokens"),
+    ("PATCH", "/api/v1/api-tokens/1"),
     ("GET", "/api/v1/capability-grants/pending"),
     ("POST", "/api/v1/capability-grants/1/approve"),
     ("GET", "/api/v1/authz/scope-readiness"),

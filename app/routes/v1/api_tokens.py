@@ -11,7 +11,7 @@ from fastapi import APIRouter, Request
 from app.controllers.api_token_controller import ApiTokenController
 from app.core.authz import AccessAdmin
 from app.core.limiter import limiter
-from app.schemas.api_token import ApiTokenCreate, ApiTokenCreatedOut, ApiTokenOut
+from app.schemas.api_token import ApiTokenCreate, ApiTokenCreatedOut, ApiTokenOut, ApiTokenUpdate
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, paginated, success
 
@@ -21,9 +21,7 @@ router = APIRouter(prefix="/api-tokens", tags=["API Tokens"])
 @router.get("", response_model=ApiResponse[list[ApiTokenOut]])
 def list_api_tokens(actor: AccessAdmin, pagination: PaginationDep):
     """Los tokens emitidos, con su estado. **Sin el secreto**, que no se guarda."""
-    items, total = ApiTokenController().list_tokens(
-        limit=pagination.size, offset=pagination.offset
-    )
+    items, total = ApiTokenController().list_tokens(limit=pagination.size, offset=pagination.offset)
     return paginated(items, total=total, pagination=pagination)
 
 
@@ -44,6 +42,23 @@ def create_api_token(request: Request, actor: AccessAdmin, payload: ApiTokenCrea
     return success(
         data=ApiTokenController().create_token(payload.model_dump(), admin=actor),
         message="Token emitido. Copialo ahora: no se vuelve a mostrar.",
+    )
+
+
+@router.patch("/{token_pk}", response_model=ApiResponse[ApiTokenOut])
+def update_api_token(actor: AccessAdmin, token_pk: int, payload: ApiTokenUpdate):
+    """
+    Reemplaza los **scopes** del token, sin reemitirlo: el bearer no cambia.
+
+    Lista completa (no suma/resta) y se valida contra el **techo de agente**, igual que el alta:
+    422 `api_token.scope_not_allowed` con `allowed`. Lista vacía es 422; un token revocado es
+    409 `api_token.already_revoked`. Exige `access.admin` y step-up (todo método no seguro).
+    Ampliar un token ya repartido amplía lo que puede hacer quien lo tenga. El cambio rige desde
+    la llamada siguiente del agente.
+    """
+    return success(
+        data=ApiTokenController().update_token(token_pk, payload.model_dump(), admin=actor),
+        message="Scopes del token actualizados.",
     )
 
 

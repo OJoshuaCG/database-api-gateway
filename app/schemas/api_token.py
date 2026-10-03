@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ApiTokenCreate(BaseModel):
@@ -31,6 +31,26 @@ class ApiTokenCreate(BaseModel):
         None, ge=1, description="Default y tope: MCP_TOKEN_MAX_TTL_DAYS (90). Sin perpetuos"
     )
     note: str | None = None
+
+
+class ApiTokenUpdate(BaseModel):
+    """
+    Edición de un token existente: **solo ``scopes``**, reemplazo completo de la lista.
+
+    Nombre, TTL, proyecto y secreto no se tocan: los scopes viven en la fila y no dentro del
+    bearer, así que ampliarlos no obliga a reemitir ni a redistribuir el secreto. Lista vacía
+    es 422 (``min_length=1``): un token sin permisos no sirve para nada, y lo que corresponde
+    es revocarlo. ``extra="forbid"`` evita que un campo mal escrito (``name``, ``project_id``)
+    se ignore en silencio y el operador crea que lo cambió.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scopes: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Lista COMPLETA de scopes. Se valida contra el techo de agente",
+    )
 
 
 class ApiTokenOut(BaseModel):

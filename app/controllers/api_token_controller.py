@@ -51,6 +51,42 @@ def _project_not_found(project_id: int) -> AppHttpException:
     )
 
 
+def _validate_scopes(raw_scopes: list[str]) -> list[str]:
+    """
+    Valida los scopes contra el **techo de agente** y devuelve sus valores canónicos.
+
+    Una sola implementación para el alta y la edición: si cada ruta tuviera su copia, la
+    edición podría quedar más laxa que el alta y el PATCH sería la puerta trasera para darle a
+    un token una capacidad que mute o divulgue. El techo excluye toda capacidad así (y
+    ``access.admin``), por eso ni un token ni su edición pueden escalar privilegios. Los errores
+    llevan solo el ``allowed`` del techo, nunca el detalle de la fila.
+    """
+    validos: list[str] = []
+    for raw in raw_scopes:
+        try:
+            cap = Capability(raw)
+        except ValueError as exc:
+            raise AppHttpException(
+                message=f"Scope inválido: {raw!r}.",
+                status_code=422,
+                public_context={"code": CODE_SCOPE_NOT_ALLOWED},
+            ) from exc
+        if cap not in AGENT_ALLOWED:
+            raise AppHttpException(
+                message=(
+                    f"El scope {raw!r} está fuera del techo de agente: un token no puede "
+                    "recibir una capacidad que mute o divulgue."
+                ),
+                status_code=422,
+                public_context={
+                    "code": CODE_SCOPE_NOT_ALLOWED,
+                    "allowed": sorted(c.value for c in AGENT_ALLOWED),
+                },
+            )
+        validos.append(cap.value)
+    return validos
+
+
 class ApiTokenController:
     def _session(self):
         from app.core.database import Database
@@ -131,30 +167,7 @@ class ApiTokenController:
                 },
             )
 
-        scopes = data.get("scopes") or [Capability.BLUEPRINTS_READ.value]
-        validos = []
-        for raw in scopes:
-            try:
-                cap = Capability(raw)
-            except ValueError as exc:
-                raise AppHttpException(
-                    message=f"Scope inválido: {raw!r}.",
-                    status_code=422,
-                    public_context={"code": CODE_SCOPE_NOT_ALLOWED},
-                ) from exc
-            if cap not in AGENT_ALLOWED:
-                raise AppHttpException(
-                    message=(
-                        f"El scope {raw!r} está fuera del techo de agente: un token no puede "
-                        "recibir una capacidad que mute o divulgue."
-                    ),
-                    status_code=422,
-                    public_context={
-                        "code": CODE_SCOPE_NOT_ALLOWED,
-                        "allowed": sorted(c.value for c in AGENT_ALLOWED),
-                    },
-                )
-            validos.append(cap.value)
+        validos = _validate_scopes(data.get("scopes") or [Capability.BLUEPRINTS_READ.value])
 
         token_id, secreto, bearer = mint()
         admin_id, _ = identity_of(admin)
@@ -239,5 +252,59 @@ class ApiTokenController:
             target_id=token_pk,
             touched_engine=False,
             detail=f"token={salida['token_id']} nombre='{salida['name']}'",
+        )
+        return salida
+
+    def update_token(self, token_pk: int, data: dict, *, admin) -> dict:
+        """
+        Reemplaza los ``scopes`` de un token existente. **Solo los scopes**.
+
+        Los scopes viven en la fila y ``mcp_auth.authenticate`` la lee en cada request, sin
+        caché: el cambio rige desde la llamada siguiente y el bearer no cambia, así que no hay
+        que reemitir ni redistribuir nada. Se valida contra el mismo techo de agente que el alta
+        (``_validate_scopes``).
+
+        **409 si está revocado**: editar un token muerto no tiene efecto útil y daría la falsa
+        impresión de haberlo tocado (mismo código que ``revoke_token``). Uno vencido sí se puede
+        editar: es inofensivo y no justifica un código nuevo.
+
+        La auditoría registra scopes antes→después y nada más: ni secreto ni HMAC.
+        """
+        validos = sorted(set(_validate_scopes(data["scopes"])))
+        session = self._session()
+        try:
+            fila = session.get(ApiToken, token_pk)
+            if fila is None:
+                raise AppHttpException(
+                    message="Token no encontrado.",
+                    status_code=404,
+                    public_context={"code": CODE_NOT_FOUND},
+                )
+            if fila.revoked_at is not None:
+                raise AppHttpException(
+                    message="Este token está revocado: no se puede editar.",
+                    status_code=409,
+                    public_context={"code": CODE_ALREADY_REVOKED},
+                )
+            # Los EFECTIVOS de antes, igual que los muestra `_serialize`, para que el rastro diga
+            # lo que el token podía hacer y no un string crudo de la fila.
+            antes = sorted(c.value for c in parse_scopes(fila.scopes))
+            fila.scopes = ",".join(validos)
+            session.commit()
+            session.refresh(fila)
+            salida = self._serialize(fila)
+        finally:
+            session.close()
+
+        audit.record(
+            "api_token.update",
+            admin=admin,
+            target_type="api_token",
+            target_id=token_pk,
+            touched_engine=False,
+            detail=(
+                f"token={salida['token_id']} nombre='{salida['name']}' "
+                f"scopes=[{','.join(antes)}]->[{','.join(validos)}]"
+            ),
         )
         return salida
