@@ -466,6 +466,28 @@ class ServerAdapter(ABC):
     @abstractmethod
     def change_password(self, username: str, new_password: str, host: str = "%") -> None: ...
 
+    def provision_readonly_account(
+        self, username: str, password: str, host: str, databases: list[str]
+    ) -> bool:
+        """
+        Crea —o RE-CONVERGE— la cuenta de solo lectura del MCP con la lista FIJA de grants del
+        plan 12 §7.2 (``readonly_probe.MYSQL_READONLY_*`` y el equivalente de PostgreSQL).
+        Devuelve ``True`` si la cuenta ya existía (se rotó su contraseña) y ``False`` si se creó.
+
+        **Idempotente por construcción**: MySQL/MariaDB no tienen DDL transaccional, así que una
+        corrida que muere a mitad deja la cuenta a medias y el reintento tiene que converger, no
+        chocar con ``already exists``. Los grants NO vienen del llamador: ``databases`` solo
+        acota ONDE se otorgan, nunca QUÉ.
+
+        Default: 422. Un motor sin implementación no aprovisiona (fail-closed), igual que
+        ``readonly_violations`` no verifica.
+        """
+        raise AppHttpException(
+            message="Este motor no soporta aprovisionar la credencial de solo lectura.",
+            status_code=422,
+            context={"dialect": self.dialect},
+        )
+
     def add_user_host(
         self,
         username: str,

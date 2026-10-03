@@ -480,6 +480,13 @@ MCP_MAX_OBJECTS_PER_CALL = int(os.getenv("MCP_MAX_OBJECTS_PER_CALL", "50"))
 # una transacción abierta en la base de un tercero retiene undo (MySQL) o frena el VACUUM (PG).
 MCP_SESSION_MAX_SECONDS = int(os.getenv("MCP_SESSION_MAX_SECONDS", "60"))
 MCP_STATEMENT_TIMEOUT_MS = int(os.getenv("MCP_STATEMENT_TIMEOUT_MS", "10000"))
+# Cuenta de motor que crea `POST /servers/{id}/readonly-credential/provision` (plan 12 §7.2).
+# Usuario y host son del OPERADOR, nunca del request: el endpoint no acepta ninguno. El host
+# default `%` es el único que no rompe un despliegue cuyo origen de red el gateway no conoce; en
+# producción acotalo a la IP/CIDR de egreso del gateway (`10.0.0.%`). Solo aplica a la familia
+# MySQL: en PostgreSQL el rol no lleva host (eso lo decide `pg_hba.conf`).
+MCP_READONLY_ACCOUNT_USERNAME = os.getenv("MCP_READONLY_ACCOUNT_USERNAME", "mcp_ro").strip()
+MCP_READONLY_ACCOUNT_HOST = os.getenv("MCP_READONLY_ACCOUNT_HOST", "%").strip()
 
 # ======= Startup validation ======= #
 if not SECRET_KEY:

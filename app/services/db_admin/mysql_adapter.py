@@ -1365,6 +1365,65 @@ class MySQLAdapter(ServerAdapter):
             extra={"username": username},
         )
 
+    #: MariaDB no tiene ``SHOW_ROUTINE`` (plan 12 §7.2): ahí el grant global no se emite.
+    _READONLY_GLOBAL_GRANT_DIALECTS = frozenset({"mysql"})
+
+    @staticmethod
+    def _db_grant_pattern(quoted_db: str) -> str:
+        """
+        Escapa ``_`` y ``%`` del nombre de una base para un ``GRANT ... ON `db`.*``.
+
+        En el nivel base de un GRANT esos dos caracteres son COMODINES aunque el nombre vaya
+        entre backticks: ``GRANT SELECT ON `app_prod`.*`` también cubriría ``appXprod``. Para una
+        credencial que se otorga base por base eso sería leer una base que nadie enumeró.
+        """
+        return quoted_db.replace("_", "\\_").replace("%", "\\%")
+
+    def provision_readonly_account(self, username, password, host, databases) -> bool:
+        from app.services.db_admin.readonly_probe import (
+            MYSQL_READONLY_DB_GRANTS,
+            MYSQL_READONLY_GLOBAL_GRANTS,
+        )
+
+        validate_identifier(username, self.dialect, "usuario")
+        validate_host(host)
+        who = self._user_at_host(username, host)
+        pwd = quote_string_literal(password, self.dialect)
+        try:
+            with server_connection(self.target) as conn:
+                existed = (
+                    conn.execute(
+                        text("SELECT 1 FROM mysql.user WHERE User = :u AND Host = :h LIMIT 1"),
+                        {"u": username, "h": host},
+                    ).first()
+                    is not None
+                )
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="provision_readonly_account", target=self.target,
+                extra={"username": username},
+            )
+        # CREATE ... IF NOT EXISTS + ALTER: converge exista o no, y un reintento tras una
+        # corrida a medias no choca. REVOKE ALL antes de otorgar: si la cuenta ya existía (de una
+        # corrida anterior o de alguien más) queda EXACTAMENTE con la lista fija, no con la
+        # fija más lo que tuviera.
+        stmts = [
+            f"CREATE USER IF NOT EXISTS {who} IDENTIFIED BY {pwd}",
+            f"ALTER USER {who} IDENTIFIED BY {pwd}",
+            f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM {who}",
+        ]
+        privs = ", ".join(MYSQL_READONLY_DB_GRANTS)
+        for db_name in databases:
+            validate_identifier(db_name, self.dialect, "base de datos", allow_existing=True)
+            db = self._db_grant_pattern(quote_identifier(db_name, self.dialect))
+            stmts.append(f"GRANT {privs} ON {db}.* TO {who}")
+        if self.dialect in self._READONLY_GLOBAL_GRANT_DIALECTS:
+            stmts.append(f"GRANT {', '.join(MYSQL_READONLY_GLOBAL_GRANTS)} ON *.* TO {who}")
+        self._execute_server(
+            stmts, op="provision_readonly_account", extra={"username": username}
+        )
+        return existed
+
     def add_user_host(self, username, source_host, new_host, *, new_password=None) -> None:
         """
         Agrega un host a un usuario: crea ``'user'@'new_host'`` como cuenta nueva.

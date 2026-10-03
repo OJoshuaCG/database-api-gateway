@@ -32,6 +32,18 @@ MYSQL_ALLOWED_PRIVILEGES = frozenset(
 #: guarda usuario y contraseña en claro (§7.2, "nunca ``SELECT ON mysql.*``").
 _MYSQL_GLOBAL_OK = frozenset({"USAGE", "SHOW_ROUTINE"})
 
+#: Lo que el aprovisionamiento AUTOMÁTICO otorga (``POST .../readonly-credential/provision``). Son
+#: constantes del servidor: ningún request las toca. Viven acá, junto a la allowlist que las
+#: juzga, para que no puedan divergir: lo que se otorga TIENE que pasar la sonda. Un grant nuevo
+#: acá que la allowlist no conoce haría fallar toda credencial aprovisionada, y el import de
+#: abajo lo detecta en el arranque en vez de en producción.
+MYSQL_READONLY_DB_GRANTS: tuple[str, ...] = ("SELECT", "SHOW VIEW", "TRIGGER", "EVENT")
+#: ``SHOW_ROUTINE`` es dinámico (8.0.20+), no scopeable a una base, y MariaDB no lo tiene (§7.2).
+MYSQL_READONLY_GLOBAL_GRANTS: tuple[str, ...] = ("SHOW_ROUTINE",)
+
+assert set(MYSQL_READONLY_DB_GRANTS) <= MYSQL_ALLOWED_PRIVILEGES
+assert set(MYSQL_READONLY_GLOBAL_GRANTS) <= _MYSQL_GLOBAL_OK
+
 _GRANT_RE = re.compile(r"^GRANT\s+(?P<privs>.+?)\s+ON\s+(?P<obj>\S+)\s+TO\s+", re.IGNORECASE)
 
 
@@ -113,6 +125,8 @@ def postgres_role_violations(facts: dict) -> list[str]:
 
 __all__ = [
     "MYSQL_ALLOWED_PRIVILEGES",
+    "MYSQL_READONLY_DB_GRANTS",
+    "MYSQL_READONLY_GLOBAL_GRANTS",
     "mysql_grant_violations",
     "postgres_role_violations",
 ]

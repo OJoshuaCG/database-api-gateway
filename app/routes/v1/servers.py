@@ -189,6 +189,25 @@ def set_readonly_credential(actor: ServersAdmin, server_id: int, payload: Readon
     )
 
 
+@router.post(
+    "/{server_id}/readonly-credential/provision", response_model=ApiResponse[ServerOut]
+)
+@limiter.limit("3/minute")
+def provision_readonly_credential(request: Request, actor: ServersAdmin, server_id: int):
+    """
+    Crea la cuenta de solo lectura del MCP en el motor con la pseudo-root, la registra cifrada y
+    corre la sonda negativa. Sin cuerpo: ni la contraseña ni los grants los elige el cliente.
+
+    Es DCL sobre la base de un tercero, y la credencial es **por servidor**: alcanza todas sus
+    bases no internas. Idempotente (si la cuenta existe, rota la contraseña y re-aplica los
+    grants). 3/min, el escalón de las operaciones DDL sensibles. Solo HTTP: no hay tool del MCP.
+    """
+    updated = ServerController().provision_readonly_credential(server_id, admin=actor)
+    return success(
+        data=updated, message="Credencial de solo lectura aprovisionada y verificada."
+    )
+
+
 @router.delete("/{server_id}/readonly-credential", response_model=ApiResponse[ServerOut])
 def clear_readonly_credential(actor: ServersAdmin, server_id: int):
     """Quita la credencial de solo lectura: el servidor sale del MCP de inmediato. Idempotente."""

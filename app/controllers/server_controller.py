@@ -9,6 +9,7 @@ Controller de Servers.
 La credencial descifrada NUNCA se persiste, se serializa ni se loguea.
 """
 
+import secrets
 from typing import TYPE_CHECKING
 
 from sqlalchemy.exc import IntegrityError
@@ -22,6 +23,8 @@ from app.core.environments import (
     DB_PASS,
     DB_PORT,
     DB_USER,
+    MCP_READONLY_ACCOUNT_HOST,
+    MCP_READONLY_ACCOUNT_USERNAME,
     REMOTE_SSL_MODE,
 )
 from app.core import remote_engine
@@ -46,6 +49,12 @@ from app.services.db_admin.dtos import (
     TableStat,
 )
 from app.services.db_admin.database_scope import assert_database_in_scope
+from app.services.db_admin.identifiers import reserved_database_names, validate_identifier
+from app.services.db_admin.protected_accounts import (
+    assert_not_privileged_role,
+    assert_not_protected_by_name,
+)
+from app.services.db_admin.query_policy import is_gateway_metadata_target
 from app.services.db_admin.factory import get_adapter
 
 if TYPE_CHECKING:
@@ -463,6 +472,132 @@ class ServerController:
         # engine viejo; se invalida igual para no dejar vivo un pool con la credencial anterior.
         remote_engine.invalidate_server(server_id)
         return result
+
+    def provision_readonly_credential(
+        self, server_id: int, *, admin: "dict | Actor | None" = None
+    ) -> dict:
+        """
+        Crea (o RE-CONVERGE) la cuenta de solo lectura del MCP con la pseudo-root, la registra
+        cifrada y corre la sonda negativa. Un click en lugar de CREATE USER + PUT + verificar.
+
+        SOLO se llega por la API HTTP/SPA. ``app/mcp`` no puede importar este módulo
+        (``tests/test_mcp_import_guard.py``) ni existe una tool que lo llame: el MCP no toca la
+        pseudo-root.
+
+        El request no trae NADA: lo decide todo el servidor. Usuario y host salen de
+        ``MCP_READONLY_ACCOUNT_*``, los grants de ``readonly_probe.MYSQL_READONLY_*`` y la
+        contraseña de ``secrets``. La contraseña nunca se devuelve ni se loguea: del adapter al
+        ``set_readonly_credential`` viaja en una variable local.
+
+        Alcance (POR SERVIDOR, no por base): ``SELECT`` & co. sobre TODAS las bases no internas
+        del servidor. Quedan fuera las del sistema del motor y la base de metadatos del propio
+        gateway si está co-alojada (``server_users`` guarda pseudo-roots cifradas). Una base
+        creada DESPUÉS no queda cubierta hasta repetir el aprovisionamiento. Nunca ``SELECT ON
+        *.*`` ni sobre ``mysql.*``. ``exclude_gateway_internal_tables`` no aplica: un grant a
+        nivel base no puede excluir tablas; el MCP filtra las internas al introspectar.
+
+        Orden y recuperación (MySQL/MariaDB no tienen DDL transaccional): 1) se BORRA la
+        verificación, porque desde que la contraseña rota la guardada ya no sirve y no puede
+        seguir figurando como verificada; 2) cuenta + grants en el motor (idempotente: rota y
+        re-aplica si existe); 3) se guarda cifrada; 4) sonda negativa. Cualquier corrida a medias
+        se reintenta tal cual. Si la sonda falla, ``_verify_readonly`` ya dejó la verificación
+        en ``null`` y devuelve el 422 ``server.readonly_probe_failed``.
+        """
+        session = self._session()
+        try:
+            server = self._get_or_404(session, server_id)
+            engine_value = (
+                server.engine.value
+                if isinstance(server.engine, EngineType)
+                else str(server.engine)
+            )
+            root_username = server.root_username
+            host, port = server.host, server.port
+        finally:
+            session.close()
+
+        username = MCP_READONLY_ACCOUNT_USERNAME
+        account_host = MCP_READONLY_ACCOUNT_HOST
+        validate_identifier(username, engine_value, "usuario")
+        assert_not_protected_by_name(
+            dialect=engine_value, username=username, root_username=root_username
+        )
+        adapter = get_adapter(self._build_target(server_id))
+        assert_not_privileged_role(adapter, dialect=engine_value, username=username)
+
+        reserved = reserved_database_names(engine_value)
+        databases: list[str] = []
+        omitidas = 0
+        for name in adapter.list_databases():
+            if name.lower() in reserved or is_gateway_metadata_target(
+                host=host,
+                port=port,
+                database=name,
+                gateway_host=DB_HOST,
+                gateway_port=DB_PORT,
+                gateway_database=DB_NAME,
+            ):
+                continue
+            try:
+                validate_identifier(name, engine_value, "base de datos", allow_existing=True)
+            except AppHttpException:
+                omitidas += 1  # un nombre raro no debe bloquear el resto, pero no se interpola
+                continue
+            databases.append(name)
+
+        password = secrets.token_urlsafe(32)
+        audit.record_intent(
+            "server.readonly_credential.provision",
+            admin=admin,
+            target_type="server",
+            target_id=server_id,
+            server_id=server_id,
+            detail=f"aprovisionamiento de la cuenta de solo lectura sobre {len(databases)} bases",
+        )
+        self._clear_readonly_verification(server_id)
+        try:
+            existed = adapter.provision_readonly_account(
+                username, password, account_host, databases
+            )
+        except AppHttpException:
+            audit.record(
+                "server.readonly_credential.provision",
+                status="error",
+                admin=admin,
+                target_type="server",
+                target_id=server_id,
+                server_id=server_id,
+                touched_engine=True,
+                detail="fallo al crear la cuenta de solo lectura en el motor; reintentable",
+            )
+            raise
+        self.set_readonly_credential(
+            server_id, {"username": username, "password": password}, admin=admin
+        )
+        audit.record(
+            "server.readonly_credential.provision",
+            admin=admin,
+            target_type="server",
+            target_id=server_id,
+            server_id=server_id,
+            touched_engine=True,
+            detail=(
+                ("cuenta existente: contraseña rotada y grants re-aplicados"
+                 if existed else "cuenta creada")
+                + f"; {len(databases)} bases cubiertas, {omitidas} omitidas por nombre"
+            ),
+        )
+        self._verify_readonly(server_id, admin=admin)
+        return self.get_server(server_id)
+
+    def _clear_readonly_verification(self, server_id: int) -> None:
+        session = self._session()
+        try:
+            server = self._get_or_404(session, server_id)
+            server.readonly_verified_at = None
+            session.commit()
+        finally:
+            session.close()
 
     def clear_readonly_credential(
         self, server_id: int, *, admin: "dict | Actor | None" = None

@@ -1210,6 +1210,64 @@ class PostgresAdapter(ServerAdapter):
             extra={"username": username},
         )
 
+    def provision_readonly_account(self, username, password, host, databases) -> bool:
+        """
+        Rol de solo lectura del MCP (plan 12 §7.2, docs/features/mcp-para-colaboradores.md §A.6).
+
+        Los atributos se (re)escriben con ``ALTER ROLE`` en cada corrida: un rol que ya existía
+        converge a ``NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS``
+        en vez de conservar lo que tuviera. El llamador YA rechazó (409) un rol privilegiado
+        preexistente con ``assert_not_privileged_role``, así que esto nunca degrada en silencio
+        a una cuenta de administración. ``host`` no aplica a PostgreSQL (lo decide
+        ``pg_hba.conf``).
+
+        Por base, PostgreSQL otorga ``CONNECT`` (nivel servidor) y ``USAGE`` sobre ``public``
+        (hay que conectarse a cada base). **No** otorga ``SELECT``: la introspección de
+        estructura lee ``pg_catalog``, que no lo necesita, y así la sonda no ve privilegios de
+        tabla de más. Los esquemas que no son ``public`` quedan fuera.
+        """
+        validate_identifier(username, self.dialect, "usuario")
+        role = quote_identifier(username, self.dialect)
+        pwd = quote_string_literal(password, self.dialect)
+        try:
+            with server_connection(self.target) as conn:
+                existed = (
+                    conn.execute(
+                        text("SELECT 1 FROM pg_roles WHERE rolname = :n"), {"n": username}
+                    ).first()
+                    is not None
+                )
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="provision_readonly_account", target=self.target,
+                extra={"username": username},
+            )
+        verb = "ALTER" if existed else "CREATE"
+        self._execute_server(
+            [
+                f"{verb} ROLE {role} WITH LOGIN PASSWORD {pwd} NOSUPERUSER NOCREATEDB "
+                "NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS",
+                f"ALTER ROLE {role} SET default_transaction_read_only = on",
+            ],
+            op="provision_readonly_account",
+            extra={"username": username},
+        )
+        for db_name in databases:
+            validate_identifier(db_name, self.dialect, "base de datos", allow_existing=True)
+            db = quote_identifier(db_name, self.dialect)
+            self._execute_server(
+                [f"GRANT CONNECT ON DATABASE {db} TO {role}"],
+                op="provision_readonly_account",
+                extra={"username": username, "database": db_name},
+            )
+            self._execute_database(
+                db_name,
+                [f"GRANT USAGE ON SCHEMA public TO {role}"],
+                op="provision_readonly_account",
+                extra={"username": username, "database": db_name},
+            )
+        return existed
+
     def is_privileged_role(self, username: str) -> bool:
         """
         ¿El rol es de administración? SUPERUSER, CREATEROLE, REPLICATION, BYPASSRLS o
