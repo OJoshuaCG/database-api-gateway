@@ -1280,6 +1280,97 @@ class PostgresAdapter(ServerAdapter):
                 extra={"username": username, "database": db_name},
             )
 
+    def _data_schemas(self, database: str) -> list[str]:
+        """Esquemas de usuario de ``database`` (sin ``pg_*`` ni ``information_schema``)."""
+        try:
+            with database_connection(self.target, database) as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT nspname FROM pg_namespace "
+                        "WHERE left(nspname, 3) <> 'pg_' AND nspname <> 'information_schema' "
+                        "ORDER BY nspname"
+                    )
+                )
+                return [str(r[0]) for r in rows]
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="provision_data_account", target=self.target,
+                extra={"database": database},
+            )
+
+    def provision_data_account(self, username, password, host, database, preflight) -> None:
+        """
+        Rol de DATOS por base: ``CONNECT`` + ``USAGE`` y ``SELECT`` por esquema de usuario.
+
+        Atributos y límites se reescriben en cada corrida (``CONNECTION LIMIT 3``,
+        ``default_transaction_read_only = on``, ``statement_timeout = '30s'``): un rol que ya
+        existía converge en vez de conservar lo que tuviera. ``REVOKE ALL ON ALL TABLES`` antes
+        del ``GRANT SELECT`` deja EXACTAMENTE ``SELECT``. Sin ``ALTER DEFAULT PRIVILEGES``: una
+        tabla creada después no queda cubierta hasta repetir el aprovisionamiento (mismo costo que
+        la credencial de estructura). ``host`` no aplica a PostgreSQL.
+        """
+        validate_identifier(username, self.dialect, "usuario")
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        role = quote_identifier(username, self.dialect)
+        db = quote_identifier(database, self.dialect)
+        pwd = quote_string_literal(password, self.dialect)
+        # Lecturas (el catálogo) y validación de nombres ANTES de la primera sentencia que muta.
+        schemas: list[str] = []
+        for name in self._data_schemas(database):
+            try:
+                validate_identifier(name, self.dialect, "esquema", allow_existing=True)
+            except AppHttpException:
+                continue  # un nombre raro no debe bloquear el resto, pero no se interpola
+            schemas.append(quote_identifier(name, self.dialect))
+        verb = "ALTER" if preflight.exists else "CREATE"
+        self._execute_server(
+            [
+                f"{verb} ROLE {role} WITH LOGIN PASSWORD {pwd} NOSUPERUSER NOCREATEDB "
+                "NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 3",
+                f"ALTER ROLE {role} SET default_transaction_read_only = on",
+                f"ALTER ROLE {role} SET statement_timeout = '30s'",
+                f"GRANT CONNECT ON DATABASE {db} TO {role}",
+            ],
+            op="provision_data_account",
+            extra={"username": username, "database": database},
+        )
+        stmts: list[str] = []
+        for sch in schemas:
+            stmts += [
+                f"GRANT USAGE ON SCHEMA {sch} TO {role}",
+                f"REVOKE ALL ON ALL TABLES IN SCHEMA {sch} FROM {role}",
+                f"GRANT SELECT ON ALL TABLES IN SCHEMA {sch} TO {role}",
+            ]
+        if stmts:
+            self._execute_database(
+                database,
+                stmts,
+                op="provision_data_account",
+                extra={"username": username, "database": database},
+            )
+
+    def revoke_data_account(self, username, host, database) -> None:
+        """
+        ``DROP OWNED BY`` (quita los privilegios en ``database`` y el ``CONNECT``) y ``DROP ROLE``.
+        ``DROP ROLE`` a secas falla mientras el rol tenga privilegios. Idempotente.
+        """
+        validate_identifier(username, self.dialect, "usuario")
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        if not self.preflight_readonly_account(username, host).exists:
+            return
+        role = quote_identifier(username, self.dialect)
+        self._execute_database(
+            database,
+            [f"DROP OWNED BY {role}"],
+            op="revoke_data_account",
+            extra={"username": username, "database": database},
+        )
+        self._execute_server(
+            [f"DROP ROLE IF EXISTS {role}"],
+            op="revoke_data_account",
+            extra={"username": username, "database": database},
+        )
+
     def is_privileged_role(self, username: str) -> bool:
         """
         ¿El rol es de administración? SUPERUSER, CREATEROLE, REPLICATION, BYPASSRLS o

@@ -258,3 +258,25 @@ class AgentAccessIn(BaseModel):
             "Veto de emergencia. GANA sobre 'allowed' y no tiene override: ni force, ni nada"
         ),
     )
+
+
+class DataCredentialOut(BaseModel):
+    """
+    Estado de la credencial de DATOS de una base. NUNCA lleva el usuario, la contraseña ni el
+    cifrado: solo si existe, si está verificada y qué códigos cortos dejó la última sonda.
+    """
+
+    managed_database_id: int
+    has_data_credential: bool = Field(
+        ..., description="false tras DELETE: la base no tiene credencial de datos"
+    )
+    verified_at: datetime | None = Field(
+        None,
+        description="Última sonda exitosa. null = sin verificar: ninguna tool de datos la usa",
+    )
+    probed_at: datetime | None = None
+    probe_violations: list[str] = Field(default_factory=list)
+    probe_warnings: list[str] = Field(default_factory=list)
+    data_access_allowed: bool = Field(
+        False, description="Opt-in de lectura de datos por base. Nace cerrado"
+    )

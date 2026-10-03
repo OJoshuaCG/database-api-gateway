@@ -493,6 +493,11 @@ MCP_STATEMENT_TIMEOUT_MS = int(os.getenv("MCP_STATEMENT_TIMEOUT_MS", "10000"))
 # MySQL: en PostgreSQL el rol no lleva host (eso lo decide `pg_hba.conf`).
 MCP_READONLY_ACCOUNT_USERNAME = os.getenv("MCP_READONLY_ACCOUNT_USERNAME", "mcp_ro").strip()
 MCP_READONLY_ACCOUNT_HOST = os.getenv("MCP_READONLY_ACCOUNT_HOST", "%").strip()
+# Prefijo de la cuenta de DATOS por base (`POST /managed-databases/{id}/data-credential/provision`):
+# el usuario es `<prefijo><id de la base gestionada>` (p. ej. `mcp_d_42`). Debe caber en los 32
+# caracteres del usuario de MySQL con un id de hasta 11 dígitos, por eso el prefijo admite 20.
+# El host reutiliza `MCP_READONLY_ACCOUNT_HOST`.
+MCP_DATA_ACCOUNT_PREFIX = os.getenv("MCP_DATA_ACCOUNT_PREFIX", "mcp_d_").strip()
 
 # ======= Startup validation ======= #
 # La cuenta del MCP se interpola (quoteada) en CREATE USER / GRANT al aprovisionar. Se valida acá
@@ -510,6 +515,11 @@ if not re.match(r"^[A-Za-z0-9_.%:\-]{1,255}$", MCP_READONLY_ACCOUNT_HOST):
     raise ValueError(
         "MCP_READONLY_ACCOUNT_HOST inválido: solo letras, dígitos y los caracteres _ . % : - "
         "(hasta 255)."
+    )
+if not re.match(r"^[A-Za-z_][A-Za-z0-9_]{0,19}$", MCP_DATA_ACCOUNT_PREFIX):
+    raise ValueError(
+        "MCP_DATA_ACCOUNT_PREFIX inválido: debe ser un identificador "
+        "([A-Za-z_][A-Za-z0-9_]*, hasta 20 caracteres) para que prefijo + id quepa en 32."
     )
 
 if not SECRET_KEY:

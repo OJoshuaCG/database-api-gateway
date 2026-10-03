@@ -72,11 +72,13 @@ if TYPE_CHECKING:
 # transacción de BD abierta durante el trabajo remoto (lento), así que no se usa
 # ``SELECT ... FOR UPDATE``. Con varios workers no serializa entre ellos. Ver
 # ``ServerController.provision_readonly_credential`` y el archivo de decisiones e incidentes.
-_PROVISIONING: set[int] = set()
+_PROVISIONING: set = set()
 _PROVISIONING_GUARD = threading.Lock()
 
 
-def _try_acquire_provision(server_id: int) -> bool:
+def _try_acquire_provision(server_id: "int | tuple") -> bool:
+    """``server_id`` es el id del servidor, o una tupla ``("data", db_id)`` para la credencial de
+    datos de una base (``ManagedDatabaseController.provision_data_credential``)."""
     with _PROVISIONING_GUARD:
         if server_id in _PROVISIONING:
             return False
@@ -84,7 +86,7 @@ def _try_acquire_provision(server_id: int) -> bool:
         return True
 
 
-def _release_provision(server_id: int) -> None:
+def _release_provision(server_id: "int | tuple") -> None:
     with _PROVISIONING_GUARD:
         _PROVISIONING.discard(server_id)
 

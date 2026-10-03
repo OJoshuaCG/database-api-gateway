@@ -19,30 +19,51 @@ Integridad: el propietario debe ser un ServerUser del MISMO servidor (se valida 
 el controller; endurecimiento futuro con FK compuesta — ver docs/plans/00).
 """
 
+import json
+import secrets
 from typing import TYPE_CHECKING
 
 from sqlalchemy.exc import IntegrityError
 
 from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.controllers.environment_controller import EnvironmentController
+from app.controllers.server_controller import _release_provision, _try_acquire_provision
+from app.core import remote_engine
+from app.core.crypto import CryptoConfigError, CryptoError, encrypt
 from app.core.database import Database
-from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+from app.core.environments import (
+    DB_HOST,
+    DB_NAME,
+    DB_PASS,
+    DB_PORT,
+    DB_USER,
+    MCP_DATA_ACCOUNT_PREFIX,
+    MCP_READONLY_ACCOUNT_HOST,
+)
 from app.core.remote_engine import DUPLICATE_DATABASE_CODES
 from app.exceptions import AppHttpException
 from app.models.database_model import DatabaseModel
 from app.models.enums import EngineType, ProvisionStatus
 from app.models.managed_database import ManagedDatabase
+from app.models.managed_database_data_credential import ManagedDatabaseDataCredential
 from app.models.model_migration import ModelMigration
 from app.models.server import Server
 from app.models.server_user import ServerUser
 from app.services import audit, charset_catalog
+from app.services import data_credential_catalog as dcodes
 from app.services import environment_catalog as ecodes
 from app.services import provisioning_catalog as pcodes
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import (
     ensure_not_reserved_database,
+    validate_host,
     validate_identifier,
 )
+from app.services.db_admin.protected_accounts import (
+    assert_not_privileged_role,
+    assert_not_protected_by_name,
+)
+from app.services.db_admin.query_policy import is_gateway_metadata_target
 
 if TYPE_CHECKING:
     from app.core.actor import Actor
@@ -206,6 +227,382 @@ class ManagedDatabaseController:
                 ),
             )
         return self._serialize_by_id(db_id)
+
+    # ------------------------------------------------------------------ #
+    # Credencial de DATOS por base (SELECT-only; design D9)               #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _serialize_data_credential(db_id: int, row: ManagedDatabaseDataCredential | None) -> dict:
+        """Estado seguro: SIN usuario, contraseña ni cifrado. ``row=None`` = sin credencial."""
+        if row is None:
+            return {
+                "managed_database_id": db_id,
+                "has_data_credential": False,
+                "verified_at": None,
+                "probed_at": None,
+                "probe_violations": [],
+                "probe_warnings": [],
+                "data_access_allowed": False,
+            }
+        return {
+            "managed_database_id": db_id,
+            "has_data_credential": True,
+            "verified_at": row.verified_at,
+            "probed_at": row.probed_at,
+            "probe_violations": json.loads(row.probe_violations or "[]"),
+            "probe_warnings": json.loads(row.probe_warnings or "[]"),
+            "data_access_allowed": bool(row.data_access_allowed),
+        }
+
+    @staticmethod
+    def _data_credential_row(session, db_id: int) -> ManagedDatabaseDataCredential | None:
+        return (
+            session.query(ManagedDatabaseDataCredential)
+            .filter(ManagedDatabaseDataCredential.managed_database_id == db_id)
+            .first()
+        )
+
+    def _data_credential_status(self, db_id: int) -> dict:
+        session = self._session()
+        try:
+            return self._serialize_data_credential(db_id, self._data_credential_row(session, db_id))
+        finally:
+            session.close()
+
+    @staticmethod
+    def _data_in_progress(db_id: int) -> AppHttpException:
+        return AppHttpException(
+            message=(
+                "Ya hay un aprovisionamiento o una revocación de la credencial de datos en curso "
+                "para esta base. Esperá a que termine y reintentá; no se cambió nada."
+            ),
+            status_code=409,
+            context={"managed_database_id": db_id},
+            public_context={"code": dcodes.CODE_DATA_PROVISION_IN_PROGRESS},
+        )
+
+    def _store_data_credential(
+        self, db_id: int, *, username: str, account_host: str, password: str
+    ) -> None:
+        """
+        Upsert de la credencial cifrada y SIN verificar. Borra la verificación y el resultado de
+        la sonda: describen a la contraseña ANTERIOR. Conserva el opt-in (``data_access_*``): es
+        una decisión humana y re-aprovisionar no la revoca.
+        """
+        try:
+            token = encrypt(password)
+        except (CryptoError, CryptoConfigError) as exc:
+            raise AppHttpException(
+                message="No se pudo cifrar la credencial de datos.", status_code=500
+            ) from exc
+        session = self._session()
+        try:
+            row = self._data_credential_row(session, db_id)
+            if row is None:
+                row = ManagedDatabaseDataCredential(managed_database_id=db_id)
+                session.add(row)
+            row.username = username
+            row.account_host = account_host
+            row.password_encrypted = token
+            row.verified_at = None
+            row.probed_at = None
+            row.probe_violations = None
+            row.probe_warnings = None
+            session.commit()
+        finally:
+            session.close()
+
+    def provision_data_credential(
+        self, db_id: int, *, admin: "dict | Actor | None" = None
+    ) -> dict:
+        """
+        Crea (o RE-CONVERGE) la cuenta de DATOS de UNA base: ``SELECT`` sobre esa base y nada más
+        (design D9). Misma disciplina que ``ServerController.provision_readonly_credential``, con
+        otro alcance: aquella es por servidor y sirve a la estructura; esta es por base.
+
+        SOLO por HTTP/SPA: ``app/mcp`` no importa este módulo. El request no trae nada: usuario
+        (``MCP_DATA_ACCOUNT_PREFIX`` + id), host (``MCP_READONLY_ACCOUNT_HOST``) y grants salen
+        del servidor, y la contraseña de ``secrets``; no se devuelve ni se loguea.
+
+        Orden, con TODA precondición antes de la primera mutación (MySQL/MariaDB no tienen DDL
+        transaccional):
+
+        1. Elegibilidad: la base existe en el motor (``active``), no es de sistema ni la base de
+           metadatos del gateway, y usuario y host configurados son válidos.
+        2. Lock por base, NO bloqueante, clave ``("data", db_id)`` (409 ``provision_in_progress``;
+           lock del PROCESO, no serializa entre workers).
+        3. Lecturas en el motor (``preflight_readonly_account``): ¿la cuenta existe?
+        4. Existe y NO es propia → 409 ``account_already_exists``. Propia = esta base ya guarda
+           una credencial de datos con ESE usuario (también tras una corrida a medias).
+        5. ``record_intent`` fail-closed y credencial cifrada SIN verificar ANTES de que el motor
+           cambie: si el paso 6 falla, el reintento ve usuario guardado == configurado y converge.
+        6. Cuenta + grants en el motor (idempotente: rota la contraseña y re-aplica).
+        7. Sonda: placeholder hasta la slice del probe; la credencial queda SIN verificar y por
+           lo tanto inusable por las tools de datos.
+        """
+        session = self._session()
+        try:
+            md = self._get_or_404(session, db_id)
+            server = get_server_or_404(session, md.server_id)
+            dialect = engine_value(server)
+            host, port, root_username = server.host, server.port, server.root_username
+            db_name, server_id, status = md.name, md.server_id, md.status
+            row = self._data_credential_row(session, db_id)
+            ours = row is not None and row.username == f"{MCP_DATA_ACCOUNT_PREFIX}{db_id}"
+        finally:
+            session.close()
+
+        username = f"{MCP_DATA_ACCOUNT_PREFIX}{db_id}"
+        account_host = MCP_READONLY_ACCOUNT_HOST
+        validate_identifier(username, dialect, "usuario")
+        if dialect != EngineType.postgresql.value:
+            validate_host(account_host)
+        assert_not_protected_by_name(
+            dialect=dialect, username=username, root_username=root_username
+        )
+        if status != ProvisionStatus.active or is_gateway_metadata_target(
+            host=host,
+            port=port,
+            database=db_name,
+            gateway_host=DB_HOST,
+            gateway_port=DB_PORT,
+            gateway_database=DB_NAME,
+        ):
+            raise self._data_not_eligible(db_id)
+        ensure_not_reserved_database(db_name, dialect)
+        validate_identifier(db_name, dialect, "base de datos", allow_existing=True)
+
+        lock_key = ("data", db_id)
+        if not _try_acquire_provision(lock_key):
+            raise self._data_in_progress(db_id)
+        try:
+            self._provision_data_locked(
+                db_id,
+                admin=admin,
+                server_id=server_id,
+                dialect=dialect,
+                db_name=db_name,
+                username=username,
+                account_host=account_host,
+                ours=ours,
+            )
+        finally:
+            _release_provision(lock_key)
+        return self._data_credential_status(db_id)
+
+    @staticmethod
+    def _data_not_eligible(db_id: int) -> AppHttpException:
+        return AppHttpException(
+            message=(
+                "Esta base no admite credencial de datos: tiene que estar activa en el motor y no "
+                "ser una base de sistema ni la base de metadatos del gateway. No se cambió nada."
+            ),
+            status_code=409,
+            context={"managed_database_id": db_id},
+            public_context={"code": dcodes.CODE_DATA_DATABASE_NOT_ELIGIBLE},
+        )
+
+    def _provision_data_locked(
+        self,
+        db_id: int,
+        *,
+        admin: "dict | Actor | None",
+        server_id: int,
+        dialect: str,
+        db_name: str,
+        username: str,
+        account_host: str,
+        ours: bool,
+    ) -> None:
+        """Pasos 3 a 7 de ``provision_data_credential``, ya dentro del lock de la base."""
+        session = self._session()
+        try:
+            target = build_target(get_server_or_404(session, server_id))
+        finally:
+            session.close()
+        adapter = get_adapter(target)
+        preflight = adapter.preflight_readonly_account(username, account_host)
+        if preflight.exists and not ours:
+            raise AppHttpException(
+                message=(
+                    "En el servidor ya existe una cuenta con el usuario de datos de esta base y "
+                    "el gateway no la creó, así que no se modifica (rotarla rompería a quien la "
+                    "use). Configurá otro MCP_DATA_ACCOUNT_PREFIX. No se cambió nada."
+                ),
+                status_code=409,
+                context={"managed_database_id": db_id},
+                public_context={"code": dcodes.CODE_DATA_ACCOUNT_ALREADY_EXISTS},
+            )
+        assert_not_privileged_role(adapter, dialect=dialect, username=username)
+
+        password = secrets.token_urlsafe(32)
+        audit.record_intent(
+            "managed_database.data_credential.provision",
+            admin=admin,
+            target_type="managed_database",
+            target_id=db_id,
+            server_id=server_id,
+            detail=f"aprovisionamiento de la cuenta de datos SELECT-only sobre '{db_name}'",
+        )
+        # El gateway registra la propiedad ANTES de que el motor cambie (cifrada y SIN verificar).
+        try:
+            self._store_data_credential(
+                db_id, username=username, account_host=account_host, password=password
+            )
+        except Exception:
+            audit.record(
+                "managed_database.data_credential.provision",
+                status="error",
+                admin=admin,
+                target_type="managed_database",
+                target_id=db_id,
+                server_id=server_id,
+                detail="no se pudo guardar la credencial; el motor no se tocó",
+            )
+            raise
+        try:
+            adapter.provision_data_account(username, password, account_host, db_name, preflight)
+        except Exception:
+            audit.record(
+                "managed_database.data_credential.provision",
+                status="error",
+                admin=admin,
+                target_type="managed_database",
+                target_id=db_id,
+                server_id=server_id,
+                touched_engine=True,
+                detail="fallo al crear la cuenta de datos en el motor; reintentable",
+            )
+            raise
+        audit.record(
+            "managed_database.data_credential.provision",
+            admin=admin,
+            target_type="managed_database",
+            target_id=db_id,
+            server_id=server_id,
+            touched_engine=True,
+            detail=(
+                "cuenta existente: contraseña rotada y grants re-aplicados"
+                if preflight.exists
+                else "cuenta creada"
+            )
+            + "; pendiente de verificación",
+        )
+        remote_engine.invalidate_server(server_id)
+        self._verify_data_credential(db_id, admin=admin)
+
+    def _verify_data_credential(self, db_id: int, *, admin: "dict | Actor | None" = None) -> None:
+        """
+        Gancho de la sonda de la credencial de datos. PLACEHOLDER de esta slice: no verifica nada,
+        así que ``verified_at`` queda en ``None`` y las tools de datos (que exigen una
+        verificación fresca) no pueden usar la credencial. La slice del probe lo reemplaza.
+        """
+        return None
+
+    def clear_data_credential(
+        self, db_id: int, *, admin: "dict | Actor | None" = None
+    ) -> dict:
+        """
+        Palanca de emergencia, idempotente: corta la lectura de datos de UNA base y borra su
+        cuenta del motor.
+
+        Orden pensado para que el CORTE sea inmediato aunque el motor no conteste: primero se
+        des-verifica la credencial y se cierra el opt-in (el gate la niega ya), después se borra
+        la cuenta del motor y, solo si eso funcionó, la fila. Si el motor falla, la fila (con su
+        usuario) queda para que el reintento revoque. Nunca borra una cuenta que el gateway no
+        creó: sin fila no hay nada que revocar.
+        """
+        session = self._session()
+        try:
+            md = self._get_or_404(session, db_id)
+            dialect = engine_value(get_server_or_404(session, md.server_id))
+            db_name, server_id = md.name, md.server_id
+        finally:
+            session.close()
+
+        lock_key = ("data", db_id)
+        if not _try_acquire_provision(lock_key):
+            raise self._data_in_progress(db_id)
+        try:
+            session = self._session()
+            try:
+                row = self._data_credential_row(session, db_id)
+                if row is None:
+                    username = account_host = None
+                else:
+                    username, account_host = row.username, row.account_host
+                    row.verified_at = None
+                    row.data_access_allowed = False
+                    session.commit()
+            finally:
+                session.close()
+            if username is not None:
+                self._revoke_data_account(
+                    db_id,
+                    admin=admin,
+                    server_id=server_id,
+                    dialect=dialect,
+                    db_name=db_name,
+                    username=username,
+                    account_host=account_host,
+                )
+                session = self._session()
+                try:
+                    row = self._data_credential_row(session, db_id)
+                    if row is not None:
+                        session.delete(row)
+                        session.commit()
+                finally:
+                    session.close()
+        finally:
+            _release_provision(lock_key)
+        audit.record(
+            "managed_database.data_credential.clear",
+            admin=admin,
+            target_type="managed_database",
+            target_id=db_id,
+            server_id=server_id,
+            touched_engine=username is not None,
+            detail=(
+                "credencial de datos revocada y cuenta borrada"
+                if username is not None
+                else "no tenía credencial de datos"
+            ),
+        )
+        remote_engine.invalidate_server(server_id)
+        return self._serialize_data_credential(db_id, None)
+
+    def _revoke_data_account(
+        self,
+        db_id: int,
+        *,
+        admin: "dict | Actor | None",
+        server_id: int,
+        dialect: str,
+        db_name: str,
+        username: str,
+        account_host: str,
+    ) -> None:
+        session = self._session()
+        try:
+            target = build_target(get_server_or_404(session, server_id))
+        finally:
+            session.close()
+        try:
+            get_adapter(target).revoke_data_account(username, account_host, db_name)
+        except Exception:
+            audit.record(
+                "managed_database.data_credential.clear",
+                status="error",
+                admin=admin,
+                target_type="managed_database",
+                target_id=db_id,
+                server_id=server_id,
+                touched_engine=True,
+                detail="fallo al borrar la cuenta de datos en el motor; la credencial quedó "
+                "des-verificada y el reintento la revoca",
+            )
+            raise
 
     def _serialize_by_id(self, db_id: int) -> dict:
         """Re-lee y serializa una BD por id en una sesión propia (estado ya commiteado)."""

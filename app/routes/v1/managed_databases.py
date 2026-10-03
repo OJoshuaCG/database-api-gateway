@@ -20,6 +20,7 @@ from app.core.authz import (
     BlueprintsRead,
     DatabasesRead,
     EnvironmentsWrite,
+    ServersAdmin,
     require_at,
 )
 from app.core.actor import Actor
@@ -28,6 +29,7 @@ from app.models.enums import EngineType, ProvisionStatus
 from app.schemas.managed_database import (
     AgentAccessIn,
     AdoptDatabaseIn,
+    DataCredentialOut,
     ManagedDatabaseCreate,
     ManagedDatabaseOut,
     ManagedDatabaseProvisionOut,
@@ -270,6 +272,46 @@ def set_agent_access(actor: EnvironmentsWrite, db_id: int, payload: AgentAccessI
             admin=actor,
         ),
         message="Acceso de agentes actualizado.",
+    )
+
+
+@router.post(
+    "/{db_id}/data-credential/provision", response_model=ApiResponse[DataCredentialOut]
+)
+@limiter.limit("3/minute")
+def provision_data_credential(request: Request, actor: ServersAdmin, db_id: int):
+    """
+    Crea la cuenta de DATOS del MCP para ESTA base con la pseudo-root: ``SELECT`` sobre esa base
+    y nada más. Sin cuerpo: ni la contraseña, ni el usuario, ni los grants los elige el cliente.
+
+    A diferencia de la credencial de estructura (por servidor), esta es **por base**: no alcanza
+    ninguna otra. Es DCL sobre la base de un tercero, por eso exige ``servers.admin`` (el mismo
+    privilegio que usa la pseudo-root) y 3/min. Idempotente: si la cuenta es del gateway, rota la
+    contraseña y re-aplica el grant. La credencial queda SIN verificar hasta la sonda, así que
+    ninguna tool de datos puede usarla todavía. Solo HTTP: no hay tool del MCP.
+
+    Errores 409 (``public_context.code``): ``data_credential.account_already_exists`` (la cuenta
+    es de un tercero), ``data_credential.provision_in_progress`` y
+    ``data_credential.database_not_eligible``.
+    """
+    return success(
+        data=ManagedDatabaseController().provision_data_credential(db_id, admin=actor),
+        message="Credencial de datos aprovisionada; pendiente de verificación.",
+    )
+
+
+@router.delete(
+    "/{db_id}/data-credential", response_model=ApiResponse[DataCredentialOut]
+)
+def clear_data_credential(actor: ServersAdmin, db_id: int):
+    """
+    Palanca de emergencia: corta la lectura de datos de esta base y borra su cuenta del motor.
+    Idempotente: sin credencial no hace nada. Si el motor no contesta responde el error del motor
+    pero la credencial queda des-verificada (ya inusable) y el reintento termina la revocación.
+    """
+    return success(
+        data=ManagedDatabaseController().clear_data_credential(db_id, admin=actor),
+        message="Credencial de datos revocada.",
     )
 
 

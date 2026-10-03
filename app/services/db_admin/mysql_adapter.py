@@ -1463,6 +1463,48 @@ class MySQLAdapter(ServerAdapter):
             stmts, op="provision_readonly_account", extra={"username": username}
         )
 
+    def provision_data_account(self, username, password, host, database, preflight) -> None:
+        """
+        Cuenta de DATOS por base: ``GRANT SELECT`` sobre ``db.*`` y NADA más.
+
+        Tope de recursos de la cuenta: ``MAX_USER_CONNECTIONS 3`` y, en MariaDB,
+        ``MAX_STATEMENT_TIME 30`` (segundos; en MySQL el tope de sentencia lo pone la sesión del
+        gateway con ``max_execution_time``, porque la cuenta no lo soporta). ``REVOKE ALL`` antes
+        de otorgar: la cuenta, ya verificada como propia por el llamador, queda EXACTAMENTE con
+        el ``SELECT`` y no con eso más lo que tuviera. El patrón de la base escapa ``_`` y ``%``
+        (``_db_grant_pattern``): sin eso ``app_prod`` también cubriría ``appXprod``.
+        Sin ``SHOW VIEW``/``TRIGGER``/``EVENT``/``SHOW_ROUTINE``: esos son de estructura y la
+        credencial de estructura ya los tiene.
+        """
+        validate_identifier(username, self.dialect, "usuario")
+        validate_host(host)
+        validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
+        who = self._user_at_host(username, host)
+        pwd = quote_string_literal(password, self.dialect)
+        limits = "MAX_USER_CONNECTIONS 3"
+        if self.dialect == "mariadb":
+            limits += " MAX_STATEMENT_TIME 30"
+        db = self._db_grant_pattern(quote_identifier(database, self.dialect))
+        self._execute_server(
+            [
+                f"CREATE USER IF NOT EXISTS {who} IDENTIFIED BY {pwd}",
+                f"ALTER USER {who} IDENTIFIED BY {pwd} WITH {limits}",
+                f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM {who}",
+                f"GRANT SELECT ON {db}.* TO {who}",
+            ],
+            op="provision_data_account",
+            extra={"username": username, "database": database},
+        )
+
+    def revoke_data_account(self, username, host, database) -> None:
+        validate_identifier(username, self.dialect, "usuario")
+        validate_host(host)
+        self._execute_server(
+            [f"DROP USER IF EXISTS {self._user_at_host(username, host)}"],
+            op="revoke_data_account",
+            extra={"username": username, "database": database},
+        )
+
     def add_user_host(self, username, source_host, new_host, *, new_password=None) -> None:
         """
         Agrega un host a un usuario: crea ``'user'@'new_host'`` como cuenta nueva.

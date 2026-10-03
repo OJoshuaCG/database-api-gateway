@@ -511,6 +511,45 @@ class ServerAdapter(ABC):
             context={"dialect": self.dialect},
         )
 
+    def provision_data_account(
+        self,
+        username: str,
+        password: str,
+        host: str,
+        database: str,
+        preflight: ReadonlyPreflight,
+    ) -> None:
+        """
+        Crea —o RE-CONVERGE— la cuenta de DATOS del MCP para UNA base: ``SELECT`` y nada más, solo
+        sobre ``database`` (design D9). Hermana de ``provision_readonly_account`` pero con otro
+        alcance: aquella es por servidor y solo ve estructura; esta es por base y lee filas.
+
+        ``preflight`` es el de ``preflight_readonly_account``: este método NO decide nada que
+        pueda rechazar, solo ejecuta. Sus ``global_grants`` se IGNORAN a propósito: la cuenta de
+        datos nunca recibe un privilegio ``*.*``.
+
+        Idempotente (MySQL/MariaDB no tienen DDL transaccional). Default: 422, fail-closed, igual
+        que ``provision_readonly_account``: un motor sin implementación no aprovisiona.
+        """
+        raise AppHttpException(
+            message="Este motor no soporta aprovisionar la credencial de datos.",
+            status_code=422,
+            context={"dialect": self.dialect},
+        )
+
+    def revoke_data_account(self, username: str, host: str, database: str) -> None:
+        """
+        Borra la cuenta de datos del motor (``DROP USER`` / ``DROP ROLE``). Idempotente: si no
+        existe no hace nada. Es la mitad del motor de ``clear_data_credential``.
+
+        Default: 422 (fail-closed).
+        """
+        raise AppHttpException(
+            message="Este motor no soporta revocar la credencial de datos.",
+            status_code=422,
+            context={"dialect": self.dialect},
+        )
+
     def add_user_host(
         self,
         username: str,
