@@ -99,6 +99,10 @@ class Actor:
     #: actor armado fuera de una sesión no tiene ventana y el step-up le falla cerrado. Ver
     #: ``app/core/step_up.py``.
     step_up_until: datetime | None = None
+    #: Solo en tokens: el ``Actor`` del usuario que EMITIÓ el token, tal como está AHORA (se relee
+    #: por request, no se congela al emitir). Es la entrada del techo del token: ver
+    #: ``token_actor``. ``None`` en actores ``admin``.
+    issuer: "Actor | None" = None
 
     def has(self, capability: Capability) -> bool:
         """La única pregunta que hace el gate de capacidad."""
@@ -162,22 +166,40 @@ def admin_actor(
 
 
 def token_actor(
-    *, token_pk: int, token_id: str, name: str, scopes: str, project_id: int
+    *,
+    token_pk: int,
+    token_id: str,
+    name: str,
+    scopes: str,
+    project_id: int,
+    issuer: Actor | None = None,
 ) -> Actor:
     """
     Actor de un token de API (servidor MCP).
 
-    Las capacidades son la INTERSECCIÓN de los scopes declarados con el techo de agente. No es
-    defensivo por gusto: una fila manipulada o legada nunca puede otorgar una capacidad fuera
-    del techo, incluso si el string lo dice.
+    Las capacidades son la INTERSECCIÓN de tres cosas: los scopes declarados, el techo de agente
+    y lo que el EMISOR puede hoy en la capa 1 (``issuer.capabilities``, que ya incluye rol unión,
+    capacidades globales y capacidades puntuales). Un token es una delegación acotada de quien lo
+    emitió: nunca puede ganar algo que su emisor no tiene, y si al emisor le quitan una
+    capacidad el token la pierde en la siguiente request.
+
+    Fail-closed en el lector: sin ``issuer`` las capacidades son vacías. ``authenticate_agent``
+    rechaza antes a los tokens sin emisor válido; esto es la segunda barrera para quien arme un
+    actor por otro camino.
+
+    Alcance: solo CAPACIDADES. No restringe el alcance por entorno/destino, porque el modelo de
+    roles no tiene denegación por entorno (un ``viewer`` lee todo); lo que acota el destino de un
+    token es su ``project_id``.
     """
+    heredables = issuer.capabilities if issuer is not None else frozenset()
     return Actor(
         kind="api_token",
         id=token_pk,
         username=name,
-        capabilities=parse_scopes(scopes) & AGENT_ALLOWED,
+        capabilities=parse_scopes(scopes) & AGENT_ALLOWED & heredables,
         token_id=token_id,
         project_id=project_id,
+        issuer=issuer,
     )
 
 

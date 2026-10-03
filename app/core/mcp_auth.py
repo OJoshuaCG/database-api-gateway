@@ -48,6 +48,21 @@ haber cerrado, más el registro real enterrado bajo ruido. Dos piezas lo cierran
 - **Auditoría agregada** (``_rejection_audit``, un ``WindowedAggregator``): como mucho una fila por IP por ventana, y esa
   fila lleva cuántos rechazos de la IP quedaron sin fila desde la anterior.
 
+EL TOKEN HEREDA, Y NUNCA SUPERA, LOS PERMISOS DE QUIEN LO EMITIÓ
+-----------------------------------------------------------------
+Un token no es una identidad independiente: es una delegación de ``created_by_admin_id``. Tras
+validar el bearer se carga al emisor y sus capacidades EFECTIVAS (capa 1: rol unión, globales y
+puntuales) acotan las del token: ``scopes ∩ techo de agente ∩ capacidades del emisor`` (ver
+``token_actor``). Se relee en cada request, así que degradar al emisor degrada sus tokens.
+
+Se rechaza (motivo de auditoría ``emisor_inactivo``, respuesta opaca ``mcp.token_invalid``) si el
+emisor es NULL, no existe o está desactivado. **Los tokens legados con ``created_by_admin_id``
+NULL quedan rechazados**: hay que reemitirlos.
+
+Límite declarado: esto acota CAPACIDADES, no el alcance por entorno. El modelo de roles no tiene
+denegación por entorno (un ``viewer`` lee todo), así que el alcance de destino de un token sigue
+siendo solo su ``project_id``.
+
 POR QUÉ HMAC Y NO ARGON2
 ------------------------
 Argon2 saltea por hash, o sea **no es indexable**: verificar sería O(N) verificaciones Argon2 por
@@ -67,12 +82,14 @@ from limits import parse
 from slowapi.util import get_remote_address
 
 from app.core.actor import Actor, token_actor
+from app.core.authz import actor_from_access_context
 from app.core.audit_aggregator import WindowedAggregator
 from app.core.crypto import api_token_pepper
 from app.core.environments import MCP_AUTH_FAILURE_RATE_LIMIT, MCP_ENABLED
 from app.core.limiter import hit_or_429, mcp_limiter
 from app.exceptions import AppHttpException
 from app.models.api_token import ApiToken
+from app.models.user_model import UserModel
 
 #: Prefijo del bearer. Ver el docstring del módulo.
 TOKEN_PREFIX = "dbgw"
@@ -193,7 +210,7 @@ def _reject(
     El 401 opaco, con el motivo en la AUDITORÍA y no en la respuesta.
 
     ``motivo`` es vocabulario cerrado (``sin_bearer``, ``malformado``, ``inexistente``,
-    ``hmac``, ``revocado``, ``expirado``) porque se lee en un incidente y un texto libre por
+    ``hmac``, ``revocado``, ``expirado``, ``emisor_inactivo``) porque se lee en un incidente y un texto libre por
     sitio de llamada lo vuelve inagrupable.
 
     Consume un cupo de rechazos de la IP; si ese era el último, el que levanta es el 429 y no
@@ -209,6 +226,27 @@ def _reject(
         message="Credencial de agente inválida.",
         status_code=401,
         public_context={"code": CODE_TOKEN_INVALID},
+    )
+
+
+def _load_issuer(created_by_admin_id: int | None) -> Actor | None:
+    """
+    El ``Actor`` del usuario que emitió el token, o ``None`` si no sirve como emisor.
+
+    ``None`` cubre tres casos y los tres rechazan: ``created_by_admin_id`` NULL (token legado o
+    sin autor), usuario inexistente (la columna no tiene FK a propósito) y usuario desactivado.
+    La existencia se verifica ANTES de leer el contexto porque ``find_access_context`` de un id
+    inexistente cae en silencio al rol ``viewer``, y eso resolvería un emisor fantasma con
+    permisos de lectura.
+    """
+    if created_by_admin_id is None:
+        return None
+    modelo = UserModel()
+    usuario = modelo.find_by_id(created_by_admin_id)
+    if not usuario or not usuario.get("is_active"):
+        return None
+    return actor_from_access_context(
+        usuario["id"], usuario["username"], modelo.find_access_context(usuario["id"])
     )
 
 
@@ -269,6 +307,12 @@ def authenticate_agent(request: Request) -> Actor:
         if fila.expires_at <= ahora:
             raise _reject(request, "expirado", token_id=token_id)
 
+        # El token delega a su emisor: se relee en CADA request (igual que ``is_active`` en la
+        # sesión humana), así que desactivar o degradar al emisor surte efecto de inmediato.
+        emisor = _load_issuer(fila.created_by_admin_id)
+        if emisor is None:
+            raise _reject(request, "emisor_inactivo", token_id=token_id)
+
         if fila.last_used_at is None or ahora - fila.last_used_at >= _LAST_USED_RESOLUTION:
             fila.last_used_at = ahora
             session.commit()
@@ -284,6 +328,7 @@ def authenticate_agent(request: Request) -> Actor:
             name=fila.name,
             scopes=fila.scopes,
             project_id=fila.project_id,
+            issuer=emisor,
         )
         # Con el actor YA resuelto: la fila queda ``actor_type='api_token'`` y
         # ``api_token_id=<pk>``. Con ``admin=None`` (la versión anterior) el filtro forense

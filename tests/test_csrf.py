@@ -201,12 +201,13 @@ def test_the_token_actor_is_exempt_by_construction():
     lo que se fija es que la condición esté escrita sobre ``actor.kind``, no que el camino HTTP
     exista.
     """
-    from app.core.actor import token_actor
-    from app.services.capability_catalog import Capability
+    from app.core.actor import admin_actor, token_actor
+    from app.services.capability_catalog import Capability, GatewayRole
 
     actor = token_actor(
         token_pk=1, token_id="gwt_abc", name="mcp-lector",
         scopes="blueprints.read", project_id=7,
+        issuer=admin_actor(user_id=1, username="emisor", role=GatewayRole.VIEWER),
     )
     assert actor.kind == "api_token"
     assert actor.is_agent

@@ -496,6 +496,7 @@ def test_token_actor_is_capped_at_the_agent_ceiling():
         name="ci-facturacion",
         scopes=",".join(c.value for c in Capability),
         project_id=7,
+        issuer=admin_actor(user_id=1, username="emisor", role=GatewayRole.OWNER),
     )
     assert actor.capabilities == AGENT_ALLOWED
     assert actor.is_agent
