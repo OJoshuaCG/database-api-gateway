@@ -303,7 +303,7 @@ requires-dist = [
     { name = "redis", specifier = ">=8.0.0" },
     { name = "slowapi", specifier = ">=0.1.9" },
     { name = "sqlalchemy", specifier = ">=2.0.46" },
-    { name = "sqlglot", specifier = ">=30.11.0" },
+    { name = "sqlglot", specifier = ">=30.11,<30.12" },
 ]
 
 [package.metadata.requires-dev]
