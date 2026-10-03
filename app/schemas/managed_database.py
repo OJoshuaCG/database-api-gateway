@@ -99,7 +99,9 @@ class ManagedDatabaseUpdate(BaseModel):
 
 
 class ReassignOwnerIn(BaseModel):
-    owner_id: int = Field(..., ge=1, description="Nuevo propietario (ServerUser del mismo servidor)")
+    owner_id: int = Field(
+        ..., ge=1, description="Nuevo propietario (ServerUser del mismo servidor)"
+    )
 
 
 class AdoptDatabaseIn(BaseModel):
@@ -108,7 +110,9 @@ class AdoptDatabaseIn(BaseModel):
     CREATE DATABASE. El gateway verifica que la BD exista realmente (404 si no).
     """
 
-    name: str = Field(..., pattern=_DBNAME, description="Nombre EXACTO de la BD existente en el motor")
+    name: str = Field(
+        ..., pattern=_DBNAME, description="Nombre EXACTO de la BD existente en el motor"
+    )
     server_id: int = Field(..., ge=1)
     owner_id: int = Field(..., ge=1, description="ServerUser propietario, del mismo servidor")
     model_id: int | None = Field(None, ge=1, description="Blueprint a vincular (opcional)")
@@ -176,6 +180,21 @@ class ManagedDatabaseOut(BaseModel):
     status: ProvisionStatus
     notes: str | None = None
     origin: str = "provisioned"
+    agent_access_allowed: bool = Field(
+        False,
+        description=(
+            "Opt-in por base. Es el eje que DECIDE el alcance de los agentes (MCP): sin esto en "
+            "true ningún agente ve la base aunque su entorno los permita. Habilitar el entorno "
+            "no abre ninguna base. Lo escribe PUT /managed-databases/{id}/agent-access"
+        ),
+    )
+    agent_access_blocked: bool = Field(
+        False,
+        description=(
+            "Veto de emergencia. GANA sobre 'agent_access_allowed' y no tiene override: con "
+            "true la base queda cerrada a agentes aunque el opt-in esté en true"
+        ),
+    )
     created_at: datetime
     updated_at: datetime
     migration: MigrationOutcomeOut | None = Field(

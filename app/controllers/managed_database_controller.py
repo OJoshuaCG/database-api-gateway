@@ -47,9 +47,8 @@ from app.services.db_admin.identifiers import (
 if TYPE_CHECKING:
     from app.core.actor import Actor
 
-def _assert_scope_at_env(
-    admin: "dict | Actor | None", env_id: int | None, server_id: int
-) -> None:
+
+def _assert_scope_at_env(admin: "dict | Actor | None", env_id: int | None, server_id: int) -> None:
     """
     ``databases.write`` en el entorno YA RESUELTO de una BD nueva (alta o adopción).
 
@@ -128,6 +127,8 @@ class ManagedDatabaseController:
             "status": d.status,
             "notes": d.notes,
             "origin": d.origin,
+            "agent_access_allowed": bool(d.agent_access_allowed),
+            "agent_access_blocked": bool(d.agent_access_blocked),
             "created_at": d.created_at,
             "updated_at": d.updated_at,
         }
@@ -177,8 +178,8 @@ class ManagedDatabaseController:
                 server_id=server_id,
                 touched_engine=False,
                 detail=(
-                    f"INTENT abrir '{nombre}' a agentes (MCP): la estructura de esta base pasa "
-                    "a ser legible por un token de agente"
+                    f"INTENT abrir '{nombre}' a agentes (MCP) (antes: cerrada): la estructura "
+                    "de esta base pasa a ser legible por un token de agente"
                 ),
             )
 
@@ -199,7 +200,10 @@ class ManagedDatabaseController:
                 target_id=db_id,
                 server_id=server_id,
                 touched_engine=False,
-                detail=f"'{nombre}' allowed={allowed} blocked={blocked}",
+                detail=(
+                    f"'{nombre}' allowed={allowed} blocked={blocked} "
+                    f"(antes: {'abierta' if antes else 'cerrada'})"
+                ),
             )
         return self._serialize_by_id(db_id)
 
@@ -406,9 +410,7 @@ class ManagedDatabaseController:
                 is None
             ):
                 raise AppHttpException(
-                    message=(
-                        f"La versión {target_version} no existe en el blueprint indicado."
-                    ),
+                    message=(f"La versión {target_version} no existe en el blueprint indicado."),
                     status_code=422,
                     context={
                         "model_id": data["model_id"],
