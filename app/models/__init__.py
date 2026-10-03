@@ -43,6 +43,7 @@ from app.models.enums import (
 )
 from app.models.export_job import ExportArtifact, ExportJob, ExportJobItem
 from app.models.managed_database import ManagedDatabase
+from app.models.managed_database_data_credential import ManagedDatabaseDataCredential
 from app.models.migration_select_result import MigrationSelectResult
 from app.models.migration_statement_progress import MigrationStatementProgress
 from app.models.model_migration import ModelMigration
@@ -74,6 +75,7 @@ __all__ = [
     "ServerUser",
     "DatabaseModel",
     "ManagedDatabase",
+    "ManagedDatabaseDataCredential",
     "Environment",
     "ModelMigration",
     "DatabaseMigrationHistory",
