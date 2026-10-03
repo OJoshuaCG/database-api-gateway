@@ -251,7 +251,22 @@ por correo a una lista.
 El `token_id` —la primera parte, después de `dbgw.`— **no es secreto** y es lo que aparece en la
 auditoría: sirve para hablar de "el token de Ana" sin exponer nada.
 
-### B.3 Revocar
+### B.3 Ampliar o recortar scopes sin reemitir
+
+Los scopes están en el gateway, no dentro del bearer: se cambian con el **mismo token**, sin
+redistribuir el secreto ni abrir una terminal nueva. El cambio rige desde la llamada siguiente
+del agente. Es el reemplazo completo de la lista, y el `4` es el `id` del listado:
+
+```bash
+curl -s -b cookies.txt -H "X-CSRF-Token: $CSRF" -H "Content-Type: application/json" \
+  -X PATCH "$BASE/api/v1/api-tokens/4" \
+  -d '{"scopes": ["blueprints.read", "databases.read", "schema_diff.read"]}'
+```
+
+Pide step-up. Un scope fuera del techo de agente da 422 `api_token.scope_not_allowed`, y un
+token revocado, 409. Ampliar un token ya repartido amplía lo que puede hacer quien lo tenga.
+
+### B.4 Revocar
 
 ```bash
 curl -s -b cookies.txt -H "X-CSRF-Token: $CSRF" \
@@ -390,7 +405,7 @@ El `detail` de un rechazo dice el motivo (`rechazo=inexistente|hmac|revocado|exp
 
 ## Cuando alguien se va del equipo
 
-1. **Revocar sus tokens** (B.3). El acceso corta en el request siguiente, sin caché.
+1. **Revocar sus tokens** (B.4). El acceso corta en el request siguiente, sin caché.
 2. Verificar con `GET /api/v1/api-tokens` que no queda ninguno vivo a su nombre.
 3. Su usuario del gateway se **desactiva**, nunca se borra: el username no se reusa jamás, porque
    `audit_log` lo desnormaliza y una persona nueva heredaría la apariencia de las filas viejas.

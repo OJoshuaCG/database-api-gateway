@@ -89,3 +89,35 @@ un formulario de alta o reemplazo, el botón «Verificar» y el botón «Quitar�
 `schema_diff.read` (ya existían en el techo), estos cuatro: `environments.read`, `exports.read`,
 `clones.read` y `catalogs.read`. El catálogo (`GET /authz/catalog`) los publica con
 `agent_allowed: true`. Un selector de scopes en el alta de tokens tiene que ofrecer los siete.
+
+## Editar los scopes de un token (`PATCH /api-tokens/{id}`)
+
+Antes, para darle más scopes a un token había que emitir otro y cambiar `GATEWAY_MCP_TOKEN`. Los
+scopes viven en la fila (`api_tokens.scopes`) y no dentro del bearer, así que ahora se reemplazan
+sin tocar el secreto: el agente los ve **desde su llamada siguiente** (no hay caché), con el mismo
+bearer y sin abrir una terminal nueva.
+
+`PATCH /api/v1/api-tokens/{id}` — `id` es el `id` numérico del listado, no el `token_id`.
+Requiere `access.admin`, CSRF y step-up (todo método no seguro lo exige).
+
+```json
+{ "scopes": ["blueprints.read", "databases.read"] }
+```
+
+- **Solo `scopes`**, y la lista es el **reemplazo completo** (no suma ni resta). Cualquier otro
+  campo (`name`, `project_id`, …) es 422.
+- Respuesta 200: `ApiResponse[ApiTokenOut]` (el token con sus scopes nuevos, **sin secreto**).
+- Se valida contra el **techo de agente**, igual que el alta.
+- Auditoría: `api_token.update` con `scopes=[antes]->[después]`.
+
+| Código | Status | Cuándo |
+|---|---|---|
+| `api_token.scope_not_allowed` | 422 | Scope desconocido o fuera del techo de agente (`public_context.allowed` lo lista cuando es lo segundo) |
+| (validación de Pydantic) | 422 | Lista vacía (un token sin permisos se revoca) o campo extra |
+| `api_token.not_found` | 404 | El token no existe |
+| `api_token.already_revoked` | 409 | El token está revocado; no se edita (un token vencido sí) |
+| `access.step_up_required` | 403 | Falta la confirmación de contraseña |
+
+**Sugerencia de UI:** un botón de edición en las filas activas, junto a «Revocar», con el mismo
+selector de scopes del alta. Avisar que ampliar un token ya repartido amplía lo que puede hacer
+quien lo tenga.
