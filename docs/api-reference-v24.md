@@ -681,7 +681,10 @@ de la v1 lo acepta, y un identificador que nada consume es superficie sin uso.
 Dos cosas están bloqueadas por backend. Conviene saberlas **antes** de planificar las pantallas,
 porque las dos se ven construibles desde el contrato y no lo son.
 
-### 10.1 El estado de acceso de agentes no es legible por ninguna vía 🔴
+### 10.1 El estado de acceso de agentes no es legible por ninguna vía ✅ resuelto en v31
+
+> **Resuelto en [v31](api-reference-v31.md):** `ManagedDatabaseOut` ya devuelve `agent_access_allowed` y
+> `agent_access_blocked`. Lo que sigue describe el estado previo.
 
 `PUT /managed-databases/{db_id}/agent-access` **escribe** `agent_access_allowed` y
 `agent_access_blocked`, y es el opt-in por base del que dependen el §4 y v23 §9.3. Pero esas dos

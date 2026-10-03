@@ -510,6 +510,8 @@ PUT   /managed-databases/{id}/agent-access   {"allowed": true, "blocked": false}
 En el `PUT`, **`allowed` y `blocked` son los dos obligatorios**: no hay forma parcial, y mandar
 solo `{"allowed": true}` da 422.
 
+> ✅ **Resuelto en [v31](api-reference-v31.md)**: el estado ya se lee. El texto que sigue describe el estado previo.
+>
 > ⚠️ **El estado resultante hoy no se puede leer por ninguna vía.** `agent_access_allowed` y
 > `agent_access_blocked` no están en `ManagedDatabaseOut`, ni en `GET /managed-databases`, ni en
 > `GET /managed-databases/{id}`, ni en la respuesta del propio `PUT`. Se puede **escribir** el
