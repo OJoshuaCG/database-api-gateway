@@ -128,6 +128,51 @@ inventario del gateway y **no tocan ningún motor**. Las tools que sí leen el c
 —`list_objects`, `check_freshness`, `get_schema` y `diff_schemas`— exigen además una **credencial de SOLO LECTURA** registrada y
 **verificada** en el servidor de la base. El MCP **nunca** usa la pseudo-root, ni como fallback.
 
+Hay dos caminos para tener esa credencial. El **automático** (A.6.0) es un click y es el
+recomendado; el **manual** (pasos 1 a 3) sigue vigente cuando el DBA no quiere que el gateway use
+la pseudo-root para esto o necesita grants distintos.
+
+#### A.6.0 Camino automático: aprovisionar con un click
+
+```bash
+curl -s -b cookies.txt -H "X-CSRF-Token: $CSRF" \
+  -X POST "$BASE/api/v1/servers/3/readonly-credential/provision"
+```
+
+Sin cuerpo: `servers.admin` + step-up, 3 por minuto. El gateway usa la **pseudo-root** del servidor
+para crear la cuenta, genera una contraseña aleatoria (nunca se devuelve ni se loguea), la guarda
+cifrada y corre la sonda negativa del paso 3. La respuesta es el `ServerOut`, con
+`readonly_verified_at` cargado. Si la sonda falla: `422 server.readonly_probe_failed`, y el
+servidor queda **sin verificar** (fuera del MCP).
+
+- **Usuario y host no se eligen en el request.** Salen de `MCP_READONLY_ACCOUNT_USERNAME`
+  (`mcp_ro`) y `MCP_READONLY_ACCOUNT_HOST` (`%`; en producción acotalo a la IP de egreso del
+  gateway). En PostgreSQL el host no aplica.
+- **Grants fijos, definidos en el servidor** (`readonly_probe.MYSQL_READONLY_*`): `SELECT`,
+  `SHOW VIEW`, `TRIGGER`, `EVENT` por base, y `SHOW_ROUTINE` global en MySQL. **MariaDB no tiene
+  `SHOW_ROUTINE`**: ahí no se otorga y el MCP no ve cuerpos de rutinas (plan 12 §7.2). En
+  PostgreSQL: rol `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`,
+  `default_transaction_read_only = on`, `CONNECT` por base y `USAGE` sobre `public`.
+- **Idempotente y recuperable.** Si la cuenta ya existe, rota la contraseña y deja los grants
+  exactamente en la lista fija (en MySQL/MariaDB hace `REVOKE ALL` antes de otorgar). Como no
+  hay DDL transaccional, una corrida cortada se reintenta tal cual. Un rol PostgreSQL
+  **privilegiado** preexistente con ese nombre se rechaza con `409 engine_user.protected_account`:
+  no se lo degrada en silencio.
+- **Aprovisionar de nuevo invalida la contraseña anterior.** Mientras corre, el servidor sale del
+  MCP (la verificación se borra antes de rotar).
+
+> **Alcance: POR SERVIDOR, no por base.** Los `SELECT` se otorgan sobre **todas** las bases no
+> internas del servidor en el momento de aprovisionar, incluidas las de otros proyectos. Quedan
+> fuera las bases del sistema del motor y la base de metadatos del propio gateway si está
+> co-alojada. Nunca `SELECT ON *.*` ni sobre `mysql.*`. Una base creada **después** no queda
+> cubierta hasta repetir el aprovisionamiento. El límite entre proyectos lo pone el gate de A.5,
+> no el motor. Si necesitás acotar a ciertas bases, usá el camino manual.
+
+> **Solo desde la SPA/API.** El MCP no tiene una tool que provisione ni puede importar esta capa:
+> nunca toca la pseudo-root.
+
+#### Camino manual
+
 **1. Crear la cuenta en el motor** (lo hace el DBA del servidor; grants mínimos del plan 12 §7.2):
 
 ```sql

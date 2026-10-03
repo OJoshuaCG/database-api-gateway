@@ -1957,6 +1957,26 @@ y `COLLATION` es reservada), así que el job de PostgreSQL de `migrations-apply.
 de llegar a cualquier migración nueva. La regla de introspección e idempotencia quedó en
 `CLAUDE.md`, sección de migraciones.
 
+## Aprovisionar la credencial de solo lectura del MCP
+
+`POST /servers/{id}/readonly-credential/provision` (api-reference-v32). Tres decisiones que no se
+deducen del código y que alguien va a querer "simplificar":
+
+- **`REVOKE ALL` antes de otorgar (MySQL/MariaDB).** `CREATE USER IF NOT EXISTS` + `ALTER USER`
+  converge la contraseña, pero una cuenta `mcp_ro` preexistente conservaría los grants que ya
+  tuviera. Sin el `REVOKE`, "re-aplicar grants" sería "sumar" y la sonda fallaría (o peor, no).
+- **`_` y `%` se escapan en el nombre de base del `GRANT`.** A nivel base son comodines aunque
+  vayan entre backticks: `` `app_prod`.* `` también cubre `appXprod`. Para una credencial por
+  servidor que se otorga base por base, eso es leer una base que nadie enumeró.
+- **La verificación se borra ANTES de rotar la contraseña**, no después. Entre la rotación y el
+  guardado, la contraseña cifrada es la vieja: dejarla "verificada" sería confiar en una cuenta
+  que el motor ya no acepta.
+
+Excluida siempre la base de metadatos del gateway co-alojada (`server_users` guarda pseudo-roots
+cifradas). PostgreSQL rechaza un rol privilegiado preexistente en vez de degradarlo.
+
+---
+
 ## Nota al pie — por qué `.env.example` "no se podía actualizar"
 
 Dos entregas de este archivo (captura de `SELECT` y exportación de BDs) anotan que
