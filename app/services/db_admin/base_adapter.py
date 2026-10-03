@@ -818,6 +818,17 @@ class ServerAdapter(ABC):
         """
         return ["engine_unsupported"]
 
+    def data_credential_facts(self, database: str) -> dict:
+        """
+        Hechos que la sonda de la credencial de DATOS necesita (design D18). Corre con la
+        credencial del ``target`` (la de datos de ``database``, NUNCA la pseudo-root) y NO decide
+        nada: el veredicto es de ``readonly_probe.data_credential_probe``.
+
+        Default **fail-closed**: un motor sin sonda declara ``engine_unsupported`` y la
+        credencial no se verifica nunca.
+        """
+        return {"engine_unsupported": True}
+
     def list_internal_tables(
         self, database: str, *, conn: Connection | None = None
     ) -> list[str]:

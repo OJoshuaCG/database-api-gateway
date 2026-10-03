@@ -232,3 +232,50 @@ def public_reason(internal: str) -> str:
     para que esa rama no se ejecute jamás.
     """
     return INTERNAL_TO_PUBLIC.get(internal, REASON_UNSUPPORTED_NODE)
+
+
+#: Motivos cortos de la sonda de la credencial de DATOS (``readonly_probe``) -> código público.
+#: Prefijos y nombres exactos de los que emiten ``mysql_data_grant_violations`` y
+#: ``postgres_data_role_violations``; lo que no está acá sale como ``CREDENTIAL_TOO_BROAD``.
+_PROBE_WRITE_PREFIXES = ("privilege:",)
+_PROBE_WRITE_EXACT = frozenset(
+    {
+        "all_privileges",
+        "table_write_privileges",
+        "default_transaction_read_only_off",
+        "write_attempt_succeeded",
+    }
+)
+_PROBE_FEDERATED_EXACT = frozenset({"foreign_engine_table", "foreign_access_extension"})
+_PROBE_NOT_GREEN_EXACT = frozenset(
+    {
+        "missing_select_on_database",
+        "connection_limit",
+        "statement_timeout_unset",
+        "engine_unsupported",
+    }
+)
+
+
+def public_probe_reason(violation: str) -> str:
+    """
+    El código público de un motivo de la sonda de datos. **Fail-closed**: un motivo sin regla
+    sale como ``CREDENTIAL_TOO_BROAD`` (la credencial no se acepta) y nunca como el nombre interno.
+    """
+    if violation in _PROBE_FEDERATED_EXACT:
+        return REASON_FEDERATED_TABLE_PRESENT
+    if violation in _PROBE_WRITE_EXACT or violation.startswith(_PROBE_WRITE_PREFIXES):
+        return REASON_WRITE_PRIVILEGE_PRESENT
+    if violation in _PROBE_NOT_GREEN_EXACT:
+        return REASON_PROBE_NOT_GREEN
+    return REASON_CREDENTIAL_TOO_BROAD
+
+
+def public_probe_reasons(violations: list[str]) -> list[str]:
+    """Códigos públicos de una lista de motivos, sin repetir y en orden de aparición."""
+    out: list[str] = []
+    for v in violations:
+        code = public_probe_reason(v)
+        if code not in out:
+            out.append(code)
+    return out

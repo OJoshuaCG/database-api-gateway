@@ -300,6 +300,32 @@ def provision_data_credential(request: Request, actor: ServersAdmin, db_id: int)
     )
 
 
+@router.post(
+    "/{db_id}/data-credential/verify", response_model=ApiResponse[DataCredentialOut]
+)
+@limiter.limit("6/minute")
+def verify_data_credential(request: Request, actor: ServersAdmin, db_id: int):
+    """
+    Corre la sonda NEGATIVA de la credencial de datos: conecta con la cuenta de ESTA base y exige
+    que el motor muestre SELECT sobre exactamente esa base, sin privilegios de escritura, sin
+    tablas que reenvíen a otro servidor (``FEDERATED``/``CONNECT``/``SPIDER``) ni extensiones
+    que lo hagan (``dblink``/FDW en PostgreSQL). Sin cuerpo.
+
+    Solo si pasa fija ``verified_at``; las tools de datos la exigen reciente
+    (``MCP_DATA_CREDENTIAL_MAX_AGE_DAYS``). Si falla, BORRA la verificación anterior y responde 422
+    ``managed_database.data_probe_failed`` con ``public_context.reasons`` (``CREDENTIAL_TOO_BROAD``,
+    ``WRITE_PRIVILEGE_PRESENT``, ``FEDERATED_TABLE_PRESENT``, ``PROBE_NOT_GREEN``) y
+    ``public_context.violations`` (motivos cortos, nunca el texto de un grant).
+
+    Errores 409: ``data_credential.missing`` (sin credencial) y
+    ``data_credential.provision_in_progress`` (aprovisionar o revocar en curso).
+    """
+    return success(
+        data=ManagedDatabaseController().verify_data_credential(db_id, admin=actor),
+        message="Credencial de datos verificada.",
+    )
+
+
 @router.delete(
     "/{db_id}/data-credential", response_model=ApiResponse[DataCredentialOut]
 )

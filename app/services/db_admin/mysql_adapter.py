@@ -333,6 +333,72 @@ class MySQLAdapter(ServerAdapter):
             raise map_driver_error(exc, op="readonly_violations", target=self.target)
         return mysql_grant_violations(lineas)
 
+    def data_credential_facts(self, database: str) -> dict:
+        """
+        Hechos de la sonda de datos (design D18) para la familia MySQL: ``SHOW GRANTS``,
+        ``lower_case_table_names``, tablas con motor que reenvía a otro servidor (``FEDERATED``,
+        ``CONNECT``, ``SPIDER``: bloqueantes) y vistas que cruzan esquema o corren con
+        ``DEFINER`` (advertencias).
+
+        Lecturas solamente, con la credencial de datos. Las dos de advertencia son de mejor
+        esfuerzo: ``VIEW_TABLE_USAGE`` no existe en MariaDB ni en MySQL < 8.0.13, y sin ``SHOW
+        VIEW`` el catálogo no muestra las vistas, así que el conteo puede ser 0 sin serlo. Son
+        advertencia justamente por eso; el límite real es el ``GRANT``.
+        """
+        from app.services.db_admin.readonly_probe import MYSQL_FOREIGN_ENGINES
+
+        engines = ", ".join(f"'{e}'" for e in MYSQL_FOREIGN_ENGINES)  # constantes del módulo
+        facts: dict = {}
+        try:
+            with database_connection(self.target, database) as conn:
+                facts["grants"] = [
+                    str(r[0]) for r in conn.execute(text("SHOW GRANTS FOR CURRENT_USER()"))
+                ]
+                facts["lower_case_table_names"] = int(
+                    conn.execute(text("SELECT @@lower_case_table_names")).scalar() or 0
+                )
+                facts["foreign_engine_tables"] = int(
+                    conn.execute(
+                        text(
+                            "SELECT COUNT(*) FROM information_schema.TABLES "
+                            "WHERE TABLE_SCHEMA = :db AND UPPER(ENGINE) IN (" + engines + ")"
+                        ),
+                        {"db": database},
+                    ).scalar()
+                    or 0
+                )
+                facts["definer_views"] = int(
+                    conn.execute(
+                        text(
+                            "SELECT COUNT(*) FROM information_schema.VIEWS "
+                            "WHERE TABLE_SCHEMA = :db AND SECURITY_TYPE = 'DEFINER'"
+                        ),
+                        {"db": database},
+                    ).scalar()
+                    or 0
+                )
+                try:
+                    facts["cross_schema_views"] = int(
+                        conn.execute(
+                            text(
+                                "SELECT COUNT(*) FROM information_schema.VIEW_TABLE_USAGE "
+                                "WHERE VIEW_SCHEMA = :db AND TABLE_SCHEMA <> :db"
+                            ),
+                            {"db": database},
+                        ).scalar()
+                        or 0
+                    )
+                except SQLAlchemyError:
+                    facts["cross_schema_views"] = 0  # la vista no existe en este motor
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc,
+                op="data_credential_facts",
+                target=self.target,
+                extra={"database": database},
+            )
+        return facts
+
     def list_databases(self) -> list[str]:
         sql = (
             "SELECT SCHEMA_NAME AS name FROM INFORMATION_SCHEMA.SCHEMATA "

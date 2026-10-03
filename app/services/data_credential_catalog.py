@@ -19,8 +19,22 @@ CODE_DATA_PROVISION_IN_PROGRESS = "data_credential.provision_in_progress"
 #: o es una base de sistema o la propia base de metadatos del gateway. 409, antes de mutar.
 CODE_DATA_DATABASE_NOT_ELIGIBLE = "data_credential.database_not_eligible"
 
+#: La base no tiene credencial de datos que verificar (nunca se aprovisionó, o se revocó). 409,
+#: no es un fallo del motor: falta el paso de aprovisionar.
+CODE_DATA_CREDENTIAL_MISSING = "data_credential.missing"
+
+#: La sonda de la credencial de datos observó que NO es "SELECT sobre exactamente esta base": puede
+#: escribir, ve más de una base o hay tablas que reenvían a otro servidor. 422. La verificación
+#: queda borrada (``verified_at`` = null): las tools de datos la rechazan hasta que pase.
+#: ``public_context.reasons`` lleva los códigos públicos (``CREDENTIAL_TOO_BROAD``,
+#: ``WRITE_PRIVILEGE_PRESENT``, ``FEDERATED_TABLE_PRESENT``, ``PROBE_NOT_GREEN``) y
+#: ``public_context.violations`` los motivos cortos; nunca el texto de un grant.
+CODE_DATA_PROBE_FAILED = "managed_database.data_probe_failed"
+
 ERROR_CODES = frozenset(
     {
+        CODE_DATA_CREDENTIAL_MISSING,
+        CODE_DATA_PROBE_FAILED,
         CODE_DATA_ACCOUNT_ALREADY_EXISTS,
         CODE_DATA_PROVISION_IN_PROGRESS,
         CODE_DATA_DATABASE_NOT_ELIGIBLE,

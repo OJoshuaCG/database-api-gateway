@@ -498,6 +498,10 @@ MCP_READONLY_ACCOUNT_HOST = os.getenv("MCP_READONLY_ACCOUNT_HOST", "%").strip()
 # caracteres del usuario de MySQL con un id de hasta 11 dígitos, por eso el prefijo admite 20.
 # El host reutiliza `MCP_READONLY_ACCOUNT_HOST`.
 MCP_DATA_ACCOUNT_PREFIX = os.getenv("MCP_DATA_ACCOUNT_PREFIX", "mcp_d_").strip()
+# Antigüedad máxima, en días, de la última sonda VERDE de la credencial de datos. Pasada, las tools
+# de datos la rechazan (`PROBE_NOT_GREEN`) hasta re-verificar: un grant cambiado a mano en el motor
+# no puede quedar escondido detrás de una verificación vieja. Entero >= 1.
+MCP_DATA_CREDENTIAL_MAX_AGE_DAYS = int(os.getenv("MCP_DATA_CREDENTIAL_MAX_AGE_DAYS", "7"))
 
 # ======= Startup validation ======= #
 # La cuenta del MCP se interpola (quoteada) en CREATE USER / GRANT al aprovisionar. Se valida acá
@@ -516,6 +520,8 @@ if not re.match(r"^[A-Za-z0-9_.%:\-]{1,255}$", MCP_READONLY_ACCOUNT_HOST):
         "MCP_READONLY_ACCOUNT_HOST inválido: solo letras, dígitos y los caracteres _ . % : - "
         "(hasta 255)."
     )
+if MCP_DATA_CREDENTIAL_MAX_AGE_DAYS < 1:
+    raise ValueError("MCP_DATA_CREDENTIAL_MAX_AGE_DAYS inválido: debe ser un entero >= 1.")
 if not re.match(r"^[A-Za-z_][A-Za-z0-9_]{0,19}$", MCP_DATA_ACCOUNT_PREFIX):
     raise ValueError(
         "MCP_DATA_ACCOUNT_PREFIX inválido: debe ser un identificador "

@@ -29,7 +29,7 @@ from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.controllers.environment_controller import EnvironmentController
 from app.controllers.server_controller import _release_provision, _try_acquire_provision
 from app.core import remote_engine
-from app.core.crypto import CryptoConfigError, CryptoError, encrypt
+from app.core.crypto import CryptoConfigError, CryptoError, decrypt, encrypt
 from app.core.database import Database
 from app.core.environments import (
     DB_HOST,
@@ -39,8 +39,9 @@ from app.core.environments import (
     DB_USER,
     MCP_DATA_ACCOUNT_PREFIX,
     MCP_READONLY_ACCOUNT_HOST,
+    REMOTE_SSL_MODE,
 )
-from app.core.remote_engine import DUPLICATE_DATABASE_CODES
+from app.core.remote_engine import DUPLICATE_DATABASE_CODES, ServerTarget
 from app.exceptions import AppHttpException
 from app.models.database_model import DatabaseModel
 from app.models.enums import EngineType, ProvisionStatus
@@ -49,7 +50,7 @@ from app.models.managed_database_data_credential import ManagedDatabaseDataCrede
 from app.models.model_migration import ModelMigration
 from app.models.server import Server
 from app.models.server_user import ServerUser
-from app.services import audit, charset_catalog
+from app.services import audit, charset_catalog, mcp_catalog
 from app.services import data_credential_catalog as dcodes
 from app.services import environment_catalog as ecodes
 from app.services import provisioning_catalog as pcodes
@@ -59,6 +60,7 @@ from app.services.db_admin.identifiers import (
     validate_host,
     validate_identifier,
 )
+from app.services.db_admin.readonly_probe import data_credential_probe
 from app.services.db_admin.protected_accounts import (
     assert_not_privileged_role,
     assert_not_protected_by_name,
@@ -337,8 +339,12 @@ class ManagedDatabaseController:
         5. ``record_intent`` fail-closed y credencial cifrada SIN verificar ANTES de que el motor
            cambie: si el paso 6 falla, el reintento ve usuario guardado == configurado y converge.
         6. Cuenta + grants en el motor (idempotente: rota la contraseña y re-aplica).
-        7. Sonda: placeholder hasta la slice del probe; la credencial queda SIN verificar y por
-           lo tanto inusable por las tools de datos.
+        7. La credencial queda SIN verificar y por lo tanto inusable por las tools de datos: la
+           sonda es un paso APARTE (``verify_data_credential``,
+           ``POST .../data-credential/verify``). No corre acá a propósito: aprovisionar y
+           verificar fallan por motivos distintos (el primero es DCL con la pseudo-root, el
+           segundo conecta con la cuenta nueva), y separarlos deja que un 422 de la sonda no
+           oculte que la cuenta SÍ quedó creada.
         """
         session = self._session()
         try:
@@ -489,15 +495,178 @@ class ManagedDatabaseController:
             + "; pendiente de verificación",
         )
         remote_engine.invalidate_server(server_id)
-        self._verify_data_credential(db_id, admin=admin)
+
+    def verify_data_credential(
+        self, db_id: int, *, admin: "dict | Actor | None" = None
+    ) -> dict:
+        """
+        Corre la sonda de la credencial de datos de UNA base y devuelve su estado. Mismo lock por
+        base que aprovisionar y revocar: sonda y rotación de contraseña no se pisan (409
+        ``provision_in_progress``). Un fallo de la sonda es un 422 (ver ``_verify_data_credential``).
+        """
+        session = self._session()
+        try:
+            self._get_or_404(session, db_id)
+        finally:
+            session.close()
+        lock_key = ("data", db_id)
+        if not _try_acquire_provision(lock_key):
+            raise self._data_in_progress(db_id)
+        try:
+            self._verify_data_credential(db_id, admin=admin)
+        finally:
+            _release_provision(lock_key)
+        return self._data_credential_status(db_id)
+
+    def _build_data_target(self, db_id: int) -> tuple[ServerTarget, str]:
+        """
+        ``(ServerTarget con la credencial de DATOS, nombre de la base)``. **Nunca lee la
+        pseudo-root**: sin credencial guardada falla 409, sin fallback con ningún flag.
+        """
+        session = self._session()
+        try:
+            md = self._get_or_404(session, db_id)
+            server = get_server_or_404(session, md.server_id)
+            row = self._data_credential_row(session, db_id)
+            if row is None:
+                raise AppHttpException(
+                    message=(
+                        "La base no tiene credencial de datos. Aprovisionala con "
+                        "POST /managed-databases/{id}/data-credential/provision antes de verificar."
+                    ),
+                    status_code=409,
+                    context={"managed_database_id": db_id},
+                    public_context={"code": dcodes.CODE_DATA_CREDENTIAL_MISSING},
+                )
+            try:
+                password = decrypt(row.password_encrypted)
+            except (CryptoError, CryptoConfigError) as exc:
+                raise AppHttpException(
+                    message="No se pudo descifrar la credencial de datos de la base.",
+                    status_code=500,
+                    context={"managed_database_id": db_id},
+                ) from exc
+            target = ServerTarget(
+                server_id=server.id,
+                dialect=engine_value(server),
+                host=server.host,
+                port=server.port,
+                admin_user=row.username,
+                admin_password=password,
+                ssl_mode=server.ssl_mode if server.ssl_mode is not None else REMOTE_SSL_MODE,
+            )
+            return target, md.name
+        finally:
+            session.close()
 
     def _verify_data_credential(self, db_id: int, *, admin: "dict | Actor | None" = None) -> None:
         """
-        Gancho de la sonda de la credencial de datos. PLACEHOLDER de esta slice: no verifica nada,
-        así que ``verified_at`` queda en ``None`` y las tools de datos (que exigen una
-        verificación fresca) no pueden usar la credencial. La slice del probe lo reemplaza.
+        Sonda NEGATIVA de la credencial de datos (design D18): conecta con la cuenta de ESA base
+        y exige que el motor muestre "SELECT sobre exactamente esta base y nada más". Solo si
+        pasa fija ``verified_at``; las tools de datos exigen además que sea reciente
+        (``MCP_DATA_CREDENTIAL_MAX_AGE_DAYS``).
+
+        Mismo contrato que ``ServerController._verify_readonly``: un fallo **borra** la
+        verificación anterior en vez de dejarla (una credencial que hoy escribe no sigue en el
+        MCP porque hace una semana no escribía). Va más lejos en un punto: si la sonda NO PUDO
+        correr (motor caído, cuenta rota), también la borra. Sin veredicto no hay verde.
+
+        Se guardan los motivos cortos y las advertencias (JSON, SIN texto de grants: puede
+        llevar el host de la cuenta). La respuesta 422 lleva ``reasons`` (códigos públicos) y
+        ``violations`` (motivos cortos), nunca el mensaje del motor.
         """
-        return None
+        from datetime import UTC, datetime
+
+        target, db_name = self._build_data_target(db_id)
+        server_id = target.server_id
+        try:
+            facts = get_adapter(target).data_credential_facts(db_name)
+            violations, warnings = data_credential_probe(
+                target.dialect, facts, database=db_name
+            )
+        except Exception:
+            self._record_data_probe(db_id, verified=False, violations=None, warnings=None)
+            audit.record(
+                "managed_database.data_credential.verify",
+                status="error",
+                admin=admin,
+                target_type="managed_database",
+                target_id=db_id,
+                server_id=server_id,
+                touched_engine=True,
+                detail="la sonda no pudo correr; la credencial quedó des-verificada",
+            )
+            raise
+        verified = not violations
+        self._record_data_probe(
+            db_id,
+            verified=verified,
+            violations=violations,
+            warnings=warnings,
+            now=datetime.now(UTC).replace(tzinfo=None),
+        )
+        if violations:
+            audit.record(
+                "managed_database.data_credential.verify",
+                status="failure",
+                admin=admin,
+                target_type="managed_database",
+                target_id=db_id,
+                server_id=server_id,
+                touched_engine=True,
+                detail="la credencial de datos no es SELECT-only sobre la base: "
+                + ", ".join(violations),
+            )
+            raise AppHttpException(
+                message=(
+                    "La credencial de datos tiene privilegios de más o de escritura. La base "
+                    "queda fuera de las tools de datos del MCP hasta corregir sus grants."
+                ),
+                status_code=422,
+                context={"managed_database_id": db_id},
+                public_context={
+                    "code": dcodes.CODE_DATA_PROBE_FAILED,
+                    "reasons": mcp_catalog.public_probe_reasons(violations),
+                    "violations": violations,
+                },
+            )
+        audit.record(
+            "managed_database.data_credential.verify",
+            admin=admin,
+            target_type="managed_database",
+            target_id=db_id,
+            server_id=server_id,
+            touched_engine=True,
+            detail="sonda superada: SELECT sobre exactamente esta base y nada más",
+        )
+
+    def _record_data_probe(
+        self,
+        db_id: int,
+        *,
+        verified: bool,
+        violations: list[str] | None,
+        warnings: list[str] | None,
+        now=None,
+    ) -> None:
+        """Persiste el resultado de la sonda. ``violations=None`` = la sonda no corrió."""
+        session = self._session()
+        try:
+            row = self._data_credential_row(session, db_id)
+            if row is None:
+                return
+            row.verified_at = now if verified else None
+            if violations is None:
+                row.probed_at = None
+                row.probe_violations = None
+                row.probe_warnings = None
+            else:
+                row.probed_at = now
+                row.probe_violations = json.dumps(violations)
+                row.probe_warnings = json.dumps(warnings or [])
+            session.commit()
+        finally:
+            session.close()
 
     def clear_data_credential(
         self, db_id: int, *, admin: "dict | Actor | None" = None

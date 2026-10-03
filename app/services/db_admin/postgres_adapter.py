@@ -354,17 +354,132 @@ class PostgresAdapter(ServerAdapter):
                         "('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')"
                     )
                 ).scalar()
-                conn.rollback()
-                try:
-                    conn.execute(text("CREATE TEMP TABLE _gw_readonly_probe (x int)"))
-                    facts["temp_write_succeeded"] = True
-                except SQLAlchemyError:
-                    facts["temp_write_succeeded"] = False
-                finally:
-                    conn.rollback()
+                facts["temp_write_succeeded"] = self._temp_write_succeeded(conn)
         except SQLAlchemyError as exc:
             raise map_driver_error(exc, op="readonly_violations", target=self.target)
         return postgres_role_violations(facts)
+
+    @staticmethod
+    def _temp_write_succeeded(conn) -> bool:
+        """
+        Intento REAL de escritura que el motor tiene que rechazar (``25006`` con
+        ``default_transaction_read_only = on``). Compartido por la sonda de estructura y la de
+        datos: un ``CREATE TEMP TABLE`` dentro de una transacción que se revierte SIEMPRE, y el
+        DDL de PG es transaccional, así que aun si pasara no queda nada.
+        """
+        conn.rollback()
+        try:
+            conn.execute(text("CREATE TEMP TABLE _gw_readonly_probe (x int)"))
+            return True
+        except SQLAlchemyError:
+            return False
+        finally:
+            conn.rollback()
+
+    def data_credential_facts(self, database: str) -> dict:
+        """
+        Hechos de la sonda de datos (design D18) para PostgreSQL, leídos conectado a ``database``
+        con el rol de datos: atributos, pertenencias a roles, privilegios de escritura sobre
+        CUALQUIER relación de usuario (incluidos los heredados de ``PUBLIC``), ``CONNECT``
+        explícito o vía ``PUBLIC`` a otras bases, extensiones que sacan datos de la base
+        (bloqueantes), tope de conexiones, ``statement_timeout`` y el intento de escritura real.
+        """
+        from app.services.db_admin.readonly_probe import POSTGRES_FOREIGN_EXTENSIONS
+
+        facts: dict = {}
+        names = ", ".join(f"'{e}'" for e in POSTGRES_FOREIGN_EXTENSIONS)  # constantes del módulo
+        me = "(SELECT oid FROM pg_roles WHERE rolname = current_user)"
+        try:
+            with database_connection(self.target, database) as conn:
+                fila = conn.execute(
+                    text(
+                        "SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, "
+                        "rolbypassrls, rolconnlimit FROM pg_roles WHERE rolname = current_user"
+                    )
+                ).mappings().first()
+                if fila is not None:
+                    facts.update({k: bool(v) for k, v in fila.items() if k != "rolconnlimit"})
+                    facts["rolconnlimit"] = int(fila["rolconnlimit"])
+                for key, setting in (
+                    ("default_transaction_read_only", "default_transaction_read_only"),
+                    ("statement_timeout", "statement_timeout"),
+                ):
+                    facts[key] = conn.execute(
+                        text("SELECT current_setting(:s)"), {"s": setting}
+                    ).scalar()
+                facts["can_create_in_database"] = bool(
+                    conn.execute(
+                        text("SELECT has_database_privilege(current_database(), 'CREATE')")
+                    ).scalar()
+                )
+                facts["can_create_in_public"] = bool(
+                    conn.execute(
+                        text(
+                            "SELECT COALESCE(has_schema_privilege("
+                            "to_regnamespace('public'), 'CREATE'), false)"
+                        )
+                    ).scalar()
+                )
+                facts["write_roles"] = [
+                    r
+                    for r in self._WRITE_ROLES
+                    if conn.execute(
+                        text(
+                            "SELECT COALESCE(pg_has_role(current_user, to_regrole(:r), "
+                            "'MEMBER'), false)"
+                        ),
+                        {"r": r},
+                    ).scalar()
+                ]
+                facts["role_memberships"] = int(
+                    conn.execute(
+                        text(f"SELECT count(*) FROM pg_auth_members WHERE member = {me}")
+                    ).scalar()
+                    or 0
+                )
+                facts["table_write_privileges"] = int(
+                    conn.execute(
+                        text(
+                            "SELECT count(*) FROM pg_class c "
+                            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                            "WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') "
+                            "AND left(n.nspname, 3) <> 'pg_' "
+                            "AND n.nspname <> 'information_schema' "
+                            "AND (has_table_privilege(c.oid, 'INSERT') "
+                            "OR has_table_privilege(c.oid, 'UPDATE') "
+                            "OR has_table_privilege(c.oid, 'DELETE') "
+                            "OR has_table_privilege(c.oid, 'TRUNCATE'))"
+                        )
+                    ).scalar()
+                    or 0
+                )
+                facts["foreign_access_extensions"] = [
+                    str(r[0])
+                    for r in conn.execute(
+                        text("SELECT extname FROM pg_extension WHERE extname IN (" + names + ")")
+                    )
+                ]
+                connect_grants = (
+                    "SELECT count(*) FROM pg_database d, "
+                    "aclexplode(COALESCE(d.datacl, acldefault('d', d.datdba))) a "
+                    "WHERE a.privilege_type = 'CONNECT' AND NOT d.datistemplate "
+                    "AND d.datname <> current_database() AND a.grantee = "
+                )
+                facts["explicit_connect_other_databases"] = int(
+                    conn.execute(text(connect_grants + me)).scalar() or 0
+                )
+                facts["public_connect_other_databases"] = int(
+                    conn.execute(text(connect_grants + "0")).scalar() or 0
+                )
+                facts["temp_write_succeeded"] = self._temp_write_succeeded(conn)
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc,
+                op="data_credential_facts",
+                target=self.target,
+                extra={"database": database},
+            )
+        return facts
 
     def list_databases(self) -> list[str]:
         sql = (
