@@ -296,6 +296,21 @@ Tres pasos. Necesita: el **host del gateway** y su **token**.
 export GATEWAY_MCP_TOKEN='dbgw.J5uBh8FFa52o3b7xKq2w.el-secreto'
 ```
 
+### B.2.1 Un token hereda los permisos de quien lo emitió
+
+Un token no es una identidad independiente: es una **delegación** del usuario que lo emitió
+(`created_by_admin_id`). Sus capacidades son `scopes ∩ techo de agente ∩ capacidades del emisor`,
+y el emisor se relee en cada request:
+
+- Un token **nunca** puede más que su emisor. Si al emisor le quitan una capacidad, el token la
+  pierde desde la llamada siguiente (`tools/list` deja de publicar esas tools).
+- Si el emisor se **desactiva**, se borra o no existe, el token se rechaza con el mismo
+  `401 mcp.token_invalid` de siempre; el motivo (`emisor_inactivo`) queda solo en la auditoría.
+- **Los tokens legados con emisor `NULL` quedan rechazados** a partir de este cambio: hay que
+  reemitirlos.
+- **No restringe el alcance por entorno.** El modelo de roles no tiene denegación por entorno (un
+  `viewer` lee todo), así que lo único que acota el destino de un token es su proyecto.
+
 **PowerShell** (perfil, `$PROFILE`):
 
 ```powershell
@@ -375,7 +390,7 @@ propio resultado lo dice en su campo `note`. Es el estado normal el primer día.
 | Qué ves | Qué pasó | Qué hacer |
 |---|---|---|
 | `503 mcp.disabled` | El servidor está apagado | `MCP_ENABLED=true` y reiniciar (A.1) |
-| `401 mcp.token_invalid` | El token no existe, venció o está revocado | Es **un solo código para los tres**, a propósito. Quien administra lo distingue: en `audit_log`, `action='mcp.auth'` trae el motivo real en `detail` |
+| `401 mcp.token_invalid` | El token no existe, venció, está revocado o su emisor está inactivo, borrado o sin registrar (token legado) | Es **un solo código para todos**, a propósito. Quien administra lo distingue: en `audit_log`, `action='mcp.auth'` trae el motivo real en `detail` |
 | `403` | Mandaste un `Origin` que no está en `CORS_ORIGINS` | Solo pasa desde un navegador. Un cliente MCP no manda `Origin` |
 | `400` con `-32020` | Los headers no coinciden con el cuerpo | **No actualices el cliente todavía: el mensaje dice cuál no calza.** Si se queja de que falta `_meta.…/protocolVersion`, el cliente está bien y el servidor está clasificando mal su revisión — reportalo. Recién si el que no calza es `Mcp-Method` o `Mcp-Name`, mirá el cliente |
 | `400` con `-32022` | El cliente pide una versión de protocolo que el servidor no habla | La respuesta trae `data.supported` con las que sí |
@@ -398,14 +413,15 @@ WHERE action = 'mcp.auth'
 ORDER BY id DESC LIMIT 20;
 ```
 
-El `detail` de un rechazo dice el motivo (`rechazo=inexistente|hmac|revocado|expirado`) y el
+El `detail` de un rechazo dice el motivo (`rechazo=inexistente|hmac|revocado|expirado|emisor_inactivo`) y el
 `token_id`. **Nunca el secreto.**
 
 ---
 
 ## Cuando alguien se va del equipo
 
-1. **Revocar sus tokens** (B.4). El acceso corta en el request siguiente, sin caché.
+1. **Revocar sus tokens** (B.4). El acceso corta en el request siguiente, sin caché. Desactivar
+   su usuario también corta los tokens que EMITIÓ (B.2.1), pero revocar sigue siendo lo explícito.
 2. Verificar con `GET /api/v1/api-tokens` que no queda ninguno vivo a su nombre.
 3. Su usuario del gateway se **desactiva**, nunca se borra: el username no se reusa jamás, porque
    `audit_log` lo desnormaliza y una persona nueva heredaría la apariencia de las filas viejas.

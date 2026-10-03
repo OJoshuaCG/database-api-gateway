@@ -1300,6 +1300,14 @@ solo head después del merge; **encadenar, nunca `alembic merge heads`**). Const
 `expires_at` **NOT NULL** · `last_used_at` nullable · `revoked_at` nullable ·
 `created_by_admin_id` FK `users.id` nullable · `note` `Text` nullable · `TimestampMixin`.
 
+> **Actualización: el token ya no es independiente del usuario.** `created_by_admin_id` (en la
+> implementación, sin FK y nullable) es el EMISOR y manda: `authenticate_agent` lo relee en cada
+> request y rechaza (`emisor_inactivo`, respuesta opaca `mcp.token_invalid`) si es NULL, no
+> existe o está desactivado; y las capacidades del token son `scopes ∩ techo de agente ∩
+> capacidades del emisor`, así que nunca superan las de quien lo emitió. Los tokens legados con
+> emisor NULL quedan rechazados. **No se restringe el alcance por entorno**: el modelo de roles no
+> tiene denegación por entorno.
+
 - **`project_id` NOT NULL.** Un token sin proyecto no tiene ninguna base alcanzable, así que lo
   único que un `NULL` podría significar es "token global" — precisamente el radio de explosión que
   este diseño existe para no tener. La tabla es nueva: no hay filas que invalidar, así que nace
