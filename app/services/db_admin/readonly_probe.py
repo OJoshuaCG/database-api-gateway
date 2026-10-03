@@ -184,7 +184,247 @@ def postgres_role_violations(facts: dict) -> list[str]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Sonda de la credencial de DATOS por base (design D18): SELECT sobre EXACTAMENTE una base          #
+# --------------------------------------------------------------------------- #
+
+#: Privilegios de ESTRUCTURA que la credencial de datos NO recibe, pero que no escriben filas: si
+#: aparecen son exceso (``extra_privilege``), no escritura. ``TRIGGER``/``EVENT`` quedan fuera a
+#: propósito: permiten crear objetos, y para la cuenta de datos sí cuentan como escritura.
+_MYSQL_DATA_EXTRA_PRIVILEGES = MYSQL_ALLOWED_PRIVILEGES - {"USAGE", "SELECT", "TRIGGER", "EVENT"}
+
+#: Motores que reenvían consultas a OTRO servidor: un ``SELECT`` sobre una tabla así sale de la
+#: base y cruza el límite del grant (BLOQUEANTE, spec S32 enmendada; D18).
+MYSQL_FOREIGN_ENGINES = ("FEDERATED", "CONNECT", "SPIDER")
+POSTGRES_FOREIGN_EXTENSIONS = ("dblink", "postgres_fdw", "mysql_fdw", "file_fdw")
+
+#: Tope de conexiones simultáneas con el que se aprovisiona el rol de PostgreSQL.
+POSTGRES_DATA_MAX_CONNECTIONS = 3
+
+
+def _split_grant_object(obj: str) -> list[tuple[str, bool]] | None:
+    """
+    ``\\`app\\_prod\\`.*`` → ``[("app\\_prod", True), ("*", False)]`` (texto, venía entre comillas).
+
+    ``None`` si la forma no se entiende: el llamador la reporta como ``unrecognized_grant``.
+    Un ``*`` entre comillas es un nombre, no el comodín: por eso se conserva el flag.
+    """
+    parts: list[tuple[str, bool]] = []
+    i, n = 0, len(obj)
+    while True:
+        if i < n and obj[i] == "`":
+            j, buf = i + 1, []
+            while True:
+                if j >= n:
+                    return None
+                if obj[j] == "`":
+                    if j + 1 < n and obj[j + 1] == "`":
+                        buf.append("`")
+                        j += 2
+                        continue
+                    break
+                buf.append(obj[j])
+                j += 1
+            parts.append(("".join(buf), True))
+            i = j + 1
+        else:
+            j = obj.find(".", i)
+            j = n if j == -1 else j
+            parts.append((obj[i:j], False))
+            i = j
+        if i >= n:
+            break
+        if obj[i] != ".":
+            return None
+        i += 1
+    return parts
+
+
+def _unescape_db_pattern(pattern: str) -> tuple[str, bool]:
+    """
+    Nombre real de un patrón de base de ``SHOW GRANTS`` y si trae comodines SIN escapar.
+
+    ``app\\_prod`` → ``("app_prod", False)``; ``app_prod`` → ``("app_prod", True)``: un ``_`` o
+    un ``%`` sin barra cubren OTRAS bases (``appXprod``), y eso es lo que la sonda busca.
+    """
+    out: list[str] = []
+    wildcard = False
+    i, n = 0, len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(pattern[i + 1])
+            i += 2
+            continue
+        if ch in "_%":
+            wildcard = True
+        out.append(ch)
+        i += 1
+    return "".join(out), wildcard
+
+
+def mysql_data_grant_violations(
+    lines: list[str], *, database: str, lower_case_table_names: int | None = 0
+) -> list[str]:
+    """
+    Motivos por los que ``SHOW GRANTS FOR CURRENT_USER()`` NO es "SELECT sobre exactamente
+    ``database`` y nada más". PURA: allowlist, y lo que no se entiende es una violación.
+
+    Admite ``USAGE ON *.*`` y ``SELECT`` (de base, tabla o columna) sobre ``database``. El
+    nombre se compara carácter a carácter tras des-escapar el patrón; distingue mayúsculas salvo
+    que el motor guarde los nombres en minúsculas (``lower_case_table_names`` 1 o 2). Un valor
+    ausente cuenta como 0 (estricto): ante la duda no se asume el motor permisivo.
+    """
+    out: list[str] = []
+
+    def add(code: str) -> None:
+        if code not in out:
+            out.append(code)
+
+    insensitive = lower_case_table_names in (1, 2)
+    target = database.lower() if insensitive else database
+    has_select = False
+    for line in lines:
+        texto = (line or "").strip()
+        if not texto:
+            continue
+        if "WITH GRANT OPTION" in texto.upper():
+            add("grant_option")
+        m = _GRANT_RE.match(texto)
+        if m is None or re.match(r"^GRANT\s+PROXY\b", texto, re.IGNORECASE):
+            add("unrecognized_grant")  # rol otorgado, PROXY, o una forma desconocida
+            continue
+        parts = _split_grant_object(m.group("obj"))
+        if parts is None or len(parts) != 2:
+            add("unrecognized_grant")
+            continue
+        (schema, schema_quoted), (table, table_quoted) = parts
+        is_global = schema == "*" and not schema_quoted
+        if is_global and (table != "*" or table_quoted):
+            add("unrecognized_grant")
+            continue
+        for priv in _split_privileges(m.group("privs")):
+            if priv == "USAGE":
+                continue
+            if is_global:
+                add(f"global_privilege:{priv.lower().replace(' ', '_')}")
+            if priv in ("ALL", "ALL PRIVILEGES"):
+                add("all_privileges")
+            elif priv in _MYSQL_DATA_EXTRA_PRIVILEGES:
+                add(f"extra_privilege:{priv.lower().replace(' ', '_')}")
+            elif priv != "SELECT":
+                add(f"privilege:{priv.lower().replace(' ', '_')}")
+            if is_global:
+                continue
+            name, wildcard = _unescape_db_pattern(schema)
+            if wildcard:
+                add("wildcard_database_pattern")
+            elif (name.lower() if insensitive else name) != target:
+                add("select_outside_database")
+            elif priv == "SELECT":
+                has_select = True
+    if not has_select:
+        add("missing_select_on_database")
+    return out
+
+
+def postgres_data_role_violations(facts: dict) -> tuple[list[str], list[str]]:
+    """
+    ``(violaciones, advertencias)`` del rol de datos de PostgreSQL a partir de los hechos que lee
+    el adapter. Una clave AUSENTE de las que protegen cuenta como violación: si el adapter no
+    pudo leer un hecho, la sonda no lo asume favorable.
+
+    ``CREATE`` sobre la base o el esquema ``public`` es solo ADVERTENCIA: en PostgreSQL <= 14
+    ``PUBLIC`` lo tiene por default y bloquear ahí dejaría la credencial inusable en un servidor
+    estándar. Lo cierra ``default_transaction_read_only`` (que SÍ es bloqueante) y el intento de
+    escritura real.
+    """
+    out: list[str] = []
+    warnings: list[str] = []
+
+    def add(code: str) -> None:
+        if code not in out:
+            out.append(code)
+
+    for attr in ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls"):
+        if facts.get(attr, True):
+            add(f"role_attribute:{attr}")
+    if facts.get("default_transaction_read_only") != "on":
+        add("default_transaction_read_only_off")
+    if facts.get("temp_write_succeeded", True):
+        add("write_attempt_succeeded")
+    if facts.get("table_write_privileges", 1):
+        add("table_write_privileges")
+    for role in facts.get("write_roles") or []:
+        add(f"member_of:{role}")
+    if facts.get("role_memberships", 1):
+        add("member_of_role")
+    if facts.get("foreign_access_extensions") or []:
+        add("foreign_access_extension")
+    if facts.get("explicit_connect_other_databases", 1):
+        add("select_outside_database")
+    limit = facts.get("rolconnlimit")
+    if not isinstance(limit, int) or not 1 <= limit <= POSTGRES_DATA_MAX_CONNECTIONS:
+        add("connection_limit")
+    if str(facts.get("statement_timeout") or "0").strip() in ("0", "0ms", "0s", ""):
+        add("statement_timeout_unset")
+    if facts.get("can_create_in_database"):
+        warnings.append("create_on_database")
+    if facts.get("can_create_in_public"):
+        warnings.append("create_on_schema_public")
+    if facts.get("public_connect_other_databases"):
+        warnings.append("public_connect_other_databases")
+    return out, warnings
+
+
+def data_credential_probe(
+    dialect: str, facts: dict, *, database: str
+) -> tuple[list[str], list[str]]:
+    """
+    Veredicto PURO de la sonda de datos: ``(violaciones bloqueantes, advertencias)``. Vacío de
+    violaciones = verde. Un motor sin sonda o unos hechos que declaran ``engine_unsupported``
+    nunca verifican (fail-closed, igual que ``ServerAdapter.readonly_violations``).
+    """
+    if facts.get("engine_unsupported"):
+        return ["engine_unsupported"], []
+    if dialect in ("mysql", "mariadb"):
+        violations = mysql_data_grant_violations(
+            facts.get("grants") or [],
+            database=database,
+            lower_case_table_names=facts.get("lower_case_table_names", 0),
+        )
+        if facts.get("foreign_engine_tables", 0):
+            violations.append("foreign_engine_table")
+        warnings: list[str] = []
+        if facts.get("cross_schema_views", 0):
+            warnings.append("cross_schema_view_reference")
+        if facts.get("definer_views", 0):
+            warnings.append("definer_views_present")
+        return violations, warnings
+    if dialect == "postgresql":
+        return postgres_data_role_violations(facts)
+    return ["engine_unsupported"], []
+
+
+def data_probe_is_fresh(verified_at, *, now, max_age_days: int) -> bool:
+    """
+    ¿La última sonda verde es lo bastante reciente? ``verified_at`` ausente = no. PURA (``now``
+    viene del llamador). Fecha futura (reloj corrido) = no fresca: ante la duda, se re-sonda.
+    """
+    if verified_at is None:
+        return False
+    age = (now - verified_at).total_seconds()
+    return 0 <= age <= max_age_days * 86400
+
+
 __all__ = [
+    "MYSQL_FOREIGN_ENGINES",
+    "POSTGRES_FOREIGN_EXTENSIONS",
+    "POSTGRES_DATA_MAX_CONNECTIONS",
+    "data_credential_probe",
+    "data_probe_is_fresh",
+    "mysql_data_grant_violations",
+    "postgres_data_role_violations",
     "MYSQL_SHOW_ROUTINE_MIN_VERSION",
     "ReadonlyPreflight",
     "mysql_global_grants_for_version",
