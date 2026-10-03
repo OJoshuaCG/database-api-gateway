@@ -2114,9 +2114,49 @@ Entrega 2 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference-v35
 - **Sin fila no se borra nada del motor.** La propiedad de la cuenta es la fila (usuario guardado
   == usuario configurado), igual que en la credencial por servidor: una cuenta homónima ajena da
   409 antes de mutar.
-- **La sonda todavía no existe:** el aprovisionamiento deja `verified_at = null`. Es deliberado: el
-  gate de las tools de datos exige verificación fresca, así que esta entrega no habilita lectura
-  de datos aunque la cuenta exista.
+- **El aprovisionamiento deja `verified_at = null`.** Es deliberado: el gate de las tools de
+  datos exige verificación fresca, así que aprovisionar solo no habilita lectura de datos. La sonda
+  es un paso aparte (ver D18).
+
+## MCP: sonda de la credencial de datos (D18, enmienda S32)
+
+Entrega 3 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference-v35.md`.
+
+- **Allowlist estricta y distinta de la de estructura.** La credencial de datos es `SELECT` sobre una
+  base y nada más, así que `mysql_data_grant_violations` solo admite `USAGE ON *.*` y `SELECT` sobre la
+  base objetivo. `SHOW VIEW` y compañía son "exceso" (`CREDENTIAL_TOO_BROAD`); `TRIGGER`/`EVENT` y todo
+  lo demás cuentan como escritura. Lo que la sonda no entiende (roles, `PROXY`, sintaxis nueva, un
+  objeto mal formado) es violación: una sonda que aprueba lo desconocido aprueba cualquier credencial
+  nueva por default.
+- **El patrón de base se des-escapa carácter a carácter.** Comparar el texto crudo daría por buena una
+  base `app_prod` otorgada como `app_prod` (el `_` sin escapar cubre también `appXprod`). Un `_`/`%` sin
+  barra es `wildcard_database_pattern`. El nombre distingue mayúsculas salvo que el motor guarde en
+  minúsculas (`lower_case_table_names` 1 o 2); un valor ausente se trata como 0 (estricto).
+- **S32 enmendada: `FEDERATED`/`CONNECT`/`SPIDER` BLOQUEAN, no avisan.** La spec original decía
+  "warn". Una tabla federada hace que un `SELECT` salga de la base y cruce el límite del grant, lo que
+  contradice "exactamente una base". En PostgreSQL, igual con `dblink`/`postgres_fdw`/`mysql_fdw`/
+  `file_fdw` instaladas. Código público `FEDERATED_TABLE_PRESENT`.
+- **PostgreSQL: `CREATE` sobre la base o `public` es solo advertencia.** En PG <= 14 `PUBLIC` lo tiene
+  por default y bloquear dejaría la credencial inusable en un servidor estándar. Lo cierra
+  `default_transaction_read_only` (bloqueante) más el intento real de escritura. El `CONNECT` a otras
+  bases vía `PUBLIC` también avisa; uno **explícito** al rol bloquea. Los privilegios de escritura se
+  miden con `has_table_privilege` sobre cada relación de usuario, no con `information_schema`, que no
+  ve los heredados de `PUBLIC`.
+- **Las advertencias de vistas son de mejor esfuerzo.** `VIEW_TABLE_USAGE` no existe en MariaDB ni en
+  MySQL < 8.0.13, y sin `SHOW VIEW` el catálogo oculta las vistas, así que el conteo puede dar 0 sin
+  serlo. Por eso son advertencia: el límite real es el `GRANT`.
+- **La sonda va en un paso aparte (`POST .../verify`) y no dentro del aprovisionamiento.** Aprovisionar
+  es DCL con la pseudo-root; verificar conecta con la cuenta nueva. Si fueran uno, un 422 de la sonda
+  ocultaría que la cuenta SÍ quedó creada. Misma disciplina que `_verify_readonly`: un fallo BORRA
+  `verified_at`; y si la sonda no pudo correr, también.
+- **Los errores salen con códigos cerrados.** `public_context.reasons` usa `mcp_catalog.
+  public_probe_reason` (fail-closed: un motivo sin regla es `CREDENTIAL_TOO_BROAD`); `violations` lleva
+  los motivos cortos. Nunca el texto de un grant (puede llevar el host de la cuenta) ni `str(exc)`.
+- **Frescura:** `MCP_DATA_CREDENTIAL_MAX_AGE_DAYS` (7) y `readonly_probe.data_probe_is_fresh`. Las tools
+  de datos (entregas 5-6) tienen que usarlas: una sonda vieja no es verde.
+- **Waiver S14 (PII):** el modelo no tiene fuente de verdad de PII, así que `PII_BLOCKED` queda
+  reservado en el vocabulario y sin emisor. El límite real es el `GRANT` del motor que esta sonda
+  verifica.
 
 ---
 
