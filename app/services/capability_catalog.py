@@ -573,6 +573,9 @@ CODE_GRANT_SCOPE_NOT_FOUND = "access.grant_scope_not_found"
 CODE_SCOPE_HAS_GRANTS = "access.scope_has_grants"
 #: El destinatario está desactivado: no se le otorga nada hasta reactivarlo. 409.
 CODE_GRANT_USER_INACTIVE = "access.grant_user_inactive"
+#: Alta masiva rechazada entera: al menos un destino falló. ``public_context.failures`` lleva
+#: ``[{scope_id, code, message}]`` (un código de este vocabulario por destino). No se insertó nada. 409.
+CODE_GRANT_BULK_FAILED = "access.grant_bulk_failed"
 #: Quien pidió una capacidad sensible no puede aprobarla él mismo. 409.
 CODE_SELF_APPROVAL = "access.self_approval_forbidden"
 #: La solicitud ya no está pendiente (decidida, vencida o cancelada). 409.

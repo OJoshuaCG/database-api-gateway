@@ -24,7 +24,12 @@ from app.core.limiter import client_address, limiter
 from app.core.authz import AccessAdmin
 from app.schemas.access_request import GatewayUserCreatedPendingOut, GatewayUserPendingOut
 from app.schemas.authz import EffectiveAccessOut
-from app.schemas.capability_grant import CapabilityGrantCreate, CapabilityGrantOut
+from app.schemas.capability_grant import (
+    CapabilityGrantBulkCreate,
+    CapabilityGrantBulkOut,
+    CapabilityGrantCreate,
+    CapabilityGrantOut,
+)
 from app.schemas.gateway_user import (
     AcceptInviteIn,
     AcceptInviteOut,
@@ -246,6 +251,32 @@ def create_capability_grant(actor: AccessAdmin, user_id: int, payload: Capabilit
     return success(
         data=CapabilityGrantController().create(user_id, payload.model_dump(), actor),
         message="Capacidad puntual registrada.",
+    )
+
+
+@router.post(
+    "/{user_id}/capability-grants/bulk",
+    response_model=ApiResponse[CapabilityGrantBulkOut],
+    status_code=201,
+)
+def create_capability_grants_bulk(
+    actor: AccessAdmin, user_id: int, payload: CapabilityGrantBulkCreate
+):
+    """
+    Otorga la MISMA capacidad puntual sobre varios entornos o servidores (``scope_ids``, de 1 a
+    100, sin repetidos), todo o nada: se valida cada destino antes de insertar y entra en una sola
+    transacción. Todas las filas nacen con el mismo estado (``pending`` si la capacidad es
+    sensible, salvo ``ACCESS_FOUR_EYES=False``).
+
+    Si algún destino falla: 409 ``access.grant_bulk_failed`` y ``public_context.failures`` lista
+    ``{scope_id, code, message[, context]}`` de cada uno (``access.grant_scope_not_found``,
+    ``access.grant_duplicate``, ``access.sod_conflict``...; ``context`` es el resto del
+    ``public_context`` del error, p. ej. ``conflicts`` y ``override`` del conflicto SoD). Los errores de la persona o de la
+    capacidad son los de ``POST /{user_id}/capability-grants``.
+    """
+    return success(
+        data=CapabilityGrantController().create_bulk(user_id, payload.model_dump(), actor),
+        message="Capacidades puntuales registradas.",
     )
 
 

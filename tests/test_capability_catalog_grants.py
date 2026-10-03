@@ -137,6 +137,7 @@ def test_matrix_publishes_the_new_columns_derived_from_the_predicates():
     [
         ("CODE_CAPABILITY_NOT_GRANTABLE", "access.capability_not_grantable"),
         ("CODE_GRANT_DUPLICATE", "access.grant_duplicate"),
+        ("CODE_GRANT_BULK_FAILED", "access.grant_bulk_failed"),
         ("CODE_GRANT_SCOPE_NOT_FOUND", "access.grant_scope_not_found"),
         ("CODE_GRANT_USER_INACTIVE", "access.grant_user_inactive"),
         ("CODE_SELF_APPROVAL", "access.self_approval_forbidden"),

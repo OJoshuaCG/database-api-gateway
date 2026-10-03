@@ -425,3 +425,89 @@ def test_audit_record_accepts_an_actor_type_override(admin_client):
     assert a.actor_type == "system"
     audit.record("capability_grant.x", admin={"id": 1, "username": "admin"})
     assert _audits("capability_grant.x")[0].actor_type == "admin"
+
+
+# --------------------------------------------------------------------------- #
+# Alta masiva (``POST .../capability-grants/bulk``)                           #
+# --------------------------------------------------------------------------- #
+
+STAGING = "staging"
+
+
+def _bulk(client, user_id, scope_ids, capability="databases.write", scope_type="environment",
+          **extra):
+    body = {"capability": capability, "scope_type": scope_type, "scope_ids": scope_ids, **extra}
+    return client.post(f"/api/v1/gateway-users/{user_id}/capability-grants/bulk", json=body)
+
+
+def _live_count(user_id: int) -> int:
+    with Database().engine.begin() as conn:
+        return conn.execute(
+            text("SELECT COUNT(*) FROM capability_grants WHERE user_id = :u"), {"u": user_id}
+        ).scalar()
+
+
+def test_bulk_creates_one_active_row_per_target_with_one_audit_each(admin_client, target):
+    ids = [env_id(DEV), env_id(PROD), env_id(STAGING)]
+    r = _bulk(admin_client, target, ids, reason="rollout")
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    assert (data["count"], data["pending"]) == (3, False)
+    assert [g["scope_id"] for g in data["grants"]] == ids
+    assert {g["status"] for g in data["grants"]} == {"active"}
+    assert {g["request_reason"] for g in data["grants"]} == {"rollout"}
+
+    audits = _audits("capability_grant.created")
+    assert len(audits) == 3
+    bulk_ids = {json.loads(a.detail)["bulk_id"] for a in audits}
+    assert len(bulk_ids) == 1
+
+
+def test_bulk_deduplicates_scope_ids(admin_client, target):
+    r = _bulk(admin_client, target, [env_id(DEV), env_id(DEV), env_id(PROD)])
+    assert r.status_code == 201, r.text
+    assert r.json()["data"]["count"] == 2
+
+
+def test_bulk_of_a_sensitive_capability_is_pending_for_every_row(admin_client, target):
+    r = _bulk(admin_client, target, [env_id(DEV), env_id(PROD)], capability="databases.drop")
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+    assert data["pending"] is True
+    assert {g["status"] for g in data["grants"]} == {"pending"}
+    assert len(_audits("capability_grant.requested")) == 2
+    assert UserModel().find_access_context(target)["capability_grants"] == []
+
+
+def test_bulk_is_all_or_nothing_and_names_every_failing_target(admin_client, target):
+    assert _grant(admin_client, target, "databases.write", scope_id=env_id(PROD)).status_code == 201
+    before = _live_count(target)
+
+    r = _bulk(admin_client, target, [env_id(DEV), env_id(PROD), 999])
+    assert (r.status_code, _code(r)) == (409, "access.grant_bulk_failed")
+    failures = r.json()["detail"]["public_context"]["failures"]
+    assert {(f["scope_id"], f["code"]) for f in failures} == {
+        (env_id(PROD), "access.grant_duplicate"),
+        (999, "access.grant_scope_not_found"),
+    }
+    # Nada se insertó, ni siquiera el destino válido.
+    assert _live_count(target) == before
+
+
+def test_bulk_person_level_errors_match_the_single_endpoint(admin_client, target):
+    r = _bulk(admin_client, target, [env_id(DEV)], capability="servers.admin")
+    assert (r.status_code, _code(r)) == (422, "access.capability_not_grantable")
+    r = _bulk(admin_client, _uid("admin"), [env_id(DEV)])
+    assert (r.status_code, _code(r)) == (409, "access.self_modification_forbidden")
+    r = _bulk(admin_client, 99999, [env_id(DEV)])
+    assert r.status_code == 404
+
+
+@pytest.mark.parametrize("scope_ids", [[], [0], [-1], list(range(1, 102))])
+def test_bulk_rejects_an_empty_invalid_or_oversized_list(admin_client, target, scope_ids):
+    assert _bulk(admin_client, target, scope_ids).status_code == 422
+
+
+def test_bulk_requires_access_admin(admin_client, target):
+    _, operador = _admin_como(admin_client, "operador2", extra=())
+    assert _bulk(operador, target, [env_id(DEV)]).status_code == 403

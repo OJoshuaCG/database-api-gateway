@@ -180,7 +180,7 @@ def test_the_split_routes_declare_the_right_half(guard):
                 vistas[prefijo] += 1
                 assert guard._capability_of(route) == esperada, f"{method} {path}"
     assert vistas == {
-        "/api/v1/gateway-users": 12,
+        "/api/v1/gateway-users": 13,
         "/api/v1/api-tokens": 3,
         "/api/v1/capability-grants": 3,
         "/api/v1/authz/scope-readiness": 1,

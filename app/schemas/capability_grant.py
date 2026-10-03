@@ -10,7 +10,7 @@ validación de Pydantic, que no nombra ningún código que la SPA pueda mapear a
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.gateway_user import SodOverrideIn
 
@@ -23,6 +23,27 @@ class CapabilityGrantCreate(BaseModel):
     #: Break-glass de la separación de deberes, si la persona tiene ``security_officer`` y la
     #: capacidad es exclusiva de ``owner``. Ver ``SodOverrideIn``.
     sod_override: SodOverrideIn | None = None
+
+
+#: Tope de destinos por alta masiva: acota el costo de validar todo antes de insertar.
+BULK_MAX_TARGETS = 100
+
+
+class CapabilityGrantBulkCreate(BaseModel):
+    """La misma capacidad sobre VARIOS entornos o servidores, todo o nada."""
+
+    capability: str = Field(..., min_length=1, max_length=64)
+    scope_type: Literal["environment", "server"]
+    scope_ids: list[int] = Field(..., min_length=1, max_length=BULK_MAX_TARGETS)
+    reason: str | None = Field(None, max_length=500, description="Motivo declarado (opcional)")
+    sod_override: SodOverrideIn | None = None
+
+    @field_validator("scope_ids")
+    @classmethod
+    def _dedupe(cls, ids: list[int]) -> list[int]:
+        if any(i < 1 for i in ids):
+            raise ValueError("scope_ids debe contener ids >= 1")
+        return list(dict.fromkeys(ids))
 
 
 class CapabilityGrantDecision(BaseModel):
@@ -55,6 +76,13 @@ class CapabilityGrantOut(BaseModel):
     sod_override: SodOverrideIn | None = Field(
         None, description="Break-glass que viaja con la solicitud: se aplica al aprobarla"
     )
+
+
+class CapabilityGrantBulkOut(BaseModel):
+    count: int
+    #: ``True`` si las filas nacieron ``pending`` (esperan a otro access_admin).
+    pending: bool
+    grants: list[CapabilityGrantOut]
 
 
 class PendingCapabilityGrantOut(CapabilityGrantOut):

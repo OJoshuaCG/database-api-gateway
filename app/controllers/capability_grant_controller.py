@@ -46,6 +46,7 @@ estado. Los rechazos por auto-otorgamiento y asignación se auditan como ``failu
 """
 
 import json
+import uuid
 
 from app.controllers import access_request_controller as access_requests
 from app.core.actor import identity_of
@@ -56,6 +57,7 @@ from app.models.user_model import UserModel
 from app.services import audit, sod_service
 from app.services.capability_catalog import (
     CODE_CAPABILITY_NOT_GRANTABLE,
+    CODE_GRANT_BULK_FAILED,
     CODE_GRANT_DUPLICATE,
     CODE_GRANT_NOT_FOUND,
     CODE_GRANT_NOT_PENDING,
@@ -158,10 +160,14 @@ class CapabilityGrantController:
         after: str | None,
         status: str = "success",
         reason: str | None = None,
+        bulk_id: str | None = None,
     ) -> None:
         detail = {"before": {"status": before}, "after": {"status": after}, "grant_id": grant_id}
         if reason:
             detail["reason"] = reason
+        if bulk_id:
+            # Correlación de un alta masiva: vive en el JSON del detalle, sin columna ni migración.
+            detail["bulk_id"] = bulk_id
         audit.record(
             action,
             status=status,
@@ -264,61 +270,20 @@ class CapabilityGrantController:
         user = self._user_or_404(user_id)
         username = user["username"]
 
-        if self._is_self(actor, user_id):
-            self._audit(action, actor, username, capability, scope_type, scope_id,
-                        grant_id=None, before=None, after=None, status="failure",
-                        reason="self_modification_forbidden")
-            raise self._self_error("otorgarte capacidades a ti mismo")
-
-        if not user.get("is_active"):
-            raise AppHttpException(
-                message="La persona está desactivada: reactívala antes de otorgarle capacidades.",
-                status_code=409,
-                public_context={"code": CODE_GRANT_USER_INACTIVE},
-            )
-
-        if not is_grantable(capability):
-            raise AppHttpException(
-                message="Esa capacidad no se puede otorgar de forma puntual.",
-                status_code=422,
-                public_context={"code": CODE_CAPABILITY_NOT_GRANTABLE},
-            )
+        self._precheck_request(user, user_id, actor, capability, scope_type, scope_id, action)
 
         if self.grants.scope_name(scope_type, scope_id) is None:
-            raise AppHttpException(
-                message="El entorno o servidor indicado no existe.",
-                status_code=404,
-                public_context={"code": CODE_GRANT_SCOPE_NOT_FOUND},
-            )
+            raise self._scope_not_found()
 
-        if not self._assignable(actor, capability):
-            self._audit(action, actor, username, capability, scope_type, scope_id,
-                        grant_id=None, before=None, after=None, status="failure",
-                        reason="not_assignable")
-            raise access_requests.not_assignable_error()
+        self._check_assignable(actor, username, capability, scope_type, scope_id, action)
 
         if self.grants.find_live(user_id, capability, scope_type, scope_id):
-            raise AppHttpException(
-                message="Ya existe una capacidad puntual viva igual para esta persona.",
-                status_code=409,
-                public_context={"code": CODE_GRANT_DUPLICATE},
-            )
+            raise self._duplicate()
 
-        # Separación de deberes sobre el estado RESULTANTE: lo que la persona tiene más esta
-        # capacidad (aunque nazca pendiente: surte efecto en cuanto se aprueba).
-        found = self._sod_conflicts(user_id, extra=(capability, scope_type, scope_id))
-        try:
-            plan = sod_service.check(
-                found,
-                covered=sod_service.covered_rules(user_id),
-                override=data.get("sod_override"),
-            )
-        except AppHttpException as exc:
-            if (exc.public_context or {}).get("code") == CODE_SOD_CONFLICT:
-                self._audit(action, actor, username, capability, scope_type, scope_id,
-                            grant_id=None, before=None, after=None, status="failure",
-                            reason="sod_conflict")
-            raise
+        plan = self._sod_plan_for_target(
+            user_id, username, actor, capability, scope_type, scope_id,
+            data.get("sod_override"), action,
+        )
         elevaciones = (
             [{"kind": "capability_grant", "capability": capability,
               "scope_type": scope_type, "scope_id": scope_id}]
@@ -356,6 +321,186 @@ class CapabilityGrantController:
                 mode=modo,
             )
         return self._serialize(row)
+
+    # -- Validaciones compartidas por ``create`` y ``create_bulk`` ----------------------------- #
+    def _precheck_request(self, user: dict, user_id: int, actor, capability: str,
+                          scope_type: str, audit_scope_id: int, action: str) -> None:
+        """Lo que no depende del destino: auto-otorgamiento (409), persona activa (409), otorgable (422)."""
+        if self._is_self(actor, user_id):
+            self._audit(action, actor, user["username"], capability, scope_type, audit_scope_id,
+                        grant_id=None, before=None, after=None, status="failure",
+                        reason="self_modification_forbidden")
+            raise self._self_error("otorgarte capacidades a ti mismo")
+
+        if not user.get("is_active"):
+            raise AppHttpException(
+                message="La persona está desactivada: reactívala antes de otorgarle capacidades.",
+                status_code=409,
+                public_context={"code": CODE_GRANT_USER_INACTIVE},
+            )
+
+        if not is_grantable(capability):
+            raise AppHttpException(
+                message="Esa capacidad no se puede otorgar de forma puntual.",
+                status_code=422,
+                public_context={"code": CODE_CAPABILITY_NOT_GRANTABLE},
+            )
+
+    def _check_assignable(self, actor, username: str, capability: str, scope_type: str,
+                          audit_scope_id: int, action: str) -> None:
+        if not self._assignable(actor, capability):
+            self._audit(action, actor, username, capability, scope_type, audit_scope_id,
+                        grant_id=None, before=None, after=None, status="failure",
+                        reason="not_assignable")
+            raise access_requests.not_assignable_error()
+
+    @staticmethod
+    def _scope_not_found() -> AppHttpException:
+        return AppHttpException(
+            message="El entorno o servidor indicado no existe.",
+            status_code=404,
+            public_context={"code": CODE_GRANT_SCOPE_NOT_FOUND},
+        )
+
+    @staticmethod
+    def _duplicate() -> AppHttpException:
+        return AppHttpException(
+            message="Ya existe una capacidad puntual viva igual para esta persona.",
+            status_code=409,
+            public_context={"code": CODE_GRANT_DUPLICATE},
+        )
+
+    def _sod_plan_for_target(self, user_id: int, username: str, actor, capability: str,
+                             scope_type: str, scope_id: int, override, action: str):
+        """
+        Separación de deberes sobre el estado RESULTANTE: lo que la persona tiene más esta
+        capacidad (aunque nazca pendiente: surte efecto en cuanto se aprueba). 409 si conflicta.
+        """
+        found = self._sod_conflicts(user_id, extra=(capability, scope_type, scope_id))
+        try:
+            return sod_service.check(
+                found, covered=sod_service.covered_rules(user_id), override=override
+            )
+        except AppHttpException as exc:
+            if (exc.public_context or {}).get("code") == CODE_SOD_CONFLICT:
+                self._audit(action, actor, username, capability, scope_type, scope_id,
+                            grant_id=None, before=None, after=None, status="failure",
+                            reason="sod_conflict")
+            raise
+
+    def create_bulk(self, user_id: int, data: dict, actor) -> dict:
+        """
+        La misma capacidad sobre VARIOS destinos (``scope_ids``), todo o nada.
+
+        Se valida TODO antes de insertar: los chequeos de la persona y la capacidad (como
+        ``create``, el primero que falla corta) y, por destino, alcance existe / duplicado /
+        separación de deberes. Si algún destino falla, 409 ``access.grant_bulk_failed`` con
+        ``failures=[{scope_id, code, message}]`` (TODOS los que fallan) y no se inserta nada.
+
+        ``access_requests.decide`` corre UNA vez: todas las filas nacen con el mismo modo. Las
+        filas entran en una sola transacción (``insert_many``); la auditoría es una por fila, con
+        un ``bulk_id`` común en el ``detail``, y la elevación sin segundo aprobador se audita una
+        vez por pedido (``record_unapproved``).
+        """
+        capability = data["capability"]
+        scope_type = data["scope_type"]
+        scope_ids = list(dict.fromkeys(int(i) for i in data["scope_ids"]))
+        override = data.get("sod_override")
+        sensitive = is_sensitive(capability)
+        action = (
+            "capability_grant.requested"
+            if sensitive and access_requests.four_eyes()
+            else "capability_grant.created"
+        )
+
+        user = self._user_or_404(user_id)
+        username = user["username"]
+        first = scope_ids[0]
+
+        self._precheck_request(user, user_id, actor, capability, scope_type, first, action)
+        self._check_assignable(actor, username, capability, scope_type, first, action)
+
+        known = self.grants.scope_names([(scope_type, i) for i in scope_ids])
+        live = self.grants.live_scope_ids(user_id, capability, scope_type, scope_ids)
+        failures: list[dict] = []
+        plans: dict[int, object] = {}
+
+        def fail(scope_id: int, exc: AppHttpException) -> None:
+            public = dict(exc.public_context or {})
+            entry = {"scope_id": scope_id, "code": public.pop("code", None), "message": exc.message}
+            if public:
+                # ``access.sod_conflict`` trae ``conflicts`` y los límites del ``override``: la SPA
+                # los necesita para ofrecer la excepción de emergencia sobre todo el lote.
+                entry["context"] = public
+            failures.append(entry)
+
+        for scope_id in scope_ids:
+            if (scope_type, scope_id) not in known:
+                fail(scope_id, self._scope_not_found())
+            elif scope_id in live:
+                fail(scope_id, self._duplicate())
+            else:
+                try:
+                    plans[scope_id] = self._sod_plan_for_target(
+                        user_id, username, actor, capability, scope_type, scope_id,
+                        override, action,
+                    )
+                except AppHttpException as exc:
+                    fail(scope_id, exc)
+
+        if failures:
+            raise AppHttpException(
+                message="No se otorgó nada: hay destinos que no se pueden otorgar.",
+                status_code=409,
+                public_context={"code": CODE_GRANT_BULK_FAILED, "failures": failures},
+            )
+
+        elevaciones = (
+            [{"kind": "capability_grant", "capability": capability,
+              "scope_type": scope_type, "scope_id": i} for i in scope_ids]
+            if sensitive else []
+        )
+        # Una sola decisión para todo el lote (ver ``decide``): mismo modo en todas las filas.
+        distinct_plans = list({p.rules: p for p in plans.values() if p}.values())
+        modo = access_requests.decide(elevaciones, distinct_plans[0] if distinct_plans else None,
+                                      actor)
+        pending = modo == access_requests.MODE_WAIT
+        action = "capability_grant.requested" if pending else "capability_grant.created"
+        if distinct_plans and not pending:
+            for plan in distinct_plans:
+                sod_service.record_override_intent(plan, admin=actor, target_id=user_id,
+                                                   username=username)
+
+        actor_id, _ = identity_of(actor)
+        rows = self.grants.insert_many(
+            user_id=user_id,
+            capability=capability,
+            scope_type=scope_type,
+            scope_ids=scope_ids,
+            requested_by=actor_id,
+            pending=pending,
+            reason=(data.get("reason") or "").strip() or None,
+            sod_override=sod_service.override_payload(override) if distinct_plans else None,
+        )
+        if distinct_plans and not pending:
+            for plan in distinct_plans:
+                sod_service.apply_override(plan, user_id=user_id, admin=actor, username=username)
+        bulk_id = uuid.uuid4().hex
+        for row in rows:
+            self._audit(action, actor, username, capability, scope_type, row["scope_id"],
+                        grant_id=row["id"], before=None, after=row["status"],
+                        reason=row.get("request_reason"), bulk_id=bulk_id)
+        if modo and not pending:
+            access_requests.record_unapproved(
+                admin=actor, target_id=user_id, username=username, elevations=elevaciones,
+                origin="capability_grant", override=override if distinct_plans else None,
+                mode=modo,
+            )
+        return {
+            "count": len(rows),
+            "pending": pending,
+            "grants": self._serialize_many(rows),
+        }
 
     @staticmethod
     def _assignable(actor, capability: str) -> bool:

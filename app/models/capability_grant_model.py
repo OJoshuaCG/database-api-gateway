@@ -300,6 +300,80 @@ class CapabilityGrantModel:
         finally:
             session.close()
 
+    def insert_many(
+        self,
+        *,
+        user_id: int,
+        capability: str,
+        scope_type: str,
+        scope_ids: list[int],
+        requested_by: int | None,
+        pending: bool,
+        reason: str | None,
+        sod_override: dict | None = None,
+    ) -> list[dict]:
+        """
+        ``insert`` de VARIOS destinos en UNA transacción: o nacen todas o ninguna. Si el
+        ``UNIQUE`` hace perder a cualquiera (alta concurrente), se revierte el lote entero y se
+        responde el mismo 409 que el chequeo previo.
+        """
+        now = utcnow()
+        session = self._session()
+        try:
+            rows = [
+                CapabilityGrant(
+                    user_id=user_id,
+                    capability=capability,
+                    scope_type=scope_type,
+                    scope_id=scope_id,
+                    status="pending" if pending else "active",
+                    live_key=1,
+                    requested_by=requested_by,
+                    requested_at=now,
+                    expires_at=(now + PENDING_TTL) if pending else None,
+                    request_reason=reason,
+                    sod_override_json=(
+                        json.dumps(sod_override, ensure_ascii=False) if sod_override else None
+                    ),
+                )
+                for scope_id in scope_ids
+            ]
+            session.add_all(rows)
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                raise AppHttpException(
+                    message="Ya existe una capacidad puntual viva igual para esta persona.",
+                    status_code=409,
+                    public_context={"code": CODE_GRANT_DUPLICATE},
+                ) from exc
+            for row in rows:
+                session.refresh(row)
+            return [_public(row) for row in rows]
+        finally:
+            session.close()
+
+    def live_scope_ids(
+        self, user_id: int, capability: str, scope_type: str, scope_ids: list[int]
+    ) -> set[int]:
+        """Cuáles de ``scope_ids`` ya tienen una capacidad viva igual (una consulta)."""
+        session = self._session()
+        try:
+            return set(
+                session.scalars(
+                    select(CapabilityGrant.scope_id).where(
+                        CapabilityGrant.user_id == user_id,
+                        CapabilityGrant.capability == capability,
+                        CapabilityGrant.scope_type == scope_type,
+                        CapabilityGrant.scope_id.in_(scope_ids),
+                        CapabilityGrant.live_key == 1,
+                    )
+                ).all()
+            )
+        finally:
+            session.close()
+
     def close_live(
         self, grant_id: int, *, expected_status: str, new_status: str, decided_by: int | None,
         reason: str | None = None,
