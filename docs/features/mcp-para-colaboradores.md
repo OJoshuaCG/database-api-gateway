@@ -148,17 +148,33 @@ servidor queda **sin verificar** (fuera del MCP).
   (`mcp_ro`) y `MCP_READONLY_ACCOUNT_HOST` (`%`; en producción acotalo a la IP de egreso del
   gateway). En PostgreSQL el host no aplica.
 - **Grants fijos, definidos en el servidor** (`readonly_probe.MYSQL_READONLY_*`): `SELECT`,
-  `SHOW VIEW`, `TRIGGER`, `EVENT` por base, y `SHOW_ROUTINE` global en MySQL. **MariaDB no tiene
-  `SHOW_ROUTINE`**: ahí no se otorga y el MCP no ve cuerpos de rutinas (plan 12 §7.2). En
+  `SHOW VIEW`, `TRIGGER`, `EVENT` por base, y `SHOW_ROUTINE` global **solo en MySQL >= 8.0.20**.
+  **MariaDB no tiene `SHOW_ROUTINE`**, y MySQL anterior a 8.0.20 tampoco: ahí no se otorga (ni si
+  la versión no se puede leer; el detalle de auditoría lo dice) y el MCP no ve cuerpos de rutinas
+  (plan 12 §7.2). La versión se lee ANTES de tocar la cuenta. En
   PostgreSQL: rol `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`,
   `default_transaction_read_only = on`, `CONNECT` por base y `USAGE` sobre `public`.
-- **Idempotente y recuperable.** Si la cuenta ya existe, rota la contraseña y deja los grants
-  exactamente en la lista fija (en MySQL/MariaDB hace `REVOKE ALL` antes de otorgar). Como no
-  hay DDL transaccional, una corrida cortada se reintenta tal cual. Un rol PostgreSQL
-  **privilegiado** preexistente con ese nombre se rechaza con `409 engine_user.protected_account`:
-  no se lo degrada en silencio.
-- **Aprovisionar de nuevo invalida la contraseña anterior.** Mientras corre, el servidor sale del
-  MCP (la verificación se borra antes de rotar).
+- **Solo rota cuentas PROPIAS.** Si en el motor ya existe una cuenta con ese usuario, el gateway
+  la rota únicamente si **este servidor ya guarda una credencial de solo lectura con ese mismo
+  usuario** (registrada a mano con `PUT`, o de un aprovisionamiento anterior a medias). Si no, no
+  la toca: `409 readonly_account.already_exists`. El operador la registra a mano (`PUT`) o
+  configura otro `MCP_READONLY_ACCOUNT_USERNAME`. Rotar la de un tercero le rompería la app.
+- **Idempotente y recuperable.** Si la cuenta propia ya existe, rota la contraseña y deja los
+  grants exactamente en la lista fija (en MySQL/MariaDB hace `REVOKE ALL` antes de otorgar). Como
+  no hay DDL transaccional, el gateway guarda la credencial nueva (sin verificar) **antes** de
+  que el motor cambie, y una corrida cortada se reintenta tal cual. Un rol PostgreSQL
+  **privilegiado** preexistente con ese nombre se rechaza con `409 engine_user.protected_account`
+  (también si es propio): no se lo degrada en silencio. En MySQL/MariaDB, una cuenta propia con
+  **roles** otorgados (que `REVOKE ALL` no quita) se rechaza con `409 readonly_account.has_roles`:
+  revocalos en el motor y reintentá.
+- **Nada cambia si una precondición falla.** Usuario y host configurados, existencia, versión,
+  roles y propiedad se comprueban antes de la primera sentencia que muta; los errores de
+  configuración (`MCP_READONLY_ACCOUNT_*` inválidos) también se validan al arrancar el gateway.
+- **Un aprovisionamiento por servidor a la vez.** Un segundo click mientras corre el primero da
+  `409 readonly_provision.in_progress` sin cambiar nada. El lock es del proceso: con varios
+  workers no serializa entre ellos (ver el archivo de decisiones e incidentes).
+- **Aprovisionar de nuevo invalida la contraseña anterior.** Desde que el gateway guarda la
+  nueva, el servidor queda sin verificar (fuera del MCP) hasta que la sonda pase.
 
 > **Alcance: POR SERVIDOR, no por base.** Los `SELECT` se otorgan sobre **todas** las bases no
 > internas del servidor en el momento de aprovisionar, incluidas las de otros proyectos. Quedan

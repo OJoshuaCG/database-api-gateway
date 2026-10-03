@@ -1968,12 +1968,35 @@ deducen del código y que alguien va a querer "simplificar":
 - **`_` y `%` se escapan en el nombre de base del `GRANT`.** A nivel base son comodines aunque
   vayan entre backticks: `` `app_prod`.* `` también cubre `appXprod`. Para una credencial por
   servidor que se otorga base por base, eso es leer una base que nadie enumeró.
-- **La verificación se borra ANTES de rotar la contraseña**, no después. Entre la rotación y el
-  guardado, la contraseña cifrada es la vieja: dejarla "verificada" sería confiar en una cuenta
-  que el motor ya no acepta.
+- **La credencial nueva se guarda cifrada y sin verificar ANTES de que el motor cambie.** Es la
+  versión corregida de «borrar la verificación antes de rotar»: guardar primero deja registrada la
+  propiedad de la cuenta, así que si el motor falla a mitad, el reintento ve usuario guardado ==
+  `MCP_READONLY_ACCOUNT_USERNAME` y converge. El orden inverso (motor, después gateway) dejaba la
+  cuenta creada y sin dueño: el reintento la tomaría por ajena o, peor, la tomaría sin preguntar.
+- **Se rota una cuenta existente SOLO si es propia, y se decide antes de mutar.** «Propia» = este
+  servidor ya guarda una credencial de solo lectura con ESE usuario (registrada por `PUT` o de una
+  corrida a medias). Sin esa regla, una app de un tercero que se llame `mcp_ro` quedaba con la
+  contraseña rotada y los grants revocados por un click. Si existe y no es propia:
+  `409 readonly_account.already_exists`, sin tocar nada (registrarla a mano o cambiar el usuario).
+- **Toda precondición corre antes de la primera sentencia que muta.** MySQL/MariaDB no tienen DDL
+  transaccional: un fallo a mitad deja rotado y revocado lo que ya corrió. Por eso `host`/usuario
+  se validan antes de auditar y de tocar la verificación (un host malo des-verificaba una
+  credencial sana en cada click), y `preflight_readonly_account` lee ANTES de mutar la versión
+  (`SHOW_ROUTINE` solo en MySQL >= 8.0.20; con versión ilegible no se otorga y el detalle de
+  auditoría lo dice) y los roles de la cuenta (`REVOKE ALL` no quita roles ni `PROXY`, y la sonda
+  los reporta como `unrecognized_grant` en cada reintento; se rechaza con
+  `409 readonly_account.has_roles` en vez de revocarlos).
+- **El lock por servidor es del PROCESO y no bloqueante** (`readonly_provision.in_progress`, 409).
+  No hay `SELECT ... FOR UPDATE`: sostendría una transacción de la BD de metadatos abierta durante
+  trabajo remoto lento, y SQLite (tests) lo ignora. Límite: con `WORKERS > 1` dos workers pueden
+  aprovisionar el mismo servidor a la vez y la contraseña guardada puede diferir de la del motor;
+  queda sin verificar y el siguiente click la converge. Si se necesita exclusión entre workers,
+  hace falta un lock distribuido (advisory lock en la BD de metadatos o Redis), no más
+  `threading`.
 
 Excluida siempre la base de metadatos del gateway co-alojada (`server_users` guarda pseudo-roots
-cifradas). PostgreSQL rechaza un rol privilegiado preexistente en vez de degradarlo.
+cifradas). PostgreSQL rechaza un rol privilegiado preexistente en vez de degradarlo (esto sigue
+valiendo aunque la cuenta sea propia).
 
 ---
 
