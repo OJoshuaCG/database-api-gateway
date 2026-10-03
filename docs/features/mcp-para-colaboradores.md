@@ -3,12 +3,11 @@
 Guía operativa. Dos partes: lo que hace **quien administra** (una vez, y después una vez por
 persona) y lo que hace **cada colaborador** en su propia máquina.
 
-> **Antes de empezar, lo que hoy sirve y lo que no.** El servidor expone **una sola tool**,
-> `list_databases`, que devuelve el inventario alcanzable: nombre, motor, entorno, blueprint y
-> versión aplicada de cada base. **Todavía no devuelve el esquema** — `list_objects`, `get_schema`
-> y `check_freshness` no están implementadas porque son consultas al catálogo de cada motor y no
-> se pudieron verificar sin Docker. Si el objetivo es que la IA vea las tablas, esto **no lo
-> resuelve todavía**; lo que resuelve es que sepa qué bases existen y en qué versión están.
+> **Qué expone hoy.** Diez tools de solo lectura: el inventario (`list_databases`,
+> `list_environments`, `list_exports`, `list_clones`, `list_catalogs`) y las que leen la
+> estructura de una base (`list_objects`, `check_freshness`, `get_schema`, `search_schema`,
+> `diff_schemas`). Ninguna devuelve filas ni cuerpos de vistas, rutinas o triggers. Para
+> encontrar una tabla o columna cuyo nombre exacto no se conoce, usar `search_schema`.
 
 ---
 
@@ -125,7 +124,7 @@ propósito: enumerar lo negado sería decirle al agente qué hay del otro lado.
 
 `list_databases`, `list_environments`, `list_exports`, `list_clones` y `list_catalogs` leen el
 inventario del gateway y **no tocan ningún motor**. Las tools que sí leen el catálogo
-—`list_objects`, `check_freshness`, `get_schema` y `diff_schemas`— exigen además una **credencial de SOLO LECTURA** registrada y
+—`list_objects`, `check_freshness`, `get_schema`, `search_schema` y `diff_schemas`— exigen además una **credencial de SOLO LECTURA** registrada y
 **verificada** en el servidor de la base. El MCP **nunca** usa la pseudo-root, ni como fallback.
 
 Hay dos caminos para tener esa credencial. El **automático** (A.6.0) es un click y es el
@@ -258,7 +257,7 @@ Para el resto, pedí los scopes al emitirlo: `"scopes": ["blueprints.read", "dat
 | Scope | Tools |
 |---|---|
 | `blueprints.read` | `list_databases` |
-| `databases.read` | `list_objects`, `check_freshness`, `get_schema` |
+| `databases.read` | `list_objects`, `check_freshness`, `get_schema`, `search_schema` |
 | `schema_diff.read` | `diff_schemas` |
 | `environments.read` | `list_environments` |
 | `exports.read` | `list_exports` |
@@ -274,6 +273,35 @@ Notas por tool:
   (`applied_version`), si el gateway puede probar que corrió (`trust`: `applied`, `declared` o
   `unknown`) y si hay una aplicación a medias. Una versión igual **no** prueba que el esquema
   siga igual: con `trust` distinto de `applied`, revalidar con `list_objects`.
+- **`search_schema(database_id, query, kinds?, limit?)`** busca en la **estructura** de una base
+  —nombres de tablas y vistas, nombres de columnas y comentarios de tablas y columnas— cuando el
+  agente no sabe el nombre exacto. Nunca lee filas. No necesita privilegios nuevos: usa la misma
+  credencial de solo lectura y los mismos grants (`SELECT`, `SHOW VIEW`, `TRIGGER`, `EVENT`) que
+  `get_schema`.
+  - **Consulta:** `query` de 2 a 100 caracteres (vacía o solo espacios se rechaza con
+    `mcp.invalid_argument`). No distingue mayúsculas ni acentos, separa `snake_case`, `camelCase` y
+    dígitos, y tolera plurales simples y prefijos (`cli` encuentra `cliente`). Las palabras vacías
+    (`de`, `the`) se descartan. **Todas** las palabras tienen que aparecer (AND), repartidas entre el
+    nombre y el comentario; una columna no matchea solo por llamarse su tabla como la consulta.
+    Funciona igual en español e inglés, también sobre comentarios.
+  - **Orden:** nombre exacto > prefijo del nombre > palabras en el nombre (tabla/vista) > columna >
+    comentario; el desempate es estable (nombre más corto, tipo, tabla, columna).
+  - **`kinds`:** `table`, `view`, `column` (default) y, opt-in, `routine` y `trigger` (solo por
+    nombre; el índice no trae más). Las columnas de vistas no se buscan.
+  - **`limit`:** default 20, máximo 50. Si hay más coincidencias, `total_matches` las cuenta todas.
+  - **Cada resultado** trae `kind`, `name`, `table`, `column`, `data_type`, `key_flags`
+    (`primary_key`, `foreign_key`, `unique`), `references` (destino de la FK), `comment`
+    (máx. 200 caracteres), `score`, `matched_on` (`name`, `name_and_table`, `comment`,
+    `name_and_comment`), `matched_tokens` y `get_schema_object`: el objeto a pasar en `objects` de
+    `get_schema` para ver la estructura completa.
+  - **Los comentarios son texto de terceros:** salen listados en `untrusted_fields` (y en
+    `clipped_fields` si se cortaron), igual que en `get_schema`.
+  - **Costo acotado y dicho:** los nombres se buscan siempre; las columnas y los comentarios de
+    tabla exigen leer cada tabla, así que se leen hasta `MCP_SEARCH_MAX_TABLES` (200) tablas por
+    llamada —las de nombre afín primero— y dentro de la mitad de `MCP_SESSION_MAX_SECONDS`. Si algo
+    queda sin leer o recortado, la respuesta trae `truncated: true`, el motivo en
+    `truncated_reasons` (`results_limit`, `scan_cap`, `time_budget`), `scanned_tables` de
+    `total_tables` y un warning. No hay caché: servir estructura vieja es peor que releerla.
 - **`list_catalogs`** devuelve privilegios, charsets/collations habilitados y las plantillas de
   perfil (nivel → privilegios), sin sus descripciones.
 

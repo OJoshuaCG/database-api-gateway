@@ -1977,6 +1977,30 @@ cifradas). PostgreSQL rechaza un rol privilegiado preexistente en vez de degrada
 
 ---
 
+## MCP `search_schema`: buscar en proceso, sin caché y con presupuesto propio
+
+- **La consulta del agente nunca llega al motor.** No hay `LIKE` ni parámetro: se lee el catálogo
+  con los métodos que ya tenía el façade (`object_index`, `table_schemas`) y se compara en memoria
+  (`app/mcp/search_matcher.py`). Un `%`, un `_` o una comilla en `query` son texto inerte, y no hace
+  falta ninguna superficie de SQL nueva ni ningún privilegio: los grants de solo lectura
+  (`SELECT`, `SHOW VIEW`, `TRIGGER`, `EVENT`) ya alcanzaban.
+- **Sin caché, a propósito.** Se evaluó reusar la huella de `check_freshness`, pero la versión de
+  Alembic es condición necesaria y nunca suficiente de frescura (un `COMMENT ON` o un `ALTER` no la
+  mueven): cachear por versión serviría comentarios viejos a un agente. En su lugar el costo se
+  acota: nombres siempre; columnas y comentarios hasta `MCP_SEARCH_MAX_TABLES` tablas, las de
+  nombre afín primero.
+- **Presupuesto de tiempo propio (la mitad de `MCP_SESSION_MAX_SECONDS`).** Si el escaneo llegara
+  al límite duro, `open_readonly` lo traduce a `mcp.session_timeout` y se pierde todo lo leído. Con
+  el presupuesto blando se devuelve lo leído con `truncated: true`. Lo recortado se declara
+  siempre; nunca un resultado cortado que parezca completo.
+- **Segunda barrera para la contabilidad interna.** `list_object_names` ya excluye `_gw_v_*` y
+  `_gw_stg_*`, pero la tool vuelve a filtrar con `target_resolution.exclude_internal_tables` (que
+  envuelve `identifiers.exclude_gateway_internal_tables`): `app/mcp` no puede importar
+  `identifiers` sin tocar la allowlist de `tests/test_mcp_import_guard.py`, y no debe depender de
+  que el filtro de la capa de abajo siga ahí.
+
+---
+
 ## Nota al pie — por qué `.env.example` "no se podía actualizar"
 
 Dos entregas de este archivo (captura de `SELECT` y exportación de BDs) anotan que
