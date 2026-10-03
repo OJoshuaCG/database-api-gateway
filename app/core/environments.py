@@ -1,5 +1,6 @@
 import ipaddress
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -494,6 +495,23 @@ MCP_READONLY_ACCOUNT_USERNAME = os.getenv("MCP_READONLY_ACCOUNT_USERNAME", "mcp_
 MCP_READONLY_ACCOUNT_HOST = os.getenv("MCP_READONLY_ACCOUNT_HOST", "%").strip()
 
 # ======= Startup validation ======= #
+# La cuenta del MCP se interpola (quoteada) en CREATE USER / GRANT al aprovisionar. Se valida acá
+# con las MISMAS reglas que `identifiers.validate_identifier` / `validate_host` (copiadas a
+# propósito: ese módulo arrastra los adapters y no se puede importar desde la config del proceso)
+# para fallar al arrancar y no en cada click de «Aprovisionar», que además des-verificaba una
+# credencial que andaba. El controller las vuelve a validar antes de tocar nada.
+
+if not re.match(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$", MCP_READONLY_ACCOUNT_USERNAME):
+    raise ValueError(
+        "MCP_READONLY_ACCOUNT_USERNAME inválido: debe ser un identificador "
+        "([A-Za-z_][A-Za-z0-9_]*, hasta 63 caracteres)."
+    )
+if not re.match(r"^[A-Za-z0-9_.%:\-]{1,255}$", MCP_READONLY_ACCOUNT_HOST):
+    raise ValueError(
+        "MCP_READONLY_ACCOUNT_HOST inválido: solo letras, dígitos y los caracteres _ . % : - "
+        "(hasta 255)."
+    )
+
 if not SECRET_KEY:
     if APP_ENV == "production":
         raise ValueError(

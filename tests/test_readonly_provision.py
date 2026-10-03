@@ -18,6 +18,7 @@ from app.services.db_admin.readonly_probe import (
     MYSQL_ALLOWED_PRIVILEGES,
     MYSQL_READONLY_DB_GRANTS,
     MYSQL_READONLY_GLOBAL_GRANTS,
+    ReadonlyPreflight,
 )
 
 URL = "/api/v1/servers/{sid}/readonly-credential/provision"
@@ -35,6 +36,28 @@ def _fila(sid):
     s = Database().get_declarative_base_session()
     try:
         return s.get(Server, sid)
+    finally:
+        s.close()
+
+
+def _registrar(admin_client, sid, username="mcp_ro", password="registrada-a-mano-xyz"):
+    """Registra a mano (PUT) una credencial de solo lectura: el gateway pasa a 'tenerla'."""
+    r = admin_client.put(
+        f"/api/v1/servers/{sid}/readonly-credential",
+        json={"username": username, "password": password},
+    )
+    assert r.status_code == 200, r.text
+
+
+def _marcar_verificada(sid):
+    from datetime import datetime
+
+    from app.models.server import Server
+
+    s = Database().get_declarative_base_session()
+    try:
+        s.get(Server, sid).readonly_verified_at = datetime(2026, 1, 1)
+        s.commit()
     finally:
         s.close()
 
@@ -57,6 +80,8 @@ class _MotorFalso:
         self.bases = ["app_prod", "otra", "mysql", "datum_meta"]
         self.violaciones: list[str] = []
         self.falla_al_provisionar = False
+        self.con_roles = False  # el preflight rechaza: la cuenta tiene roles otorgados
+        self.preflights = []  # (usuario, host): lecturas previas a mutar
         self.objetivos = []  # targets con los que se pidió un adapter
 
     def adapter(self, target):
@@ -74,13 +99,22 @@ class _AdapterFalso:
     def is_privileged_role(self, username):
         return self._m.privilegiado
 
-    def provision_readonly_account(self, username, password, host, databases):
+    def preflight_readonly_account(self, username, host):
+        """Solo lectura: no muta NADA (lo que el controller exige antes de tocar el motor)."""
+        self._m.preflights.append((username, host))
+        if self._m.con_roles:
+            raise AppHttpException(
+                message="La cuenta tiene roles.",
+                status_code=409,
+                public_context={"code": "readonly_account.has_roles"},
+            )
+        return ReadonlyPreflight(exists=self._m.existe)
+
+    def provision_readonly_account(self, username, password, host, databases, preflight):
         if self._m.falla_al_provisionar:
             raise AppHttpException(message="El motor rechazó la operación.", status_code=502)
         self._m.llamadas.append((username, password, host, list(databases)))
-        existia = self._m.existe
         self._m.existe = True
-        return existia
 
     def test_connection(self):
         return ConnectionInfo(ok=True, dialect="mysql", server_version="8.0.36")
@@ -164,8 +198,10 @@ def test_the_fixed_grants_pass_the_probe_allowlist():
 # --------------------------------------------------------------------------- #
 
 
-def test_an_existing_account_is_rotated_not_rejected(admin_client, server_payload, motor):
+def test_an_existing_account_of_ours_is_rotated_not_rejected(admin_client, server_payload, motor):
+    """Propia = el gateway ya guarda una credencial con ESE usuario (registrada por PUT)."""
     sid = _servidor(admin_client, server_payload)
+    _registrar(admin_client, sid)
     motor.existe = True
     r = admin_client.post(URL.format(sid=sid))
     assert r.status_code == 200, r.text
@@ -204,6 +240,140 @@ def test_an_engine_failure_is_retryable_and_leaves_the_server_unverified(
     motor.falla_al_provisionar = False
     assert admin_client.post(URL.format(sid=sid)).status_code == 200
     assert _fila(sid).readonly_verified_at is not None
+
+
+def test_a_retry_after_a_failure_creating_the_account_converges(
+    admin_client, server_payload, motor
+):
+    """
+    El gateway guarda la propiedad ANTES de que el motor mute. Si el motor falla a mitad (la
+    cuenta pudo quedar creada), el reintento ve usuario guardado == configurado: es propia y
+    converge en vez de chocar con 'already_exists'.
+    """
+    sid = _servidor(admin_client, server_payload)
+    motor.falla_al_provisionar = True
+    assert admin_client.post(URL.format(sid=sid)).status_code == 502
+    fila = _fila(sid)
+    assert fila.readonly_username == "mcp_ro"  # propiedad registrada
+    assert fila.readonly_verified_at is None  # honestamente sin verificar
+
+    motor.existe = True  # la cuenta quedó creada en el motor antes de fallar
+    motor.falla_al_provisionar = False
+    r = admin_client.post(URL.format(sid=sid))
+    assert r.status_code == 200, r.text
+    assert _fila(sid).readonly_verified_at is not None
+    assert motor.llamadas[-1][1] == decrypt(_fila(sid).readonly_password_encrypted)
+
+
+# --------------------------------------------------------------------------- #
+# Toda precondición se detecta ANTES de la primera mutación                    #
+# --------------------------------------------------------------------------- #
+
+
+def test_an_existing_account_that_is_not_ours_is_refused_without_changes(
+    admin_client, server_payload, motor
+):
+    sid = _servidor(admin_client, server_payload)
+    _registrar(admin_client, sid, username="otra_cuenta", password="de-otro-xyz")
+    _marcar_verificada(sid)
+    antes = _fila(sid)
+    cifrado_antes = antes.readonly_password_encrypted
+    motor.existe = True  # 'mcp_ro' existe en el motor y el gateway no la tiene guardada
+
+    r = admin_client.post(URL.format(sid=sid))
+    assert r.status_code == 409
+    assert r.json()["detail"]["public_context"]["code"] == "readonly_account.already_exists"
+    assert motor.llamadas == []  # ninguna sentencia que muta
+    fila = _fila(sid)
+    assert fila.readonly_username == "otra_cuenta"
+    assert fila.readonly_password_encrypted == cifrado_antes
+    assert fila.readonly_verified_at is not None  # la verificación NO se tocó
+    assert not [e for e in _auditoria() if e[0] == "server.readonly_credential.provision"]
+
+
+def test_an_existing_account_with_no_stored_credential_is_refused(
+    admin_client, server_payload, motor
+):
+    sid = _servidor(admin_client, server_payload)
+    motor.existe = True
+    r = admin_client.post(URL.format(sid=sid))
+    assert r.status_code == 409
+    assert r.json()["detail"]["public_context"]["code"] == "readonly_account.already_exists"
+    assert motor.llamadas == []
+    assert _fila(sid).readonly_username is None
+
+
+def test_a_preflight_failure_such_as_roles_changes_nothing(admin_client, server_payload, motor):
+    sid = _servidor(admin_client, server_payload)
+    _registrar(admin_client, sid)
+    _marcar_verificada(sid)
+    motor.existe = True
+    motor.con_roles = True
+    r = admin_client.post(URL.format(sid=sid))
+    assert r.status_code == 409
+    assert r.json()["detail"]["public_context"]["code"] == "readonly_account.has_roles"
+    assert motor.llamadas == []
+    assert _fila(sid).readonly_verified_at is not None
+
+
+def test_a_bad_configured_host_is_rejected_before_clearing_the_verification(
+    admin_client, server_payload, motor, monkeypatch
+):
+    import app.controllers.server_controller as ctrl
+
+    sid = _servidor(admin_client, server_payload)
+    _registrar(admin_client, sid)
+    _marcar_verificada(sid)
+    monkeypatch.setattr(ctrl, "MCP_READONLY_ACCOUNT_HOST", "bad host';--")
+    r = admin_client.post(URL.format(sid=sid))
+    assert r.status_code == 422
+    assert motor.preflights == [] and motor.llamadas == []
+    assert _fila(sid).readonly_verified_at is not None
+    assert not [e for e in _auditoria() if e[0] == "server.readonly_credential.provision"]
+
+
+def test_a_bad_configured_username_is_rejected_before_clearing_the_verification(
+    admin_client, server_payload, motor, monkeypatch
+):
+    import app.controllers.server_controller as ctrl
+
+    sid = _servidor(admin_client, server_payload)
+    _registrar(admin_client, sid)
+    _marcar_verificada(sid)
+    monkeypatch.setattr(ctrl, "MCP_READONLY_ACCOUNT_USERNAME", "bad`user")
+    assert admin_client.post(URL.format(sid=sid)).status_code == 422
+    assert motor.llamadas == []
+    assert _fila(sid).readonly_verified_at is not None
+
+
+def test_a_provision_in_progress_for_the_same_server_returns_409_and_changes_nothing(
+    admin_client, server_payload, motor
+):
+    import app.controllers.server_controller as ctrl
+
+    sid = _servidor(admin_client, server_payload)
+    _registrar(admin_client, sid)
+    _marcar_verificada(sid)
+    assert ctrl._try_acquire_provision(sid) is True
+    try:
+        r = admin_client.post(URL.format(sid=sid))
+    finally:
+        ctrl._release_provision(sid)
+    assert r.status_code == 409
+    assert r.json()["detail"]["public_context"]["code"] == "readonly_provision.in_progress"
+    assert motor.preflights == [] and motor.llamadas == []
+    assert _fila(sid).readonly_verified_at is not None
+    # Liberado el lock, el siguiente click procede.
+    assert admin_client.post(URL.format(sid=sid)).status_code == 200
+
+
+def test_the_lock_is_released_even_when_the_provision_fails(admin_client, server_payload, motor):
+    import app.controllers.server_controller as ctrl
+
+    sid = _servidor(admin_client, server_payload)
+    motor.falla_al_provisionar = True
+    assert admin_client.post(URL.format(sid=sid)).status_code == 502
+    assert sid not in ctrl._PROVISIONING
 
 
 # --------------------------------------------------------------------------- #

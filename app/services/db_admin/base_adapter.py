@@ -32,6 +32,7 @@ from app.core.remote_engine import (
 from app.core.logger import get_logger
 from app.exceptions import AppHttpException
 from app.services.db_admin import snapshot_data
+from app.services.db_admin.readonly_probe import ReadonlyPreflight
 from app.services.db_admin.dtos import (
     CheckConstraintInfo,
     CollatableForeignKey,
@@ -466,13 +467,35 @@ class ServerAdapter(ABC):
     @abstractmethod
     def change_password(self, username: str, new_password: str, host: str = "%") -> None: ...
 
+    def preflight_readonly_account(self, username: str, host: str) -> ReadonlyPreflight:
+        """
+        Lecturas SIN mutación previas a ``provision_readonly_account``: ¿la cuenta existe?, ¿qué
+        grants globales admite este servidor (versión)?, ¿tiene grants que ``REVOKE ALL`` no
+        quita (roles)? Toda precondición que pueda fallar se detecta ACÁ: un click fallido tiene
+        que dejar el motor y el gateway como estaban.
+
+        Rechaza con 409 ``readonly_account.has_roles`` si la cuenta tiene roles otorgados.
+        Default: 422, igual que ``provision_readonly_account`` (fail-closed).
+        """
+        raise AppHttpException(
+            message="Este motor no soporta aprovisionar la credencial de solo lectura.",
+            status_code=422,
+            context={"dialect": self.dialect},
+        )
+
     def provision_readonly_account(
-        self, username: str, password: str, host: str, databases: list[str]
-    ) -> bool:
+        self,
+        username: str,
+        password: str,
+        host: str,
+        databases: list[str],
+        preflight: ReadonlyPreflight,
+    ) -> None:
         """
         Crea —o RE-CONVERGE— la cuenta de solo lectura del MCP con la lista FIJA de grants del
         plan 12 §7.2 (``readonly_probe.MYSQL_READONLY_*`` y el equivalente de PostgreSQL).
-        Devuelve ``True`` si la cuenta ya existía (se rotó su contraseña) y ``False`` si se creó.
+        ``preflight`` es el resultado de ``preflight_readonly_account`` (existencia y grants
+        globales admitidos): este método NO decide nada que pueda rechazar, solo ejecuta.
 
         **Idempotente por construcción**: MySQL/MariaDB no tienen DDL transaccional, así que una
         corrida que muere a mitad deja la cuenta a medias y el reintento tiene que converger, no

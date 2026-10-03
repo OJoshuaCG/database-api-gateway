@@ -10,6 +10,7 @@ La credencial descifrada NUNCA se persiste, se serializa ni se loguea.
 """
 
 import secrets
+import threading
 from typing import TYPE_CHECKING
 
 from sqlalchemy.exc import IntegrityError
@@ -37,8 +38,10 @@ from app.models.server_user import ServerUser
 from app.services import audit
 from app.services.server_catalog import (
     CODE_CREDENTIAL_REQUIRED_FOR_REBIND,
+    CODE_READONLY_ACCOUNT_ALREADY_EXISTS,
     CODE_READONLY_CREDENTIAL_MISSING,
     CODE_READONLY_PROBE_FAILED,
+    CODE_READONLY_PROVISION_IN_PROGRESS,
 )
 from app.services.db_admin.dtos import (
     ConnectionInfo,
@@ -49,7 +52,11 @@ from app.services.db_admin.dtos import (
     TableStat,
 )
 from app.services.db_admin.database_scope import assert_database_in_scope
-from app.services.db_admin.identifiers import reserved_database_names, validate_identifier
+from app.services.db_admin.identifiers import (
+    reserved_database_names,
+    validate_host,
+    validate_identifier,
+)
 from app.services.db_admin.protected_accounts import (
     assert_not_privileged_role,
     assert_not_protected_by_name,
@@ -60,6 +67,26 @@ from app.services.db_admin.factory import get_adapter
 if TYPE_CHECKING:
     from app.core.actor import Actor
 
+
+# Aprovisionamientos en curso, por ``server_id``. Lock NO bloqueante y solo del PROCESO: no hay
+# transacción de BD abierta durante el trabajo remoto (lento), así que no se usa
+# ``SELECT ... FOR UPDATE``. Con varios workers no serializa entre ellos. Ver
+# ``ServerController.provision_readonly_credential`` y el archivo de decisiones e incidentes.
+_PROVISIONING: set[int] = set()
+_PROVISIONING_GUARD = threading.Lock()
+
+
+def _try_acquire_provision(server_id: int) -> bool:
+    with _PROVISIONING_GUARD:
+        if server_id in _PROVISIONING:
+            return False
+        _PROVISIONING.add(server_id)
+        return True
+
+
+def _release_provision(server_id: int) -> None:
+    with _PROVISIONING_GUARD:
+        _PROVISIONING.discard(server_id)
 
 
 class ServerController:
@@ -494,14 +521,28 @@ class ServerController:
         gateway si está co-alojada (``server_users`` guarda pseudo-roots cifradas). Una base
         creada DESPUÉS no queda cubierta hasta repetir el aprovisionamiento. Nunca ``SELECT ON
         *.*`` ni sobre ``mysql.*``. ``exclude_gateway_internal_tables`` no aplica: un grant a
-        nivel base no puede excluir tablas; el MCP filtra las internas al introspectar.
+        nivel base no puede excluirla; el MCP filtra las internas al introspectar.
 
-        Orden y recuperación (MySQL/MariaDB no tienen DDL transaccional): 1) se BORRA la
-        verificación, porque desde que la contraseña rota la guardada ya no sirve y no puede
-        seguir figurando como verificada; 2) cuenta + grants en el motor (idempotente: rota y
-        re-aplica si existe); 3) se guarda cifrada; 4) sonda negativa. Cualquier corrida a medias
-        se reintenta tal cual. Si la sonda falla, ``_verify_readonly`` ya dejó la verificación
-        en ``null`` y devuelve el 422 ``server.readonly_probe_failed``.
+        PRECONDICIONES ANTES DE LA PRIMERA MUTACIÓN. MySQL/MariaDB no tienen DDL transaccional:
+        todo lo que pueda fallar se detecta ANTES, para que un click fallido deje el motor y el
+        gateway como estaban. Orden:
+
+        1. Validar usuario y host configurados (antes de auditar y de tocar la verificación: un
+           host malo daba 422 en cada click Y des-verificaba una credencial que andaba).
+        2. Lock por servidor, NO bloqueante (``readonly_provision.in_progress``, 409). Es un lock
+           del PROCESO: con varios workers no serializa entre ellos (ver
+           ``docs/development/decisiones-e-incidentes.md``).
+        3. Lecturas en el motor (``preflight_readonly_account``): existencia, versión, roles.
+        4. Si la cuenta existe y NO es propia → 409 ``readonly_account.already_exists``. Propia =
+           este servidor ya guarda una credencial de solo lectura con ESE usuario (registrada a
+           mano por PUT, o de una corrida anterior a medias). Rotar la de un tercero le rompe su
+           app.
+        5. Se guarda la credencial nueva cifrada y SIN verificar (``set_readonly_credential``)
+           ANTES de que el motor cambie: si el paso 6 falla, un reintento ve usuario guardado ==
+           usuario configurado y converge.
+        6. Cuenta + grants en el motor (idempotente: rota y re-aplica si existe).
+        7. Sonda negativa. Si falla, ``_verify_readonly`` deja la verificación en ``null`` y
+           devuelve el 422 ``server.readonly_probe_failed``.
         """
         session = self._session()
         try:
@@ -513,16 +554,73 @@ class ServerController:
             )
             root_username = server.root_username
             host, port = server.host, server.port
+            stored_username = server.readonly_username
+            has_stored = bool(server.readonly_username and server.readonly_password_encrypted)
         finally:
             session.close()
 
         username = MCP_READONLY_ACCOUNT_USERNAME
         account_host = MCP_READONLY_ACCOUNT_HOST
         validate_identifier(username, engine_value, "usuario")
+        if engine_value != EngineType.postgresql.value:
+            validate_host(account_host)
         assert_not_protected_by_name(
             dialect=engine_value, username=username, root_username=root_username
         )
+        # "Propia": el gateway ya guarda, para ESTE servidor, una credencial con este usuario.
+        ours = has_stored and stored_username == username
+
+        if not _try_acquire_provision(server_id):
+            raise AppHttpException(
+                message=(
+                    "Ya hay un aprovisionamiento de la credencial de solo lectura en curso para "
+                    "este servidor. Esperá a que termine y reintentá; no se cambió nada."
+                ),
+                status_code=409,
+                context={"server_id": server_id},
+                public_context={"code": CODE_READONLY_PROVISION_IN_PROGRESS},
+            )
+        try:
+            return self._provision_locked(
+                server_id,
+                admin=admin,
+                engine_value=engine_value,
+                host=host,
+                port=port,
+                username=username,
+                account_host=account_host,
+                ours=ours,
+            )
+        finally:
+            _release_provision(server_id)
+
+    def _provision_locked(
+        self,
+        server_id: int,
+        *,
+        admin: "dict | Actor | None",
+        engine_value: str,
+        host: str,
+        port: int,
+        username: str,
+        account_host: str,
+        ours: bool,
+    ) -> dict:
+        """Pasos 3 a 7 de ``provision_readonly_credential``, ya dentro del lock del servidor."""
         adapter = get_adapter(self._build_target(server_id))
+        preflight = adapter.preflight_readonly_account(username, account_host)
+        if preflight.exists and not ours:
+            raise AppHttpException(
+                message=(
+                    "En el servidor ya existe una cuenta con el usuario configurado y el gateway "
+                    "no la creó, así que no se modifica (rotarla rompería a quien la use). "
+                    "Registrala a mano con PUT /servers/{id}/readonly-credential, o configurá "
+                    "otro MCP_READONLY_ACCOUNT_USERNAME. No se cambió nada."
+                ),
+                status_code=409,
+                context={"server_id": server_id},
+                public_context={"code": CODE_READONLY_ACCOUNT_ALREADY_EXISTS},
+            )
         assert_not_privileged_role(adapter, dialect=engine_value, username=username)
 
         reserved = reserved_database_names(engine_value)
@@ -554,12 +652,28 @@ class ServerController:
             server_id=server_id,
             detail=f"aprovisionamiento de la cuenta de solo lectura sobre {len(databases)} bases",
         )
-        self._clear_readonly_verification(server_id)
+        # El gateway registra la propiedad ANTES de que el motor cambie (cifrada y SIN verificar).
+        # Si algo falla después, el reintento ve usuario guardado == configurado y converge.
         try:
-            existed = adapter.provision_readonly_account(
-                username, password, account_host, databases
+            self.set_readonly_credential(
+                server_id, {"username": username, "password": password}, admin=admin
             )
-        except AppHttpException:
+        except Exception:
+            audit.record(
+                "server.readonly_credential.provision",
+                status="error",
+                admin=admin,
+                target_type="server",
+                target_id=server_id,
+                server_id=server_id,
+                detail="no se pudo guardar la credencial; el motor no se tocó",
+            )
+            raise
+        try:
+            adapter.provision_readonly_account(
+                username, password, account_host, databases, preflight
+            )
+        except Exception:
             audit.record(
                 "server.readonly_credential.provision",
                 status="error",
@@ -571,9 +685,6 @@ class ServerController:
                 detail="fallo al crear la cuenta de solo lectura en el motor; reintentable",
             )
             raise
-        self.set_readonly_credential(
-            server_id, {"username": username, "password": password}, admin=admin
-        )
         audit.record(
             "server.readonly_credential.provision",
             admin=admin,
@@ -583,21 +694,13 @@ class ServerController:
             touched_engine=True,
             detail=(
                 ("cuenta existente: contraseña rotada y grants re-aplicados"
-                 if existed else "cuenta creada")
+                 if preflight.exists else "cuenta creada")
                 + f"; {len(databases)} bases cubiertas, {omitidas} omitidas por nombre"
+                + (f"; {preflight.note}" if preflight.note else "")
             ),
         )
         self._verify_readonly(server_id, admin=admin)
         return self.get_server(server_id)
-
-    def _clear_readonly_verification(self, server_id: int) -> None:
-        session = self._session()
-        try:
-            server = self._get_or_404(session, server_id)
-            server.readonly_verified_at = None
-            session.commit()
-        finally:
-            session.close()
 
     def clear_readonly_credential(
         self, server_id: int, *, admin: "dict | Actor | None" = None

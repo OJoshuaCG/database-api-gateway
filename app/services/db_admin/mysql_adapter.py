@@ -54,6 +54,12 @@ from app.services.db_admin.identifiers import (
     validate_privileges,
 )
 from app.services.db_admin.protected_accounts import MYSQL_SYSTEM_USERS
+from app.services.db_admin.readonly_probe import (
+    ReadonlyPreflight,
+    mysql_global_grants_for_version,
+    mysql_has_unrecognized_grants,
+)
+from app.services.server_catalog import CODE_READONLY_ACCOUNT_HAS_ROLES
 from app.services.db_admin.sql_dialect import mask_quoted_spans
 
 _SYSTEM_DATABASES = ("information_schema", "mysql", "performance_schema", "sys")
@@ -1365,9 +1371,6 @@ class MySQLAdapter(ServerAdapter):
             extra={"username": username},
         )
 
-    #: MariaDB no tiene ``SHOW_ROUTINE`` (plan 12 §7.2): ahí el grant global no se emite.
-    _READONLY_GLOBAL_GRANT_DIALECTS = frozenset({"mysql"})
-
     @staticmethod
     def _db_grant_pattern(quoted_db: str) -> str:
         """
@@ -1379,16 +1382,19 @@ class MySQLAdapter(ServerAdapter):
         """
         return quoted_db.replace("_", "\\_").replace("%", "\\%")
 
-    def provision_readonly_account(self, username, password, host, databases) -> bool:
-        from app.services.db_admin.readonly_probe import (
-            MYSQL_READONLY_DB_GRANTS,
-            MYSQL_READONLY_GLOBAL_GRANTS,
-        )
+    def preflight_readonly_account(self, username, host) -> ReadonlyPreflight:
+        """
+        Solo LECTURAS (``mysql.user``, ``VERSION()``, ``SHOW GRANTS``), antes de cualquier mutación.
 
+        - Versión: ``SHOW_ROUTINE`` solo en MySQL >= 8.0.20 (``mysql_global_grants_for_version``).
+          Emitirlo en una versión menor falla DESPUÉS de rotar y revocar la cuenta.
+        - Roles: ``REVOKE ALL PRIVILEGES, GRANT OPTION`` no quita roles otorgados, y la sonda los
+          reporta como ``unrecognized_grant`` en cada reintento. Si la cuenta existe y los tiene,
+          409 ``readonly_account.has_roles`` ANTES de tocarla.
+        """
         validate_identifier(username, self.dialect, "usuario")
         validate_host(host)
         who = self._user_at_host(username, host)
-        pwd = quote_string_literal(password, self.dialect)
         try:
             with server_connection(self.target) as conn:
                 existed = (
@@ -1398,15 +1404,49 @@ class MySQLAdapter(ServerAdapter):
                     ).first()
                     is not None
                 )
+                try:
+                    version = conn.execute(text(self._version_sql())).scalar()
+                except SQLAlchemyError:
+                    version = None  # no determinable: se degrada (sin SHOW_ROUTINE), no se aborta
+                lines = (
+                    [str(r[0]) for r in conn.execute(text(f"SHOW GRANTS FOR {who}"))]
+                    if existed
+                    else []
+                )
         except SQLAlchemyError as exc:
             raise map_driver_error(
-                exc, op="provision_readonly_account", target=self.target,
+                exc, op="preflight_readonly_account", target=self.target,
                 extra={"username": username},
             )
+        if mysql_has_unrecognized_grants(lines):
+            raise AppHttpException(
+                message=(
+                    "La cuenta de solo lectura ya existe con roles u otros grants que el "
+                    "aprovisionamiento no puede quitar. Revocalos en el motor, o configurá otro "
+                    "MCP_READONLY_ACCOUNT_USERNAME. No se modificó nada."
+                ),
+                status_code=409,
+                context={"username": username},
+                public_context={"code": CODE_READONLY_ACCOUNT_HAS_ROLES},
+            )
+        global_grants, note = mysql_global_grants_for_version(
+            None if version is None else str(version), dialect=self.dialect
+        )
+        return ReadonlyPreflight(existed, global_grants, note)
+
+    def provision_readonly_account(
+        self, username, password, host, databases, preflight
+    ) -> None:
+        from app.services.db_admin.readonly_probe import MYSQL_READONLY_DB_GRANTS
+
+        validate_identifier(username, self.dialect, "usuario")
+        validate_host(host)
+        who = self._user_at_host(username, host)
+        pwd = quote_string_literal(password, self.dialect)
         # CREATE ... IF NOT EXISTS + ALTER: converge exista o no, y un reintento tras una
-        # corrida a medias no choca. REVOKE ALL antes de otorgar: si la cuenta ya existía (de una
-        # corrida anterior o de alguien más) queda EXACTAMENTE con la lista fija, no con la
-        # fija más lo que tuviera.
+        # corrida a medias no choca. REVOKE ALL antes de otorgar: la cuenta (ya verificada como
+        # propia por el llamador) queda EXACTAMENTE con la lista fija, no con la fija más lo que
+        # tuviera.
         stmts = [
             f"CREATE USER IF NOT EXISTS {who} IDENTIFIED BY {pwd}",
             f"ALTER USER {who} IDENTIFIED BY {pwd}",
@@ -1417,12 +1457,11 @@ class MySQLAdapter(ServerAdapter):
             validate_identifier(db_name, self.dialect, "base de datos", allow_existing=True)
             db = self._db_grant_pattern(quote_identifier(db_name, self.dialect))
             stmts.append(f"GRANT {privs} ON {db}.* TO {who}")
-        if self.dialect in self._READONLY_GLOBAL_GRANT_DIALECTS:
-            stmts.append(f"GRANT {', '.join(MYSQL_READONLY_GLOBAL_GRANTS)} ON *.* TO {who}")
+        if preflight.global_grants:
+            stmts.append(f"GRANT {', '.join(preflight.global_grants)} ON *.* TO {who}")
         self._execute_server(
             stmts, op="provision_readonly_account", extra={"username": username}
         )
-        return existed
 
     def add_user_host(self, username, source_host, new_host, *, new_password=None) -> None:
         """

@@ -22,6 +22,7 @@ la sesión del MCP corre en ``TRANSACTION READ ONLY`` y ninguna tool acepta SQL 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 #: Privilegios que la credencial puede tener en la familia MySQL (§7.2). ``USAGE`` es "ninguno".
 MYSQL_ALLOWED_PRIVILEGES = frozenset(
@@ -43,6 +44,65 @@ MYSQL_READONLY_GLOBAL_GRANTS: tuple[str, ...] = ("SHOW_ROUTINE",)
 
 assert set(MYSQL_READONLY_DB_GRANTS) <= MYSQL_ALLOWED_PRIVILEGES
 assert set(MYSQL_READONLY_GLOBAL_GRANTS) <= _MYSQL_GLOBAL_OK
+
+#: Primera versión de MySQL que tiene el privilegio dinámico ``SHOW_ROUTINE``. Antes, el ``GRANT``
+#: falla con un error de sintaxis, y si falla DESPUÉS de rotar y revocar la cuenta queda a medias.
+MYSQL_SHOW_ROUTINE_MIN_VERSION: tuple[int, int, int] = (8, 0, 20)
+
+_VERSION_RE = re.compile(r"^\s*(\d+)\.(\d+)\.(\d+)")
+
+
+@dataclass(frozen=True)
+class ReadonlyPreflight:
+    """
+    Hechos que el adapter lee del motor ANTES de la primera sentencia que muta.
+
+    ``exists``: la cuenta ya existe en el motor. ``global_grants``: privilegios ``*.*`` que se
+    pueden otorgar en ESTE servidor (vacío en MariaDB, en MySQL < 8.0.20 y si la versión no se
+    pudo determinar). ``note``: texto corto, sin secretos, para el detalle de auditoría.
+    """
+
+    exists: bool
+    global_grants: tuple[str, ...] = ()
+    note: str | None = None
+
+
+def mysql_global_grants_for_version(
+    version: str | None, *, dialect: str
+) -> tuple[tuple[str, ...], str | None]:
+    """
+    ``(grants globales a otorgar, nota)`` según el motor y su versión. PURA.
+
+    ``SHOW_ROUTINE`` solo en MySQL >= 8.0.20: nunca en MariaDB (ni en un servidor registrado como
+    ``mysql`` cuya versión diga MariaDB) y, ante una versión ilegible, tampoco: un "no sé" que
+    otorgara igual rompería el aprovisionamiento a mitad de camino.
+    """
+    if dialect != "mysql" or "mariadb" in (version or "").lower():
+        return (), "SHOW_ROUTINE no aplica a MariaDB"
+    m = _VERSION_RE.match(version or "")
+    if m is None:
+        return (), "versión del servidor no determinada: SHOW_ROUTINE no otorgado"
+    if tuple(int(g) for g in m.groups()) < MYSQL_SHOW_ROUTINE_MIN_VERSION:
+        return (), "MySQL < 8.0.20: SHOW_ROUTINE no existe y no se otorgó"
+    return MYSQL_READONLY_GLOBAL_GRANTS, None
+
+
+def mysql_has_unrecognized_grants(lines: list[str]) -> bool:
+    """
+    ¿``SHOW GRANTS FOR <cuenta>`` trae algo que ``REVOKE ALL PRIVILEGES, GRANT OPTION`` no quita?
+
+    Un rol otorgado (``GRANT `r`@`%` TO ...``) o un ``PROXY`` (que ``REVOKE ALL`` tampoco quita) no están en la lista: sobreviven al
+    ``REVOKE ALL`` y la sonda los reporta como ``unrecognized_grant`` en cada reintento. Se detecta
+    ANTES de mutar, para rechazar en vez de dejar la cuenta rotada y sin poder verificarse.
+    """
+    for line in lines:
+        texto = (line or "").strip()
+        if not texto:
+            continue
+        if _GRANT_RE.match(texto) is None or re.match(r"^GRANT\s+PROXY\b", texto, re.IGNORECASE):
+            return True
+    return False
+
 
 _GRANT_RE = re.compile(r"^GRANT\s+(?P<privs>.+?)\s+ON\s+(?P<obj>\S+)\s+TO\s+", re.IGNORECASE)
 
@@ -124,6 +184,10 @@ def postgres_role_violations(facts: dict) -> list[str]:
 
 
 __all__ = [
+    "MYSQL_SHOW_ROUTINE_MIN_VERSION",
+    "ReadonlyPreflight",
+    "mysql_global_grants_for_version",
+    "mysql_has_unrecognized_grants",
     "MYSQL_ALLOWED_PRIVILEGES",
     "MYSQL_READONLY_DB_GRANTS",
     "MYSQL_READONLY_GLOBAL_GRANTS",

@@ -22,6 +22,7 @@ from app.core.remote_engine import database_connection, map_driver_error, server
 from app.exceptions import AppHttpException
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin.base_adapter import ServerAdapter
+from app.services.db_admin.readonly_probe import ReadonlyPreflight
 from app.services.db_admin.dtos import (
     CollatableForeignKey,
     CollationGroup,
@@ -1210,25 +1211,9 @@ class PostgresAdapter(ServerAdapter):
             extra={"username": username},
         )
 
-    def provision_readonly_account(self, username, password, host, databases) -> bool:
-        """
-        Rol de solo lectura del MCP (plan 12 §7.2, docs/features/mcp-para-colaboradores.md §A.6).
-
-        Los atributos se (re)escriben con ``ALTER ROLE`` en cada corrida: un rol que ya existía
-        converge a ``NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS``
-        en vez de conservar lo que tuviera. El llamador YA rechazó (409) un rol privilegiado
-        preexistente con ``assert_not_privileged_role``, así que esto nunca degrada en silencio
-        a una cuenta de administración. ``host`` no aplica a PostgreSQL (lo decide
-        ``pg_hba.conf``).
-
-        Por base, PostgreSQL otorga ``CONNECT`` (nivel servidor) y ``USAGE`` sobre ``public``
-        (hay que conectarse a cada base). **No** otorga ``SELECT``: la introspección de
-        estructura lee ``pg_catalog``, que no lo necesita, y así la sonda no ve privilegios de
-        tabla de más. Los esquemas que no son ``public`` quedan fuera.
-        """
+    def preflight_readonly_account(self, username, host) -> ReadonlyPreflight:
+        """Solo lectura: ¿el rol existe? (``host`` no aplica a PostgreSQL). Sin mutación."""
         validate_identifier(username, self.dialect, "usuario")
-        role = quote_identifier(username, self.dialect)
-        pwd = quote_string_literal(password, self.dialect)
         try:
             with server_connection(self.target) as conn:
                 existed = (
@@ -1239,9 +1224,37 @@ class PostgresAdapter(ServerAdapter):
                 )
         except SQLAlchemyError as exc:
             raise map_driver_error(
-                exc, op="provision_readonly_account", target=self.target,
+                exc, op="preflight_readonly_account", target=self.target,
                 extra={"username": username},
             )
+        return ReadonlyPreflight(existed)
+
+    def provision_readonly_account(
+        self, username, password, host, databases, preflight
+    ) -> None:
+        """
+        Rol de solo lectura del MCP (plan 12 §7.2, docs/features/mcp-para-colaboradores.md §A.6).
+
+        Los atributos se (re)escriben con ``ALTER ROLE`` en cada corrida: un rol que ya existía
+        converge a ``NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS``
+        en vez de conservar lo que tuviera. El llamador YA verificó que el rol preexistente es
+        PROPIO del gateway y no privilegiado (``assert_not_privileged_role``), así que esto nunca
+        degrada en silencio a una cuenta ajena ni de administración. ``host`` no aplica a
+        PostgreSQL (lo decide ``pg_hba.conf``).
+
+        Por base, PostgreSQL otorga ``CONNECT`` (nivel servidor) y ``USAGE`` sobre ``public``
+        (hay que conectarse a cada base). **No** otorga ``SELECT``: la introspección de
+        estructura lee ``pg_catalog``, que no lo necesita, y así la sonda no ve privilegios de
+        tabla de más. Los esquemas que no son ``public`` quedan fuera.
+        """
+        validate_identifier(username, self.dialect, "usuario")
+        role = quote_identifier(username, self.dialect)
+        pwd = quote_string_literal(password, self.dialect)
+        existed = preflight.exists
+        # Todo identificador se valida ANTES de la primera sentencia: un nombre inválido no puede
+        # dejar el rol ya rotado.
+        for db_name in databases:
+            validate_identifier(db_name, self.dialect, "base de datos", allow_existing=True)
         verb = "ALTER" if existed else "CREATE"
         self._execute_server(
             [
@@ -1266,7 +1279,6 @@ class PostgresAdapter(ServerAdapter):
                 op="provision_readonly_account",
                 extra={"username": username, "database": db_name},
             )
-        return existed
 
     def is_privileged_role(self, username: str) -> bool:
         """
