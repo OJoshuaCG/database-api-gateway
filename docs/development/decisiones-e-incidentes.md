@@ -2024,6 +2024,76 @@ valiendo aunque la cuenta sea propia).
 
 ---
 
+## MCP `draft_query`: validar SQL de un agente por AST y no ejecutarlo
+
+Entrega 1 de `mcp-readonly-query-execution`. El MCP pasó de "nunca acepta SQL del agente" a
+"nunca **ejecuta** SQL del agente": `draft_query` recibe un texto, lo clasifica y devuelve solo
+texto (`touches_engine: false`), sin abrir una conexión. Contrato en `docs/api-reference-v34.md`;
+el validador es `app/services/db_admin/agent_sql_policy.py`. Lo que sigue es el porqué de lo que
+parece exagerado.
+
+- **El validador es defensa en profundidad, no la barrera.** El límite real (que esta entrega no
+  agrega) es la cuenta del motor con `SELECT` sobre una sola base, en `READ ONLY` y con timeout
+  del lado del servidor. El parseo no ve vistas con `DEFINER`, tablas `FEDERATED`/`CONNECT`/`SPIDER`,
+  extensiones tipo `dblink` ni las diferencias entre cómo sqlglot y el motor leen el mismo texto.
+  Esa lista es el enunciado de residuales (S11) que un revisor tiene que poder citar.
+- **D2/D3 — allowlist de nodos, argumentos y funciones sobre el árbol COMPLETO.** Una blocklist
+  deja pasar por default los nodos que una versión nueva de sqlglot agrega; una allowlist los
+  rechaza. El recorrido es total (`tree.walk()`): el CTE con `DELETE … RETURNING`, el subselect y
+  los argumentos de función no se miran solo en la raíz. Los argumentos permitidos de cada nodo son
+  explícitos para los que cargan cláusulas (`Select` no permite `for_`, `locks`, `into`, `hint`,
+  `sample` ni `operation_modifiers`: `SQL_CALC_FOUND_ROWS` vive ahí). La línea base sale de
+  `cls.arg_types` y no está hardcodeada, y `tests/test_agent_sql_invariants.py` fija una foto de
+  nodos, funciones y claves: sqlglot 30.11 renombró `from`→`from_`, `with`→`with_`, `for`→`for_`, y
+  una clave renombrada habría rechazado en silencio toda consulta con `FROM`. Por eso el
+  `pyproject` fija `sqlglot>=30.11,<30.12` y el módulo falla al importar fuera de ese rango.
+- **D4 — se ejecuta el render canónico, no el texto del agente, y vuelve a pasar el pipeline
+  completo.** El render tiene que dar el mismo multiconjunto de tipos de nodo. Costos medidos: `a
+  DIV 2` de MySQL se renderiza como `CAST(a / 2 AS SIGNED)` (otro árbol) y se rechaza; un literal
+  con salto de línea se renderiza con `\n` y cae en D7.
+- **D5 — fallo de parseo = rechazo, sin respaldo por texto.** El `_READ_FALLBACK_RE` de la consola
+  existe para `SHOW GRANTS`; acá no. sqlglot 30.11 no parsea `SELECT … INTO OUTFILE` ni un DML
+  dentro de un subselect: salen como `PARSE_FAILED` y, solo como etiqueta, se les suma `SELECT_INTO`
+  / `DML_IN_SUBQUERY` leyendo los TOKENS (el veredicto ya es rechazo y no cambia).
+- **D6 — `/*!` y `/*M!` se rechazan sobre el texto crudo, incluso dentro de un literal.** El
+  tokenizador de MySQL de sqlglot entrega `/*!50000 ,2 */` como un comentario común y el árbol
+  nunca ve lo que el motor ejecuta. Es el único chequeo sobre texto crudo y solo puede rechazar.
+  Costo aceptado: `'/*! x'` como literal se rechaza. Los demás comentarios, los `;` y las fronteras
+  de literal se leen con el escáner compartido (`sql_lexing`, extraído de
+  `query_policy._scan_normalize`, que sigue devolviendo EXACTAMENTE lo mismo: hay un test
+  diferencial contra una copia del algoritmo anterior) y con un segundo lector independiente, el
+  tokenizador de sqlglot; cualquiera de los dos que vea un comentario rechaza.
+- **D7 — doble léxico por `sql_mode`.** `NO_BACKSLASH_ESCAPES` es desconocido y cambia dónde
+  termina un literal: `'a\'' -- x` es UN literal más un comentario en MySQL y un `TokenError` en
+  PostgreSQL. Se escanea con y sin escape por barra invertida y, si discrepan, se rechaza
+  (`PARSE_FAILED`; en PostgreSQL pasa igual con un literal que termina en `\`, como `'C:\'`).
+  Además, en MySQL/MariaDB un literal con `\` (o salto de línea o tabulador, que
+  el generador escribe como `\n`/`\t`) se rechaza: el SQL renderizado significaría cosas distintas
+  bajo los dos modos. Falso positivo deliberado y fuera de A1-A8 (`LIKE '%\_%'`, `'x\\y'`);
+  agentes: evitar la barra invertida en literales MySQL.
+- **D8 — se parsea SOLO con el dialecto del destino.** Un consenso entre dialectos aceptaría texto
+  que el motor real lee distinto.
+- **D15 — `bound_select` / `RowBound` (`PUSHED`, `OWN_LIMIT`, `UNBOUNDABLE`).** `_limited_sql`
+  devolvía `None` tanto para "ya trae un `LIMIT` chico" (acotada, correcta tal cual) como para "no
+  se puede acotar". La consola no distingue porque recorta del lado del gateway; una tool que
+  ejecuta SQL de un agente sí: con `None` había que rechazar `SELECT … LIMIT 10`. `_limited_sql`
+  sigue existiendo como envoltorio (`sql if PUSHED else None`) y la consola devuelve lo mismo que
+  antes (también probado por diferencial). `LIMIT ALL` de PostgreSQL no deja rastro en el AST y se
+  acepta: queda acotada igual por el `LIMIT n+1` empujado.
+- **La segunda opinión (`query_policy.classify`) no se amplió.** La consola mapea como lectura solo
+  `Select`/`Union`: un `INTERSECT`/`EXCEPT` o una consulta entre paréntesis salen `ddl` ("raíz no
+  mapeada"). Cambiarlo cambiaría la consola, así que el validador le pide la opinión sobre la misma
+  consulta envuelta en un `SELECT * FROM (…)`, que sí mapea y recorre el árbol entero.
+- **`UPDATE`/`DROP` y compañía no son `invalid`:** salen `write`/`ddl` con `WRITE_NOT_EXECUTED` /
+  `DDL_NOT_EXECUTED`, para que el agente no crea que "borrar" ocurrió. `invalid` es solo lo que no
+  tiene un árbol confiable (vacío, enorme, ilegible, varias sentencias).
+- **Funciones omitidas a propósito:** `REPEAT`, `SPACE`, `LPAD`/`RPAD` (un argumento fabrica
+  resultados enormes: el timeout acota el tiempo, no la memoria), `GENERATE_SERIES`, `UNNEST`,
+  `OVERLAY` (su argumento `for_` choca con la clave prohibida de `Select`) y todo lo que revela el
+  servidor (`VERSION`, `CURRENT_USER`, `DATABASE`).
+
+---
+
 ## Nota al pie — por qué `.env.example` "no se podía actualizar"
 
 Dos entregas de este archivo (captura de `SELECT` y exportación de BDs) anotan que

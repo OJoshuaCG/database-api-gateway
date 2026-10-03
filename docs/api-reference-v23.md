@@ -552,8 +552,13 @@ fila `mcp.auth` por IP por minuto y por proceso, con `agregados=N` en el `detail
 
 ### 9.5 Lo que el MCP nunca va a hacer
 
-**No acepta SQL del agente, en ninguna versión.** No es prudencia genérica: `sqlglot` no tokeniza
-los comentarios ejecutables `/*!` de MySQL ni `/*M!` de MariaDB, así que todo guard por AST sobre
-SQL arbitrario es **evadible** — fue una vulnerabilidad real de la consola SQL de este repo,
-corregida en dos rondas. Cuando haga falta ver datos, la vía son tools **parametrizados**.
+**No EJECUTA SQL del agente, en ninguna versión.** `draft_query` (v34) acepta un texto SQL para
+clasificarlo y devuelve solo texto, sin abrir una conexión (`touches_engine: false`). No es
+prudencia genérica: `sqlglot` no tokeniza los comentarios ejecutables `/*!` de MySQL ni `/*M!` de
+MariaDB, así que todo guard por AST sobre SQL arbitrario es **evadible** — fue una vulnerabilidad
+real de la consola SQL de este repo, corregida en dos rondas. Cuando haga falta ver datos, la vía
+son tools **parametrizados**. Lo que el parseo no detecta (vistas con `DEFINER`, tablas
+`FEDERATED`/`CONNECT`, diferencias entre el parser y el motor) lo cierra el límite real, la cuenta
+del motor con `SELECT` sobre una sola base; el validador es defensa en profundidad. Ver
+[v34](api-reference-v34.md).
 

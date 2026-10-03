@@ -329,7 +329,9 @@ lo que hace falta es contexto de esquema para programar.
 ### La puerta de datos queda abierta, y con una decisión tomada
 
 Cuando haga falta ver datos, **la vía NO es SQL libre.** El invariante que este plan establece
-es que **el MCP nunca acepta SQL del agente**, y ese invariante debe sobrevivir a la v2. Razón
+es que **el MCP nunca EJECUTA SQL del agente** (`draft_query`, v34, acepta el texto para
+clasificarlo y devuelve solo texto, sin abrir una conexión), y ese invariante debe sobrevivir a la
+v2. Razón
 verificada en este repo: sqlglot no tokeniza el contenido de los comentarios ejecutables `/*!` de
 MySQL ni `/*M!` de MariaDB, así que todo guard por AST sobre SQL arbitrario es evadible — fue una
 vulnerabilidad real de la consola SQL, corregida en dos rondas
@@ -952,7 +954,7 @@ esquema de un tercero en el disco del gateway, que hoy no almacena nada del plan
 
 ### 6.7 Identificadores que aporta el agente
 
-El invariante del §4 es *"el MCP nunca acepta SQL del agente"*. Sigue en pie — pero **el agente sí
+El invariante del §4 es *"el MCP nunca ejecuta SQL del agente"*. Sigue en pie — pero **el agente sí
 aporta identificadores**: `objects[].name`, `objects[].kind` y `name_prefix`. Y los identificadores
 **no se parametrizan**, que es la excepción a la regla dura del repo ("SQL siempre
 parametrizado"). Es la única superficie de v1 donde texto de un actor externo termina dentro de un
@@ -1590,8 +1592,9 @@ divergencia identificada.
 Todo lo demás de este plan está argumentado en su sección. Estas cinco son las que un revisor no
 va a deducir del código y cuya violación no rompe ningún test existente:
 
-1. **El MCP nunca acepta SQL del agente** — ni en v1 ni en la puerta de datos (§4). Los guards por
-   AST sobre SQL arbitrario son evadibles vía comentarios ejecutables; está verificado en este repo.
+1. **El MCP nunca ejecuta SQL del agente** — ni en v1 ni en la puerta de datos (§4); `draft_query`
+   lo acepta como texto y no abre ninguna conexión. Los guards por AST sobre SQL arbitrario son
+   evadibles vía comentarios ejecutables; está verificado en este repo.
 2. **Nunca se omite un objeto ni una columna** (§6.3). El texto libre se capa y se declara; la
    estructura no se toca nunca.
 3. **Nunca hay fallback a pseudo-root** cuando falta o vence la credencial read-only (§5.2, paso 4).

@@ -3,11 +3,12 @@
 Guía operativa. Dos partes: lo que hace **quien administra** (una vez, y después una vez por
 persona) y lo que hace **cada colaborador** en su propia máquina.
 
-> **Qué expone hoy.** Diez tools de solo lectura: el inventario (`list_databases`,
-> `list_environments`, `list_exports`, `list_clones`, `list_catalogs`) y las que leen la
+> **Qué expone hoy.** Once tools de solo lectura: el inventario (`list_databases`,
+> `list_environments`, `list_exports`, `list_clones`, `list_catalogs`), las que leen la
 > estructura de una base (`list_objects`, `check_freshness`, `get_schema`, `search_schema`,
-> `diff_schemas`). Ninguna devuelve filas ni cuerpos de vistas, rutinas o triggers. Para
-> encontrar una tabla o columna cuyo nombre exacto no se conoce, usar `search_schema`.
+> `diff_schemas`) y `draft_query`, que **clasifica un texto SQL sin ejecutarlo**. Ninguna
+> devuelve filas ni cuerpos de vistas, rutinas o triggers. Para encontrar una tabla o columna
+> cuyo nombre exacto no se conoce, usar `search_schema`.
 
 ---
 
@@ -273,7 +274,7 @@ Para el resto, pedí los scopes al emitirlo: `"scopes": ["blueprints.read", "dat
 | Scope | Tools |
 |---|---|
 | `blueprints.read` | `list_databases` |
-| `databases.read` | `list_objects`, `check_freshness`, `get_schema`, `search_schema` |
+| `databases.read` | `list_objects`, `check_freshness`, `get_schema`, `search_schema`, `draft_query` |
 | `schema_diff.read` | `diff_schemas` |
 | `environments.read` | `list_environments` |
 | `exports.read` | `list_exports` |
@@ -320,6 +321,33 @@ Notas por tool:
     `total_tables` y un warning. No hay caché: servir estructura vieja es peor que releerla.
 - **`list_catalogs`** devuelve privilegios, charsets/collations habilitados y las plantillas de
   perfil (nivel → privilegios), sin sus descripciones.
+- **`draft_query(database_id, sql)`** recibe un texto SQL y devuelve SOLO texto:
+  `{classification, reasons, warnings, query_text, touches_engine}`. **No abre ninguna conexión al
+  motor, tampoco para una lectura** (`touches_engine` vale siempre `false`): sirve para redactar una
+  consulta —o una escritura que va a revisar una persona— y saber de antemano qué clase de
+  sentencia es y por qué no sería una lectura aceptable.
+  - **`classification`:** `read` (una lectura que el validador acepta), `write`, `ddl`, `blocked` (la
+    consola la prohíbe incluso confirmando, o es una lectura que el perfil de agente rechaza) o
+    `invalid` (vacía, ilegible, enorme o con varias sentencias).
+  - **`reasons`:** códigos cerrados: `PARSE_FAILED`, `MULTIPLE_STATEMENTS`, `NOT_SELECT`,
+    `DML_IN_CTE`, `DML_IN_SUBQUERY`, `SELECT_INTO`, `LOCKING_READ`, `FUNCTION_NOT_ALLOWED`,
+    `VARIABLE_ASSIGNMENT`, `EXECUTABLE_COMMENT`, `COMMENT_NOT_ALLOWED`, `SYSTEM_SCHEMA`,
+    `CROSS_DATABASE`, `UNSUPPORTED_NODE`, `LIMIT_NOT_BOUNDABLE`, `OFFSET_TOO_HIGH` y
+    `SQL_TOO_LARGE`. Una escritura o un DDL siempre traen además una advertencia
+    (`WRITE_NOT_EXECUTED` / `DDL_NOT_EXECUTED`): **este servidor no los ejecuta**.
+  - **`query_text`:** el texto canónico si es una lectura aceptada; en cualquier otro caso, el texto
+    recibido, sin caracteres de control y recortado a 16 KiB.
+  - **La base la fija `database_id`:** los nombres calificados con otra base (`otra.t`) se rechazan,
+    y también los esquemas del sistema (`information_schema`, `mysql`, `pg_catalog`…).
+  - **Qué se rechaza aunque sea una lectura:** funciones que no están en la lista blanca (la
+    lista es cerrada: `SLEEP`, `GET_LOCK`, `nextval`, funciones propias…), variables y
+    asignaciones (`@a := 1`), `FOR UPDATE`/`FOR SHARE`, `SELECT … INTO`, comentarios de cualquier
+    tipo (también `/*!…*/` y `/*M!…*/`, que el motor ejecuta) y cualquier `LIMIT`/`OFFSET` que no sea
+    un literal entero. **Costo conocido:** en MySQL/MariaDB un literal que lleve una barra invertida
+    (`'x\_y'`) o un salto de línea se rechaza (`PARSE_FAILED`), y `a DIV 2` también
+    (`UNSUPPORTED_NODE`; alternativa: `FLOOR(a / 2)`).
+  - Exige el mismo gate que las demás tools de una base, incluida la credencial de solo lectura
+    verificada del servidor, aunque no la use para conectar.
 
 Ninguno muta ni divulga: es un invariante del catálogo que se verifica al arrancar.
 
@@ -519,10 +547,17 @@ El `detail` de un rechazo dice el motivo (`rechazo=inexistente|hmac|revocado|exp
 
 ## Lo que este MCP nunca va a hacer
 
-- **No acepta SQL del agente**, en ninguna versión futura. `sqlglot` no tokeniza los comentarios
-  ejecutables `/*!` de MySQL ni `/*M!` de MariaDB, así que todo guard por AST sobre SQL arbitrario
-  es evadible — fue una vulnerabilidad real de la consola SQL de este repo. Cuando haga falta ver
-  datos, la vía son tools **parametrizados**.
+- **No EJECUTA SQL del agente.** `draft_query` acepta el texto para clasificarlo y devuelve solo
+  texto, sin abrir una conexión. `sqlglot` no tokeniza los comentarios ejecutables `/*!` de MySQL
+  ni `/*M!` de MariaDB, así que todo guard por AST sobre SQL arbitrario es evadible — fue una
+  vulnerabilidad real de la consola SQL de este repo. Cuando haga falta ver datos, la vía son
+  tools **parametrizados**.
+- **Lo que el validador de `draft_query` no puede detectar** (y por qué no es la barrera): vistas
+  con `DEFINER`, tablas `FEDERATED`/`CONNECT`/`SPIDER` que leen otras bases, y las diferencias
+  entre cómo `sqlglot` y el motor leen el mismo texto. La barrera real, para cualquier tool que
+  algún día ejecute SQL, es la cuenta del motor con `SELECT` sobre **una sola base**, dentro de
+  una transacción `READ ONLY` y con timeout del lado del servidor; el validador es defensa en
+  profundidad.
 - **No escribe nada.** El techo de capacidades de un token excluye todo lo que mute o divulgue, y
   la intersección se aplica dos veces: al emitir y al autenticar.
 - **No usa la credencial pseudo-root.** Las tools que leen el catálogo van con la credencial de
