@@ -2092,6 +2092,32 @@ parece exagerado.
   `OVERLAY` (su argumento `for_` choca con la clave prohibida de `Select`) y todo lo que revela el
   servidor (`VERSION`, `CURRENT_USER`, `DATABASE`).
 
+## MCP: credencial de datos por base y migración única (D9, D13)
+
+Entrega 2 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference-v35.md`.
+
+- **D9 — tabla propia 1:1 y no reutilizar `servers.readonly_*`.** Esas columnas son por servidor y
+  ven estructura; una credencial de datos con ese alcance leería filas de TODAS las bases del
+  servidor. La tabla `managed_database_data_credentials` es por base, mantiene el secreto cifrado
+  fuera de la fila caliente que serializa el inventario y muere con la base (`ON DELETE CASCADE`).
+  La cuenta es `<MCP_DATA_ACCOUNT_PREFIX><id>` y su único privilegio es `SELECT` sobre esa base.
+- **D13 — UNA migración (`e4a6c8f0b2d5`) con las columnas del opt-in ya incluidas.** Las
+  `data_access_*` nacen cerradas y nadie las lee todavía. Una segunda migración en la slice del
+  opt-in sería otra ventana con el esquema a medias en MySQL/MariaDB, que no tienen DDL
+  transaccional. Las FKs van sin nombre a mano (el de la convención pasa de 64 caracteres) y el
+  downgrade borra la tabla entera: nunca `drop_constraint` con un nombre escrito.
+- **El borrado revoca en el motor ANTES de olvidar la contraseña.** `DELETE .../data-credential`
+  des-verifica y cierra el opt-in primero (corte inmediato aunque el motor no conteste), borra la
+  cuenta y recién entonces la fila. Al revés, un motor caído dejaría una cuenta con SELECT y una
+  contraseña que el gateway ya no recuerda. Por la misma razón, bajar la migración exige haber
+  revocado antes.
+- **Sin fila no se borra nada del motor.** La propiedad de la cuenta es la fila (usuario guardado
+  == usuario configurado), igual que en la credencial por servidor: una cuenta homónima ajena da
+  409 antes de mutar.
+- **La sonda todavía no existe:** el aprovisionamiento deja `verified_at = null`. Es deliberado: el
+  gate de las tools de datos exige verificación fresca, así que esta entrega no habilita lectura
+  de datos aunque la cuenta exista.
+
 ---
 
 ## Nota al pie — por qué `.env.example` "no se podía actualizar"
