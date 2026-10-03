@@ -14,9 +14,14 @@ para evitar:
 - **Estimación de impacto**: solo cuando el conteo es EXACTO.
 """
 
+import re
+
 import pytest
+import sqlglot
+from sqlglot import exp
 
 from app.services.db_admin import query_policy as qp
+from app.services.db_admin import sql_lexing
 
 MYSQL = "mysql"
 PG = "postgresql"
@@ -801,3 +806,320 @@ def test_escribir_un_esquema_del_sistema_calificado_sigue_bloqueado_por_su_regla
     plan = qp.classify("UPDATE mysql.user SET x = 1", engine=MYSQL, database="tienda")
     assert plan.is_blocked
     assert any(r.code == "system_schema_write" for r in plan.reasons)
+
+
+# --------------------------------------------------------------------------- #
+# Extracción de ``sql_lexing`` y de ``bound_select``: la consola NO cambia      #
+# --------------------------------------------------------------------------- #
+# Las dos refactorizaciones (el escáner de literales/comentarios pasó a ``sql_lexing`` y
+# ``_limited_sql`` pasó a ser un envoltorio de ``bound_select``) prometen salidas IDÉNTICAS. La
+# forma de probarlo no es repetir los casos de arriba con la misma lógica: es comparar contra una
+# COPIA LITERAL del algoritmo anterior, sobre un corpus que roza todos los bordes (comentarios sin
+# cerrar, comillas dobladas, dollar-quoting, ``#`` según el motor, barras invertidas).
+#
+# Las copias de abajo NO se tocan: si algún día divergen del código vivo a propósito, ese cambio
+# de comportamiento de la consola tiene que ser explícito y no un efecto colateral.
+
+_LEGACY_EXEC_PREFIXES = ("/*M!", "/*m!", "/*!")
+
+
+def _legacy_exec_prefix(sql: str, i: int) -> int:
+    """
+    Largo del prefijo de comentario ejecutable que abre en ``i``, o ``0`` si no hay.
+
+    Devolver el LARGO y no un booleano es lo que permite que el llamador salte el prefijo
+    correcto (3 para ``/*!``, 4 para ``/*M!``) sin duplicar la tabla de prefijos.
+    """
+    for prefix in _LEGACY_EXEC_PREFIXES:
+        if sql.startswith(prefix, i):
+            return len(prefix)
+    return 0
+
+
+def _legacy_scan_normalize(sql: str, *, engine: str = "mysql", upper: bool = True) -> str:
+    """Copia LITERAL del algoritmo anterior a la extracción de ``sql_lexing``."""
+    hash_is_comment = engine in ("mysql", "mariadb")
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+
+        # --- comentarios ---
+        if ch == "-" and sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j == -1 else j
+            out.append(" ")
+            continue
+        if ch == "#" and hash_is_comment:
+            j = sql.find("\n", i)
+            i = n if j == -1 else j
+            out.append(" ")
+            continue
+        if ch == "/" and sql.startswith("/*", i):
+            executable = _legacy_exec_prefix(sql, i)
+            if executable:
+                # Comentario EJECUTABLE de MySQL/MariaDB: se conserva el contenido como
+                # código. El número que sigue al prefijo es la versión MÍNIMA del motor
+                # (``/*!40101 GRANT … */``), no parte de la sentencia: si no se descarta,
+                # queda como primera palabra y los patrones anclados con ``^`` no matchean
+                # — es decir, sería una evasión trivial de la blocklist.
+                #
+                # ``/*M!`` es la variante EXCLUSIVA de MariaDB (``/*M!100000 … */``) y su
+                # ausencia acá era un agujero real: el contenido se descartaba como
+                # comentario común, la blocklist nunca lo veía y el motor lo ejecutaba
+                # igual. Con la credencial pseudo-root, un
+                # ``/*M!100000 INTO OUTFILE '/tmp/x' */`` es escritura de archivo
+                # arbitraria en el host de la base del cliente. Se reconoce en los TRES
+                # motores a propósito (fail-closed): un MariaDB dado de alta como ``mysql``
+                # es un error de inventario frecuente, y conservar texto de más solo puede
+                # sobre-bloquear, nunca dejar pasar.
+                j = sql.find("*/", i + executable)
+                body = re.sub(r"^\d+", "", sql[i + executable : (n if j == -1 else j)])
+                out.append(" " + body + " ")
+                i = n if j == -1 else j + 2
+                continue
+            j = sql.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+            out.append(" ")
+            continue
+
+        # --- literales de cadena: se vacían ---
+        if ch == "'":
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":  # '' escapada
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            out.append("''")
+            continue
+
+        # --- identificadores citados: se conservan tal cual ---
+        if ch in ('"', "`"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            while i < n:
+                out.append(sql[i])
+                if sql[i] == quote:
+                    if i + 1 < n and sql[i + 1] == quote:
+                        out.append(sql[i + 1])
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+
+        # --- dollar-quoting de PostgreSQL: se conserva entero ---
+        if ch == "$":
+            m = re.match(r"\$[A-Za-z_0-9]*\$", sql[i:])
+            if m:
+                tag = m.group(0)
+                j = sql.find(tag, i + len(tag))
+                end = n if j == -1 else j + len(tag)
+                out.append(sql[i:end])
+                i = end
+                continue
+
+        out.append(ch)
+        i += 1
+
+    collapsed = qp._WS_RE.sub(" ", "".join(out)).strip()
+    # ``upper=False`` lo usa SOLO el chequeo de nombres calificados entre bases: en MySQL
+    # sobre Linux el nombre de la BD distingue mayúsculas, así que ahí no se puede comparar
+    # sobre el texto en mayúsculas.
+    return collapsed.upper() if upper else collapsed
+
+
+def _legacy_limited_sql(tree: exp.Expression | None, dialect: str, max_rows: int | None) -> str | None:
+    """Copia LITERAL de ``_limited_sql`` anterior a ``bound_select``."""
+    if max_rows is None or tree is None:
+        return None
+    if not isinstance(tree, (exp.Select, exp.Union)):
+        return None
+    if tree.args.get("into") is not None:
+        return None
+    if any(isinstance(node, exp.Lock) for node in tree.walk()):
+        return None
+
+    existing = tree.args.get("limit")
+    if existing is not None:
+        literal = getattr(existing, "expression", None)
+        if isinstance(literal, exp.Literal) and literal.is_int:
+            try:
+                if int(literal.name) <= max_rows:
+                    return None
+            except (TypeError, ValueError):
+                return None
+        else:
+            # ``LIMIT ?`` o una expresión: no se puede comparar, se deja como está.
+            return None
+
+    try:
+        return tree.copy().limit(max_rows + 1).sql(dialect=dialect)
+    except Exception:  # noqa: BLE001 — acotar es una optimización, nunca rompe el plan
+        return None
+
+
+_SCAN_CORPUS = [
+    "",
+    "SELECT 1",
+    "SELECT 'a''b' -- c\nFROM t",
+    "SELECT 'sin cerrar",
+    "SELECT \"id\", `col` FROM `t`",
+    "SELECT \"sin cerrar",
+    "SELECT `sin cerrar",
+    "SELECT 1 /* c */ + 2",
+    "SELECT 1 /* sin cerrar",
+    "SELECT 1 /*/ no cierra",
+    "SELECT 1 /*!40101 GRANT ALL */",
+    "SELECT 1 /*!40101 sin cerrar",
+    "SELECT 1 /*M!100000 INTO OUTFILE '/x' */",
+    "/*m! DROP TABLE t */",
+    "SELECT 1 # comentario mysql\nFROM t",
+    "SELECT id # 0, lo_import('/etc/shadow') FROM t",
+    "SELECT 'a\\'; DROP DATABASE x",
+    "SELECT 'x#y', 'a--b', '/* z */'",
+    "DO $$BEGIN GRANT ALL ON DATABASE d TO app; END$$",
+    "SELECT $tag$ -- no es comentario 'x' $tag$, 1",
+    "SELECT $$ sin cerrar",
+    "SELECT $1, $2 FROM t WHERE a = $1",
+    "SELECT a$b FROM t",
+    "  \n SELECT  1 \t  ,  2  \n",
+    "SELECT 1 -- final sin salto",
+    "SELECT 1;\n-- otra\nSELECT 2 /* x */",
+    "SELECT '--' FROM t -- real",
+    "SELECT \"a--b\" FROM t",
+    "select * from T where Accion = 'DELETE'",
+]
+
+
+@pytest.mark.parametrize("engine", ["mysql", "mariadb", "postgresql"])
+@pytest.mark.parametrize("upper", [True, False])
+def test_scan_normalize_is_byte_identical_to_the_algorithm_before_the_extraction(engine, upper):
+    for sql in _SCAN_CORPUS:
+        assert qp._scan_normalize(sql, engine=engine, upper=upper) == _legacy_scan_normalize(
+            sql, engine=engine, upper=upper
+        ), f"{engine} upper={upper}: {sql!r}"
+
+
+def test_literal_spans_find_the_string_literals_the_console_blanks():
+    sql = "SELECT 'a''b', \"id\", 'x' -- 'no es literal'"
+
+    spans = sql_lexing.literal_spans(sql, "postgresql", False)
+
+    assert [sql[s:e] for s, e in spans] == ["'a''b'", "'x'"]
+
+
+def test_literal_spans_depend_on_the_backslash_mode_only_in_the_agent_policy():
+    sql = r"SELECT 'a\'' x"
+
+    plain = sql_lexing.literal_spans(sql, "mysql", False)
+    escaped = sql_lexing.literal_spans(sql, "mysql", True)
+
+    assert plain != escaped
+    # La consola usa SIEMPRE ``False``: la barra invertida no escapa comillas (ver
+    # ``_scan_normalize``), y eso no cambió.
+    # ...así que el literal queda sin cerrar y consume el resto del texto: comportamiento
+    # histórico del escáner de la consola, que la extracción no cambió.
+    assert qp._scan_normalize(sql, engine="mysql", upper=False) == "SELECT ''"
+
+
+_TREE_CORPUS = [
+    ("SELECT * FROM t", "mysql"),
+    ("SELECT * FROM t LIMIT 10", "mysql"),
+    ("SELECT * FROM t LIMIT 1000", "mysql"),
+    ("SELECT * FROM t LIMIT 100", "mysql"),
+    ("SELECT * FROM t LIMIT 101", "mysql"),
+    ("SELECT * FROM t LIMIT ?", "mysql"),
+    ("SELECT * FROM t LIMIT 1 + 1", "postgresql"),
+    ("SELECT * FROM t LIMIT 5, 10", "mysql"),
+    ("SELECT * FROM t LIMIT 5 OFFSET 7", "postgresql"),
+    ("SELECT * FROM t FETCH FIRST 5 ROWS ONLY", "postgresql"),
+    ("SELECT * FROM t LIMIT ALL", "postgresql"),
+    ("SELECT * FROM t FOR UPDATE", "postgresql"),
+    ("SELECT * FROM t LOCK IN SHARE MODE", "mysql"),
+    ("SELECT a INTO @v FROM t", "mysql"),
+    ("SELECT a INTO new_t FROM t", "postgresql"),
+    ("SELECT 1 UNION SELECT 2", "mysql"),
+    ("SELECT 1 UNION ALL SELECT 2 LIMIT 3", "mysql"),
+    ("SELECT 1 INTERSECT SELECT 2", "postgresql"),
+    ("SELECT 1 EXCEPT SELECT 2", "postgresql"),
+    ("WITH c AS (SELECT 1) SELECT * FROM c", "mysql"),
+    ("UPDATE t SET a = 1", "mysql"),
+    ("DELETE FROM t", "postgresql"),
+    ("SHOW TABLES", "mysql"),
+    ("CREATE TABLE n AS SELECT * FROM t", "mysql"),
+]
+
+
+@pytest.mark.parametrize("max_rows", [None, 0, 5, 100, 1000])
+def test_limited_sql_outputs_are_unchanged(max_rows):
+    """D15: ``_limited_sql`` es un envoltorio de ``bound_select`` y devuelve lo mismo que antes."""
+    for sql, engine in _TREE_CORPUS:
+        dialect = qp._sqlglot_dialect(engine)
+        tree = sqlglot.parse_one(sql, read=dialect)
+
+        assert qp._limited_sql(tree, dialect, max_rows) == _legacy_limited_sql(
+            tree, dialect, max_rows
+        ), f"{sql!r} max_rows={max_rows}"
+
+    assert qp._limited_sql(None, "mysql", 5) is None
+
+
+def test_the_console_still_gets_the_same_fetch_sql_through_classify():
+    plan = qp.classify("SELECT * FROM t", engine="mysql", max_rows=100)
+    assert plan.statements[0].fetch_sql == "SELECT * FROM t LIMIT 101"
+
+    own = qp.classify("SELECT * FROM t LIMIT 10", engine="mysql", max_rows=100)
+    assert own.statements[0].fetch_sql is None
+
+    # INTERSECT/EXCEPT nunca se acotaron en la consola y siguen sin acotarse.
+    setop = qp.classify("SELECT 1 INTERSECT SELECT 2", engine="postgresql", max_rows=100)
+    assert setop.statements[0].fetch_sql is None
+
+
+def test_bound_select_distinguishes_already_bounded_from_unboundable():
+    """H1: ``None`` conflaba las dos cosas; ``RowBound`` las separa."""
+    mysql = qp._sqlglot_dialect("mysql")
+
+    def tree(sql):
+        return sqlglot.parse_one(sql, read=mysql)
+
+    pushed = qp.bound_select(tree("SELECT * FROM t"), mysql, 100)
+    assert (pushed.kind, pushed.sql) == (qp.PUSHED, "SELECT * FROM t LIMIT 101")
+
+    replaced = qp.bound_select(tree("SELECT * FROM t LIMIT 1000"), mysql, 100)
+    assert (replaced.kind, replaced.sql) == (qp.PUSHED, "SELECT * FROM t LIMIT 101")
+
+    own = qp.bound_select(tree("SELECT * FROM t LIMIT 10"), mysql, 100)
+    assert (own.kind, own.sql) == (qp.OWN_LIMIT, "SELECT * FROM t LIMIT 10")
+
+    at_cap = qp.bound_select(tree("SELECT * FROM t LIMIT 100"), mysql, 100)
+    assert at_cap.kind == qp.OWN_LIMIT
+
+    for sql in (
+        "SELECT * FROM t LIMIT ?",
+        "SELECT * FROM t FOR UPDATE",
+        "SELECT a INTO @v FROM t",
+        "UPDATE t SET a = 1",
+    ):
+        bound = qp.bound_select(tree(sql), mysql, 100)
+        assert (bound.kind, bound.sql) == (qp.UNBOUNDABLE, None), sql
+
+    assert qp.bound_select(tree("SELECT 1"), mysql, None).kind == qp.UNBOUNDABLE
+    assert qp.bound_select(None, mysql, 100).kind == qp.UNBOUNDABLE
+
+
+def test_bound_select_only_handles_intersect_and_except_when_asked():
+    pg = qp._sqlglot_dialect("postgresql")
+    tree = sqlglot.parse_one("SELECT 1 EXCEPT SELECT 2", read=pg)
+
+    assert isinstance(tree, exp.Except)
+    assert qp.bound_select(tree, pg, 10).kind == qp.UNBOUNDABLE
+    asked = qp.bound_select(tree, pg, 10, include_set_ops=True)
+    assert (asked.kind, asked.sql) == (qp.PUSHED, "SELECT 1 EXCEPT SELECT 2 LIMIT 11")

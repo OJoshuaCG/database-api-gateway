@@ -60,6 +60,13 @@ from sqlglot import exp
 
 from app.services.db_admin.identifiers import references_gateway_internal_table
 from app.services.db_admin.sql_dialect import split_sql_statements
+from app.services.db_admin.sql_lexing import (
+    COMMENT_KINDS,
+    EXEC_COMMENT,
+    STRING,
+    executable_comment_prefix,
+    lex_spans,
+)
 
 # --------------------------------------------------------------------------- #
 # Niveles                                                                      #
@@ -136,25 +143,6 @@ class QueryPlan:
 
 _WS_RE = re.compile(r"\s+")
 
-# Prefijos de comentario EJECUTABLE de la familia MySQL, del más largo al más corto para
-# que ``/*M!`` no se confunda nunca con ``/*``. ``/*!`` lo ejecutan MySQL y MariaDB;
-# ``/*M!`` es exclusivo de MariaDB (y su ``M`` es sensible a mayúsculas en el motor, pero
-# acá se acepta también minúscula: reconocer de más solo sobre-bloquea).
-_EXECUTABLE_COMMENT_PREFIXES = ("/*M!", "/*m!", "/*!")
-
-
-def _executable_comment_prefix(sql: str, i: int) -> int:
-    """
-    Largo del prefijo de comentario ejecutable que abre en ``i``, o ``0`` si no hay.
-
-    Devolver el LARGO y no un booleano es lo que permite que el llamador salte el prefijo
-    correcto (3 para ``/*!``, 4 para ``/*M!``) sin duplicar la tabla de prefijos.
-    """
-    for prefix in _EXECUTABLE_COMMENT_PREFIXES:
-        if sql.startswith(prefix, i):
-            return len(prefix)
-    return 0
-
 
 def _scan_normalize(sql: str, *, engine: str = "mysql", upper: bool = True) -> str:
     """
@@ -188,95 +176,39 @@ def _scan_normalize(sql: str, *, engine: str = "mysql", upper: bool = True) -> s
     la blocklist la ve — fail-closed. El costo es sobre-bloquear alguna consulta con
     apóstrofos escapados, no dejar pasar una peligrosa.
     """
-    hash_is_comment = engine in ("mysql", "mariadb")
     out: list[str] = []
-    i, n = 0, len(sql)
-    while i < n:
-        ch = sql[i]
-
-        # --- comentarios ---
-        if ch == "-" and sql.startswith("--", i):
-            j = sql.find("\n", i)
-            i = n if j == -1 else j
+    pos = 0
+    for span in lex_spans(sql, engine=engine):
+        out.append(sql[pos : span.start])
+        pos = span.end
+        if span.kind in COMMENT_KINDS and span.kind != EXEC_COMMENT:
             out.append(" ")
-            continue
-        if ch == "#" and hash_is_comment:
-            j = sql.find("\n", i)
-            i = n if j == -1 else j
-            out.append(" ")
-            continue
-        if ch == "/" and sql.startswith("/*", i):
-            executable = _executable_comment_prefix(sql, i)
-            if executable:
-                # Comentario EJECUTABLE de MySQL/MariaDB: se conserva el contenido como
-                # código. El número que sigue al prefijo es la versión MÍNIMA del motor
-                # (``/*!40101 GRANT … */``), no parte de la sentencia: si no se descarta,
-                # queda como primera palabra y los patrones anclados con ``^`` no matchean
-                # — es decir, sería una evasión trivial de la blocklist.
-                #
-                # ``/*M!`` es la variante EXCLUSIVA de MariaDB (``/*M!100000 … */``) y su
-                # ausencia acá era un agujero real: el contenido se descartaba como
-                # comentario común, la blocklist nunca lo veía y el motor lo ejecutaba
-                # igual. Con la credencial pseudo-root, un
-                # ``/*M!100000 INTO OUTFILE '/tmp/x' */`` es escritura de archivo
-                # arbitraria en el host de la base del cliente. Se reconoce en los TRES
-                # motores a propósito (fail-closed): un MariaDB dado de alta como ``mysql``
-                # es un error de inventario frecuente, y conservar texto de más solo puede
-                # sobre-bloquear, nunca dejar pasar.
-                j = sql.find("*/", i + executable)
-                body = re.sub(r"^\d+", "", sql[i + executable : (n if j == -1 else j)])
-                out.append(" " + body + " ")
-                i = n if j == -1 else j + 2
-                continue
-            j = sql.find("*/", i + 2)
-            i = n if j == -1 else j + 2
-            out.append(" ")
-            continue
-
-        # --- literales de cadena: se vacían ---
-        if ch == "'":
-            i += 1
-            while i < n:
-                if sql[i] == "'":
-                    if i + 1 < n and sql[i + 1] == "'":  # '' escapada
-                        i += 2
-                        continue
-                    i += 1
-                    break
-                i += 1
+        elif span.kind == EXEC_COMMENT:
+            # Comentario EJECUTABLE de MySQL/MariaDB: se conserva el contenido como código. El
+            # número que sigue al prefijo es la versión MÍNIMA del motor (``/*!40101 GRANT … */``),
+            # no parte de la sentencia: si no se descarta, queda como primera palabra y los
+            # patrones anclados con ``^`` no matchean — es decir, sería una evasión trivial de la
+            # blocklist.
+            #
+            # ``/*M!`` es la variante EXCLUSIVA de MariaDB (``/*M!100000 … */``) y su ausencia
+            # acá era un agujero real: el contenido se descartaba como comentario común, la
+            # blocklist nunca lo veía y el motor lo ejecutaba igual. Con la credencial
+            # pseudo-root, un ``/*M!100000 INTO OUTFILE '/tmp/x' */`` es escritura de archivo
+            # arbitraria en el host de la base del cliente. Se reconoce en los TRES motores a
+            # propósito (fail-closed): un MariaDB dado de alta como ``mysql`` es un error de
+            # inventario frecuente, y conservar texto de más solo puede sobre-bloquear, nunca
+            # dejar pasar.
+            prefix = executable_comment_prefix(sql, span.start)
+            body_end = span.end - 2 if span.terminated else span.end
+            body = re.sub(r"^\d+", "", sql[span.start + prefix : body_end])
+            out.append(" " + body + " ")
+        elif span.kind == STRING:
+            # Literales ``'…'`` => ``''``: una palabra clave DENTRO de un literal no se ejecuta.
             out.append("''")
-            continue
-
-        # --- identificadores citados: se conservan tal cual ---
-        if ch in ('"', "`"):
-            quote = ch
-            out.append(ch)
-            i += 1
-            while i < n:
-                out.append(sql[i])
-                if sql[i] == quote:
-                    if i + 1 < n and sql[i + 1] == quote:
-                        out.append(sql[i + 1])
-                        i += 2
-                        continue
-                    i += 1
-                    break
-                i += 1
-            continue
-
-        # --- dollar-quoting de PostgreSQL: se conserva entero ---
-        if ch == "$":
-            m = re.match(r"\$[A-Za-z_0-9]*\$", sql[i:])
-            if m:
-                tag = m.group(0)
-                j = sql.find(tag, i + len(tag))
-                end = n if j == -1 else j + len(tag)
-                out.append(sql[i:end])
-                i = end
-                continue
-
-        out.append(ch)
-        i += 1
+        else:
+            # Identificadores citados y dollar-quoting se CONSERVAN tal cual.
+            out.append(sql[span.start : span.end])
+    out.append(sql[pos:])
 
     collapsed = _WS_RE.sub(" ", "".join(out)).strip()
     # ``upper=False`` lo usa SOLO el chequeo de nombres calificados entre bases: en MySQL
@@ -761,9 +693,36 @@ def _impact_query(tree: exp.Expression, dialect: str) -> str | None:
 # --------------------------------------------------------------------------- #
 
 
-def _limited_sql(tree: exp.Expression | None, dialect: str, max_rows: int | None) -> str | None:
+#: Cómo quedó acotada una consulta (ver ``bound_select``).
+PUSHED = "pushed"
+OWN_LIMIT = "own_limit"
+UNBOUNDABLE = "unboundable"
+
+
+@dataclass(frozen=True, slots=True)
+class RowBound:
     """
-    La misma consulta con ``LIMIT max_rows + 1``, o ``None`` si no se puede acotar.
+    Resultado de ``bound_select``: ``kind`` más el texto a ejecutar.
+
+    - ``PUSHED``: el gateway agregó ``LIMIT max_rows + 1``; ``sql`` es la consulta con ese tope.
+    - ``OWN_LIMIT``: la consulta ya traía un ``LIMIT`` literal ``<= max_rows``; ``sql`` es la
+      misma consulta, tal cual (``.limit()`` lo REEMPLAZARÍA por uno más grande).
+    - ``UNBOUNDABLE``: no hay forma de acotarla sin cambiar su semántica; ``sql`` es ``None``.
+    """
+
+    kind: str
+    sql: str | None = None
+
+
+def bound_select(
+    tree: exp.Expression | None,
+    dialect: str,
+    max_rows: int | None,
+    *,
+    include_set_ops: bool = False,
+) -> RowBound:
+    """
+    La consulta acotada a ``max_rows`` filas, con el motivo explícito (``RowBound``).
 
     POR QUÉ ES LA ÚNICA DEFENSA REAL. Recortar del lado del gateway
     (``fetchmany(max_rows + 1)`` + cerrar el cursor) acota la MEMORIA pero no el
@@ -776,39 +735,69 @@ def _limited_sql(tree: exp.Expression | None, dialect: str, max_rows: int | None
 
     Se pide una fila DE MÁS para poder informar ``truncated`` con certeza.
 
-    NO se acota cuando cambiaría la semántica:
-    - Solo raíces ``Select``/``Union``: el resto (``SHOW``, ``Command``, DDL) no admite
-      ``LIMIT`` y devuelve pocas filas o ninguna.
+    POR QUÉ DEVUELVE UN ``RowBound`` Y NO UN ``str | None``. ``_limited_sql`` devolvía ``None``
+    tanto para "ya trae su propio ``LIMIT`` chico" (consulta ACOTADA, correcta tal cual) como
+    para "no se puede acotar" (consulta NO acotada). La consola puede ignorar la diferencia
+    porque ella misma recorta del lado del gateway; una tool que ejecuta SQL de un agente no:
+    sin ella, rechazar todo ``None`` rechazaba ``SELECT … LIMIT 10``, que es la consulta más
+    razonable que existe, y aceptarlo todo dejaba pasar lo no acotable.
+
+    NO se acota (``UNBOUNDABLE``) cuando cambiaría la semántica:
+    - Solo raíces ``Select``/``Union`` (más ``Intersect``/``Except`` con ``include_set_ops``, que
+      solo pide el validador de agentes: la consola nunca los acotó y su salida no cambia). El
+      resto (``SHOW``, ``Command``, DDL) no admite ``LIMIT`` y devuelve pocas filas o ninguna.
     - Con ``FOR UPDATE``/``FOR SHARE``, el ``LIMIT`` cambia QUÉ FILAS se bloquean.
     - Con ``INTO``, el resultado se materializa en otro lado.
-    - Un ``LIMIT`` propio más chico se respeta tal cual (``.limit()`` lo REEMPLAZARÍA).
+    - Con un ``LIMIT`` no literal (``LIMIT ?``, una expresión) o mayor al tope se acota
+      (``PUSHED``) solo si es literal; uno no comparable queda ``UNBOUNDABLE``.
+    - Un ``LIMIT`` propio ``<= max_rows`` se respeta tal cual (``OWN_LIMIT``).
     """
+    roots: tuple[type[exp.Expression], ...] = (exp.Select, exp.Union)
+    if include_set_ops:
+        roots = (exp.Select, exp.SetOperation)
+    unbounded = RowBound(UNBOUNDABLE)
     if max_rows is None or tree is None:
-        return None
-    if not isinstance(tree, (exp.Select, exp.Union)):
-        return None
+        return unbounded
+    if not isinstance(tree, roots):
+        return unbounded
     if tree.args.get("into") is not None:
-        return None
+        return unbounded
     if any(isinstance(node, exp.Lock) for node in tree.walk()):
-        return None
+        return unbounded
 
     existing = tree.args.get("limit")
     if existing is not None:
         literal = getattr(existing, "expression", None)
         if isinstance(literal, exp.Literal) and literal.is_int:
             try:
-                if int(literal.name) <= max_rows:
-                    return None
+                own = int(literal.name) <= max_rows
             except (TypeError, ValueError):
-                return None
+                return unbounded
+            if own:
+                try:
+                    return RowBound(OWN_LIMIT, tree.sql(dialect=dialect))
+                except Exception:  # noqa: BLE001 — acotar nunca rompe el plan
+                    return unbounded
         else:
-            # ``LIMIT ?`` o una expresión: no se puede comparar, se deja como está.
-            return None
+            # ``LIMIT ?`` o una expresión: no se puede comparar, no se toca.
+            return unbounded
 
     try:
-        return tree.copy().limit(max_rows + 1).sql(dialect=dialect)
+        return RowBound(PUSHED, tree.copy().limit(max_rows + 1).sql(dialect=dialect))
     except Exception:  # noqa: BLE001 — acotar es una optimización, nunca rompe el plan
-        return None
+        return unbounded
+
+
+def _limited_sql(tree: exp.Expression | None, dialect: str, max_rows: int | None) -> str | None:
+    """
+    La misma consulta con ``LIMIT max_rows + 1``, o ``None`` si no hay nada que empujar.
+
+    Envoltorio fino de ``bound_select`` para la consola: ``None`` conflaba "ya acotada por su
+    propio ``LIMIT``" con "no acotable", y a la consola le da igual (acota del lado del
+    gateway). Ver ``bound_select`` para el porqué del tope y los casos que no se acotan.
+    """
+    bound = bound_select(tree, dialect, max_rows)
+    return bound.sql if bound.kind == PUSHED else None
 
 
 # --------------------------------------------------------------------------- #
