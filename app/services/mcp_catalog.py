@@ -59,6 +59,13 @@ WARN_OBJECTS_OMITTED_BY_FILTER = "mcp.warn.objects_omitted_by_filter"
 #: apagado por diseño, plan 12 §4).
 WARN_BODIES_UNAVAILABLE = "mcp.warn.bodies_unavailable"
 
+#: ``search_schema`` no pudo leer todo lo que debía: el tope de tablas escaneadas por llamada
+#: (``MCP_SEARCH_MAX_TABLES``) o el presupuesto de tiempo lo cortaron. Los resultados son válidos
+#: pero PARCIALES para columnas y comentarios de las tablas no escaneadas.
+WARN_SEARCH_SCAN_TRUNCATED = "mcp.warn.search_scan_truncated"
+#: ``search_schema`` encontró más coincidencias que ``limit``: se devuelven las mejor rankeadas.
+WARN_SEARCH_RESULTS_TRUNCATED = "mcp.warn.search_results_truncated"
+
 #: --- Referencias ---------------------------------------------------------- #
 #: v1 NO acepta referencia cruda (`server_id` + nombre) y se rechaza ANTES de cualquier lookup.
 #: La referencia cruda existe para flujos de adopción y legado de la SPA; para un agente es puro

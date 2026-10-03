@@ -475,6 +475,11 @@ MCP_AUTH_FAILURE_RATE_LIMIT = os.getenv("MCP_AUTH_FAILURE_RATE_LIMIT", "30/minut
 MCP_READONLY_MAX_AGE_DAYS = int(os.getenv("MCP_READONLY_MAX_AGE_DAYS", "30"))
 # Tope de objetos por llamada a `get_schema`, evaluado ANTES de abrir la conexión (plan 12 §6.3).
 MCP_MAX_OBJECTS_PER_CALL = int(os.getenv("MCP_MAX_OBJECTS_PER_CALL", "50"))
+# Tope de tablas cuyo detalle (columnas y comentarios) lee UNA llamada a `search_schema`. Cada tabla
+# es una lectura de catálogo, así que sin tope una base de miles de tablas costaría minutos de sesión.
+# Pasado el tope no se falla: se busca en las primeras (las de nombre afín primero) y la respuesta
+# marca `truncated: true`. Los nombres de tablas y vistas se buscan siempre, sin tope.
+MCP_SEARCH_MAX_TABLES = int(os.getenv("MCP_SEARCH_MAX_TABLES", "200"))
 # Duración máxima y timeout de sentencia de la sesión de lectura del MCP (plan 12 §5.3). Mucho más
 # chicos que los del export: una tool alimenta un contexto con alguien esperando del otro lado, y
 # una transacción abierta en la base de un tercero retiene undo (MySQL) o frena el VACUUM (PG).

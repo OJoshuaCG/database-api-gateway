@@ -199,7 +199,13 @@ def test_tools_list_publishes_only_what_the_token_can_call(client, admin_client,
     nombres = [
         t["name"] for t in _rpc(client, solo_lectura, "tools/list").json()["result"]["tools"]
     ]
-    assert nombres == ["list_databases", "list_objects", "check_freshness", "get_schema"]
+    assert nombres == [
+        "list_databases",
+        "list_objects",
+        "check_freshness",
+        "get_schema",
+        "search_schema",
+    ]
 
     todos = _token(admin_client, pid, TODOS_LOS_SCOPES)
     nombres = [t["name"] for t in _rpc(client, todos, "tools/list").json()["result"]["tools"]]
@@ -207,6 +213,7 @@ def test_tools_list_publishes_only_what_the_token_can_call(client, admin_client,
         "list_databases",
         "list_objects",
         "get_schema",
+        "search_schema",
         "diff_schemas",
         "list_environments",
         "list_exports",
@@ -221,6 +228,7 @@ def test_tools_list_publishes_only_what_the_token_can_call(client, admin_client,
     [
         ("list_objects", {"database_id": 1}),
         ("get_schema", {"database_id": 1, "objects": [{"kind": "table", "name": "t"}]}),
+        ("search_schema", {"database_id": 1, "query": "cliente"}),
         ("diff_schemas", {"source_database_id": 1, "target_database_id": 2}),
         ("list_environments", {}),
         ("list_exports", {}),

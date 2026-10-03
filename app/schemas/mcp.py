@@ -219,6 +219,61 @@ class SchemaOut(_Out):
     missing: list[ObjectRefOut]
 
 
+# ---- search_schema --------------------------------------------------------- #
+
+SearchKind = Literal["table", "view", "column", "routine", "trigger"]
+SearchTruncationReason = Literal["results_limit", "scan_cap", "time_budget"]
+
+#: Constante del gateway (no texto de terceros): qué hacer con un resultado.
+SEARCH_NEXT_STEP = (
+    "Cada resultado trae 'get_schema_object': pasalo en 'objects' de get_schema para leer la "
+    "estructura completa (columnas, claves, índices) de esa tabla o vista."
+)
+
+
+class SearchHitOut(_Out):
+    """
+    Un resultado de ``search_schema``: ESTRUCTURA, nunca filas. ``comment`` es texto de terceros
+    (capado y listado en ``untrusted_fields``). ``score`` solo sirve para ordenar dentro de una
+    misma respuesta.
+    """
+
+    kind: SearchKind
+    name: str
+    #: La tabla dueña (columnas) o la propia tabla/vista. ``None`` en rutinas y triggers.
+    table: str | None
+    column: str | None
+    data_type: str | None
+    key_flags: list[Literal["primary_key", "foreign_key", "unique"]]
+    #: ``tabla.columna`` a la que apunta una clave foránea de esta columna.
+    references: str | None
+    comment: str | None
+    score: int
+    matched_on: Literal["name", "name_and_table", "comment", "name_and_comment"]
+    matched_tokens: list[str]
+    get_schema_object: ObjectRefOut
+
+
+class SchemaSearchOut(_Out):
+    """
+    ``truncated`` es ``true`` si CUALQUIER motivo de ``truncated_reasons`` recortó el resultado:
+    ``results_limit`` (hay más coincidencias que ``limit``), ``scan_cap`` (más tablas que
+    ``MCP_SEARCH_MAX_TABLES``: las no escaneadas no se buscaron por columna ni comentario) o
+    ``time_budget`` (se agotó el presupuesto de tiempo de la sesión).
+    """
+
+    query_tokens: list[str]
+    hits: list[SearchHitOut]
+    count: int
+    total_matches: int
+    truncated: bool
+    truncated_reasons: list[SearchTruncationReason]
+    scanned_tables: int
+    total_tables: int
+    searched_kinds: list[SearchKind]
+    next_step: str
+
+
 # ---- diff_schemas ---------------------------------------------------------- #
 
 
@@ -347,7 +402,7 @@ class ToolEnvelope(_Out):
     """
 
     notice: str
-    data: ObjectIndexOut | SchemaOut | SchemaDiffOut | FreshnessOut
+    data: ObjectIndexOut | SchemaOut | SchemaDiffOut | FreshnessOut | SchemaSearchOut
     source: Literal["managed_database"]
     untrusted_content: bool
     untrusted_fields: list[str]

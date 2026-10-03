@@ -429,6 +429,20 @@ def structural_changes(source, target) -> tuple[list[dict], bool]:
     return cambios, bool(diff.cross_flavor_warning)
 
 
+def exclude_internal_tables(names) -> list[str]:
+    """
+    Quita la contabilidad interna del gateway (``_gw_v_*``/``_gw_stg_*``) de una lista de tablas.
+
+    ``list_object_names`` ya la excluye en el adapter; esto es la SEGUNDA barrera para las tools
+    del MCP, que no pueden importar ``identifiers`` (``tests/test_mcp_import_guard.py``) y no
+    deben confiar en que el filtro de capa de abajo siga ahí: una tool de búsqueda que la
+    listara le daría al agente la tabla de versión de Alembic como candidato de cualquier consulta.
+    """
+    from app.services.db_admin.identifiers import exclude_gateway_internal_tables
+
+    return exclude_gateway_internal_tables(names)
+
+
 # --------------------------------------------------------------------------- #
 # Inventario operativo de lo alcanzable: entornos, exportaciones, clonados       #
 # --------------------------------------------------------------------------- #

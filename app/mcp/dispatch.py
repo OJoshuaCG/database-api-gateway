@@ -43,6 +43,7 @@ def _tool_descriptor(spec) -> dict:
         "name": spec.name,
         "description": spec.description,
         "inputSchema": spec.input_schema,
+        "annotations": dict(spec.annotations),
     }
 
 

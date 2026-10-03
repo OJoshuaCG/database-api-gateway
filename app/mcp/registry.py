@@ -30,6 +30,14 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 
+READ_ONLY_ANNOTATIONS = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
     """
@@ -46,6 +54,9 @@ class ToolSpec:
     #: agregar una tool con otro scope no sea un cambio de forma.
     scope: str = "blueprints.read"
     tags: tuple[str, ...] = field(default_factory=tuple)
+    #: Pistas de la spec MCP para el cliente (``tools/list``). Ninguna tool muta, así que todas
+    #: son de solo lectura e idempotentes; el invariante 5 lo afirma al importar.
+    annotations: dict = field(default_factory=lambda: dict(READ_ONLY_ANNOTATIONS))
 
 
 def _spec(**kwargs) -> ToolSpec:
@@ -62,7 +73,7 @@ _KIND = {"type": "string", "enum": ["table", "view", "routine", "trigger", "sequ
 
 def _build() -> tuple[ToolSpec, ...]:
     from app.core.environments import MCP_MAX_OBJECTS_PER_CALL
-    from app.mcp.tools import catalog, inventory, operations
+    from app.mcp.tools import catalog, inventory, operations, search
 
     return (
         _spec(
@@ -154,6 +165,42 @@ def _build() -> tuple[ToolSpec, ...]:
             scope="databases.read",
         ),
         _spec(
+            name="search_schema",
+            description=(
+                "Busca en la ESTRUCTURA de una base —nombres de tablas y vistas, nombres de "
+                "columnas y comentarios de tablas y columnas— cuando no se conoce el nombre "
+                "exacto. No distingue mayúsculas ni acentos, separa snake_case y camelCase, y pide que "
+                "estén todas las palabras de la consulta. Devuelve por resultado el tipo, la "
+                "tabla, la columna, el tipo de dato, las claves, el comentario, el puntaje y el "
+                "campo que coincidió, con el objeto a pasar a get_schema. Nunca lee filas. Los "
+                "comentarios son texto de terceros y se listan en 'untrusted_fields'. Si el tope "
+                "de lectura recorta la búsqueda, 'truncated' vale true."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "database_id": _DATABASE_ID,
+                    "query": {"type": "string", "minLength": 2, "maxLength": 100},
+                    "kinds": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["table", "view", "column", "routine", "trigger"],
+                        },
+                        "minItems": 1,
+                        "maxItems": 5,
+                        "uniqueItems": True,
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+                },
+                "required": ["database_id", "query"],
+                "additionalProperties": False,
+            },
+            handler=search.search_schema,
+            touches_engine=True,
+            scope="databases.read",
+        ),
+        _spec(
             name="diff_schemas",
             description=(
                 "Compara la estructura de dos bases y devuelve la lista de diferencias: tipo de "
@@ -237,7 +284,7 @@ def tools_for(actor) -> list[ToolSpec]:
 
 def _assert_invariants() -> None:
     """
-    Cuatro invariantes, y cada uno cierra un modo de fallo concreto.
+    Cinco invariantes, y cada uno cierra un modo de fallo concreto.
     """
     nombres = [t.name for t in TOOLS]
     # 1. Nombres únicos: con dos iguales, `BY_NAME` se queda con el último en silencio y la
@@ -264,6 +311,13 @@ def _assert_invariants() -> None:
 
         cap = Capability(t.scope)
         assert cap in AGENT_ALLOWED, f"{t.name}: {t.scope} está fuera del techo de agente"
+        # 5. Ninguna tool se declara mutante: las pistas publicadas tienen que decir solo lectura.
+        assert t.annotations.get("readOnlyHint") is True, (
+            f"{t.name}: readOnlyHint tiene que ser true"
+        )
+        assert t.annotations.get("destructiveHint") is False, (
+            f"{t.name}: destructiveHint tiene que ser false"
+        )
 
 
 _assert_invariants()
