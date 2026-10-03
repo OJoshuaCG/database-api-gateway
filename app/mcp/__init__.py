@@ -20,10 +20,17 @@ deriva accidental**, que no es trivial y sí es valioso.
 
 EL INVARIANTE QUE SOBREVIVE A TODA VERSIÓN FUTURA
 -------------------------------------------------
-**El MCP nunca acepta SQL del agente.** No es prudencia genérica: ``sqlglot`` no tokeniza el
+**El MCP nunca EJECUTA SQL del agente.** No es prudencia genérica: ``sqlglot`` no tokeniza el
 contenido de los comentarios ejecutables ``/*!`` de MySQL ni ``/*M!`` de MariaDB, así que todo
 guard por AST sobre SQL arbitrario es **evadible** — fue una vulnerabilidad real de la consola SQL
 de este mismo repo, corregida en dos rondas.
+
+El texto SÍ se puede ACEPTAR: ``draft_query`` lo clasifica con un validador estricto
+(``app/services/db_admin/agent_sql_policy.py``) y devuelve solo texto, con ``touches_engine`` en
+``false``. Lo que garantiza que no llegue al motor es que esa ruta no tiene credencial ni façade y
+que este paquete no puede importar la capa de motor. El validador es defensa en profundidad: lo que
+el parseo no ve (vistas con ``DEFINER``, tablas ``FEDERATED``/``CONNECT``, diferencias entre el
+parser y el motor) lo cierra el límite real, la cuenta del motor con ``SELECT`` sobre una sola base.
 
 Cuando haga falta ver datos, la vía son tools **parametrizados** (``sample_rows``,
 ``distinct_values``, ``count_rows``): cubren el caso real y son imposibles de volver destructivos,

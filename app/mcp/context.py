@@ -66,3 +66,15 @@ class ToolContext:
         from app.controllers.target_resolution import open_readonly
 
         return open_readonly(self.actor, database_id, self.capability)
+
+    def draft_query(self, database_id: int, sql: str) -> dict:
+        """
+        Clasifica el SQL de un agente SIN ejecutarlo y devuelve el sobre ya armado.
+
+        Pasa por el gate de la base pero no abre ninguna sesión: no hay façade ni credencial en
+        esta ruta. Es la única puerta por la que texto SQL de un agente entra al paquete, y de
+        ella solo sale texto (``touches_engine`` es siempre ``False``).
+        """
+        from app.controllers.target_resolution import draft_agent_query
+
+        return draft_agent_query(self.actor, database_id, sql, self.capability)

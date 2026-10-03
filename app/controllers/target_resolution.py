@@ -401,6 +401,35 @@ def open_readonly(actor: Actor, database_id: int, capability: Capability):
         ) from exc
 
 
+def draft_agent_query(actor: Actor, database_id: int, sql: str, capability: Capability) -> dict:
+    """
+    Clasifica el SQL que redactó un agente SIN ejecutarlo: el sobre de ``draft_query``.
+
+    Pasa por el gate completo de la base (``resolve_agent_database``) pero **no construye ningún
+    target ni abre ninguna conexión**: no llama a ``_readonly_target`` ni a ``open_readonly``. Es
+    lo que distingue a ``draft_query`` de las tools que leen el catálogo, y por eso el test
+    (``tests/test_mcp_draft_query.py``) parchea ``remote_engine.database_connection`` para que
+    explote si alguien lo toca. Redactar nunca ejecuta, ni siquiera una lectura.
+
+    El motor y el nombre de la base salen de la FILA de inventario (``resuelta.database``), nunca
+    de un string del agente: el validador compara los nombres calificados del SQL contra ESA base.
+    Los imports son perezosos por la misma razón que en el resto del módulo (el guard de
+    ``tests/test_mcp_import_guard.py``).
+    """
+    from app.services.db_admin import agent_sql_policy as policy
+
+    resuelta = resolve_agent_database(actor, database_id, capability)
+    verdict = policy.validate_agent_select(
+        sql,
+        engine=resuelta.database.engine,
+        database=resuelta.database.database,
+        max_rows=policy.DEFAULT_MAX_ROWS,
+        max_offset=policy.DEFAULT_MAX_OFFSET,
+        max_bytes=policy.DEFAULT_MAX_SQL_BYTES,
+    )
+    return policy.build_draft_envelope(verdict, sql, max_bytes=policy.DEFAULT_MAX_SQL_BYTES)
+
+
 def structural_changes(source, target) -> tuple[list[dict], bool]:
     """
     El diff de dos snapshots, PROYECTADO a lo que puede ver un agente: ``(cambios, cross_flavor)``.

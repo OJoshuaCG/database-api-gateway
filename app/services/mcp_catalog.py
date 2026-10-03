@@ -90,3 +90,145 @@ POLICY_HINTS = {
         "La base tiene el veto de agentes activo (agent_access_blocked). No hay override."
     ),
 }
+
+# --------------------------------------------------------------------------- #
+# SQL de agente: códigos PÚBLICOS de razón y de advertencia                     #
+# --------------------------------------------------------------------------- #
+#
+# Vocabulario CERRADO de ``reasons[]`` y ``warnings[]`` de ``draft_query`` (y de las tools que
+# aceptan SQL de un agente). Son strings en MAYÚSCULAS y no ``mcp.*`` porque son el contrato del
+# SOBRE de respuesta (``{classification, reasons, warnings, …}``) y no códigos de error de tool.
+#
+# NUNCA salen nombres internos: el validador razona con códigos propios (``agent_sql.*``) y los
+# traduce con ``public_reason`` justo antes de responder. Así un refactor del validador no cambia
+# el contrato que consume el agente, y un código interno nuevo sin traducción falla en un test
+# (``INTERNAL_TO_PUBLIC`` es total) en vez de filtrarse al agente.
+
+REASON_PARSE_FAILED = "PARSE_FAILED"
+REASON_MULTIPLE_STATEMENTS = "MULTIPLE_STATEMENTS"
+REASON_NOT_SELECT = "NOT_SELECT"
+REASON_DML_IN_CTE = "DML_IN_CTE"
+REASON_DML_IN_SUBQUERY = "DML_IN_SUBQUERY"
+REASON_SELECT_INTO = "SELECT_INTO"
+REASON_LOCKING_READ = "LOCKING_READ"
+REASON_FUNCTION_NOT_ALLOWED = "FUNCTION_NOT_ALLOWED"
+REASON_VARIABLE_ASSIGNMENT = "VARIABLE_ASSIGNMENT"
+REASON_EXECUTABLE_COMMENT = "EXECUTABLE_COMMENT"
+REASON_COMMENT_NOT_ALLOWED = "COMMENT_NOT_ALLOWED"
+REASON_SYSTEM_SCHEMA = "SYSTEM_SCHEMA"
+REASON_CROSS_DATABASE = "CROSS_DATABASE"
+REASON_UNSUPPORTED_NODE = "UNSUPPORTED_NODE"
+REASON_LIMIT_TOO_HIGH = "LIMIT_TOO_HIGH"
+REASON_OFFSET_TOO_HIGH = "OFFSET_TOO_HIGH"
+REASON_UNKNOWN_IDENTIFIER = "UNKNOWN_IDENTIFIER"
+REASON_DATA_DISABLED = "DATA_DISABLED"
+REASON_PROBE_NOT_GREEN = "PROBE_NOT_GREEN"
+#: Reservado: no hay fuente de verdad de PII en el modelo; el límite real es el GRANT del motor.
+REASON_PII_BLOCKED = "PII_BLOCKED"
+REASON_QUERY_TIMEOUT = "QUERY_TIMEOUT"
+REASON_AUDIT_UNAVAILABLE = "AUDIT_UNAVAILABLE"
+REASON_CREDENTIAL_TOO_BROAD = "CREDENTIAL_TOO_BROAD"
+REASON_WRITE_PRIVILEGE_PRESENT = "WRITE_PRIVILEGE_PRESENT"
+REASON_FEDERATED_TABLE_PRESENT = "FEDERATED_TABLE_PRESENT"
+#: Adiciones del diseño (aditivas sobre el vocabulario de la spec).
+REASON_SQL_TOO_LARGE = "SQL_TOO_LARGE"
+REASON_LIMIT_NOT_BOUNDABLE = "LIMIT_NOT_BOUNDABLE"
+REASON_QUERY_FAILED = "QUERY_FAILED"
+REASON_MALFORMED_REQUEST = "MALFORMED_REQUEST"
+
+REASON_CODES = frozenset(
+    {
+        REASON_PARSE_FAILED,
+        REASON_MULTIPLE_STATEMENTS,
+        REASON_NOT_SELECT,
+        REASON_DML_IN_CTE,
+        REASON_DML_IN_SUBQUERY,
+        REASON_SELECT_INTO,
+        REASON_LOCKING_READ,
+        REASON_FUNCTION_NOT_ALLOWED,
+        REASON_VARIABLE_ASSIGNMENT,
+        REASON_EXECUTABLE_COMMENT,
+        REASON_COMMENT_NOT_ALLOWED,
+        REASON_SYSTEM_SCHEMA,
+        REASON_CROSS_DATABASE,
+        REASON_UNSUPPORTED_NODE,
+        REASON_LIMIT_TOO_HIGH,
+        REASON_OFFSET_TOO_HIGH,
+        REASON_UNKNOWN_IDENTIFIER,
+        REASON_DATA_DISABLED,
+        REASON_PROBE_NOT_GREEN,
+        REASON_PII_BLOCKED,
+        REASON_QUERY_TIMEOUT,
+        REASON_AUDIT_UNAVAILABLE,
+        REASON_CREDENTIAL_TOO_BROAD,
+        REASON_WRITE_PRIVILEGE_PRESENT,
+        REASON_FEDERATED_TABLE_PRESENT,
+        REASON_SQL_TOO_LARGE,
+        REASON_LIMIT_NOT_BOUNDABLE,
+        REASON_QUERY_FAILED,
+        REASON_MALFORMED_REQUEST,
+    }
+)
+
+#: Una sentencia de escritura o DDL nunca se ejecuta por el MCP: estas advertencias viajan SIEMPRE
+#: con ella para que el agente no crea que "borrar" ocurrió. ``LIMIT_TOO_HIGH`` es también
+#: advertencia (un ``limit`` pedido por encima del tope se recorta, no se rechaza).
+WARN_WRITE_NOT_EXECUTED = "WRITE_NOT_EXECUTED"
+WARN_DDL_NOT_EXECUTED = "DDL_NOT_EXECUTED"
+WARN_LIMIT_TOO_HIGH = REASON_LIMIT_TOO_HIGH
+
+WARNING_CODES = frozenset({WARN_WRITE_NOT_EXECUTED, WARN_DDL_NOT_EXECUTED, WARN_LIMIT_TOO_HIGH})
+
+#: Traducción interno -> público (tabla del diseño). Total sobre los códigos internos del
+#: validador (``agent_sql_policy.INTERNAL_CODES``) y de las capas de datos que se suman después.
+INTERNAL_TO_PUBLIC: dict[str, str] = {
+    # Léxico / parseo
+    "agent_sql.unparseable": REASON_PARSE_FAILED,
+    "agent_sql.tokenizer_error": REASON_PARSE_FAILED,
+    "agent_sql.ambiguous_literal": REASON_PARSE_FAILED,
+    "agent_sql.backslash_in_literal": REASON_PARSE_FAILED,
+    "agent_sql.too_large": REASON_SQL_TOO_LARGE,
+    "agent_sql.multiple_statements": REASON_MULTIPLE_STATEMENTS,
+    # Forma de la sentencia
+    "agent_sql.not_select": REASON_NOT_SELECT,
+    "agent_sql.classify_not_read": REASON_NOT_SELECT,
+    "agent_sql.dml_in_cte": REASON_DML_IN_CTE,
+    "agent_sql.dml_in_subquery": REASON_DML_IN_SUBQUERY,
+    "agent_sql.select_into": REASON_SELECT_INTO,
+    "agent_sql.locking_read": REASON_LOCKING_READ,
+    "agent_sql.function_not_allowed": REASON_FUNCTION_NOT_ALLOWED,
+    "agent_sql.variable_assignment": REASON_VARIABLE_ASSIGNMENT,
+    "agent_sql.executable_comment": REASON_EXECUTABLE_COMMENT,
+    "agent_sql.comment": REASON_COMMENT_NOT_ALLOWED,
+    # Identificadores. La contabilidad interna del gateway (``_gw_v_*``) se reporta como esquema
+    # de sistema: es la misma clase de objeto (no es esquema del usuario) y evita un código nuevo.
+    "agent_sql.system_schema": REASON_SYSTEM_SCHEMA,
+    "agent_sql.gateway_internal_table": REASON_SYSTEM_SCHEMA,
+    "agent_sql.cross_database": REASON_CROSS_DATABASE,
+    "agent_sql.unsupported_construct": REASON_UNSUPPORTED_NODE,
+    "agent_sql.render_mismatch": REASON_UNSUPPORTED_NODE,
+    "agent_sql.too_complex": REASON_UNSUPPORTED_NODE,
+    # Cota de filas
+    "agent_sql.limit_not_boundable": REASON_LIMIT_NOT_BOUNDABLE,
+    "agent_sql.offset_too_high": REASON_OFFSET_TOO_HIGH,
+    # Capas de datos (slices 2-6): se declaran acá para que la tabla sea una sola.
+    "mcp.data_disabled": REASON_DATA_DISABLED,
+    "mcp.data_not_opted_in": REASON_DATA_DISABLED,
+    "mcp.data_credential_missing": REASON_DATA_DISABLED,
+    "mcp.data_probe_stale": REASON_PROBE_NOT_GREEN,
+    "mcp.data_probe_failed": REASON_PROBE_NOT_GREEN,
+    "mcp.query_timeout": REASON_QUERY_TIMEOUT,
+    "mcp.audit_unavailable": REASON_AUDIT_UNAVAILABLE,
+    "mcp.query_failed": REASON_QUERY_FAILED,
+    "mcp.policy_miss": REASON_QUERY_FAILED,
+    "mcp.query_rejected": REASON_MALFORMED_REQUEST,
+}
+
+
+def public_reason(internal: str) -> str:
+    """
+    El código público de un código interno. **Fail-closed**: un código sin traducción sale como
+    ``UNSUPPORTED_NODE`` (rechazo) y nunca como el nombre interno. El test de totalidad existe
+    para que esa rama no se ejecute jamás.
+    """
+    return INTERNAL_TO_PUBLIC.get(internal, REASON_UNSUPPORTED_NODE)

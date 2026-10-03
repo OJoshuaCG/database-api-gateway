@@ -16,7 +16,8 @@ POR QUÉ ``TRIGGER`` Y ``EVENT`` ESTÁN PERMITIDOS AUNQUE PERMITEN CREAR OBJETOS
 En MySQL/MariaDB son los únicos privilegios que dejan VER triggers y events, y su ausencia es
 silenciosa: el catálogo devuelve cero filas en vez de un error (plan 12 §3.3). El §7.2 los incluye
 en los grants mínimos a sabiendas. La defensa contra que se usen para escribir es la otra mitad:
-la sesión del MCP corre en ``TRANSACTION READ ONLY`` y ninguna tool acepta SQL del agente.
+la sesión del MCP corre en ``TRANSACTION READ ONLY`` y ninguna tool EJECUTA SQL del agente
+(``draft_query`` lo acepta como texto y nunca abre una conexión).
 """
 
 from __future__ import annotations

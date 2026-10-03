@@ -73,7 +73,7 @@ _KIND = {"type": "string", "enum": ["table", "view", "routine", "trigger", "sequ
 
 def _build() -> tuple[ToolSpec, ...]:
     from app.core.environments import MCP_MAX_OBJECTS_PER_CALL
-    from app.mcp.tools import catalog, inventory, operations, search
+    from app.mcp.tools import catalog, inventory, operations, query, search
 
     return (
         _spec(
@@ -267,6 +267,35 @@ def _build() -> tuple[ToolSpec, ...]:
             handler=operations.list_catalogs,
             touches_engine=False,
             scope="catalogs.read",
+        ),
+        _spec(
+            name="draft_query",
+            description=(
+                "Clasifica un texto SQL contra una base sin ejecutarlo y devuelve la clase "
+                "(read, write, ddl, blocked o invalid), los códigos de razón y de advertencia, y "
+                "el texto de la consulta: el canónico si es una lectura aceptable, el recibido "
+                "en cualquier otro caso. No abre ninguna conexión al motor, tampoco para una "
+                "lectura, y 'touches_engine' vale siempre false. Una escritura o un DDL se "
+                "devuelve solo como texto con su advertencia: este servidor no los ejecuta."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "database_id": _DATABASE_ID,
+                    "sql": {
+                        "type": "string",
+                        "description": (
+                            "El texto SQL a clasificar. Un texto vacío, ilegible o demasiado "
+                            "largo también devuelve un sobre, con clase 'invalid'."
+                        ),
+                    },
+                },
+                "required": ["database_id", "sql"],
+                "additionalProperties": False,
+            },
+            handler=query.draft_query,
+            touches_engine=False,
+            scope="databases.read",
         ),
     )
 

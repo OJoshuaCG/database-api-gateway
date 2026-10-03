@@ -205,6 +205,7 @@ def test_tools_list_publishes_only_what_the_token_can_call(client, admin_client,
         "check_freshness",
         "get_schema",
         "search_schema",
+        "draft_query",
     ]
 
     todos = _token(admin_client, pid, TODOS_LOS_SCOPES)
@@ -220,6 +221,7 @@ def test_tools_list_publishes_only_what_the_token_can_call(client, admin_client,
         "list_clones",
         "check_freshness",
         "list_catalogs",
+        "draft_query",
     }
 
 
@@ -235,6 +237,7 @@ def test_tools_list_publishes_only_what_the_token_can_call(client, admin_client,
         ("list_clones", {}),
         ("check_freshness", {"database_id": 1}),
         ("list_catalogs", {}),
+        ("draft_query", {"database_id": 1, "sql": "SELECT 1"}),
     ],
 )
 def test_every_tool_requires_its_own_scope(client, admin_client, mcp_on, motor_falso, tool, args):
