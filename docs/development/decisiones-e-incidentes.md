@@ -2244,3 +2244,50 @@ con otro valor del pedido; el aviso es lo único que lo delata.
 futura = no fresca) en el gate y otra vez en `_data_target`, justo antes de descifrar. Orden real del
 gate: el de estructura (scope, proyecto, entorno, opt-in de estructura) corre antes que los ejes de
 datos; el kill switch de datos se mira primero de todos en las tools.
+
+## MCP `run_select`: SQL de solo lectura del agente y el invariante final (D4, D15, D16)
+
+Cambio `mcp-readonly-query-execution`, entrega 6 (última). Contrato en `docs/api-reference-v38.md`.
+
+**El invariante cambió, y conviene saber de cuál a cuál.** "El MCP nunca acepta SQL del agente" (v1)
+→ "nunca EJECUTA" (entrega 1) → **"ejecuta únicamente `SELECT` únicos validados, en una transacción
+`READ ONLY` y bajo una credencial por base con `SELECT` solamente"**. No se relajó el guard: se movió
+la barrera al motor (cuenta + transacción + timeout) y el validador pasó a ser defensa en profundidad.
+Editado en `docs/features/mcp-para-colaboradores.md`, `docs/api-reference-v23.md` §9.5 y el plan 12
+§4/§13.
+
+**D16 — un no-`SELECT` en `run_select` es TEXTO, no un error.** Escritura, DDL, bloqueado e ilegible
+vuelven como el sobre del borrador (`touches_engine: false`), sin conexión, sin descifrar la
+credencial de datos y sin `record_intent` de ejecución. Un error de protocolo por un SQL mal escrito
+hace que el agente reintente en loop; el texto con `reasons` le dice por qué. `MALFORMED_REQUEST` queda
+para argumentos ausentes o mal tipados. El gate corre ANTES del validador: con el gate cerrado no se
+clasifica nada (así `run_select` no sirve de oráculo del validador a un token sin acceso).
+
+**Mismo gate, mismo servicio, mismo validador.** `run_select` no tiene camino propio al motor:
+`target_resolution.run_agent_select_query` usa `_data_gate`, `validate_agent_select`, `_data_target` y
+`agent_query.run_agent_select`, igual que las tres tools parametrizadas. Los dos kill switches
+(`MCP_DATA_READ_ENABLED`, `MCP_DATA_QUERY_ENABLED`) son independientes (S26).
+
+**D4/D15 — se ejecuta el render del árbol verificado y el tope se respeta.** `executed_sql` es el
+render de `sqlglot` (que re-pasó el pipeline completo), nunca el texto del agente. `RowBound.OWN_LIMIT`
+(literal `<=` tope) se acepta como ya acotado y se ejecuta tal cual; `PUSHED` fuerza tope + 1;
+`UNBOUNDABLE` es `LIMIT_NOT_BOUNDABLE`. `limit` solo iguala o baja el máximo; `OFFSET` literal por
+encima de `MCP_QUERY_MAX_OFFSET` es `OFFSET_TOO_HIGH` (S27). En MySQL/MariaDB un literal con barra
+invertida se rechaza a propósito (su significado cambia con `NO_BACKSLASH_ESCAPES`).
+
+**Auditoría del despacho.** `dispatch._audit` marca `touched_engine=false` si el resultado trae
+`touches_engine: false` (el borrador de `run_select`); la ejecución real se audita aparte
+(`mcp.agent_query`, intención ANTES de conectar).
+
+**Riesgo residual ACEPTADO, explícito.** (1) **Inyección de prompt por los datos de las filas**: el
+sobre (`data.rows` como arreglos, `untrusted_fields`, `notice`, control fuera, celdas de 512) es una
+mitigación de eficacia desconocida; la contención es que ninguna tool escribe. (2) **Lo que el parseo
+no ve**: vistas con `DEFINER`, `FEDERATED`/`CONNECT`/`SPIDER`/FDW (la sonda bloquea o avisa lo que
+detecta) y diferenciales entre `sqlglot` y el motor (el render canónico los acota, el motor los cierra).
+(3) **Los datos personales no se filtran**: la lista de denegación por PII quedó diferida por la
+enmienda S14 (no hay fuente de verdad de qué columna es PII; `PII_BLOCKED` queda reservado), así que lo
+legible lo fija el `GRANT` de la cuenta de datos.
+
+**No verificado contra un motor real.** `tests/test_run_select_e2e.py` está escrito y se SALTA sin
+Docker; nadie lo ejecutó. Que el motor acepte el render canónico de cada forma permitida, aplique
+`READ ONLY` y el `GRANT`, y corte por timeout es una afirmación de diseño, no un hecho medido.

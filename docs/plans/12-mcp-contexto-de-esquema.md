@@ -328,10 +328,12 @@ lo que hace falta es contexto de esquema para programar.
 
 ### La puerta de datos queda abierta, y con una decisión tomada
 
-Cuando haga falta ver datos, **la vía NO es SQL libre.** El invariante que este plan establece
-es que **el MCP nunca EJECUTA SQL del agente** (`draft_query`, v34, acepta el texto para
-clasificarlo y devuelve solo texto, sin abrir una conexión), y ese invariante debe sobrevivir a la
-v2. Razón
+Cuando haga falta ver datos, **la vía NO es SQL libre sin control.** El invariante que este plan
+estableció (v1) fue que **el MCP nunca EJECUTA SQL del agente** (`draft_query`, v34, acepta el texto
+para clasificarlo y devuelve solo texto, sin abrir una conexión). **La fase 2 (`run_select`, v38) lo
+REEMPLAZA por: el MCP ejecuta únicamente `SELECT` únicos validados, dentro de una transacción
+`READ ONLY` y bajo una credencial por base con `SELECT` solamente.** La barrera real pasó a ser la
+cuenta del motor y la transacción; el validador es defensa en profundidad. Razón
 verificada en este repo: sqlglot no tokeniza el contenido de los comentarios ejecutables `/*!` de
 MySQL ni `/*M!` de MariaDB, así que todo guard por AST sobre SQL arbitrario es evadible — fue una
 vulnerabilidad real de la consola SQL, corregida en dos rondas
@@ -954,8 +956,9 @@ esquema de un tercero en el disco del gateway, que hoy no almacena nada del plan
 
 ### 6.7 Identificadores que aporta el agente
 
-El invariante del §4 es *"el MCP nunca ejecuta SQL del agente"*. Sigue en pie — pero **el agente sí
-aporta identificadores**: `objects[].name`, `objects[].kind` y `name_prefix`. Y los identificadores
+El invariante del §4 (v1) era *"el MCP nunca ejecuta SQL del agente"*; la fase 2 lo reemplazó por
+*"ejecuta únicamente SELECT validados bajo una credencial SELECT-only"* (§13). Esta sección sigue
+valiendo para las tools de estructura — **el agente sí aporta identificadores**: `objects[].name`, `objects[].kind` y `name_prefix`. Y los identificadores
 **no se parametrizan**, que es la excepción a la regla dura del repo ("SQL siempre
 parametrizado"). Es la única superficie de v1 donde texto de un actor externo termina dentro de un
 SQL, así que necesita regla escrita.
@@ -1592,9 +1595,15 @@ divergencia identificada.
 Todo lo demás de este plan está argumentado en su sección. Estas cinco son las que un revisor no
 va a deducir del código y cuya violación no rompe ningún test existente:
 
-1. **El MCP nunca ejecuta SQL del agente** — ni en v1 ni en la puerta de datos (§4); `draft_query`
-   lo acepta como texto y no abre ninguna conexión. Los guards por AST sobre SQL arbitrario son
-   evadibles vía comentarios ejecutables; está verificado en este repo.
+1. **El MCP ejecuta únicamente `SELECT` únicos validados, en una transacción `READ ONLY` y bajo una
+   credencial por base con `SELECT` solamente** (§4; reemplaza a "nunca ejecuta SQL del agente" de
+   la v1, vigente hasta la fase 2). `draft_query` lo acepta como texto sin conexión; `run_select`
+   ejecuta lo que pasa el validador y devuelve como texto lo demás. Los guards por AST sobre SQL
+   arbitrario son evadibles vía comentarios ejecutables (verificado en este repo): por eso la
+   barrera real es la cuenta del motor. **Riesgo residual aceptado, dicho completo:** inyección de
+   prompt por los datos de las filas; lo que el parseo no ve (vistas con `DEFINER`,
+   `FEDERATED`/`CONNECT`/FDW, diferenciales parser/motor); y los PII no se filtran (lista de
+   denegación diferida, enmienda S14).
 2. **Nunca se omite un objeto ni una columna** (§6.3). El texto libre se capa y se declara; la
    estructura no se toca nunca.
 3. **Nunca hay fallback a pseudo-root** cuando falta o vence la credencial read-only (§5.2, paso 4).

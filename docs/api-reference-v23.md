@@ -552,13 +552,17 @@ fila `mcp.auth` por IP por minuto y por proceso, con `agregados=N` en el `detail
 
 ### 9.5 Lo que el MCP nunca va a hacer
 
-**No EJECUTA SQL del agente, en ninguna versión.** `draft_query` (v34) acepta un texto SQL para
-clasificarlo y devuelve solo texto, sin abrir una conexión (`touches_engine: false`). No es
+**El MCP ejecuta únicamente `SELECT` únicos validados, bajo una credencial por base con `SELECT`
+solamente** (invariante de la fase 2; reemplaza a "no acepta SQL del agente" y a "no EJECUTA SQL del
+agente"). `draft_query` (v34) acepta un texto SQL para clasificarlo y devuelve solo texto, sin abrir una
+conexión (`touches_engine: false`); `run_select` (v38) ejecuta lecturas que pasaron el validador
+compartido, dentro de una transacción `READ ONLY`, y devuelve como texto todo lo demás. No es
 prudencia genérica: `sqlglot` no tokeniza los comentarios ejecutables `/*!` de MySQL ni `/*M!` de
 MariaDB, así que todo guard por AST sobre SQL arbitrario es **evadible** — fue una vulnerabilidad
-real de la consola SQL de este repo, corregida en dos rondas. Cuando haga falta ver datos, la vía
-son tools **parametrizados**. Lo que el parseo no detecta (vistas con `DEFINER`, tablas
-`FEDERATED`/`CONNECT`, diferencias entre el parser y el motor) lo cierra el límite real, la cuenta
-del motor con `SELECT` sobre una sola base; el validador es defensa en profundidad. Ver
-[v34](api-reference-v34.md).
+real de la consola SQL de este repo, corregida en dos rondas — y por eso el validador es defensa en
+profundidad y la barrera real es la cuenta del motor con `SELECT` sobre una sola base. Lo que el
+parseo no detecta (vistas con `DEFINER`, tablas `FEDERATED`/`CONNECT`, diferencias entre el parser y
+el motor) lo cierra ese límite; los datos personales no se filtran (lista de PII diferida, enmienda
+S14) y el contenido de una fila puede ser una inyección de prompt: riesgos aceptados, ver
+[v38](api-reference-v38.md) y [v34](api-reference-v34.md).
 

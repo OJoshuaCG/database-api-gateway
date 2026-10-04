@@ -563,6 +563,47 @@ exporta ni pagina. Errores solo con códigos cerrados (`QUERY_TIMEOUT`, `QUERY_F
 nunca texto del motor. Cada ejecución se audita *antes* (si la auditoría cae, no se ejecuta) y
 *después* con hash, filas y duración.
 
+### `run_select`: un SELECT libre, con el mismo gate y los mismos topes
+
+`run_select {database_id, sql, limit?}` (scope `data.query`) es la única tool que recibe SQL del agente
+y lo **ejecuta**. Existe solo con `MCP_DATA_QUERY_ENABLED=true` (apagado por default; se reinicia para
+cambiarlo, se re-chequea en cada llamada y es **independiente** de `MCP_DATA_READ_ENABLED`: con éste
+último encendido y `MCP_DATA_QUERY_ENABLED` apagado, `run_select` no está en `tools/list` y las tres
+lecturas parametrizadas siguen andando). No es un camino nuevo: usa el mismo gate (kill switch →
+scope → base y entorno → opt-in aprobado → credencial de datos con sonda fresca), el mismo validador y
+el mismo servicio que `sample_rows`, con los mismos topes de filas, tiempo y bytes. El `limit` solo puede
+igualar o bajar el máximo.
+
+- **Lo que no es un `SELECT` aceptable no se ejecuta ni se rechaza con error**: vuelve el sobre del
+  borrador `{classification, reasons, warnings, query_text, touches_engine: false}`, sin filas, sin
+  abrir una conexión y sin intención de auditoría de ejecución. Vale para escrituras (`write`, con
+  `WRITE_NOT_EXECUTED`), DDL (`ddl`, con `DDL_NOT_EXECUTED`), varias sentencias, `SELECT ... INTO`,
+  comentarios (también los ejecutables `/*!`), funciones fuera de la lista permitida, esquemas del
+  sistema, otra base y un `OFFSET` por encima de `MCP_QUERY_MAX_OFFSET` (`OFFSET_TOO_HIGH`).
+  `MALFORMED_REQUEST` es solo para argumentos ausentes o de tipo equivocado.
+- **El motor ejecuta el render de `sqlglot` del árbol ya verificado** (`executed_sql`), jamás el texto
+  crudo del agente; ese render vuelve a pasar el pipeline completo. Un `LIMIT` propio literal menor o
+  igual al tope se respeta; uno mayor o ausente se reemplaza por tope + 1; si no se puede acotar,
+  `LIMIT_NOT_BOUNDABLE`. Si el resultado se recorta, `human_query` es la consulta completa del agente
+  sin el tope del gateway, y el servidor no la ejecuta.
+- **Costo conocido, deliberado:** en MySQL/MariaDB un literal con una barra invertida se rechaza
+  (`PARSE_FAILED`, p. ej. `LIKE '%\_%'`), porque su significado cambia con `NO_BACKSLASH_ESCAPES`.
+
+**Riesgo residual ACEPTADO** (para `run_select` y para las tres tools de datos; la barrera real es la
+cuenta del motor con `SELECT` sobre una sola base en una transacción `READ ONLY`, no el validador):
+
+1. **Inyección de prompt por los datos de las filas.** Una fila puede contener texto que parezca una
+   instrucción. Se mitiga con el sobre (`data.rows` como arreglos, `untrusted_fields`, `notice`,
+   caracteres de control fuera, celdas de 512 caracteres), pero es una mitigación de eficacia
+   desconocida; lo que la contiene es que **ninguna tool escribe**.
+2. **Lo que el análisis del SQL no puede ver:** vistas con `DEFINER`, tablas `FEDERATED`/`CONNECT`/
+   `SPIDER` y FDW/`dblink` (la sonda de la credencial bloquea o avisa lo que puede detectar) y las
+   diferencias entre cómo `sqlglot` y el motor leen el mismo texto (el render canónico las acota, el
+   motor las cierra).
+3. **Los datos personales (PII) no se filtran.** La lista de denegación por PII quedó **diferida**
+   (enmienda S14 de la spec; `PII_BLOCKED` queda reservado). Lo que `run_select` puede leer lo fija
+   el `GRANT` de la cuenta de datos, no una marca de sensibilidad.
+
 ---
 
 ## Cuando alguien se va del equipo
@@ -577,19 +618,23 @@ nunca texto del motor. Cada ejecución se audita *antes* (si la auditoría cae, 
 
 ## Lo que este MCP nunca va a hacer
 
-- **No EJECUTA SQL del agente.** `draft_query` acepta el texto para clasificarlo y devuelve solo
-  texto, sin abrir una conexión. `sqlglot` no tokeniza los comentarios ejecutables `/*!` de MySQL
-  ni `/*M!` de MariaDB, así que todo guard por AST sobre SQL arbitrario es evadible — fue una
-  vulnerabilidad real de la consola SQL de este repo. Cuando haga falta ver datos, la vía son
-  tools **parametrizados**.
-- **Lo que el validador de `draft_query` no puede detectar** (y por qué no es la barrera): vistas
-  con `DEFINER`, tablas `FEDERATED`/`CONNECT`/`SPIDER` que leen otras bases, y las diferencias
-  entre cómo `sqlglot` y el motor leen el mismo texto. La barrera real, para cualquier tool que
-  algún día ejecute SQL, es la cuenta del motor con `SELECT` sobre **una sola base**, dentro de
-  una transacción `READ ONLY` y con timeout del lado del servidor; el validador es defensa en
-  profundidad.
-- **No escribe nada.** El techo de capacidades de un token excluye todo lo que mute o divulgue, y
-  la intersección se aplica dos veces: al emitir y al autenticar.
+- **Ejecuta únicamente `SELECT` únicos validados, bajo una credencial por base con `SELECT`
+  solamente.** Es el invariante de la fase 2 (reemplaza a "no acepta SQL del agente" y a "no EJECUTA
+  SQL del agente"): el SQL del agente se ejecuta solo si pasa el validador compartido, dentro de una
+  transacción `READ ONLY` y con la cuenta del motor con `SELECT` sobre una sola base. `draft_query`
+  clasifica sin abrir conexión; `run_select` ejecuta lecturas y devuelve como texto todo lo demás.
+  `sqlglot` no tokeniza los comentarios ejecutables `/*!` de MySQL ni `/*M!` de MariaDB, así que
+  todo guard por AST sobre SQL arbitrario es evadible — fue una vulnerabilidad real de la consola
+  SQL de este repo — y por eso el validador es defensa en profundidad y no la barrera.
+- **Lo que el validador no puede detectar** (y por qué no es la barrera): vistas con `DEFINER`,
+  tablas `FEDERATED`/`CONNECT`/`SPIDER` que leen otras bases, y las diferencias entre cómo `sqlglot`
+  y el motor leen el mismo texto. Tampoco filtra datos personales (PII: lista diferida, enmienda S14)
+  ni impide que el contenido de una fila sea una inyección de prompt. La barrera real es la cuenta
+  del motor con `SELECT` sobre **una sola base**, dentro de una transacción `READ ONLY` y con
+  timeout del lado del servidor. Ver «`run_select`» más arriba.
+- **No escribe nada.** El techo de capacidades de un token excluye todo lo que mute y todo lo que
+  divulgue, salvo el par cerrado `data.read`/`data.query` (filas, con opt-in y credencial propios),
+  y la intersección se aplica dos veces: al emitir y al autenticar.
 - **No usa la credencial pseudo-root.** Las tools que leen el catálogo van con la credencial de
   solo lectura del servidor (A.6), verificada por el motor, y con la sesión en `READ ONLY`.
 - **No devuelve cuerpos** de vistas, rutinas ni triggers, ni SQL de un diff: salen como
