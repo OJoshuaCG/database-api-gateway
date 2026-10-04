@@ -514,6 +514,94 @@ MCP_DATA_TOKEN_MAX_TTL_DAYS = int(os.getenv("MCP_DATA_TOKEN_MAX_TTL_DAYS", "30")
 if MCP_DATA_TOKEN_MAX_TTL_DAYS < 1:
     raise ValueError("MCP_DATA_TOKEN_MAX_TTL_DAYS inválido: debe ser un entero >= 1.")
 
+# ---- Lecturas de datos del agente: topes de filas, tiempo, tamaño ---------------------------- #
+# TECHOS ABSOLUTOS: ninguna configuración los supera. Un valor por encima se RECORTA al techo al
+# cargar y deja UN aviso de arranque por cada recorte (no se levanta una excepción: un despliegue
+# con `MCP_QUERY_MAX_ROWS=900` heredado de otro entorno tiene que arrancar con el techo, no morir).
+# La decisión y su costo están en `docs/development/decisiones-e-incidentes.md` (D17).
+MCP_QUERY_ROWS_CEILING = 500
+MCP_QUERY_TIMEOUT_CEILING_MS = 30_000
+_MCP_QUERY_DEFAULT_ROWS = 100
+_MCP_QUERY_MAX_ROWS = 200
+_MCP_QUERY_TIMEOUT_MS = 20_000
+
+
+def _positive_int_env(env, name: str, default: int) -> int:
+    """Entero >= 1 de ``env``; algo que no es entero o no es positivo impide arrancar."""
+    raw = env.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} inválido: debe ser un entero >= 1.") from exc
+    if value < 1:
+        raise ValueError(f"{name} inválido: debe ser un entero >= 1.")
+    return value
+
+
+def resolve_query_limits(env) -> tuple[dict[str, int], list[str]]:
+    """
+    Los topes efectivos de las lecturas de datos del agente y los avisos de recorte. PURA: recibe
+    el mapeo de variables (``os.environ`` en producción, un dict en un test).
+
+    - ``MCP_QUERY_MAX_ROWS`` se recorta a ``MCP_QUERY_ROWS_CEILING`` (900 -> 500).
+    - ``MCP_QUERY_TIMEOUT_MS`` se recorta a ``MCP_QUERY_TIMEOUT_CEILING_MS`` (60000 -> 30000).
+    - ``MCP_QUERY_DEFAULT_ROWS`` se recorta al máximo efectivo (el default no puede superar el tope).
+
+    Nada se SUBE: un valor por debajo de lo razonable es decisión del operador. Cero o negativo no
+    es un valor, es un error de configuración (``0`` en un timeout significaría "sin límite").
+    """
+    warnings: list[str] = []
+    max_rows = _positive_int_env(env, "MCP_QUERY_MAX_ROWS", _MCP_QUERY_MAX_ROWS)
+    if max_rows > MCP_QUERY_ROWS_CEILING:
+        warnings.append(
+            f"MCP_QUERY_MAX_ROWS={max_rows} supera el techo absoluto; se usa "
+            f"{MCP_QUERY_ROWS_CEILING}."
+        )
+        max_rows = MCP_QUERY_ROWS_CEILING
+    default_rows = _positive_int_env(env, "MCP_QUERY_DEFAULT_ROWS", _MCP_QUERY_DEFAULT_ROWS)
+    if default_rows > max_rows:
+        warnings.append(
+            f"MCP_QUERY_DEFAULT_ROWS={default_rows} supera el máximo efectivo; se usa {max_rows}."
+        )
+        default_rows = max_rows
+    timeout_ms = _positive_int_env(env, "MCP_QUERY_TIMEOUT_MS", _MCP_QUERY_TIMEOUT_MS)
+    if timeout_ms > MCP_QUERY_TIMEOUT_CEILING_MS:
+        warnings.append(
+            f"MCP_QUERY_TIMEOUT_MS={timeout_ms} supera el techo absoluto; se usa "
+            f"{MCP_QUERY_TIMEOUT_CEILING_MS}."
+        )
+        timeout_ms = MCP_QUERY_TIMEOUT_CEILING_MS
+    limits = {
+        "MCP_QUERY_DEFAULT_ROWS": default_rows,
+        "MCP_QUERY_MAX_ROWS": max_rows,
+        "MCP_QUERY_TIMEOUT_MS": timeout_ms,
+        "MCP_QUERY_MAX_OFFSET": _positive_int_env(env, "MCP_QUERY_MAX_OFFSET", 10_000),
+        "MCP_QUERY_MAX_SQL_BYTES": _positive_int_env(env, "MCP_QUERY_MAX_SQL_BYTES", 16_384),
+        "MCP_DATA_MAX_RESULT_BYTES": _positive_int_env(env, "MCP_DATA_MAX_RESULT_BYTES", 131_072),
+    }
+    return limits, warnings
+
+
+_QUERY_LIMITS, _QUERY_LIMIT_WARNINGS = resolve_query_limits(os.environ)
+# Filas por defecto y por llamada (el agente nunca las sube), timeout de sentencia del lado del
+# SERVIDOR del motor, offset literal máximo y tamaño máximo del SQL que valida el agente.
+MCP_QUERY_DEFAULT_ROWS = _QUERY_LIMITS["MCP_QUERY_DEFAULT_ROWS"]
+MCP_QUERY_MAX_ROWS = _QUERY_LIMITS["MCP_QUERY_MAX_ROWS"]
+MCP_QUERY_TIMEOUT_MS = _QUERY_LIMITS["MCP_QUERY_TIMEOUT_MS"]
+MCP_QUERY_MAX_OFFSET = _QUERY_LIMITS["MCP_QUERY_MAX_OFFSET"]
+MCP_QUERY_MAX_SQL_BYTES = _QUERY_LIMITS["MCP_QUERY_MAX_SQL_BYTES"]
+# Presupuesto de bytes del bloque de filas de una respuesta de datos. Pasado, se recortan FILAS
+# (`truncated=true`) en vez de fallar. `app/mcp/dispatch.py` afirma al importar que no supera la
+# mitad del tope duro de la respuesta (512 KiB), que sigue ahí como red de abajo.
+MCP_DATA_MAX_RESULT_BYTES = _QUERY_LIMITS["MCP_DATA_MAX_RESULT_BYTES"]
+if _QUERY_LIMIT_WARNINGS:
+    import logging as _query_logging
+
+    for _aviso in _QUERY_LIMIT_WARNINGS:
+        _query_logging.getLogger(__name__).warning(_aviso)
+
 # ======= Startup validation ======= #
 # La cuenta del MCP se interpola (quoteada) en CREATE USER / GRANT al aprovisionar. Se valida acá
 # con las MISMAS reglas que `identifiers.validate_identifier` / `validate_host` (copiadas a
