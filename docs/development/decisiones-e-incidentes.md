@@ -2158,6 +2158,39 @@ Entrega 3 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference-v35
   reservado en el vocabulario y sin emisor. El límite real es el `GRANT` del motor que esta sonda
   verifica.
 
+## MCP: scopes de datos, excepción cerrada del catálogo y opt-in (D12 del catálogo)
+
+Entrega 4 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference-v36.md`.
+
+- **La excepción es un conjunto cerrado y no "se quitó el invariante".** Los invariantes 5 ("un token
+  nunca muta ni divulga") y 11 ("step-up implica no agente") siguen siendo reglas de import; solo se
+  exceptúa `AGENT_DATA_EXCEPTIONS = {data.read, data.query}`. El invariante 13 fija el conjunto al par
+  literal y exige que cada miembro divulgue sin mutar, sea solo de owner, tenga step-up y sea sensible.
+  Un `foo.read` que divulgue y sea de agente sigue rompiendo el import; mutar no tiene excepción.
+- **El step-up lo da el emisor, no el token.** Un token no tiene contraseña. Por eso
+  `api_token_controller._validate_scopes(raw, *, admin)` (firma cambiada: alta y PATCH pasan al
+  emisor) llama a `assert_step_up(admin, cap, method="POST")` con `POST` fijo: el PATCH es escritura y
+  no puede heredar el "GET no pide". Un `admin` que no es un `Actor` falla cerrado.
+- **Dos vallas más contra el token de larga vida.** TTL de datos de 30 días (en el PATCH cuenta la vida
+  restante) y la intersección existente con las capacidades del emisor: un emisor viewer no delega
+  `data.read` aunque el string lo diga.
+- **Kill switch por capacidad, leído en cada llamada, y scope inerte en vez de borrado.** `parse_scopes`
+  descarta el scope de datos con su switch apagado (nacen apagados); `parse_stored_scopes` lo
+  conserva solo para mostrar y editar. Si el listado ocultara lo guardado, un PATCH de la SPA lo
+  perdería en silencio. Como las tools se publican por `actor.has`, apagar el switch también las saca
+  de `tools/list`.
+- **El opt-in de datos va en la fila de la credencial y exige aprobador registrado.** El gate
+  (`resolve_agent_data_database`) pide además de `data_access_allowed` un `data_access_approved_by_id`:
+  un `UPDATE` a mano del flag no abre nada. Si el usuario aprobador se borra (`ON DELETE SET NULL`) el
+  acceso se cierra solo. Segundo aprobador solo en `production` y en bases sin entorno (lo no
+  clasificado se trata como lo más protegido); fuera de eso el pedido abre en el acto. Es una
+  constante revisable en código, no una variable de entorno. Pregunta abierta del diseño: segundo
+  aprobador fuera de producción.
+- **Cerrar el opt-in no tiene exención de step-up.** La exención de `check_route_capabilities` es solo
+  para `POST .../cancel`; el `DELETE` pide contraseña fresca como el resto. `data.query` no tiene ruta
+  HTTP (la consume `run_select`), así que entra en `NON_ROUTE_CAPABILITIES`.
+
+
 ---
 
 ## Nota al pie — por qué `.env.example` "no se podía actualizar"
