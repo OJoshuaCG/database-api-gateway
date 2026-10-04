@@ -17,6 +17,7 @@ import json
 from typing import Any
 
 from app.core.actor import Actor
+from app.core.environments import MCP_DATA_MAX_RESULT_BYTES
 from app.exceptions import AppHttpException
 from app.mcp import jsonrpc, protocol
 from app.mcp.context import ToolContext
@@ -30,6 +31,14 @@ from app.services import audit
 #: Se corta con un ERROR y **nunca truncando**: un JSON truncado que el agente parsea a medias
 #: es peor que un fallo, porque le hace creer que el esquema es más chico de lo que es.
 MAX_RESULT_BYTES = 512 * 1024
+
+# El presupuesto de filas de las tools de datos (``MCP_DATA_MAX_RESULT_BYTES``, truncando por fila)
+# tiene que dejar holgura bajo este tope: si lo igualara o superara, el recorte por fila nunca
+# llegaría a actuar y el agente recibiría el error de arriba en vez de un resultado truncado.
+assert MCP_DATA_MAX_RESULT_BYTES <= MAX_RESULT_BYTES // 2, (
+    "MCP_DATA_MAX_RESULT_BYTES no puede superar la mitad del tope de la respuesta del MCP "
+    f"({MAX_RESULT_BYTES // 2} bytes)"
+)
 
 
 def server_info() -> dict:
@@ -216,7 +225,13 @@ def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Resp
     from app.services.mcp_catalog import CODE_SCOPE_DENIED
 
     if not actor.has(Capability(spec.scope)):
-        _audit(spec.name, actor, ok=False, detail=f"denegado: {CODE_SCOPE_DENIED}")
+        _audit(
+            spec.name,
+            actor,
+            ok=False,
+            detail=f"denegado: {CODE_SCOPE_DENIED}",
+            touched_engine=False,
+        )
         return _ok(
             rid,
             jsonrpc.tool_error_result(CODE_SCOPE_DENIED, "El token no tiene el scope necesario."),
@@ -231,7 +246,9 @@ def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Resp
         # contenido de TOOL, con su código del vocabulario cerrado. Un error de tool en el campo
         # `error` haría que el agente crea que el servidor está roto y reintente.
         codigo = (exc.public_context or {}).get("code") or "mcp.error"
-        _audit(spec.name, actor, ok=False, detail=f"denegado: {codigo}")
+        _audit(
+            spec.name, actor, ok=False, detail=f"denegado: {codigo}", touched_engine=spec.touches_engine
+        )
         return _ok(rid, jsonrpc.tool_error_result(codigo, exc.message))
     except Exception:  # noqa: BLE001 — ver el comentario
         # Cualquier otra cosa NO puede salir con detalle: un traceback o un `str(exc)` del motor
@@ -240,7 +257,9 @@ def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Resp
         from app.core.logger import get_logger
 
         get_logger(__name__).exception("Fallo no esperado en la tool %s", spec.name)
-        _audit(spec.name, actor, ok=False, detail="fallo interno")
+        _audit(
+            spec.name, actor, ok=False, detail="fallo interno", touched_engine=spec.touches_engine
+        )
         return protocol.Respuesta(
             200, jsonrpc.error(rid, jsonrpc.INTERNAL_ERROR, "Fallo interno del servidor MCP.")
         )
@@ -248,7 +267,13 @@ def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Resp
     payload_tool = jsonrpc.tool_result_payload(resultado)
     serializado = json.dumps(payload_tool, ensure_ascii=False, default=str)
     if len(serializado.encode("utf-8")) > MAX_RESULT_BYTES:
-        _audit(spec.name, actor, ok=False, detail="excedió el presupuesto de bytes")
+        _audit(
+            spec.name,
+            actor,
+            ok=False,
+            detail="excedió el presupuesto de bytes",
+            touched_engine=spec.touches_engine,
+        )
         return _ok(
             rid,
             jsonrpc.tool_error_result(
@@ -261,17 +286,29 @@ def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Resp
             ),
         )
 
-    _audit(spec.name, actor, ok=True, detail=f"{len(serializado)} bytes")
+    _audit(
+        spec.name,
+        actor,
+        ok=True,
+        detail=f"{len(serializado)} bytes",
+        touched_engine=spec.touches_engine,
+    )
     return _ok(rid, payload_tool)
 
 
-def _audit(tool: str, actor: Actor, *, ok: bool, detail: str) -> None:
+def _audit(
+    tool: str, actor: Actor, *, ok: bool, detail: str, touched_engine: bool = False
+) -> None:
     """
     Una fila por invocación. **El secreto del token nunca se audita** — solo su ``token_id``,
     que es la parte pública, y el id de la fila.
 
+    ``touched_engine`` sale de ``ToolSpec.touches_engine`` de la tool (antes era un ``False`` fijo,
+    y la fila de una tool que abre una conexión al motor decía que no lo había hecho).
+
     Best-effort: un fallo al auditar no puede tirar abajo la respuesta de una tool de solo
-    lectura. Lo fail-closed está reservado a lo que divulga datos, y esto no lo hace todavía.
+    lectura. Lo fail-closed de las tools de datos vive en ``agent_query`` (``record_intent`` antes
+    de ejecutar); esta fila es el rastro del despacho.
     """
     audit.record(
         f"mcp.{tool}",
@@ -279,6 +316,6 @@ def _audit(tool: str, actor: Actor, *, ok: bool, detail: str) -> None:
         admin=actor,
         target_type="api_token",
         target_id=actor.id,
-        touched_engine=False,
+        touched_engine=touched_engine,
         detail=f"token={actor.token_id} proyecto={actor.project_id} {detail}",
     )

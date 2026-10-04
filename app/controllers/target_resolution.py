@@ -350,10 +350,7 @@ def resolve_agent_data_database(
     a ``DATA_DISABLED`` / ``PROBE_NOT_GREEN``. No descifra nada ni abre conexión: el secreto lo
     lee recién quien ejecuta.
     """
-    from datetime import UTC, datetime, timedelta
-
     from app.core.database import Database
-    from app.core.environments import MCP_DATA_CREDENTIAL_MAX_AGE_DAYS
     from app.models.managed_database_data_credential import ManagedDatabaseDataCredential
     from app.services.capability_catalog import data_capability_enabled
 
@@ -375,33 +372,52 @@ def resolve_agent_data_database(
             )
             .first()
         )
-        if cred is None or not cred.username or not cred.password_encrypted:
-            raise _deny(
-                codes.CODE_DATA_CREDENTIAL_MISSING,
-                403,
-                "La base no tiene credencial de datos registrada.",
-            )
-        limite = datetime.now(UTC).replace(tzinfo=None) - timedelta(
-            days=MCP_DATA_CREDENTIAL_MAX_AGE_DAYS
-        )
-        if cred.verified_at is None or cred.verified_at <= limite:
-            raise _deny(
-                codes.CODE_DATA_PROBE_STALE,
-                403,
-                (
-                    "La credencial de datos no tiene una sonda verde de los últimos "
-                    f"{MCP_DATA_CREDENTIAL_MAX_AGE_DAYS} días."
-                ),
-            )
-        if not cred.data_access_allowed or cred.data_access_approved_by_id is None:
-            raise _deny(
-                codes.CODE_DATA_NOT_OPTED_IN,
-                403,
-                "La base no tiene el opt-in de lectura de datos aprobado.",
-            )
+        _assert_data_credential_open(cred)
     finally:
         session.close()
     return resuelta
+
+
+def _assert_data_credential_open(cred) -> None:
+    """
+    La credencial de datos de una base tiene que existir, tener una sonda VERDE y fresca
+    (``data_probe_is_fresh`` con ``MCP_DATA_CREDENTIAL_MAX_AGE_DAYS``) y el opt-in aprobado.
+
+    Es lo que mantiene a las tools de datos atadas a una OBSERVACIÓN reciente del motor y no a la
+    promesa del provisionado: antes de esto nada enforzaba la frescura al LEER. Una fecha futura
+    (reloj corrido) cuenta como no fresca. Lo comparten el gate y ``_data_target`` (que vuelve a
+    exigirlo justo antes de descifrar), así que no hay dos criterios.
+    """
+    from datetime import UTC, datetime
+
+    from app.core.environments import MCP_DATA_CREDENTIAL_MAX_AGE_DAYS
+    from app.services.db_admin.readonly_probe import data_probe_is_fresh
+
+    if cred is None or not cred.username or not cred.password_encrypted:
+        raise _deny(
+            codes.CODE_DATA_CREDENTIAL_MISSING,
+            403,
+            "La base no tiene credencial de datos registrada.",
+        )
+    if not data_probe_is_fresh(
+        cred.verified_at,
+        now=datetime.now(UTC).replace(tzinfo=None),
+        max_age_days=MCP_DATA_CREDENTIAL_MAX_AGE_DAYS,
+    ):
+        raise _deny(
+            codes.CODE_DATA_PROBE_STALE,
+            403,
+            (
+                "La credencial de datos no tiene una sonda verde de los últimos "
+                f"{MCP_DATA_CREDENTIAL_MAX_AGE_DAYS} días."
+            ),
+        )
+    if not cred.data_access_allowed or cred.data_access_approved_by_id is None:
+        raise _deny(
+            codes.CODE_DATA_NOT_OPTED_IN,
+            403,
+            "La base no tiene el opt-in de lectura de datos aprobado.",
+        )
 
 
 def _readonly_target(server_id: int):
@@ -504,6 +520,226 @@ def draft_agent_query(actor: Actor, database_id: int, sql: str, capability: Capa
         max_bytes=policy.DEFAULT_MAX_SQL_BYTES,
     )
     return policy.build_draft_envelope(verdict, sql, max_bytes=policy.DEFAULT_MAX_SQL_BYTES)
+
+
+# --------------------------------------------------------------------------- #
+# Lecturas de DATOS del agente: sample_rows, distinct_values, count_rows        #
+# --------------------------------------------------------------------------- #
+
+#: Códigos internos de la política de datos que salen al agente traducidos (``public_reason``).
+_DATA_GATE_CODES = frozenset(
+    {
+        codes.CODE_DATA_DISABLED,
+        codes.CODE_DATA_NOT_OPTED_IN,
+        codes.CODE_DATA_CREDENTIAL_MISSING,
+        codes.CODE_DATA_PROBE_STALE,
+    }
+)
+
+
+def _data_gate(actor: Actor, database_id: int, capability: Capability) -> AgentDatabase:
+    """
+    ``resolve_agent_data_database`` con la salida que ve el agente: los códigos internos de la
+    política de datos (``mcp.data_*``) salen como los públicos cerrados ``DATA_DISABLED`` /
+    ``PROBE_NOT_GREEN``. Los de autorización (scope, no encontrada) y los del gate de estructura
+    pasan tal cual.
+
+    El kill switch se mira PRIMERO y en cada llamada: apagado, no se lee ni el inventario.
+    """
+    from app.services.capability_catalog import data_capability_enabled
+
+    if not data_capability_enabled(capability):
+        raise _deny(
+            codes.REASON_DATA_DISABLED,
+            403,
+            "Las tools de datos están apagadas en este gateway (kill switch).",
+        )
+    try:
+        return resolve_agent_data_database(actor, database_id, capability)
+    except AppHttpException as exc:
+        interno = (exc.public_context or {}).get("code")
+        if interno in _DATA_GATE_CODES:
+            raise _deny(codes.public_reason(interno), exc.status_code, exc.message) from exc
+        raise
+
+
+def _data_target(resuelta: AgentDatabase):
+    """
+    ``(ServerTarget, QueryCredential)`` con la credencial de DATOS de la base. Es la ÚNICA función de
+    este módulo que descifra el secreto de datos, y vuelve a exigir credencial presente, sonda fresca
+    y opt-in aprobado (``_assert_data_credential_open``) justo antes de descifrar: entre el gate y
+    acá alguien pudo revocar.
+
+    Nunca lee ``root_password_encrypted`` ni la credencial de estructura del servidor.
+    """
+    from app.core.crypto import CryptoConfigError, CryptoError, decrypt
+    from app.core.database import Database
+    from app.core.environments import REMOTE_SSL_MODE
+    from app.core.remote_engine import ServerTarget
+    from app.models.managed_database_data_credential import ManagedDatabaseDataCredential
+    from app.models.server import Server
+    from app.services.db_admin.query_runner import MODE_STORED, QueryCredential
+
+    session = Database().get_declarative_base_session()
+    try:
+        cred = (
+            session.query(ManagedDatabaseDataCredential)
+            .filter(
+                ManagedDatabaseDataCredential.managed_database_id
+                == resuelta.database.database_id
+            )
+            .first()
+        )
+        try:
+            _assert_data_credential_open(cred)
+        except AppHttpException as exc:
+            interno = (exc.public_context or {}).get("code")
+            raise _deny(codes.public_reason(interno), exc.status_code, exc.message) from exc
+        srv = session.get(Server, resuelta.database.server_id)
+        if srv is None:
+            raise _deny(codes.REASON_PROBE_NOT_GREEN, 403, "El servidor de la base no existe.")
+        try:
+            password = decrypt(cred.password_encrypted)
+        except (CryptoError, CryptoConfigError) as exc:
+            raise _deny(
+                codes.REASON_DATA_DISABLED,
+                403,
+                "La credencial de datos de la base no se pudo descifrar.",
+            ) from exc
+        username = cred.username
+        target = ServerTarget(
+            server_id=srv.id,
+            dialect=srv.engine.value if hasattr(srv.engine, "value") else str(srv.engine),
+            host=srv.host,
+            port=srv.port,
+            admin_user=username,
+            admin_password=password,
+            ssl_mode=srv.ssl_mode if srv.ssl_mode is not None else REMOTE_SSL_MODE,
+        )
+        return target, QueryCredential(mode=MODE_STORED, username=username, password=password)
+    finally:
+        session.close()
+
+
+def _run_data_tool(
+    actor: Actor,
+    tool: str,
+    database_id: int,
+    capability: Capability,
+    *,
+    table,
+    columns: list[str] | None,
+    limit,
+    kind: str,
+) -> dict:
+    """
+    El camino único de las tres tools de datos. Orden (cada paso corta el siguiente):
+
+    1. gate de datos (kill switch -> scope -> proyecto/entorno -> opt-in -> credencial -> sonda
+       fresca), con los códigos públicos cerrados;
+    2. identificadores contra el CATÁLOGO por ``open_readonly`` (credencial de estructura): uno
+       desconocido es ``UNKNOWN_IDENTIFIER`` y la cuenta de datos nunca conecta (S12);
+    3. sentencia armada sobre AST cuoteado + ``validate_agent_select`` (``limit`` clamped, nunca
+       elevado);
+    4. ``agent_query.run_agent_select``: ``record_intent`` -> conexión de datos READ ONLY.
+
+    Los imports son perezosos por el guard de ``tests/test_mcp_import_guard.py``.
+    """
+    from app.services.db_admin import agent_query as aq
+
+    resuelta = _data_gate(actor, database_id, capability)
+
+    pedidas = [] if columns is None else list(columns)
+    with open_readonly(actor, database_id, capability) as (_, facade):
+        tabla, cols = aq.resolve_identifiers(facade, table, pedidas)
+
+    if kind == "count":
+        max_rows, warnings = 1, []
+        sql = aq.build_count_rows(resuelta.database.engine, tabla)
+    else:
+        max_rows, warnings = aq.effective_limit(limit)
+        if kind == "distinct":
+            sql = aq.build_distinct_values(resuelta.database.engine, tabla, cols[0])
+        else:
+            sql = aq.build_sample_rows(resuelta.database.engine, tabla, cols or None)
+
+    verdict = aq.validate_built(
+        sql,
+        engine=resuelta.database.engine,
+        database=resuelta.database.database,
+        max_rows=max_rows,
+    )
+    target, credential = _data_target(resuelta)
+    return aq.run_agent_select(
+        aq.AuditContext(
+            actor=actor,
+            tool=tool,
+            database_id=resuelta.database.database_id,
+            server_id=resuelta.database.server_id,
+        ),
+        resolved=resuelta.database,
+        target=target,
+        credential=credential,
+        verdict=verdict,
+        max_rows=max_rows,
+        warnings=warnings,
+    )
+
+
+def sample_rows_query(
+    actor: Actor,
+    database_id: int,
+    table: str,
+    columns: list[str] | None,
+    limit: int | None,
+    capability: Capability,
+) -> dict:
+    """``sample_rows``: hasta ``limit`` filas de una tabla del catálogo (ver ``_run_data_tool``)."""
+    return _run_data_tool(
+        actor,
+        "sample_rows",
+        database_id,
+        capability,
+        table=table,
+        columns=columns,
+        limit=limit,
+        kind="sample",
+    )
+
+
+def distinct_values_query(
+    actor: Actor,
+    database_id: int,
+    table: str,
+    column: str,
+    limit: int | None,
+    capability: Capability,
+) -> dict:
+    """``distinct_values``: valores distintos de UNA columna, ordenados (ver ``_run_data_tool``)."""
+    return _run_data_tool(
+        actor,
+        "distinct_values",
+        database_id,
+        capability,
+        table=table,
+        columns=[column],
+        limit=limit,
+        kind="distinct",
+    )
+
+
+def count_rows_query(actor: Actor, database_id: int, table: str, capability: Capability) -> dict:
+    """``count_rows``: ``COUNT(*)`` de una tabla del catálogo (ver ``_run_data_tool``)."""
+    return _run_data_tool(
+        actor,
+        "count_rows",
+        database_id,
+        capability,
+        table=table,
+        columns=None,
+        limit=None,
+        kind="count",
+    )
 
 
 def structural_changes(source, target) -> tuple[list[dict], bool]:

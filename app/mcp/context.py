@@ -78,3 +78,30 @@ class ToolContext:
         from app.controllers.target_resolution import draft_agent_query
 
         return draft_agent_query(self.actor, database_id, sql, self.capability)
+
+    def sample_rows(
+        self, database_id: int, table: str, columns: list[str] | None, limit: int | None
+    ) -> dict:
+        """
+        Filas de una tabla del catálogo con la credencial de DATOS de la base. Recibe
+        IDENTIFICADORES, nunca SQL: el gateway arma la sentencia, la pasa por el validador y la
+        ejecuta en una transacción READ ONLY. El handler no ve credencial, target ni conexión: sale
+        el sobre ya armado (filas como arreglos, marcadas no confiables).
+        """
+        from app.controllers.target_resolution import sample_rows_query
+
+        return sample_rows_query(self.actor, database_id, table, columns, limit, self.capability)
+
+    def distinct_values(
+        self, database_id: int, table: str, column: str, limit: int | None
+    ) -> dict:
+        """Valores distintos de una columna del catálogo. Mismo camino y garantías que ``sample_rows``."""
+        from app.controllers.target_resolution import distinct_values_query
+
+        return distinct_values_query(self.actor, database_id, table, column, limit, self.capability)
+
+    def count_rows(self, database_id: int, table: str) -> dict:
+        """``COUNT(*)`` de una tabla del catálogo. Mismo camino y garantías que ``sample_rows``."""
+        from app.controllers.target_resolution import count_rows_query
+
+        return count_rows_query(self.actor, database_id, table, self.capability)
