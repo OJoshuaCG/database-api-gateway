@@ -49,6 +49,7 @@ cursores server-side.
 """
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -58,6 +59,7 @@ from app.core.logger import get_logger
 from app.core.remote_engine import ServerTarget, database_connection, map_driver_error
 from app.services.db_admin.identifiers import quote_identifier
 from app.services.db_admin.query_policy import DDL, StatementPlan
+from app.services.db_admin.statement_limits import apply_session_timeouts
 from app.services.db_admin.value_json import json_value
 
 logger = get_logger(__name__)
@@ -294,41 +296,6 @@ def effective_target(target: ServerTarget, credential: QueryCredential) -> Serve
     )
 
 
-def _apply_statement_timeout(conn, engine: str, timeout_ms: int) -> None:
-    """
-    Timeout de sentencia a nivel de SESIÓN, además del que ya aplica la conexión.
-
-    En PostgreSQL el ``statement_timeout`` ya viaja en los parámetros de conexión, así que
-    esto solo aporta en MySQL/MariaDB, donde el límite de la conexión es un timeout de
-    SOCKET: cancela matando la conexión, sin mensaje del motor. Con la variable de sesión
-    el servidor cancela la consulta y devuelve un error legible. Best-effort: si el motor
-    no la soporta, se sigue adelante con el timeout de socket.
-    """
-    if engine not in ("mysql", "mariadb") or timeout_ms <= 0:
-        return
-    seconds = max(1, int(round(timeout_ms / 1000)))
-    # Se intentan las variables de AMBOS motores y se ignora la que no exista: un MariaDB
-    # dado de alta como ``mysql`` (o al revés) es un error de inventario frecuente, y cada
-    # SET sobrante es un no-op inocuo. Sin esto, un MariaDB mal clasificado se quedaba sin
-    # ningún timeout de sentencia.
-    for stmt in (
-        # MySQL: milisegundos, y SOLO aplica a SELECT de solo lectura de nivel superior.
-        f"SET SESSION max_execution_time = {int(timeout_ms)}",
-        # MariaDB: segundos (double), y sí aborta cualquier consulta, no solo SELECT.
-        f"SET SESSION max_statement_time = {timeout_ms / 1000.0}",
-        # Sin estos dos, un UPDATE/ALTER que espera un lock NO tiene techo real: el
-        # default de lock_wait_timeout (metadata locks) es de UN AÑO en MySQL y un día en
-        # MariaDB. El timeout de socket corta al CLIENTE, pero el servidor sigue encolado
-        # y termina aplicando la sentencia que la API ya reportó como vencida.
-        f"SET SESSION lock_wait_timeout = {seconds}",
-        f"SET SESSION innodb_lock_wait_timeout = {seconds}",
-    ):
-        try:
-            conn.exec_driver_sql(stmt)
-        except SQLAlchemyError:
-            logger.debug("El motor no admite «%s»; se continúa.", stmt)
-
-
 def _prepare_session(
     conn, *, engine: str, read_only: bool, credential: QueryCredential, timeout_ms: int
 ) -> None:
@@ -343,7 +310,7 @@ def _prepare_session(
        estar permitido en cuanto la transacción ejecutó cualquier consulta. Un ``SET`` no
        es una escritura, así que es válido dentro de una transacción de solo lectura.
     """
-    _apply_statement_timeout(conn, engine, timeout_ms)
+    apply_session_timeouts(conn, engine, timeout_ms)
 
     if read_only:
         conn.exec_driver_sql(_READ_ONLY_SQL[engine])
@@ -451,6 +418,7 @@ def run_statements(
     max_rows: int,
     max_cell_chars: int,
     timeout_ms: int,
+    session_hook: Callable[[Any], None] | None = None,
 ) -> ExecutionOutcome:
     """
     Ejecuta el lote y devuelve un resultado por sentencia. Se detiene en el primer error
@@ -461,6 +429,12 @@ def run_statements(
     real en PostgreSQL —incluido el DDL— y en el DML de MySQL/MariaDB; el DDL de
     MySQL/MariaDB hace COMMIT implícito y NO se puede deshacer, límite del motor que el
     llamador debe advertir.
+
+    ``session_hook`` (opcional) se llama con la conexión DESPUÉS de ``_prepare_session`` y antes de la
+    primera sentencia. Lo usa el servicio de lecturas del agente (``agent_query``) para anotar el id de
+    conexión del vigilante y fijar el timeout exacto. La consola pasa ``None``: sin hook el
+    comportamiento es idéntico al anterior. Una excepción del hook se propaga (la conexión se cierra
+    y no se corre ninguna sentencia): nunca se ejecuta con la sesión a medio preparar.
     """
     eff_target = effective_target(target, credential)
     outcomes: list[StatementOutcome] = []
@@ -484,6 +458,8 @@ def run_statements(
                 credential=credential,
                 timeout_ms=timeout_ms,
             )
+            if session_hook is not None:
+                session_hook(conn)
 
             stopped = False
             for plan in statements:
