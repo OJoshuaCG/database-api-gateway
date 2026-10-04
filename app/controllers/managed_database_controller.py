@@ -93,6 +93,13 @@ def _assert_scope_at_env(admin: "dict | Actor | None", env_id: int | None, serve
     )
 
 
+#: Entornos (por ``slug``) cuyo opt-in de DATOS exige que lo apruebe un segundo owner distinto del
+#: solicitante. Por defecto solo ``production``; una base SIN entorno también lo exige (fail-closed:
+#: lo no clasificado se trata como lo más protegido). Fuera de esto el pedido abre el acceso en el
+#: acto. Constante y no variable de entorno a propósito: relajarla es una decisión de política que
+#: se revisa en código (follow-up abierto en el diseño: segundo aprobador fuera de producción).
+_DATA_SECOND_APPROVER_ENV_SLUGS = frozenset({"production"})
+
 #: Marca del bloque de diagnóstico que escribe el gateway dentro de ``notes``. Todo lo que NO
 #: empieza con esto es del operador y no se toca.
 _GW_NOTE_MARK = "[gateway]"
@@ -234,7 +241,12 @@ class ManagedDatabaseController:
     # Credencial de DATOS por base (SELECT-only; design D9)               #
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _serialize_data_credential(db_id: int, row: ManagedDatabaseDataCredential | None) -> dict:
+    def _serialize_data_credential(
+        db_id: int,
+        row: ManagedDatabaseDataCredential | None,
+        *,
+        second_approver_required: bool = True,
+    ) -> dict:
         """Estado seguro: SIN usuario, contraseña ni cifrado. ``row=None`` = sin credencial."""
         if row is None:
             return {
@@ -245,7 +257,15 @@ class ManagedDatabaseController:
                 "probe_violations": [],
                 "probe_warnings": [],
                 "data_access_allowed": False,
+                "data_access_state": "closed",
+                "data_access_second_approver_required": second_approver_required,
             }
+        if row.data_access_allowed:
+            state = "open"
+        elif row.data_access_requested_by_id is not None:
+            state = "pending"
+        else:
+            state = "closed"
         return {
             "managed_database_id": db_id,
             "has_data_credential": True,
@@ -254,7 +274,17 @@ class ManagedDatabaseController:
             "probe_violations": json.loads(row.probe_violations or "[]"),
             "probe_warnings": json.loads(row.probe_warnings or "[]"),
             "data_access_allowed": bool(row.data_access_allowed),
+            "data_access_state": state,
+            "data_access_second_approver_required": second_approver_required,
         }
+
+    @staticmethod
+    def _data_second_approver_required(session, md: ManagedDatabase) -> bool:
+        """¿El entorno de ``md`` exige un segundo owner para abrir el acceso a datos?"""
+        from app.models.environment import Environment
+
+        env = session.get(Environment, md.environment_id) if md.environment_id else None
+        return env is None or env.slug in _DATA_SECOND_APPROVER_ENV_SLUGS
 
     @staticmethod
     def _data_credential_row(session, db_id: int) -> ManagedDatabaseDataCredential | None:
@@ -267,9 +297,245 @@ class ManagedDatabaseController:
     def _data_credential_status(self, db_id: int) -> dict:
         session = self._session()
         try:
-            return self._serialize_data_credential(db_id, self._data_credential_row(session, db_id))
+            md = session.get(ManagedDatabase, db_id)
+            return self._serialize_data_credential(
+                db_id,
+                self._data_credential_row(session, db_id),
+                second_approver_required=(
+                    True if md is None else self._data_second_approver_required(session, md)
+                ),
+            )
         finally:
             session.close()
+
+    def get_data_credential_status(self, db_id: int) -> dict:
+        """Estado de la credencial y del opt-in de datos (solo lectura; 404 si la base no existe)."""
+        session = self._session()
+        try:
+            self._get_or_404(session, db_id)
+        finally:
+            session.close()
+        return self._data_credential_status(db_id)
+
+    # ------------------------------------------------------------------ #
+    # Opt-in de DATOS por base, con segundo aprobador                      #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _data_actor_id(admin: "dict | Actor | None") -> int:
+        """
+        El id del usuario del gateway que pide o aprueba. Fail-closed: sin id no hay rastro de
+        QUIÉN abrió el acceso a datos, y el control del segundo aprobador compara ids.
+        """
+        from app.core.actor import identity_of
+
+        actor_id, _ = identity_of(admin)
+        if not isinstance(actor_id, int) or isinstance(actor_id, bool):
+            raise AppHttpException(
+                message="No se pudo identificar al usuario que pide o aprueba el acceso a datos.",
+                status_code=403,
+                public_context={"code": dcodes.CODE_DATA_ACCESS_IDENTITY_REQUIRED},
+            )
+        if getattr(admin, "is_agent", False):
+            raise AppHttpException(
+                message="Un token de agente no administra el acceso a datos.",
+                status_code=403,
+                public_context={"code": dcodes.CODE_DATA_ACCESS_IDENTITY_REQUIRED},
+            )
+        return actor_id
+
+    def _data_access_context(self, db_id: int) -> tuple[str, int, bool]:
+        """``(nombre, server_id, requiere segundo aprobador)`` de la base, o 404/409."""
+        session = self._session()
+        try:
+            md = self._get_or_404(session, db_id)
+            if self._data_credential_row(session, db_id) is None:
+                raise AppHttpException(
+                    message=(
+                        "La base no tiene credencial de datos: aprovisionala y verificala antes "
+                        "de abrir el acceso."
+                    ),
+                    status_code=409,
+                    context={"managed_database_id": db_id},
+                    public_context={"code": dcodes.CODE_DATA_CREDENTIAL_MISSING},
+                )
+            return md.name, md.server_id, self._data_second_approver_required(session, md)
+        finally:
+            session.close()
+
+    def request_data_access(self, db_id: int, *, admin: "dict | Actor | None" = None) -> dict:
+        """
+        Pide abrir la lectura de DATOS de una base a agentes. Quien pide tiene ``data.read`` en el
+        entorno (lo exige la ruta con capa 2).
+
+        Si el entorno exige segundo aprobador (``_DATA_SECOND_APPROVER_ENV_SLUGS``) el pedido
+        queda PENDIENTE y no abre nada hasta que OTRO owner lo apruebe. En los demás, abre en el
+        acto. **Abrir se audita fail-closed** (``record_intent``): si el rastro no se persiste, no
+        se abre ni se registra el pedido. Que quede abierto NO alcanza para leer: el gate además
+        exige credencial con sonda verde reciente y el kill switch de datos encendido.
+        """
+        actor_id = self._data_actor_id(admin)
+        nombre, server_id, requiere_segundo = self._data_access_context(db_id)
+
+        session = self._session()
+        try:
+            row = self._data_credential_row(session, db_id)
+            if row is not None and row.data_access_allowed:
+                raise AppHttpException(
+                    message="El acceso a datos de esta base ya está abierto.",
+                    status_code=409,
+                    public_context={"code": dcodes.CODE_DATA_ACCESS_ALREADY_OPEN},
+                )
+        finally:
+            session.close()
+
+        audit.record_intent(
+            "managed_database.data_access_request"
+            if requiere_segundo
+            else "managed_database.data_access_open",
+            admin=admin,
+            target_type="managed_database",
+            target_id=db_id,
+            server_id=server_id,
+            touched_engine=False,
+            detail=(
+                f"INTENT {'pedir' if requiere_segundo else 'abrir'} la lectura de DATOS de "
+                f"'{nombre}' a agentes (MCP)"
+                + (": queda pendiente de un segundo owner" if requiere_segundo else "")
+            ),
+        )
+
+        from datetime import UTC, datetime
+
+        session = self._session()
+        try:
+            row = self._data_credential_row(session, db_id)
+            if row is None:
+                raise AppHttpException(
+                    message="La base no tiene credencial de datos.",
+                    status_code=409,
+                    public_context={"code": dcodes.CODE_DATA_CREDENTIAL_MISSING},
+                )
+            row.data_access_requested_by_id = actor_id
+            if requiere_segundo:
+                row.data_access_allowed = False
+                row.data_access_approved_by_id = None
+                row.data_access_approved_at = None
+            else:
+                row.data_access_allowed = True
+                row.data_access_approved_by_id = actor_id
+                row.data_access_approved_at = datetime.now(UTC).replace(tzinfo=None)
+            session.commit()
+        finally:
+            session.close()
+        return self._data_credential_status(db_id)
+
+    def approve_data_access(self, db_id: int, *, admin: "dict | Actor | None" = None) -> dict:
+        """
+        Aprueba el pedido pendiente: abre la lectura de datos. El aprobador es OTRO owner:
+        el solicitante no puede aprobar el suyo (403 ``data_access.self_approval_forbidden``), y
+        sin pedido pendiente es 409 ``data_access.not_pending``. Se audita fail-closed.
+        """
+        actor_id = self._data_actor_id(admin)
+        nombre, server_id, _ = self._data_access_context(db_id)
+
+        session = self._session()
+        try:
+            row = self._data_credential_row(session, db_id)
+            solicitante = None if row is None else row.data_access_requested_by_id
+            abierto = bool(row is not None and row.data_access_allowed)
+        finally:
+            session.close()
+        if abierto or solicitante is None:
+            raise AppHttpException(
+                message="No hay un pedido de acceso a datos pendiente de aprobación.",
+                status_code=409,
+                public_context={"code": dcodes.CODE_DATA_ACCESS_NOT_PENDING},
+            )
+        if solicitante == actor_id:
+            raise AppHttpException(
+                message=(
+                    "No podés aprobar tu propio pedido: lo tiene que aprobar otro owner con "
+                    "acceso a datos en este entorno."
+                ),
+                status_code=403,
+                public_context={"code": dcodes.CODE_DATA_ACCESS_SELF_APPROVAL},
+            )
+
+        audit.record_intent(
+            "managed_database.data_access_open",
+            admin=admin,
+            target_type="managed_database",
+            target_id=db_id,
+            server_id=server_id,
+            touched_engine=False,
+            detail=(
+                f"INTENT abrir la lectura de DATOS de '{nombre}' a agentes (MCP): pedido del "
+                f"usuario {solicitante} aprobado por el usuario {actor_id}"
+            ),
+        )
+
+        from datetime import UTC, datetime
+
+        session = self._session()
+        try:
+            row = self._data_credential_row(session, db_id)
+            if (
+                row is None
+                or row.data_access_allowed
+                or row.data_access_requested_by_id != solicitante
+            ):
+                # El pedido cambió entre la lectura y la escritura (revocado o re-pedido).
+                raise AppHttpException(
+                    message="No hay un pedido de acceso a datos pendiente de aprobación.",
+                    status_code=409,
+                    public_context={"code": dcodes.CODE_DATA_ACCESS_NOT_PENDING},
+                )
+            row.data_access_allowed = True
+            row.data_access_approved_by_id = actor_id
+            row.data_access_approved_at = datetime.now(UTC).replace(tzinfo=None)
+            session.commit()
+        finally:
+            session.close()
+        return self._data_credential_status(db_id)
+
+    def revoke_data_access(self, db_id: int, *, admin: "dict | Actor | None" = None) -> dict:
+        """
+        Cierra el acceso a datos de la base (o cancela un pedido pendiente). INMEDIATO e
+        idempotente: la fila de la credencial queda (la cuenta del motor no se toca; para borrarla
+        está ``clear_data_credential``). Se audita best-effort: negar acceso no necesita la misma
+        garantía que otorgarlo, y un fallo del rastro no puede impedir cortar en una emergencia.
+        """
+        session = self._session()
+        try:
+            md = self._get_or_404(session, db_id)
+            nombre, server_id = md.name, md.server_id
+            row = self._data_credential_row(session, db_id)
+            antes = "sin credencial"
+            if row is not None:
+                antes = (
+                    "abierto"
+                    if row.data_access_allowed
+                    else "pendiente"
+                    if row.data_access_requested_by_id is not None
+                    else "cerrado"
+                )
+                row.data_access_allowed = False
+                row.data_access_requested_by_id = None
+                row.data_access_approved_by_id = None
+                row.data_access_approved_at = None
+                session.commit()
+        finally:
+            session.close()
+        audit.record(
+            "managed_database.data_access_close",
+            admin=admin,
+            target_type="managed_database",
+            target_id=db_id,
+            server_id=server_id,
+            touched_engine=False,
+            detail=f"lectura de DATOS de '{nombre}' cerrada (antes: {antes})",
+        )
+        return self._data_credential_status(db_id)
 
     @staticmethod
     def _data_in_progress(db_id: int) -> AppHttpException:

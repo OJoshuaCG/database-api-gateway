@@ -30,6 +30,16 @@ CODE_ENV_DENIES = "mcp.environment_denies_agents"
 CODE_NOT_OPTED_IN = "mcp.database_not_opted_in"
 CODE_BLOCKED = "mcp.database_blocked"
 
+#: --- Política de DATOS (las evalúa ``resolve_agent_data_database`` después de la de estructura) --- #
+#: Son códigos INTERNOS de tool: ``INTERNAL_TO_PUBLIC`` los traduce a ``DATA_DISABLED`` /
+#: ``PROBE_NOT_GREEN`` antes de salir al agente. Kill switch apagado, sin credencial de datos y sin
+#: opt-in comparten el público: al agente no le toca saber cuál palanca falta.
+CODE_DATA_DISABLED = "mcp.data_disabled"
+CODE_DATA_NOT_OPTED_IN = "mcp.data_not_opted_in"
+CODE_DATA_CREDENTIAL_MISSING = "mcp.data_credential_missing"
+#: Credencial sin sonda verde, o con una más vieja que ``MCP_DATA_CREDENTIAL_MAX_AGE_DAYS``.
+CODE_DATA_PROBE_STALE = "mcp.data_probe_stale"
+
 #: Tope de objetos superado. Se corta con un ERROR y nunca truncando: una lista cortada le hace
 #: creer al agente que no hay más, que es peor que un fallo.
 CODE_TOO_MANY_OBJECTS = "mcp.too_many_objects"
@@ -212,10 +222,10 @@ INTERNAL_TO_PUBLIC: dict[str, str] = {
     "agent_sql.limit_not_boundable": REASON_LIMIT_NOT_BOUNDABLE,
     "agent_sql.offset_too_high": REASON_OFFSET_TOO_HIGH,
     # Capas de datos (slices 2-6): se declaran acá para que la tabla sea una sola.
-    "mcp.data_disabled": REASON_DATA_DISABLED,
-    "mcp.data_not_opted_in": REASON_DATA_DISABLED,
-    "mcp.data_credential_missing": REASON_DATA_DISABLED,
-    "mcp.data_probe_stale": REASON_PROBE_NOT_GREEN,
+    CODE_DATA_DISABLED: REASON_DATA_DISABLED,
+    CODE_DATA_NOT_OPTED_IN: REASON_DATA_DISABLED,
+    CODE_DATA_CREDENTIAL_MISSING: REASON_DATA_DISABLED,
+    CODE_DATA_PROBE_STALE: REASON_PROBE_NOT_GREEN,
     "mcp.data_probe_failed": REASON_PROBE_NOT_GREEN,
     "mcp.query_timeout": REASON_QUERY_TIMEOUT,
     "mcp.audit_unavailable": REASON_AUDIT_UNAVAILABLE,

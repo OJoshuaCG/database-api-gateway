@@ -31,8 +31,28 @@ CODE_DATA_CREDENTIAL_MISSING = "data_credential.missing"
 #: ``public_context.violations`` los motivos cortos; nunca el texto de un grant.
 CODE_DATA_PROBE_FAILED = "managed_database.data_probe_failed"
 
+#: Opt-in de datos (``request/approve/revoke_data_access``). El solicitante NO puede aprobar su
+#: propio pedido: en los entornos que lo exigen (por defecto ``production``) lo aprueba OTRO owner.
+#: 403, no se cambió nada.
+CODE_DATA_ACCESS_SELF_APPROVAL = "data_access.self_approval_forbidden"
+
+#: ``approve`` sin un pedido pendiente (nunca se pidió, ya está abierto, o se revocó). 409.
+CODE_DATA_ACCESS_NOT_PENDING = "data_access.not_pending"
+
+#: ``request`` sobre una base cuyo acceso a datos YA está abierto. 409: revocá primero si querés
+#: re-pedirlo. Evita que un pedido repetido pise al aprobador original.
+CODE_DATA_ACCESS_ALREADY_OPEN = "data_access.already_open"
+
+#: La identidad del actor no es un usuario del gateway (llamada interna o dict legado): el
+#: solicitante/aprobador tiene que quedar registrado, así que se rechaza. 403, fail-closed.
+CODE_DATA_ACCESS_IDENTITY_REQUIRED = "data_access.identity_required"
+
 ERROR_CODES = frozenset(
     {
+        CODE_DATA_ACCESS_SELF_APPROVAL,
+        CODE_DATA_ACCESS_NOT_PENDING,
+        CODE_DATA_ACCESS_ALREADY_OPEN,
+        CODE_DATA_ACCESS_IDENTITY_REQUIRED,
         CODE_DATA_CREDENTIAL_MISSING,
         CODE_DATA_PROBE_FAILED,
         CODE_DATA_ACCOUNT_ALREADY_EXISTS,

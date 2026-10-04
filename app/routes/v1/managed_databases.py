@@ -69,6 +69,9 @@ BlueprintsApplyAtDb = Annotated[
 BlueprintsCapturesAtDb = Annotated[
     Actor, Depends(require_at(Capability.BLUEPRINTS_CAPTURES, target=database))
 ]
+# Opt-in de DATOS: ``data.read`` EN el entorno de la base (capa 2) y step-up. Es owner-only, así que
+# "otro owner" del segundo aprobador es alguien que ya tiene ``data.read`` aquí.
+DataReadAtDb = Annotated[Actor, Depends(require_at(Capability.DATA_READ, target=database))]
 # PATCH de inventario: igual que ``DatabasesWriteAtDb`` salvo que un PATCH que trae SOLO
 # ``environment_id`` (reclasificar) exige ``environments.write`` y no ``databases.write``: el
 # ``security_officer`` con rol base ``viewer`` tiene que poder hacerlo. Si toca otro campo
@@ -323,6 +326,62 @@ def verify_data_credential(request: Request, actor: ServersAdmin, db_id: int):
     return success(
         data=ManagedDatabaseController().verify_data_credential(db_id, admin=actor),
         message="Credencial de datos verificada.",
+    )
+
+
+@router.get("/{db_id}/data-credential", response_model=ApiResponse[DataCredentialOut])
+def get_data_credential_status(actor: DatabasesRead, db_id: int):
+    """
+    Estado de la credencial de datos y de su opt-in: existe, sonda (``verified_at``, códigos),
+    ``data_access_state`` (``closed``/``pending``/``open``) y si el entorno exige segundo owner.
+    Solo lectura; nunca lleva usuario, contraseña ni grants.
+    """
+    return success(data=ManagedDatabaseController().get_data_credential_status(db_id))
+
+
+@router.post("/{db_id}/data-access/request", response_model=ApiResponse[DataCredentialOut])
+@limiter.limit("10/minute")
+def request_data_access(request: Request, actor: DataReadAtDb, db_id: int):
+    """
+    Pide abrir la lectura de DATOS de esta base a agentes (opt-in por base). Exige ``data.read``
+    en el entorno y step-up. Sin cuerpo.
+
+    En ``production`` (y en bases sin entorno) el pedido queda ``pending`` hasta que OTRO owner lo
+    apruebe; en los demás entornos abre en el acto. Se audita fail-closed. Abrirlo NO alcanza: las
+    tools de datos además exigen credencial con sonda verde reciente y el kill switch encendido.
+
+    Errores: 409 ``data_credential.missing`` (sin credencial) y ``data_access.already_open``.
+    """
+    return success(
+        data=ManagedDatabaseController().request_data_access(db_id, admin=actor),
+        message="Pedido de acceso a datos registrado.",
+    )
+
+
+@router.post("/{db_id}/data-access/approve", response_model=ApiResponse[DataCredentialOut])
+@limiter.limit("10/minute")
+def approve_data_access(request: Request, actor: DataReadAtDb, db_id: int):
+    """
+    Aprueba el pedido pendiente y abre la lectura de datos. Lo aprueba OTRO owner: el solicitante
+    recibe 403 ``data_access.self_approval_forbidden``; sin pedido pendiente, 409
+    ``data_access.not_pending``. Exige ``data.read`` en el entorno y step-up. Se audita fail-closed.
+    """
+    return success(
+        data=ManagedDatabaseController().approve_data_access(db_id, admin=actor),
+        message="Acceso a datos aprobado.",
+    )
+
+
+@router.delete("/{db_id}/data-access", response_model=ApiResponse[DataCredentialOut])
+def revoke_data_access(actor: DataReadAtDb, db_id: int):
+    """
+    Cierra el acceso a datos de la base o cancela un pedido pendiente. Inmediato e idempotente.
+    Exige ``data.read`` en el entorno y step-up (el DELETE es un método no seguro y la exención de
+    step-up es solo para ``POST .../cancel``). No toca el motor ni la credencial (para borrar la cuenta: ``DELETE .../data-credential``).
+    """
+    return success(
+        data=ManagedDatabaseController().revoke_data_access(db_id, admin=actor),
+        message="Acceso a datos cerrado.",
     )
 
 

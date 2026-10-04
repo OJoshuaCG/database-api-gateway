@@ -1,6 +1,7 @@
 """Schemas Pydantic del recurso ManagedDatabase (BD gestionada en un servidor)."""
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -279,4 +280,18 @@ class DataCredentialOut(BaseModel):
     probe_warnings: list[str] = Field(default_factory=list)
     data_access_allowed: bool = Field(
         False, description="Opt-in de lectura de datos por base. Nace cerrado"
+    )
+    data_access_state: Literal["closed", "pending", "open"] = Field(
+        "closed",
+        description=(
+            "closed = sin pedido; pending = pedido esperando a un segundo owner; "
+            "open = opt-in vigente (las tools de datos aún exigen sonda verde y kill switch)"
+        ),
+    )
+    data_access_second_approver_required: bool = Field(
+        True,
+        description=(
+            "El entorno de la base exige que el pedido lo apruebe OTRO owner "
+            "(por defecto production; sin entorno, también)"
+        ),
     )

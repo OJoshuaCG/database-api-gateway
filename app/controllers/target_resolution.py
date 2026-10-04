@@ -328,6 +328,82 @@ def resolve_agent_database(
         session.close()
 
 
+def resolve_agent_data_database(
+    actor: Actor, database_id: int, capability: Capability
+) -> AgentDatabase:
+    """
+    El gate de DATOS de UNA base: todo ``resolve_agent_database`` MÁS lo propio de leer filas.
+
+    Orden, y cada eje se evalúa SIEMPRE después del anterior (autorización antes que política,
+    como en el gate de estructura):
+
+    1. ``resolve_agent_database`` — scope, proyecto, credencial de estructura, entorno, opt-in de
+       estructura y veto. Una base ajena o inexistente responde ``mcp.not_found``.
+    2. **Kill switch** de la capacidad (``MCP_DATA_READ_ENABLED`` / ``MCP_DATA_QUERY_ENABLED``),
+       leído en CADA llamada: apagarlo corta aunque el token y la base estén abiertos.
+    3. Credencial de datos de ESA base registrada (``ManagedDatabaseDataCredential``).
+    4. Sonda verde con ``verified_at`` más nuevo que ``MCP_DATA_CREDENTIAL_MAX_AGE_DAYS``.
+    5. Opt-in de datos abierto (``data_access_allowed``) y con aprobador registrado: una fila con
+       el flag en 1 pero sin ``data_access_approved_by_id`` (un ``UPDATE`` a mano) no abre nada.
+
+    Los códigos son los internos de ``mcp_catalog`` (``mcp.data_*``): salen al agente traducidos
+    a ``DATA_DISABLED`` / ``PROBE_NOT_GREEN``. No descifra nada ni abre conexión: el secreto lo
+    lee recién quien ejecuta.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.core.database import Database
+    from app.core.environments import MCP_DATA_CREDENTIAL_MAX_AGE_DAYS
+    from app.models.managed_database_data_credential import ManagedDatabaseDataCredential
+    from app.services.capability_catalog import data_capability_enabled
+
+    resuelta = resolve_agent_database(actor, database_id, capability)
+    if not data_capability_enabled(capability):
+        raise _deny(
+            codes.CODE_DATA_DISABLED,
+            403,
+            "Las tools de datos están apagadas en este gateway (kill switch).",
+        )
+
+    session = Database().get_declarative_base_session()
+    try:
+        cred = (
+            session.query(ManagedDatabaseDataCredential)
+            .filter(
+                ManagedDatabaseDataCredential.managed_database_id
+                == resuelta.database.database_id
+            )
+            .first()
+        )
+        if cred is None or not cred.username or not cred.password_encrypted:
+            raise _deny(
+                codes.CODE_DATA_CREDENTIAL_MISSING,
+                403,
+                "La base no tiene credencial de datos registrada.",
+            )
+        limite = datetime.now(UTC).replace(tzinfo=None) - timedelta(
+            days=MCP_DATA_CREDENTIAL_MAX_AGE_DAYS
+        )
+        if cred.verified_at is None or cred.verified_at <= limite:
+            raise _deny(
+                codes.CODE_DATA_PROBE_STALE,
+                403,
+                (
+                    "La credencial de datos no tiene una sonda verde de los últimos "
+                    f"{MCP_DATA_CREDENTIAL_MAX_AGE_DAYS} días."
+                ),
+            )
+        if not cred.data_access_allowed or cred.data_access_approved_by_id is None:
+            raise _deny(
+                codes.CODE_DATA_NOT_OPTED_IN,
+                403,
+                "La base no tiene el opt-in de lectura de datos aprobado.",
+            )
+    finally:
+        session.close()
+    return resuelta
+
+
 def _readonly_target(server_id: int):
     """
     El ``ServerTarget`` con la credencial de SOLO LECTURA. Es la ÚNICA función de este módulo que
