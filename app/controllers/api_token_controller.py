@@ -17,14 +17,21 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.exc import IntegrityError
 
-from app.core.environments import MCP_TOKEN_MAX_TTL_DAYS
+from app.core.environments import MCP_DATA_TOKEN_MAX_TTL_DAYS, MCP_TOKEN_MAX_TTL_DAYS
 from app.core.mcp_auth import mint, token_hmac
 from app.exceptions import AppHttpException
 from app.models.api_token import ApiToken
 from app.models.project import Project
 from app.services import audit
 from app.services import project_catalog as project_codes
-from app.services.capability_catalog import AGENT_ALLOWED, Capability, parse_scopes
+from app.services.capability_catalog import (
+    AGENT_ALLOWED,
+    AGENT_DATA_EXCEPTIONS,
+    CODE_FORBIDDEN,
+    CODE_STEP_UP_REQUIRED,
+    Capability,
+    parse_stored_scopes,
+)
 
 CODE_NOT_FOUND = "api_token.not_found"
 CODE_TTL_TOO_LONG = "api_token.ttl_too_long"
@@ -51,15 +58,49 @@ def _project_not_found(project_id: int) -> AppHttpException:
     )
 
 
-def _validate_scopes(raw_scopes: list[str]) -> list[str]:
+def _require_issuer_step_up(admin, capability: Capability) -> None:
+    """
+    Re-autenticación del EMISOR para un scope de datos: contraseña fresca (step-up).
+
+    Un token no tiene contraseña que reconfirmar, así que el step-up de ``data.*`` (invariante 11
+    relajado para ``AGENT_DATA_EXCEPTIONS``) lo cumple quien lo emite o edita. ``method="POST"``
+    fijo: el PATCH de edición también es una escritura y no puede heredar el "GET no pide" de
+    ``assert_step_up``. Un ``admin`` que no es un ``Actor`` (llamada interna, dict legado) falla
+    CERRADO: sin ventana de step-up no hay re-autenticación.
+    """
+    from app.core.actor import Actor
+    from app.core.step_up import assert_step_up
+
+    if not isinstance(admin, Actor):
+        raise AppHttpException(
+            message="Esta operación requiere confirmar tu contraseña.",
+            status_code=403,
+            public_context={"code": CODE_STEP_UP_REQUIRED},
+        )
+    if admin.is_agent:
+        raise AppHttpException(
+            message="No tienes permiso para esta operación.",
+            status_code=403,
+            public_context={"code": CODE_FORBIDDEN},
+        )
+    assert_step_up(admin, capability, method="POST")
+
+
+def _validate_scopes(raw_scopes: list[str], *, admin) -> list[str]:
     """
     Valida los scopes contra el **techo de agente** y devuelve sus valores canónicos.
 
+    ``admin`` es el EMISOR (alta y PATCH lo pasan): si algún scope es de datos
+    (``AGENT_DATA_EXCEPTIONS``) exige un step-up FRESCO del emisor y deja un rastro
+    ``api_token.data_scope_grant`` con ``record_intent`` fail-closed (si el rastro no se persiste,
+    el scope no se otorga). Los scopes sin datos no tocan ``admin``.
+
     Una sola implementación para el alta y la edición: si cada ruta tuviera su copia, la
     edición podría quedar más laxa que el alta y el PATCH sería la puerta trasera para darle a
-    un token una capacidad que mute o divulgue. El techo excluye toda capacidad así (y
-    ``access.admin``), por eso ni un token ni su edición pueden escalar privilegios. Los errores
-    llevan solo el ``allowed`` del techo, nunca el detalle de la fila.
+    un token una capacidad que mute o divulgue. El techo excluye toda capacidad así (salvo
+    la excepción cerrada de datos, arriba) y ``access.admin``, por eso ni un token ni su edición
+    pueden escalar privilegios. Los errores llevan solo el ``allowed`` del techo, nunca el detalle
+    de la fila.
     """
     validos: list[str] = []
     for raw in raw_scopes:
@@ -84,7 +125,35 @@ def _validate_scopes(raw_scopes: list[str]) -> list[str]:
                 },
             )
         validos.append(cap.value)
+
+    datos = sorted(c for c in {Capability(v) for v in validos} if c in AGENT_DATA_EXCEPTIONS)
+    for cap in datos:
+        _require_issuer_step_up(admin, cap)
+    if datos:
+        # Fail-closed: otorgar acceso a filas de un tercero no puede quedar sin rastro.
+        audit.record_intent(
+            "api_token.data_scope_grant",
+            admin=admin,
+            target_type="api_token",
+            touched_engine=False,
+            detail=f"INTENT otorgar scopes de datos [{','.join(c.value for c in datos)}] a un token",
+        )
     return validos
+
+
+def _has_data_scope(scopes: list[str]) -> bool:
+    return any(Capability(v) in AGENT_DATA_EXCEPTIONS for v in scopes)
+
+
+def _ttl_too_long_for_data(dias: int) -> AppHttpException:
+    return AppHttpException(
+        message=(
+            f"Un token con scope de datos vive como máximo {MCP_DATA_TOKEN_MAX_TTL_DAYS} días: "
+            "un bearer que lee filas de un tercero no puede quedar meses en el repo de otra gente."
+        ),
+        status_code=422,
+        public_context={"code": CODE_TTL_TOO_LONG, "max_days": MCP_DATA_TOKEN_MAX_TTL_DAYS},
+    )
 
 
 class ApiTokenController:
@@ -106,7 +175,9 @@ class ApiTokenController:
         # operador como si el token tuviera esa capacidad, mientras el efectivo es vacío. La
         # autorización ya era fail-closed —`parse_scopes` intersecta con el techo de agente— pero
         # la PANTALLA afirmaba otra cosa, y en una revisión de accesos eso es lo que se lee.
-        efectivos = sorted(c.value for c in parse_scopes(t.scopes))
+        # ``parse_stored_scopes``: con el kill switch de datos apagado el scope sigue en la fila
+        # (inerte). Mostrarlo evita que la SPA lo "pierda" al guardar un PATCH.
+        efectivos = sorted(c.value for c in parse_stored_scopes(t.scopes))
         return {
             "id": t.id,
             "token_id": t.token_id,
@@ -167,7 +238,11 @@ class ApiTokenController:
                 },
             )
 
-        validos = _validate_scopes(data.get("scopes") or [Capability.BLUEPRINTS_READ.value])
+        validos = _validate_scopes(
+            data.get("scopes") or [Capability.BLUEPRINTS_READ.value], admin=admin
+        )
+        if _has_data_scope(validos) and dias > MCP_DATA_TOKEN_MAX_TTL_DAYS:
+            raise _ttl_too_long_for_data(dias)
 
         token_id, secreto, bearer = mint()
         admin_id, _ = identity_of(admin)
@@ -270,7 +345,7 @@ class ApiTokenController:
 
         La auditoría registra scopes antes→después y nada más: ni secreto ni HMAC.
         """
-        validos = sorted(set(_validate_scopes(data["scopes"])))
+        validos = sorted(set(_validate_scopes(data["scopes"], admin=admin)))
         session = self._session()
         try:
             fila = session.get(ApiToken, token_pk)
@@ -288,7 +363,13 @@ class ApiTokenController:
                 )
             # Los EFECTIVOS de antes, igual que los muestra `_serialize`, para que el rastro diga
             # lo que el token podía hacer y no un string crudo de la fila.
-            antes = sorted(c.value for c in parse_scopes(fila.scopes))
+            antes = sorted(c.value for c in parse_stored_scopes(fila.scopes))
+            if _has_data_scope(validos) and fila.expires_at > _utcnow() + timedelta(
+                days=MCP_DATA_TOKEN_MAX_TTL_DAYS
+            ):
+                # La vida restante cuenta: agregar datos a un token de 90 días lo dejaría leyendo
+                # filas 90 días. Hay que emitir otro (o esperar a que le queden <= el tope).
+                raise _ttl_too_long_for_data(0)
             fila.scopes = ",".join(validos)
             session.commit()
             session.refresh(fila)

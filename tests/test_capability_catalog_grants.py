@@ -23,10 +23,12 @@ SENSITIVE = {
     "blueprints.apply",
     "schema_diff.execute",
     "collation.execute",
+    "data.read",
+    "data.query",
 }
 
 
-def test_sensitive_set_is_exactly_the_eleven_policy_capabilities():
+def test_sensitive_set_is_exactly_the_thirteen_policy_capabilities():
     assert {s.id.value for s in CAPABILITIES if cc.is_sensitive(s.id)} == SENSITIVE
 
 
@@ -117,7 +119,7 @@ def test_reads_and_global_capabilities_imply_nothing():
 
 def test_mutating_grantable_capabilities_with_a_read_sibling_all_imply_it():
     for s in CAPABILITIES:
-        if cc.is_grantable(s.id) and (s.mutates or s.discloses):
+        if cc.is_grantable(s.id) and (s.mutates or s.discloses) and s.id not in cc.AGENT_DATA_EXCEPTIONS:
             assert s.id in cc.IMPLIED_READ, s.id.value
 
 

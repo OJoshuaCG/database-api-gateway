@@ -396,6 +396,13 @@ CatalogsWrite = Annotated[Actor, Depends(require(Capability.CATALOGS_WRITE))]
 EnvironmentsRead = Annotated[Actor, Depends(require(Capability.ENVIRONMENTS_READ))]
 EnvironmentsWrite = Annotated[Actor, Depends(require(Capability.ENVIRONMENTS_WRITE))]
 
+#: Datos de bases gestionadas para agentes (excepción cerrada del catálogo). Las rutas HTTP de
+#: opt-in usan ``require_at(Capability.DATA_READ, target=database)`` (capa 2); estos alias existen
+#: porque el catálogo exige un alias público por capacidad. ``DataQuery`` no lo usa ninguna ruta:
+#: lo consume la tool ``run_select`` del MCP.
+DataRead = Annotated[Actor, Depends(require(Capability.DATA_READ))]
+DataQuery = Annotated[Actor, Depends(require(Capability.DATA_QUERY))]
+
 #: Usuarios del gateway, accesos, capacidades puntuales, tokens y preparación de alcances. Solo
 #: la global ``access_admin``.
 AccessAdmin = Annotated[Actor, Depends(require(Capability.ACCESS_ADMIN_CAP))]

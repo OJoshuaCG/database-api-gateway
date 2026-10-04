@@ -129,7 +129,9 @@ AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
 
 #: Capacidades que existen para consumidores que NO son rutas (tools del MCP, workers). Sin
 #: esta lista, el chequeo 4 reportaría como vocabulario muerto algo que sí tiene consumidor.
-NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset()
+#: ``data.query`` lo consume ``run_select`` (tool del MCP, scope por tool) y ninguna ruta HTTP:
+#: ``data.read`` sí tiene ruta (el opt-in por base), pero el SQL libre de un agente no.
+NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset({Capability.DATA_QUERY})
 
 #: Cuántas rutas declaran capacidad. **Solo puede SUBIR.** Ver "EL TRINQUETE".
 MIN_MIGRATED_ROUTES = 196

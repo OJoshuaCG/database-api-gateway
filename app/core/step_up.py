@@ -35,9 +35,12 @@ seguro — en particular ``GET .../content`` no consume el artefacto con este 40
 
 LOS TOKENS DE AGENTE NUNCA LLEGAN ACÁ
 -------------------------------------
-El techo de agente no tiene ninguna capacidad con step-up (invariante 11 del catálogo) y un
-token no tiene contraseña que reconfirmar. Si igual llegara uno, es 403 ``access.forbidden``:
-pedirle un step-up a una máquina es un prompt que nadie puede contestar.
+El techo de agente no tiene ninguna capacidad con step-up (invariante 11 del catálogo) SALVO la
+excepción cerrada ``AGENT_DATA_EXCEPTIONS`` (``data.read``, ``data.query``; invariante 13). Un
+token no tiene contraseña que reconfirmar, así que el step-up de esas dos lo cumple el EMISOR al
+emitir o editar el token (``api_token_controller._validate_scopes`` llama a ``assert_step_up``
+con el actor humano), nunca el token. Si un actor de token llegara igual a ``assert_step_up``, es
+403 ``access.forbidden``: pedirle un step-up a una máquina es un prompt que nadie puede contestar.
 """
 
 from __future__ import annotations
@@ -109,7 +112,8 @@ def assert_step_up(actor: Actor, capability: Capability, *, method: str | None =
     if not spec(capability).requires_step_up:
         return
     if actor.is_agent:
-        # Inalcanzable por el invariante 11; escrito igual. Ver el docstring del módulo.
+        # Inalcanzable salvo por la excepción de datos (inv. 11/13), y esa la cumple el emisor,
+        # no el token; escrito igual. Ver el docstring del módulo.
         raise AppHttpException(
             message="No tienes permiso para esta operación.",
             status_code=403,

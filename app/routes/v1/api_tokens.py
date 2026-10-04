@@ -32,8 +32,13 @@ def create_api_token(request: Request, actor: AccessAdmin, payload: ApiTokenCrea
     Emite un token y devuelve el bearer **una sola vez**.
 
     Los scopes se validan contra el **techo de agente**, que excluye toda capacidad que mute o
-    divulgue: un token no puede recibir una ni por error del operador. La intersección se
-    vuelve a aplicar al autenticar, o sea que es fail-closed en el lector además del escritor.
+    divulgue: un token no puede recibir una ni por error del operador. La única excepción es el
+    par cerrado ``data.read`` / ``data.query``: exige un **step-up fresco del emisor** (403
+    ``access.step_up_required`` si la ventana venció), deja rastro ``api_token.data_scope_grant``
+    (fail-closed) y limita la vida del token a ``MCP_DATA_TOKEN_MAX_TTL_DAYS`` (422
+    ``api_token.ttl_too_long``). Con el kill switch de datos apagado el scope queda inerte. La
+    intersección se vuelve a aplicar al autenticar, o sea que es fail-closed en el lector además
+    del escritor.
 
     **Distribución**: en el `.mcp.json` del repo consumidor va por **expansión de variable de
     entorno**, nunca el literal. El gate de secretos del CI protege *este* repo; el token se
@@ -53,6 +58,8 @@ def update_api_token(actor: AccessAdmin, token_pk: int, payload: ApiTokenUpdate)
     Lista completa (no suma/resta) y se valida contra el **techo de agente**, igual que el alta:
     422 `api_token.scope_not_allowed` con `allowed`. Lista vacía es 422; un token revocado es
     409 `api_token.already_revoked`. Exige `access.admin` y step-up (todo método no seguro).
+    Agregar un scope de datos exige el mismo step-up fresco del emisor y que al token le queden
+    como máximo ``MCP_DATA_TOKEN_MAX_TTL_DAYS`` días de vida (422 ``api_token.ttl_too_long``).
     Ampliar un token ya repartido amplía lo que puede hacer quien lo tenga. El cambio rige desde
     la llamada siguiente del agente.
     """

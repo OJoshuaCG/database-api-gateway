@@ -19,7 +19,12 @@ from sqlalchemy import text
 
 from app.core.actor import Actor, admin_actor, token_actor
 from app.core.database import Database
-from app.services.capability_catalog import AGENT_ALLOWED, Capability, GatewayRole
+from app.services.capability_catalog import (
+    AGENT_ALLOWED,
+    AGENT_DATA_EXCEPTIONS,
+    Capability,
+    GatewayRole,
+)
 from tests.test_mcp_server import _crear_token, _proyecto, _rpc, mcp_on  # noqa: F401
 
 
@@ -152,7 +157,7 @@ def test_a_normal_issuer_leaves_the_token_unchanged():
         project_id=1,
         issuer=emisor,
     )
-    assert actor.capabilities == AGENT_ALLOWED
+    assert actor.capabilities == AGENT_ALLOWED - AGENT_DATA_EXCEPTIONS
 
 
 def test_without_issuer_the_reader_fails_closed():

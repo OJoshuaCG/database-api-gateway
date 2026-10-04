@@ -25,6 +25,7 @@ from app.core.actor import admin_actor, token_actor
 from app.services import capability_catalog as cc
 from app.services.capability_catalog import (
     AGENT_ALLOWED,
+    AGENT_DATA_EXCEPTIONS,
     CAPABILITIES,
     GLOBAL_CAPABILITIES,
     ROLE_CAPABILITIES,
@@ -110,6 +111,8 @@ def test_the_disclosing_capabilities_are_the_expected_ones():
         Capability.CLONES_EXECUTE,
         Capability.EXPORTS_DOWNLOAD,
         Capability.SQL_CONSOLE_EXECUTE,
+        Capability.DATA_READ,
+        Capability.DATA_QUERY,
     }
 
 
@@ -351,7 +354,8 @@ def test_environments_write_belongs_only_to_security_officer():
 def test_agent_allowed_never_mutates_nor_discloses():
     for s in CAPABILITIES:
         if s.agent_allowed:
-            assert not s.mutates and not s.discloses, s.id.value
+            assert not s.mutates, s.id.value
+            assert not s.discloses or s.id in AGENT_DATA_EXCEPTIONS, s.id.value
 
 
 def test_parse_scopes_intersects_with_the_agent_ceiling():
@@ -498,6 +502,6 @@ def test_token_actor_is_capped_at_the_agent_ceiling():
         project_id=7,
         issuer=admin_actor(user_id=1, username="emisor", role=GatewayRole.OWNER),
     )
-    assert actor.capabilities == AGENT_ALLOWED
+    assert actor.capabilities == AGENT_ALLOWED - AGENT_DATA_EXCEPTIONS
     assert actor.is_agent
     assert not actor.has(Capability.DATABASES_DROP)

@@ -184,6 +184,14 @@ class Capability(StrEnum):
     ENVIRONMENTS_READ = "environments.read"
     ENVIRONMENTS_WRITE = "environments.write"
 
+    # -- Lectura de DATOS por agentes (MCP) --------------------------------- #
+    # Las ÚNICAS capacidades que divulgan filas de un tercero y a la vez viven en el techo de
+    # agente (``AGENT_DATA_EXCEPTIONS``). La excepción es CERRADA: ver el invariante 13.
+    #: Tools parametrizadas de lectura (``sample_rows``, ``distinct_values``, ``count_rows``).
+    DATA_READ = "data.read"
+    #: SQL ``SELECT`` redactado por el agente, tras el validador compartido (``run_select``).
+    DATA_QUERY = "data.query"
+
     # -- Administración del acceso y de la política del gateway -------------- #
     # Eran UNA sola capacidad (``gateway.admin``) y la tenían las dos globales, así que
     # ``security_officer`` también administraba usuarios: la separación de deberes quedaba
@@ -448,6 +456,26 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         step_up=True,
         axis="global",
     ),
+    # Excepción CERRADA a los invariantes 5 y 11 (``AGENT_DATA_EXCEPTIONS``): divulgan filas de
+    # la base de un tercero, exigen step-up y viven en el techo de agente. Nunca mutan: la
+    # credencial de datos es SELECT-only y la transacción READ ONLY. Solo ``owner``, y por eso
+    # sensibles (segundo aprobador al otorgarlas sueltas). El step-up lo da el EMISOR al emitir el
+    # token (``api_token_controller._validate_scopes``): un token no tiene contraseña que
+    # reconfirmar.
+    _spec(
+        Capability.DATA_READ,
+        "Leer filas de bases gestionadas mediante tools parametrizadas del MCP",
+        discloses=True,
+        step_up=True,
+        agent=True,
+    ),
+    _spec(
+        Capability.DATA_QUERY,
+        "Ejecutar SELECT redactados por un agente (MCP) sobre bases gestionadas",
+        discloses=True,
+        step_up=True,
+        agent=True,
+    ),
 )
 
 _BY_ID: Mapping[Capability, CapabilitySpec] = MappingProxyType(
@@ -507,6 +535,8 @@ _OWNER: frozenset[Capability] = _OPERATOR | {
     Capability.EXPORTS_DOWNLOAD,
     Capability.SQL_CONSOLE_EXECUTE,
     Capability.COLLATION_EXECUTE,
+    Capability.DATA_READ,
+    Capability.DATA_QUERY,
 }
 
 ROLE_CAPABILITIES: Mapping[GatewayRole, frozenset[Capability]] = MappingProxyType(
@@ -539,6 +569,38 @@ OWNER_ONLY_CAPABILITIES: frozenset[Capability] = _OWNER - _OPERATOR
 AGENT_ALLOWED: frozenset[Capability] = frozenset(
     s.id for s in CAPABILITIES if s.agent_allowed
 )
+
+#: La ÚNICA excepción al "un token nunca divulga" (invariante 5) y al "step-up ⇒ no agente"
+#: (invariante 11). CERRADA: el invariante 13 la fija al par literal, así que agregar un miembro
+#: exige editar a propósito el código y el invariante, y un ``foo.read`` que divulgue y sea de
+#: agente sigue rompiendo el import. Mutar NO tiene excepción.
+AGENT_DATA_EXCEPTIONS: frozenset[Capability] = frozenset(
+    {Capability.DATA_READ, Capability.DATA_QUERY}
+)
+
+#: Capacidad de datos → nombre del kill switch (``app.core.environments``) que la enciende.
+_DATA_KILL_SWITCH: Mapping[Capability, str] = MappingProxyType(
+    {
+        Capability.DATA_READ: "MCP_DATA_READ_ENABLED",
+        Capability.DATA_QUERY: "MCP_DATA_QUERY_ENABLED",
+    }
+)
+
+
+def data_capability_enabled(capability: Capability | str) -> bool:
+    """
+    ¿El kill switch de esta capacidad de DATOS está encendido? Lee el valor VIGENTE en cada
+    llamada (un test lo apaga con ``monkeypatch.setattr(environments, ...)``). Fail-closed: una
+    capacidad que no es de datos o desconocida devuelve ``False``; las que no son de datos no
+    pasan por acá.
+    """
+    from app.core import environments
+
+    try:
+        name = _DATA_KILL_SWITCH[Capability(capability)]
+    except (KeyError, ValueError):
+        return False
+    return bool(getattr(environments, name, False))
 
 # --------------------------------------------------------------------------- #
 # Códigos de error — vocabulario cerrado, va en public_context["code"]         #
@@ -647,7 +709,7 @@ def is_sensitive(capability: Capability | str) -> bool:
     Antes eran las que divulgan o son de nivel ``drop`` (8). Al retirar el techo por tenencia
     (C3), ``blueprints.apply``, ``schema_diff.execute`` y ``collation.execute`` —destructivas y
     solo de ``owner``— quedaban otorgables por UN solo administrador, porque lo único que las
-    frenaba era que quien otorga tuviera ``owner``. El invariante 8 fija el conjunto (11) y
+    frenaba era que quien otorga tuviera ``owner``. El invariante 8 fija el conjunto (13: las 11 de siempre más ``data.read`` y ``data.query``) y
     exige que siga conteniendo todo lo que divulga o es ``drop``.
     """
     try:
@@ -823,7 +885,31 @@ def parse_scopes(raw: str) -> frozenset[Capability]:
             out.add(Capability(token))
         except ValueError:
             continue
+    return frozenset(c for c in out if c in AGENT_ALLOWED and _data_scope_live(c))
+
+
+def parse_stored_scopes(raw: str) -> frozenset[Capability]:
+    """
+    Los scopes GUARDADOS de un token dentro del techo de agente, SIN aplicar los kill switches.
+
+    Para MOSTRAR y editar (``api_token_controller``): con el switch de datos apagado el scope sigue
+    en la fila —inerte, no borrado—, y la SPA tiene que verlo para que un PATCH no lo descarte en
+    silencio. La AUTORIZACIÓN usa ``parse_scopes``.
+    """
+    out: set[Capability] = set()
+    for token in (raw or "").split(","):
+        try:
+            out.add(Capability(token.strip()))
+        except ValueError:
+            continue
     return frozenset(out) & AGENT_ALLOWED
+
+
+def _data_scope_live(capability: Capability) -> bool:
+    """Los scopes de datos valen solo con su kill switch encendido; el resto siempre."""
+    if capability not in AGENT_DATA_EXCEPTIONS:
+        return True
+    return data_capability_enabled(capability)
 
 
 def capability_matrix() -> list[dict]:
@@ -878,6 +964,9 @@ _SENSITIVE_POLICY: frozenset[str] = frozenset(
         "sql_console.execute",
         "engine_users.drop",
         "databases.drop",
+        # Datos por agentes (excepción cerrada, invariante 13): divulgan y son solo de owner.
+        "data.read",
+        "data.query",
         # C3: sin el techo por tenencia, estas tres (destructivas, solo de owner) las otorgaba
         # un solo administrador. Ver `is_sensitive`.
         "blueprints.apply",
@@ -922,10 +1011,13 @@ def _assert_invariants() -> None:
         if s.discloses and not s.requires_step_up:
             raise AssertionError(f"{s.id.value} divulga y no exige step-up.")
 
-    # 5. El techo de agente. Un token nunca puede mutar ni divulgar.
+    # 5. El techo de agente. Un token nunca puede mutar, y nunca puede divulgar SALVO las dos
+    #    de ``AGENT_DATA_EXCEPTIONS`` (fijadas por el invariante 13).
     for s in CAPABILITIES:
-        if s.agent_allowed and (s.mutates or s.discloses):
-            raise AssertionError(f"{s.id.value} es agent_allowed y muta o divulga.")
+        if s.agent_allowed and s.mutates:
+            raise AssertionError(f"{s.id.value} es agent_allowed y muta.")
+        if s.agent_allowed and s.discloses and s.id not in AGENT_DATA_EXCEPTIONS:
+            raise AssertionError(f"{s.id.value} es agent_allowed y divulga.")
 
     # 6. El id concuerda con módulo.nivel. Evita que un valor y su spec se desincronicen.
     for s in CAPABILITIES:
@@ -962,7 +1054,7 @@ def _assert_invariants() -> None:
             if s.id in ROLE_CAPABILITIES[role]:
                 raise AssertionError(f"{s.id.value} es destructive y está en '{role.value}'.")
 
-    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 11 (owner
+    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 13 (owner
     #    menos operator, otorgables): si el catálogo crece, esto obliga a decidirlo a propósito.
     #    Y el criterio viejo (divulga o es `drop`) sigue contenido: ninguna otorgable que divulgue
     #    o borre puede quedar sin segundo aprobador.
@@ -999,8 +1091,10 @@ def _assert_invariants() -> None:
     # 11. Step-up ⇒ NO agente. Un token no tiene contraseña que reconfirmar: una capacidad con
     #     step-up en el techo de agente sería una operación que el agente nunca puede completar
     #     o, peor, un incentivo a eximir a los tokens del step-up. Ver `app/core/step_up.py`.
+    #     Relajado SOLO para ``AGENT_DATA_EXCEPTIONS``: el step-up de esas dos lo cumple el
+    #     EMISOR al emitir el token (``_validate_scopes``), no el token.
     for s in CAPABILITIES:
-        if s.requires_step_up and s.agent_allowed:
+        if s.requires_step_up and s.agent_allowed and s.id not in AGENT_DATA_EXCEPTIONS:
             raise AssertionError(f"{s.id.value} exige step-up y es agent_allowed.")
 
     # 9. Los conjuntos de las globales son DISJUNTOS de a pares. Es la separación de deberes
@@ -1030,6 +1124,32 @@ def _assert_invariants() -> None:
     retiradas = {c.value for c in Capability} & RETIRED_CAPABILITIES
     if retiradas:
         raise AssertionError(f"Capacidades retiradas reintroducidas: {sorted(retiradas)}")
+
+
+    # 13. La excepción de datos está FIJADA. El conjunto es el par literal, y cada miembro divulga
+    #     sin mutar, es solo de owner, exige step-up, es sensible y no es una lectura implícita de
+    #     otra capacidad. Sin esto, "excepción" se vuelve un conjunto al que cualquiera agrega un
+    #     miembro y el techo de agente deja de significar algo.
+    if AGENT_DATA_EXCEPTIONS != frozenset({Capability.DATA_READ, Capability.DATA_QUERY}):
+        raise AssertionError("AGENT_DATA_EXCEPTIONS tiene que ser exactamente {data.read, data.query}.")
+    implied_values = set().union(*IMPLIED_READ.values()) if IMPLIED_READ else set()
+    for cap in AGENT_DATA_EXCEPTIONS:
+        s = _BY_ID[cap]
+        if s.mutates or s.destructive:
+            raise AssertionError(f"{cap.value} está en la excepción de datos y muta o destruye.")
+        if not (s.discloses and s.requires_step_up and s.agent_allowed):
+            raise AssertionError(f"{cap.value} no divulga con step-up dentro del techo de agente.")
+        if s.module != "data":
+            raise AssertionError(f"{cap.value} está en la excepción de datos fuera del módulo 'data'.")
+        if cap not in OWNER_ONLY_CAPABILITIES or cap in _OPERATOR:
+            raise AssertionError(f"{cap.value} tiene que ser solo de owner.")
+        if not is_sensitive(cap):
+            raise AssertionError(f"{cap.value} tiene que pedir segundo aprobador.")
+        if cap in implied_values:
+            raise AssertionError(f"{cap.value} no puede ser lectura implícita de otra capacidad.")
+    for s in CAPABILITIES:
+        if s.module == "data" and s.id not in AGENT_DATA_EXCEPTIONS:
+            raise AssertionError(f"{s.id.value} es del módulo 'data' y no está en la excepción.")
 
 
 _assert_invariants()

@@ -16,6 +16,7 @@ import pytest
 from app.core import session_store, step_up
 from app.services.capability_catalog import (
     AGENT_ALLOWED,
+    AGENT_DATA_EXCEPTIONS,
     CAPABILITIES,
     CODE_FORBIDDEN,
     CODE_STEP_UP_REQUIRED,
@@ -396,8 +397,12 @@ def test_disabled_step_up_never_prompts(admin_client, expire_step_up, monkeypatc
 def test_invariant_step_up_excludes_agent_allowed():
     """Invariante 11 del catálogo: ninguna capacidad con step-up está en el techo de agente."""
     for s in CAPABILITIES:
+        if s.id in AGENT_DATA_EXCEPTIONS:
+            continue
         assert not (s.requires_step_up and s.agent_allowed), s.id.value
-    assert not any(spec(c).requires_step_up for c in AGENT_ALLOWED)
+    assert not any(
+        spec(c).requires_step_up for c in AGENT_ALLOWED if c not in AGENT_DATA_EXCEPTIONS
+    )
 
 
 def _token(caps):
@@ -418,7 +423,7 @@ def test_agent_tokens_never_get_step_up_required():
     from app.exceptions import AppHttpException
 
     agente = _token(AGENT_ALLOWED)
-    for cap in AGENT_ALLOWED:
+    for cap in AGENT_ALLOWED - AGENT_DATA_EXCEPTIONS:
         step_up.assert_step_up(agente, cap, method="POST")  # no levanta
 
     # Defensivo: un token que llegara a una capacidad con step-up recibe access.forbidden.

@@ -502,6 +502,17 @@ MCP_DATA_ACCOUNT_PREFIX = os.getenv("MCP_DATA_ACCOUNT_PREFIX", "mcp_d_").strip()
 # de datos la rechazan (`PROBE_NOT_GREEN`) hasta re-verificar: un grant cambiado a mano en el motor
 # no puede quedar escondido detrás de una verificación vieja. Entero >= 1.
 MCP_DATA_CREDENTIAL_MAX_AGE_DAYS = int(os.getenv("MCP_DATA_CREDENTIAL_MAX_AGE_DAYS", "7"))
+# KILL SWITCHES de las tools de DATOS del MCP (`data.read`, `data.query`). Nacen APAGADOS y son
+# independientes: con uno apagado su scope queda INERTE (`parse_scopes` lo descarta), sus tools
+# desaparecen de `tools/list` y el gate (`resolve_agent_data_database`) niega con `DATA_DISABLED`.
+# Un token con scope de datos emitido antes no hace nada hasta que alguien los encienda a propósito.
+MCP_DATA_READ_ENABLED = os.getenv("MCP_DATA_READ_ENABLED", "false").lower() == "true"
+MCP_DATA_QUERY_ENABLED = os.getenv("MCP_DATA_QUERY_ENABLED", "false").lower() == "true"
+# Vida máxima, en días, de un token con scope de datos (más corta que `MCP_TOKEN_MAX_TTL_DAYS`):
+# un bearer que lee filas de un tercero no debería vivir meses en el repo de otra gente. Entero >= 1.
+MCP_DATA_TOKEN_MAX_TTL_DAYS = int(os.getenv("MCP_DATA_TOKEN_MAX_TTL_DAYS", "30"))
+if MCP_DATA_TOKEN_MAX_TTL_DAYS < 1:
+    raise ValueError("MCP_DATA_TOKEN_MAX_TTL_DAYS inválido: debe ser un entero >= 1.")
 
 # ======= Startup validation ======= #
 # La cuenta del MCP se interpola (quoteada) en CREATE USER / GRANT al aprovisionar. Se valida acá
