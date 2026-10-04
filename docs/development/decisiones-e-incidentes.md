@@ -2210,3 +2210,37 @@ Importa la distinción porque cambia el remedio: no hay nada que arreglar en el 
 ni en el WSL. Quien necesite actualizar `.env.example` afloja esa regla (o lo edita a mano) y
 listo. Documentarlo como límite del entorno mandó a dos personas a buscar un problema que no
 existía.
+
+## MCP: lecturas de datos del agente (D10, D11, D12, D17)
+
+Cambio `mcp-readonly-query-execution`, entrega 5 (`sample_rows`, `distinct_values`, `count_rows`).
+
+**D10 — timeout: sesión + cuenta + vigilante.** El timeout se fija del lado del servidor
+(`max_execution_time` MySQL, `max_statement_time` MariaDB, `statement_timeout` PostgreSQL) y un
+`threading.Timer` (timeout + 2 s, acotado por `MCP_SESSION_MAX_SECONDS`) abre una segunda conexión con
+la misma credencial y ejecuta `KILL QUERY` / `pg_cancel_backend`. Existe porque el límite de sesión es
+de mejor esfuerzo y porque el timeout de SOCKET del cliente vence primero que el del servidor en
+algunos casos (`2013`): cerrar el socket no detiene un `SELECT`. Por eso, si el cliente se rindió por
+socket, el servicio mata la sentencia en el acto (`kill_now`) en vez de confiar en el `Timer`, que ya
+se canceló. `2013`/`2006` cuentan como `QUERY_TIMEOUT` solo si pasó ≥90 % del presupuesto.
+**No verificado contra un motor real** (`tests/test_agent_query_e2e.py` está escrito, no ejecutado).
+
+**D11 — respuesta grande: se recortan filas.** Presupuesto de 128 KiB sobre el bloque de filas
+(fila por fila, separador `", "` como el despacho). El tope duro del despacho (512 KiB) queda como red.
+Peor caso: el sobre viaja dos veces (`structuredContent` + `content[0].text` escapado), hasta ~3×; por
+eso el import afirma `MCP_DATA_MAX_RESULT_BYTES <= MAX_RESULT_BYTES // 2`.
+
+**D12 — excepción del catálogo.** `data.read`/`data.query` son la única excepción cerrada a «un token no
+divulga». En el registro, el invariante 6 exige a toda tool con scope de datos: abrir el motor, tag
+`data` y descripción que diga «contenido no confiable de terceros»; y el tag `data` no cuelga de otro
+scope.
+
+**D17 — configuración sobre el techo: se recorta, no se levanta.** `MCP_QUERY_MAX_ROWS` > 500 → 500,
+`MCP_QUERY_TIMEOUT_MS` > 30000 → 30000, default ≤ máximo; un aviso por recorte. Cero/negativo/no entero
+sí impide arrancar (`0` en un timeout sería «sin límite»). Costo: un despliegue mal configurado arranca
+con otro valor del pedido; el aviso es lo único que lo delata.
+
+**Frescura de la sonda al leer.** `_assert_data_credential_open` usa `data_probe_is_fresh` (fecha
+futura = no fresca) en el gate y otra vez en `_data_target`, justo antes de descifrar. Orden real del
+gate: el de estructura (scope, proyecto, entorno, opt-in de estructura) corre antes que los ejes de
+datos; el kill switch de datos se mira primero de todos en las tools.

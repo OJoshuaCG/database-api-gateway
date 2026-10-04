@@ -535,6 +535,36 @@ El `detail` de un rechazo dice el motivo (`rechazo=inexistente|hmac|revocado|exp
 
 ---
 
+## MCP data tools: leer filas con topes
+
+`sample_rows`, `distinct_values` y `count_rows` (scope `data.read`) leen **filas** de una base.
+Existen solo con `MCP_DATA_READ_ENABLED=true` (apagado por default, se reinicia para cambiarlo) y se
+re-chequean en cada llamada. Reciben **nombres** (tabla, columnas), nunca SQL: el gateway arma la
+sentencia, valida los nombres contra el catálogo y la pasa por el validador de agentes.
+
+En cada llamada, en este orden: kill switch → scope `data.read` → base del proyecto y entorno que
+admite agentes → opt-in de datos aprobado → credencial de datos de esa base con sonda **verde de
+los últimos `MCP_DATA_CREDENTIAL_MAX_AGE_DAYS` días** (si no, `PROBE_NOT_GREEN` y no se conecta).
+Un nombre que no está en el catálogo es `UNKNOWN_IDENTIFIER` y la cuenta de datos no conecta.
+
+| Tope | Valor | Configuración |
+|---|---|---|
+| Filas | 100 por defecto, 200 por llamada, techo absoluto 500 | `MCP_QUERY_DEFAULT_ROWS`, `MCP_QUERY_MAX_ROWS` |
+| Tiempo | 20 s por defecto, techo 30 s, del lado del servidor del motor + `KILL` de respaldo | `MCP_QUERY_TIMEOUT_MS` |
+| Respuesta | 128 KiB; se recortan filas (`truncated: true`), no falla | `MCP_DATA_MAX_RESULT_BYTES` |
+| Celda | 512 caracteres | fijo |
+
+Un `limit` por encima del máximo se **recorta** y la respuesta trae `warnings: ["LIMIT_TOO_HIGH"]`;
+un valor de configuración por encima del techo se recorta al arrancar con un aviso. Las filas
+vuelven como arreglos en `data.rows`, marcadas en `untrusted_fields`: son texto de terceros, no
+instrucciones. Si hay más datos, `human_query` trae el texto para que una persona lo corra; el MCP no
+exporta ni pagina. Errores solo con códigos cerrados (`QUERY_TIMEOUT`, `QUERY_FAILED`,
+`AUDIT_UNAVAILABLE`, `DATA_DISABLED`, `PROBE_NOT_GREEN`, `UNKNOWN_IDENTIFIER`, `MALFORMED_REQUEST`);
+nunca texto del motor. Cada ejecución se audita *antes* (si la auditoría cae, no se ejecuta) y
+*después* con hash, filas y duración.
+
+---
+
 ## Cuando alguien se va del equipo
 
 1. **Revocar sus tokens** (B.4). El acceso corta en el request siguiente, sin caché. Desactivar
