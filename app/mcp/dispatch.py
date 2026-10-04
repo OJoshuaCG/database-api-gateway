@@ -291,7 +291,10 @@ def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Resp
         actor,
         ok=True,
         detail=f"{len(serializado)} bytes",
-        touched_engine=spec.touches_engine,
+        # ``run_select`` devuelve el sobre del borrador (``touches_engine: false``) cuando rechaza o
+        # clasifica sin ejecutar: la fila no puede decir que se tocó el motor si no se conectó.
+        touched_engine=spec.touches_engine
+        and not (isinstance(resultado, dict) and resultado.get("touches_engine") is False),
     )
     return _ok(rid, payload_tool)
 

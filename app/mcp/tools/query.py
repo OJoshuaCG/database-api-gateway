@@ -1,7 +1,7 @@
 """
-Tools que reciben SQL de un agente (``draft_query``, que **no ejecuta nada**) y las tres lecturas de
-DATOS parametrizadas (``sample_rows``, ``distinct_values``, ``count_rows``), que ejecutan sin recibir
-SQL.
+Tools que reciben SQL de un agente (``draft_query``, que **no ejecuta nada**, y ``run_select``, que
+ejecuta SOLO lecturas validadas) y las tres lecturas de DATOS parametrizadas (``sample_rows``,
+``distinct_values``, ``count_rows``), que ejecutan sin recibir SQL.
 
 ``draft_query`` existe para que un agente pueda redactar una consulta (o una escritura que un
 humano va a revisar) y saber, antes de molestar a nadie, qué clase de sentencia es y por qué no
@@ -9,18 +9,22 @@ sería una lectura aceptable. La respuesta es TEXTO: ``{classification, reasons,
 query_text, touches_engine}`` con ``touches_engine`` siempre en ``false``. No abre una conexión al
 motor, ni siquiera para una lectura: ejecutar es otra tool, con otro scope y otras garantías.
 
-POR QUÉ ACEPTAR SQL DEL AGENTE NO ROMPE EL INVARIANTE DEL PAQUETE
------------------------------------------------------------------
-El invariante es "el MCP nunca EJECUTA SQL del agente", no "nunca lo lee". Lo que importa es que
-ningún camino llegue al motor con ese texto, y eso lo sostienen dos cosas independientes: este
-handler no tiene a dónde mandarlo (``ctx.draft_query`` no entrega ni credencial ni façade) y el
-guard de importaciones (``tests/test_mcp_import_guard.py``) impide que este paquete alcance la capa
-de motor. El validador vive en ``app/services/db_admin/agent_sql_policy.py`` y se invoca por la
-puerta de siempre: tool -> ``ToolContext`` -> ``target_resolution`` -> servicio.
+EL INVARIANTE DEL PAQUETE (fase 2): SQL DE AGENTE SOLO SE EJECUTA SI ES UN SELECT VALIDADO
+------------------------------------------------------------------------------------------
+Hasta la fase 1 el invariante era "el MCP nunca EJECUTA SQL del agente". ``run_select`` lo reemplaza
+por: el MCP ejecuta únicamente ``SELECT`` únicos que pasaron el validador compartido
+(``agent_sql_policy.validate_agent_select``), dentro de una transacción READ ONLY y bajo la
+credencial por base con ``SELECT`` solamente. El control REAL es el motor (esa cuenta y esa
+transacción); el validador es defensa en profundidad. Lo que no es una lectura aceptada vuelve como
+el sobre del borrador y no llega al motor. Este handler sigue sin tener a dónde mandar el texto:
+``ctx.run_select`` solo entrega el sobre ya armado, y el guard de importaciones
+(``tests/test_mcp_import_guard.py``) impide que este paquete alcance la capa de motor. El validador
+vive en ``app/services/db_admin/agent_sql_policy.py`` y se invoca por la puerta de siempre: tool ->
+``ToolContext`` -> ``target_resolution`` -> servicio.
 
 Todo input devuelve un sobre, también el basura, el vacío y el enorme: un agente que recibiera un
-error de protocolo por un SQL mal escrito reintentaría en loop. Solo un ``database_id`` o un
-``sql`` que no sean del tipo declarado se rechazan como argumento inválido.
+error de protocolo por un SQL mal escrito reintentaría en loop. Solo un ``database_id``, un ``sql`` o
+un ``limit`` que no sean del tipo declarado se rechazan como argumento inválido.
 """
 
 from app.exceptions import AppHttpException
@@ -65,7 +69,8 @@ def draft_query(ctx: ToolContext, params: dict) -> dict:
 # exitosa no consigue ninguna acción, solo texto. El día que una tool de datos pueda mutar, este
 # análisis se reabre antes de mergear, no después.
 #
-# Reciben identificadores (tabla, columnas), NUNCA SQL: el gateway arma la sentencia.
+# Las tres reciben identificadores (tabla, columnas), NUNCA SQL: el gateway arma la sentencia.
+# ``run_select`` recibe SQL del agente, y le aplica el MISMO validador, gate y servicio.
 
 
 def _database_id(params: dict) -> int:
@@ -120,3 +125,18 @@ def count_rows(ctx: ToolContext, params: dict) -> dict:
     """Cantidad de filas de una tabla (acotada por el timeout del motor)."""
     database_id = _database_id(params)
     return ctx.count_rows(database_id, _name(params, "table"))
+
+
+def run_select(ctx: ToolContext, params: dict) -> dict:
+    """
+    Ejecuta un ``SELECT`` del agente si pasa el validador; si no, devuelve el sobre del borrador.
+
+    ``limit`` ausente = el predeterminado del gateway; solo puede igualar o bajar el tope, nunca
+    subirlo (por encima del máximo se recorta y se avisa). Un ``sql`` que no es una lectura aceptable
+    no es un error: es un sobre con ``classification``, ``reasons`` y ``touches_engine: false``.
+    """
+    database_id = _database_id(params)
+    sql = params.get("sql")
+    if not isinstance(sql, str):
+        raise _malformed("'sql' tiene que ser una cadena de texto.")
+    return ctx.run_select(database_id, sql, _limit(params))

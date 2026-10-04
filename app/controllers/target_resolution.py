@@ -742,6 +742,74 @@ def count_rows_query(actor: Actor, database_id: int, table: str, capability: Cap
     )
 
 
+# --------------------------------------------------------------------------- #
+# run_select: SQL libre de SOLO LECTURA, mismo gate, mismo servicio, mismo validador #
+# --------------------------------------------------------------------------- #
+
+
+def run_agent_select_query(
+    actor: Actor, database_id: int, sql: str, limit, capability: Capability
+) -> dict:
+    """
+    ``run_select``: ejecuta un ``SELECT`` redactado por el agente, o devuelve un borrador.
+
+    NO es un camino nuevo hacia el motor: es el MISMO gate de datos (``_data_gate``: kill switch
+    ``MCP_DATA_QUERY_ENABLED`` -> scope ``data.query`` -> proyecto/entorno -> credencial de datos con
+    sonda fresca -> opt-in aprobado), el MISMO validador (``validate_agent_select``) y el MISMO
+    servicio (``run_agent_select``) que las tres tools parametrizadas; solo cambia quién escribió el
+    texto. Orden, y cada paso corta el siguiente:
+
+    1. gate de datos (el kill switch se mira primero y en cada llamada);
+    2. ``limit`` (ausente = ``MCP_QUERY_DEFAULT_ROWS``; por encima del máximo se recorta con
+       ``LIMIT_TOO_HIGH``): solo BAJA o iguala el tope del gateway, nunca lo sube;
+    3. ``validate_agent_select`` sobre el texto del agente;
+    4. **todo lo que no es una lectura aceptada** (write, ddl, blocked, invalid: un ``DELETE``, un
+       ``SELECT ... INTO OUTFILE``, un ``OFFSET`` enorme, un literal ilegible) vuelve como el SOBRE
+       DEL BORRADOR (``classification``, ``reasons``, ``warnings``, ``query_text``,
+       ``touches_engine: false``) y TERMINA ACÁ: no se descifra la credencial de datos, no hay
+       conexión ni intención de auditoría de ejecución (S23, S25). Un rechazo no es un error de
+       protocolo: un agente que lo recibiera reintentaría en loop;
+    5. lectura aceptada: ``run_agent_select`` ejecuta ``verdict.executed_sql`` (el render de
+       sqlglot del árbol ya verificado, jamás el texto crudo del agente: un ``LIMIT`` propio
+       ``<= tope`` tal cual, o el tope + 1 empujado), con ``record_intent`` antes de conectar.
+
+    Los imports son perezosos por el guard de ``tests/test_mcp_import_guard.py``.
+    """
+    from app.core import environments as env
+    from app.services.db_admin import agent_query as aq
+    from app.services.db_admin import agent_sql_policy as policy
+
+    resuelta = _data_gate(actor, database_id, capability)
+    max_rows, warnings = aq.effective_limit(limit)
+
+    verdict = policy.validate_agent_select(
+        sql,
+        engine=resuelta.database.engine,
+        database=resuelta.database.database,
+        max_rows=max_rows,
+        max_offset=env.MCP_QUERY_MAX_OFFSET,
+        max_bytes=env.MCP_QUERY_MAX_SQL_BYTES,
+    )
+    if not verdict.accepted or verdict.executed_sql is None or verdict.row_bound is None:
+        return policy.build_draft_envelope(verdict, sql, max_bytes=env.MCP_QUERY_MAX_SQL_BYTES)
+
+    target, credential = _data_target(resuelta)
+    return aq.run_agent_select(
+        aq.AuditContext(
+            actor=actor,
+            tool="run_select",
+            database_id=resuelta.database.database_id,
+            server_id=resuelta.database.server_id,
+        ),
+        resolved=resuelta.database,
+        target=target,
+        credential=credential,
+        verdict=verdict,
+        max_rows=max_rows,
+        warnings=warnings,
+    )
+
+
 def structural_changes(source, target) -> tuple[list[dict], bool]:
     """
     El diff de dos snapshots, PROYECTADO a lo que puede ver un agente: ``(cambios, cross_flavor)``.

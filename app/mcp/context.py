@@ -100,6 +100,17 @@ class ToolContext:
 
         return distinct_values_query(self.actor, database_id, table, column, limit, self.capability)
 
+    def run_select(self, database_id: int, sql: str, limit: int | None) -> dict:
+        """
+        Ejecuta el ``SELECT`` de un agente SOLO si pasa el validador compartido, dentro de una
+        transacción READ ONLY y con la credencial de DATOS de la base. Cualquier otra cosa (write,
+        ddl, bloqueado, ilegible) vuelve como el sobre del borrador, sin conexión. El handler no ve
+        credencial, target ni conexión: sale el sobre ya armado.
+        """
+        from app.controllers.target_resolution import run_agent_select_query
+
+        return run_agent_select_query(self.actor, database_id, sql, limit, self.capability)
+
     def count_rows(self, database_id: int, table: str) -> dict:
         """``COUNT(*)`` de una tabla del catálogo. Mismo camino y garantías que ``sample_rows``."""
         from app.controllers.target_resolution import count_rows_query
