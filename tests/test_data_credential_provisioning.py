@@ -568,3 +568,64 @@ def test_clear_cuts_access_first_and_keeps_the_row_when_the_engine_fails(admin_c
     motor.fail_revoke = False
     assert admin_client.delete(CLEAR.format(db=db_id)).status_code == 200
     assert _row(db_id) is None and motor.revoked == [(f"mcp_d_{db_id}", "%", "app_prod")]
+
+
+# --------------------------------------------------------------------------- #
+# Borrar la base del inventario no deja una cuenta de datos huérfana           #
+# --------------------------------------------------------------------------- #
+
+DELETE_DB = "/api/v1/managed-databases/{db}"
+
+
+def _database_exists(db_id) -> bool:
+    s = Database().get_declarative_base_session()
+    try:
+        return s.get(ManagedDatabase, db_id) is not None
+    finally:
+        s.close()
+
+
+def test_deleting_a_database_revokes_its_data_account_before_the_row_goes(admin_client, motor):
+    """Sin esto el CASCADE se lleva la fila y la cuenta queda viva con SELECT en el motor."""
+    db_id = _database(admin_client)
+    assert admin_client.post(PROVISION.format(db=db_id)).status_code == 200
+
+    r = admin_client.delete(DELETE_DB.format(db=db_id))
+
+    assert r.status_code == 200, r.text
+    assert motor.revoked == [(f"mcp_d_{db_id}", "%", "app_prod")]
+    assert not _database_exists(db_id)
+    assert _row(db_id) is None
+    assert ("managed_database.data_credential.clear", "success") in _audit_rows()
+
+
+def test_deleting_a_database_without_a_data_credential_does_not_touch_the_engine(
+    admin_client, motor
+):
+    db_id = _database(admin_client)
+
+    r = admin_client.delete(DELETE_DB.format(db=db_id))
+
+    assert r.status_code == 200, r.text
+    assert motor.revoked == [] and motor.events == []
+    assert not _database_exists(db_id)
+    assert _audit_rows() == []  # ni siquiera un rastro de "clear" que nadie pidió
+
+
+def test_the_delete_is_aborted_and_retryable_when_the_engine_cannot_revoke(admin_client, motor):
+    db_id = _database(admin_client)
+    assert admin_client.post(PROVISION.format(db=db_id)).status_code == 200
+    _set_opt_in(db_id)
+
+    motor.fail_revoke = True
+    assert admin_client.delete(DELETE_DB.format(db=db_id)).status_code == 502
+
+    # La base sigue en el inventario y la credencial quedó cortada: el reintento puede revocar.
+    assert _database_exists(db_id)
+    row = _row(db_id)
+    assert row is not None and row.verified_at is None and row.data_access_allowed is False
+
+    motor.fail_revoke = False
+    assert admin_client.delete(DELETE_DB.format(db=db_id)).status_code == 200
+    assert not _database_exists(db_id) and _row(db_id) is None
+    assert motor.revoked == [(f"mcp_d_{db_id}", "%", "app_prod")]

@@ -1763,6 +1763,7 @@ class ManagedDatabaseController:
             server = get_server_or_404(session, md.server_id)
             db_name, server_id = md.name, md.server_id
             target = build_target(server) if drop_remote else None
+            has_data_credential = self._data_credential_row(session, db_id) is not None
         finally:
             session.close()
 
@@ -1778,6 +1779,17 @@ class ManagedDatabaseController:
                     status_code=422,
                     context={"managed_database_id": db_id, "required": "confirm_name == name"},
                 )
+
+        # La cuenta de datos del MCP se revoca ANTES de cualquier borrado. Si no, el CASCADE de la
+        # fila de credencial se llevaría el usuario y la contraseña cifrada y la cuenta quedaría
+        # viva en el motor con SELECT sobre una base que puede recrearse con el mismo nombre; en
+        # PostgreSQL además hace falta la base viva para revocar. Si el motor no contesta, el
+        # borrado se aborta (la credencial ya quedó des-verificada y con el acceso cerrado) y el
+        # reintento la revoca. Sin credencial no se toca el motor ni se deja rastro de más.
+        if has_data_credential:
+            self.clear_data_credential(db_id, admin=admin)
+
+        if drop_remote:
             # Auditar la INTENCIÓN antes de la acción irreversible (queda traza aunque
             # el proceso muera entre el DROP y el registro del resultado).
             audit.record(
