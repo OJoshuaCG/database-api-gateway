@@ -2174,6 +2174,15 @@ Entrega 4 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference-v36
 - **Dos vallas más contra el token de larga vida.** TTL de datos de 30 días (en el PATCH cuenta la vida
   restante) y la intersección existente con las capacidades del emisor: un emisor viewer no delega
   `data.read` aunque el string lo diga.
+- **El tope propio de vida del token de datos es opcional y nace desactivado.** La valla de 30 días
+  de arriba pasó a ser configurable: `MCP_DATA_TOKEN_MAX_TTL_DAYS=0` (por defecto) la apaga y el
+  token de datos vive lo mismo que cualquiera, hasta `MCP_TOKEN_MAX_TTL_DAYS`; un valor >= 1 la
+  vuelve a encender. Se decidió así a pedido del operador, porque 30 días obligaba a reemitir tokens
+  de datos con demasiada frecuencia. Sigue habiendo cuatro barreras: la intersección con las
+  capacidades del emisor, el opt-in aprobado por base, la sonda vigente y el interruptor general.
+  Lo que se pierde es la vida corta como mitigación de una filtración del bearer; quien la quiera
+  vuelve a poner un número. No hay tokens perpetuos: el tope general se mantiene. El frontend no
+  lleva el número fijo: si el backend lo fija, el 422 `ttl_too_long` trae `max_days`.
 - **Kill switch por capacidad, leído en cada llamada, y scope inerte en vez de borrado.** `parse_scopes`
   descarta el scope de datos con su switch apagado (nacen apagados); `parse_stored_scopes` lo
   conserva solo para mostrar y editar. Si el listado ocultara lo guardado, un PATCH de la SPA lo

@@ -19,7 +19,8 @@ estos scopes son inertes aunque se otorguen.
 
 `DataCredentialOut` gana `data_access_state` (`closed` / `pending` / `open`) y
 `data_access_second_approver_required` (aditivo, con default). Variables nuevas:
-`MCP_DATA_READ_ENABLED=false`, `MCP_DATA_QUERY_ENABLED=false`, `MCP_DATA_TOKEN_MAX_TTL_DAYS=30`.
+`MCP_DATA_READ_ENABLED=false`, `MCP_DATA_QUERY_ENABLED=false`, `MCP_DATA_TOKEN_MAX_TTL_DAYS=0`
+(0 = sin tope propio de vida para los tokens de datos).
 
 ## Catálogo: `data.read` y `data.query`
 
@@ -35,9 +36,11 @@ estos scopes son inertes aunque se otorguen.
   `access.step_up_required` si la ventana venció. El token no tiene contraseña; la da quien lo emite.
 - Rastro `api_token.data_scope_grant` con `record_intent` **fail-closed** (500 y no se otorga si el
   rastro no se persiste).
-- Vida máxima `MCP_DATA_TOKEN_MAX_TTL_DAYS` (30): 422 `api_token.ttl_too_long` con `max_days`. En el
-  PATCH cuenta la vida **restante** del token. Sin `expires_in_days` el default (90) excede el tope y
-  también da 422: hay que pedir el TTL explícito.
+- Vida de un token con scope de datos: por defecto **sin tope propio** (`MCP_DATA_TOKEN_MAX_TTL_DAYS=0`),
+  o sea que rige solo el tope general `MCP_TOKEN_MAX_TTL_DAYS` (90) y siguen sin existir tokens
+  perpetuos. Con `MCP_DATA_TOKEN_MAX_TTL_DAYS` >= 1 el tope propio vuelve: 422
+  `api_token.ttl_too_long` con `max_days`; en el PATCH cuenta la vida **restante** del token, y sin
+  `expires_in_days` el default (90) lo excede y también da 422 (hay que pedir el TTL explícito).
 - Con el kill switch de la capacidad apagado el scope se **guarda y se lista** pero el token no lo
   ejerce (inerte). `GET /api-tokens` lo muestra igual para que un PATCH no lo pierda.
 
@@ -65,7 +68,7 @@ Sin cuerpo en los tres. Capa 2 sobre la base: hace falta `data.read` EN su entor
 | `data_access.already_open` | 409 | `request` con el acceso ya abierto |
 | `data_access.identity_required` | 403 | El actor no es un usuario del gateway (fail-closed) |
 | `data_credential.missing` | 409 | La base no tiene credencial de datos |
-| `api_token.ttl_too_long` | 422 | Token con scope de datos que excede `MCP_DATA_TOKEN_MAX_TTL_DAYS` |
+| `api_token.ttl_too_long` | 422 | Token que excede `MCP_TOKEN_MAX_TTL_DAYS`, o con scope de datos que excede `MCP_DATA_TOKEN_MAX_TTL_DAYS` (solo si es >= 1) |
 | `access.step_up_required` | 403 | Falta la confirmación de contraseña |
 
 Los de `data_access.*` viven en `app/services/data_credential_catalog.py`.

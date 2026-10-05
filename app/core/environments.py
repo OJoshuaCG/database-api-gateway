@@ -508,11 +508,16 @@ MCP_DATA_CREDENTIAL_MAX_AGE_DAYS = int(os.getenv("MCP_DATA_CREDENTIAL_MAX_AGE_DA
 # Un token con scope de datos emitido antes no hace nada hasta que alguien los encienda a propósito.
 MCP_DATA_READ_ENABLED = os.getenv("MCP_DATA_READ_ENABLED", "false").lower() == "true"
 MCP_DATA_QUERY_ENABLED = os.getenv("MCP_DATA_QUERY_ENABLED", "false").lower() == "true"
-# Vida máxima, en días, de un token con scope de datos (más corta que `MCP_TOKEN_MAX_TTL_DAYS`):
-# un bearer que lee filas de un tercero no debería vivir meses en el repo de otra gente. Entero >= 1.
-MCP_DATA_TOKEN_MAX_TTL_DAYS = int(os.getenv("MCP_DATA_TOKEN_MAX_TTL_DAYS", "30"))
-if MCP_DATA_TOKEN_MAX_TTL_DAYS < 1:
-    raise ValueError("MCP_DATA_TOKEN_MAX_TTL_DAYS inválido: debe ser un entero >= 1.")
+# Tope PROPIO, en días, de la vida de un token con scope de datos. `0` (el valor por defecto) lo
+# desactiva: el token vive lo mismo que cualquiera, hasta `MCP_TOKEN_MAX_TTL_DAYS`. Un valor >= 1
+# lo vuelve a activar y debe ser menor que ese tope general para tener efecto: un bearer que lee
+# filas de un tercero y se filtra es más dañino cuanto más vive, así que quien quiera limitarlo lo
+# hace poniendo un número acá. Entero >= 0.
+MCP_DATA_TOKEN_MAX_TTL_DAYS = int(os.getenv("MCP_DATA_TOKEN_MAX_TTL_DAYS", "0"))
+if MCP_DATA_TOKEN_MAX_TTL_DAYS < 0:
+    raise ValueError(
+        "MCP_DATA_TOKEN_MAX_TTL_DAYS inválido: debe ser un entero >= 0 (0 = sin tope propio)."
+    )
 
 # ---- Lecturas de datos del agente: topes de filas, tiempo, tamaño ---------------------------- #
 # TECHOS ABSOLUTOS: ninguna configuración los supera. Un valor por encima se RECORTA al techo al

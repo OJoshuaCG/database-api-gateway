@@ -145,6 +145,18 @@ def _has_data_scope(scopes: list[str]) -> bool:
     return any(Capability(v) in AGENT_DATA_EXCEPTIONS for v in scopes)
 
 
+def _data_token_ttl_cap_is_active() -> bool:
+    """
+    ¿Rige el tope PROPIO de vida de los tokens de datos?
+
+    `MCP_DATA_TOKEN_MAX_TTL_DAYS=0` (el valor por defecto) lo desactiva: un token con scope de
+    datos vive entonces lo mismo que cualquiera, hasta `MCP_TOKEN_MAX_TTL_DAYS`. Se lee del módulo
+    en cada llamada, no se cachea, para que un cambio de configuración en un test o al arrancar se
+    vea en la siguiente emisión o edición.
+    """
+    return MCP_DATA_TOKEN_MAX_TTL_DAYS > 0
+
+
 def _ttl_too_long_for_data(dias: int) -> AppHttpException:
     return AppHttpException(
         message=(
@@ -241,8 +253,9 @@ class ApiTokenController:
         validos = _validate_scopes(
             data.get("scopes") or [Capability.BLUEPRINTS_READ.value], admin=admin
         )
-        if _has_data_scope(validos) and dias > MCP_DATA_TOKEN_MAX_TTL_DAYS:
-            raise _ttl_too_long_for_data(dias)
+        if _data_token_ttl_cap_is_active() and _has_data_scope(validos):
+            if dias > MCP_DATA_TOKEN_MAX_TTL_DAYS:
+                raise _ttl_too_long_for_data(dias)
 
         token_id, secreto, bearer = mint()
         admin_id, _ = identity_of(admin)
@@ -364,12 +377,13 @@ class ApiTokenController:
             # Los EFECTIVOS de antes, igual que los muestra `_serialize`, para que el rastro diga
             # lo que el token podía hacer y no un string crudo de la fila.
             antes = sorted(c.value for c in parse_stored_scopes(fila.scopes))
-            if _has_data_scope(validos) and fila.expires_at > _utcnow() + timedelta(
-                days=MCP_DATA_TOKEN_MAX_TTL_DAYS
-            ):
-                # La vida restante cuenta: agregar datos a un token de 90 días lo dejaría leyendo
-                # filas 90 días. Hay que emitir otro (o esperar a que le queden <= el tope).
-                raise _ttl_too_long_for_data(0)
+            if _data_token_ttl_cap_is_active() and _has_data_scope(validos):
+                latest_allowed_expiry = _utcnow() + timedelta(days=MCP_DATA_TOKEN_MAX_TTL_DAYS)
+                if fila.expires_at > latest_allowed_expiry:
+                    # La vida restante cuenta: agregar datos a un token de 90 días lo dejaría
+                    # leyendo filas 90 días. Hay que emitir otro (o esperar a que le queden <=
+                    # el tope).
+                    raise _ttl_too_long_for_data(0)
             fila.scopes = ",".join(validos)
             session.commit()
             session.refresh(fila)

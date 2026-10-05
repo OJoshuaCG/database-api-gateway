@@ -7,8 +7,10 @@ LO QUE SE FIJA
   ``api_token.data_scope_grant`` con ``record_intent`` fail-closed. Los scopes sin datos no tocan
   ``admin`` (los llamadores existentes siguen andando).
 - Un ``admin`` que no es un ``Actor`` (dict legado) o es un token de agente falla CERRADO.
-- TTL: un token con scope de datos vive como máximo ``MCP_DATA_TOKEN_MAX_TTL_DAYS`` desde el alta
-  y desde el PATCH (la vida restante cuenta).
+- TTL: con ``MCP_DATA_TOKEN_MAX_TTL_DAYS`` >= 1 un token con scope de datos vive como máximo ese
+  tope desde el alta y desde el PATCH (la vida restante cuenta). Con 0, el valor por defecto, no
+  hay tope propio y rige solo ``MCP_TOKEN_MAX_TTL_DAYS``. Cada test fija el tope que prueba con
+  ``monkeypatch`` sobre el controlador y no depende de lo que traiga el entorno.
 - Con el kill switch apagado el scope se guarda y se muestra, pero el token no lo ejerce
   (``token_actor``): inerte, no borrado.
 """
@@ -29,6 +31,9 @@ from tests.step_up_helpers import OPEN_WINDOW
 from tests.test_mcp_server import _crear_token, _proyecto, mcp_on  # noqa: F401
 
 DATOS = ["blueprints.read", "databases.read", "data.read"]
+
+# Tope propio de vida que se activa en los tests del tope (el valor por defecto de producción es 0).
+TOPE_DE_DATOS_ACTIVO_EN_DIAS = 30
 
 
 def _emisor(*, fresco: bool):
@@ -152,25 +157,54 @@ def test_create_token_with_a_failing_audit_creates_nothing(admin_client, monkeyp
 # --------------------------------------------------------------------------- #
 
 
-def test_create_with_data_scope_succeeds_within_the_data_ttl(admin_client):
+def test_create_with_data_scope_succeeds_within_the_data_ttl(admin_client, monkeypatch):
+    monkeypatch.setattr(atc, "MCP_DATA_TOKEN_MAX_TTL_DAYS", TOPE_DE_DATOS_ACTIVO_EN_DIAS)
     pid = _proyecto(admin_client)
-    r = _post(admin_client, pid, scopes=DATOS, expires_in_days=environments.MCP_DATA_TOKEN_MAX_TTL_DAYS)
+    r = _post(admin_client, pid, scopes=DATOS, expires_in_days=TOPE_DE_DATOS_ACTIVO_EN_DIAS)
     assert r.status_code == 201, r.text
     # Con el switch apagado el scope se guarda y se muestra (inerte), no se descarta.
     assert "data.read" in r.json()["data"]["scopes"]
     assert _filas("api_token.data_scope_grant")
 
 
-def test_create_with_data_scope_and_a_longer_ttl_is_refused(admin_client):
+def test_create_with_data_scope_and_a_longer_ttl_is_refused(admin_client, monkeypatch):
+    monkeypatch.setattr(atc, "MCP_DATA_TOKEN_MAX_TTL_DAYS", TOPE_DE_DATOS_ACTIVO_EN_DIAS)
     pid = _proyecto(admin_client)
     r = _post(
         admin_client, pid, scopes=DATOS,
-        expires_in_days=environments.MCP_DATA_TOKEN_MAX_TTL_DAYS + 1,
+        expires_in_days=TOPE_DE_DATOS_ACTIVO_EN_DIAS + 1,
     )
     assert r.status_code == 422, r.text
     ctx = r.json()["detail"]["public_context"]
     assert ctx["code"] == "api_token.ttl_too_long"
-    assert ctx["max_days"] == environments.MCP_DATA_TOKEN_MAX_TTL_DAYS
+    assert ctx["max_days"] == TOPE_DE_DATOS_ACTIVO_EN_DIAS
+
+
+def test_create_with_data_scope_and_the_general_max_ttl_works_when_the_data_cap_is_off(
+    admin_client, monkeypatch
+):
+    """Con ``MCP_DATA_TOKEN_MAX_TTL_DAYS=0`` un token de datos puede vivir el tope general."""
+    monkeypatch.setattr(atc, "MCP_DATA_TOKEN_MAX_TTL_DAYS", 0)
+    pid = _proyecto(admin_client)
+    r = _post(admin_client, pid, scopes=DATOS, expires_in_days=environments.MCP_TOKEN_MAX_TTL_DAYS)
+    assert r.status_code == 201, r.text
+    assert "data.read" in r.json()["data"]["scopes"]
+    assert _filas("api_token.data_scope_grant")
+
+
+def test_the_general_max_ttl_still_applies_to_a_data_token_when_the_data_cap_is_off(
+    admin_client, monkeypatch
+):
+    """Quitar el tope propio no habilita tokens perpetuos: el general sigue rigiendo."""
+    monkeypatch.setattr(atc, "MCP_DATA_TOKEN_MAX_TTL_DAYS", 0)
+    pid = _proyecto(admin_client)
+    r = _post(
+        admin_client, pid, scopes=DATOS, expires_in_days=environments.MCP_TOKEN_MAX_TTL_DAYS + 1
+    )
+    assert r.status_code == 422, r.text
+    ctx = r.json()["detail"]["public_context"]
+    assert ctx["code"] == "api_token.ttl_too_long"
+    assert ctx["max_days"] == environments.MCP_TOKEN_MAX_TTL_DAYS
 
 
 def test_create_without_data_scope_keeps_the_long_ttl(admin_client):
@@ -179,9 +213,10 @@ def test_create_without_data_scope_keeps_the_long_ttl(admin_client):
     assert r.status_code == 201, r.text
 
 
-def test_default_ttl_with_a_data_scope_is_refused_not_silently_clamped(admin_client):
-    """Sin ``expires_in_days`` el default es el tope general (90): excede el de datos."""
-    if environments.MCP_TOKEN_MAX_TTL_DAYS <= environments.MCP_DATA_TOKEN_MAX_TTL_DAYS:
+def test_default_ttl_with_a_data_scope_is_refused_not_silently_clamped(admin_client, monkeypatch):
+    """Sin ``expires_in_days`` el default es el tope general (90): excede el de datos activo."""
+    monkeypatch.setattr(atc, "MCP_DATA_TOKEN_MAX_TTL_DAYS", TOPE_DE_DATOS_ACTIVO_EN_DIAS)
+    if environments.MCP_TOKEN_MAX_TTL_DAYS <= TOPE_DE_DATOS_ACTIVO_EN_DIAS:
         pytest.skip("el tope general ya no excede al de datos")
     pid = _proyecto(admin_client)
     r = _post(admin_client, pid, scopes=DATOS)
@@ -189,7 +224,15 @@ def test_default_ttl_with_a_data_scope_is_refused_not_silently_clamped(admin_cli
     assert r.json()["detail"]["public_context"]["code"] == "api_token.ttl_too_long"
 
 
-def test_patch_adding_a_data_scope_to_a_long_lived_token_is_refused(admin_client):
+def test_default_ttl_with_a_data_scope_works_when_the_data_cap_is_off(admin_client, monkeypatch):
+    monkeypatch.setattr(atc, "MCP_DATA_TOKEN_MAX_TTL_DAYS", 0)
+    pid = _proyecto(admin_client)
+    r = _post(admin_client, pid, scopes=DATOS)
+    assert r.status_code == 201, r.text
+
+
+def test_patch_adding_a_data_scope_to_a_long_lived_token_is_refused(admin_client, monkeypatch):
+    monkeypatch.setattr(atc, "MCP_DATA_TOKEN_MAX_TTL_DAYS", TOPE_DE_DATOS_ACTIVO_EN_DIAS)
     pid = _proyecto(admin_client)
     datos = _crear_token(admin_client, project_id=pid, scopes=["blueprints.read"], expires_in_days=90)
     r = admin_client.patch(f"/api/v1/api-tokens/{datos['id']}", json={"scopes": DATOS})
@@ -198,7 +241,20 @@ def test_patch_adding_a_data_scope_to_a_long_lived_token_is_refused(admin_client
     assert "data.read" not in _fila_token(datos["id"]).scopes
 
 
-def test_patch_adding_a_data_scope_to_a_short_lived_token_works(admin_client):
+def test_patch_adding_a_data_scope_to_a_long_lived_token_works_when_the_data_cap_is_off(
+    admin_client, monkeypatch
+):
+    monkeypatch.setattr(atc, "MCP_DATA_TOKEN_MAX_TTL_DAYS", 0)
+    pid = _proyecto(admin_client)
+    datos = _crear_token(admin_client, project_id=pid, scopes=["blueprints.read"], expires_in_days=90)
+    r = admin_client.patch(f"/api/v1/api-tokens/{datos['id']}", json={"scopes": DATOS})
+    assert r.status_code == 200, r.text
+    assert "data.read" in r.json()["data"]["scopes"]
+    assert _filas("api_token.data_scope_grant")
+
+
+def test_patch_adding_a_data_scope_to_a_short_lived_token_works(admin_client, monkeypatch):
+    monkeypatch.setattr(atc, "MCP_DATA_TOKEN_MAX_TTL_DAYS", TOPE_DE_DATOS_ACTIVO_EN_DIAS)
     pid = _proyecto(admin_client)
     datos = _crear_token(admin_client, project_id=pid, scopes=["blueprints.read"], expires_in_days=7)
     r = admin_client.patch(f"/api/v1/api-tokens/{datos['id']}", json={"scopes": DATOS})
