@@ -157,6 +157,48 @@ def _data_token_ttl_cap_is_active() -> bool:
     return MCP_DATA_TOKEN_MAX_TTL_DAYS > 0
 
 
+def _require_editor_may_add_data_scopes(admin, fila: ApiToken, added: list[Capability]) -> None:
+    """
+    Agregar un scope de datos a un token YA emitido exige ser quien lo emitió o tener hoy ese
+    permiso.
+
+    Sin esta regla cualquier ``access.admin`` podía sumarle ``data.read``/``data.query`` al token
+    de otro. Como el token ejerce la INTERSECCIÓN con las capacidades de su emisor, si el emisor
+    las tiene (es ``owner``), el token ganaba lectura de filas por la decisión de un tercero, sin
+    que el emisor participara y sin el segundo aprobador que el catálogo pide cuando esos
+    permisos se otorgan sueltos. Si el emisor no las tiene, el scope quedaba inerte, así que ese
+    caso no cambia nada. Solo cuenta lo que se AGREGA: quitar un scope de datos, o editar los
+    demás permisos de un token que ya los traía, no exige nada nuevo.
+
+    El rastro ``api_token.data_scope_grant`` (intención) lo deja ``_validate_scopes`` antes de
+    mirar la fila, así que un intento denegado queda auditado como intento.
+    """
+    if not added:
+        return
+    from app.core.actor import identity_of  # import local: el módulo lo hace igual en create_token
+
+    editor_id, _ = identity_of(admin)
+    editor_is_the_original_issuer = (
+        editor_id is not None and editor_id == fila.created_by_admin_id
+    )
+    if editor_is_the_original_issuer:
+        return
+    capability_check = getattr(admin, "has", None)
+    editor_holds_every_added_scope = callable(capability_check) and all(
+        capability_check(capability) for capability in added
+    )
+    if editor_holds_every_added_scope:
+        return
+    raise AppHttpException(
+        message=(
+            "Solo quien emitió el token, o alguien que ya tenga ese permiso de datos, puede "
+            "agregárselo. Pedile a un owner que emita un token nuevo con ese permiso."
+        ),
+        status_code=403,
+        public_context={"code": CODE_FORBIDDEN},
+    )
+
+
 def _ttl_too_long_for_data(dias: int) -> AppHttpException:
     return AppHttpException(
         message=(
@@ -377,6 +419,19 @@ class ApiTokenController:
             # Los EFECTIVOS de antes, igual que los muestra `_serialize`, para que el rastro diga
             # lo que el token podía hacer y no un string crudo de la fila.
             antes = sorted(c.value for c in parse_stored_scopes(fila.scopes))
+            data_scopes_before = {
+                Capability(v) for v in antes if Capability(v) in AGENT_DATA_EXCEPTIONS
+            }
+            data_scopes_added = sorted(
+                (
+                    Capability(v)
+                    for v in validos
+                    if Capability(v) in AGENT_DATA_EXCEPTIONS
+                    and Capability(v) not in data_scopes_before
+                ),
+                key=lambda capability: capability.value,
+            )
+            _require_editor_may_add_data_scopes(admin, fila, data_scopes_added)
             if _data_token_ttl_cap_is_active() and _has_data_scope(validos):
                 latest_allowed_expiry = _utcnow() + timedelta(days=MCP_DATA_TOKEN_MAX_TTL_DAYS)
                 if fila.expires_at > latest_allowed_expiry:

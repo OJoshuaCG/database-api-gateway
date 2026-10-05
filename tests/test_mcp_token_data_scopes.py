@@ -328,3 +328,100 @@ def test_tools_list_for_a_token_follows_the_kill_switch(client, admin_client, mc
     assert {t.name for t in sin} <= {t.name for t in con}
     assert not any(t.scope in ("data.read", "data.query") for t in sin)
 
+
+# --------------------------------------------------------------------------- #
+# Quién puede AGREGAR un scope de datos a un token que ya existe               #
+# --------------------------------------------------------------------------- #
+
+
+def _editor(user_id: int, role: GatewayRole, *, step_up_fresco: bool = True):
+    return admin_actor(
+        user_id=user_id,
+        username=f"editor{user_id}",
+        role=role,
+        step_up_until=OPEN_WINDOW if step_up_fresco else None,
+    )
+
+
+def _token_ajeno(admin_client, monkeypatch, *, scopes):
+    """Un token emitido por el admin del fixture; devuelve (fila serializada, id de su emisor)."""
+    monkeypatch.setattr(atc, "MCP_DATA_TOKEN_MAX_TTL_DAYS", 0)  # el tope de vida no es el tema
+    pid = _proyecto(admin_client)
+    token = _crear_token(admin_client, project_id=pid, scopes=scopes, expires_in_days=7)
+    emisor = _fila_token(token["id"]).created_by_admin_id
+    assert emisor is not None
+    return token, emisor
+
+
+def _editar(token_pk, scopes, editor):
+    return atc.ApiTokenController().update_token(token_pk, {"scopes": scopes}, admin=editor)
+
+
+def test_an_editor_who_is_not_the_issuer_and_lacks_the_scope_cannot_add_it(
+    admin_client, monkeypatch
+):
+    token, emisor = _token_ajeno(admin_client, monkeypatch, scopes=["blueprints.read"])
+    ajeno_sin_el_permiso = _editor(emisor + 100, GatewayRole.OPERATOR)
+
+    with pytest.raises(AppHttpException) as exc:
+        _editar(token["id"], DATOS, ajeno_sin_el_permiso)
+
+    assert exc.value.status_code == 403 and _codigo(exc) == "access.forbidden"
+    assert "data.read" not in _fila_token(token["id"]).scopes
+
+
+def test_the_original_issuer_can_add_a_data_scope_to_its_own_token(admin_client, monkeypatch):
+    token, emisor = _token_ajeno(admin_client, monkeypatch, scopes=["blueprints.read"])
+
+    # Aunque hoy no tenga el permiso: el scope queda inerte (el token ejerce la intersección con
+    # lo que su emisor puede), así que permitirlo no le da a nadie nada que no tuviera.
+    salida = _editar(token["id"], DATOS, _editor(emisor, GatewayRole.OPERATOR))
+
+    assert "data.read" in salida["scopes"]
+
+
+def test_another_editor_who_already_holds_the_scope_can_add_it(admin_client, monkeypatch):
+    token, emisor = _token_ajeno(admin_client, monkeypatch, scopes=["blueprints.read"])
+
+    salida = _editar(token["id"], DATOS, _editor(emisor + 100, GatewayRole.OWNER))
+
+    assert "data.read" in salida["scopes"]
+
+
+def test_an_outsider_can_still_edit_the_non_data_scopes_of_a_token(admin_client, monkeypatch):
+    token, emisor = _token_ajeno(admin_client, monkeypatch, scopes=["blueprints.read"])
+    ajeno = _editor(emisor + 100, GatewayRole.OPERATOR, step_up_fresco=False)
+
+    salida = _editar(token["id"], ["blueprints.read", "databases.read"], ajeno)
+
+    assert set(salida["scopes"]) == {"blueprints.read", "databases.read"}
+
+
+def test_an_outsider_can_remove_a_data_scope_or_keep_one_the_token_already_had(
+    admin_client, monkeypatch
+):
+    """La regla mira lo que se AGREGA: quitar o conservar un scope de datos no exige nada nuevo."""
+    token, emisor = _token_ajeno(admin_client, monkeypatch, scopes=DATOS)
+    ajeno = _editor(emisor + 100, GatewayRole.OPERATOR)
+
+    conservado = _editar(token["id"], DATOS + ["catalogs.read"], ajeno)
+    assert "data.read" in conservado["scopes"] and "catalogs.read" in conservado["scopes"]
+
+    quitado = _editar(token["id"], ["blueprints.read", "databases.read"], ajeno)
+    assert "data.read" not in quitado["scopes"]
+
+
+def test_a_legacy_admin_without_capabilities_cannot_add_a_data_scope_either(
+    admin_client, monkeypatch
+):
+    """Un ``admin`` que no es un ``Actor`` (dict legado) no tiene ``has``: falla cerrado."""
+    token, emisor = _token_ajeno(admin_client, monkeypatch, scopes=["blueprints.read"])
+    fila = _fila_token(token["id"])
+
+    with pytest.raises(AppHttpException) as exc:
+        atc._require_editor_may_add_data_scopes(
+            {"id": emisor + 100, "username": "legado"}, fila, [Capability.DATA_READ]
+        )
+
+    assert exc.value.status_code == 403
+
