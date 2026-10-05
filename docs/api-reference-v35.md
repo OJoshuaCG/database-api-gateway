@@ -25,8 +25,10 @@ existente ni `ManagedDatabaseOut`.
   (`MCP_READONLY_ACCOUNT_HOST`), grants y contraseña los fija el servidor. Un cuerpo enviado se
   ignora.
 - **Alcance POR BASE:** MySQL/MariaDB `GRANT SELECT ON <base>.*` y nada más (sin `SHOW VIEW`,
-  `TRIGGER`, `EVENT` ni privilegios globales), con `MAX_USER_CONNECTIONS 3` (y `MAX_STATEMENT_TIME 30`
-  en MariaDB). PostgreSQL: rol `LOGIN` sin atributos de administración, `CONNECTION LIMIT 3`,
+  `TRIGGER`, `EVENT` ni privilegios globales), con `MAX_USER_CONNECTIONS 6` (cinco consultas más la
+  conexión del vigilante que cancela; una cuenta ya creada conserva su tope hasta regenerarla) y
+  `MAX_STATEMENT_TIME 30` en MariaDB. PostgreSQL: rol `LOGIN` sin atributos de administración,
+  `CONNECTION LIMIT 3`,
   `default_transaction_read_only = on`, `statement_timeout = '30s'`, `CONNECT` sobre la base y
   `USAGE` + `SELECT` por cada esquema de usuario. Una tabla creada después no queda cubierta hasta
   repetir el aprovisionamiento.

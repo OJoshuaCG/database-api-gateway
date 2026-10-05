@@ -36,7 +36,8 @@ solo puede igualar o bajar el máximo; por encima se recorta y `warnings` trae `
   `UNSUPPORTED_NODE`, `OFFSET_TOO_HIGH` (literal `> MCP_QUERY_MAX_OFFSET`), `LIMIT_NOT_BOUNDABLE`,
   `SQL_TOO_LARGE`. Advertencias: `WRITE_NOT_EXECUTED`, `DDL_NOT_EXECUTED`.
 - **Errores de tool** (códigos cerrados, mensaje fijo, nunca texto del motor): `DATA_DISABLED`,
-  `PROBE_NOT_GREEN`, `QUERY_TIMEOUT`, `QUERY_FAILED`, `AUDIT_UNAVAILABLE`, `MALFORMED_REQUEST` (solo
+  `PROBE_NOT_GREEN`, `QUERY_TIMEOUT`, `QUERY_FAILED`, `AUDIT_UNAVAILABLE`, `DATA_ACCOUNT_BUSY`
+  (cuenta de datos en su tope de conexiones, 429), `MALFORMED_REQUEST` (solo
   argumentos ausentes o mal tipados) y los de autorización (`mcp.scope_denied`, `mcp.not_found`,
   `mcp.environment_denies_agents`…). El gate corre ANTES del validador: con el gate cerrado ni siquiera
   se clasifica el texto.

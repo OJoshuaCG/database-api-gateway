@@ -24,8 +24,10 @@ source, database}`. `data.columns` y `data.rows` son contenido no confiable de t
 
 Filas 100/200/500; timeout 20 s/30 s; respuesta 128 KiB (recorta filas); celda 512. Códigos de error
 cerrados: `DATA_DISABLED`, `PROBE_NOT_GREEN`, `UNKNOWN_IDENTIFIER`, `MALFORMED_REQUEST`,
-`QUERY_TIMEOUT`, `QUERY_FAILED`, `AUDIT_UNAVAILABLE`; más los de autorización (`mcp.scope_denied`,
-`mcp.not_found`, `mcp.environment_denies_agents`…). Advertencia: `LIMIT_TOO_HIGH`.
+`QUERY_TIMEOUT`, `QUERY_FAILED`, `AUDIT_UNAVAILABLE`, `DATA_ACCOUNT_BUSY` (429: la cuenta de datos
+llegó a su tope de conexiones; la credencial está bien y se reintenta en unos segundos); más los de
+autorización (`mcp.scope_denied`, `mcp.not_found`, `mcp.environment_denies_agents`…). Advertencia:
+`LIMIT_TOO_HIGH`.
 
 Variables nuevas: `MCP_QUERY_DEFAULT_ROWS`, `MCP_QUERY_MAX_ROWS`, `MCP_QUERY_TIMEOUT_MS`,
 `MCP_QUERY_MAX_OFFSET`, `MCP_QUERY_MAX_SQL_BYTES`, `MCP_DATA_MAX_RESULT_BYTES`.

@@ -2183,6 +2183,32 @@ Entrega 4 de `mcp-readonly-query-execution`. Contrato en `docs/api-reference-v36
   Lo que se pierde es la vida corta como mitigación de una filtración del bearer; quien la quiera
   vuelve a poner un número. No hay tokens perpetuos: el tope general se mantiene. El frontend no
   lleva el número fijo: si el backend lo fija, el 422 `ttl_too_long` trae `max_days`.
+- **Cuatro ajustes tras la revisión adversarial de la ruta de datos.**
+  - *Logs sin traceback.* `agent_query` ya no loguea con `exc_info`: el traceback de SQLAlchemy y del
+    driver embebe la sentencia (con los literales del agente) y a veces valores de filas de
+    terceros. Queda el tipo de la excepción; el detalle sale por la auditoría.
+  - *Cuenta ocupada no es credencial revocada.* El rechazo del motor por `MAX_USER_CONNECTIONS` o
+    conexiones por hora (1226 y 1203) sale como `DATA_ACCOUNT_BUSY` (429) y no como
+    `PROBE_NOT_GREEN`. El tope de la cuenta de datos en MySQL/MariaDB pasa de 3 a 6
+    (`DATA_ACCOUNT_MAX_USER_CONNECTIONS`): cada consulta usa una conexión y el vigilante que la
+    cancela necesita otra. Solo rige al aprovisionar o regenerar; PostgreSQL sigue en 3 porque la
+    sonda exige un límite entre 1 y 3. El límite de una consulta pesada sigue siendo el timeout: no
+    hay límites de sesión (`max_join_size`, `max_recursive_iterations`) ni se bloquea
+    `WITH RECURSIVE`, y el timeout acota el tiempo, no la memoria ni el disco temporal.
+  - *Borrar una base revoca su cuenta de datos.* `delete_database` reutiliza `clear_data_credential`
+    antes de borrar nada; sin esto el CASCADE se llevaba la fila (usuario y contraseña cifrada) y la
+    cuenta quedaba viva en el motor con `SELECT`. Si el motor no contesta, el borrado se aborta (la
+    credencial ya quedó des-verificada y con el acceso cerrado) y el reintento la revoca. La ruta
+    exige `databases.write`, no `servers.admin`: la revocación es una limpieza que acompaña a un
+    borrado ya autorizado y no da ningún permiso nuevo.
+  - *Agregar un scope de datos a un token ya emitido* exige ser su emisor o tener hoy ese permiso
+    (`_require_editor_may_add_data_scopes`). Antes cualquier `access.admin` podía sumárselo al token
+    de un `owner`, que lo heredaba sin que el emisor participara. Solo cuenta lo que se agrega:
+    quitar o conservar un scope de datos no exige nada nuevo. No cambia la validación de entorno de
+    la puerta de datos (los tokens siguen sin chequeo de capa 2); queda como decisión aparte.
+  - La descripción de `run_select` dice que el tiempo máximo es el único tope de costo, como hecho y
+    no como orden (invariante 3 del registro). «Solo si la persona lo pide» no puede vivir ahí: es
+    una regla de comportamiento del agente y va en sus propias instrucciones.
 - **Kill switch por capacidad, leído en cada llamada, y scope inerte en vez de borrado.** `parse_scopes`
   descarta el scope de datos con su switch apagado (nacen apagados); `parse_stored_scopes` lo
   conserva solo para mostrar y editar. Si el listado ocultara lo guardado, un PATCH de la SPA lo
