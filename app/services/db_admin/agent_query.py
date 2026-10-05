@@ -85,6 +85,9 @@ _TIMEOUT_CODES = frozenset({"3024", "1969", "1317", "57014"})
 #: Conexión perdida durante la consulta: es un timeout SOLO si pasó (casi) todo el tiempo, porque el
 #: timeout de socket de la conexión es el mismo y compite con el del servidor.
 _LOST_CONNECTION_CODES = frozenset({"2013", "2006"})
+#: El motor rechazó la conexión por el tope de la CUENTA, no porque la credencial sea inválida:
+#: 1226 (``MAX_USER_CONNECTIONS``, conexiones simultáneas) y 1203 (conexiones por hora).
+_ACCOUNT_BUSY_CODES = frozenset({"1226", "1203"})
 
 _MESSAGES = {
     codes.REASON_QUERY_TIMEOUT: "La consulta superó el tiempo máximo y se canceló.",
@@ -96,6 +99,10 @@ _MESSAGES = {
     ),
     codes.REASON_MALFORMED_REQUEST: "Los argumentos de la tool no tienen la forma esperada.",
     codes.REASON_PROBE_NOT_GREEN: "La credencial de datos de la base ya no está habilitada.",
+    codes.REASON_DATA_ACCOUNT_BUSY: (
+        "La cuenta de datos de la base está ocupada: hay demasiadas consultas en curso. "
+        "La credencial está bien; reintentá en unos segundos."
+    ),
 }
 _STATUS = {
     codes.REASON_QUERY_TIMEOUT: 504,
@@ -104,6 +111,7 @@ _STATUS = {
     codes.REASON_UNKNOWN_IDENTIFIER: 404,
     codes.REASON_MALFORMED_REQUEST: 422,
     codes.REASON_PROBE_NOT_GREEN: 403,
+    codes.REASON_DATA_ACCOUNT_BUSY: 429,
 }
 
 
@@ -389,8 +397,13 @@ class _Watchdog:
                     conn.exec_driver_sql(f"SELECT pg_cancel_backend({conn_id})")
                 else:
                     conn.exec_driver_sql(f"KILL QUERY {conn_id}")
-        except Exception:  # noqa: BLE001 — el vigilante nunca rompe nada; queda en el log
-            logger.error("El vigilante no pudo cancelar la consulta del agente", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — el vigilante nunca rompe nada; queda en el log
+            # Sin `exc_info`: el traceback de SQLAlchemy y del driver lleva el texto de la
+            # sentencia (con los literales del agente) y a veces valores de filas de terceros. El
+            # tipo de la excepción alcanza para diagnosticar; el detalle sale por la auditoría.
+            logger.error(
+                "El vigilante no pudo cancelar la consulta del agente (%s)", type(exc).__name__
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -515,8 +528,9 @@ def run_agent_select(
             timeout_ms=timeout,
             session_hook=watchdog.hook,
         )
-    except Exception:  # noqa: BLE001 — jamás str(exc): puede llevar host, usuario o una fila
-        logger.error("Falló la ejecución de la lectura del agente", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 — jamás str(exc): puede llevar host, usuario o una fila
+        # Sin `exc_info`, por lo mismo que en el vigilante: el traceback embebe el SQL y valores.
+        logger.error("Falló la ejecución de la lectura del agente (%s)", type(exc).__name__)
         _record_result(
             ctx,
             verdict,
@@ -530,6 +544,17 @@ def run_agent_select(
     duration_ms = int((time.monotonic() - started) * 1000)
 
     if outcome.connection_error is not None:
+        if outcome.connection_error.code in _ACCOUNT_BUSY_CODES:
+            # La cuenta es válida pero llegó a su tope de conexiones: no está revocada. Decirle al
+            # agente "credencial deshabilitada" lo mandaría a pedir algo que ya está bien.
+            _record_result(
+                ctx,
+                verdict,
+                ok=False,
+                extra=f"status={codes.REASON_DATA_ACCOUNT_BUSY} detail=account_busy "
+                f"duration_ms={duration_ms}",
+            )
+            raise query_error(codes.REASON_DATA_ACCOUNT_BUSY)
         # Credencial de datos rechazada por el motor (revocada o cambiada a mano).
         _record_result(
             ctx,

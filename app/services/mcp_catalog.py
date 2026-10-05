@@ -145,6 +145,11 @@ REASON_SQL_TOO_LARGE = "SQL_TOO_LARGE"
 REASON_LIMIT_NOT_BOUNDABLE = "LIMIT_NOT_BOUNDABLE"
 REASON_QUERY_FAILED = "QUERY_FAILED"
 REASON_MALFORMED_REQUEST = "MALFORMED_REQUEST"
+#: La cuenta de datos existe y es válida, pero el motor rechazó la conexión por su tope de
+#: conexiones simultáneas o por hora (`MAX_USER_CONNECTIONS`). Distinto de ``PROBE_NOT_GREEN``: que
+#: la cuenta esté ocupada no significa que esté revocada, y decirle eso al agente lo manda a pedir
+#: una credencial que ya está bien.
+REASON_DATA_ACCOUNT_BUSY = "DATA_ACCOUNT_BUSY"
 
 REASON_CODES = frozenset(
     {
@@ -177,6 +182,7 @@ REASON_CODES = frozenset(
         REASON_LIMIT_NOT_BOUNDABLE,
         REASON_QUERY_FAILED,
         REASON_MALFORMED_REQUEST,
+        REASON_DATA_ACCOUNT_BUSY,
     }
 )
 

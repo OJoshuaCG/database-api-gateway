@@ -418,6 +418,14 @@ def test_the_run_select_description_has_no_imperative_phrase():
         assert imperativo not in bajo
 
 
+def test_the_run_select_description_states_that_the_time_limit_is_the_only_cost_cap():
+    """Un hecho sobre el costo, no una orden: el timeout es lo único que frena una consulta pesada."""
+    t = {x.name: x for x in registry._build(data_query_enabled=True)}["run_select"]
+    bajo = t.description.lower()
+    assert "único tope de costo" in bajo and "tiempo máximo" in bajo
+    assert "producto cartesiano" in bajo
+
+
 def test_tools_list_shows_run_select_only_to_a_token_with_data_query(
     admin_client, monkeypatch, select_tools
 ):

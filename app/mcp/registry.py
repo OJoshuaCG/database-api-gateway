@@ -211,8 +211,11 @@ def _query_tools(query) -> tuple[ToolSpec, ...]:
             description=(
                 "Ejecuta un único SELECT contra una base con una credencial de datos propia de "
                 "esa base: solo lectura, dentro de una transacción de lectura que siempre se "
-                "revierte, con tope de filas, de tiempo y de tamaño. Antes de ejecutar, el "
-                "gateway analiza el SQL y lo ejecuta en la forma canónica que él mismo renderiza. "
+                "revierte, con tope de filas, de tiempo y de tamaño. El único tope de costo es el "
+                "tiempo máximo: una consulta pesada pero válida (un producto cartesiano, una "
+                "recursión larga) corre hasta ese tiempo y el servidor no la frena antes. Antes de "
+                "ejecutar, el gateway analiza el SQL y lo ejecuta en la forma canónica que él "
+                "mismo renderiza. "
                 "Si el texto no es un SELECT aceptable (una escritura, un DDL, varias sentencias, "
                 "comentarios, funciones o esquemas no permitidos, un OFFSET enorme), no se ejecuta "
                 "nada y la respuesta es solo texto: 'classification', 'reasons', 'warnings' y "

@@ -102,6 +102,13 @@ _KV_PASSWORD_RE = re.compile(
 
 _REDACTED = "***"
 
+#: Conexiones simultáneas de la cuenta de DATOS por base (``MAX_USER_CONNECTIONS``). Cada consulta
+#: del agente usa una y el vigilante que la cancela necesita OTRA con la misma cuenta, así que con
+#: un tope de 3 tres consultas en paralelo dejaban sin lugar al vigilante, y la cuarta se rechazaba.
+#: Con 6 caben cinco consultas más la del vigilante. Solo rige al aprovisionar o regenerar: una
+#: cuenta ya creada conserva su tope hasta que se vuelva a aprovisionar.
+DATA_ACCOUNT_MAX_USER_CONNECTIONS = 6
+
 
 class MySQLAdapter(ServerAdapter):
     dialect = "mysql"
@@ -1533,7 +1540,8 @@ class MySQLAdapter(ServerAdapter):
         """
         Cuenta de DATOS por base: ``GRANT SELECT`` sobre ``db.*`` y NADA más.
 
-        Tope de recursos de la cuenta: ``MAX_USER_CONNECTIONS 3`` y, en MariaDB,
+        Tope de recursos de la cuenta: ``MAX_USER_CONNECTIONS``
+        (``DATA_ACCOUNT_MAX_USER_CONNECTIONS``) y, en MariaDB,
         ``MAX_STATEMENT_TIME 30`` (segundos; en MySQL el tope de sentencia lo pone la sesión del
         gateway con ``max_execution_time``, porque la cuenta no lo soporta). ``REVOKE ALL`` antes
         de otorgar: la cuenta, ya verificada como propia por el llamador, queda EXACTAMENTE con
@@ -1547,7 +1555,7 @@ class MySQLAdapter(ServerAdapter):
         validate_identifier(database, self.dialect, "base de datos", allow_existing=True)
         who = self._user_at_host(username, host)
         pwd = quote_string_literal(password, self.dialect)
-        limits = "MAX_USER_CONNECTIONS 3"
+        limits = f"MAX_USER_CONNECTIONS {DATA_ACCOUNT_MAX_USER_CONNECTIONS}"
         if self.dialect == "mariadb":
             limits += " MAX_STATEMENT_TIME 30"
         db = self._db_grant_pattern(quote_identifier(database, self.dialect))

@@ -26,7 +26,11 @@ from app.services import audit as audit_mod
 from app.services.db_admin import postgres_adapter as pg_mod
 from app.services.db_admin.base_adapter import ServerAdapter
 from app.services.db_admin.identifiers import quote_string_literal
-from app.services.db_admin.mysql_adapter import MariaDBAdapter, MySQLAdapter
+from app.services.db_admin.mysql_adapter import (
+    DATA_ACCOUNT_MAX_USER_CONNECTIONS,
+    MariaDBAdapter,
+    MySQLAdapter,
+)
 from app.services.db_admin.postgres_adapter import PostgresAdapter
 from app.services.db_admin.readonly_probe import ReadonlyPreflight
 
@@ -137,10 +141,11 @@ def test_mysql_never_grants_structure_global_or_grant_option(monkeypatch):
 def test_mysql_connection_cap_and_mariadb_statement_time(monkeypatch):
     mysql, m1 = _mysql(monkeypatch, MySQLAdapter)
     mysql.provision_data_account(USER, PWD, HOST, "app", ReadonlyPreflight(exists=False))
-    assert m1[1].endswith("WITH MAX_USER_CONNECTIONS 3")
+    cap = DATA_ACCOUNT_MAX_USER_CONNECTIONS
+    assert m1[1].endswith(f"WITH MAX_USER_CONNECTIONS {cap}")
     maria, m2 = _mysql(monkeypatch, MariaDBAdapter)
     maria.provision_data_account(USER, PWD, HOST, "app", ReadonlyPreflight(exists=False))
-    assert m2[1].endswith("WITH MAX_USER_CONNECTIONS 3 MAX_STATEMENT_TIME 30")
+    assert m2[1].endswith(f"WITH MAX_USER_CONNECTIONS {cap} MAX_STATEMENT_TIME 30")
 
 
 def test_mysql_quotes_user_host_and_password_with_the_existing_helpers(monkeypatch):

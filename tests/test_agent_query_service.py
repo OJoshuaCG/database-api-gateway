@@ -549,6 +549,56 @@ def test_a_refused_data_credential_is_PROBE_NOT_GREEN(run, auditoria):
     assert _codigo(exc) == "PROBE_NOT_GREEN" and exc.value.status_code == 403
 
 
+@pytest.mark.parametrize("codigo_del_motor", ["1226", "1203"])
+def test_a_busy_account_is_DATA_ACCOUNT_BUSY_not_a_revoked_credential(
+    run, auditoria, codigo_del_motor
+):
+    """El tope de conexiones de la cuenta no es una credencial revocada: no se le dice eso al agente."""
+    run.outcome = _outcome(
+        None, success=False,
+        connection_error=qr.ExecError(
+            code=codigo_del_motor, sqlstate=None, message="User has exceeded a resource limit"
+        ),
+    )
+    with pytest.raises(AppHttpException) as exc:
+        _ejecutar()
+    assert _codigo(exc) == "DATA_ACCOUNT_BUSY" and exc.value.status_code == 429
+    assert "PROBE_NOT_GREEN" not in str(exc.value)
+    assert "detail=account_busy" in auditoria.records[0][1]["detail"]
+
+
+class _Logs:
+    """Reemplaza el logger del módulo: graba el mensaje ya formateado y los kwargs, sin `caplog`."""
+
+    def __init__(self):
+        self.llamadas: list[tuple[str, dict]] = []
+
+    def error(self, msg, *args, **kwargs):
+        self.llamadas.append((msg % args if args else msg, kwargs))
+
+
+@pytest.fixture()
+def logs(monkeypatch):
+    fake = _Logs()
+    monkeypatch.setattr(aq, "logger", fake)
+    return fake
+
+
+def test_a_failed_execution_logs_the_error_type_without_the_sql_or_a_traceback(
+    run, auditoria, logs
+):
+    """El traceback del driver embebe la sentencia (literales del agente) y a veces valores de filas."""
+    run.raises = RuntimeError("Incorrect DOUBLE value: 'dato-de-un-tercero' en SELECT secreto FROM t")
+    with pytest.raises(AppHttpException) as exc:
+        _ejecutar()
+    assert _codigo(exc) == "QUERY_FAILED"
+    ((mensaje, kwargs),) = logs.llamadas
+    assert "RuntimeError" in mensaje
+    assert "exc_info" not in kwargs
+    for filtrado in ("dato-de-un-tercero", "secreto", "SELECT"):
+        assert filtrado not in mensaje
+
+
 def test_a_failed_rollback_or_close_is_a_failure_never_a_result(run, auditoria):
     run.outcome = _outcome(_stmt([[1, "a"]]), success=False)
     with pytest.raises(AppHttpException) as exc:
@@ -654,6 +704,19 @@ def _vigilante(engine="mysql", timeout_ms=20_000):
     return aq._Watchdog(
         _target(engine), database="core", engine=engine, credential=_CRED, timeout_ms=timeout_ms
     )
+
+
+def test_a_watchdog_that_cannot_cancel_logs_the_error_type_without_a_traceback(kill, logs):
+    kill.falla = True  # la conexión de cancelación revienta con "sin conexiones"
+    w = _vigilante("mysql")
+    w.conn_id = 77
+
+    w._kill()  # el vigilante nunca rompe nada: solo deja el rastro en el log
+
+    ((mensaje, kwargs),) = logs.llamadas
+    assert "RuntimeError" in mensaje
+    assert "exc_info" not in kwargs
+    assert "sin conexiones" not in mensaje
 
 
 def test_the_mysql_hook_records_the_connection_id_and_arms_the_timer_at_timeout_plus_2s(timer):
