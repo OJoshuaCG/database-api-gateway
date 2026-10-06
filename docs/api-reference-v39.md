@@ -43,13 +43,14 @@ inexistente. Cambiar el switch exige reiniciar el proceso para que `tools/list` 
 
 **Topes**
 
-- **5 objetos por llamada** (`maxItems` del schema publicado; se vuelve a exigir en el handler y en
+- **3 objetos por llamada** (`maxItems` del schema publicado; se vuelve a exigir en el handler y en
   `read_definitions`). Más es `422 mcp.invalid_argument`. Los duplicados se colapsan.
 - `name` de 1 a 128 caracteres. No se rechaza por sus caracteres: un nombre con comilla o prefijo de otra
   base no está en el índice y vuelve en `missing`, sin que se emita SQL con ese texto.
 - **64 KiB por cuerpo**, medidos sobre su codificación JSON y **después de redactar**. Un cuerpo mayor
   **se rechaza, no se trunca**: vuelve `body_available=false`, `unavailable_reason=too_large` y su
-  `size_bytes`. 5 x 64 KiB = 320 KiB entran en el presupuesto de 512 KiB del dispatcher.
+  `size_bytes`. El dispatcher cuenta cada resultado dos veces (texto y `structuredContent`):
+  3 x 64 KiB x 2 = 384 KiB entran en su presupuesto de 512 KiB.
 - Lo que no está en el índice de la base vuelve en `missing[]` (`{kind, name, routine_kind}`) y **no se
   consulta al motor**. Nunca hay un éxito vacío: o hay objetos, o hay `missing`, o la llamada falló con su
   código.

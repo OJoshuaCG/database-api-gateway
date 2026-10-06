@@ -1041,7 +1041,7 @@ capturar cuerpos de rutinas y aislar por base son mutuamente excluyentes.**
 > **Actualización (cambio `mcp-schema-definitions`).** MariaDB 11.3+ tiene el privilegio
 > `SHOW CREATE ROUTINE` **a nivel de base**: el aprovisionamiento lo otorga por base y ahí el conflicto
 > desaparece (sin confirmar en staging). El grant `SELECT ON mysql.proc` por servidor queda como opción
-> **pendiente** (slice S6, bandera `readonly_proc_grant`) para MariaDB < 11.3 y MySQL 5.7. Los cuerpos
+> **entregada** (slice S6, bandera `readonly_proc_grant`, apagada por defecto) para MariaDB < 11.3 y MySQL 5.7. Los cuerpos
 > ya no están "fuera de v1": se leen con `get_definition` bajo el scope `data.definitions`.
 
 **Nunca `SELECT ON mysql.*`**: `mysql.servers` guarda usuario y contraseña en claro (§3.1).

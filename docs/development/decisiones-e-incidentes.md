@@ -2368,7 +2368,9 @@ estructura (proyecto, entorno, opt-in de agentes, veto) sigue completo.
 
 **Se rechaza (`too_large`), no se trunca.** Un cuerpo cortado a mitad es peor que uno ausente: el agente
 razonaría sobre código incompleto creyéndolo entero. El tope de 64 KiB se mide sobre el JSON redactado
-(lo que viaja) y 5 objetos x 64 KiB = 320 KiB entran en el presupuesto de 512 KiB del dispatcher.
+(lo que viaja). El dispatcher cuenta cada resultado dos veces (bloque de texto y `structuredContent`), así
+que el tope por llamada es 3 objetos: 3 x 64 KiB x 2 = 384 KiB entran en su presupuesto de 512 KiB. Con 5
+el peor caso (640 KiB) fallaba con `mcp.result_too_large`.
 
 **Nunca un éxito vacío.** Es la regla del plan 12 §3.3 y la causa del S1: un cuerpo NULL, vacío o en blanco
 sale como no disponible con motivo cerrado, y el modelo de salida lo valida al construirse (un mapeador
@@ -2402,8 +2404,9 @@ alcance servidor (`SELECT ON mysql.proc`) en las versiones nuevas. Se decide en 
 antes de mutar, porque un `GRANT` con un privilegio que el servidor no conoce falla después del
 `REVOKE ALL` y deja la cuenta a medias. **No verificado en un servidor real ni en staging**: el literal
 sale de la documentación de MariaDB y vive en una constante marcada. Para MariaDB < 11.3 y MySQL 5.7 la
-alternativa (`mysql.proc` por servidor, flag `readonly_proc_grant`) es la slice S6, pendiente: hoy esas
-versiones responden `flag_off`.
+alternativa (`mysql.proc` por servidor, flag `readonly_proc_grant`) es la slice S6, ya entregada (ver la
+sección de S6 y S8 más abajo): esas versiones responden `flag_off` hasta que un administrador enciende la
+bandera.
 
 **`TRIGGER` y `EVENT` siguen permitidos: riesgo aceptado.** Son los únicos privilegios que dejan VER
 triggers y eventos (su ausencia es silenciosa) y a la vez permiten crearlos. La defensa es que la sesión es
