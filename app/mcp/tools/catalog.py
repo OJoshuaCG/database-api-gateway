@@ -16,7 +16,13 @@ LOS MAPEADORES SON LA LISTA BLANCA
 ----------------------------------
 Cada salida se arma campo por campo desde el DTO interno hacia un modelo de ``app.schemas.mcp``
 con ``extra="forbid"``. Los cuerpos de vistas, rutinas y triggers existen en el DTO interno y
-**no tienen campo destino**: salen como ``body_omitted_reason: "scope_disabled"``.
+**no tienen campo destino**: en ``get_schema`` salen como ``body_omitted_reason:
+"scope_disabled"`` (un literal único: ``flag_off`` y ``too_large`` son razones de ``get_definition``).
+
+``list_objects`` dice la VERDAD sobre los cuerpos de cada objeto: ``body_available`` sale del scope
+``data.definitions`` del llamador y del motor/versión (``ToolContext.body_availability``), sin leer
+ningún cuerpo. "Disponible" significa "se puede pedir con ``get_definition``", no "el motor lo va a
+entregar": un privilegio faltante lo dice ``get_definition`` por objeto.
 """
 
 from __future__ import annotations
@@ -29,7 +35,9 @@ from app.schemas import mcp as out
 from app.services import mcp_catalog as codes
 
 KINDS: tuple[str, ...] = ("table", "view", "routine", "trigger", "sequence")
-_WITH_BODY = frozenset({"view", "routine", "trigger"})
+#: ``list_objects`` suma ``event`` (MySQL/MariaDB). ``get_schema`` conserva ``KINDS``: no lee events.
+LIST_KINDS: tuple[str, ...] = KINDS + ("event",)
+_WITH_BODY = frozenset({"view", "routine", "trigger", "event"})
 _NAME_MAX = 128
 
 
@@ -92,8 +100,8 @@ def _warnings(resuelta, facade, *, bodies_requested: bool) -> list[out.WarningOu
             out.WarningOut(
                 code=codes.WARN_BODIES_UNAVAILABLE,
                 message=(
-                    "Los cuerpos de vistas, rutinas y triggers no se entregan: el scope de "
-                    "cuerpos está apagado por diseño."
+                    "Los cuerpos de vistas, rutinas y triggers no se entregan acá: se piden con "
+                    "get_definition, que exige el scope data.definitions."
                 ),
             )
         )
@@ -126,13 +134,24 @@ def _envelope(data, *, resuelta, tracker: Tracker, warnings) -> dict:
 def _kinds(params: dict) -> tuple[str, ...]:
     pedidos = params.get("kinds")
     if pedidos is None:
-        return KINDS
+        return LIST_KINDS
     if not isinstance(pedidos, list) or not pedidos:
         raise _invalid("'kinds' tiene que ser una lista no vacía.")
-    desconocidos = [k for k in pedidos if k not in KINDS]
+    desconocidos = [k for k in pedidos if k not in LIST_KINDS]
     if desconocidos:
-        raise _invalid(f"'kinds' admite solo {list(KINDS)}.")
-    return tuple(k for k in KINDS if k in pedidos)
+        raise _invalid(f"'kinds' admite solo {list(LIST_KINDS)}.")
+    return tuple(k for k in LIST_KINDS if k in pedidos)
+
+
+def _body_flags(kind: str, disponibilidad) -> tuple[bool | None, str | None]:
+    """
+    ``(body_available, unavailable_reason)`` de un objeto del índice. Tablas y secuencias no tienen
+    cuerpo: ``(None, None)``. Para el resto, disponible si no hay razón, y si la hay, esa razón.
+    """
+    if kind not in _WITH_BODY:
+        return None, None
+    reason = disponibilidad.reasons.get(kind)
+    return reason is None, reason
 
 
 def list_objects(ctx: ToolContext, params: dict) -> dict:
@@ -159,9 +178,22 @@ def list_objects(ctx: ToolContext, params: dict) -> dict:
     with ctx.open_readonly(database_id) as (resuelta, facade):
         indice = facade.object_index()
         warnings = _warnings(resuelta, facade, bodies_requested=False)
+        # Una consulta de VERSION() como mucho, y solo si el llamador tiene el scope: jamás un
+        # SHOW CREATE. Se calcula con la sesión abierta porque el façade se cierra al salir.
+        disponibilidad = ctx.body_availability(resuelta, facade)
+        if disponibilidad.routines_may_be_hidden:
+            warnings.append(
+                out.WarningOut(
+                    code=codes.WARN_ROUTINES_NOT_VISIBLE,
+                    message=(
+                        "Este motor puede ocultar rutinas a la credencial de solo lectura: que "
+                        "una rutina no aparezca en el índice no prueba que no exista."
+                    ),
+                )
+            )
         elegidos: list[tuple[str, str]] = []
         total = 0
-        for kind in KINDS:
+        for kind in LIST_KINDS:
             for nombre in indice.get(kind, []):
                 total += 1
                 if kind in kinds and (not prefijo or str(nombre).startswith(prefijo)):
@@ -196,8 +228,8 @@ def list_objects(ctx: ToolContext, params: dict) -> dict:
         out.ObjectOut(
             kind=kind,
             name=clean(nombre),
-            body_available=False if kind in _WITH_BODY else None,
-            unavailable_reason="scope_disabled" if kind in _WITH_BODY else None,
+            body_available=_body_flags(kind, disponibilidad)[0],
+            unavailable_reason=_body_flags(kind, disponibilidad)[1],
             column_count=conteos.get(nombre) if (con_conteos and kind == "table") else None,
         )
         for (kind, nombre) in elegidos

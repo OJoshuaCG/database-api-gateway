@@ -136,6 +136,15 @@ class _FacadeFalso:
     def triggers(self):
         return []
 
+    def events(self):
+        return []
+
+    def server_version(self):
+        return "8.0.36"
+
+    def definition(self, kind, name, routine_kind=None):
+        return []
+
     def sequences(self):
         return []
 
@@ -659,6 +668,28 @@ def test_output_field_sets_are_frozen():
             "blueprint",
             "rule",
         },
+        out.DefinitionOut: {
+            "kind",
+            "name",
+            "routine_kind",
+            "identity_arguments",
+            "body_available",
+            "unavailable_reason",
+            "body",
+            "size_bytes",
+            "body_fingerprint",
+            "security",
+            "check_option",
+            "trigger",
+            "event",
+            "redactions",
+            "flagged",
+        },
+        out.DefinitionsOut: {"objects", "missing"},
+        out.DefinitionRefOut: {"kind", "name", "routine_kind"},
+        out.TriggerMetaOut: {"table", "timing", "events"},
+        out.EventMetaOut: {"schedule", "status"},
+        out.RedactionCountOut: {"category", "count"},
         out.PermissionProfileOut: {"name", "engine", "items"},
         out.PrivilegeOut: {
             "engine",
