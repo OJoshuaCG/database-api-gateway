@@ -2386,6 +2386,35 @@ class MySQLAdapter(ServerAdapter):
             )
         return out
 
+    def list_routine_names(self, conn, database, schema) -> list[str]:
+        """
+        Nombres de rutinas por ``information_schema.ROUTINES``, sin ``SHOW CREATE`` por rutina.
+
+        ``ROUTINES`` solo muestra las rutinas sobre las que la cuenta tiene privilegio (EXECUTE,
+        DEFINER o equivalente): en MariaDB < 11.3 sin la bandera y en MySQL < 8.0.20 puede haber
+        rutinas que este índice no lista. De ahí el aviso ``WARN_ROUTINES_NOT_VISIBLE`` en
+        ``list_objects``: "no aparece" no prueba "no existe".
+        """
+        rows = conn.execute(
+            text(
+                "SELECT ROUTINE_NAME FROM information_schema.ROUTINES "
+                "WHERE ROUTINE_SCHEMA = :db ORDER BY ROUTINE_NAME"
+            ),
+            {"db": database},
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def list_trigger_names(self, conn, database, schema) -> list[str]:
+        """Nombres de triggers por ``information_schema.TRIGGERS``, sin ``SHOW CREATE`` por trigger."""
+        rows = conn.execute(
+            text(
+                "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
+                "WHERE TRIGGER_SCHEMA = :db ORDER BY TRIGGER_NAME"
+            ),
+            {"db": database},
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
     def list_event_names(self, conn, database) -> list[str]:
         """
         Nombres de los events por una consulta barata (sin ``SHOW CREATE`` por event).

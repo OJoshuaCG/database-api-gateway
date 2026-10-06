@@ -216,6 +216,22 @@ class ServerAdapter(ABC):
         """
         return []
 
+    def list_routine_names(self, conn: Connection, database: str, schema: str) -> list[str]:
+        """
+        Nombres de las rutinas visibles para la credencial, SIN leer su código.
+
+        Default: los nombres del snapshot (los motores sin ``SHOW CREATE`` por objeto traen el
+        cuerpo en la misma consulta, así que no hay nada que ahorrar). El override de MySQL usa
+        ``information_schema.ROUTINES`` porque su snapshot hace un ``SHOW CREATE`` por rutina, y
+        ``list_objects`` no puede leer código: sería el cuerpo que ``get_definition`` protege con su
+        scope, auditoría y redacción.
+        """
+        return [routine.name for routine in self._snapshot_routines(conn, database, schema)]
+
+    def list_trigger_names(self, conn: Connection, database: str, schema: str) -> list[str]:
+        """Igual que ``list_routine_names``, para triggers."""
+        return [trigger.name for trigger in self._snapshot_triggers(conn, database, schema)]
+
     #: Tipos de objeto cuyo código puede pedir ``get_definition``.
     _DEFINITION_KINDS = frozenset({"view", "trigger", "event", "routine"})
 
@@ -875,12 +891,8 @@ class ServerAdapter(ABC):
                         sorted(insp.get_table_names(schema=schema))
                     ),
                     "view": sorted(insp.get_view_names(schema=schema)),
-                    "routine": sorted(
-                        {r.name for r in self._snapshot_routines(conn, database, schema)}
-                    ),
-                    "trigger": sorted(
-                        {t.name for t in self._snapshot_triggers(conn, database, schema)}
-                    ),
+                    "routine": sorted(set(self.list_routine_names(conn, database, schema))),
+                    "trigger": sorted(set(self.list_trigger_names(conn, database, schema))),
                     "sequence": sorted(
                         {s.name for s in self._snapshot_sequences(conn, database, schema)}
                     ),

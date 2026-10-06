@@ -495,7 +495,9 @@ class ToolEnvelope(_Out):
     """
 
     notice: str
-    data: ObjectIndexOut | SchemaOut | SchemaDiffOut | FreshnessOut | SchemaSearchOut
+    data: (
+        ObjectIndexOut | SchemaOut | SchemaDiffOut | FreshnessOut | SchemaSearchOut | DefinitionsOut
+    )
     source: Literal["managed_database"]
     untrusted_content: bool
     untrusted_fields: list[str]

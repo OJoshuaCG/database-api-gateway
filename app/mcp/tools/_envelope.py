@@ -51,6 +51,22 @@ class Tracker:
             return texto[:FREE_TEXT_MAX_CHARS]
         return texto
 
+    def code_body(self, value, path: str):
+        """
+        Código (vista, trigger, event, rutina) de un tercero: saneado, anotado y NUNCA capado.
+
+        Es la regla de las expresiones estructurales llevada al cuerpo entero: un cuerpo cortado a
+        mitad es peor que ausente, porque el agente razonaría sobre código incompleto creyéndolo
+        entero. El tope vive aguas arriba (``definition_reader``: sobre ``MAX_DEFINITION_BYTES`` el
+        objeto vuelve como ``too_large``), así que acá no hay nada que recortar. Un cuerpo vacío no
+        se anota: no hay texto de terceros que marcar.
+        """
+        texto = clean(value)
+        if texto is None or texto == "":
+            return texto
+        self.untrusted.append(path)
+        return texto
+
 
 def fingerprint(payload: dict) -> str:
     """sha256 corto del DTO de identidad ya normalizado: estable entre llamadas, para cachés."""

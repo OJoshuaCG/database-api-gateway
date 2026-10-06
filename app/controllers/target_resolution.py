@@ -207,6 +207,10 @@ class AgentDatabase:
 
     database: ReachableDatabase
     quarantined: bool
+    #: Bandera del servidor ``readonly_proc_grant`` (``SELECT ON mysql.proc`` para la credencial
+    #: de solo lectura). Decide si un cuerpo de rutina ausente se explica con ``flag_off``. El
+    #: default ``False`` mantiene a los constructores existentes y a un servidor sin la columna.
+    readonly_proc_grant: bool = False
 
 
 def _deny(code: str, status: int, message: str) -> AppHttpException:
@@ -323,6 +327,9 @@ def resolve_agent_database(
                 model_version=bd.model_version,
             ),
             quarantined=bd.status == ProvisionStatus.error,
+            # ``getattr``: la columna llega con su propia migración; hasta entonces el valor
+            # honesto es "apagada", que es también el default del modelo.
+            readonly_proc_grant=bool(getattr(srv, "readonly_proc_grant", False)),
         )
     finally:
         session.close()
@@ -491,6 +498,270 @@ def open_readonly(actor: Actor, database_id: int, capability: Capability):
             "La lectura del catálogo superó el tiempo máximo de la sesión del MCP. Pedí menos "
             "objetos por llamada.",
         ) from exc
+
+
+# --------------------------------------------------------------------------- #
+# Código de objetos (get_definition) y disponibilidad de cuerpos en list_objects  #
+# --------------------------------------------------------------------------- #
+
+_DEFINITION_AUDIT_ACTION = "mcp.get_definition"
+#: Tope de la lista ``kind:nombre`` de la auditoría de intención. Los nombres salen del índice del
+#: motor (no del agente), pero un esquema con nombres largos no puede inflar una fila de auditoría.
+_DEFINITION_AUDIT_DETAIL_MAX_BYTES = 2048
+_KINDS_WITH_BODY = ("view", "trigger", "event", "routine")
+
+
+@dataclass(frozen=True, slots=True)
+class DefinitionBatch:
+    """
+    Lo que ``read_definitions`` entrega al handler, ya sin sesión abierta: el handler mapea esto a
+    la salida pública sin tocar nunca el façade ni la credencial.
+
+    ``results`` son ``definition_reader.DefinitionResult`` (cuerpo ya redactado y medido).
+    ``missing`` son los ``(kind, name, routine_kind)`` pedidos que NO están en el índice.
+    """
+
+    database: AgentDatabase
+    results: tuple
+    missing: tuple[tuple[str, str, str | None], ...]
+    consistent_structure: bool
+    session_warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BodyAvailability:
+    """
+    Disponibilidad del cuerpo por tipo de objeto para ESTE llamador (``list_objects``).
+
+    ``reasons[kind]`` es ``None`` si el cuerpo se puede pedir con ``get_definition`` o la razón
+    cerrada si no. ``routines_may_be_hidden`` avisa que el índice puede no listar rutinas.
+    """
+
+    reasons: dict
+    routines_may_be_hidden: bool
+
+
+def assert_definitions_enabled() -> None:
+    """
+    Kill switch de ``get_definition`` (``MCP_SCHEMA_DEFINITIONS_ENABLED``), leído en CADA llamada.
+
+    Es el PRIMER paso de la tool y no lee ni el inventario: apagado, la respuesta no se distingue
+    por tiempo ni por efectos de "la base no existe". Es un 403 con código propio y NO una razón
+    por objeto: no es que un objeto no tenga cuerpo, es que la función entera está apagada.
+    """
+    from app.services.capability_catalog import data_capability_enabled
+
+    if not data_capability_enabled(Capability.DATA_DEFINITIONS):
+        raise _deny(
+            codes.CODE_DEFINITIONS_DISABLED,
+            403,
+            "La lectura de definiciones está apagada en este gateway (kill switch).",
+        )
+
+
+def _partition_by_index(
+    requested: list[tuple[str, str, str | None]], index: dict[str, list[str]]
+) -> tuple[list[tuple[str, str, str | None]], list[tuple[str, str, str | None]]]:
+    """
+    ``(presentes, ausentes)`` contra el ÍNDICE de la base. Es la barrera contra la inyección y el
+    cruce de bases: un nombre que no es exactamente uno del índice (``x`; DROP TABLE t --``,
+    ``otra_base.v1``) nunca llega a un ``SHOW CREATE``; se informa en ``missing`` y listo.
+    """
+    names_by_kind = {kind: set(names) for kind, names in index.items()}
+    present: list[tuple[str, str, str | None]] = []
+    missing: list[tuple[str, str, str | None]] = []
+    for kind, name, routine_kind in requested:
+        if name in names_by_kind.get(kind, set()):
+            present.append((kind, name, routine_kind))
+        else:
+            missing.append((kind, name, routine_kind))
+    return present, missing
+
+
+def _record_definition_intent(
+    actor: Actor, resuelta: AgentDatabase, present: list[tuple[str, str, str | None]]
+) -> None:
+    """
+    Intención de auditoría ANTES de leer el primer cuerpo. FAIL-CLOSED: si no se puede escribir, no
+    se lee nada y el agente recibe ``AUDIT_UNAVAILABLE``.
+
+    Guarda ``tipo:nombre`` de lo que se va a leer y NUNCA un cuerpo. Solo van los nombres que
+    existen en el índice: los pedidos ausentes son texto del agente y no tienen por qué entrar a
+    una fila de auditoría.
+    """
+    from app.core.logger import get_logger
+    from app.services import audit
+    from app.services.db_admin.agent_query import clean_text
+
+    object_list = ",".join(f"{kind}:{name}" for kind, name, _ in present)
+    detail = f"token={getattr(actor, 'token_id', None)} objects={clean_text(object_list)}"
+    detail = detail.encode("utf-8")[:_DEFINITION_AUDIT_DETAIL_MAX_BYTES].decode(
+        "utf-8", errors="ignore"
+    )
+    try:
+        audit.record_intent(
+            _DEFINITION_AUDIT_ACTION,
+            admin=actor,
+            target_type="managed_database",
+            target_id=resuelta.database.database_id,
+            server_id=resuelta.database.server_id,
+            touched_engine=True,
+            detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-closed: sin auditoría no se lee ningún cuerpo
+        get_logger(__name__).error("Auditoría de intención caída; no se leen definiciones")
+        raise _deny(
+            codes.REASON_AUDIT_UNAVAILABLE,
+            503,
+            "No se pudo registrar la auditoría; no se leyó ninguna definición.",
+        ) from exc
+
+
+def _record_definition_result(
+    actor: Actor, resuelta: AgentDatabase, *, ok: bool, results: list, missing_count: int
+) -> None:
+    """
+    Fila de resultado con CONTEOS por razón, sin cuerpos ni nombres. ``audit.record`` nunca lanza:
+    la intención ya dejó el rastro fail-closed, esta fila completa el cuadro.
+    """
+    from collections import Counter
+
+    from app.services import audit
+
+    reason_counts = Counter(r.unavailable_reason for r in results if not r.body_available)
+    available = sum(1 for r in results if r.body_available)
+    redacted = sum(sum(r.redactions.values()) for r in results)
+    reasons_text = " ".join(f"{reason}={count}" for reason, count in sorted(reason_counts.items()))
+    detail = (
+        f"token={getattr(actor, 'token_id', None)} available={available} "
+        f"missing={missing_count} redacted={redacted} {reasons_text}"
+    ).strip()
+    audit.record(
+        _DEFINITION_AUDIT_ACTION,
+        status="success" if ok else "failure",
+        admin=actor,
+        target_type="managed_database",
+        target_id=resuelta.database.database_id,
+        server_id=resuelta.database.server_id,
+        touched_engine=True,
+        detail=detail,
+    )
+
+
+def read_definitions(
+    actor: Actor,
+    database_id: int,
+    objects: list[tuple[str, str, str | None]],
+    capability: Capability,
+) -> DefinitionBatch:
+    """
+    ``get_definition``: el código de hasta ``MAX_DEFINITIONS_PER_CALL`` objetos de UNA base.
+
+    Orden (cada paso corta el siguiente):
+
+    1. **Kill switch** (``assert_definitions_enabled``): antes de leer nada.
+    2. Argumentos: el handler ya los validó sin conectar; acá solo queda la defensa del tope.
+    3. ``open_readonly``: scope -> proyecto (``mcp.not_found``) -> credencial de ESTRUCTURA fresca
+       -> entorno, opt-in y veto -> sesión READ ONLY.
+    4. **Índice**: lo pedido que no está va a ``missing``. Es metadatos, no lee cuerpos.
+    5. ``record_intent`` FAIL-CLOSED con ``tipo:nombre`` (jamás un cuerpo).
+    6. Lectura por objeto + ``build_definition`` (redacta, mide, huella).
+    7. Fila de resultado con conteos por razón.
+
+    NO pasa por ``_data_gate``: los cuerpos se leen con la credencial de ESTRUCTURA (la misma de
+    ``list_objects``), no con la de datos por base, y exigir esa le pondría a un token de
+    definiciones un opt-in de datos que no corresponde. El control de acceso es el scope
+    ``data.definitions`` más el kill switch. Los imports son perezosos por el guard de
+    ``tests/test_mcp_import_guard.py``.
+    """
+    from app.services.db_admin.definition_reader import MAX_DEFINITIONS_PER_CALL, build_definition
+    from app.services.db_admin.readonly_probe import routine_body_reason
+
+    assert_definitions_enabled()
+    if not objects or len(objects) > MAX_DEFINITIONS_PER_CALL:
+        raise _deny(
+            codes.CODE_INVALID_ARGUMENT,
+            422,
+            f"'objects' admite de 1 a {MAX_DEFINITIONS_PER_CALL} objetos por llamada.",
+        )
+
+    results: list = []
+    with open_readonly(actor, database_id, capability) as (resuelta, facade):
+        present, missing = _partition_by_index(objects, facade.object_index())
+        if present:
+            _record_definition_intent(actor, resuelta, present)
+            try:
+                server_version = facade.server_version()
+                engine = resuelta.database.engine
+                proc_flag = resuelta.readonly_proc_grant
+                for kind, name, routine_kind in present:
+                    reads = facade.definition(kind, name, routine_kind)
+                    if not reads:
+                        # El índice lo listó y el adapter ya no lo encuentra (un ``DROP`` en el
+                        # medio). Se informa como ausente: omitirlo en silencio dejaría una
+                        # respuesta que no dice nada de lo que se pidió.
+                        missing.append((kind, name, routine_kind))
+                        continue
+                    for read in reads:
+                        missing_body_reason = (
+                            routine_body_reason(engine, server_version, proc_flag)
+                            if read.kind == "routine"
+                            else None
+                        )
+                        results.append(
+                            build_definition(read, missing_body_reason=missing_body_reason)
+                        )
+            except Exception:
+                # El detalle (timeout de sesión, error del driver) lo traduce quien llama o va al
+                # log del despachador; acá solo queda el rastro de que la lectura no terminó.
+                _record_definition_result(
+                    actor, resuelta, ok=False, results=results, missing_count=len(missing)
+                )
+                raise
+            _record_definition_result(
+                actor, resuelta, ok=True, results=results, missing_count=len(missing)
+            )
+        consistent_structure = facade.consistent_structure
+        session_warnings = tuple(facade.warnings)
+
+    return DefinitionBatch(
+        database=resuelta,
+        results=tuple(results),
+        missing=tuple(missing),
+        consistent_structure=consistent_structure,
+        session_warnings=session_warnings,
+    )
+
+
+def body_availability(actor: Actor, resuelta: AgentDatabase, facade) -> BodyAvailability:
+    """
+    ¿Se puede pedir el cuerpo de cada tipo con ``get_definition``? Solo con el scope del llamador y
+    la versión del motor: NO ejecuta ningún ``SHOW CREATE`` (``list_objects`` es el índice barato y
+    no puede leer código).
+
+    - Sin el scope ``data.definitions`` (o con el kill switch apagado): ``scope_disabled`` en todo.
+    - Con el scope: la razón por motor/versión de ``routine_body_reason`` para las RUTINAS
+      (``flag_off`` o ``engine_unsupported``); vistas, triggers y events salen disponibles. Que
+      "disponible" no promete un cuerpo (un privilegio puede faltar): lo dice ``get_definition``
+      por objeto. Lo que no puede afirmarse sin leer, no se afirma acá.
+    """
+    from app.services.capability_catalog import data_capability_enabled
+    from app.services.db_admin.readonly_probe import routine_body_reason
+
+    scope_open = actor.has(Capability.DATA_DEFINITIONS) and data_capability_enabled(
+        Capability.DATA_DEFINITIONS
+    )
+    if not scope_open:
+        return BodyAvailability(
+            reasons={kind: "scope_disabled" for kind in _KINDS_WITH_BODY},
+            routines_may_be_hidden=False,
+        )
+    routine_reason = routine_body_reason(
+        resuelta.database.engine, facade.server_version(), resuelta.readonly_proc_grant
+    )
+    reasons: dict = {kind: None for kind in _KINDS_WITH_BODY}
+    reasons["routine"] = routine_reason
+    return BodyAvailability(reasons=reasons, routines_may_be_hidden=routine_reason is not None)
 
 
 def draft_agent_query(actor: Actor, database_id: int, sql: str, capability: Capability) -> dict:
