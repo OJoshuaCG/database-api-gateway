@@ -2348,3 +2348,77 @@ gateway (`AT ...` / `EVERY n UNIDAD`) y la clave `event` en `list_object_names` 
 (MariaDB sin privilegio): ahora deja rastro en el log, pero `diff_schemas` ve `""` y no "no disponible".
 El camino `dump_structure` de PostgreSQL (vistas del export) todavía lee `information_schema.views`;
 no se tocó en esta slice. No verificado contra un motor real.
+
+## MCP definiciones de esquema, S2 a S7: `get_definition`, `get_table_stats` y sus límites
+
+Contrato en [`api-reference-v39.md`](../api-reference-v39.md). Acá solo el porqué.
+
+**Scope propio `data.definitions` y no `databases.read`.** El cuerpo de una vista, rutina, trigger o evento
+lleva literales, reglas de negocio y a veces credenciales del tercero: divulga aunque no lea filas. Colgarlo
+de `databases.read` habría entregado ese código a todo token de estructura, que es el scope de menor riesgo.
+Por eso es la tercera excepción cerrada del techo del agente (owner-only, sensible, step-up del emisor,
+kill switch `MCP_SCHEMA_DEFINITIONS_ENABLED` apagado por default) y el invariante 13 pasó de par a terna a
+propósito. Las aserciones que fijaban el par y el recuento de 13 sensibles se cambiaron a mano; no se
+aflojó ninguna garantía.
+
+**Credencial de ESTRUCTURA, no `_data_gate`.** Los cuerpos se leen con la misma credencial de `list_objects`.
+Pasar por `_data_gate` le habría exigido a un token de definiciones el opt-in y la credencial de datos por
+base, que no corresponden: no lee filas. El control de acceso es el scope más el kill switch, y el gate de
+estructura (proyecto, entorno, opt-in de agentes, veto) sigue completo.
+
+**Se rechaza (`too_large`), no se trunca.** Un cuerpo cortado a mitad es peor que uno ausente: el agente
+razonaría sobre código incompleto creyéndolo entero. El tope de 64 KiB se mide sobre el JSON redactado
+(lo que viaja) y 5 objetos x 64 KiB = 320 KiB entran en el presupuesto de 512 KiB del dispatcher.
+
+**Nunca un éxito vacío.** Es la regla del plan 12 §3.3 y la causa del S1: un cuerpo NULL, vacío o en blanco
+sale como no disponible con motivo cerrado, y el modelo de salida lo valida al construirse (un mapeador
+futuro que se equivoque falla, no entrega "disponible" sin texto). `not_found` no es un motivo: un objeto
+que no existe va a `missing`, para que el agente sepa si existe.
+
+**La redacción es best effort y NO es una frontera.** Enmascara patrones conocidos de credenciales; cuenta
+emails y hosts sin enmascararlos; no puede garantizar que no quede nada. La frontera es el scope. Lo que
+sobrevive al mapeador va marcado como contenido no confiable y sin recortar. Por eso el aviso
+`mcp.warn.bodies_redacted` cuenta lo enmascarado y no promete nada. La cuenta del `DEFINER` jamás sale:
+solo el modo `definer`/`invoker`.
+
+**Auditoría: `record_intent` fail-closed y solo `tipo:nombre`.** La intención se escribe antes de leer el
+primer cuerpo; si falla no se lee nada (`AUDIT_UNAVAILABLE`). Entran solo nombres que están en el índice:
+los pedidos ausentes son texto del agente. Nunca un cuerpo en la fila.
+
+**El índice es la barrera de inyección.** Un nombre que no es exactamente uno del índice nunca llega a un
+`SHOW CREATE`; va a `missing`. Por eso no se rechazan nombres por sus caracteres.
+
+**`list_objects` dice la verdad sobre `body_available`.** Antes era `false` fijo. Ahora sale del scope y del
+motor/versión sin ejecutar ningún `SHOW CREATE`: "lo que no puede afirmarse sin leer, no se afirma".
+
+**`get_table_stats` bajo `databases.read`; estimados solo con `data.read`.** Cubre lo que el agente buscaba
+en `information_schema` (bloqueado en `run_select`) sin abrirlo a SQL libre. `TABLE_ROWS`/`reltuples`
+aproximan `COUNT(*)` y `AUTO_INCREMENT` delata cuántas filas se insertaron: darlos a un token de solo
+estructura abriría por la puerta de atrás lo que `data.read` cierra. Sin el scope las claves no existen
+(modelo aparte) en vez de ser `null`, y el adapter ni las selecciona.
+
+**MariaDB 11.3+: `SHOW CREATE ROUTINE` por base.** Resuelve el conflicto del plan 12 §7.2 sin el grant de
+alcance servidor (`SELECT ON mysql.proc`) en las versiones nuevas. Se decide en runtime por la versión leída
+antes de mutar, porque un `GRANT` con un privilegio que el servidor no conoce falla después del
+`REVOKE ALL` y deja la cuenta a medias. **No verificado en un servidor real ni en staging**: el literal
+sale de la documentación de MariaDB y vive en una constante marcada. Para MariaDB < 11.3 y MySQL 5.7 la
+alternativa (`mysql.proc` por servidor, flag `readonly_proc_grant`) es la slice S6, pendiente: hoy esas
+versiones responden `flag_off`.
+
+**`TRIGGER` y `EVENT` siguen permitidos: riesgo aceptado.** Son los únicos privilegios que dejan VER
+triggers y eventos (su ausencia es silenciosa) y a la vez permiten crearlos. La defensa es que la sesión es
+`READ ONLY` y esta credencial nunca ve SQL del agente. El razonamiento completo está en el docstring de
+`app/services/db_admin/readonly_probe.py` (sección "POR QUÉ `TRIGGER` Y `EVENT` ESTÁN PERMITIDOS").
+`get_definition` no lo cambia: lee texto, no ejecuta.
+
+**Brechas conocidas (no se cierran en este cambio).**
+- `dump_structure` de PostgreSQL (vistas del export) todavía lee `information_schema.views`, que devuelve
+  NULL a quien no es dueño. El S1 corrigió el snapshot, no ese camino.
+- `tests/test_sod_exceptions_migration.py::test_owner_only_snapshot_matches_the_catalog` falla desde
+  `9877e41`: el snapshot de la migración no incluye las capacidades `data.*`. Es previo a este cambio y no
+  se tocó la migración ni el test (no se re-ejecutó para confirmar si `data.definitions` agrega otra
+  diferencia).
+- El diff (`diff_schemas`) y el export siguen ciegos a las rutinas en MariaDB sin el privilegio: ven `""`
+  y no "no disponible". Ahora deja un WARNING en el log, pero no una señal tipada.
+- Sin verificar contra un motor real: lectura de cuerpos por motor y versión, `GRANT SHOW CREATE ROUTINE`,
+  y que `SHOW CREATE` sin privilegio devuelva NULL y no un error en cada versión.

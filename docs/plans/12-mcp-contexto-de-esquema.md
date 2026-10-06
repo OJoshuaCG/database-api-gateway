@@ -299,7 +299,7 @@ peor que no tenerla.
 | Nivel | Estado en v1 | Por qué |
 |---|---|---|
 | `inspect` (estructura, sin cuerpos) | **SÍ** | Es el caso de uso real |
-| `inspect:bodies` (cuerpos de vistas/rutinas/triggers) | Scope propio, **apagado por default** | Es el canal de fuga: un procedure real lleva tokens, hosts internos y emails hardcodeados. Y es la carga de inyección más estructurada que el motor puede devolver |
+| `inspect:bodies` (cuerpos de vistas/rutinas/triggers) | Scope propio, **apagado por default** (implementado como `data.definitions` + `MCP_SCHEMA_DEFINITIONS_ENABLED`, tool `get_definition`; ver [api-reference-v39](../api-reference-v39.md)) | Es el canal de fuga: un procedure real lleva tokens, hosts internos y emails hardcodeados. Y es la carga de inyección más estructurada que el motor puede devolver |
 | `analyze` (diff, previews) | **NO** | Filtra el `confirm_token` (§2.1) |
 | `author` (borradores de migración) | **NO** | Se auto-aprueba `reviewed=true` (§2.4), y lee filas de negocio embebidas en `up_sql` (§2.5) |
 | `query` (SQL de solo lectura) | **NO** | Corre con pseudo-root y cruza bases (§2.3) |
@@ -1035,8 +1035,14 @@ GRANT SELECT ON `mysql`.`proc` TO 'mcp_ro'@'…';   -- alcance SERVIDOR, inevita
 ```
 
 MariaDB **no tiene `SHOW_ROUTINE`**. `mysql.proc` es una sola tabla del instance con las rutinas
-de **todas** las bases, y el grant **no es scopeable**. O sea: **en MariaDB (y en MySQL <8.0.20)
+de **todas** las bases, y el grant **no es scopeable**. O sea: **en MariaDB < 11.3 (y en MySQL <8.0.20)
 capturar cuerpos de rutinas y aislar por base son mutuamente excluyentes.**
+
+> **Actualización (cambio `mcp-schema-definitions`).** MariaDB 11.3+ tiene el privilegio
+> `SHOW CREATE ROUTINE` **a nivel de base**: el aprovisionamiento lo otorga por base y ahí el conflicto
+> desaparece (sin confirmar en staging). El grant `SELECT ON mysql.proc` por servidor queda como opción
+> **pendiente** (slice S6, bandera `readonly_proc_grant`) para MariaDB < 11.3 y MySQL 5.7. Los cuerpos
+> ya no están "fuera de v1": se leen con `get_definition` bajo el scope `data.definitions`.
 
 **Nunca `SELECT ON mysql.*`**: `mysql.servers` guarda usuario y contraseña en claro (§3.1).
 
