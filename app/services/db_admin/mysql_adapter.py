@@ -62,6 +62,8 @@ from app.services.db_admin.identifiers import (
 from app.services.db_admin.protected_accounts import MYSQL_SYSTEM_USERS
 from app.services.db_admin.readonly_probe import (
     ReadonlyPreflight,
+    is_mariadb_engine,
+    mariadb_routine_grants_for_version,
     mysql_global_grants_for_version,
     mysql_has_unrecognized_grants,
 )
@@ -332,9 +334,18 @@ class MySQLAdapter(ServerAdapter):
                 lineas = [
                     str(r[0]) for r in conn.execute(text("SHOW GRANTS FOR CURRENT_USER()"))
                 ]
+                try:
+                    version = conn.execute(text(self._version_sql())).scalar()
+                except SQLAlchemyError:
+                    # Sin versión se decide por el dialecto registrado: un MariaDBAdapter sigue
+                    # siendo MariaDB. Es la misma decisión que toma el aprovisionamiento.
+                    version = None
         except SQLAlchemyError as exc:
             raise map_driver_error(exc, op="readonly_violations", target=self.target)
-        return mysql_grant_violations(lineas)
+        server_is_mariadb = is_mariadb_engine(
+            None if version is None else str(version), self.dialect
+        )
+        return mysql_grant_violations(lineas, is_mariadb=server_is_mariadb)
 
     def data_credential_facts(self, database: str) -> dict:
         """
@@ -1498,10 +1509,18 @@ class MySQLAdapter(ServerAdapter):
                 context={"username": username},
                 public_context={"code": CODE_READONLY_ACCOUNT_HAS_ROLES},
             )
-        global_grants, note = mysql_global_grants_for_version(
-            None if version is None else str(version), dialect=self.dialect
+        version_text = None if version is None else str(version)
+        global_grants, note = mysql_global_grants_for_version(version_text, dialect=self.dialect)
+        # ``SHOW CREATE ROUTINE`` por base solo en MariaDB >= 11.3. Se decide ACÁ, antes de mutar:
+        # un GRANT con un privilegio que el servidor no conoce fallaría después del REVOKE ALL.
+        db_extra_grants, db_extra_note = mariadb_routine_grants_for_version(
+            version_text, dialect=self.dialect
         )
-        return ReadonlyPreflight(existed, global_grants, note)
+        if is_mariadb_engine(version_text, self.dialect):
+            # En MariaDB la nota de ``SHOW_ROUTINE`` ("no aplica") es ruido: informa la que
+            # explica por qué no se otorgó el privilegio por base, o ninguna si se otorgó.
+            note = db_extra_note
+        return ReadonlyPreflight(existed, global_grants, note, db_extra_grants)
 
     def provision_readonly_account(
         self, username, password, host, databases, preflight
@@ -1521,7 +1540,7 @@ class MySQLAdapter(ServerAdapter):
             f"ALTER USER {who} IDENTIFIED BY {pwd}",
             f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM {who}",
         ]
-        privs = ", ".join(MYSQL_READONLY_DB_GRANTS)
+        privs = ", ".join((*MYSQL_READONLY_DB_GRANTS, *preflight.db_extra_grants))
         for db_name in databases:
             validate_identifier(db_name, self.dialect, "base de datos", allow_existing=True)
             db = self._db_grant_pattern(quote_identifier(db_name, self.dialect))

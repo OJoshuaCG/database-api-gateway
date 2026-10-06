@@ -27,10 +27,31 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
+#: Privilegio de MariaDB >= 11.3 (MDEV-29167) que deja leer el código de las rutinas de UNA base
+#: sin ``SELECT ON mysql.proc``. ÚNICO lugar donde vive el literal: el aprovisionamiento, la
+#: allowlist de la sonda y el helper de versión lo toman de acá.
+#: SIN CONFIRMAR EN STAGING: el nombre exacto y la sintaxis del ``GRANT`` salen de la
+#: documentación de MariaDB, no de un servidor 11.3+ probado. Confirmar con ``GRANT SHOW CREATE
+#: ROUTINE ON `db`.* TO ...`` y con la salida de ``SHOW GRANTS`` ANTES de habilitar en producción;
+#: si el nombre difiere, se corrige solo esta constante.
+MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE = "SHOW CREATE ROUTINE"
+
 #: Privilegios que la credencial puede tener en la familia MySQL (§7.2). ``USAGE`` es "ninguno".
 MYSQL_ALLOWED_PRIVILEGES = frozenset(
-    {"USAGE", "SELECT", "SHOW VIEW", "TRIGGER", "EVENT", "SHOW_ROUTINE"}
+    {
+        "USAGE",
+        "SELECT",
+        "SHOW VIEW",
+        "TRIGGER",
+        "EVENT",
+        "SHOW_ROUTINE",
+        MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE,
+    }
 )
+
+#: Privilegios de la allowlist que solo existen en MariaDB: en MySQL (u otro motor) verlos en una
+#: cuenta es una anomalía y la sonda los reporta, aunque estén en ``MYSQL_ALLOWED_PRIVILEGES``.
+_MARIADB_ONLY_PRIVILEGES = frozenset({MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE})
 
 #: Privilegios que se aceptan sobre ``*.*``. ``SELECT ON *.*`` NO: incluye ``mysql.servers``, que
 #: guarda usuario y contraseña en claro (§7.2, "nunca ``SELECT ON mysql.*``").
@@ -44,9 +65,15 @@ _MYSQL_GLOBAL_OK = frozenset({"USAGE", "SHOW_ROUTINE"})
 MYSQL_READONLY_DB_GRANTS: tuple[str, ...] = ("SELECT", "SHOW VIEW", "TRIGGER", "EVENT")
 #: ``SHOW_ROUTINE`` es dinámico (8.0.20+), no scopeable a una base, y MariaDB no lo tiene (§7.2).
 MYSQL_READONLY_GLOBAL_GRANTS: tuple[str, ...] = ("SHOW_ROUTINE",)
+#: Grants por base que se SUMAN solo en MariaDB >= 11.3 (``mariadb_routine_grants_for_version``).
+#: Nunca globales y nunca sobre ``mysql.*``: el flag server-wide de ``mysql.proc`` es otro camino.
+MARIADB_READONLY_DB_EXTRA_GRANTS: tuple[str, ...] = (MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE,)
 
 assert set(MYSQL_READONLY_DB_GRANTS) <= MYSQL_ALLOWED_PRIVILEGES
 assert set(MYSQL_READONLY_GLOBAL_GRANTS) <= _MYSQL_GLOBAL_OK
+assert set(MARIADB_READONLY_DB_EXTRA_GRANTS) <= MYSQL_ALLOWED_PRIVILEGES
+assert set(MARIADB_READONLY_DB_EXTRA_GRANTS) <= _MARIADB_ONLY_PRIVILEGES
+assert not set(MARIADB_READONLY_DB_EXTRA_GRANTS) & _MYSQL_GLOBAL_OK
 
 #: Primera versión de MySQL que tiene el privilegio dinámico ``SHOW_ROUTINE``. Antes, el ``GRANT``
 #: falla con un error de sintaxis, y si falla DESPUÉS de rotar y revocar la cuenta queda a medias.
@@ -63,11 +90,15 @@ class ReadonlyPreflight:
     ``exists``: la cuenta ya existe en el motor. ``global_grants``: privilegios ``*.*`` que se
     pueden otorgar en ESTE servidor (vacío en MariaDB, en MySQL < 8.0.20 y si la versión no se
     pudo determinar). ``note``: texto corto, sin secretos, para el detalle de auditoría.
+    ``db_extra_grants``: privilegios que se SUMAN a ``MYSQL_READONLY_DB_GRANTS`` en cada base
+    (``SHOW CREATE ROUTINE`` en MariaDB >= 11.3; vacío en cualquier otro motor o versión). Va al
+    final para no mover los campos posicionales existentes.
     """
 
     exists: bool
     global_grants: tuple[str, ...] = ()
     note: str | None = None
+    db_extra_grants: tuple[str, ...] = ()
 
 
 def mysql_global_grants_for_version(
@@ -121,22 +152,36 @@ def _is_mariadb(version: str | None, dialect: str) -> bool:
     return dialect == _DEFINITION_ENGINE_MARIADB or "mariadb" in (version or "").lower()
 
 
-def mariadb_routine_grants_for_version(version: str | None) -> tuple[tuple[str, ...], str | None]:
+def is_mariadb_engine(version: str | None, dialect: str) -> bool:
+    """
+    ¿El servidor es MariaDB? Por el dialecto registrado O por la cadena de versión. PURA.
+
+    Aprovisionamiento y sonda usan ESTA misma decisión: lo que se otorga tiene que pasar la sonda.
+    """
+    return _is_mariadb(version, dialect)
+
+
+def mariadb_routine_grants_for_version(
+    version: str | None, dialect: str = _DEFINITION_ENGINE_MYSQL_FAMILY
+) -> tuple[tuple[str, ...], str | None]:
     """
     ``(grants por base a agregar, nota)``: ``SHOW CREATE ROUTINE`` solo en MariaDB >= 11.3. PURA.
+
+    ``dialect`` es el del servidor registrado: un ``MariaDBAdapter`` cuyo ``VERSION()`` no
+    trae el sufijo ``-MariaDB`` sigue siendo MariaDB.
 
     Ante una versión ilegible NO se otorga: un ``GRANT`` con un privilegio que el servidor no
     conoce falla con error de sintaxis DESPUÉS de rotar y revocar la cuenta, y la deja a medias
     (mismo criterio que ``mysql_global_grants_for_version``).
     """
-    if not _is_mariadb(version, _DEFINITION_ENGINE_MYSQL_FAMILY):
+    if not _is_mariadb(version, dialect):
         return (), "SHOW CREATE ROUTINE a nivel de base solo existe en MariaDB"
     parsed = _parse_server_version(version)
     if parsed is None:
         return (), "versión del servidor no determinada: SHOW CREATE ROUTINE no otorgado"
     if parsed < MARIADB_SHOW_CREATE_ROUTINE_MIN_VERSION:
         return (), "MariaDB < 11.3: SHOW CREATE ROUTINE no existe y no se otorgó"
-    return ("SHOW CREATE ROUTINE",), None
+    return MARIADB_READONLY_DB_EXTRA_GRANTS, None
 
 
 def proc_grant_supported(version: str | None, dialect: str) -> bool:
@@ -220,9 +265,13 @@ def _normalize_object(obj: str) -> str:
     return obj.replace("`", "").replace('"', "").lower()
 
 
-def mysql_grant_violations(lines: list[str]) -> list[str]:
+def mysql_grant_violations(lines: list[str], *, is_mariadb: bool = False) -> list[str]:
     """
     Motivos por los que un ``SHOW GRANTS FOR CURRENT_USER()`` permite escribir o divulgar.
+
+    ``is_mariadb``: los privilegios de ``_MARIADB_ONLY_PRIVILEGES`` solo se toleran si es True, y
+    solo a nivel de base (``db.*``). Por defecto False: ante la duda de motor no se asume
+    el permisivo (mismo criterio que ``lower_case_table_names`` en la sonda de datos).
 
     Devuelve códigos cortos y estables (sin el texto del grant: puede llevar el host de la
     cuenta), en el orden en que aparecen y sin repetir.
@@ -252,8 +301,13 @@ def mysql_grant_violations(lines: list[str]) -> list[str]:
             if priv not in MYSQL_ALLOWED_PRIVILEGES:
                 add(f"privilege:{priv.lower().replace(' ', '_')}")
                 continue
-            if obj == "*.*" and priv not in _MYSQL_GLOBAL_OK:
+            if priv in _MARIADB_ONLY_PRIVILEGES and not is_mariadb:
+                add(f"privilege:{priv.lower().replace(' ', '_')}")
+            elif obj == "*.*" and priv not in _MYSQL_GLOBAL_OK:
                 add(f"global_privilege:{priv.lower().replace(' ', '_')}")
+            elif priv in _MARIADB_ONLY_PRIVILEGES and not obj.endswith(".*"):
+                # Solo a nivel de base: sobre una tabla o rutina suelta no es lo que se aprovisiona.
+                add(f"non_database_privilege:{priv.lower().replace(' ', '_')}")
             elif obj.startswith("mysql.") and priv == "SELECT" and obj != "mysql.proc":
                 add("select_on_mysql_schema")
     return out
@@ -535,5 +589,8 @@ __all__ = [
     "MYSQL_READONLY_DB_GRANTS",
     "MYSQL_READONLY_GLOBAL_GRANTS",
     "mysql_grant_violations",
+    "is_mariadb_engine",
+    "MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE",
+    "MARIADB_READONLY_DB_EXTRA_GRANTS",
     "postgres_role_violations",
 ]
