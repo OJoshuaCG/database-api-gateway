@@ -6,6 +6,7 @@ pseudo-root (ni cifrada ni descifrada). Solo se informa `has_root_password`.
 """
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -76,6 +77,9 @@ class ServerOut(BaseModel):
     # el cifrado salen nunca (plan 12 §5.2).
     has_readonly_credential: bool = False
     readonly_verified_at: datetime | None = None
+    # ``SELECT ON mysql.proc`` server-wide habilitado para la credencial de solo lectura. Es un
+    # dato de riesgo, no un secreto: la SPA lo muestra junto al toggle.
+    readonly_proc_grant: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -94,6 +98,42 @@ class ReadonlyCredentialIn(BaseModel):
     username: str = Field(..., min_length=1, max_length=128)
     # Entra en texto plano; el controller lo cifra antes de persistir.
     password: str = Field(..., min_length=1)
+
+
+class ReadonlyProcGrantIn(BaseModel):
+    """
+    Enciende o apaga ``SELECT ON mysql.proc`` para la credencial de solo lectura (MariaDB < 11.3 /
+    MySQL 5.7). Es SERVER-WIDE: expone el código de las rutinas de TODAS las bases del servidor.
+
+    Habilitar exige ``acknowledgement`` igual, carácter por carácter, a
+    ``server_catalog.READONLY_PROC_ACK_TEXT``. Deshabilitar no lo necesita: cortar nunca debe
+    requerir más fricción que abrir.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    acknowledgement: str | None = None
+
+
+#: Qué pasó con los grants del motor al cambiar la bandera.
+ProcGrantEngineState = Literal["converged", "not_alterable", "no_credential"]
+
+
+class ReadonlyProcGrantOut(BaseModel):
+    """
+    Resultado del cambio de la bandera. ``engine_grant``:
+
+    - ``converged``: la cuenta propia del gateway se re-aprovisionó (``REVOKE ALL`` y re-grant,
+      con ``mysql.proc`` solo si la bandera quedó encendida) y la sonda pasó.
+    - ``not_alterable``: la credencial se registró a mano; el gateway NO toca sus grants. Solo se
+      re-corrió la sonda. Si el operador no ajustó los grants en el motor, el servidor queda sin
+      verificar (``server.readonly_verified_at`` nulo).
+    - ``no_credential``: el servidor no tiene credencial de solo lectura; solo cambió la bandera.
+    """
+
+    server: ServerOut
+    engine_grant: ProcGrantEngineState
 
 
 # ─── Reconciliación (drift): plano en vivo vs inventario del gateway ───────── #

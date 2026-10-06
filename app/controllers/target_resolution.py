@@ -327,9 +327,7 @@ def resolve_agent_database(
                 model_version=bd.model_version,
             ),
             quarantined=bd.status == ProvisionStatus.error,
-            # ``getattr``: la columna llega con su propia migración; hasta entonces el valor
-            # honesto es "apagada", que es también el default del modelo.
-            readonly_proc_grant=bool(getattr(srv, "readonly_proc_grant", False)),
+            readonly_proc_grant=bool(srv.readonly_proc_grant),
         )
     finally:
         session.close()

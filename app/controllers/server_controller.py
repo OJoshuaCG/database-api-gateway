@@ -9,6 +9,7 @@ Controller de Servers.
 La credencial descifrada NUNCA se persiste, se serializa ni se loguea.
 """
 
+import dataclasses
 import secrets
 import threading
 from typing import TYPE_CHECKING
@@ -41,7 +42,10 @@ from app.services.server_catalog import (
     CODE_READONLY_ACCOUNT_ALREADY_EXISTS,
     CODE_READONLY_CREDENTIAL_MISSING,
     CODE_READONLY_PROBE_FAILED,
+    CODE_READONLY_PROC_GRANT_ACK_MISMATCH,
+    CODE_READONLY_PROC_GRANT_ENGINE_UNSUPPORTED,
     CODE_READONLY_PROVISION_IN_PROGRESS,
+    READONLY_PROC_ACK_TEXT,
 )
 from app.services.db_admin.dtos import (
     ConnectionInfo,
@@ -62,6 +66,7 @@ from app.services.db_admin.protected_accounts import (
     assert_not_protected_by_name,
 )
 from app.services.db_admin.query_policy import is_gateway_metadata_target
+from app.services.db_admin.readonly_probe import proc_grant_supported
 from app.services.db_admin.factory import get_adapter
 
 if TYPE_CHECKING:
@@ -122,6 +127,7 @@ class ServerController:
                 s.readonly_username and s.readonly_password_encrypted
             ),
             "readonly_verified_at": s.readonly_verified_at,
+            "readonly_proc_grant": bool(s.readonly_proc_grant),
             "created_at": s.created_at,
             "updated_at": s.updated_at,
         }
@@ -558,17 +564,11 @@ class ServerController:
             host, port = server.host, server.port
             stored_username = server.readonly_username
             has_stored = bool(server.readonly_username and server.readonly_password_encrypted)
+            proc_grant = bool(server.readonly_proc_grant)
         finally:
             session.close()
 
-        username = MCP_READONLY_ACCOUNT_USERNAME
-        account_host = MCP_READONLY_ACCOUNT_HOST
-        validate_identifier(username, engine_value, "usuario")
-        if engine_value != EngineType.postgresql.value:
-            validate_host(account_host)
-        assert_not_protected_by_name(
-            dialect=engine_value, username=username, root_username=root_username
-        )
+        username, account_host = self._validated_readonly_account(engine_value, root_username)
         # "Propia": el gateway ya guarda, para ESTE servidor, una credencial con este usuario.
         ours = has_stored and stored_username == username
 
@@ -592,9 +592,27 @@ class ServerController:
                 username=username,
                 account_host=account_host,
                 ours=ours,
+                proc_grant=proc_grant,
             )
         finally:
             _release_provision(server_id)
+
+    @staticmethod
+    def _validated_readonly_account(engine_value: str, root_username: str) -> tuple[str, str]:
+        """
+        ``(usuario, host)`` configurados para la cuenta de solo lectura, ya validados. Se llama
+        ANTES de auditar y de tocar la verificación: un valor malo daba 422 en cada click Y
+        des-verificaba una credencial que andaba.
+        """
+        username = MCP_READONLY_ACCOUNT_USERNAME
+        account_host = MCP_READONLY_ACCOUNT_HOST
+        validate_identifier(username, engine_value, "usuario")
+        if engine_value != EngineType.postgresql.value:
+            validate_host(account_host)
+        assert_not_protected_by_name(
+            dialect=engine_value, username=username, root_username=root_username
+        )
+        return username, account_host
 
     def _provision_locked(
         self,
@@ -607,10 +625,19 @@ class ServerController:
         username: str,
         account_host: str,
         ours: bool,
+        proc_grant: bool = False,
     ) -> dict:
-        """Pasos 3 a 7 de ``provision_readonly_credential``, ya dentro del lock del servidor."""
+        """
+        Pasos 3 a 7 de ``provision_readonly_credential``, ya dentro del lock del servidor.
+
+        ``proc_grant``: ¿la corrida debe otorgar ``SELECT ON mysql.proc``? Lo decide el llamador
+        (la bandera ``readonly_proc_grant`` de la fila, o el valor que se está por persistir al
+        cambiarla) y NO se lee de la fila acá: al habilitar, la fila todavía dice ``False`` hasta
+        que el motor confirme. El adapter solo lo otorga si además el motor lo necesita.
+        """
         adapter = get_adapter(self._build_target(server_id))
         preflight = adapter.preflight_readonly_account(username, account_host)
+        preflight = dataclasses.replace(preflight, proc_grant=proc_grant)
         if preflight.exists and not ours:
             raise AppHttpException(
                 message=(
@@ -701,8 +728,203 @@ class ServerController:
                 + (f"; {preflight.note}" if preflight.note else "")
             ),
         )
-        self._verify_readonly(server_id, admin=admin)
+        self._verify_readonly(
+            server_id,
+            admin=admin,
+            allow_mysql_proc=proc_grant and preflight.proc_grant_supported,
+        )
         return self.get_server(server_id)
+
+    def set_readonly_proc_grant(
+        self,
+        server_id: int,
+        *,
+        enabled: bool,
+        acknowledgement: str | None,
+        admin: "dict | Actor | None" = None,
+    ) -> dict:
+        """
+        Enciende o apaga ``SELECT ON mysql.proc`` para la credencial de solo lectura (MariaDB <
+        11.3 / MySQL 5.7). ``{"server": ServerOut-dict, "engine_grant": ...}``.
+
+        ``mysql.proc`` es SERVER-WIDE: con el grant, la credencial lee el código de las rutinas de
+        TODAS las bases del servidor, también las fuera del proyecto o excluidas. Solo el filtrado
+        del gateway lo contiene, por eso habilitar exige el texto de acknowledgement EXACTO y que
+        el motor lo necesite (``proc_grant_supported``). Deshabilitar nunca pide fricción extra.
+
+        Orden (los chequeos baratos primero; nada muta hasta el paso 4):
+
+        1. Habilitar: acknowledgement idéntico (422 ``ack_mismatch``) y motor que lo necesita
+           (422 ``engine_unsupported``; lectura con la pseudo-root, sin mutar).
+        2. Lock por servidor, el MISMO del aprovisionamiento (409 ``in_progress``).
+        3. Intención auditada (fail-closed) ANTES de tocar nada.
+        4. Según de quién es la credencial:
+
+           - **Propia del gateway**: se re-converge con el aprovisionamiento idempotente (``REVOKE
+             ALL`` y re-grant, con ``mysql.proc`` solo si se habilita). Re-aprovisionar des-verifica
+             la credencial antes de tocar el motor, así que el CORTE es inmediato aunque el motor
+             falle (mismo criterio que ``clear_data_credential``). La bandera de la fila cambia
+             SOLO después de que el motor confirmó y la sonda pasó: si algo falla, queda como
+             estaba y el reintento revoca.
+           - **Registrada a mano (PUT)**: el gateway no altera grants de un tercero. Se persiste la
+             bandera y solo se re-corre la sonda (``not_alterable``). Si el operador no ajustó los
+             grants en el motor, la sonda falla y el servidor queda sin verificar: cierra.
+           - **Sin credencial**: solo cambia la bandera (``no_credential``).
+        """
+        if enabled and acknowledgement != READONLY_PROC_ACK_TEXT:
+            raise AppHttpException(
+                message=(
+                    "Para habilitar SELECT ON mysql.proc hay que reenviar el texto de "
+                    "acknowledgement exacto. No se cambió nada."
+                ),
+                status_code=422,
+                context={"server_id": server_id},
+                public_context={"code": CODE_READONLY_PROC_GRANT_ACK_MISMATCH},
+            )
+
+        session = self._session()
+        try:
+            server = self._get_or_404(session, server_id)
+            engine_value = (
+                server.engine.value
+                if isinstance(server.engine, EngineType)
+                else str(server.engine)
+            )
+            root_username = server.root_username
+            host, port = server.host, server.port
+            stored_username = server.readonly_username
+            has_stored = bool(server.readonly_username and server.readonly_password_encrypted)
+        finally:
+            session.close()
+
+        if enabled:
+            self._assert_proc_grant_supported(server_id, engine_value)
+
+        username, account_host = self._validated_readonly_account(engine_value, root_username)
+        ours = has_stored and stored_username == username
+
+        if not _try_acquire_provision(server_id):
+            raise AppHttpException(
+                message=(
+                    "Ya hay un aprovisionamiento de la credencial de solo lectura en curso para "
+                    "este servidor. Esperá a que termine y reintentá; no se cambió nada."
+                ),
+                status_code=409,
+                context={"server_id": server_id},
+                public_context={"code": CODE_READONLY_PROVISION_IN_PROGRESS},
+            )
+        try:
+            action = "habilitar" if enabled else "deshabilitar"
+            audit.record_intent(
+                "server.readonly_proc_grant.set",
+                admin=admin,
+                target_type="server",
+                target_id=server_id,
+                server_id=server_id,
+                detail=(
+                    f"{action} SELECT ON mysql.proc (server-wide) para la credencial de solo "
+                    "lectura"
+                ),
+            )
+            try:
+                if ours:
+                    engine_grant = "converged"
+                    self._provision_locked(
+                        server_id,
+                        admin=admin,
+                        engine_value=engine_value,
+                        host=host,
+                        port=port,
+                        username=username,
+                        account_host=account_host,
+                        ours=True,
+                        proc_grant=enabled,
+                    )
+                    self._persist_proc_grant(server_id, enabled)
+                elif has_stored:
+                    engine_grant = "not_alterable"
+                    self._persist_proc_grant(server_id, enabled)
+                    self._reprobe_manual_credential(server_id, admin=admin, enabled=enabled)
+                else:
+                    engine_grant = "no_credential"
+                    self._persist_proc_grant(server_id, enabled)
+            except Exception:
+                audit.record(
+                    "server.readonly_proc_grant.set",
+                    status="error",
+                    admin=admin,
+                    target_type="server",
+                    target_id=server_id,
+                    server_id=server_id,
+                    touched_engine=ours,
+                    detail=(
+                        f"no se pudo {action} SELECT ON mysql.proc; la bandera quedó como estaba "
+                        "y la credencial sin verificar hasta reintentar"
+                    ),
+                )
+                raise
+        finally:
+            _release_provision(server_id)
+        audit.record(
+            "server.readonly_proc_grant.set",
+            admin=admin,
+            target_type="server",
+            target_id=server_id,
+            server_id=server_id,
+            touched_engine=ours,
+            detail=(
+                f"SELECT ON mysql.proc {'habilitado' if enabled else 'deshabilitado'} "
+                f"(credencial: {engine_grant})"
+            ),
+        )
+        remote_engine.invalidate_server(server_id)
+        return {"server": self.get_server(server_id), "engine_grant": engine_grant}
+
+    def _assert_proc_grant_supported(self, server_id: int, engine_value: str) -> None:
+        """
+        422 ``engine_unsupported`` si el motor no necesita ``SELECT ON mysql.proc`` (PostgreSQL,
+        MySQL >= 8.0, MariaDB >= 11.3) o su versión no se puede leer. Solo lectura con la
+        pseudo-root; PostgreSQL se decide por el dialecto, sin conectar.
+        """
+        supported = False
+        if engine_value in (EngineType.mysql.value, EngineType.mariadb.value):
+            info = get_adapter(self._build_target(server_id)).test_connection()
+            supported = proc_grant_supported(info.server_version, engine_value)
+        if not supported:
+            raise AppHttpException(
+                message=(
+                    "Este servidor no necesita ni admite SELECT ON mysql.proc (solo MariaDB < "
+                    "11.3 y MySQL 5.7). No se cambió nada."
+                ),
+                status_code=422,
+                context={"server_id": server_id, "engine": engine_value},
+                public_context={"code": CODE_READONLY_PROC_GRANT_ENGINE_UNSUPPORTED},
+            )
+
+    def _persist_proc_grant(self, server_id: int, enabled: bool) -> None:
+        session = self._session()
+        try:
+            server = self._get_or_404(session, server_id)
+            server.readonly_proc_grant = enabled
+            session.commit()
+        finally:
+            session.close()
+
+    def _reprobe_manual_credential(
+        self, server_id: int, *, admin: "dict | Actor | None", enabled: bool
+    ) -> None:
+        """
+        Re-corre la sonda de una credencial registrada a mano con la bandera ya cambiada. Que la
+        sonda falle NO es un error de esta operación: el gateway no altera esos grants, así que un
+        ``mysql.proc`` que el operador todavía no revocó deja al servidor sin verificar (cierra) y
+        la respuesta lo informa con ``not_alterable`` y ``readonly_verified_at`` nulo.
+        """
+        try:
+            self._verify_readonly(server_id, admin=admin, allow_mysql_proc=enabled)
+        except AppHttpException as exc:
+            probe_code = (exc.public_context or {}).get("code")
+            if probe_code != CODE_READONLY_PROBE_FAILED:
+                raise
 
     def clear_readonly_credential(
         self, server_id: int, *, admin: "dict | Actor | None" = None
@@ -780,7 +1002,11 @@ class ServerController:
             session.close()
 
     def _verify_readonly(
-        self, server_id: int, *, admin: "dict | Actor | None" = None
+        self,
+        server_id: int,
+        *,
+        admin: "dict | Actor | None" = None,
+        allow_mysql_proc: bool | None = None,
     ) -> ConnectionInfo:
         """
         Sonda NEGATIVA (plan 12 §5.2): conecta con la credencial de solo lectura y exige que el
@@ -789,13 +1015,27 @@ class ServerController:
         Un fallo **borra** la verificación anterior en vez de dejarla: una credencial que hoy
         puede escribir no sigue en el MCP porque hace dos semanas no podía. No toca el ``status``
         del servidor: ese describe la conexión con la pseudo-root, no esta.
+
+        ``allow_mysql_proc``: si la sonda tolera ``SELECT ON mysql.proc``. ``None`` = lo que dice
+        la bandera ``readonly_proc_grant`` de la fila (``test-connection``). El cambio de la
+        bandera pasa el valor explícito: la fila se actualiza DESPUÉS de que el motor confirma, y
+        la sonda tiene que juzgar el estado que se acaba de dejar, no el anterior. El adapter lo
+        honra solo si el motor lo necesita (MariaDB < 11.3 / MySQL < 8.0).
         """
         from datetime import UTC, datetime
 
         target = self._build_readonly_target(server_id)
+        if allow_mysql_proc is None:
+            flag_session = self._session()
+            try:
+                allow_mysql_proc = bool(
+                    self._get_or_404(flag_session, server_id).readonly_proc_grant
+                )
+            finally:
+                flag_session.close()
         adapter = get_adapter(target)
         info = adapter.test_connection()
-        violaciones = adapter.readonly_violations()
+        violaciones = adapter.readonly_violations(allow_mysql_proc=allow_mysql_proc)
         session = self._session()
         try:
             server = self._get_or_404(session, server_id)

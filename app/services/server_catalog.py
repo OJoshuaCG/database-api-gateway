@@ -36,8 +36,29 @@ CODE_READONLY_ACCOUNT_HAS_ROLES = "readonly_account.has_roles"
 #: proceso). 409, no se cambió nada: reintentar cuando termine.
 CODE_READONLY_PROVISION_IN_PROGRESS = "readonly_provision.in_progress"
 
+#: ``PUT .../readonly-credential/routine-bodies`` con ``enabled=true`` sin el texto de
+#: acknowledgement EXACTO (``READONLY_PROC_ACK_TEXT``). 422, la bandera no cambia y no se otorga
+#: nada: el administrador tiene que haber leído que ``mysql.proc`` es server-wide.
+CODE_READONLY_PROC_GRANT_ACK_MISMATCH = "server.readonly_proc_grant.ack_mismatch"
+
+#: ``PUT .../readonly-credential/routine-bodies`` con ``enabled=true`` sobre un motor que no
+#: necesita o no admite ``SELECT ON mysql.proc`` (PostgreSQL, MySQL >= 8.0, MariaDB >= 11.3, o una
+#: versión ilegible). 422, la bandera no cambia.
+CODE_READONLY_PROC_GRANT_ENGINE_UNSUPPORTED = "server.readonly_proc_grant.engine_unsupported"
+
+#: Texto que el administrador debe reenviar TAL CUAL para habilitar ``readonly_proc_grant``. La
+#: comparación es exacta (sin ``strip`` ni normalización): el objetivo es que el riesgo se lea, no
+#: que se acierte una frase. La SPA muestra este mismo texto; si cambia, cambia en ambos lados.
+READONLY_PROC_ACK_TEXT = (
+    "Entiendo que SELECT ON mysql.proc es server-wide: expone el código de las rutinas de TODAS "
+    "las bases de datos de este servidor, incluidas las que están fuera del proyecto o excluidas, "
+    "y que solo el filtrado del gateway lo contiene."
+)
+
 ERROR_CODES = frozenset(
     {
+        CODE_READONLY_PROC_GRANT_ACK_MISMATCH,
+        CODE_READONLY_PROC_GRANT_ENGINE_UNSUPPORTED,
         CODE_READONLY_ACCOUNT_ALREADY_EXISTS,
         CODE_READONLY_ACCOUNT_HAS_ROLES,
         CODE_READONLY_PROVISION_IN_PROGRESS,

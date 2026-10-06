@@ -50,6 +50,8 @@ from app.schemas.server_database import (
 )
 from app.schemas.server import (
     ReadonlyCredentialIn,
+    ReadonlyProcGrantIn,
+    ReadonlyProcGrantOut,
     ReconcileResult,
     ServerCreate,
     ServerOut,
@@ -205,6 +207,40 @@ def provision_readonly_credential(request: Request, actor: ServersAdmin, server_
     updated = ServerController().provision_readonly_credential(server_id, admin=actor)
     return success(
         data=updated, message="Credencial de solo lectura aprovisionada y verificada."
+    )
+
+
+@router.put(
+    "/{server_id}/readonly-credential/routine-bodies",
+    response_model=ApiResponse[ReadonlyProcGrantOut],
+)
+@limiter.limit("3/minute")
+def set_readonly_proc_grant(
+    request: Request, actor: ServersAdmin, server_id: int, payload: ReadonlyProcGrantIn
+):
+    """
+    Enciende o apaga ``SELECT ON mysql.proc`` para la credencial de solo lectura del MCP
+    (MariaDB < 11.3 / MySQL 5.7), lo único que deja leer el código de las rutinas ahí.
+
+    **Es SERVER-WIDE**: expone el código de las rutinas de TODAS las bases del servidor, también
+    las fuera del proyecto o excluidas; solo el filtrado del gateway lo contiene. Habilitar exige
+    ``servers.admin`` con step-up (lo aplica ``ServersAdmin`` a todo ``PUT``) y el texto de
+    ``acknowledgement`` exacto. Con credencial propia del gateway re-converge la cuenta del
+    motor; con una registrada a mano solo re-corre la sonda (``not_alterable``). 3/min.
+    """
+    result = ServerController().set_readonly_proc_grant(
+        server_id,
+        enabled=payload.enabled,
+        acknowledgement=payload.acknowledgement,
+        admin=actor,
+    )
+    return success(
+        data=result,
+        message=(
+            "Lectura de cuerpos de rutinas habilitada."
+            if payload.enabled
+            else "Lectura de cuerpos de rutinas deshabilitada."
+        ),
     )
 
 
