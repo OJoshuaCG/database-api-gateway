@@ -7,7 +7,7 @@ La credencial nunca se expone en respuestas ni se loguea.
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint, false
 from sqlalchemy import Enum as SQLAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -109,6 +109,23 @@ class Server(Base, TimestampMixin):
         DateTime,
         nullable=True,
         comment="Última sonda negativa exitosa: el motor rechazó escribir con esta credencial",
+    )
+
+    # ---- Código de rutinas en MariaDB < 11.3 / MySQL 5.7 (``SELECT ON mysql.proc``) ---- #
+    # ``mysql.proc`` es SERVER-WIDE: con el grant, la credencial de solo lectura lee el código de
+    # las rutinas de TODAS las bases del servidor, incluidas las que están fuera del proyecto o
+    # excluidas. Lo único que lo contiene es el filtrado del gateway. Por eso nace apagada y solo
+    # la enciende ``PUT /servers/{id}/readonly-credential/routine-bodies`` (servers.admin, step-up
+    # y texto de acknowledgement exacto).
+    readonly_proc_grant: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=false(),
+        comment=(
+            "Permite SELECT ON mysql.proc a la credencial de solo lectura (cuerpos de rutinas "
+            "en MariaDB <11.3 / MySQL 5.7). Expone rutinas de TODAS las bases del servidor"
+        ),
     )
 
     def __repr__(self) -> str:

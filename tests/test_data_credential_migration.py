@@ -145,7 +145,7 @@ def test_migration_never_drops_a_hand_named_constraint():
     assert "op.drop_constraint" not in _PATH.read_text()
 
 
-def test_the_migration_graph_has_a_single_head_and_ours_is_it():
+def test_the_migration_graph_has_a_single_head_and_ours_is_chained_into_it():
     script = _load_path("check_migration_graph_mod", _ROOT / "scripts" / "check_migration_graph.py")
     assert script.main() == 0
     parents = {}
@@ -155,5 +155,7 @@ def test_the_migration_graph_has_a_single_head_and_ours_is_it():
         rev, down = script._parse_migration(path)
         parents[rev] = down
     referenced = {p for down in parents.values() for p in down}
-    assert set(parents) - referenced == {"e4a6c8f0b2d5"}
+    # S6 encadenó ``f5b7d9e1a3c6`` sobre esta migración: ella es el head actual y la nuestra su padre.
+    assert set(parents) - referenced == {"f5b7d9e1a3c6"}
+    assert parents["f5b7d9e1a3c6"] == ("e4a6c8f0b2d5",)
     assert parents["e4a6c8f0b2d5"] == ("d3f5a7b9c1e4",)
