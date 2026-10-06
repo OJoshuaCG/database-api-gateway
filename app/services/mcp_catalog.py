@@ -69,6 +69,17 @@ WARN_OBJECTS_OMITTED_BY_FILTER = "mcp.warn.objects_omitted_by_filter"
 #: apagado por diseño, plan 12 §4).
 WARN_BODIES_UNAVAILABLE = "mcp.warn.bodies_unavailable"
 
+#: ``get_definition`` con el kill switch ``MCP_SCHEMA_DEFINITIONS_ENABLED`` apagado. Se evalúa
+#: ANTES de leer el inventario: apagado no se distingue de "la base no existe" por tiempo ni por
+#: efectos.
+CODE_DEFINITIONS_DISABLED = "mcp.definitions_disabled"
+#: Puede haber rutinas que el índice no lista (MariaDB < 11.3 con la bandera apagada, MySQL <
+#: 8.0.20): "no aparece" no prueba "no existe".
+WARN_ROUTINES_NOT_VISIBLE = "mcp.warn.routines_not_visible"
+#: Alguna definición devuelta tuvo credenciales enmascaradas. La redacción es best effort y NO una
+#: frontera: el aviso cuenta lo enmascarado, no promete que no quede nada.
+WARN_BODIES_REDACTED = "mcp.warn.bodies_redacted"
+
 #: ``search_schema`` no pudo leer todo lo que debía: el tope de tablas escaneadas por llamada
 #: (``MCP_SEARCH_MAX_TABLES``) o el presupuesto de tiempo lo cortaron. Los resultados son válidos
 #: pero PARCIALES para columnas y comentarios de las tablas no escaneadas.

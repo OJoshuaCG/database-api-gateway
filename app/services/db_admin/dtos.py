@@ -6,6 +6,7 @@ datos de filas de las tablas gestionadas: solo estructura/metadatos.
 
 import enum
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -299,6 +300,39 @@ class EventInfo(BaseModel):
     name: str
     schedule: str | None = None
     body: str  # DDL completo (DEFINER saneado, normalizado)
+
+
+class DefinitionRead(BaseModel):
+    """
+    Lectura CRUDA del código de UN objeto, tal como la entrega el adapter (``get_definition``).
+
+    POR QUÉ NO SE REUTILIZAN ``ViewInfo``/``RoutineInfo``/``TriggerInfo``/``EventInfo``: sus
+    cuerpos son ``str`` obligatorio porque alimentan al diff y al export, y un cuerpo NULL se
+    degrada a ``""`` con un WARNING. Acá "el motor no entregó el cuerpo" es un estado de primera
+    clase: ``body is None`` + ``unavailable_reason``.
+
+    ``body`` llega sin ``DEFINER`` pero SIN redactar: la redacción, el tope de tamaño y la huella
+    son del ``definition_reader``. Un objeto con ``body`` y con ``unavailable_reason`` a la vez es
+    inconsistente y el lector lo trata como no disponible.
+    """
+
+    kind: Literal["view", "trigger", "event", "routine"]
+    name: str
+    #: Solo ``routine``. En MySQL puede ser ``None`` si el adapter no lo distinguió.
+    routine_kind: Literal["PROCEDURE", "FUNCTION"] | None = None
+    #: PostgreSQL: argumentos de identidad de UNA sobrecarga (``integer, text``).
+    identity_arguments: str | None = None
+    body: str | None = None
+    #: Razón que el ADAPTER puede afirmar sin conocer la versión (p. ej. PostgreSQL y events).
+    unavailable_reason: Literal["insufficient_privilege", "engine_unsupported"] | None = None
+    #: ``definer`` | ``invoker``. NUNCA la cuenta: el nombre del DEFINER no sale del gateway.
+    security: Literal["definer", "invoker"] | None = None
+    check_option: str | None = None
+    trigger_table: str | None = None
+    trigger_timing: str | None = None
+    trigger_events: list[str] = Field(default_factory=list)
+    event_schedule: str | None = None
+    event_status: str | None = None
 
 
 class SchemaSnapshot(BaseModel):

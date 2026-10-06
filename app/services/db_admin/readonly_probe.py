@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 #: Privilegios que la credencial puede tener en la familia MySQL (§7.2). ``USAGE`` es "ninguno".
 MYSQL_ALLOWED_PRIVILEGES = frozenset(
@@ -87,6 +88,106 @@ def mysql_global_grants_for_version(
     if tuple(int(g) for g in m.groups()) < MYSQL_SHOW_ROUTINE_MIN_VERSION:
         return (), "MySQL < 8.0.20: SHOW_ROUTINE no existe y no se otorgó"
     return MYSQL_READONLY_GLOBAL_GRANTS, None
+
+
+#: Primera versión de MariaDB con el privilegio ``SHOW CREATE ROUTINE`` a nivel de base. Antes, el
+#: código de una rutina solo se lee con ``SELECT ON mysql.proc`` (todas las bases del servidor).
+MARIADB_SHOW_CREATE_ROUTINE_MIN_VERSION: tuple[int, int, int] = (11, 3, 0)
+#: Primera versión de MySQL sin ``mysql.proc`` (lo reemplaza el diccionario de datos): desde acá
+#: el grant ``SELECT ON mysql.proc`` no existe y no tiene sentido ofrecerlo.
+MYSQL_NO_PROC_TABLE_MIN_VERSION: tuple[int, int, int] = (8, 0, 0)
+
+#: MariaDB antepone ``5.5.5-`` a su versión real en ciertos handshakes (``5.5.5-10.11.6-MariaDB``);
+#: sin descartarlo, la versión leída sería 5.5.5 y toda decisión por versión saldría mal.
+_MARIADB_REPLICATION_PREFIX_RE = re.compile(r"^\s*5\.5\.5-(\d+\.\d+\.\d+)")
+
+_DEFINITION_ENGINE_MYSQL_FAMILY = "mysql"
+_DEFINITION_ENGINE_MARIADB = "mariadb"
+
+
+def _parse_server_version(version: str | None) -> tuple[int, int, int] | None:
+    """``(mayor, menor, parche)`` de la cadena de versión, o ``None`` si no se puede leer."""
+    raw_version = version or ""
+    prefixed = _MARIADB_REPLICATION_PREFIX_RE.match(raw_version)
+    candidate = prefixed.group(1) if prefixed else raw_version
+    match = _VERSION_RE.match(candidate)
+    if match is None:
+        return None
+    major, minor, patch = (int(group) for group in match.groups())
+    return major, minor, patch
+
+
+def _is_mariadb(version: str | None, dialect: str) -> bool:
+    return dialect == _DEFINITION_ENGINE_MARIADB or "mariadb" in (version or "").lower()
+
+
+def mariadb_routine_grants_for_version(version: str | None) -> tuple[tuple[str, ...], str | None]:
+    """
+    ``(grants por base a agregar, nota)``: ``SHOW CREATE ROUTINE`` solo en MariaDB >= 11.3. PURA.
+
+    Ante una versión ilegible NO se otorga: un ``GRANT`` con un privilegio que el servidor no
+    conoce falla con error de sintaxis DESPUÉS de rotar y revocar la cuenta, y la deja a medias
+    (mismo criterio que ``mysql_global_grants_for_version``).
+    """
+    if not _is_mariadb(version, _DEFINITION_ENGINE_MYSQL_FAMILY):
+        return (), "SHOW CREATE ROUTINE a nivel de base solo existe en MariaDB"
+    parsed = _parse_server_version(version)
+    if parsed is None:
+        return (), "versión del servidor no determinada: SHOW CREATE ROUTINE no otorgado"
+    if parsed < MARIADB_SHOW_CREATE_ROUTINE_MIN_VERSION:
+        return (), "MariaDB < 11.3: SHOW CREATE ROUTINE no existe y no se otorgó"
+    return ("SHOW CREATE ROUTINE",), None
+
+
+def proc_grant_supported(version: str | None, dialect: str) -> bool:
+    """
+    ¿Tiene sentido ``SELECT ON mysql.proc`` en este servidor? Solo MariaDB < 11.3 y MySQL < 8.0. PURA.
+
+    PostgreSQL no tiene ``mysql.proc``. Con una versión ilegible la respuesta es ``False``: no
+    se ofrece un grant que quizás no exista.
+    """
+    if dialect not in (_DEFINITION_ENGINE_MYSQL_FAMILY, _DEFINITION_ENGINE_MARIADB):
+        return False
+    parsed = _parse_server_version(version)
+    if parsed is None:
+        return False
+    if _is_mariadb(version, dialect):
+        return parsed < MARIADB_SHOW_CREATE_ROUTINE_MIN_VERSION
+    return parsed < MYSQL_NO_PROC_TABLE_MIN_VERSION
+
+
+def routine_body_reason(
+    engine: str, version: str | None, proc_flag: bool
+) -> Literal["flag_off", "engine_unsupported"] | None:
+    """
+    Por qué el cuerpo de una RUTINA no está disponible según motor y versión, o ``None`` si la
+    versión no lo explica (el llamador cae en ``insufficient_privilege``). PURA.
+
+    - MariaDB < 11.3 o MySQL 5.7 (< 8.0) con la bandera ``readonly_proc_grant`` apagada:
+      ``flag_off`` (un administrador PUEDE habilitarlo). Con la bandera prendida y sin cuerpo, el
+      motivo ya no es la bandera: ``None``.
+    - MySQL 8.0.0 a 8.0.19: ``engine_unsupported``. No hay ``mysql.proc`` ni ``SHOW_ROUTINE``
+      (llega en 8.0.20), así que NO existe grant que lo arregle.
+    - MySQL 8.0.20+ y MariaDB 11.3+: ``None`` (el motivo es privilegio o DEFINER).
+    - PostgreSQL y versión ilegible: ``None`` (conservador).
+
+    ``engine`` es el dialecto del gateway (``mysql``, ``mariadb`` o ``postgresql``); un servidor
+    registrado como ``mysql`` cuya versión dice MariaDB se trata como MariaDB.
+    """
+    if engine not in (_DEFINITION_ENGINE_MYSQL_FAMILY, _DEFINITION_ENGINE_MARIADB):
+        return None
+    parsed = _parse_server_version(version)
+    if parsed is None:
+        return None
+    if _is_mariadb(version, engine):
+        if parsed < MARIADB_SHOW_CREATE_ROUTINE_MIN_VERSION and not proc_flag:
+            return "flag_off"
+        return None
+    if parsed < MYSQL_NO_PROC_TABLE_MIN_VERSION:
+        return None if proc_flag else "flag_off"
+    if parsed < MYSQL_SHOW_ROUTINE_MIN_VERSION:
+        return "engine_unsupported"
+    return None
 
 
 def mysql_has_unrecognized_grants(lines: list[str]) -> bool:

@@ -20,10 +20,14 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
-ObjectKind = Literal["table", "view", "routine", "trigger", "sequence"]
-UnavailableReason = Literal["insufficient_privilege", "engine_unsupported", "scope_disabled"]
+ObjectKind = Literal["table", "view", "routine", "trigger", "sequence", "event"]
+#: Por qué un cuerpo no está disponible en ``list_objects``. ``flag_off`` y ``too_large`` se suman
+#: para que el índice y ``get_definition`` hablen el mismo vocabulario cerrado.
+UnavailableReason = Literal[
+    "insufficient_privilege", "engine_unsupported", "scope_disabled", "flag_off", "too_large"
+]
 
 #: El aviso que va al frente del bloque de texto. Mitigación de eficacia desconocida contra
 #: inyección de prompt: el control real es que no existe ninguna tool mutante.
@@ -217,6 +221,95 @@ class SchemaOut(_Out):
     #: Lo pedido que no existe en la base. Explícito para que "no vino" nunca se confunda con
     #: "se omitió": el envelope ya garantiza que no se omite nada.
     missing: list[ObjectRefOut]
+
+
+# ---- get_definition -------------------------------------------------------- #
+
+DefinitionKind = Literal["view", "trigger", "event", "routine"]
+#: Vocabulario CERRADO. ``not_found`` NO está a propósito: un objeto que no existe va a
+#: ``missing`` y nunca es un objeto "sin cuerpo" (confundirlos le diría al agente que existe).
+DefinitionUnavailableReason = Literal[
+    "insufficient_privilege", "engine_unsupported", "scope_disabled", "flag_off", "too_large"
+]
+
+
+class TriggerMetaOut(_Out):
+    table: str
+    timing: str | None
+    events: list[str]
+
+
+class EventMetaOut(_Out):
+    schedule: str | None
+    status: str | None
+
+
+class RedactionCountOut(_Out):
+    """Cuántas apariciones de una categoría (jamás el valor): ``category`` es de un set cerrado."""
+
+    category: str
+    count: int
+
+
+class DefinitionOut(_Out):
+    """
+    El código de UN objeto, con su disponibilidad explícita (nunca un éxito vacío).
+
+    ``body`` es texto de terceros: la tool lo lista en ``untrusted_fields``. ``security`` es solo
+    el MODO (``definer``/``invoker``): la cuenta del DEFINER nunca sale del gateway. Los nombres de
+    campo evitan ``host``/``port``/``password``/``encrypted``/``confirm_token`` (test de subcadenas).
+    """
+
+    kind: DefinitionKind
+    name: str
+    routine_kind: Literal["PROCEDURE", "FUNCTION"] | None
+    #: PostgreSQL: los argumentos de identidad de UNA sobrecarga.
+    identity_arguments: str | None
+    body_available: bool
+    unavailable_reason: DefinitionUnavailableReason | None
+    body: str | None
+    size_bytes: int | None
+    body_fingerprint: str | None
+    security: Literal["definer", "invoker"] | None
+    check_option: str | None
+    trigger: TriggerMetaOut | None
+    event: EventMetaOut | None
+    redactions: list[RedactionCountOut]
+    flagged: list[RedactionCountOut]
+
+    @model_validator(mode="after")
+    def _availability_is_consistent(self) -> DefinitionOut:
+        """
+        ``body_available`` XOR ``unavailable_reason``; el cuerpo existe solo si está disponible.
+
+        Se valida en el modelo y no solo en quien lo arma: un mapeador futuro que se equivoque
+        falla al construir la respuesta, no entrega un "disponible" sin cuerpo.
+        """
+        if self.body_available:
+            if self.unavailable_reason is not None:
+                raise ValueError("body_available=true no admite unavailable_reason")
+            if not self.body:
+                raise ValueError("body_available=true exige un body no vacío")
+            return self
+        if self.unavailable_reason is None:
+            raise ValueError("body_available=false exige unavailable_reason")
+        if self.body is not None or self.body_fingerprint is not None:
+            raise ValueError("un objeto sin cuerpo disponible no lleva body ni body_fingerprint")
+        if self.unavailable_reason == "too_large" and self.size_bytes is None:
+            raise ValueError("too_large exige size_bytes")
+        return self
+
+
+class DefinitionRefOut(_Out):
+    kind: DefinitionKind
+    name: str
+    routine_kind: Literal["PROCEDURE", "FUNCTION"] | None
+
+
+class DefinitionsOut(_Out):
+    objects: list[DefinitionOut]
+    #: Lo pedido que NO está en el índice de la base. Explícito: "no vino" != "sin cuerpo".
+    missing: list[DefinitionRefOut]
 
 
 # ---- search_schema --------------------------------------------------------- #
