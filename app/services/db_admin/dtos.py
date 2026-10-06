@@ -335,6 +335,32 @@ class DefinitionRead(BaseModel):
     event_status: str | None = None
 
 
+class TableStatsRead(BaseModel):
+    """
+    Estadísticas de almacenamiento de UNA tabla, tal como las entrega el catálogo del motor
+    (``get_table_stats``). Solo metadatos: jamás filas.
+
+    ``row_estimate`` y ``auto_increment`` quedan en ``None`` cuando el adapter NO los leyó
+    (``include_row_estimates=False``): son el estimado de ``COUNT(*)`` y el siguiente valor de la
+    secuencia de la clave, o sea una aproximación de lo que da ``count_rows`` con scope
+    ``data.read``. Un ``None`` no distingue "no se pidió" de "el motor no lo informa": quien
+    decide qué sale al agente es el mapeador de la tool, según el scope del llamador.
+    """
+
+    table: str
+    #: Motor de almacenamiento (``InnoDB``). ``None`` en PostgreSQL: no tiene el concepto.
+    engine: str | None = None
+    #: Collation de la TABLA. ``None`` en PostgreSQL (la collation es por columna).
+    collation: str | None = None
+    data_bytes: int | None = None
+    index_bytes: int | None = None
+    #: Naive y en la zona horaria del motor tal como las informa; PostgreSQL no las guarda.
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    row_estimate: int | None = None
+    auto_increment: int | None = None
+
+
 class SchemaSnapshot(BaseModel):
     """
     Snapshot estructural canónico y COMPLETO de una BD (solo estructura, jamás filas).

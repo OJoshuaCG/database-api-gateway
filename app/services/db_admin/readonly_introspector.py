@@ -40,6 +40,7 @@ from app.services.db_admin.dtos import (
     SchemaSnapshot,
     SequenceInfo,
     TableSchema,
+    TableStatsRead,
     TriggerInfo,
     ViewInfo,
 )
@@ -123,6 +124,25 @@ class ReadonlyIntrospector:
         self.__session.check_deadline()
         return self.__adapter.read_definition(
             self.__session.conn, self.database, self._schema(), kind, name, routine_kind
+        )
+
+    def table_stats(
+        self, tables: Sequence[str], *, include_row_estimates: bool
+    ) -> list[TableStatsRead]:
+        """
+        Estadísticas de almacenamiento de tablas YA presentes en el índice (``get_table_stats``).
+
+        Solo metadatos del catálogo, jamás filas. ``include_row_estimates`` es la decisión de
+        scope que toma quien llama (``target_resolution``); con ``False`` el adapter no lee
+        ``row_estimate`` ni ``auto_increment``.
+        """
+        self.__session.check_deadline()
+        return self.__adapter.read_table_storage_stats(
+            self.__session.conn,
+            self.database,
+            self._schema(),
+            list(tables),
+            include_row_estimates=include_row_estimates,
         )
 
     def server_version(self) -> str | None:

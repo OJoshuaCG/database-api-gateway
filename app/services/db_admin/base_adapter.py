@@ -64,6 +64,7 @@ from app.services.db_admin.dtos import (
     TableCollationInfo,
     TableSchema,
     TableStat,
+    TableStatsRead,
     TextForeignKey,
     TriggerInfo,
     UniqueConstraintInfo,
@@ -277,6 +278,48 @@ class ServerAdapter(ABC):
                 status_code=422,
                 context={"allowed": sorted(self._DEFINITION_KINDS)},
             )
+
+    def read_table_storage_stats(
+        self,
+        conn: Connection,
+        database: str,
+        schema: str,
+        tables: Sequence[str],
+        *,
+        include_row_estimates: bool,
+    ) -> list[TableStatsRead]:
+        """
+        Estadísticas de almacenamiento de las tablas pedidas (``get_table_stats`` del MCP).
+
+        ``tables`` son nombres que el llamador ya validó contra el índice de la base: se enlazan
+        como parámetros, nunca se interpolan. ``include_row_estimates=False`` hace que
+        ``row_estimate`` y ``auto_increment`` NI SIQUIERA se lean del motor: son una aproximación
+        de ``count_rows`` y solo salen para un llamador con ``data.read``, así que el dato no
+        viaja por el proceso cuando no se va a entregar.
+
+        Default: el motor no sabe leerlas. Se levanta un error y NO se devuelve ``[]``: una lista
+        vacía se leería como "ninguna de esas tablas tiene estadísticas".
+        """
+        raise AppHttpException(
+            message="Este motor no expone estadísticas de tablas.",
+            status_code=422,
+            context={"engine": self.dialect},
+        )
+
+    @staticmethod
+    def _bound_name_list(names: Sequence[str]) -> tuple[str, dict[str, str]]:
+        """
+        ``("(:t0, :t1)", {"t0": ..., "t1": ...})`` para un ``IN`` con valores enlazados.
+
+        El texto SQL solo contiene los marcadores ``:t<n>`` que arma esta función; los nombres
+        viajan en el diccionario de parámetros y el driver los escapa. Exige al menos un nombre:
+        un ``IN ()`` vacío es un error de sintaxis y su llamador ya filtró ese caso.
+        """
+        if not names:
+            raise ValueError("_bound_name_list necesita al menos un nombre")
+        params = {f"t{position}": name for position, name in enumerate(names)}
+        placeholders = ", ".join(f":{key}" for key in params)
+        return f"({placeholders})", params
 
     def _definition_rows_or_none(self, conn: Connection, sql: str, params: dict | None = None):
         """

@@ -42,6 +42,7 @@ from app.services.db_admin.dtos import (
     RoutineParam,
     StructureDump,
     TableCollationInfo,
+    TableStatsRead,
     TextForeignKey,
     TriggerInfo,
     ViewInfo,
@@ -2701,6 +2702,69 @@ class MySQLAdapter(ServerAdapter):
             )
         ]
 
+    # ------------------------- get_table_stats (almacenamiento) --------------- #
+    def read_table_storage_stats(
+        self,
+        conn,
+        database: str,
+        schema: str,
+        tables: Sequence[str],
+        *,
+        include_row_estimates: bool,
+    ) -> list[TableStatsRead]:
+        """
+        Estadísticas de ``information_schema.TABLES`` filtradas por ``TABLE_SCHEMA = :db`` y por
+        los nombres pedidos, todo enlazado.
+
+        La lista de columnas es una constante de este método: sin ``include_row_estimates`` se
+        selecciona ``NULL`` en lugar de ``TABLE_ROWS``/``AUTO_INCREMENT`` para que ese dato no
+        salga del motor. Se compara el nombre devuelto contra el pedido en Python además del
+        ``IN``: la collation del catálogo puede ser insensible a mayúsculas y devolver una tabla
+        ``Clientes`` para el pedido ``clientes``, que NO es la que el índice listó.
+        """
+        if not tables:
+            return []
+        estimate_columns = "TABLE_ROWS, AUTO_INCREMENT" if include_row_estimates else "NULL, NULL"
+        name_list_sql, name_params = self._bound_name_list(tables)
+        statement = (
+            "SELECT TABLE_NAME, ENGINE, TABLE_COLLATION, DATA_LENGTH, INDEX_LENGTH, "
+            f"CREATE_TIME, UPDATE_TIME, {estimate_columns} "
+            "FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA = :db AND TABLE_NAME IN {name_list_sql}"
+        )
+        try:
+            rows = conn.execute(text(statement), {"db": database, **name_params}).fetchall()
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="read_table_storage_stats", target=self.target, extra={"database": database}
+            )
+        requested_names = set(tables)
+        reads_by_name: dict[str, TableStatsRead] = {}
+        for (
+            table_name,
+            engine_name,
+            table_collation,
+            data_length,
+            index_length,
+            create_time,
+            update_time,
+            table_rows,
+            auto_increment,
+        ) in rows:
+            if table_name not in requested_names:
+                continue
+            reads_by_name[table_name] = TableStatsRead(
+                table=table_name,
+                engine=None if engine_name is None else str(engine_name),
+                collation=None if table_collation is None else str(table_collation),
+                data_bytes=None if data_length is None else int(data_length),
+                index_bytes=None if index_length is None else int(index_length),
+                created_at=create_time,
+                updated_at=update_time,
+                row_estimate=None if table_rows is None else int(table_rows),
+                auto_increment=None if auto_increment is None else int(auto_increment),
+            )
+        return [reads_by_name[name] for name in tables if name in reads_by_name]
 
     # ------------------------- generación de DDL (Fase 3) --------------------- #
     # NOTA: los type strings (col.type) provienen de introspección y se emiten

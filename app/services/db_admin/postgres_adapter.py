@@ -13,6 +13,7 @@ Particularidades frente a MySQL:
 
 import hashlib
 import re
+from collections.abc import Sequence
 
 from sqlalchemy import MetaData, Table, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -42,6 +43,7 @@ from app.services.db_admin.dtos import (
     SequenceInfo,
     StructureDump,
     TableCollationInfo,
+    TableStatsRead,
     TriggerInfo,
     ViewInfo,
 )
@@ -2090,6 +2092,60 @@ class PostgresAdapter(ServerAdapter):
         ):
             out.append(ExtensionInfo(name=extname, version=str(extversion) if extversion else None))
         return out
+
+    # ------------------------- get_table_stats (almacenamiento) --------------- #
+    def read_table_storage_stats(
+        self,
+        conn,
+        database: str,
+        schema: str,
+        tables: Sequence[str],
+        *,
+        include_row_estimates: bool,
+    ) -> list[TableStatsRead]:
+        """
+        Estadísticas de ``pg_class`` del schema fijado (``public``), con nombres y schema
+        enlazados.
+
+        Bytes de datos = ``pg_total_relation_size`` menos ``pg_indexes_size`` (heap + TOAST + mapas
+        de espacio); bytes de índices = ``pg_indexes_size``. PostgreSQL no guarda motor de
+        almacenamiento, collation de tabla ni fechas de creación o modificación: salen ``None``.
+        ``reltuples`` es -1 en una tabla que nunca pasó por ``ANALYZE``/``VACUUM``: se informa
+        ``None`` ("el motor no lo sabe") y NO un conteo negativo. Sin ``include_row_estimates`` se
+        selecciona ``NULL`` en lugar de ``reltuples``.
+        """
+        if not tables:
+            return []
+        row_estimate_column = (
+            "CASE WHEN c.reltuples < 0 THEN NULL ELSE c.reltuples::bigint END"
+            if include_row_estimates
+            else "NULL"
+        )
+        name_list_sql, name_params = self._bound_name_list(tables)
+        statement = (
+            "SELECT c.relname, pg_total_relation_size(c.oid) - pg_indexes_size(c.oid), "
+            f"pg_indexes_size(c.oid), {row_estimate_column} "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            f"WHERE n.nspname = :schema AND c.relkind IN ('r', 'p') AND c.relname IN {name_list_sql}"
+        )
+        try:
+            rows = conn.execute(text(statement), {"schema": schema, **name_params}).fetchall()
+        except SQLAlchemyError as exc:
+            raise map_driver_error(
+                exc, op="read_table_storage_stats", target=self.target, extra={"database": database}
+            )
+        requested_names = set(tables)
+        reads_by_name: dict[str, TableStatsRead] = {}
+        for relation_name, data_bytes, index_bytes, row_estimate in rows:
+            if relation_name not in requested_names:
+                continue
+            reads_by_name[relation_name] = TableStatsRead(
+                table=relation_name,
+                data_bytes=None if data_bytes is None else int(data_bytes),
+                index_bytes=None if index_bytes is None else int(index_bytes),
+                row_estimate=None if row_estimate is None else int(row_estimate),
+            )
+        return [reads_by_name[name] for name in tables if name in reads_by_name]
 
     # ------------------------- generación de DDL (Fase 3) --------------------- #
     # Todo NOMBRE de objeto pasa por validate_identifier + quote_identifier (self._q).
