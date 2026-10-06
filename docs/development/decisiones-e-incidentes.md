@@ -2326,3 +2326,25 @@ legible lo fija el `GRANT` de la cuenta de datos.
 **No verificado contra un motor real.** `tests/test_run_select_e2e.py` está escrito y se SALTA sin
 Docker; nadie lo ejecutó. Que el motor acepte el render canónico de cada forma permitida, aplique
 `READ ONLY` y el `GRANT`, y corte por timeout es una afirmación de diseño, no un hecho medido.
+
+## MCP definiciones de esquema, S1: los adapters ya no fingen "objeto vacío"
+
+**Qué fallaba.** Tres caminos devolvían un cuerpo vacío (o un 500 opaco) cuando el motor no entregaba
+el código de un objeto, indistinguible de "el objeto está vacío":
+(1) PostgreSQL leía las vistas de `information_schema.views`, cuyo `view_definition` es NULL para quien
+no es dueño de la vista; la credencial de solo lectura del gateway nunca lo es, así que todo cuerpo
+salía `""`. Ahora `_snapshot_views` usa `pg_class` + `pg_get_viewdef`. (2) En MySQL/MariaDB un
+`SHOW CREATE` sin privilegio puede devolver la columna del cuerpo en NULL y `_strip_definer_clause(None)`
+lanzaba `TypeError` (500 que tumbaba el snapshot entero). (3) Una vista con `VIEW_DEFINITION` NULL
+terminaba en `str(vdef or "")`, otra vez `""` mudo.
+
+**Qué se hizo y qué NO.** `_strip_definer_clause` acepta `None`; los hooks del snapshot dejan un
+WARNING con tipo y nombre (nunca el cuerpo). El DTO interno sigue siendo `str` (`""`) a propósito: el
+diff y el export dependen de ese contrato y la señal tipada "no disponible" vive en `DefinitionRead`
+(slices siguientes). Agregado: `ReadonlyIntrospector.events()`, `EventInfo.schedule` armado por el
+gateway (`AT ...` / `EVERY n UNIDAD`) y la clave `event` en `list_object_names` (`[]` en PostgreSQL).
+
+**Riesgo residual.** El diff/export sigue ciego para un objeto cuyo cuerpo el motor no entrega
+(MariaDB sin privilegio): ahora deja rastro en el log, pero `diff_schemas` ve `""` y no "no disponible".
+El camino `dump_structure` de PostgreSQL (vistas del export) todavía lee `information_schema.views`;
+no se tocó en esta slice. No verificado contra un motor real.
