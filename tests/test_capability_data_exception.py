@@ -31,7 +31,7 @@ from app.services.capability_catalog import (
     GatewayRole,
 )
 
-PAR = {Capability.DATA_READ, Capability.DATA_QUERY}
+PAR = {Capability.DATA_READ, Capability.DATA_QUERY, Capability.DATA_DEFINITIONS}
 
 
 def _con_spec(monkeypatch, cap: Capability, **cambios) -> None:
@@ -167,10 +167,10 @@ def test_the_data_capabilities_are_grantable_sensitive_and_need_a_second_approve
         assert rows[cap.value]["discloses"] and not rows[cap.value]["mutates"]
 
 
-def test_the_sensitive_set_is_the_old_eleven_plus_the_two_data_capabilities():
+def test_the_sensitive_set_is_the_old_eleven_plus_the_three_data_capabilities():
     sensibles = {s.id.value for s in CAPABILITIES if cc.is_sensitive(s.id)}
-    assert len(sensibles) == 13
-    assert {"data.read", "data.query"} <= sensibles
+    assert len(sensibles) == 14
+    assert {"data.read", "data.query", "data.definitions"} <= sensibles
     assert sensibles == cc._SENSITIVE_POLICY
 
 

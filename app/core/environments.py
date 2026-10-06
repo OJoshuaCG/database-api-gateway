@@ -502,12 +502,19 @@ MCP_DATA_ACCOUNT_PREFIX = os.getenv("MCP_DATA_ACCOUNT_PREFIX", "mcp_d_").strip()
 # de datos la rechazan (`PROBE_NOT_GREEN`) hasta re-verificar: un grant cambiado a mano en el motor
 # no puede quedar escondido detrás de una verificación vieja. Entero >= 1.
 MCP_DATA_CREDENTIAL_MAX_AGE_DAYS = int(os.getenv("MCP_DATA_CREDENTIAL_MAX_AGE_DAYS", "7"))
-# KILL SWITCHES de las tools de DATOS del MCP (`data.read`, `data.query`). Nacen APAGADOS y son
+# KILL SWITCHES de las tools de DATOS del MCP (`data.read`, `data.query`; el de `data.definitions` va abajo). Nacen APAGADOS y son
 # independientes: con uno apagado su scope queda INERTE (`parse_scopes` lo descarta), sus tools
 # desaparecen de `tools/list` y el gate (`resolve_agent_data_database`) niega con `DATA_DISABLED`.
 # Un token con scope de datos emitido antes no hace nada hasta que alguien los encienda a propósito.
 MCP_DATA_READ_ENABLED = os.getenv("MCP_DATA_READ_ENABLED", "false").lower() == "true"
 MCP_DATA_QUERY_ENABLED = os.getenv("MCP_DATA_QUERY_ENABLED", "false").lower() == "true"
+# Kill switch del scope `data.definitions` (definiciones de vistas, triggers, eventos y rutinas).
+# Mismo contrato que los dos de arriba y también independiente: APAGADO por defecto, con el scope
+# inerte. El cuerpo de un objeto puede llevar literales y reglas de negocio del tercero, por eso
+# no se enciende solo al desplegar el código.
+MCP_SCHEMA_DEFINITIONS_ENABLED = (
+    os.getenv("MCP_SCHEMA_DEFINITIONS_ENABLED", "false").lower() == "true"
+)
 # Tope PROPIO, en días, de la vida de un token con scope de datos. `0` (el valor por defecto) lo
 # desactiva: el token vive lo mismo que cualquiera, hasta `MCP_TOKEN_MAX_TTL_DAYS`. Un valor >= 1
 # lo vuelve a activar y debe ser menor que ese tope general para tener efecto: un bearer que lee

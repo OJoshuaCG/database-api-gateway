@@ -36,7 +36,7 @@ seguro — en particular ``GET .../content`` no consume el artefacto con este 40
 LOS TOKENS DE AGENTE NUNCA LLEGAN ACÁ
 -------------------------------------
 El techo de agente no tiene ninguna capacidad con step-up (invariante 11 del catálogo) SALVO la
-excepción cerrada ``AGENT_DATA_EXCEPTIONS`` (``data.read``, ``data.query``; invariante 13). Un
+excepción cerrada ``AGENT_DATA_EXCEPTIONS`` (``data.read``, ``data.query``, ``data.definitions``; invariante 13). Un
 token no tiene contraseña que reconfirmar, así que el step-up de esas dos lo cumple el EMISOR al
 emitir o editar el token (``api_token_controller._validate_scopes`` llama a ``assert_step_up``
 con el actor humano), nunca el token. Si un actor de token llegara igual a ``assert_step_up``, es

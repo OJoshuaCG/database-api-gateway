@@ -113,6 +113,7 @@ def test_the_disclosing_capabilities_are_the_expected_ones():
         Capability.SQL_CONSOLE_EXECUTE,
         Capability.DATA_READ,
         Capability.DATA_QUERY,
+        Capability.DATA_DEFINITIONS,
     }
 
 

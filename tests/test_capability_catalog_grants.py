@@ -25,10 +25,11 @@ SENSITIVE = {
     "collation.execute",
     "data.read",
     "data.query",
+    "data.definitions",
 }
 
 
-def test_sensitive_set_is_exactly_the_thirteen_policy_capabilities():
+def test_sensitive_set_is_exactly_the_fourteen_policy_capabilities():
     assert {s.id.value for s in CAPABILITIES if cc.is_sensitive(s.id)} == SENSITIVE
 
 

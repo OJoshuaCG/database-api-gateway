@@ -402,6 +402,8 @@ EnvironmentsWrite = Annotated[Actor, Depends(require(Capability.ENVIRONMENTS_WRI
 #: lo consume la tool ``run_select`` del MCP.
 DataRead = Annotated[Actor, Depends(require(Capability.DATA_READ))]
 DataQuery = Annotated[Actor, Depends(require(Capability.DATA_QUERY))]
+#: Igual que ``DataQuery``: ninguna ruta HTTP lo usa. Lo consume la tool ``get_definition`` del MCP.
+DataDefinitions = Annotated[Actor, Depends(require(Capability.DATA_DEFINITIONS))]
 
 #: Usuarios del gateway, accesos, capacidades puntuales, tokens y preparación de alcances. Solo
 #: la global ``access_admin``.
