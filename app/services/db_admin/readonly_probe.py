@@ -53,6 +53,12 @@ MYSQL_ALLOWED_PRIVILEGES = frozenset(
 #: cuenta es una anomalía y la sonda los reporta, aunque estén en ``MYSQL_ALLOWED_PRIVILEGES``.
 _MARIADB_ONLY_PRIVILEGES = frozenset({MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE})
 
+#: Única tabla del esquema ``mysql`` sobre la que el aprovisionamiento puede otorgar ``SELECT``, y
+#: solo con la bandera ``servers.readonly_proc_grant`` encendida en un motor que la necesita
+#: (MariaDB < 11.3, MySQL < 8.0). ÚNICO lugar donde vive el literal: el ``GRANT`` y la sonda lo
+#: toman de acá. Es SERVER-WIDE: expone el código de las rutinas de todas las bases del servidor.
+MYSQL_PROC_TABLE = "mysql.proc"
+
 #: Privilegios que se aceptan sobre ``*.*``. ``SELECT ON *.*`` NO: incluye ``mysql.servers``, que
 #: guarda usuario y contraseña en claro (§7.2, "nunca ``SELECT ON mysql.*``").
 _MYSQL_GLOBAL_OK = frozenset({"USAGE", "SHOW_ROUTINE"})
@@ -93,12 +99,20 @@ class ReadonlyPreflight:
     ``db_extra_grants``: privilegios que se SUMAN a ``MYSQL_READONLY_DB_GRANTS`` en cada base
     (``SHOW CREATE ROUTINE`` en MariaDB >= 11.3; vacío en cualquier otro motor o versión). Va al
     final para no mover los campos posicionales existentes.
+
+    ``proc_grant_supported``: el motor y su versión necesitan y admiten ``SELECT ON mysql.proc``
+    (``proc_grant_supported()``; lo decide el adapter con la versión que lee). ``proc_grant``:
+    el aprovisionamiento DEBE otorgarlo en esta corrida. Lo fija el controller como
+    ``bandera del servidor AND proc_grant_supported``; el adapter nunca lo deduce por su cuenta,
+    porque la bandera es una decisión de un administrador y no un hecho del motor.
     """
 
     exists: bool
     global_grants: tuple[str, ...] = ()
     note: str | None = None
     db_extra_grants: tuple[str, ...] = ()
+    proc_grant_supported: bool = False
+    proc_grant: bool = False
 
 
 def mysql_global_grants_for_version(
@@ -265,13 +279,23 @@ def _normalize_object(obj: str) -> str:
     return obj.replace("`", "").replace('"', "").lower()
 
 
-def mysql_grant_violations(lines: list[str], *, is_mariadb: bool = False) -> list[str]:
+def mysql_grant_violations(
+    lines: list[str], *, is_mariadb: bool = False, allow_mysql_proc: bool = False
+) -> list[str]:
     """
     Motivos por los que un ``SHOW GRANTS FOR CURRENT_USER()`` permite escribir o divulgar.
 
     ``is_mariadb``: los privilegios de ``_MARIADB_ONLY_PRIVILEGES`` solo se toleran si es True, y
     solo a nivel de base (``db.*``). Por defecto False: ante la duda de motor no se asume
     el permisivo (mismo criterio que ``lower_case_table_names`` en la sonda de datos).
+
+    ``allow_mysql_proc``: tolera ``SELECT ON mysql.proc`` y NADA más del esquema ``mysql``. Es
+    True solo cuando la bandera ``readonly_proc_grant`` del servidor está encendida Y el motor la
+    necesita (el llamador resuelve ambas con ``proc_grant_supported``). Con False —el default— ese
+    grant es ``select_on_mysql_schema``: ``mysql.proc`` expone las rutinas de TODAS las bases del
+    servidor, y una credencial que lo tiene sin que un administrador lo haya aceptado no verifica.
+    ``SELECT ON mysql.*`` o sobre cualquier otra tabla de ``mysql`` es violación con cualquier
+    valor: ``mysql.user`` y ``mysql.servers`` guardan secretos.
 
     Devuelve códigos cortos y estables (sin el texto del grant: puede llevar el host de la
     cuenta), en el orden en que aparecen y sin repetir.
@@ -308,9 +332,24 @@ def mysql_grant_violations(lines: list[str], *, is_mariadb: bool = False) -> lis
             elif priv in _MARIADB_ONLY_PRIVILEGES and not obj.endswith(".*"):
                 # Solo a nivel de base: sobre una tabla o rutina suelta no es lo que se aprovisiona.
                 add(f"non_database_privilege:{priv.lower().replace(' ', '_')}")
-            elif obj.startswith("mysql.") and priv == "SELECT" and obj != "mysql.proc":
-                add("select_on_mysql_schema")
+            elif obj.startswith("mysql.") and priv == "SELECT":
+                is_tolerated_proc_grant = allow_mysql_proc and obj == MYSQL_PROC_TABLE
+                if not is_tolerated_proc_grant:
+                    add("select_on_mysql_schema")
     return out
+
+
+# Lo que el aprovisionamiento otorga con la bandera encendida TIENE que pasar la sonda con la
+# bandera encendida, y NO pasarla con la bandera apagada: si divergen, o nada verifica o la
+# bandera no se hace cumplir. Se detecta en el import y no en producción.
+_PROC_GRANT_SHOW_GRANTS_LINE = f"GRANT SELECT ON {MYSQL_PROC_TABLE} TO `u`@`%`"
+assert mysql_grant_violations([_PROC_GRANT_SHOW_GRANTS_LINE], allow_mysql_proc=True) == []
+assert mysql_grant_violations([_PROC_GRANT_SHOW_GRANTS_LINE], allow_mysql_proc=False) == [
+    "select_on_mysql_schema"
+]
+assert mysql_grant_violations(["GRANT SELECT ON mysql.* TO `u`@`%`"], allow_mysql_proc=True) == [
+    "select_on_mysql_schema"
+]
 
 
 def postgres_role_violations(facts: dict) -> list[str]:
@@ -592,5 +631,7 @@ __all__ = [
     "is_mariadb_engine",
     "MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE",
     "MARIADB_READONLY_DB_EXTRA_GRANTS",
+    "MYSQL_PROC_TABLE",
+    "proc_grant_supported",
     "postgres_role_violations",
 ]

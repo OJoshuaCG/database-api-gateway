@@ -83,6 +83,7 @@ class _MotorFalso:
         self.con_roles = False  # el preflight rechaza: la cuenta tiene roles otorgados
         self.preflights = []  # (usuario, host): lecturas previas a mutar
         self.objetivos = []  # targets con los que se pidió un adapter
+        self.allow_mysql_proc_vistos = []  # bandera con la que se pidió la sonda
 
     def adapter(self, target):
         self.objetivos.append(target)
@@ -119,7 +120,8 @@ class _AdapterFalso:
     def test_connection(self):
         return ConnectionInfo(ok=True, dialect="mysql", server_version="8.0.36")
 
-    def readonly_violations(self):
+    def readonly_violations(self, *, allow_mysql_proc=False):
+        self._m.allow_mysql_proc_vistos.append(allow_mysql_proc)
         return list(self._m.violaciones)
 
 

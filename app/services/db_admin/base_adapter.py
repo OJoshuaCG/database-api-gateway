@@ -967,10 +967,13 @@ class ServerAdapter(ABC):
                 exc, op="column_counts", target=self.target, extra={"database": database}
             )
 
-    def readonly_violations(self) -> list[str]:
+    def readonly_violations(self, *, allow_mysql_proc: bool = False) -> list[str]:
         """
         Sonda NEGATIVA de la credencial de solo lectura (plan 12 §5.2): la lista de motivos por
         los que esta credencial **podría escribir**. Vacía = el motor observó que no puede.
+
+        ``allow_mysql_proc``: bandera ``readonly_proc_grant`` del servidor; solo la familia MySQL
+        la usa (tolera ``SELECT ON mysql.proc``, y nada más de ``mysql``).
 
         Corre con la credencial del ``target`` (la de solo lectura, nunca la pseudo-root). El
         default es **fail-closed**: un motor sin sonda implementada no se verifica nunca, así que

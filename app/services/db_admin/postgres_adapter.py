@@ -296,9 +296,10 @@ class PostgresAdapter(ServerAdapter):
         "pg_read_server_files",
     )
 
-    def readonly_violations(self) -> list[str]:
+    def readonly_violations(self, *, allow_mysql_proc: bool = False) -> list[str]:
         """
-        Sonda negativa (plan 12 §5.2) para PostgreSQL: atributos del rol, privilegios de
+        Sonda negativa (plan 12 §5.2) para PostgreSQL (``allow_mysql_proc`` no aplica y se ignora:
+        PostgreSQL no tiene ``mysql.proc``): atributos del rol, privilegios de
         creación, roles de escritura y **un intento real de escritura** que el motor tiene que
         rechazar.
 

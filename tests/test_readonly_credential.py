@@ -50,7 +50,7 @@ class _AdapterFalso:
     def test_connection(self):
         return ConnectionInfo(ok=True, dialect="mysql", server_version="8.0.36")
 
-    def readonly_violations(self):
+    def readonly_violations(self, *, allow_mysql_proc=False):
         return list(self._violaciones)
 
 
@@ -237,7 +237,9 @@ def test_mysql_minimal_grants_pass():
         "GRANT SELECT, SHOW VIEW, TRIGGER, EVENT ON `la_base`.* TO `mcp_ro`@`10.0.0.%`",
         "GRANT SELECT ON `mysql`.`proc` TO `mcp_ro`@`%`",
     ]
-    assert mysql_grant_violations(lineas) == []
+    # ``SELECT ON mysql.proc`` ya no es gratis: solo pasa con la bandera ``readonly_proc_grant``.
+    assert mysql_grant_violations(lineas, allow_mysql_proc=True) == []
+    assert mysql_grant_violations(lineas) == ["select_on_mysql_schema"]
 
 
 @pytest.mark.parametrize(

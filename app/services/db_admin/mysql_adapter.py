@@ -62,11 +62,13 @@ from app.services.db_admin.identifiers import (
 )
 from app.services.db_admin.protected_accounts import MYSQL_SYSTEM_USERS
 from app.services.db_admin.readonly_probe import (
+    MYSQL_PROC_TABLE,
     ReadonlyPreflight,
     is_mariadb_engine,
     mariadb_routine_grants_for_version,
     mysql_global_grants_for_version,
     mysql_has_unrecognized_grants,
+    proc_grant_supported,
 )
 from app.services.server_catalog import CODE_READONLY_ACCOUNT_HAS_ROLES
 from app.services.db_admin.sql_dialect import mask_quoted_spans
@@ -318,10 +320,15 @@ class MySQLAdapter(ServerAdapter):
         # Conectados a la BD, el Inspector usa el schema = nombre de la BD.
         return database
 
-    def readonly_violations(self) -> list[str]:
+    def readonly_violations(self, *, allow_mysql_proc: bool = False) -> list[str]:
         """
         Sonda negativa (plan 12 §5.2) para la familia MySQL: clasifica ``SHOW GRANTS`` contra
         la allowlist de ``readonly_probe``.
+
+        ``allow_mysql_proc`` es la bandera ``readonly_proc_grant`` del servidor. Solo se honra si
+        además el motor la necesita (``proc_grant_supported``): en MySQL 8.0+ o MariaDB 11.3+
+        ``SELECT ON mysql.proc`` no tiene sentido y un grant así se reporta aunque la bandera
+        esté encendida.
 
         No intenta una escritura de verdad, a diferencia de PostgreSQL: en MySQL el DDL hace
         commit implícito y es irreversible, así que "probar si puede" sería, en el peor caso,
@@ -346,7 +353,13 @@ class MySQLAdapter(ServerAdapter):
         server_is_mariadb = is_mariadb_engine(
             None if version is None else str(version), self.dialect
         )
-        return mysql_grant_violations(lineas, is_mariadb=server_is_mariadb)
+        version_text = None if version is None else str(version)
+        proc_grant_tolerated = allow_mysql_proc and proc_grant_supported(
+            version_text, self.dialect
+        )
+        return mysql_grant_violations(
+            lineas, is_mariadb=server_is_mariadb, allow_mysql_proc=proc_grant_tolerated
+        )
 
     def data_credential_facts(self, database: str) -> dict:
         """
@@ -1521,7 +1534,13 @@ class MySQLAdapter(ServerAdapter):
             # En MariaDB la nota de ``SHOW_ROUTINE`` ("no aplica") es ruido: informa la que
             # explica por qué no se otorgó el privilegio por base, o ninguna si se otorgó.
             note = db_extra_note
-        return ReadonlyPreflight(existed, global_grants, note, db_extra_grants)
+        return ReadonlyPreflight(
+            existed,
+            global_grants,
+            note,
+            db_extra_grants,
+            proc_grant_supported=proc_grant_supported(version_text, self.dialect),
+        )
 
     def provision_readonly_account(
         self, username, password, host, databases, preflight
@@ -1548,6 +1567,11 @@ class MySQLAdapter(ServerAdapter):
             stmts.append(f"GRANT {privs} ON {db}.* TO {who}")
         if preflight.global_grants:
             stmts.append(f"GRANT {', '.join(preflight.global_grants)} ON *.* TO {who}")
+        if preflight.proc_grant and preflight.proc_grant_supported:
+            # Server-wide: el código de las rutinas de TODAS las bases. Solo con la bandera del
+            # servidor encendida (la fija el controller) y en un motor que lo necesita. El REVOKE
+            # ALL de arriba ya lo quitó, así que con la bandera apagada no queda nada.
+            stmts.append(f"GRANT SELECT ON {MYSQL_PROC_TABLE} TO {who}")
         self._execute_server(
             stmts, op="provision_readonly_account", extra={"username": username}
         )
