@@ -17,7 +17,11 @@ POR QUÉ SE RECHAZA Y NO SE TRUNCA (``too_large``)
 Un cuerpo cortado es peor que uno ausente: el agente razonaría sobre código incompleto creyéndolo
 entero. Más de ``MAX_DEFINITION_BYTES`` (medido sobre el JSON, que es lo que viaja y lo que cuenta
 contra el presupuesto de 512 KiB del dispatcher) vuelve como ``too_large`` con su tamaño.
-``MAX_DEFINITIONS_PER_CALL`` x ``MAX_DEFINITION_BYTES`` = 320 KiB entra en ese presupuesto.
+
+El dispatcher cuenta cada resultado DOS veces contra esos 512 KiB: una en el bloque de texto y otra
+en ``structuredContent``. Por eso ``MAX_DEFINITIONS_PER_CALL`` x ``MAX_DEFINITION_BYTES`` x 2 =
+3 x 64 KiB x 2 = 384 KiB, y los 128 KiB restantes cubren el envelope y los metadatos. Con 5 objetos
+el peor caso eran 640 KiB y la llamada habría fallado con ``mcp.result_too_large``.
 
 LA CUENTA DEL DEFINER NUNCA SALE
 --------------------------------
@@ -39,8 +43,9 @@ from app.services.db_admin.definition_redaction import RedactionResult, redact_d
 from app.services.db_admin.dtos import DefinitionRead
 from app.services.db_admin.schema_diff import normalize_body
 
-#: Objetos por llamada: 5 x 64 KiB = 320 KiB, por debajo del presupuesto de 512 KiB del dispatcher.
-MAX_DEFINITIONS_PER_CALL = 5
+#: Objetos por llamada: 3 x 64 KiB x 2 (el dispatcher cuenta el resultado en el texto y en
+#: ``structuredContent``) = 384 KiB, por debajo del presupuesto de 512 KiB del dispatcher.
+MAX_DEFINITIONS_PER_CALL = 3
 #: Tope del cuerpo ya redactado, medido sobre su codificación JSON (comillas y escapes incluidos).
 MAX_DEFINITION_BYTES = 65536
 

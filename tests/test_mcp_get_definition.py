@@ -27,9 +27,17 @@ from app.core.actor import admin_actor, token_actor
 from app.core.database import Database
 from app.exceptions import AppHttpException
 from app.mcp import dispatch, registry
+from app.mcp.tools import definitions as definitions_tool
+from app.mcp.tools._envelope import Tracker
 from app.models.audit_log import AuditLog
 from app.services import audit as audit_mod
 from app.services.capability_catalog import Capability, GatewayRole
+from app.services.db_admin.definition_reader import (
+    MAX_DEFINITION_BYTES,
+    MAX_DEFINITIONS_PER_CALL,
+    json_encoded_size,
+)
+from app.services.db_admin.definition_redaction import redact_definition
 from app.services.db_admin.dtos import DefinitionRead
 from app.services.db_admin.export_session import ExportDurationExceeded
 from tests.step_up_helpers import OPEN_WINDOW
@@ -215,7 +223,8 @@ def test_the_spec_satisfies_invariant_6_and_accepts_no_sql(definition_tools):
     props = spec.input_schema["properties"]
     assert spec.input_schema["required"] == ["database_id", "objects"]
     assert not ({"sql", "query", "statement", "where"} & set(props))
-    assert props["objects"]["maxItems"] == 5 and props["objects"]["minItems"] == 1
+    assert props["objects"]["maxItems"] == MAX_DEFINITIONS_PER_CALL
+    assert props["objects"]["minItems"] == 1
     item = props["objects"]["items"]
     assert item["additionalProperties"] is False
     assert set(item["properties"]) == {"kind", "name", "routine_kind"}
@@ -368,11 +377,12 @@ def test_s4_no_sql_argument_is_accepted_at_the_top_level(
     assert motor_falso.abiertas == []
 
 
-def test_s4_9_six_objects_are_rejected_and_five_are_accepted(
+def test_s4_9_one_over_the_cap_is_rejected_and_the_cap_is_accepted(
     admin_client, monkeypatch, motor_falso, definition_tools
 ):
     actor, database_id = _escenario(admin_client, monkeypatch)
-    nombres = [f"v{i}" for i in range(6)]
+    tope = MAX_DEFINITIONS_PER_CALL
+    nombres = [f"v{i}" for i in range(tope + 1)]
     indice = {"table": [], "view": nombres, "routine": [], "trigger": [], "sequence": [], "event": []}
     facade = _facade(
         motor_falso,
@@ -392,11 +402,84 @@ def test_s4_9_six_objects_are_rejected_and_five_are_accepted(
     sobre = _ok(
         _llamar(
             actor,
-            {"database_id": database_id, "objects": _objetos(*[("view", n) for n in nombres[:5]])},
+            {
+                "database_id": database_id,
+                "objects": _objetos(*[("view", n) for n in nombres[:tope]]),
+            },
         )
     )
-    assert [o["name"] for o in sobre["data"]["objects"]] == nombres[:5]
-    assert len(facade.llamadas_definition) == 5
+    assert [o["name"] for o in sobre["data"]["objects"]] == nombres[:tope]
+    assert len(facade.llamadas_definition) == tope
+
+
+def test_the_tool_cap_and_the_reader_cap_are_the_same_number():
+    """La tool no puede importar el lector (guard de importaciones): se repite y esto las ata."""
+    assert definitions_tool.MAX_OBJECTS_PER_CALL == MAX_DEFINITIONS_PER_CALL
+
+
+def test_max_size_bodies_at_the_cap_fit_the_dispatcher_budget_through_the_real_dispatcher(
+    admin_client, monkeypatch, motor_falso, definition_tools
+):
+    """
+    W1: el dispatcher cuenta cada resultado dos veces (texto y ``structuredContent``). El peor
+    caso permitido, ``MAX_DEFINITIONS_PER_CALL`` cuerpos de exactamente 64 KiB JSON, tiene que
+    entrar en ``MAX_RESULT_BYTES`` sin ``mcp.result_too_large``.
+    """
+    actor, database_id = _escenario(admin_client, monkeypatch)
+    nombres = [f"v{i}" for i in range(MAX_DEFINITIONS_PER_CALL)]
+    # Palabras cortas separadas por espacio: no matchean ningún patrón de credencial. Se mide
+    # sobre la codificación JSON (comillas incluidas), que es lo que fija el tope.
+    cuerpo = "x " * ((MAX_DEFINITION_BYTES - 2) // 2)
+    assert json_encoded_size(cuerpo) == MAX_DEFINITION_BYTES
+    indice = {"table": [], "view": nombres, "routine": [], "trigger": [], "sequence": [], "event": []}
+    _facade(
+        motor_falso,
+        indice=indice,
+        definiciones={
+            ("view", n): [DefinitionRead(kind="view", name=n, body=cuerpo)] for n in nombres
+        },
+    )
+
+    respuesta = _llamar(
+        actor,
+        {"database_id": database_id, "objects": _objetos(*[("view", n) for n in nombres])},
+    )
+
+    sobre = _ok(respuesta)
+    assert all(o["body_available"] and o["size_bytes"] == MAX_DEFINITION_BYTES
+               for o in sobre["data"]["objects"])
+    tamano_total = len(json.dumps(respuesta["result"], ensure_ascii=False).encode("utf-8"))
+    assert tamano_total <= dispatch.MAX_RESULT_BYTES
+
+
+def test_a_secret_split_by_a_control_character_is_redacted_after_the_control_is_stripped():
+    """
+    S-a: ``IDENT\\x01IFIED BY 'secreto'`` no matchea antes de sanear; al quitar el control queda
+    ``IDENTIFIED BY 'secreto'``. La segunda pasada de ``Tracker.code_body`` lo tiene que enmascarar.
+    """
+    def redactor(texto: str) -> str:
+        return redact_definition(texto).text
+
+    tracker = Tracker()
+    cuerpo = "CREATE USER u IDENT\x01IFIED BY 'hunter2-secreto'"
+
+    entregado = tracker.code_body(cuerpo, "data.objects[0].body", redact=redactor)
+
+    assert "hunter2-secreto" not in entregado
+    assert "\x01" not in entregado
+    assert tracker.untrusted == ["data.objects[0].body"]
+
+
+def test_code_body_redacts_before_and_after_stripping_control_characters():
+    vistos: list[str] = []
+
+    def redactor_que_registra(texto: str) -> str:
+        vistos.append(texto)
+        return texto
+
+    Tracker().code_body("AB\x01CD", "p", redact=redactor_que_registra)
+
+    assert vistos == ["AB\x01CD", "ABCD"]
 
 
 def test_duplicate_requests_are_collapsed(admin_client, monkeypatch, motor_falso, definition_tools):

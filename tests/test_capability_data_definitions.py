@@ -161,6 +161,13 @@ def test_a_token_cannot_be_issued_with_a_mutating_scope():
     assert refused.value.status_code == 422
 
 
-def test_this_stage_ships_no_tool_for_the_scope():
-    """S3 es solo el scope: ninguna tool registrada lo usa todavía."""
-    assert not [t.name for t in registry.TOOLS if t.scope == SCOPE.value]
+def test_no_tool_uses_the_scope_while_the_kill_switch_is_off(monkeypatch):
+    """
+    ``get_definition`` es la única tool del scope y solo se registra con
+    ``MCP_SCHEMA_DEFINITIONS_ENABLED`` encendido AL IMPORTAR. ``registry.TOOLS`` ya está fijado por el
+    entorno de quien corre el test, así que se reconstruye con el switch apagado explícito: el
+    resultado no depende de cómo se lanzó la suite.
+    """
+    monkeypatch.setattr(environments, "MCP_SCHEMA_DEFINITIONS_ENABLED", False)
+    tools_with_switch_off = registry._build()
+    assert not [t.name for t in tools_with_switch_off if t.scope == SCOPE.value]

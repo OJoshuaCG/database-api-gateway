@@ -646,6 +646,19 @@ def _record_definition_result(
     )
 
 
+def redact_definition_text(text: str) -> str:
+    """
+    Enmascara credenciales de un texto con el redactor de definiciones (mejor esfuerzo).
+
+    Vive acá porque ``app/mcp`` solo puede importar este módulo de la capa de servicios (guard de
+    imports de ``test_mcp_import_guard``): el redactor entra por este controlador y no por un
+    import directo desde el paquete. No devuelve conteos: los del aviso salen de la lectura.
+    """
+    from app.services.db_admin.definition_redaction import redact_definition
+
+    return redact_definition(text).text
+
+
 def read_definitions(
     actor: Actor,
     database_id: int,

@@ -130,7 +130,7 @@ class ToolContext:
 
     def get_definitions(self, database_id: int, objects: list[tuple[str, str, str | None]]):
         """
-        El código de hasta 5 objetos de UNA base, ya redactado y medido (``DefinitionBatch``).
+        El código de hasta 3 objetos de UNA base, ya redactado y medido (``DefinitionBatch``).
 
         Recibe ``(tipo, nombre, tipo_de_rutina)`` YA validados por el handler: nunca SQL. El gate,
         la auditoría fail-closed y la lectura viven en ``target_resolution.read_definitions``; el
@@ -139,6 +139,18 @@ class ToolContext:
         from app.controllers.target_resolution import read_definitions
 
         return read_definitions(self.actor, database_id, objects, self.capability)
+
+    def redact_text(self, text: str) -> str:
+        """
+        Enmascara credenciales de un texto con el redactor de definiciones (best effort).
+
+        Existe para la segunda pasada de ``Tracker.code_body``: el paquete no importa la capa de
+        servicios, así que el redactor entra por el resolvedor, como el resto de las operaciones.
+        No cuenta lo enmascarado: los conteos del aviso salen de la lectura (``DefinitionResult``).
+        """
+        from app.controllers.target_resolution import redact_definition_text
+
+        return redact_definition_text(text)
 
     def get_table_stats(self, database_id: int, tables: list[str]):
         """

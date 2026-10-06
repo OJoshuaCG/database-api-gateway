@@ -71,9 +71,10 @@ def _view_read(body: str | None, **overrides) -> DefinitionRead:
 # Constantes de tope                                                           #
 # --------------------------------------------------------------------------- #
 def test_topes_encajan_en_el_presupuesto_del_dispatcher():
-    assert MAX_DEFINITIONS_PER_CALL == 5
+    assert MAX_DEFINITIONS_PER_CALL == 3
     assert MAX_DEFINITION_BYTES == 65536
-    assert MAX_DEFINITIONS_PER_CALL * MAX_DEFINITION_BYTES < _DISPATCHER_BUDGET_BYTES
+    # El dispatcher cuenta cada resultado dos veces (bloque de texto y structuredContent).
+    assert MAX_DEFINITIONS_PER_CALL * MAX_DEFINITION_BYTES * 2 < _DISPATCHER_BUDGET_BYTES
 
 
 # --------------------------------------------------------------------------- #

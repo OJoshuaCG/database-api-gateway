@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 FREE_TEXT_MAX_CHARS = 512
@@ -51,9 +52,18 @@ class Tracker:
             return texto[:FREE_TEXT_MAX_CHARS]
         return texto
 
-    def code_body(self, value, path: str):
+    def code_body(self, value, path: str, redact: Callable[[str], str] | None = None):
         """
-        Código (vista, trigger, event, rutina) de un tercero: saneado, anotado y NUNCA capado.
+        Código (vista, trigger, event, rutina) de un tercero: redactado, saneado, anotado y NUNCA
+        capado.
+
+        ``redact`` (opcional) enmascara credenciales y se aplica ANTES y DESPUÉS de sacar los
+        caracteres de control. Antes, porque es lo que ve el patrón sobre el texto tal cual llegó.
+        Después, porque quitar un carácter de control UNE lo que él separaba: un secreto (o la
+        palabra clave que lo delata, ``IDENT\\x01IFIED BY``) partido por un control no matchea en
+        la primera pasada y quedaría legible tras el saneado. La segunda pasada ve el texto que de
+        verdad se entrega. El paquete no puede importar la capa de servicios, así que el
+        redactor llega por parámetro (``ToolContext.redact_text``).
 
         Es la regla de las expresiones estructurales llevada al cuerpo entero: un cuerpo cortado a
         mitad es peor que ausente, porque el agente razonaría sobre código incompleto creyéndolo
@@ -61,7 +71,11 @@ class Tracker:
         objeto vuelve como ``too_large``), así que acá no hay nada que recortar. Un cuerpo vacío no
         se anota: no hay texto de terceros que marcar.
         """
+        if value is not None and redact is not None:
+            value = redact(str(value))
         texto = clean(value)
+        if texto is not None and texto != "" and redact is not None:
+            texto = redact(texto)
         if texto is None or texto == "":
             return texto
         self.untrusted.append(path)

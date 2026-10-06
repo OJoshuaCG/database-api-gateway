@@ -31,6 +31,7 @@ campo para la cuenta del DEFINER, ni para el texto sin redactar, ni para un erro
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from app.exceptions import AppHttpException
@@ -40,11 +41,12 @@ from app.mcp.tools.catalog import _envelope, _warnings
 from app.schemas import mcp as out
 from app.services import mcp_catalog as codes
 
-#: Tope de objetos por llamada. Espeja ``MAX_DEFINITIONS_PER_CALL`` del lector (5 x 64 KiB = 320 KiB
-#: entran en el presupuesto de 512 KiB del dispatcher) y el ``maxItems`` del schema publicado. Se
-#: repite acá porque este paquete no puede importar la capa de motor (``test_mcp_import_guard``);
-#: ``read_definitions`` lo vuelve a exigir con la constante del lector.
-MAX_OBJECTS_PER_CALL = 5
+#: Tope de objetos por llamada. Espeja ``MAX_DEFINITIONS_PER_CALL`` del lector (3 x 64 KiB x 2 = 384
+#: KiB entran en el presupuesto de 512 KiB del dispatcher, que cuenta el resultado en el texto y en
+#: ``structuredContent``) y el ``maxItems`` del schema publicado. Se repite acá porque este paquete
+#: no puede importar la capa de motor (``test_mcp_import_guard``); ``read_definitions`` lo vuelve a
+#: exigir con la constante del lector y un test fija que ambas coincidan.
+MAX_OBJECTS_PER_CALL = 3
 _NAME_MAX = 128
 _KINDS: tuple[str, ...] = ("view", "trigger", "event", "routine")
 _ROUTINE_KINDS: tuple[str, ...] = ("PROCEDURE", "FUNCTION")
@@ -122,7 +124,9 @@ def _counts(counter: dict[str, int]) -> list[out.RedactionCountOut]:
     ]
 
 
-def _map_definition(result, index: int, tracker: Tracker) -> out.DefinitionOut:
+def _map_definition(
+    result, index: int, tracker: Tracker, redact: Callable[[str], str] | None = None
+) -> out.DefinitionOut:
     """
     ``DefinitionResult`` -> ``DefinitionOut``, campo por campo.
 
@@ -132,7 +136,7 @@ def _map_definition(result, index: int, tracker: Tracker) -> out.DefinitionOut:
     """
     body = None
     if result.body_available:
-        body = tracker.code_body(result.body, f"data.objects[{index}].body")
+        body = tracker.code_body(result.body, f"data.objects[{index}].body", redact=redact)
     body_usable = bool(body and body.strip())
     unavailable_reason = result.unavailable_reason
     if result.body_available and not body_usable:
@@ -188,7 +192,10 @@ def get_definition(ctx: ToolContext, params: dict) -> dict:
     batch = ctx.get_definitions(database_id, requested)
 
     tracker = Tracker()
-    mapped = [_map_definition(result, i, tracker) for i, result in enumerate(batch.results)]
+    mapped = [
+        _map_definition(result, i, tracker, redact=ctx.redact_text)
+        for i, result in enumerate(batch.results)
+    ]
     data = out.DefinitionsOut(
         objects=mapped,
         missing=[
