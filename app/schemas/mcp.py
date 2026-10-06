@@ -312,6 +312,54 @@ class DefinitionsOut(_Out):
     missing: list[DefinitionRefOut]
 
 
+# ---- get_table_stats ------------------------------------------------------- #
+
+#: Por qué ``row_estimate`` y ``auto_increment`` no vienen. Vocabulario cerrado de un solo valor: el
+#: motivo es siempre el scope, y un campo de texto libre sería una puerta para volcar otra cosa.
+RowEstimatesOmittedReason = Literal["requires_data_read_scope"]
+
+
+class _TableStatsBase(_Out):
+    """
+    Campos de almacenamiento de UNA tabla que ve cualquier token con ``databases.read``.
+
+    ``engine`` y ``collation`` son ``None`` en PostgreSQL; ``created_at``/``updated_at`` también
+    (el motor no los guarda). ``name`` es texto de terceros (``clean`` en el mapeador).
+    """
+
+    name: str
+    engine: str | None
+    collation: str | None
+    data_bytes: int | None
+    index_bytes: int | None
+    created_at: str | None
+    updated_at: str | None
+
+
+class TableStatsOut(_TableStatsBase):
+    """Sin ``row_estimate`` ni ``auto_increment``: NO existen como claves para un token sin ``data.read``."""
+
+
+class TableStatsWithEstimatesOut(_TableStatsBase):
+    """
+    Lo mismo MÁS el estimado de filas y el próximo ``AUTO_INCREMENT``, solo para un token que
+    también tiene ``data.read``: aproximan ``count_rows``. Es un modelo aparte y no un campo
+    opcional para que "sin permiso" sea ausencia de la CLAVE y no un ``null`` ambiguo.
+    """
+
+    row_estimate: int | None
+    auto_increment: int | None
+
+
+class TableStatsListOut(_Out):
+    tables: list[TableStatsOut | TableStatsWithEstimatesOut]
+    #: Lo pedido que NO es una tabla del índice de la base. Explícito: "no vino" != "sin estadísticas".
+    missing: list[str]
+    row_estimates_included: bool
+    #: Presente solo cuando ``row_estimates_included`` es ``False``: dice por qué faltan las claves.
+    row_estimates_omitted_reason: RowEstimatesOmittedReason | None
+
+
 # ---- search_schema --------------------------------------------------------- #
 
 SearchKind = Literal["table", "view", "column", "routine", "trigger"]
@@ -496,7 +544,13 @@ class ToolEnvelope(_Out):
 
     notice: str
     data: (
-        ObjectIndexOut | SchemaOut | SchemaDiffOut | FreshnessOut | SchemaSearchOut | DefinitionsOut
+        ObjectIndexOut
+        | SchemaOut
+        | SchemaDiffOut
+        | FreshnessOut
+        | SchemaSearchOut
+        | DefinitionsOut
+        | TableStatsListOut
     )
     source: Literal["managed_database"]
     untrusted_content: bool

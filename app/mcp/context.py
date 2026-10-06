@@ -140,6 +140,19 @@ class ToolContext:
 
         return read_definitions(self.actor, database_id, objects, self.capability)
 
+    def get_table_stats(self, database_id: int, tables: list[str]):
+        """
+        Estadísticas de almacenamiento de hasta ``MCP_MAX_OBJECTS_PER_CALL`` tablas de UNA base
+        (``TableStatsBatch``).
+
+        Recibe NOMBRES ya validados por el handler: nunca SQL. El gate, el índice y la lectura
+        viven en ``target_resolution.read_table_stats``; si el llamador ve el estimado de filas lo
+        decide esa función según su scope, no el handler.
+        """
+        from app.controllers.target_resolution import read_table_stats
+
+        return read_table_stats(self.actor, database_id, tables, self.capability)
+
     def body_availability(self, resuelta, facade):
         """Disponibilidad del cuerpo por tipo para este llamador. Ver ``target_resolution``."""
         from app.controllers.target_resolution import body_availability

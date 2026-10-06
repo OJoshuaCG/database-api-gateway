@@ -764,6 +764,97 @@ def body_availability(actor: Actor, resuelta: AgentDatabase, facade) -> BodyAvai
     return BodyAvailability(reasons=reasons, routines_may_be_hidden=routine_reason is not None)
 
 
+# --------------------------------------------------------------------------- #
+# Estadísticas de almacenamiento de tablas (get_table_stats)                    #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class TableStatsBatch:
+    """
+    Lo que ``read_table_stats`` entrega al handler, ya sin sesión abierta.
+
+    ``results`` son ``TableStatsRead`` en el orden del pedido. ``missing`` son los nombres pedidos
+    que NO están en el índice de tablas (o que el motor dejó de resolver en el medio).
+    ``row_estimates_included`` dice si ESTE llamador puede ver ``row_estimate`` y
+    ``auto_increment``: el handler lo usa para elegir el modelo de salida y documentar el motivo.
+    """
+
+    database: AgentDatabase
+    results: tuple
+    missing: tuple[str, ...]
+    row_estimates_included: bool
+    consistent_structure: bool
+    session_warnings: tuple[str, ...]
+
+
+def caller_may_see_row_estimates(actor: Actor) -> bool:
+    """
+    ¿Este llamador puede ver ``row_estimate`` y ``auto_increment``? Solo con ``data.read`` Y su kill
+    switch encendido (``MCP_DATA_READ_ENABLED``, leído en cada llamada).
+
+    Es la misma frontera que ``count_rows``: ``TABLE_ROWS``/``reltuples`` aproximan un ``COUNT(*)``
+    y ``AUTO_INCREMENT`` delata cuántas filas se insertaron alguna vez, así que dárselos a un token
+    de solo estructura abriría por la puerta de atrás lo que el scope de datos cierra. No exige la
+    credencial de datos por base: el estimado se lee del catálogo con la credencial de ESTRUCTURA.
+    """
+    from app.services.capability_catalog import data_capability_enabled
+
+    return actor.has(Capability.DATA_READ) and data_capability_enabled(Capability.DATA_READ)
+
+
+def read_table_stats(
+    actor: Actor, database_id: int, tables: list[str], capability: Capability
+) -> TableStatsBatch:
+    """
+    ``get_table_stats``: estadísticas de almacenamiento de hasta ``MCP_MAX_OBJECTS_PER_CALL``
+    tablas de UNA base.
+
+    Va por el gate de ESTRUCTURA (``open_readonly``), igual que ``list_objects``, y NO por
+    ``_data_gate``: el scope es ``databases.read`` y lo único de "datos" que hay (el estimado de
+    filas y el próximo ``AUTO_INCREMENT``) se decide acá con ``caller_may_see_row_estimates`` y,
+    cuando es que no, ni se lee del motor.
+
+    Orden: tope de tablas -> ``open_readonly`` (scope, proyecto, credencial de estructura, política)
+    -> índice -> lo que no es una tabla del índice va a ``missing`` SIN consultarse -> lectura de
+    las presentes. Un nombre ajeno al índice (``x'; DROP TABLE t``, ``otra_base.t``, ``_gw_v_x``,
+    que el índice excluye) nunca llega a una consulta.
+    """
+    from app.core.environments import MCP_MAX_OBJECTS_PER_CALL
+
+    if not tables or len(tables) > MCP_MAX_OBJECTS_PER_CALL:
+        raise _deny(
+            codes.CODE_TOO_MANY_OBJECTS,
+            413,
+            f"'tables' admite de 1 a {MCP_MAX_OBJECTS_PER_CALL} tablas por llamada.",
+        )
+
+    include_row_estimates = caller_may_see_row_estimates(actor)
+    with open_readonly(actor, database_id, capability) as (resuelta, facade):
+        indexed_tables = set(facade.object_index().get("table", []))
+        present = [name for name in tables if name in indexed_tables]
+        missing = [name for name in tables if name not in indexed_tables]
+        results: list = []
+        if present:
+            reads = facade.table_stats(present, include_row_estimates=include_row_estimates)
+            read_names = {read.table for read in reads}
+            results.extend(reads)
+            # El índice la listó y el catálogo ya no la devuelve (un ``DROP`` en el medio, o una
+            # tabla sin privilegio): se informa como ausente y no se omite en silencio.
+            missing.extend(name for name in present if name not in read_names)
+        consistent_structure = facade.consistent_structure
+        session_warnings = tuple(facade.warnings)
+
+    return TableStatsBatch(
+        database=resuelta,
+        results=tuple(results),
+        missing=tuple(missing),
+        row_estimates_included=include_row_estimates,
+        consistent_structure=consistent_structure,
+        session_warnings=session_warnings,
+    )
+
+
 def draft_agent_query(actor: Actor, database_id: int, sql: str, capability: Capability) -> dict:
     """
     Clasifica el SQL que redactó un agente SIN ejecutarlo: el sobre de ``draft_query``.

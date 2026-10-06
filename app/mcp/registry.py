@@ -335,7 +335,15 @@ def _build(
     """
     from app.core import environments
     from app.core.environments import MCP_MAX_OBJECTS_PER_CALL
-    from app.mcp.tools import catalog, definitions, inventory, operations, query, search
+    from app.mcp.tools import (
+        catalog,
+        definitions,
+        inventory,
+        operations,
+        query,
+        search,
+        table_stats,
+    )
 
     if data_read_enabled is None:
         data_read_enabled = bool(environments.MCP_DATA_READ_ENABLED)
@@ -470,6 +478,36 @@ def _build(
                 "additionalProperties": False,
             },
             handler=search.search_schema,
+            touches_engine=True,
+            scope="databases.read",
+        ),
+        _spec(
+            name="get_table_stats",
+            description=(
+                "Devuelve estadísticas de almacenamiento de las tablas indicadas de una base: "
+                "motor, collation, bytes de datos, bytes de índices y fechas de creación y de "
+                "última modificación, leídas del catálogo del motor con una credencial de solo "
+                "lectura. Recibe nombres de tablas, no SQL, y no lee filas. Los nombres que no "
+                "son tablas de la base vuelven en 'missing'. 'row_estimate' y 'auto_increment' "
+                "solo aparecen si el token además tiene el scope data.read; sin él faltan esas "
+                "claves y 'row_estimates_omitted_reason' lo indica. PostgreSQL no informa motor, "
+                "collation ni fechas."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "database_id": _DATABASE_ID,
+                    "tables": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": table_stats.MAX_TABLES_PER_CALL,
+                        "items": _TABLE,
+                    },
+                },
+                "required": ["database_id", "tables"],
+                "additionalProperties": False,
+            },
+            handler=table_stats.get_table_stats,
             touches_engine=True,
             scope="databases.read",
         ),
