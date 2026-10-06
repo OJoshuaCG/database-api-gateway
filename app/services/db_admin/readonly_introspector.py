@@ -34,6 +34,7 @@ from contextlib import contextmanager
 from app.core.environments import MCP_SESSION_MAX_SECONDS, MCP_STATEMENT_TIMEOUT_MS
 from app.core.remote_engine import ServerTarget
 from app.services.db_admin.dtos import (
+    EventInfo,
     RoutineInfo,
     SchemaSnapshot,
     SequenceInfo,
@@ -97,6 +98,16 @@ class ReadonlyIntrospector:
     def triggers(self) -> list[TriggerInfo]:
         self.__session.check_deadline()
         return self.__adapter._snapshot_triggers(self.__session.conn, self.database, self._schema())
+
+    def events(self) -> list[EventInfo]:
+        """
+        Events del scheduler con su programación. ``[]`` en motores sin scheduler (PostgreSQL).
+
+        Como ``views``/``routines``/``triggers``, entrega el cuerpo en el DTO interno: el
+        mapeador de la tool decide qué sale al agente.
+        """
+        self.__session.check_deadline()
+        return self.__adapter._snapshot_events(self.__session.conn, self.database, self._schema())
 
     def sequences(self) -> list[SequenceInfo]:
         self.__session.check_deadline()

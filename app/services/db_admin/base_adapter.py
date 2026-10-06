@@ -165,7 +165,7 @@ class ServerAdapter(ABC):
     )
 
     @classmethod
-    def _strip_definer_clause(cls, ddl: str) -> str:
+    def _strip_definer_clause(cls, ddl: str | None) -> str:
         """
         Quita la cláusula ``DEFINER=...`` de un DDL capturado (MySQL/MariaDB).
 
@@ -173,8 +173,47 @@ class ServerAdapter(ABC):
         usuario no existe. Tras quitarlo, el motor usa el invocador/owner del destino.
         ``SQL SECURITY DEFINER`` se deja intacto (es válido y no referencia un usuario
         concreto); el riesgo de escalada se documenta para revisión del admin.
+
+        Acepta ``None`` y devuelve ``""``: un ``SHOW CREATE`` sin privilegio puede devolver
+        la columna del cuerpo en NULL (MariaDB), y ``re.sub`` sobre ``None`` era un
+        ``TypeError`` que tumbaba el snapshot entero con un 500 opaco. Quien necesite
+        distinguir "sin cuerpo" de "cuerpo vacío" usa ``_snapshot_body_or_empty``, que además
+        deja la advertencia en el log.
         """
+        if ddl is None:
+            return ""
         return cls._DEFINER_RE.sub("", ddl)
+
+    @staticmethod
+    def _snapshot_body_or_empty(raw_body: object, *, kind: str, name: str) -> str:
+        """
+        Cuerpo de un objeto (vista/rutina/trigger/event) para el snapshot interno.
+
+        POR QUÉ DEVUELVE ``""`` Y NO UN ESTADO "NO DISPONIBLE": los DTO del snapshot
+        (``ViewInfo.definition``, ``RoutineInfo.body``…) exigen ``str`` y alimentan al diff y
+        al export; hacerlos opcionales cambiaría ese contrato interno. La señal explícita de
+        "este cuerpo no está disponible" vive en ``DefinitionRead`` (contrato de
+        ``get_definition``), no acá. Lo que SÍ se evita es el silencio: un cuerpo NULL o en
+        blanco deja un WARNING con tipo y nombre (jamás el cuerpo ni el texto del motor), para
+        que quien lea el log sepa que ese ``""`` no significa "objeto vacío".
+        """
+        if raw_body is None or not str(raw_body).strip():
+            logger.warning(
+                "Cuerpo de %s '%s' NULL o vacío en el snapshot: el motor no lo devolvió "
+                "(¿falta privilegio?). El diff/export de este objeto no es confiable.",
+                kind,
+                name,
+            )
+            return ""
+        return str(raw_body)
+
+    def list_event_names(self, conn: Connection, database: str) -> list[str]:
+        """
+        Nombres de los events de ``database``. Default ``[]``: el scheduler de events es de la
+        familia MySQL/MariaDB y PostgreSQL no tiene equivalente. El override de MySQL usa una
+        consulta de nombres, no ``_snapshot_events`` (que hace un ``SHOW CREATE`` por event).
+        """
+        return []
 
     # ------------------------------------------------------------------ #
     # Snapshot: consulta de catálogo OPCIONAL (compartida)                #
@@ -750,7 +789,7 @@ class ServerAdapter(ABC):
     ) -> dict[str, list[str]]:
         """
         Índice BARATO de la base: ``{kind: [nombres]}`` para ``table``, ``view``, ``routine``,
-        ``trigger`` y ``sequence``. Es lo que consume ``list_objects`` del MCP (plan 12 §6.2).
+        ``trigger``, ``sequence`` y ``event`` (``[]`` donde el motor no tiene scheduler). Es lo que consume ``list_objects`` del MCP (plan 12 §6.2).
 
         Existe para no pasar por ``structural_snapshot``, que arma un ``TableSchema`` completo por
         tabla: el "índice" costaría más que el detalle. Tablas y vistas salen del Inspector (una
@@ -780,6 +819,7 @@ class ServerAdapter(ABC):
                     "sequence": sorted(
                         {s.name for s in self._snapshot_sequences(conn, database, schema)}
                     ),
+                    "event": sorted(self.list_event_names(conn, database)),
                 }
         except SQLAlchemyError as exc:
             raise map_driver_error(

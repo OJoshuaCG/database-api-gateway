@@ -2245,7 +2245,7 @@ class MySQLAdapter(ServerAdapter):
                 ViewInfo(
                     name=name,
                     is_materialized=False,
-                    definition=str(vdef or ""),
+                    definition=self._snapshot_body_or_empty(vdef, kind="vista", name=name),
                     columns=cols,
                     check_option=None if not check_option or check_option == "NONE" else str(check_option),
                     security_definer=str(security or "").upper() == "DEFINER",
@@ -2293,9 +2293,13 @@ class MySQLAdapter(ServerAdapter):
                 validate_identifier(name, self.dialect, "rutina", allow_existing=True),
                 self.dialect,
             )
-            crow = conn.execute(text(f"SHOW CREATE {kind} {q}")).fetchone()
-            body = self._strip_definer_clause(
-                self._show_create_value(crow, (f"Create {kind.capitalize()}",), 2)
+            body = self._show_create_body(
+                conn,
+                f"SHOW CREATE {kind} {q}",
+                (f"Create {kind.capitalize()}",),
+                2,
+                kind="rutina",
+                name=name,
             )
             params = params_por_rutina.get(name, [])
             out.append(
@@ -2327,9 +2331,13 @@ class MySQLAdapter(ServerAdapter):
                 validate_identifier(name, self.dialect, "trigger", allow_existing=True),
                 self.dialect,
             )
-            crow = conn.execute(text(f"SHOW CREATE TRIGGER {q}")).fetchone()
-            action = self._strip_definer_clause(
-                self._show_create_value(crow, ("SQL Original Statement",), 2)
+            action = self._show_create_body(
+                conn,
+                f"SHOW CREATE TRIGGER {q}",
+                ("SQL Original Statement",),
+                2,
+                kind="trigger",
+                name=name,
             )
             out.append(
                 TriggerInfo(
@@ -2353,20 +2361,102 @@ class MySQLAdapter(ServerAdapter):
         """
         rows = self._catalog_fetch(
             conn,
-            "SELECT EVENT_NAME FROM information_schema.EVENTS "
-            "WHERE EVENT_SCHEMA = :db ORDER BY EVENT_NAME",
+            "SELECT EVENT_NAME, EVENT_TYPE, EXECUTE_AT, INTERVAL_VALUE, INTERVAL_FIELD "
+            "FROM information_schema.EVENTS WHERE EVENT_SCHEMA = :db ORDER BY EVENT_NAME",
             {"db": database},
         ).rows
         out: list[EventInfo] = []
-        for (name,) in rows:
+        for name, event_type, execute_at, interval_value, interval_field in rows:
             q = quote_identifier(
                 validate_identifier(name, self.dialect, "event", allow_existing=True),
                 self.dialect,
             )
-            crow = conn.execute(text(f"SHOW CREATE EVENT {q}")).fetchone()
-            body = self._strip_definer_clause(self._show_create_value(crow, ("Create Event",), 3))
-            out.append(EventInfo(name=name, body=body))
+            body = self._show_create_body(
+                conn,
+                f"SHOW CREATE EVENT {q}",
+                ("Create Event",),
+                3,
+                kind="event",
+                name=name,
+            )
+            out.append(
+                EventInfo(
+                    name=name,
+                    schedule=self._build_event_schedule(
+                        event_type, execute_at, interval_value, interval_field
+                    ),
+                    body=body,
+                )
+            )
         return out
+
+    def list_event_names(self, conn, database) -> list[str]:
+        """
+        Nombres de los events por una consulta barata (sin ``SHOW CREATE`` por event).
+
+        Pasa por ``_catalog_fetch`` por la misma razón que ``_snapshot_events``:
+        ``information_schema.EVENTS`` puede faltar o negarse, y ahí el ``[]`` lo acompaña un
+        WARNING en el log en vez de pasar por "esta base no tiene events".
+        """
+        rows = self._catalog_fetch(
+            conn,
+            "SELECT EVENT_NAME FROM information_schema.EVENTS "
+            "WHERE EVENT_SCHEMA = :db ORDER BY EVENT_NAME",
+            {"db": database},
+        ).rows
+        return [str(row[0]) for row in rows]
+
+    @staticmethod
+    def _build_event_schedule(
+        event_type: object,
+        execute_at: object,
+        interval_value: object,
+        interval_field: object,
+    ) -> str | None:
+        """
+        Texto legible de la programación de un event, armado por el gateway.
+
+        ``AT <instante>`` para ``ONE TIME`` y ``EVERY <n> <unidad>`` para ``RECURRING`` (las
+        columnas de ``information_schema.EVENTS`` ya vienen separadas). Devuelve ``None`` si el
+        motor no entregó los datos: es mejor "sin programación conocida" que una cadena
+        inventada. No se agrega ``STARTS``/``ENDS``: están en el cuerpo y este texto es solo un
+        resumen para el índice.
+        """
+        normalized_type = str(event_type or "").strip().upper()
+        if normalized_type == "ONE TIME" and execute_at is not None:
+            return f"AT {execute_at}"
+        if (
+            normalized_type == "RECURRING"
+            and interval_value is not None
+            and interval_field is not None
+        ):
+            return f"EVERY {interval_value} {str(interval_field).upper()}"
+        return None
+
+    def _show_create_body(
+        self,
+        conn,
+        statement: str,
+        candidates: tuple[str, ...],
+        fallback_idx: int,
+        *,
+        kind: str,
+        name: str,
+    ) -> str:
+        """
+        Ejecuta un ``SHOW CREATE`` ya armado (nombre validado y cuoteado por el llamador) y
+        devuelve el cuerpo sin DEFINER, o ``""`` con WARNING si el motor no lo entregó.
+
+        Cubre los dos modos de "sin cuerpo": que no haya fila y que la columna del cuerpo venga
+        NULL (MariaDB sin privilegio). Antes ambos terminaban en ``AttributeError``/
+        ``TypeError`` dentro de ``_strip_definer_clause``.
+        """
+        create_row = conn.execute(text(statement)).fetchone()
+        raw_body = None
+        if create_row is not None:
+            raw_body = self._show_create_value(create_row, candidates, fallback_idx)
+        body = self._snapshot_body_or_empty(raw_body, kind=kind, name=name)
+        return self._strip_definer_clause(body)
 
 
     # ------------------------- generación de DDL (Fase 3) --------------------- #

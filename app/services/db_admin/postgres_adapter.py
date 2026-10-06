@@ -1813,12 +1813,23 @@ class PostgresAdapter(ServerAdapter):
             out[name] = {"collation": coll, "charset": None, "on_update": None}
         return out
 
+    #: Prefijo con el que ``pg_class.reloptions`` guarda la opción de ``WITH CHECK OPTION``
+    #: (``check_option=local`` | ``check_option=cascaded``).
+    _VIEW_CHECK_OPTION_RELOPTION_PREFIX = "check_option="
+
     def _snapshot_views(self, conn, database, schema) -> list[ViewInfo]:
+        # POR QUÉ ``pg_class`` + ``pg_get_viewdef`` Y NO ``information_schema.views``:
+        # ``information_schema.views.view_definition`` es NULL para quien no es dueño de la
+        # vista (la vista del catálogo filtra por ``pg_has_role``). Con la credencial de solo
+        # lectura del gateway, que nunca es dueña, todo cuerpo salía como ``""`` — y el diff y
+        # el export subreportaban en silencio. ``pg_get_viewdef`` solo requiere poder ver la
+        # vista en el catálogo. ``relkind = 'v'`` deja afuera las matviews (van abajo).
         out: list[ViewInfo] = []
-        for vname, vdef, check_option in self._safe_fetch(
+        for vname, vdef, reloptions in self._safe_fetch(
             conn,
-            "SELECT table_name, view_definition, check_option FROM information_schema.views "
-            "WHERE table_schema = 'public' ORDER BY table_name",
+            "SELECT c.relname, pg_get_viewdef(c.oid, true), c.reloptions "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' AND c.relkind = 'v' ORDER BY c.relname",
         ):
             cols = [
                 r[0]
@@ -1831,9 +1842,11 @@ class PostgresAdapter(ServerAdapter):
             ]
             out.append(
                 ViewInfo(
-                    name=vname, is_materialized=False, definition=str(vdef or ""),
+                    name=vname,
+                    is_materialized=False,
+                    definition=self._snapshot_body_or_empty(vdef, kind="vista", name=vname),
                     columns=cols,
-                    check_option=None if not check_option or str(check_option) == "NONE" else str(check_option),
+                    check_option=self._check_option_from_reloptions(reloptions),
                 )
             )
         for mname, mdef in self._safe_fetch(
@@ -1843,6 +1856,22 @@ class PostgresAdapter(ServerAdapter):
         ):
             out.append(ViewInfo(name=mname, is_materialized=True, definition=str(mdef or "")))
         return out
+
+    @classmethod
+    def _check_option_from_reloptions(cls, reloptions: object) -> str | None:
+        """
+        ``CASCADED`` | ``LOCAL`` | ``None`` a partir de ``pg_class.reloptions`` (``text[]`` o
+        NULL). Mantiene el formato en mayúsculas que antes entregaba
+        ``information_schema.views.check_option``, para que el diff y el render no cambien.
+        """
+        if not reloptions:
+            return None
+        for option in reloptions:
+            option_text = str(option)
+            if option_text.lower().startswith(cls._VIEW_CHECK_OPTION_RELOPTION_PREFIX):
+                value = option_text[len(cls._VIEW_CHECK_OPTION_RELOPTION_PREFIX) :].strip()
+                return value.upper() or None
+        return None
 
     def _snapshot_routines(self, conn, database, schema) -> list[RoutineInfo]:
         out: list[RoutineInfo] = []
@@ -1863,7 +1892,7 @@ class PostgresAdapter(ServerAdapter):
                     language=str(lang) if lang else None,
                     volatility=_vol.get(str(volatile), None),
                     security_definer=bool(secdef),
-                    body=str(fdef or ""),
+                    body=self._snapshot_body_or_empty(fdef, kind="rutina", name=proname or ""),
                 )
             )
         return out
