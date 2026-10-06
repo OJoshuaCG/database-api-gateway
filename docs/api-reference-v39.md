@@ -1,8 +1,10 @@
 # API v39 — Tools de definiciones y estadísticas del MCP: `get_definition`, `get_table_stats`
 
-Addendum de [v38](api-reference-v38.md). Cambio `mcp-schema-definitions`, slices S1 a S5 y S7. **No hay
-rutas HTTP nuevas**: son tools del endpoint `/mcp/`. Contrato para el frontend: ninguno todavía, porque
-la pantalla de scopes de token que agrega `data.definitions` es la slice S8 (pendiente, ver el final).
+Addendum de [v38](api-reference-v38.md). Cambio `mcp-schema-definitions`, slices S1 a S8. Las tools
+(`get_definition`, `get_table_stats`) son del endpoint `/mcp/`. **La única ruta HTTP nueva** es
+`PUT /servers/{id}/readonly-credential/routine-bodies` (S6, ver [su sección](#put-serversidreadonly-credentialroutine-bodies-s6)),
+y `ServerOut` gana `readonly_proc_grant`. La SPA (S8) agrega `data.definitions` al selector de scopes
+de token y el control de esa bandera en el panel de la credencial de solo lectura.
 
 ## Invariante
 
@@ -155,10 +157,10 @@ a nivel base (global o por tabla sigue siendo violación; `SELECT` sobre `mysql.
 | Motor / versión | Cuerpo de rutinas | `unavailable_reason` si falta |
 |---|---|---|
 | MariaDB 11.3+ | Con `SHOW CREATE ROUTINE` por base (otorgado al aprovisionar) | `insufficient_privilege` |
-| MariaDB < 11.3 | Solo con `SELECT ON mysql.proc` (alcance servidor, opción **pendiente**, ver S6) | `flag_off` |
+| MariaDB < 11.3 | Solo con `SELECT ON mysql.proc` (alcance servidor, bandera `readonly_proc_grant`, ver S6) | `flag_off` |
 | MySQL 8.0.20+ | `SHOW_ROUTINE` global (ya existente) | `insufficient_privilege` |
 | MySQL 8.0.0 a 8.0.19 | No hay grant posible | `engine_unsupported` |
-| MySQL 5.7 | Solo con `SELECT ON mysql.proc` (pendiente, S6) | `flag_off` |
+| MySQL 5.7 | Solo con `SELECT ON mysql.proc` (bandera `readonly_proc_grant`, S6) | `flag_off` |
 | PostgreSQL | `pg_get_functiondef` y `pg_get_viewdef`, una lectura por sobrecarga; no tiene eventos | `engine_unsupported` (eventos) |
 
 Vistas, triggers y eventos se leen con los grants por base ya existentes (`SELECT`, `SHOW VIEW`,
@@ -171,11 +173,79 @@ entrega corrió contra un motor real. Confirmar el `GRANT` y la salida de `SHOW 
 `MCP_SCHEMA_DEFINITIONS_ENABLED` en producción. Una credencial ya aprovisionada no recibe el privilegio
 hasta que se vuelve a aprovisionar.
 
-## Pendiente
+## `PUT /servers/{id}/readonly-credential/routine-bodies` (S6)
 
-- **S6**: bandera por servidor `readonly_proc_grant` (`SELECT ON mysql.proc`, alcance servidor) para
-  MariaDB < 11.3 y MySQL 5.7. El código ya la lee con `getattr(..., False)`, pero **no existe columna ni
-  UI**: hoy esos motores responden `flag_off`.
-- **S8**: SPA (alta de tokens con `data.definitions`, textos del scope y de la bandera).
+Enciende o apaga `SELECT ON mysql.proc` para la credencial de solo lectura del MCP en **MariaDB < 11.3 y
+MySQL 5.7**, el único camino para leer el código de las rutinas ahí. **Es SERVER-WIDE**: `mysql.proc` no se
+puede acotar a una base, así que la credencial lee las rutinas de TODAS las bases del servidor, también las
+que están fuera del proyecto o excluidas; solo el filtrado del gateway lo contiene.
+
+| Aspecto | Comportamiento |
+|---|---|
+| Autorización | `servers.admin` (la dependencia `ServersAdmin`) con **step-up** (lo exige a todo `PUT`; sin él, `403 access.step_up_required`) |
+| Límite | `3/minute` por cliente (`429` al excederlo) |
+| Cuerpo | `{"enabled": bool, "acknowledgement": str \| null}`; `extra="forbid"` |
+| Acknowledgement | Al **habilitar** (`enabled=true`) tiene que ser igual, carácter por carácter y sin `strip`, a `READONLY_PROC_ACK_TEXT` (`app/services/server_catalog.py`). Al deshabilitar se ignora: cortar nunca pide más fricción que abrir |
+| Respuesta `200` | `{"server": ServerOut, "engine_grant": "converged" \| "not_alterable" \| "no_credential"}` |
+
+Texto de acknowledgement vigente (la SPA lo duplica literal; si cambia, cambia en los dos lados):
+
+> Entiendo que SELECT ON mysql.proc es server-wide: expone el código de las rutinas de TODAS las bases de
+> datos de este servidor, incluidas las que están fuera del proyecto o excluidas, y que solo el filtrado del
+> gateway lo contiene.
+
+**Errores (códigos cerrados en `public_context.code`).** La bandera no cambia en ninguno.
+
+| Estado | Código | Cuándo |
+|---|---|---|
+| `422` | `server.readonly_proc_grant.ack_mismatch` | `enabled=true` sin el texto exacto. No se toca el motor |
+| `422` | `server.readonly_proc_grant.engine_unsupported` | `enabled=true` en PostgreSQL, MySQL >= 8.0, MariaDB >= 11.3 o con versión ilegible (se lee con la pseudo-root, sin mutar) |
+| `409` | `readonly_provision.in_progress` | Hay un aprovisionamiento de este servidor en curso (el mismo lock por servidor, solo dentro del proceso) |
+
+**`engine_grant`: qué pasó en el motor.**
+
+| Valor | Significa |
+|---|---|
+| `converged` | La credencial es **propia** del gateway: se re-aprovisionó la cuenta (`REVOKE ALL` y re-grant, con `mysql.proc` solo si la bandera quedó encendida) y la sonda pasó. La bandera de la fila cambia **después** de que el motor confirmó y la sonda pasó |
+| `not_alterable` | La credencial se cargó **a mano** (`PUT /servers/{id}/readonly-credential`): el gateway no altera grants de un tercero. Se persiste la bandera y solo se re-corre la sonda. Si el DBA no ajustó los grants en el motor, la sonda falla **sin error HTTP** y el servidor queda sin verificar (`readonly_verified_at` nulo): el MCP cierra |
+| `no_credential` | El servidor no tiene credencial de solo lectura: solo cambia la bandera, que aplicará el próximo aprovisionamiento |
+
+**Revocar (`enabled=false`).** Con credencial propia re-converge la cuenta **sin** `mysql.proc`: el
+`REVOKE ALL` previo al re-grant lo quita. Re-aprovisionar des-verifica la credencial **antes** de tocar el
+motor, así que el corte es inmediato aunque el motor falle; en ese caso la bandera queda como estaba y el
+reintento revoca. Con credencial a mano el gateway no revoca nada: el DBA tiene que quitar el grant.
+
+**Sonda con conciencia de la bandera.** Con la bandera apagada, `SELECT ON mysql.proc` sigue siendo
+violación (`select_on_mysql_schema`) y la credencial no verifica; solo se tolera esa tabla (nunca
+`mysql.*` ni otra tabla de `mysql`) con la bandera encendida **y** un motor que la necesita.
+
+`ServerOut` agrega `readonly_proc_grant: bool` (default `false`). Es un dato de riesgo, no un secreto.
+
+**Migración** `f5b7d9e1a3c6` (`down_revision` `e4a6c8f0b2d5`): agrega `servers.readonly_proc_grant`, booleana
+`NOT NULL` con default falso. Idempotente.
+
+**Nota de despliegue — rompe a propósito.** Un servidor MariaDB < 11.3 o MySQL 5.7 cuya credencial de solo
+lectura se cargó a mano **con** `SELECT ON mysql.proc` ya otorgado **fallará la sonda después del deploy**
+(`select_on_mysql_schema`) y quedará fuera del MCP hasta que un administrador habilite la bandera con el
+acknowledgement, o el DBA quite el grant. Es lo buscado: un grant server-wide que nadie aceptó
+explícitamente no verifica.
+
+**Auditoría.** `server.readonly_proc_grant.set`, con intención fail-closed antes de tocar nada y registro
+final con `touched_engine`. El detalle no lleva el texto del acknowledgement ni credenciales.
+
+## Frontend (S8)
+
+- `data.definitions` entra en el vocabulario de capacidades y en los scopes de datos del selector de
+  scopes de token, con el aviso de que los cuerpos son texto de terceros no confiable que puede contener
+  secretos. Es owner-only, sensible, con step-up del emisor, exactamente como `data.read` y `data.query`.
+- `ReadonlyCredentialPanel` muestra `readonly_proc_grant` y el control para habilitarlo o deshabilitarlo.
+  Como `ServerOut` no trae la versión del motor, lo ofrece a toda la familia MySQL/MariaDB y se apoya en
+  el `422 engine_unsupported` para el mensaje. Habilitar abre un diálogo con el texto de acknowledgement y
+  una casilla; `not_alterable` se muestra como aviso persistente.
+
+## Estado de las slices
+
+S1 a S8 hechas. No queda nada pendiente de este cambio salvo lo que figura como **SIN VERIFICAR** (motor
+real, `GRANT SHOW CREATE ROUTINE`).
 
 Variable nueva: `MCP_SCHEMA_DEFINITIONS_ENABLED` (default `false`, documentada en `.env.example`).

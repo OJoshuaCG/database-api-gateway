@@ -2422,3 +2422,45 @@ triggers y eventos (su ausencia es silenciosa) y a la vez permiten crearlos. La 
   y no "no disponible". Ahora deja un WARNING en el log, pero no una señal tipada.
 - Sin verificar contra un motor real: lectura de cuerpos por motor y versión, `GRANT SHOW CREATE ROUTINE`,
   y que `SHOW CREATE` sin privilegio devuelva NULL y no un error en cada versión.
+
+## MCP definiciones de esquema, S6 y S8: `mysql.proc` por servidor (D7, D8, D9)
+
+Contrato en [`api-reference-v39.md`](../api-reference-v39.md). Acá solo el porqué.
+
+**D7: la sonda conoce la bandera (`allow_mysql_proc`), en vez de tolerar siempre `mysql.proc`.** Una sonda
+que aceptara `SELECT ON mysql.proc` con la bandera apagada dejaría verificar una credencial que expone el
+código de las rutinas de TODAS las bases del servidor sin que ningún administrador lo haya aceptado: el
+grant es server-wide y no se puede acotar. Por eso con la bandera apagada es `select_on_mysql_schema` y con
+ella encendida se tolera esa única tabla (nunca `mysql.*`, que incluye `mysql.user` y `mysql.servers`) y
+solo si el motor la necesita (`proc_grant_supported`: MariaDB < 11.3 o MySQL 5.7). Consecuencia buscada, no
+un bug: un servidor con una credencial cargada a mano que ya tenía `SELECT ON mysql.proc` falla la sonda
+tras el deploy y queda fuera del MCP hasta que alguien acepta el riesgo por escrito (el acknowledgement) o
+quita el grant. No se hizo retrocompatible porque la alternativa es un grant server-wide aceptado en
+silencio. El acknowledgement exige el texto exacto (sin `strip`) para que el riesgo se lea; el objetivo no
+es que se acierte una frase.
+
+**D8: orden a prueba de fallos al cambiar la bandera.** Los chequeos baratos (acknowledgement, motor
+soportado) van antes de cualquier mutación; después el lock por servidor (el mismo del aprovisionamiento) y
+la intención auditada fail-closed. Con credencial propia, la bandera de la fila se persiste SOLO después de
+que el motor confirmó y la sonda pasó. Re-aprovisionar des-verifica la credencial antes de tocar el motor,
+así que el CORTE es inmediato aunque el motor falle, igual que `clear_data_credential`. Si algo falla, la
+bandera queda como estaba y la credencial sin verificar: el reintento revoca. `_provision_locked` recibe
+`proc_grant` por parámetro y no lo lee de la fila porque al habilitar la fila todavía dice `False` hasta que
+el motor confirme. La validación del motor (`engine_unsupported`) se hace con la pseudo-root y solo al
+habilitar: apagar nunca depende de leer el motor antes, así que cortar no queda sujeto a que la versión
+sea legible.
+
+**D9: una credencial cargada a mano NO es alterable (`not_alterable`).** El gateway no modifica grants de una
+cuenta que no creó: rotarla o re-grantearla le rompe la aplicación a quien la use (misma regla que
+`readonly_account.already_exists`). Para esas credenciales solo se persiste la bandera y se re-corre la
+sonda. Que la sonda falle ahí NO es un error de la operación: significa que el DBA todavía no ajustó los
+grants y el servidor queda sin verificar, o sea cerrado. Se informa con `engine_grant: "not_alterable"` y
+`readonly_verified_at` nulo, no con un 4xx, porque la bandera sí cambió y devolver error ocultaría ese
+estado. La SPA lo muestra como aviso persistente, no como toast de éxito.
+
+**SPA (S8): el control se ofrece a toda la familia MySQL/MariaDB.** `ServerOut` no trae la versión del
+motor, así que la SPA no puede saber si hace falta. En vez de adivinar, ofrece el control a MySQL y MariaDB
+(y a cualquier servidor que ya tenga la bandera encendida, para poder apagarla) y deja que el backend decida
+con el `422 engine_unsupported`. El texto del acknowledgement está duplicado literal en la SPA
+(`READONLY_PROC_ACK_TEXT`) con un comentario que apunta a la constante del backend; hay un test que fija el
+literal para que una divergencia falle ahí y no en producción.
