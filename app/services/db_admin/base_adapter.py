@@ -43,6 +43,7 @@ from app.services.db_admin.dtos import (
     ComputedInfo,
     ConnectionInfo,
     DatabaseGranteeInfo,
+    DefinitionRead,
     EngineUserInfo,
     EnumTypeInfo,
     EventInfo,
@@ -214,6 +215,70 @@ class ServerAdapter(ABC):
         consulta de nombres, no ``_snapshot_events`` (que hace un ``SHOW CREATE`` por event).
         """
         return []
+
+    #: Tipos de objeto cuyo código puede pedir ``get_definition``.
+    _DEFINITION_KINDS = frozenset({"view", "trigger", "event", "routine"})
+
+    def read_server_version(self, conn: Connection) -> str | None:
+        """
+        Cadena de versión del servidor (``VERSION()``), o ``None`` si el motor no la entregó.
+
+        Es lo que decide POR QUÉ un cuerpo no está disponible (MariaDB < 11.3, MySQL < 8.0.20):
+        ver ``readonly_probe.routine_body_reason``. Una versión ilegible no rompe la lectura:
+        el llamador cae al motivo conservador ``insufficient_privilege``.
+        """
+        fetched = self._catalog_fetch(conn, self._version_sql())
+        if not fetched.rows:
+            return None
+        raw_version = fetched.rows[0][0]
+        return None if raw_version is None else str(raw_version)
+
+    def read_definition(
+        self,
+        conn: Connection,
+        database: str,
+        schema: str,
+        kind: str,
+        name: str,
+        routine_kind: str | None = None,
+    ) -> list[DefinitionRead]:
+        """
+        Código de UN objeto ya presente en el índice, como lista de ``DefinitionRead``.
+
+        Lista y no un valor: PostgreSQL admite sobrecargas (una rutina por firma) y un mismo
+        nombre de trigger en varias tablas. Default: el motor no sabe leer definiciones
+        (``engine_unsupported``), que es la respuesta honesta para un adapter nuevo y no un
+        cuerpo vacío. Los overrides NUNCA ejecutan el objeto: solo ``SHOW CREATE`` y funciones de
+        catálogo ``pg_get_*``, con el nombre validado, cuoteado y, donde se compara, parametrizado.
+        """
+        self._validate_definition_kind(kind)
+        return [DefinitionRead(kind=kind, name=name, unavailable_reason="engine_unsupported")]
+
+    def _validate_definition_kind(self, kind: str) -> None:
+        if kind not in self._DEFINITION_KINDS:
+            raise AppHttpException(
+                message="Tipo de objeto inválido (use view, trigger, event o routine).",
+                status_code=422,
+                context={"allowed": sorted(self._DEFINITION_KINDS)},
+            )
+
+    def _definition_rows_or_none(self, conn: Connection, sql: str, params: dict | None = None):
+        """
+        Filas de una consulta de definición, o ``None`` si el motor NO entregó el objeto.
+
+        ``None`` cubre un privilegio denegado y un objeto que el índice listó pero el motor ya
+        no resuelve (1305/1370 de MySQL, una carrera con un ``DROP``). Ambos se informan como
+        "sin cuerpo", nunca como cuerpo vacío. El detalle del motor va SOLO al log.
+        """
+        fetched = self._catalog_fetch(conn, sql, params)
+        if fetched.availability != "ok":
+            logger.warning(
+                "Definición no entregada por el motor (availability=%s): se informa como "
+                "no disponible.",
+                fetched.availability,
+            )
+            return None
+        return fetched.rows
 
     # ------------------------------------------------------------------ #
     # Snapshot: consulta de catálogo OPCIONAL (compartida)                #

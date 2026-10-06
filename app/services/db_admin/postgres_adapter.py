@@ -30,6 +30,7 @@ from app.services.db_admin.dtos import (
     CollationOptionInfo,
     ColumnCollationInfo,
     DatabaseGranteeInfo,
+    DefinitionRead,
     DumpStatement,
     EngineUserInfo,
     EnumTypeInfo,
@@ -1872,6 +1873,141 @@ class PostgresAdapter(ServerAdapter):
                 value = option_text[len(cls._VIEW_CHECK_OPTION_RELOPTION_PREFIX) :].strip()
                 return value.upper() or None
         return None
+
+    # ------------------------- get_definition (lectura de código) ------------- #
+    #: ``BEFORE|AFTER|INSTEAD OF <eventos> ON`` dentro de ``pg_get_triggerdef``.
+    _TRIGGER_TIMING_EVENTS_RE = re.compile(
+        r"\b(BEFORE|AFTER|INSTEAD OF)\s+([A-Z ]{1,80}?)\s+ON\b", re.IGNORECASE
+    )
+
+    def read_definition(
+        self,
+        conn,
+        database: str,
+        schema: str,
+        kind: str,
+        name: str,
+        routine_kind: str | None = None,
+    ) -> list[DefinitionRead]:
+        """
+        Código de un objeto del schema ``public`` con funciones ``pg_get_*`` (nunca se ejecuta
+        el objeto). El nombre viaja SIEMPRE como parámetro enlazado y, además, se valida: no hay
+        ``SHOW CREATE`` en PostgreSQL, así que no se interpola ningún identificador.
+
+        Un event no existe en PostgreSQL (``engine_unsupported``).
+        """
+        self._validate_definition_kind(kind)
+        validate_identifier(name, self.dialect, kind, allow_existing=True)
+        if kind == "event":
+            return [DefinitionRead(kind="event", name=name, unavailable_reason="engine_unsupported")]
+        if kind == "view":
+            return [self._read_view_definition(conn, schema, name)]
+        if kind == "trigger":
+            return self._read_trigger_definitions(conn, schema, name)
+        return self._read_routine_definitions(conn, schema, name, routine_kind)
+
+    @staticmethod
+    def _unavailable_when_no_body(body: str | None) -> str | None:
+        return None if body is not None and body.strip() else "insufficient_privilege"
+
+    def _read_view_definition(self, conn, schema: str, name: str) -> DefinitionRead:
+        rows = self._definition_rows_or_none(
+            conn,
+            "SELECT c.relkind, pg_get_viewdef(c.oid, true), c.reloptions "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = :schema AND c.relname = :name AND c.relkind IN ('v', 'm')",
+            {"schema": schema, "name": name},
+        )
+        if not rows:
+            return DefinitionRead(kind="view", name=name, unavailable_reason="insufficient_privilege")
+        _relkind, raw_body, reloptions = rows[0][0], rows[0][1], rows[0][2]
+        body = None if raw_body is None or not str(raw_body).strip() else str(raw_body)
+        # PostgreSQL ejecuta una vista con los privilegios de su dueño salvo ``security_invoker``
+        # (PG 15+): el modo útil para el lector es cuál de los dos aplica.
+        options = [str(option).lower() for option in (reloptions or [])]
+        security = "invoker" if "security_invoker=true" in options else "definer"
+        return DefinitionRead(
+            kind="view",
+            name=name,
+            body=body,
+            unavailable_reason=self._unavailable_when_no_body(body),
+            security=security,
+            check_option=self._check_option_from_reloptions(reloptions),
+        )
+
+    def _read_trigger_definitions(self, conn, schema: str, name: str) -> list[DefinitionRead]:
+        rows = self._definition_rows_or_none(
+            conn,
+            "SELECT c.relname, pg_get_triggerdef(t.oid, true) "
+            "FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = :schema AND t.tgname = :name AND NOT t.tgisinternal "
+            "ORDER BY c.relname",
+            {"schema": schema, "name": name},
+        )
+        if not rows:
+            return [DefinitionRead(kind="trigger", name=name, unavailable_reason="insufficient_privilege")]
+        reads: list[DefinitionRead] = []
+        for table_name, raw_body in rows:
+            body = None if raw_body is None or not str(raw_body).strip() else str(raw_body)
+            timing: str | None = None
+            events: list[str] = []
+            if body is not None:
+                match = self._TRIGGER_TIMING_EVENTS_RE.search(body)
+                if match is not None:
+                    timing = match.group(1).upper()
+                    events = [part.strip().upper() for part in re.split(r"\s+OR\s+", match.group(2), flags=re.IGNORECASE)]
+            reads.append(
+                DefinitionRead(
+                    kind="trigger",
+                    name=name,
+                    body=body,
+                    unavailable_reason=self._unavailable_when_no_body(body),
+                    trigger_table=str(table_name),
+                    trigger_timing=timing,
+                    trigger_events=events,
+                )
+            )
+        return reads
+
+    def _read_routine_definitions(
+        self, conn, schema: str, name: str, routine_kind: str | None
+    ) -> list[DefinitionRead]:
+        if routine_kind is not None and routine_kind not in self._ROUTINE_KINDS:
+            raise AppHttpException(
+                message="Tipo de rutina inválido (use FUNCTION o PROCEDURE).",
+                status_code=422,
+                context={"allowed": sorted(self._ROUTINE_KINDS)},
+            )
+        rows = self._definition_rows_or_none(
+            conn,
+            "SELECT p.prokind, pg_get_function_identity_arguments(p.oid), "
+            "pg_get_functiondef(p.oid), p.prosecdef "
+            "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = :schema AND p.proname = :name AND p.prokind IN ('f', 'p') "
+            "ORDER BY p.prokind, pg_get_function_identity_arguments(p.oid)",
+            {"schema": schema, "name": name},
+        )
+        reads: list[DefinitionRead] = []
+        for prokind, identity_arguments, raw_body, security_definer in rows or []:
+            this_kind = "PROCEDURE" if str(prokind) == "p" else "FUNCTION"
+            if routine_kind is not None and routine_kind != this_kind:
+                continue
+            body = None if raw_body is None or not str(raw_body).strip() else str(raw_body)
+            reads.append(
+                DefinitionRead(
+                    kind="routine",
+                    name=name,
+                    routine_kind=this_kind,
+                    identity_arguments=str(identity_arguments) if identity_arguments is not None else None,
+                    body=body,
+                    unavailable_reason=self._unavailable_when_no_body(body),
+                    security="definer" if security_definer else "invoker",
+                )
+            )
+        if reads:
+            return reads
+        return [DefinitionRead(kind="routine", name=name, unavailable_reason="insufficient_privilege")]
 
     def _snapshot_routines(self, conn, database, schema) -> list[RoutineInfo]:
         out: list[RoutineInfo] = []

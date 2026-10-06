@@ -28,6 +28,7 @@ from app.services.db_admin.dtos import (
     CollationInventory,
     CollationObjectInfo,
     DatabaseGranteeInfo,
+    DefinitionRead,
     DumpStatement,
     EngineUserInfo,
     EventInfo,
@@ -44,6 +45,11 @@ from app.services.db_admin.dtos import (
     TextForeignKey,
     TriggerInfo,
     ViewInfo,
+)
+from app.services.db_admin.definition_redaction import (
+    KV_PASSWORD_RE,
+    REDACTED,
+    URI_USERINFO_PASSWORD_RE,
 )
 from app.services.db_admin.identifiers import (
     exclude_gateway_internal_tables,
@@ -85,22 +91,12 @@ _CREDENTIAL_TABLE_OPTION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# ``scheme://usuario:CONTRASEÑA@host…`` (FEDERATED, y el URI de CONNECT).
-# El ``@`` es OBLIGATORIO y la contraseña tiene que tener AL MENOS un carácter: sin eso no
-# hay nada que redactar, que es justo el caso ``mysql://user@host/db/tbl`` (y el de
-# ``CONNECTION='fedlink'``, un nombre de ``mysql.servers`` sin URI).
-_URI_USERINFO_PASSWORD_RE = re.compile(r"(://[^:/?#@'\s]+):(?:\\.|''|[^@'\\])+(@)")
-
-# ``password=…`` / ``pwd=…`` dentro de un OPTION_LIST de CONNECT o de una cadena ODBC.
-# El valor termina en ``,`` (separador de OPTION_LIST), ``;`` (ODBC) o el cierre del
-# literal. ``\'``/``''`` se consumen como escape para no cortar el valor por la mitad, y
-# el ``+`` evita inventar un ``***`` donde el valor venía vacío.
-_KV_PASSWORD_RE = re.compile(
-    r"\b(password|passwd|pwd)(\s*=\s*)(?:\\.|''|[^,;'\\])+",
-    re.IGNORECASE,
-)
-
-_REDACTED = "***"
+# Las regex de URI con contraseña y de ``password=`` (y el marcador ``***``) viven en
+# ``definition_redaction``: una sola fuente con la redacción del código de objetos. Los alias
+# conservan los nombres que usa ``_redact_embedded_credentials`` más abajo.
+_URI_USERINFO_PASSWORD_RE = URI_USERINFO_PASSWORD_RE
+_KV_PASSWORD_RE = KV_PASSWORD_RE
+_REDACTED = REDACTED
 
 #: Conexiones simultáneas de la cuenta de DATOS por base (``MAX_USER_CONNECTIONS``). Cada consulta
 #: del agente usa una y el vigilante que la cancela necesita OTRA con la misma cuenta, así que con
@@ -2457,6 +2453,205 @@ class MySQLAdapter(ServerAdapter):
             raw_body = self._show_create_value(create_row, candidates, fallback_idx)
         body = self._snapshot_body_or_empty(raw_body, kind=kind, name=name)
         return self._strip_definer_clause(body)
+
+    # ------------------------- get_definition (lectura de código) ------------- #
+    def read_definition(
+        self,
+        conn,
+        database: str,
+        schema: str,
+        kind: str,
+        name: str,
+        routine_kind: str | None = None,
+    ) -> list[DefinitionRead]:
+        """
+        Código de un objeto con ``SHOW CREATE`` (nunca se ejecuta el objeto) más una consulta de
+        metadatos por ``information_schema`` con parámetros enlazados.
+
+        El nombre pasa por ``validate_identifier`` + ``quote_identifier`` porque ``SHOW CREATE``
+        no admite parámetros enlazados; es la misma defensa en dos capas del resto del adapter.
+        """
+        self._validate_definition_kind(kind)
+        validated_name = validate_identifier(name, self.dialect, kind, allow_existing=True)
+        quoted_name = quote_identifier(validated_name, self.dialect)
+        if kind == "view":
+            return [self._read_view_definition(conn, database, name, quoted_name)]
+        if kind == "trigger":
+            return [self._read_trigger_definition(conn, database, name, quoted_name)]
+        if kind == "event":
+            return [self._read_event_definition(conn, database, name, quoted_name)]
+        return self._read_routine_definitions(conn, database, name, quoted_name, routine_kind)
+
+    def _read_show_create_body(
+        self, conn, statement: str, candidates: tuple[str, ...], fallback_idx: int
+    ) -> tuple[bool, str | None]:
+        """
+        ``(el objeto existe, cuerpo sin DEFINER o None)``.
+
+        Se separa "no hay fila" (el motor no resuelve el objeto: privilegio denegado o 1305) de
+        "hay fila pero el cuerpo viene NULL/vacío" (MariaDB sin privilegio): ambos terminan en
+        ``None``, pero el llamador de rutinas necesita saber si el tipo existe para no inventar
+        un objeto cuando prueba PROCEDURE y FUNCTION a la vez.
+        """
+        rows = self._definition_rows_or_none(conn, statement)
+        if not rows:
+            return False, None
+        raw_body = self._show_create_value(rows[0], candidates, fallback_idx)
+        if raw_body is None or not str(raw_body).strip():
+            return True, None
+        return True, self._strip_definer_clause(str(raw_body))
+
+    @staticmethod
+    def _unavailable_or_available(body: str | None) -> str | None:
+        return None if body is not None else "insufficient_privilege"
+
+    def _read_view_definition(self, conn, database: str, name: str, quoted_name: str) -> DefinitionRead:
+        _, body = self._read_show_create_body(
+            conn, f"SHOW CREATE VIEW {quoted_name}", ("Create View",), 1
+        )
+        check_option: str | None = None
+        security: str | None = None
+        meta_rows = self._definition_rows_or_none(
+            conn,
+            "SELECT CHECK_OPTION, SECURITY_TYPE FROM information_schema.VIEWS "
+            "WHERE TABLE_SCHEMA = :db AND TABLE_NAME = :name",
+            {"db": database, "name": name},
+        )
+        if meta_rows:
+            raw_check_option, raw_security = meta_rows[0][0], meta_rows[0][1]
+            if raw_check_option and str(raw_check_option).upper() != "NONE":
+                check_option = str(raw_check_option).upper()
+            security = self._security_from_engine_value(raw_security)
+        return DefinitionRead(
+            kind="view",
+            name=name,
+            body=body,
+            unavailable_reason=self._unavailable_or_available(body),
+            security=security,
+            check_option=check_option,
+        )
+
+    @staticmethod
+    def _security_from_engine_value(raw_security: object) -> str | None:
+        """``definer`` | ``invoker`` | ``None``. Solo el MODO: la cuenta del DEFINER no sale."""
+        normalized = str(raw_security or "").strip().upper()
+        if normalized == "DEFINER":
+            return "definer"
+        if normalized == "INVOKER":
+            return "invoker"
+        return None
+
+    def _read_trigger_definition(self, conn, database: str, name: str, quoted_name: str) -> DefinitionRead:
+        _, body = self._read_show_create_body(
+            conn, f"SHOW CREATE TRIGGER {quoted_name}", ("SQL Original Statement",), 2
+        )
+        table: str | None = None
+        timing: str | None = None
+        events: list[str] = []
+        meta_rows = self._definition_rows_or_none(
+            conn,
+            "SELECT EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION "
+            "FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = :db AND TRIGGER_NAME = :name",
+            {"db": database, "name": name},
+        )
+        if meta_rows:
+            raw_table, raw_timing, raw_event = meta_rows[0][0], meta_rows[0][1], meta_rows[0][2]
+            table = str(raw_table) if raw_table else None
+            timing = str(raw_timing) if raw_timing else None
+            events = [str(raw_event)] if raw_event else []
+        return DefinitionRead(
+            kind="trigger",
+            name=name,
+            body=body,
+            unavailable_reason=self._unavailable_or_available(body),
+            trigger_table=table,
+            trigger_timing=timing,
+            trigger_events=events,
+        )
+
+    def _read_event_definition(self, conn, database: str, name: str, quoted_name: str) -> DefinitionRead:
+        _, body = self._read_show_create_body(
+            conn, f"SHOW CREATE EVENT {quoted_name}", ("Create Event",), 3
+        )
+        schedule: str | None = None
+        status: str | None = None
+        meta_rows = self._definition_rows_or_none(
+            conn,
+            "SELECT EVENT_TYPE, EXECUTE_AT, INTERVAL_VALUE, INTERVAL_FIELD, STATUS "
+            "FROM information_schema.EVENTS WHERE EVENT_SCHEMA = :db AND EVENT_NAME = :name",
+            {"db": database, "name": name},
+        )
+        if meta_rows:
+            event_type, execute_at, interval_value, interval_field, raw_status = meta_rows[0][:5]
+            schedule = self._build_event_schedule(
+                event_type, execute_at, interval_value, interval_field
+            )
+            status = str(raw_status) if raw_status else None
+        return DefinitionRead(
+            kind="event",
+            name=name,
+            body=body,
+            unavailable_reason=self._unavailable_or_available(body),
+            event_schedule=schedule,
+            event_status=status,
+        )
+
+    def _read_routine_definitions(
+        self,
+        conn,
+        database: str,
+        name: str,
+        quoted_name: str,
+        routine_kind: str | None,
+    ) -> list[DefinitionRead]:
+        """
+        Sin ``routine_kind`` se prueban PROCEDURE y FUNCTION (MySQL admite los dos con el mismo
+        nombre). Que un tipo no resuelva (1305) significa "ausente para ese tipo" y se omite;
+        si ninguno resuelve, UNA lectura sin cuerpo (el índice dijo que el nombre existe).
+        """
+        if routine_kind is not None and routine_kind not in self._ROUTINE_KINDS:
+            raise AppHttpException(
+                message="Tipo de rutina inválido (use FUNCTION o PROCEDURE).",
+                status_code=422,
+                context={"allowed": sorted(self._ROUTINE_KINDS)},
+            )
+        kinds_to_try = [routine_kind] if routine_kind else ["PROCEDURE", "FUNCTION"]
+        reads: list[DefinitionRead] = []
+        for candidate_kind in kinds_to_try:
+            exists, body = self._read_show_create_body(
+                conn,
+                f"SHOW CREATE {candidate_kind} {quoted_name}",
+                (f"Create {candidate_kind.capitalize()}",),
+                2,
+            )
+            if not exists and routine_kind is None:
+                continue
+            security: str | None = None
+            meta_rows = self._definition_rows_or_none(
+                conn,
+                "SELECT SECURITY_TYPE FROM information_schema.ROUTINES "
+                "WHERE ROUTINE_SCHEMA = :db AND ROUTINE_NAME = :name AND ROUTINE_TYPE = :rtype",
+                {"db": database, "name": name, "rtype": candidate_kind},
+            )
+            if meta_rows:
+                security = self._security_from_engine_value(meta_rows[0][0])
+            reads.append(
+                DefinitionRead(
+                    kind="routine",
+                    name=name,
+                    routine_kind=candidate_kind,
+                    body=body,
+                    unavailable_reason=self._unavailable_or_available(body),
+                    security=security,
+                )
+            )
+        if reads:
+            return reads
+        return [
+            DefinitionRead(
+                kind="routine", name=name, unavailable_reason="insufficient_privilege"
+            )
+        ]
 
 
     # ------------------------- generación de DDL (Fase 3) --------------------- #

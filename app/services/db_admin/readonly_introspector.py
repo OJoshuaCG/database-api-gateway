@@ -34,6 +34,7 @@ from contextlib import contextmanager
 from app.core.environments import MCP_SESSION_MAX_SECONDS, MCP_STATEMENT_TIMEOUT_MS
 from app.core.remote_engine import ServerTarget
 from app.services.db_admin.dtos import (
+    DefinitionRead,
     EventInfo,
     RoutineInfo,
     SchemaSnapshot,
@@ -108,6 +109,26 @@ class ReadonlyIntrospector:
         """
         self.__session.check_deadline()
         return self.__adapter._snapshot_events(self.__session.conn, self.database, self._schema())
+
+    def definition(
+        self, kind: str, name: str, routine_kind: str | None = None
+    ) -> list[DefinitionRead]:
+        """
+        Código de UN objeto del índice (``view``/``trigger``/``event``/``routine``).
+
+        Devuelve una lectura por sobrecarga o tipo de rutina (ver ``ServerAdapter.read_definition``).
+        El cuerpo llega SIN redactar: ``definition_reader.build_definition`` redacta, mide y
+        huella. Corre en la misma sesión de solo lectura que el resto de la fachada.
+        """
+        self.__session.check_deadline()
+        return self.__adapter.read_definition(
+            self.__session.conn, self.database, self._schema(), kind, name, routine_kind
+        )
+
+    def server_version(self) -> str | None:
+        """Versión del servidor (``VERSION()``), o ``None`` si no se pudo leer."""
+        self.__session.check_deadline()
+        return self.__adapter.read_server_version(self.__session.conn)
 
     def sequences(self) -> list[SequenceInfo]:
         self.__session.check_deadline()
