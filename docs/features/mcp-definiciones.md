@@ -63,7 +63,9 @@ En MySQL y MariaDB, una cuenta de solo lectura sin privilegio de rutina recibe *
 Cómo arreglarlo si la rutina existe:
 
 - **MariaDB >= 11.3:** regenerar la credencial de solo lectura del servidor (botón «Regenerar credencial»
-  del panel de la SPA). Ese aprovisionamiento ya otorga lo necesario.
+  del panel de la SPA). Ese aprovisionamiento ya otorga lo necesario. El botón está en el panel «Acceso
+  de agentes (MCP)» del **detalle del servidor**, no en el modal «Acceso de agentes» de cada base: ese
+  administra la credencial de **datos** y no otorga nada sobre rutinas.
 - **MariaDB < 11.3 o MySQL 5.7:** habilitar la lectura de cuerpos de rutinas (sección siguiente).
 
 ## MariaDB < 11.3 y MySQL 5.7: `mysql.proc` por servidor
@@ -93,11 +95,12 @@ deploy y queda fuera del MCP hasta que se acepte el riesgo con la bandera o se q
 
 ## Qué todavía no se verificó
 
-- **El `GRANT SHOW CREATE ROUTINE` de MariaDB 11.3+** (nombre y sintaxis) sale de la documentación de
-  MariaDB, no de un servidor probado. El literal está en una sola constante marcada para confirmar
-  (`MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE`). Confirmalo, junto con la salida de `SHOW GRANTS`, antes de
-  encender `MCP_SCHEMA_DEFINITIONS_ENABLED` en producción. Una credencial ya aprovisionada no recibe el
-  privilegio hasta que se re-aprovisiona.
-- **Ningún test de esta entrega corrió contra un motor real** (MySQL, MariaDB ni PostgreSQL); usan un motor
-  falso.
+- **El `GRANT SHOW CREATE ROUTINE` de MariaDB** se verificó en vivo solo en la versión **11.8.3**: al
+  regenerar la credencial de estructura, las rutinas pasaron a verse en `list_objects` y sus cuerpos se
+  leyeron con `get_definition`. No se probó en otras versiones 11.3 a 11.7 ni se inspeccionó la salida de
+  `SHOW GRANTS` posterior. El literal está en una sola constante
+  (`MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE`). Una credencial ya aprovisionada no recibe el privilegio hasta
+  que se regenera.
+- **MySQL, PostgreSQL y la bandera de `mysql.proc`** (MariaDB anterior a 11.3 y MySQL 5.7) no se probaron
+  contra un motor real; los tests usan un motor falso.
 - Que `SHOW CREATE` sin privilegio devuelva NULL y no un error en cada versión del motor.

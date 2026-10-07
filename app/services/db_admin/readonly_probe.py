@@ -30,10 +30,10 @@ from typing import Literal
 #: Privilegio de MariaDB >= 11.3 (MDEV-29167) que deja leer el código de las rutinas de UNA base
 #: sin ``SELECT ON mysql.proc``. ÚNICO lugar donde vive el literal: el aprovisionamiento, la
 #: allowlist de la sonda y el helper de versión lo toman de acá.
-#: SIN CONFIRMAR EN STAGING: el nombre exacto y la sintaxis del ``GRANT`` salen de la
-#: documentación de MariaDB, no de un servidor 11.3+ probado. Confirmar con ``GRANT SHOW CREATE
-#: ROUTINE ON `db`.* TO ...`` y con la salida de ``SHOW GRANTS`` ANTES de habilitar en producción;
-#: si el nombre difiere, se corrige solo esta constante.
+#: VERIFICADO EN VIVO en MariaDB 11.8.3 (staging): regenerar la credencial de estructura con este
+#: privilegio hizo visibles las rutinas en ``list_objects`` y legibles sus cuerpos con
+#: ``get_definition``. NO se probó en otras versiones 11.3 a 11.7, y no se inspeccionó la salida de
+#: ``SHOW GRANTS`` posterior; si una versión difiere, se corrige solo esta constante.
 MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE = "SHOW CREATE ROUTINE"
 
 #: Privilegios que la credencial puede tener en la familia MySQL (§7.2). ``USAGE`` es "ninguno".

@@ -178,12 +178,11 @@ a nivel base (global o por tabla sigue siendo violación; `SELECT` sobre `mysql.
 Vistas, triggers y eventos se leen con los grants por base ya existentes (`SELECT`, `SHOW VIEW`,
 `TRIGGER`, `EVENT`).
 
-**SIN VERIFICAR EN STAGING**: el nombre exacto y la sintaxis del `GRANT SHOW CREATE ROUTINE` salen de la
-documentación de MariaDB, no de un servidor 11.3+ probado. El literal vive en una sola constante
-(`MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE`, `readonly_probe.py`) marcada para confirmar. Ningún test de esta
-entrega corrió contra un motor real. Confirmar el `GRANT` y la salida de `SHOW GRANTS` antes de habilitar
-`MCP_SCHEMA_DEFINITIONS_ENABLED` en producción. Una credencial ya aprovisionada no recibe el privilegio
-hasta que se vuelve a aprovisionar.
+**Verificado en vivo solo en MariaDB 11.8.3** (staging): al regenerar la credencial de estructura, las
+rutinas pasaron a verse en `list_objects` y sus cuerpos se leyeron con `get_definition`. No se probó en
+otras versiones 11.3 a 11.7 ni se inspeccionó la salida de `SHOW GRANTS` posterior. El literal vive en una
+sola constante (`MARIADB_SHOW_CREATE_ROUTINE_PRIVILEGE`, `readonly_probe.py`). Una credencial ya
+aprovisionada no recibe el privilegio hasta que se regenera. Los tests de esta entrega usan un motor falso.
 
 ## `PUT /servers/{id}/readonly-credential/routine-bodies` (S6)
 
@@ -257,7 +256,7 @@ final con `touched_engine`. El detalle no lleva el texto del acknowledgement ni 
 
 ## Estado de las slices
 
-S1 a S8 hechas. No queda nada pendiente de este cambio salvo lo que figura como **SIN VERIFICAR** (motor
-real, `GRANT SHOW CREATE ROUTINE`).
+S1 a S8 hechas. Verificado en vivo en MariaDB 11.8.3 (vistas, triggers, rutinas y estadísticas de tablas).
+Sin verificar contra un motor real: MySQL, PostgreSQL, MariaDB 11.3 a 11.7 y la bandera de `mysql.proc`.
 
 Variable nueva: `MCP_SCHEMA_DEFINITIONS_ENABLED` (default `false`, documentada en `.env.example`).
