@@ -52,6 +52,7 @@ from app.models.managed_database import ManagedDatabase
 from app.models.schema_comparison import SchemaComparison
 from app.models.schema_comparison_item import SchemaComparisonItem
 from app.services import audit
+from app.services.db_admin import definition_visibility
 from app.services.db_admin.export_spec import sanitize_filename
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import references_gateway_internal_table
@@ -101,6 +102,13 @@ def _snapshot_fingerprint(snapshot) -> str:
         ext.pop("version", None)
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+#: Línea que reemplaza al cuerpo de un objeto en el ``.sql`` exportado cuando el lector no tiene
+#: ``schema.definitions``. Es un comentario SQL: el archivo sigue siendo ejecutable (se saltea).
+HIDDEN_DEFINITION_COMMENT = (
+    "-- [contenido oculto: tu rol no ve el código de este objeto (schema.definitions)]"
+)
 
 
 @dataclass(frozen=True)
@@ -670,6 +678,10 @@ class SchemaComparisonController:
             f"-- [{it['seq']}] {it['object_type']} {it['object_name']} "
             f"({it['change_type']}){destructive}{review}"
         )
+        if it.get("redacted"):
+            # Sin ``schema.definitions`` el cuerpo no se entrega: el archivo lo dice en vez de
+            # dejar el objeto sin sentencia (un objeto "sin definición" sería mentira).
+            return f"{header}\n{HIDDEN_DEFINITION_COMMENT}"
         sql = it["sql"].rstrip().rstrip(";")
         # El criterio de la envoltura vive en ``sql_dialect`` (fuente única): lo comparte
         # con el writer de exportación vía ``ServerAdapter.export_body_wrapper``. Tenerlo
@@ -706,7 +718,12 @@ class SchemaComparisonController:
         artefacto de revisión, no una ejecución. Funciona idéntico para BDs adoptadas y
         crudas (el recurso ya está keyed por comparación). ``include_rollback`` anexa el
         ``down_sql`` sugerido (orden inverso) COMENTADO al final.
+
+        Sin ``schema.definitions`` (``admin`` es quien descarga) las vistas, rutinas, triggers y
+        eventos salen con una línea de comentario en lugar del cuerpo y sin su rollback; las tablas
+        y el resto de la estructura salen completos.
         """
+        sees_definitions = self.reader_sees_definitions(comparison_id, admin)
         session = self._session()
         try:
             comp = self._comparison_or_404(session, comparison_id)
@@ -768,6 +785,10 @@ class SchemaComparisonController:
             }
         finally:
             session.close()
+
+        if not sees_definitions:
+            selected = [definition_visibility.redact_item(it) for it in selected]
+        redacted_count = sum(1 for it in selected if it.get("redacted"))
 
         if not selected:
             raise AppHttpException(
@@ -846,9 +867,40 @@ class SchemaComparisonController:
                 f"export .sql de la comparación {meta['id']}: {len(selected)} de "
                 f"{total_in_comparison} sentencia(s)"
                 + (" (con rollback)" if include_rollback else "")
+                + (f" (código oculto en {redacted_count} objeto(s))" if redacted_count else "")
             ),
         )
         return filename, content
+
+    def reader_sees_definitions(
+        self, comparison_id: int, reader: "dict | Actor | None"
+    ) -> bool:
+        """
+        ¿``reader`` tiene ``schema.definitions`` en el ORIGEN y en el DESTINO de la comparación?
+
+        Los cuerpos de un ítem salen de los dos lados (``sql`` de lo nuevo o modificado viene del
+        origen; ``down_sql`` de lo modificado o borrado, del destino), así que se piden los dos:
+        con uno solo, una comparación entre producción y desarrollo filtraría el código del lado
+        donde la persona no puede leerlo. Cada lado se resuelve como una base (inventariada o
+        cruda), con la misma capa 2 que el resto. Un lector que no es un ``Actor`` no ve cuerpos.
+        """
+        from app.core.scope_targets import server_database
+
+        session = self._session()
+        try:
+            comp = self._comparison_or_404(session, comparison_id)
+            sides = [
+                (comp.source_server_id, comp.source_database_name),
+                (comp.target_server_id, comp.target_database_name),
+            ]
+        finally:
+            session.close()
+        return all(
+            definition_visibility.actor_reads_definitions(
+                reader, server_database(server_id, database_name)
+            )
+            for server_id, database_name in sides
+        )
 
     def list_items(
         self,
@@ -858,7 +910,15 @@ class SchemaComparisonController:
         change_type: str | None = None,
         limit: int,
         offset: int,
+        reader: "dict | Actor | None",
     ) -> tuple[list[dict], int]:
+        """
+        Ítems de la comparación. ``reader`` es keyword y SIN default: una llamada que olvide decir
+        quién lee falla con ``TypeError`` en vez de devolver el código de las vistas. Sin
+        ``schema.definitions`` los ítems de vistas, rutinas, triggers y eventos salen sin cuerpo y
+        con ``redacted=true`` (ver ``definition_visibility``).
+        """
+        sees_definitions = self.reader_sees_definitions(comparison_id, reader)
         session = self._session()
         try:
             self._comparison_or_404(session, comparison_id)
@@ -876,9 +936,12 @@ class SchemaComparisonController:
                 .offset(offset)
                 .all()
             )
-            return [self._serialize_item(r) for r in rows], total
+            items = [self._serialize_item(r) for r in rows]
         finally:
             session.close()
+        visible = definition_visibility.mark_visible
+        redact = definition_visibility.redact_item
+        return [visible(i) if sees_definitions else redact(i) for i in items], total
 
     # ------------------------------------------------------------------ #
     # Integridad del plan: grupos atómicos y cierre de dependencias        #
@@ -1041,7 +1104,27 @@ class SchemaComparisonController:
             for f in findings
         ]
 
-    def resolve_selection(self, comparison_id: int, selected_item_ids: list[int]) -> dict:
+    @staticmethod
+    def _added_item_view(row: SchemaComparisonItem, *, sees_definitions: bool) -> dict:
+        """Una sentencia agregada por dependencia, sin cuerpo si el lector no ve definiciones."""
+        view = {
+            "item_id": row.id,
+            "object_type": row.object_type,
+            "object_name": row.object_name,
+            "change_type": row.change_type,
+            "sql": row.sql,
+        }
+        if sees_definitions:
+            return {**view, "redacted": False}
+        return definition_visibility.redact_item(view)
+
+    def resolve_selection(
+        self,
+        comparison_id: int,
+        selected_item_ids: list[int],
+        *,
+        reader: "dict | Actor | None",
+    ) -> dict:
         """
         Expande una selección a su CIERRE de dependencias sin ejecutar ni adoptar nada.
 
@@ -1049,7 +1132,12 @@ class SchemaComparisonController:
         frontend manda lo que el usuario marcó y recibe el conjunto realmente ejecutable,
         con el detalle de qué se agregó y por qué. Evita el ciclo "intento → 422 → agrego
         → reintento".
+
+        ``reader`` es keyword y SIN default (``TypeError`` si se olvida). Las sentencias agregadas
+        por dependencia de tipo vista, rutina, trigger o evento salen sin cuerpo y con
+        ``redacted=true`` para quien no tiene ``schema.definitions`` en origen y destino.
         """
+        sees_definitions = self.reader_sees_definitions(comparison_id, reader)
         session = self._session()
         try:
             self._comparison_or_404(session, comparison_id)
@@ -1081,13 +1169,7 @@ class SchemaComparisonController:
             "added_item_ids": list(closure.added_item_ids),
             "added_reasons": reasons,
             "added": [
-                {
-                    "item_id": by_id[i].id,
-                    "object_type": by_id[i].object_type,
-                    "object_name": by_id[i].object_name,
-                    "change_type": by_id[i].change_type,
-                    "sql": by_id[i].sql,
-                }
+                self._added_item_view(by_id[i], sees_definitions=sees_definitions)
                 for i in closure.added_item_ids
             ],
             "total": len(closure.item_ids),

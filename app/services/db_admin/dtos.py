@@ -407,6 +407,15 @@ class DumpStatement(BaseModel):
             "del split manual. Solo aristas baratas/fiables; vistas/rutinas no se parsean."
         ),
     )
+    redacted: bool = Field(
+        default=False,
+        description=(
+            "``True`` si ``ddl`` se VACIÓ porque quien lee no tiene ``schema.definitions``: el "
+            "objeto es una vista, vista materializada, rutina, trigger o evento y su código no "
+            "se entrega. Es la marca explícita de «oculto»: un ``ddl`` vacío sin ella sería un "
+            "objeto sin definición. Las tablas nunca se redactan."
+        ),
+    )
     requires_manual_credentials: bool = Field(
         default=False,
         description=(

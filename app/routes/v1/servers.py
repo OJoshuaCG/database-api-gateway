@@ -73,6 +73,7 @@ from app.schemas.server_user import (
     PasswordChangeBatchOut,
     RevealedPasswordOut,
 )
+from app.services.db_admin import definition_visibility
 from app.services.db_admin.dtos import (
     ConnectionInfo,
     EngineUserInfo,
@@ -484,7 +485,9 @@ def snapshot_database(
 ):
     """
     Snapshot estructural EN VIVO de una BD (tablas, vistas, rutinas, triggers, etc.).
-    Solo estructura, nunca filas. Es la PREVIEW (no persiste): para fijarlo como
+    Solo estructura, nunca filas. **El CÓDIGO de vistas, vistas materializadas, rutinas, triggers y
+    eventos exige ``schema.definitions``** (``operator`` y ``owner``): sin ella esos objetos salen
+    con ``ddl`` vacío y ``redacted=true``; el guard de la ruta sigue siendo ``databases.read``. Es la PREVIEW (no persiste): para fijarlo como
     blueprint baseline use POST /database-models/from-snapshot.
 
     Con ``?include_data_stats=true`` agrega ``table_stats`` (estimación de filas y si
@@ -493,6 +496,14 @@ def snapshot_database(
     """
     ctrl = ServerController()
     dump = ctrl.snapshot(server_id, database)
+    if not definition_visibility.actor_reads_definitions(
+        actor, server_database(server_id, database)
+    ):
+        # Sin ``schema.definitions`` EN esta base: la estructura sale completa y el código de
+        # vistas, rutinas, triggers y eventos, vacío y marcado ``redacted``. Se redacta acá y no en
+        # ``ServerController.snapshot``: los consumidores internos (blueprint desde snapshot) usan
+        # el dump completo.
+        dump = definition_visibility.redact_dump(dump)
     if include_data_stats:
         dump = dump.model_copy(update={"table_stats": ctrl.table_stats(server_id, database)})
     return success(data=dump)

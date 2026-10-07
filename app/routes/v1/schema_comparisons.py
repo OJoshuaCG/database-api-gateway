@@ -12,9 +12,15 @@ Endpoints de comparaciones estructurales entre dos BDs gestionadas (Plan diff).
 - POST /schema-comparisons/{id}/execute       — Opción B: ejecución directa ad-hoc.
 
 Todo detrás de ``schema_diff.read`` / ``schema_diff.execute``; ``adopt`` exige además
-``blueprints.write``, porque crea una versión de blueprint desde otro módulo. La creación toca ambos motores (introspección, coste
-alto → 10/min); adopt/execute son las operaciones más sensibles → 3/min (alineado
-con apply-all).
+``blueprints.write``, porque crea una versión de blueprint desde otro módulo.
+
+El CÓDIGO de vistas, rutinas, triggers y eventos (``items``, ``export`` y ``resolve-selection``)
+solo se entrega a quien tiene ``schema.definitions`` en origen y destino; al resto le llega vacío y
+con ``redacted=true`` (``definition_visibility``). ``execute-preview``, ``adopt`` y ``execute`` son
+de ``schema_diff.execute``: quien puede aplicar el DDL ve las sentencias exactas que aplica.
+
+La creación toca ambos motores (introspección, coste alto → 10/min); adopt/execute son las
+operaciones más sensibles → 3/min (alineado con apply-all).
 """
 
 from typing import Annotated
@@ -96,6 +102,7 @@ def list_comparison_items(
         change_type=change_type,
         limit=pagination.size,
         offset=pagination.offset,
+        reader=actor,
     )
     return paginated(items, total=total, pagination=pagination)
 
@@ -200,7 +207,7 @@ def resolve_selection(actor: SchemaDiffRead, comparison_id: int, payload: Resolv
     para que el frontend lo muestre antes de pedir confirmación.
     """
     result = SchemaComparisonController().resolve_selection(
-        comparison_id, payload.selected_item_ids
+        comparison_id, payload.selected_item_ids, reader=actor
     )
     n = len(result["added_item_ids"])
     msg = (

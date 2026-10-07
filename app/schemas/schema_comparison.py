@@ -140,6 +140,14 @@ class ResolveSelectionAddedOut(BaseModel):
     object_name: str
     change_type: str
     sql: str
+    redacted: bool = Field(
+        default=False,
+        description=(
+            "``True`` si ``sql``/``down_sql`` se VACIARON porque el objeto es una vista, vista "
+            "materializada, rutina, trigger o evento y quien lee no tiene ``schema.definitions`` "
+            "en origen y destino. La estructura (tablas, columnas, índices) nunca se redacta."
+        ),
+    )
 
 
 class ResolveSelectionOut(BaseModel):
@@ -286,6 +294,14 @@ class SchemaComparisonItemOut(BaseModel):
     execution_status: str | None = None
     execution_error: str | None = None
     executed_at: datetime | None = None
+    redacted: bool = Field(
+        default=False,
+        description=(
+            "``True`` si ``sql``/``down_sql`` se VACIARON porque el objeto es una vista, vista "
+            "materializada, rutina, trigger o evento y quien lee no tiene ``schema.definitions`` "
+            "en origen y destino. La estructura (tablas, columnas, índices) nunca se redacta."
+        ),
+    )
 
 
 class AdoptComparisonOut(BaseModel):
