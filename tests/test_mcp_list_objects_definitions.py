@@ -323,3 +323,117 @@ def test_the_default_name_hooks_reuse_the_snapshot_of_engines_without_show_creat
 
     assert ServerAdapter.list_routine_names(adapter_minimo, None, "db", "db") == ["f1", "f2"]
     assert ServerAdapter.list_trigger_names(adapter_minimo, None, "db", "db") == ["t1"]
+
+
+# --------------------------------------------------------------------------- #
+# routines_not_visible: motor que puede ocultarlas O índice con cero rutinas   #
+# --------------------------------------------------------------------------- #
+_CODIGO_RUTINAS_NO_VISIBLES = "mcp.warn.routines_not_visible"
+_INDICE_SIN_RUTINAS = {**_INDICE_CON_TODO, "routine": []}
+
+
+def _avisos(sobre) -> dict:
+    return {w["code"]: w["message"] for w in sobre["warnings"]}
+
+
+def test_zero_routines_listed_on_a_modern_engine_warns_without_claiming_certainty(
+    admin_client, monkeypatch, motor_falso
+):
+    actor, database_id = _escenario(admin_client, monkeypatch)
+    _facade(motor_falso, indice=_INDICE_SIN_RUTINAS, version_motor="11.8.3-MariaDB")
+
+    sobre = _ok(actor, database_id)
+
+    mensaje = _avisos(sobre)[_CODIGO_RUTINAS_NO_VISIBLES]
+    assert "Cero rutinas listadas" in mensaje and "puede que no existan" in mensaje
+
+
+def test_zero_routines_warns_even_without_the_definitions_scope(
+    admin_client, monkeypatch, motor_falso
+):
+    """El cero del índice no depende del scope: la cuenta sigue sin ver rutinas."""
+    actor, database_id = _escenario(admin_client, monkeypatch, scopes=_SCOPES_SIN_DEFINICIONES)
+    _facade(motor_falso, indice=_INDICE_SIN_RUTINAS)
+
+    sobre = _ok(actor, database_id)
+
+    assert _CODIGO_RUTINAS_NO_VISIBLES in _avisos(sobre)
+
+
+def test_zero_routines_does_not_warn_when_kinds_leave_routines_out(
+    admin_client, monkeypatch, motor_falso
+):
+    actor, database_id = _escenario(admin_client, monkeypatch)
+    _facade(motor_falso, indice=_INDICE_SIN_RUTINAS)
+
+    sobre = _ok(actor, database_id, kinds=["table", "view"])
+
+    assert _CODIGO_RUTINAS_NO_VISIBLES not in _avisos(sobre)
+
+
+def test_zero_routines_warns_when_kinds_include_routine(admin_client, monkeypatch, motor_falso):
+    actor, database_id = _escenario(admin_client, monkeypatch)
+    _facade(motor_falso, indice=_INDICE_SIN_RUTINAS)
+
+    sobre = _ok(actor, database_id, kinds=["routine"])
+
+    assert _CODIGO_RUTINAS_NO_VISIBLES in _avisos(sobre)
+
+
+def test_a_name_prefix_that_filters_out_every_routine_is_not_zero_routines(
+    admin_client, monkeypatch, motor_falso
+):
+    """Con rutinas en el índice, un prefijo que no coincide no dispara el aviso del cero."""
+    actor, database_id = _escenario(admin_client, monkeypatch)
+    _facade(motor_falso, indice=_INDICE_CON_TODO, version_motor="8.0.36")
+
+    sobre = _ok(actor, database_id, name_prefix="zzz")
+
+    assert _CODIGO_RUTINAS_NO_VISIBLES not in _avisos(sobre)
+
+
+def test_an_engine_that_may_hide_routines_keeps_its_own_message_even_with_zero_listed(
+    admin_client, monkeypatch, motor_falso
+):
+    actor, database_id = _escenario(admin_client, monkeypatch)
+    _facade(motor_falso, indice=_INDICE_SIN_RUTINAS, version_motor="10.6.12-MariaDB")
+
+    sobre = _ok(actor, database_id)
+
+    avisos = [w for w in sobre["warnings"] if w["code"] == _CODIGO_RUTINAS_NO_VISIBLES]
+    assert len(avisos) == 1
+    assert "puede ocultar rutinas" in avisos[0]["message"]
+
+
+def test_the_engine_hint_warns_for_a_filtered_listing_that_includes_routines(
+    admin_client, monkeypatch, motor_falso
+):
+    actor, database_id = _escenario(admin_client, monkeypatch)
+    _facade(motor_falso, indice=_INDICE_CON_TODO, version_motor="10.6.12-MariaDB")
+
+    sobre = _ok(actor, database_id, kinds=["routine"])
+
+    assert "puede ocultar rutinas" in _avisos(sobre)[_CODIGO_RUTINAS_NO_VISIBLES]
+
+
+@pytest.mark.parametrize(
+    "engine, kinds, oculta, cantidad, esperado",
+    [
+        ("postgresql", ("routine",), True, 0, False),
+        ("mysql", ("table",), True, 0, False),
+        ("mysql", ("routine",), False, 3, False),
+        ("mysql", ("routine",), False, 0, True),
+        ("mariadb", ("table", "routine"), True, 3, True),
+    ],
+)
+def test_the_routines_not_visible_decision_table(engine, kinds, oculta, cantidad, esperado):
+    from app.mcp.tools.catalog import _routines_not_visible_warning
+
+    aviso = _routines_not_visible_warning(
+        engine=engine,
+        kinds=kinds,
+        engine_may_hide_routines=oculta,
+        routines_listed_count=cantidad,
+    )
+
+    assert (aviso is not None) is esperado

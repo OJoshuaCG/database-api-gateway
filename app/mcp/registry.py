@@ -275,7 +275,8 @@ def _definition_tools(definitions) -> tuple[ToolSpec, ...]:
                 "que no quede ninguna. Este servidor no ejecuta ningún objeto y la tool no acepta "
                 "SQL. Un objeto sin código disponible trae 'unavailable_reason'; uno de más de "
                 "64 KiB vuelve como 'too_large' sin recortar; un nombre que no existe en la base "
-                "vuelve en 'missing'."
+                "vuelve en 'missing'. En MySQL y MariaDB una rutina en 'missing' puede existir y "
+                "no ser visible para la cuenta de solo lectura: la respuesta lo avisa."
             ),
             input_schema={
                 "type": "object",

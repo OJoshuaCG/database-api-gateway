@@ -51,6 +51,9 @@ _NAME_MAX = 128
 _KINDS: tuple[str, ...] = ("view", "trigger", "event", "routine")
 _ROUTINE_KINDS: tuple[str, ...] = ("PROCEDURE", "FUNCTION")
 _ALLOWED_ITEM_KEYS = frozenset({"kind", "name", "routine_kind"})
+#: Motores cuyo índice de rutinas puede salir vacío por falta de privilegio, sin error. PostgreSQL
+#: no entra: ``pg_proc`` lista las rutinas del schema aunque la cuenta no pueda ejecutarlas.
+_ENGINES_WITH_HIDDEN_ROUTINES = frozenset({"mysql", "mariadb"})
 
 
 def _invalid(message: str) -> AppHttpException:
@@ -176,6 +179,32 @@ def _map_definition(
     )
 
 
+def _routine_missing_warning(
+    engine: str, missing: list[tuple[str, str, str | None]]
+) -> out.WarningOut | None:
+    """
+    Un único aviso si alguna RUTINA pedida volvió en ``missing`` en MySQL/MariaDB, o ``None``.
+
+    Por qué existe: una cuenta de estructura sin privilegio de rutina recibe cero filas de
+    ``information_schema.ROUTINES`` sin ningún error, y ``missing`` diría "no existe" de una rutina
+    que sí existe. El aviso no afirma ninguna de las dos cosas: da las dos salidas posibles. Se
+    emite UNO por llamada aunque falten varias rutinas, y no cambia la forma de ``missing[]``.
+    """
+    if engine not in _ENGINES_WITH_HIDDEN_ROUTINES:
+        return None
+    routine_is_missing = any(kind == "routine" for (kind, _name, _routine_kind) in missing)
+    if not routine_is_missing:
+        return None
+    return out.WarningOut(
+        code=codes.WARN_ROUTINE_NOT_FOUND_OR_NOT_VISIBLE,
+        message=(
+            "La rutina no se encontró o la cuenta de solo lectura no tiene privilegio para "
+            "verla. Si existe, regenerá la credencial de solo lectura del servidor (MariaDB >= "
+            "11.3) o habilitá la lectura de cuerpos de rutinas (motores más antiguos)."
+        ),
+    )
+
+
 def get_definition(ctx: ToolContext, params: dict) -> dict:
     """
     El código de los objetos pedidos, con disponibilidad EXPLÍCITA por objeto.
@@ -210,6 +239,9 @@ def get_definition(ctx: ToolContext, params: dict) -> dict:
         ),
         bodies_requested=False,
     )
+    routine_warning = _routine_missing_warning(batch.database.database.engine, list(batch.missing))
+    if routine_warning is not None:
+        warnings.append(routine_warning)
     if any(obj.redactions for obj in mapped):
         warnings.append(
             out.WarningOut(

@@ -39,6 +39,8 @@ KINDS: tuple[str, ...] = ("table", "view", "routine", "trigger", "sequence")
 LIST_KINDS: tuple[str, ...] = KINDS + ("event",)
 _WITH_BODY = frozenset({"view", "routine", "trigger", "event"})
 _NAME_MAX = 128
+#: Motores donde ``information_schema.ROUTINES`` puede salir vacío por falta de privilegio, sin error.
+_ENGINES_WITH_HIDDEN_ROUTINES = frozenset({"mysql", "mariadb"})
 
 
 def _invalid(message: str) -> AppHttpException:
@@ -154,6 +156,44 @@ def _body_flags(kind: str, disponibilidad) -> tuple[bool | None, str | None]:
     return reason is None, reason
 
 
+def _routines_not_visible_warning(
+    *,
+    engine: str,
+    kinds: tuple[str, ...],
+    engine_may_hide_routines: bool,
+    routines_listed_count: int,
+) -> out.WarningOut | None:
+    """
+    Aviso ``routines_not_visible`` de ``list_objects``, o ``None`` si no corresponde.
+
+    Corresponde en MySQL/MariaDB cuando las rutinas forman parte del listado pedido Y se cumple
+    alguna de dos señales: el motor/versión/bandera dice que puede ocultarlas, o el índice no listó
+    NINGUNA. La segunda es la señal barata y veraz del caso real: sin privilegio de rutina,
+    ``information_schema.ROUTINES`` devuelve cero filas sin error. Se mide sobre el índice completo
+    y no sobre lo filtrado por ``name_prefix``: un prefijo que no coincide no es "cero rutinas".
+    Nunca se afirma certeza: cero puede ser "no hay" o "no las veo". PostgreSQL no se toca.
+    """
+    if engine not in _ENGINES_WITH_HIDDEN_ROUTINES:
+        return None
+    if "routine" not in kinds:
+        return None
+    zero_routines_listed = routines_listed_count == 0
+    if not engine_may_hide_routines and not zero_routines_listed:
+        return None
+    if engine_may_hide_routines:
+        message = (
+            "Este motor puede ocultar rutinas a la credencial de solo lectura: que una rutina no "
+            "aparezca en el índice no prueba que no exista."
+        )
+    else:
+        message = (
+            "Cero rutinas listadas: puede que no existan o que esta cuenta no las vea. Si esperabas "
+            "alguna, regenerá la credencial de solo lectura del servidor (MariaDB >= 11.3) o "
+            "habilitá la lectura de cuerpos de rutinas (motores más antiguos)."
+        )
+    return out.WarningOut(code=codes.WARN_ROUTINES_NOT_VISIBLE, message=message)
+
+
 def list_objects(ctx: ToolContext, params: dict) -> dict:
     """
     El índice barato de una base: tipo y nombre de cada objeto, sin estructura.
@@ -181,16 +221,15 @@ def list_objects(ctx: ToolContext, params: dict) -> dict:
         # Una consulta de VERSION() como mucho, y solo si el llamador tiene el scope: jamás un
         # SHOW CREATE. Se calcula con la sesión abierta porque el façade se cierra al salir.
         disponibilidad = ctx.body_availability(resuelta, facade)
-        if disponibilidad.routines_may_be_hidden:
-            warnings.append(
-                out.WarningOut(
-                    code=codes.WARN_ROUTINES_NOT_VISIBLE,
-                    message=(
-                        "Este motor puede ocultar rutinas a la credencial de solo lectura: que "
-                        "una rutina no aparezca en el índice no prueba que no exista."
-                    ),
-                )
-            )
+        routines_listed_count = len(indice.get("routine", []))
+        routines_not_visible_warning = _routines_not_visible_warning(
+            engine=resuelta.database.engine,
+            kinds=kinds,
+            engine_may_hide_routines=disponibilidad.routines_may_be_hidden,
+            routines_listed_count=routines_listed_count,
+        )
+        if routines_not_visible_warning is not None:
+            warnings.append(routines_not_visible_warning)
         elegidos: list[tuple[str, str]] = []
         total = 0
         for kind in LIST_KINDS:

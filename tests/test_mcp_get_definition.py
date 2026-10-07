@@ -1142,3 +1142,118 @@ def test_the_definition_output_models_are_frozen_and_forbid_extra_fields():
     for modelo, campos in congelados.items():
         assert set(modelo.model_fields) == campos, modelo.__name__
         assert modelo.model_config.get("extra") == "forbid", modelo.__name__
+
+
+# --------------------------------------------------------------------------- #
+# Rutinas en missing[]: pueden existir y no ser visibles (MySQL/MariaDB)       #
+# --------------------------------------------------------------------------- #
+_CODIGO_RUTINA_NO_VISIBLE = "mcp.warn.routine_not_found_or_not_visible"
+
+
+def test_a_missing_routine_on_mysql_family_adds_one_warning_and_keeps_the_missing_shape(
+    admin_client, monkeypatch, motor_falso, definition_tools
+):
+    actor, database_id = _escenario(admin_client, monkeypatch)
+    _facade(motor_falso, indice={"table": [], "view": [], "routine": [], "trigger": []})
+
+    sobre = _ok(
+        _llamar(
+            actor,
+            {
+                "database_id": database_id,
+                # Dos rutinas ausentes: el aviso es UNO por llamada, no uno por rutina.
+                "objects": _objetos(("routine", "calcular"), ("routine", "recalcular")),
+            },
+        )
+    )
+
+    assert sobre["data"]["missing"] == [
+        {"kind": "routine", "name": "calcular", "routine_kind": None},
+        {"kind": "routine", "name": "recalcular", "routine_kind": None},
+    ]
+    avisos = [w for w in sobre["warnings"] if w["code"] == _CODIGO_RUTINA_NO_VISIBLE]
+    assert len(avisos) == 1
+    assert "no se encontró" in avisos[0]["message"] and "privilegio" in avisos[0]["message"]
+    assert "11.3" in avisos[0]["message"]
+
+
+def test_a_missing_view_trigger_or_event_keeps_plain_missing_without_the_routine_warning(
+    admin_client, monkeypatch, motor_falso, definition_tools
+):
+    actor, database_id = _escenario(admin_client, monkeypatch)
+    _facade(motor_falso)
+
+    sobre = _ok(
+        _llamar(
+            actor,
+            {
+                "database_id": database_id,
+                "objects": _objetos(("view", "ghost"), ("trigger", "ghost"), ("event", "ghost")),
+            },
+        )
+    )
+
+    assert len(sobre["data"]["missing"]) == 3
+    assert _CODIGO_RUTINA_NO_VISIBLE not in {w["code"] for w in sobre["warnings"]}
+
+
+def test_a_routine_that_is_found_does_not_raise_the_routine_warning(
+    admin_client, monkeypatch, motor_falso, definition_tools
+):
+    actor, database_id = _escenario(admin_client, monkeypatch)
+    _facade(
+        motor_falso,
+        definiciones={
+            ("routine", "calcular"): [
+                DefinitionRead(
+                    kind="routine",
+                    name="calcular",
+                    routine_kind="PROCEDURE",
+                    body="CREATE PROCEDURE calcular() SELECT 1",
+                )
+            ]
+        },
+    )
+
+    sobre = _ok(
+        _llamar(actor, {"database_id": database_id, "objects": _objetos(("routine", "calcular"))})
+    )
+
+    assert sobre["data"]["missing"] == []
+    assert _CODIGO_RUTINA_NO_VISIBLE not in {w["code"] for w in sobre["warnings"]}
+
+
+def test_a_routine_the_adapter_no_longer_finds_also_raises_the_routine_warning(
+    admin_client, monkeypatch, motor_falso, definition_tools
+):
+    """Cubre el camino de ``missing.append`` tras el índice, no solo el del índice vacío."""
+    actor, database_id = _escenario(admin_client, monkeypatch)
+    _facade(motor_falso, definiciones={("routine", "calcular"): []})
+
+    sobre = _ok(
+        _llamar(actor, {"database_id": database_id, "objects": _objetos(("routine", "calcular"))})
+    )
+
+    assert sobre["data"]["missing"] == [{"kind": "routine", "name": "calcular", "routine_kind": None}]
+    assert _CODIGO_RUTINA_NO_VISIBLE in {w["code"] for w in sobre["warnings"]}
+
+
+@pytest.mark.parametrize(
+    "engine, esperado",
+    [("mysql", True), ("mariadb", True), ("postgresql", False)],
+)
+def test_the_routine_warning_helper_only_applies_to_the_mysql_family(engine, esperado):
+    faltantes = [("routine", "calcular", None)]
+
+    aviso = definitions_tool._routine_missing_warning(engine, faltantes)
+
+    assert (aviso is not None) is esperado
+    if aviso is not None:
+        assert aviso.code == _CODIGO_RUTINA_NO_VISIBLE
+
+
+def test_the_description_says_routines_in_missing_may_be_invisible_and_keeps_invariant_6():
+    spec = {t.name: t for t in registry._build(definitions_enabled=True)}["get_definition"]
+
+    assert "'missing'" in spec.description and "no ser visible" in spec.description
+    assert "no confiable" in spec.description.lower() and "terceros" in spec.description.lower()

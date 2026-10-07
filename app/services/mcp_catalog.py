@@ -76,6 +76,11 @@ CODE_DEFINITIONS_DISABLED = "mcp.definitions_disabled"
 #: Puede haber rutinas que el índice no lista (MariaDB < 11.3 con la bandera apagada, MySQL <
 #: 8.0.20): "no aparece" no prueba "no existe".
 WARN_ROUTINES_NOT_VISIBLE = "mcp.warn.routines_not_visible"
+#: ``get_definition`` en MySQL/MariaDB: una RUTINA pedida volvió en ``missing``. En esos motores
+#: ``information_schema.ROUTINES`` devuelve CERO filas, sin error, a una cuenta sin privilegio de
+#: rutina, así que "no está en el índice" no prueba "no existe". Vistas, triggers y events no tienen
+#: esa ambigüedad y conservan el ``missing`` llano.
+WARN_ROUTINE_NOT_FOUND_OR_NOT_VISIBLE = "mcp.warn.routine_not_found_or_not_visible"
 #: Alguna definición devuelta tuvo credenciales enmascaradas. La redacción es best effort y NO una
 #: frontera: el aviso cuenta lo enmascarado, no promete que no quede nada.
 WARN_BODIES_REDACTED = "mcp.warn.bodies_redacted"
