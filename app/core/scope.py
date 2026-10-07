@@ -335,6 +335,42 @@ def assert_at(actor: Actor, capability: Capability, target: ScopeTarget) -> None
     assert_step_up(actor, capability)
 
 
+def assert_at_with_code(
+    actor: "Actor | dict | None",
+    capability: Capability,
+    target: ScopeTarget,
+    *,
+    code: str,
+    message: str,
+    public_context: dict | None = None,
+) -> None:
+    """
+    ``assert_at`` para un escalamiento por payload cuyo 403 tiene que NOMBRAR lo que falta.
+
+    El ``access.forbidden`` opaco existe para que un 403 no sea un mapa de la superficie. Un
+    escalamiento por payload es otro caso: quien llega acá YA pasó el guard de la ruta (tiene la
+    capacidad base) y eligió el payload que escala, así que decirle qué capacidad suma no le
+    revela nada y la SPA necesita el código para explicarlo. ``code`` va en ``public_context``
+    (nunca en ``context``) y sale de un ``*_catalog.py``; ``public_context`` se completa con él.
+
+    Mismas dos capas y mismo step-up final que ``assert_at``; la denegación deja el MISMO rastro
+    agregado (``record_denial``) con la capacidad que faltó. Un actor que no es un ``Actor``
+    (``dict`` legado o ``None``) falla CERRADO: no hay identidad a la que atribuirle la capacidad.
+    """
+    from app.core.actor import Actor as ActorType
+    from app.core.denial_audit import record_denial
+    from app.core.step_up import assert_step_up
+
+    if not isinstance(actor, ActorType) or not can_at(actor, capability, target):
+        record_denial(code, actor=actor, capability=capability, check="capability")
+        raise AppHttpException(
+            message=message,
+            status_code=403,
+            public_context={**(public_context or {}), "code": code},
+        )
+    assert_step_up(actor, capability)
+
+
 def assert_at_point(actor: Actor, capability: Capability, point: ScopePoint) -> None:
     """
     Capa 1 + capa 2 sobre un punto YA resuelto. Para los controllers que conocen el entorno

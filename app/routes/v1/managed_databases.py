@@ -14,6 +14,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path as FPath, Query, Request
 
+from app.controllers.grant_controller import GrantController
 from app.controllers.managed_database_controller import ManagedDatabaseController
 from app.controllers.managed_migration_controller import ManagedMigrationController
 from app.core.authz import (
@@ -53,6 +54,7 @@ from app.core.scope_targets import (
     managed_create_for,
 )
 from app.services.capability_catalog import Capability
+from app.services.engine_user_catalog import GRANT_ADMIN_REASON_PROVISION_REASSIGN_OWNER
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, empty, paginated, success
 
@@ -413,14 +415,20 @@ def reassign_owner(
     Reasigna el usuario del motor dueño de la BD en el inventario.
 
     Con ``provision=true`` además lo aplica en el motor (re-GRANT, y en PostgreSQL
-    ``ALTER DATABASE ... OWNER TO``). **Eso exige ``databases.drop`` en la BD**, no solo
+    ``ALTER DATABASE ... OWNER TO``). **Eso exige ``databases.drop`` en la BD** y
+    ``engine_users.grant_admin`` (403 ``engine_user.grant_admin_required`` si falta), no solo
     ``databases.write``: en PostgreSQL el dueño de una base puede hacerle ``DROP DATABASE``, y en
     MySQL/MariaDB el re-GRANT le da ``ALL PRIVILEGES`` sobre ella. Entregar ese control a otro
-    usuario del motor es equivalente a poder borrarla, así que pide la misma capacidad.
+    usuario del motor es equivalente a poder borrarla, así que pide ambas capacidades.
     Sin ``provision`` solo cambia la fila del gateway y basta ``databases.write``.
     """
     if provision:
         assert_at(actor, Capability.DATABASES_DROP, database(db_id))
+        # Además de ``databases.drop``: aplicar el dueño en el motor es DELEGAR el control de la base
+        # (re-GRANT de ALL PRIVILEGES, o ``ALTER DATABASE … OWNER TO``). Ver ``engine_users.grant_admin``.
+        GrantController.assert_grant_admin(
+            actor, database(db_id), reason=GRANT_ADMIN_REASON_PROVISION_REASSIGN_OWNER
+        )
     updated = ManagedDatabaseController().reassign_owner(
         db_id, payload.owner_id, provision=provision, admin=actor
     )

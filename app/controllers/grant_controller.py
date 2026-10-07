@@ -21,6 +21,8 @@ from app.controllers.common import build_target, engine_value, get_server_or_404
 from app.core.database import Database
 from app.core.environments import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 from app.core.logger import get_logger
+from app.core.scope import assert_at_with_code
+from app.core.scope_targets import server_user
 from app.exceptions import AppHttpException
 from app.models.permission_profile import PermissionProfile, PermissionProfileItem
 from app.models.server_user import ServerUser
@@ -36,11 +38,19 @@ from app.schemas.grant import (
     RevokeRequest,
 )
 from app.services import audit
+from app.services.capability_catalog import Capability
 from app.services.db_admin import privileges as priv_catalog
 from app.services.db_admin import protected_accounts
 from app.services.db_admin.dtos import EngineUserInfo, GrantInfo, GrantLevel, ObjectRef
 from app.services.db_admin.factory import get_adapter
 from app.services.db_admin.identifiers import validate_host, validate_identifier
+from app.services.engine_user_catalog import (
+    CODE_GRANT_ADMIN_REQUIRED,
+    GRANT_ADMIN_CAPABILITY_ID,
+    GRANT_ADMIN_REASON_SENSITIVE_PRIVILEGE,
+    GRANT_ADMIN_REASON_WITH_GRANT_OPTION,
+    grant_admin_required_message,
+)
 
 if TYPE_CHECKING:
     from app.core.actor import Actor
@@ -103,6 +113,44 @@ class GrantController:
         adapter = get_adapter(target)
         grantee = EngineUserInfo(username=user.username, host=user.host)
         return user, server.id, adapter, grantee, server.root_username
+
+    @staticmethod
+    def grant_admin_reason(
+        *,
+        dialect: str,
+        level: GrantLevel,
+        privileges: list[str],
+        with_grant_option: bool,
+    ) -> str | None:
+        """
+        ¿Este GRANT delega privilegios? Devuelve el motivo (``GRANT_ADMIN_REASONS``) o ``None``.
+
+        Es el mismo criterio que la operación GATE de ``grant_object`` (``WITH GRANT OPTION`` o un
+        privilegio del set GATE de ``db_admin.privileges``): lo que ya se audita como intención
+        fail-closed es exactamente lo que exige ``engine_users.grant_admin``. Puede lanzar el 422
+        de ``validate_privileges`` (nivel o privilegio inválido), igual que antes del cambio.
+        """
+        if with_grant_option:
+            return GRANT_ADMIN_REASON_WITH_GRANT_OPTION
+        _, requires_confirmation = priv_catalog.validate_privileges(privileges, dialect, level)
+        if requires_confirmation:
+            return GRANT_ADMIN_REASON_SENSITIVE_PRIVILEGE
+        return None
+
+    @staticmethod
+    def assert_grant_admin(actor: "dict | Actor | None", target, *, reason: str) -> None:
+        """
+        Exige ``engine_users.grant_admin`` en ``target`` (capas 1 y 2 + step-up) y, si falta, el 403
+        ``engine_user.grant_admin_required`` que nombra la capacidad. Ver ``assert_at_with_code``.
+        """
+        assert_at_with_code(
+            actor,
+            Capability.ENGINE_USERS_GRANT_ADMIN,
+            target,
+            code=CODE_GRANT_ADMIN_REQUIRED,
+            message=grant_admin_required_message(reason),
+            public_context={"required_capability": GRANT_ADMIN_CAPABILITY_ID, "reason": reason},
+        )
 
     @staticmethod
     def _guard_protected(adapter, username: str, grantor: str | None) -> None:
@@ -212,6 +260,19 @@ class GrantController:
         finally:
             session.close()
 
+        # DELEGAR privilegios (WITH GRANT OPTION o un privilegio sensible) exige además
+        # ``engine_users.grant_admin``. Va ANTES de tocar el motor (``can_grant`` abre una conexión)
+        # y vive en el controller y no en la ruta porque ``provision_with_grants`` también llama a
+        # este método para sus grants iniciales: un solo punto cubre los dos caminos.
+        grant_admin_reason = self.grant_admin_reason(
+            dialect=adapter.dialect,
+            level=payload.level,
+            privileges=payload.privileges,
+            with_grant_option=payload.with_grant_option,
+        )
+        if grant_admin_reason is not None:
+            self.assert_grant_admin(admin, server_user(user_id), reason=grant_admin_reason)
+
         self._guard_protected(adapter, username, grantor)
 
         # Pre-chequeo: ¿la credencial del gateway puede delegar estos privilegios?
@@ -230,11 +291,9 @@ class GrantController:
                 },
             )
 
-        # ¿Operación GATE? (privilegio sensible o WITH GRANT OPTION) → auditar intención.
-        _, requires_confirmation = priv_catalog.validate_privileges(
-            payload.privileges, adapter.dialect, payload.level
-        )
-        is_gate = requires_confirmation or payload.with_grant_option
+        # ¿Operación GATE? (privilegio sensible o WITH GRANT OPTION) → auditar intención. Es la
+        # misma condición que exige ``grant_admin`` arriba.
+        is_gate = grant_admin_reason is not None
 
         priv_csv = ",".join(payload.privileges)
         obj_name = _object_name(payload.object_ref)

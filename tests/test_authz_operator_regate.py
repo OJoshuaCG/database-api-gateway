@@ -264,8 +264,13 @@ def test_f10_operator_with_drop_grant_on_the_database_environment_passes(
 ):
     _rol("operator")
     _otorgar_cg("databases.drop", "environment", parque["dev"])
+    # Desde la partición ``engine_users.grant_admin``, entregar el control de la base con
+    # ``provision`` pide también esa capacidad: el grant de ``databases.drop`` solo ya no alcanza
+    # (ver ``tests/test_engine_users_grant_admin.py``).
+    _otorgar_cg("engine_users.grant_admin", "environment", parque["dev"])
     r = _reasignar(admin_client, parque["db_id"], True)
     assert not _forbidden(r), r.text
+    assert _code(r) != "engine_user.grant_admin_required", r.text
 
 
 # --------------------------------------------------------------------------- #

@@ -354,6 +354,41 @@ class ServerUserController:
         )
         return result
 
+    def _assert_initial_grants_may_delegate(
+        self,
+        server_id: int,
+        initial_grants: list[GrantOnCreate],
+        *,
+        admin: "dict | Actor | None",
+    ) -> None:
+        """
+        ``engine_users.grant_admin`` en el servidor si algún grant inicial delega privilegios
+        (WITH GRANT OPTION o un privilegio sensible). Un grant inválido (422 de
+        ``validate_privileges``) NO se rechaza acá: lo reporta el camino best-effort de cada grant,
+        como antes de este chequeo.
+        """
+        from app.controllers.grant_controller import GrantController
+        from app.core.scope_targets import server
+
+        session = self._session()
+        try:
+            dialect = engine_value(get_server_or_404(session, server_id))
+        finally:
+            session.close()
+
+        for grant_spec in initial_grants:
+            try:
+                reason = GrantController.grant_admin_reason(
+                    dialect=dialect,
+                    level=grant_spec.level,
+                    privileges=grant_spec.privileges,
+                    with_grant_option=grant_spec.with_grant_option,
+                )
+            except AppHttpException:
+                continue
+            if reason is not None:
+                GrantController.assert_grant_admin(admin, server(server_id), reason=reason)
+
     def provision_with_grants(
         self,
         data: dict,
@@ -367,6 +402,14 @@ class ServerUserController:
         un fallo no deshace la creación del usuario.
         """
         from app.controllers.grant_controller import GrantController
+
+        # 0) Delegar privilegios exige ``engine_users.grant_admin``. Se verifica ANTES de crear la
+        # cuenta: si faltara, los grants iniciales fallarían uno a uno (best-effort) y quedaría un
+        # usuario creado a medias. ``grant_object`` repite el chequeo por grant (es el punto único).
+        if initial_grants:
+            self._assert_initial_grants_may_delegate(
+                data["server_id"], initial_grants, admin=admin
+            )
 
         # 1) Crear el usuario (siempre con provision=True en este endpoint)
         user_dict = self.create_server_user(data, provision=True, admin=admin)
