@@ -38,6 +38,8 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from slowapi.wrappers import Limit
 
+from app.core.mcp_token_format import ACCEPTED_TOKEN_PREFIXES
+
 from app.core.environments import (
     LOGIN_USERNAME_RATE_LIMIT,
     MCP_RATE_LIMIT,
@@ -235,7 +237,7 @@ def agent_token_key(request) -> str:
     crudo = request.headers.get("authorization") or ""
     if crudo.lower().startswith("bearer "):
         partes = crudo[7:].strip().split(".")
-        if len(partes) == 3 and partes[0] == "dbgw" and partes[1]:
+        if len(partes) == 3 and partes[0] in ACCEPTED_TOKEN_PREFIXES and partes[1]:
             return f"agent:{partes[1]}"
     return f"ip:{get_remote_address(request)}"
 

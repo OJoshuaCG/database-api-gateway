@@ -1,5 +1,10 @@
 """
-Autenticación de agentes: ``Authorization: Bearer dbgw.<token_id>.<secreto>``.
+Autenticación de agentes: ``Authorization: Bearer datum.<token_id>.<secreto>``.
+
+Los tokens emitidos antes del cambio de nombre del producto usan ``dbgw.<token_id>.<secreto>`` y
+**se siguen aceptando**. El prefijo NO entra en el HMAC (se calcula solo sobre el secreto) ni en
+la búsqueda (se indexa por ``token_id``), así que un token legado verifica con su prefijo
+original sin migrar ninguna fila. Solo la EMISIÓN usa el prefijo nuevo.
 
 Es la hermana de ``authenticated_user``, y las dos convergen en el mismo ``Actor`` a propósito:
 **una sola comprobación de autorización y un solo vocabulario**, no dos políticas que divergen en
@@ -13,12 +18,13 @@ forma de entrar sin pasar.
 
 EL FORMATO USA PUNTO Y NO GUION BAJO, Y NO ES ESTÉTICA
 ------------------------------------------------------
-El alfabeto de ``secrets.token_urlsafe`` **incluye ``_``**, así que ``dbgw_<id>_<secreto>`` es
-imparseable con ``split("_")`` y produce un 401 **intermitente e irreproducible** según qué
+El alfabeto de ``secrets.token_urlsafe`` **incluye ``_``**, así que ``datum_<id>_<secreto>`` es
+imparseable con ``split("_")`` (aplica igual a ``datum_`` que a ``dbgw_``) y produce un 401 **intermitente e irreproducible** según qué
 caracteres salieron en el secreto. Con punto, el split es exacto.
 
-El prefijo ``dbgw.`` además hace el secreto matcheable por escáneres de secretos, que es lo que
-puede detectarlo cuando termine commiteado en el repo de otra gente.
+El prefijo (``datum.``, y ``dbgw.`` en los legados) además hace el secreto matcheable por
+escáneres de secretos, que es lo que puede detectarlo cuando termine commiteado en el repo de
+otra gente. Por eso las reglas de escaneo tienen que cubrir **los dos** prefijos.
 
 TODO INTENTO DEJA RASTRO, Y EL MOTIVO NO VIAJA EN LA RESPUESTA
 --------------------------------------------------------------
@@ -87,12 +93,14 @@ from app.core.audit_aggregator import WindowedAggregator
 from app.core.crypto import api_token_pepper
 from app.core.environments import MCP_AUTH_FAILURE_RATE_LIMIT, MCP_ENABLED
 from app.core.limiter import hit_or_429, mcp_limiter
+from app.core.mcp_token_format import ACCEPTED_TOKEN_PREFIXES, TOKEN_PREFIX
 from app.exceptions import AppHttpException
 from app.models.api_token import ApiToken
 from app.models.user_model import UserModel
 
-#: Prefijo del bearer. Ver el docstring del módulo.
-TOKEN_PREFIX = "dbgw"
+# ``TOKEN_PREFIX`` (emisión), ``LEGACY_TOKEN_PREFIX`` y ``ACCEPTED_TOKEN_PREFIXES`` (parseo)
+# viven en ``mcp_token_format`` para que ``limiter`` los comparta sin ciclo. Ver el docstring del
+# módulo.
 
 #: Cada cuánto, como mucho, se escribe ``last_used_at``. Un UPDATE por request es amplificación
 #: de escritura gratis sobre la BD de metadatos.
@@ -284,7 +292,7 @@ def authenticate_agent(request: Request) -> Actor:
     if not crudo.lower().startswith("bearer "):
         raise _reject(request, "sin_bearer")
     partes = crudo[7:].strip().split(".")
-    if len(partes) != 3 or partes[0] != TOKEN_PREFIX:
+    if len(partes) != 3 or partes[0] not in ACCEPTED_TOKEN_PREFIXES:
         raise _reject(request, "malformado")
     _, token_id, secreto = partes
 

@@ -85,7 +85,7 @@ class ApiTokenCreatedOut(ApiTokenOut):
     token: str = Field(
         ...,
         description=(
-            "El bearer completo, formato 'dbgw.<id>.<secreto>'. Se muestra una sola vez. "
+            "El bearer completo, formato 'datum.<id>.<secreto>' (los tokens legados 'dbgw.<id>.<secreto>' siguen siendo válidos). Se muestra una sola vez. "
             "Distribuilo por variable de entorno en el .mcp.json del repo, nunca como literal"
         ),
     )
