@@ -3,13 +3,14 @@ Endpoint de administración del cifrado.
 
 `POST /admin/crypto/rotate` rota la clave de datos (DEK) y re-cifra TODAS las
 credenciales almacenadas, sin cambiar `SECRET_KEY` ni requerir reinicio. Exige
-`policy.admin`, que solo tiene la global `security_officer`: rotar el cifrado es política, no
-administración de accesos.
+`crypto.rotate`, que solo tiene la global `security_officer`: rotar el cifrado es política, no
+administración de accesos. Quien revisa el rastro de la rotación lo hace con `audit.read`, una
+capacidad distinta (actor y revisor no se confunden).
 """
 
 from fastapi import APIRouter
 
-from app.core.authz import PolicyAdmin
+from app.core.authz import CryptoRotate
 from app.schemas.crypto import CryptoRotationOut
 from app.services import audit, crypto_rotation
 from app.utils.response import ApiResponse, success
@@ -18,7 +19,7 @@ router = APIRouter(prefix="/admin/crypto", tags=["Admin"])
 
 
 @router.post("/rotate", response_model=ApiResponse[CryptoRotationOut])
-def rotate_encryption(actor: PolicyAdmin):
+def rotate_encryption(actor: CryptoRotate):
     result = crypto_rotation.rotate_data_key()
     audit.record(
         "crypto.rotate",

@@ -1,5 +1,5 @@
 """
-Lectura de la auditoría (``/audit-log``). Solo ``policy.admin`` (``security_officer``).
+Lectura de la auditoría (``/audit-log``). Solo ``audit.read`` (``security_officer``).
 
 Quien hace los cambios de acceso (``access_admin``) no lee el rastro que los registra: recibe el
 403 opaco de ``require()``. El porqué completo, y por qué la lectura no divulga (un ``GET`` no
@@ -12,7 +12,7 @@ from typing import Literal
 from fastapi import APIRouter, Query
 
 from app.controllers.audit_log_controller import AuditLogController
-from app.core.authz import PolicyAdmin
+from app.core.authz import AuditRead
 from app.schemas.audit_log import AuditLogOut
 from app.utils.pagination import PaginationDep
 from app.utils.response import ApiResponse, paginated, success
@@ -22,7 +22,7 @@ router = APIRouter(prefix="/audit-log", tags=["Audit"])
 
 @router.get("", response_model=ApiResponse[list[AuditLogOut]])
 def list_audit_log(
-    actor: PolicyAdmin,
+    actor: AuditRead,
     pagination: PaginationDep,
     action: str | None = Query(
         None,
@@ -68,12 +68,12 @@ def list_audit_log(
         "date_to": date_to,
     }
     items, total = AuditLogController().list_entries(
-        filters, limit=pagination.size, offset=pagination.offset
+        filters, limit=pagination.size, offset=pagination.offset, reader=actor
     )
     return paginated(items, total=total, pagination=pagination)
 
 
 @router.get("/{entry_id}", response_model=ApiResponse[AuditLogOut])
-def get_audit_entry(actor: PolicyAdmin, entry_id: int):
+def get_audit_entry(actor: AuditRead, entry_id: int):
     """Una entrada. ``404 audit.not_found`` si no existe."""
-    return success(data=AuditLogController().get_entry(entry_id))
+    return success(data=AuditLogController().get_entry(entry_id, reader=actor))

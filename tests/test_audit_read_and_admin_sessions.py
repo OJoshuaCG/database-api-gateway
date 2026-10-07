@@ -1,5 +1,5 @@
 """
-F-25: lectura de la auditoría (``policy.admin``) y revocación administrativa de sesiones
+F-25: lectura de la auditoría (``audit.read``) y revocación administrativa de sesiones
 (``access.admin``).
 
 La separación de deberes se apoya en que toda escalada de un solo actor queda auditada; eso solo
@@ -142,7 +142,7 @@ def test_audit_entry_not_found(so_client):
 
 
 def test_access_admin_alone_cannot_read_the_audit(aa_client):
-    """El revisado no se revisa a sí mismo: ``access_admin`` no tiene ``policy.admin``."""
+    """El revisado no se revisa a sí mismo: ``access_admin`` no tiene ``audit.read``."""
     for path in (AUDIT, f"{AUDIT}/1"):
         r = aa_client.get(path)
         assert r.status_code == 403, r.text
@@ -158,7 +158,7 @@ def test_viewer_cannot_read_the_audit(admin_client):
 
 
 def test_reading_the_audit_does_not_prompt_step_up(so_client, expire_step_up):
-    """``policy.admin`` no divulga: un GET con la ventana vencida no pide contraseña."""
+    """``audit.read`` no divulga: un GET con la ventana vencida no pide contraseña."""
     expire_step_up(so_client)
     assert so_client.get(AUDIT).status_code == 200
 

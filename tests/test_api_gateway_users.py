@@ -325,7 +325,7 @@ def test_removing_access_admin_from_the_last_one_is_rejected(admin_client):
 
 
 # --------------------------------------------------------------------------- #
-# Separación de deberes: `access.admin` y `policy.admin` (C1)                 #
+# Separación de deberes: `access.admin`, `crypto.rotate` y `audit.read` (C1)    #
 # --------------------------------------------------------------------------- #
 
 #: Una ruta de cada módulo que pasó de ``gateway.admin`` a ``access.admin``.
@@ -336,9 +336,10 @@ _ACCESS_ADMIN_ROUTES = [
     ("PUT", "/api/v1/gateway-users/1/access"),
     ("GET", "/api/v1/gateway-users/1/capability-grants"),
     ("GET", "/api/v1/gateway-users/1/effective-access"),
-    ("GET", "/api/v1/api-tokens"),
-    ("POST", "/api/v1/api-tokens"),
-    ("PATCH", "/api/v1/api-tokens/1"),
+    # Las rutas de `/api-tokens` ya NO están acá: aceptan `access.admin` (todos los tokens) o
+    # `tokens.own` (solo los propios, que traen los tres roles). Que un `security_officer` con
+    # rol vea ahí únicamente los suyos es lo buscado; el aislamiento por dueño lo prueba
+    # `test_api_token_self_service`.
     ("GET", "/api/v1/capability-grants/pending"),
     ("POST", "/api/v1/capability-grants/1/approve"),
     ("GET", "/api/v1/authz/scope-readiness"),
@@ -361,7 +362,7 @@ def test_a_security_officer_alone_does_not_administer_access(admin_client, metho
 
 
 def test_an_access_admin_alone_does_not_rotate_crypto(admin_client):
-    """La otra mitad: rotar el cifrado es ``policy.admin`` (``security_officer``)."""
+    """La otra mitad: rotar el cifrado es ``crypto.rotate`` (``security_officer``)."""
     datos = _crear(admin_client, "aa-solo", global_capabilities=["access_admin"])
     aa = _cliente_como(datos, "aa-solo")
     r = aa.post("/api/v1/admin/crypto/rotate", json={})
@@ -371,8 +372,8 @@ def test_an_access_admin_alone_does_not_rotate_crypto(admin_client):
     assert aa.get("/api/v1/gateway-users").status_code == 200
 
 
-def test_a_security_officer_alone_still_reaches_policy_admin(admin_client):
-    """``policy.admin`` pasa la capa de capacidad: lo que frena después es el step-up o el body."""
+def test_a_security_officer_alone_still_reaches_crypto_rotate(admin_client):
+    """``crypto.rotate`` pasa la capa de capacidad: lo que frena después es el step-up o el body."""
     datos = _crear(admin_client, "so-policy", global_capabilities=["security_officer"])
     so = _cliente_como(datos, "so-policy")
     r = so.post("/api/v1/admin/crypto/rotate", json={})

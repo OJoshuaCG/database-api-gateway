@@ -140,7 +140,8 @@ def test_the_legacy_guard_no_longer_exists(guard):
 def test_no_route_declares_the_retired_gateway_admin(guard):
     """
     Trinquete del invariante 12 sobre la app REAL: ``gateway.admin`` se partió en
-    ``access.admin`` y ``policy.admin`` y ninguna ruta la puede volver a declarar. El alias
+    ``access.admin`` y, tras otra partición, ``audit.read`` + ``crypto.rotate`` (``policy.admin``
+    también está retirada); ninguna ruta las puede volver a declarar. El alias
     ``GatewayAdmin`` tampoco existe: copiar una ruta vieja tiene que fallar al importar.
     """
     import app.core.authz as authz_mod
@@ -157,8 +158,8 @@ _SPLIT_ROUTES = {
     "/api/v1/api-tokens": "access.admin",
     "/api/v1/capability-grants": "access.admin",
     "/api/v1/authz/scope-readiness": "access.admin",
-    "/api/v1/admin/crypto": "policy.admin",
-    "/api/v1/audit-log": "policy.admin",
+    "/api/v1/admin/crypto": "crypto.rotate",
+    "/api/v1/audit-log": "audit.read",
 }
 
 

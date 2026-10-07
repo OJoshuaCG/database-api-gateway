@@ -1,22 +1,31 @@
 """
-Lectura de ``audit_log`` (``GET /audit-log``), detrás de ``policy.admin``.
+Lectura de ``audit_log`` (``GET /audit-log``), detrás de ``audit.read``.
 
-POR QUÉ ``policy.admin`` Y NO ``access.admin``
----------------------------------------------
+POR QUÉ ``audit.read`` Y NO ``access.admin``
+--------------------------------------------
 La separación de deberes se apoya en que toda escalada de un solo actor queda auditada, y eso
 solo es un control si alguien que NO la hizo puede leerla. ``access_admin`` hace los cambios de
 acceso: si también leyera el rastro, el revisado se revisaría a sí mismo. Por eso la lectura es de
-``security_officer`` (la única global con ``policy.admin``), y ``access_admin`` recibe 403.
+``security_officer`` (la única global con ``audit.read``), y ``access_admin`` recibe 403.
 
-POR QUÉ NO DIVULGA (``discloses=False``)
----------------------------------------
+POR QUÉ NO DIVULGA (``discloses=False``) Y POR QUÉ EL ``detail`` SE ENMASCARA
+-----------------------------------------------------------------------------
 ``discloses`` marca lo que saca DATOS DEL TERCERO del perímetro (filas de negocio, credenciales
 del motor). La auditoría dice quién hizo qué, sobre qué objeto y con qué resultado. El caso límite
 es ``query_console.execute``, cuyo ``detail`` lleva hasta 500 caracteres del SQL con los secretos
-redactados (``query_policy.redact_secrets``) pero con los literales: es la misma información que
-``sql_console.history`` ya le muestra a ``viewer``, que el catálogo clasifica como no divulgante.
-Marcar la auditoría como divulgante sería incoherente con eso. Consecuencia: un ``GET`` no pide
-step-up (la regla de método de ``app/core/step_up.py``).
+redactados (``query_policy.redact_secrets``) pero CON los literales. El historial de la consola SQL
+ya enmascara esos literales para quien no tiene ``sql_console.execute``
+(``QueryConsoleController.list_history``); sin el mismo tratamiento acá, ``audit.read`` era un
+camino lateral para leer lo que el historial esconde. Por eso las filas ``query_console.*`` pasan
+por ``sql_masking.mask_literals`` salvo que el lector pueda ejecutar SQL en el destino de la fila
+(``security_officer`` nunca puede: ``sql_console.execute`` es de ``owner``). Con ese enmascarado la
+lectura sigue sin divulgar, y un ``GET`` no pide step-up (la regla de método de
+``app/core/step_up.py``).
+
+El enmascarado es fail-closed: de una fila ``query_console.*`` solo se conserva tal cual el prefijo
+conocido de la intención de ejecución (``<bd> as <usuario> (<modo>) [<peligro>]: ``); cualquier otro
+formato se enmascara entero, y sin servidor identificable (o con un servidor que ya no existe) se
+usa el dialecto por defecto de ``mask_literals``.
 
 ORDEN Y FILTROS
 ---------------
@@ -33,15 +42,34 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
+from app.controllers.common import engine_value
 from app.core.database import Database
+from app.core.scope import can_at
+from app.core.scope_targets import sql_console_for
 from app.exceptions import AppHttpException
 from app.models.audit_log import AuditLog
+from app.models.server import Server
+from app.services.capability_catalog import Capability
+from app.services.db_admin import sql_masking
+
+if TYPE_CHECKING:
+    from app.core.actor import Actor
 
 CODE_NOT_FOUND = "audit.not_found"
 CODE_INVALID_RANGE = "audit.invalid_range"
 
 _LIKE_ESCAPE = "\\"
+
+#: Las acciones de la consola SQL. Solo ``query_console.execute`` (la intención previa al motor)
+#: lleva SQL hoy, pero el prefijo entero se trata como sensible: un formato nuevo no abre la fuga.
+QUERY_CONSOLE_ACTION_PREFIX = "query_console."
+
+#: Cierra el prefijo estructurado de la intención de ejecución y abre el SQL:
+#: ``<bd> as <usuario> (<modo>) [<peligro>]: <sql>``. Es la PRIMERA aparición: un nombre de base o
+#: de usuario que contenga ``]: `` solo hace que se enmascare de más, nunca de menos.
+_INTENT_SQL_SEPARATOR = "]: "
 
 
 def _like_prefix(prefix: str) -> str:
@@ -96,6 +124,7 @@ class AuditLogController:
             "status": f.status,
             "detail": f.detail,
             "detail_json": _parse_detail(f.detail),
+            "detail_masked": False,
             "ip": f.ip,
             "grantee": f.grantee,
             "privilege": f.privilege,
@@ -104,6 +133,78 @@ class AuditLogController:
             "with_grant_option": f.with_grant_option,
             "grantor": f.grantor,
         }
+
+    @staticmethod
+    def _engines_by_server(server_ids: set[int]) -> dict[int, str]:
+        """Dialecto de cada servidor pedido, para que el enmascarado use las reglas de su motor."""
+        if not server_ids:
+            return {}
+        session = AuditLogController._session()
+        try:
+            servers = session.query(Server).filter(Server.id.in_(server_ids)).all()
+            return {server.id: engine_value(server) for server in servers}
+        finally:
+            session.close()
+
+    @staticmethod
+    def _mask_console_detail(detail: str | None, engine: str) -> str | None:
+        """``detail`` de una fila ``query_console.*`` con los literales del SQL reemplazados por ``?``."""
+        if not detail:
+            return detail
+        separator_at = detail.find(_INTENT_SQL_SEPARATOR)
+        if separator_at == -1:
+            return sql_masking.mask_literals(detail, engine)
+        sql_starts_at = separator_at + len(_INTENT_SQL_SEPARATOR)
+        structured_prefix = detail[:sql_starts_at]
+        sql_text = detail[sql_starts_at:]
+        return structured_prefix + sql_masking.mask_literals(sql_text, engine)
+
+    @classmethod
+    def _apply_detail_masking(cls, entries: list[dict], *, reader: "Actor") -> None:
+        """
+        Enmascara EN SITIO el ``detail`` de las filas ``query_console.*`` que el lector no podría
+        haber visto completas, y marca cada fila con ``detail_masked``.
+
+        La decisión usa la misma regla que el historial de la consola: ``sql_console.execute`` en
+        el destino de la fila (``can_at``), y se cachea por servidor porque la capa 2 puede ir a
+        la BD. Una fila sin servidor no tiene destino al que anclar el permiso: se enmascara.
+        """
+        console_entries = [
+            entry
+            for entry in entries
+            if str(entry["action"]).startswith(QUERY_CONSOLE_ACTION_PREFIX)
+        ]
+        for entry in entries:
+            entry["detail_masked"] = False
+        if not console_entries:
+            return
+
+        may_see_full_sql_at: dict[int | None, bool] = {}
+        for entry in console_entries:
+            server_id = entry["server_id"]
+            if server_id not in may_see_full_sql_at:
+                may_see_full_sql_at[server_id] = (
+                    server_id is not None
+                    and can_at(
+                        reader,
+                        Capability.SQL_CONSOLE_EXECUTE,
+                        sql_console_for(server_id, None),
+                    )
+                )
+
+        masked_entries = [
+            entry for entry in console_entries if not may_see_full_sql_at[entry["server_id"]]
+        ]
+        server_ids_to_resolve = {
+            entry["server_id"] for entry in masked_entries if entry["server_id"] is not None
+        }
+        engine_by_server_id = cls._engines_by_server(server_ids_to_resolve)
+        for entry in masked_entries:
+            engine = engine_by_server_id.get(entry["server_id"], "")
+            masked_detail = cls._mask_console_detail(entry["detail"], engine)
+            entry["detail"] = masked_detail
+            entry["detail_json"] = _parse_detail(masked_detail)
+            entry["detail_masked"] = True
 
     @staticmethod
     def _filtered(q, filters: dict):
@@ -145,17 +246,26 @@ class AuditLogController:
             q = q.filter(AuditLog.created_at < hasta)
         return q
 
-    def list_entries(self, filters: dict, *, limit: int, offset: int) -> tuple[list[dict], int]:
+    def list_entries(
+        self, filters: dict, *, limit: int, offset: int, reader: "Actor"
+    ) -> tuple[list[dict], int]:
+        """
+        ``reader`` es keyword y sin default, como en ``QueryConsoleController.list_history``: una
+        llamada que olvide decir quién lee falla con ``TypeError`` en vez de devolver el SQL
+        completo de la consola.
+        """
         session = self._session()
         try:
             q = self._filtered(session.query(AuditLog), filters)
             total = q.count()
             filas = q.order_by(AuditLog.id.desc()).limit(limit).offset(offset).all()
-            return [self._serialize(f) for f in filas], total
+            entries = [self._serialize(f) for f in filas]
         finally:
             session.close()
+        self._apply_detail_masking(entries, reader=reader)
+        return entries, total
 
-    def get_entry(self, entry_id: int) -> dict:
+    def get_entry(self, entry_id: int, *, reader: "Actor") -> dict:
         session = self._session()
         try:
             fila = session.get(AuditLog, entry_id)
@@ -166,6 +276,8 @@ class AuditLogController:
                     public_context={"code": CODE_NOT_FOUND},
                     context={"audit_id": entry_id},
                 )
-            return self._serialize(fila)
+            entry = self._serialize(fila)
         finally:
             session.close()
+        self._apply_detail_masking([entry], reader=reader)
+        return entry
