@@ -50,6 +50,22 @@ veto) y la credencial de solo lectura del servidor tiene que estar verificada.
 - Si se enmascaró algo, la respuesta trae el aviso `mcp.warn.bodies_redacted`; su ausencia **no** garantiza
   que el cuerpo esté limpio.
 
+## Una rutina "ausente" o "cero rutinas" puede significar "no la veo"
+
+En MySQL y MariaDB, una cuenta de solo lectura sin privilegio de rutina recibe **cero filas** de
+`information_schema.ROUTINES`, sin ningún error. Consecuencias que el agente ve:
+
+- `list_objects` lista cero rutinas y avisa `mcp.warn.routines_not_visible` ("cero rutinas listadas: puede
+  que no existan o que esta cuenta no las vea"). También avisa cuando el motor/versión puede ocultarlas.
+- `get_definition` devuelve la rutina en `missing[]` y suma `mcp.warn.routine_not_found_or_not_visible`.
+  Vistas, triggers y events ausentes siguen siendo un `missing` confiable.
+
+Cómo arreglarlo si la rutina existe:
+
+- **MariaDB >= 11.3:** regenerar la credencial de solo lectura del servidor (botón «Regenerar credencial»
+  del panel de la SPA). Ese aprovisionamiento ya otorga lo necesario.
+- **MariaDB < 11.3 o MySQL 5.7:** habilitar la lectura de cuerpos de rutinas (sección siguiente).
+
 ## MariaDB < 11.3 y MySQL 5.7: `mysql.proc` por servidor
 
 Ahí no existe un grant por base que permita leer el código de las rutinas, y el único camino es

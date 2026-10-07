@@ -93,6 +93,14 @@ Envelope habitual (`notice`, `data`, `warnings`, `untrusted_fields`, `untrusted_
 diff (sin DEFINER, espacios colapsados, sin `;` final). Advertencias: las de `list_objects` (cuarentena,
 estructura no atómica, etc.) más `mcp.warn.bodies_redacted` si se enmascaró algo.
 
+**Rutinas en `missing[]` (MySQL/MariaDB).** Sin privilegio de rutina, `information_schema.ROUTINES` devuelve
+cero filas **sin error**, así que una rutina que existe puede volver en `missing[]`. Si alguna rutina pedida
+queda ahí en MySQL o MariaDB, la respuesta suma UN aviso `mcp.warn.routine_not_found_or_not_visible`
+(vocabulario cerrado, uno por llamada aunque falten varias): la rutina no se encontró o la cuenta no tiene
+privilegio para verla; si existe, regenerar la credencial de solo lectura (MariaDB >= 11.3) o habilitar la
+lectura de cuerpos de rutinas (motores más antiguos). La forma de los ítems de `missing[]` no cambia. Vistas,
+triggers y events conservan el `missing` llano (su ausencia sí es confiable). PostgreSQL no emite el aviso.
+
 ### Contenido no confiable y redacción
 
 Cada `body` va en `untrusted_fields` y bajo el `notice`: es código de un tercero y puede contener texto
@@ -120,8 +128,11 @@ leer ningún cuerpo ni emitir `SHOW CREATE`:
   (`flag_off` o `engine_unsupported`). "Disponible" no promete un cuerpo: lo confirma `get_definition` por
   objeto.
 - Tablas y secuencias no llevan los campos (`null`).
-- Aviso `mcp.warn.routines_not_visible` cuando el motor puede ocultar rutinas al índice: que no aparezcan no
-  prueba que no existan.
+- Aviso `mcp.warn.routines_not_visible` en MySQL/MariaDB cuando las rutinas forman parte del listado (`kinds`
+  omitido o que incluye `routine`) y se cumple una de dos: el motor/versión/bandera puede ocultarlas, **o** el
+  índice listó **cero** rutinas ("puede que no existan o que esta cuenta no las vea"). Que no aparezcan no
+  prueba que no existan; nunca se afirma certeza. El cero se mide sobre el índice completo, no sobre lo
+  filtrado por `name_prefix`. PostgreSQL no cambia.
 - **Nuevo tipo `event`** en `kinds` (MySQL y MariaDB; en PostgreSQL no existe y la lista es vacía).
   `get_schema` conserva sus tipos y no lee eventos ni cuerpos.
 - Listar nombres de rutinas y triggers ya no hace un `SHOW CREATE` por objeto.

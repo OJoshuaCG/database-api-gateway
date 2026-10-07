@@ -2467,3 +2467,23 @@ motor, así que la SPA no puede saber si hace falta. En vez de adivinar, ofrece 
 con el `422 engine_unsupported`. El texto del acknowledgement está duplicado literal en la SPA
 (`READONLY_PROC_ACK_TEXT`) con un comentario que apunta a la constante del backend; hay un test que fija el
 literal para que una divergencia falle ahí y no en producción.
+
+### mcp-schema-definitions: una rutina ausente puede ser una rutina invisible (MariaDB 11.8.3)
+
+**Incidente.** En la validación en vivo, una cuenta de estructura sin privilegio de rutina recibió CERO filas
+de `information_schema.ROUTINES` (sin error). `get_definition` contestó `missing` ("no existe") de rutinas
+que existían y `list_objects` listó cero rutinas sin avisar. Además la SPA mostraba la sección «Lectura de
+cuerpos de rutinas» (`mysql.proc`) en todo servidor MySQL/MariaDB, y confundía a quien tiene MariaDB >= 11.3
+y no la necesita.
+
+**Decisión.** No se cambia la forma de `missing[]` (campos congelados): se suma UN aviso
+`mcp.warn.routine_not_found_or_not_visible` cuando una rutina cae en `missing` en MySQL/MariaDB, con la
+salida concreta (regenerar la credencial o habilitar la lectura de cuerpos). `list_objects` emite
+`routines_not_visible` también cuando el índice listó cero rutinas (señal barata y veraz) y no solo cuando
+el motor/versión lo explica; el cero se mide sobre el índice completo, no sobre el filtro. Vistas, triggers
+y events conservan el `missing` llano: su catálogo no tiene esta ambigüedad. En la SPA la sección de
+`mysql.proc` queda plegada bajo «Opciones avanzadas: servidores antiguos» y solo abre sola si la bandera ya
+está encendida (para poder apagarla).
+
+**Por qué no más.** No se intentó distinguir "no existe" de "no la veo" con una consulta extra: sin el
+privilegio la cuenta no puede probarlo, y afirmar certeza sería peor que avisar la duda.
