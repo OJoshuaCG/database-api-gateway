@@ -2503,3 +2503,62 @@ así que no hay migración de filas: los tokens emitidos antes siguen valiendo h
 **Consecuencia operativa.** Los escáneres de secretos y las reglas de detección tienen que cubrir
 **los dos** prefijos mientras exista algún token legado vivo. Quitar `dbgw` de la tupla es el
 retiro del formato legado y rompe a todo agente que no haya rotado.
+
+### Tokens de agente: autoservicio con `tokens.own` (una capacidad más, no partir `access.admin`)
+
+**Decisión.** Cada persona administra sus propios tokens de agente sin `access.admin`. Se agregó UNA
+capacidad, `tokens.own`, que tienen los tres roles como `self.read`, y las rutas de `/api-tokens` aceptan
+`access.admin` (todos los tokens) o `tokens.own` (solo los de `created_by_admin_id` igual al propio id).
+Detalle del contrato en `docs/api-reference-v40.md`.
+
+**Por qué una capacidad más y no partir `access.admin`.** El invariante 10 fija `access_admin` como
+exactamente `{access.admin}` y existe por la separación de deberes que costó la partición de
+`gateway.admin`. Sacar "tokens" de `access.admin` habría obligado a decidir quién administra los tokens
+ajenos (una tercera global, con su regla de segundo aprobador y su disyunción del invariante 9) para
+resolver algo que no es un problema de administración sino de **dueño**. `tokens.own` no agrega poder
+sobre nadie: el token ya ejerce la intersección con las capacidades de su emisor, así que emitirlo no
+entrega más de lo que la persona ya puede.
+
+**Por qué los tres roles.** Es el precedente de `self.read`: si hubiera que asignarla, `access.admin`
+volvería a ser el cuello de botella que esto viene a quitar, y las personas sin ella pedirían tokens por
+fuera del gateway (copiando uno ajeno). No es sensible, no es otorgable y no divulga: expone solo filas
+propias y nunca el secreto. Por eso tampoco necesita segundo aprobador.
+
+**Por qué `mutates=false` y `requires_step_up=false` en la spec.** No es una omisión: está en `viewer` y el
+invariante 3 prohíbe que `viewer` mute; el catálogo solo admite step-up en lo que muta o divulga. El
+step-up real de POST/PATCH/DELETE lo pone la ruta con la spec de `access.admin` (`authz.require_either`).
+Si dependiera de la capacidad que el actor tiene, el camino de autoservicio quedaría más laxo que el
+administrativo.
+
+**Por qué las mismas rutas con `require_either` y no endpoints duplicados.** Duplicarlos deja dos copias del
+techo del emisor, del step-up y de la auditoría que divergen en silencio (el mismo motivo por el que
+`_validate_scopes` es único para alta y edición). `require`/`require_at` exigen UNA capacidad y no había un
+patrón de "una u otra"; `require_either` es el mínimo que lo resuelve. El marcador `__gw_capability__` queda
+en `access.admin` (el piso estricto, así que `_SPLIT_ROUTES` y los chequeos 1-4 del script siguen
+valiendo) y `__gw_alternatives__` lleva `tokens.own` para que no se lea como vocabulario muerto. **El guard
+solo autoriza la capa 1:** acotar por dueño es del controller (`owner_scope_of` + `owner_scope`), y usar el
+guard sin ese filtro convertiría a `tokens.own` en `access.admin`. El parámetro es explícito y no se infiere
+del actor dentro del controller porque `update_token` ya lo invocan llamadores internos con un actor sin
+`access.admin` y sin acotar; el default (`None`) conserva ese comportamiento y la ruta siempre lo calcula
+(falla CERRADO: sin `access.admin` queda acotado a su id; sin id, 403).
+
+**Por qué 404 y no 403 para un token ajeno.** Un 403 confirma que el id existe y convierte la ruta en un
+oráculo de enumeración de tokens de otras personas. El ajeno responde el mismo 404, con el mismo mensaje y
+código, que el inexistente, y se resuelve antes del 409 `already_revoked`. El listado filtra antes del
+`COUNT` por la misma razón: `total` también habría delatado cuántos hay.
+
+**Techo del emisor al escribir.** El token ya ejercía la intersección con su emisor al autenticar, y eso
+alcanzaba mientras solo `access.admin` emitía. Con autoservicio, un `viewer` podía dejar `data.read`
+escrito, inerte, y activarse el día que lo promovieran a `owner` sin que nadie lo decidiera. En el camino de
+autoservicio cada scope **nuevo** tiene que estar entre las capacidades del emisor (403): los datos
+siguen siendo solo de `owner`. Conservar un scope que el emisor perdió no cuenta como agregar.
+
+**Proyecto: lo que se encontró.** No existe ACL de proyecto por usuario: `GET /projects/{id}` lo ve quien
+tenga `blueprints.read`, y el alta de token solo verificaba existencia. En autoservicio se exige que el
+emisor tenga `blueprints.read` (mismo 422 que un proyecto inexistente, para no confirmar existencia). Hoy
+los tres roles la tienen, así que la regla no rechaza a nadie por rol: es un seguro para que una ACL futura
+no tenga en el autoservicio un camino de salto.
+
+**Consecuencias conocidas.** Un token cuyo emisor se borró (`created_by_admin_id` sin FK) solo lo ve
+`access.admin`. Un `viewer` sin ningún grant puede emitir tokens de lectura sobre cualquier proyecto con
+las capacidades de su rol; el alcance por entorno no restringe un token (documentado en `token_actor`).

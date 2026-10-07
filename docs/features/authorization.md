@@ -391,7 +391,7 @@ mismo `422 gateway_user.not_found` (sin `410`, que era un oráculo de cuentas pe
   Nada que mute ni divulgue (invariante 5) y nada con step-up (invariante 11).
 - `parse_scopes` **intersecta** los scopes guardados con el techo al leer: una fila manipulada nunca
   otorga más, aunque el string lo diga.
-- Crear, listar y revocar tokens es `access.admin`. Un token está atado a un proyecto, vence
+- Crear, listar, editar y revocar los tokens de TODOS es `access.admin`; cada persona administra los suyos con `tokens.own` (los tres roles; ver `api-reference-v40.md`). Un token está atado a un proyecto, vence
   (`MCP_TOKEN_MAX_TTL_DAYS`, default 90) y el servidor MCP está apagado por defecto (`MCP_ENABLED`).
 - El dispatcher MCP exige el scope de cada herramienta (`mcp.scope_denied`, auditado).
 - Qué BD ve un agente lo decide la **política**, no el acceso: `allows_agent_access` del entorno y
@@ -428,7 +428,7 @@ Contrato en `api-reference-v23.md` §9 y `api-reference-v24.md` §3; guía de us
 | `/gateway-users/*` (salvo `invite/accept`, público) | `access.admin` | `api-reference-v24.md` §2; `api-reference-v29.md` §9 y §11 |
 | `/gateway-users/{id}/capability-grants`, `/capability-grants/*` | `access.admin` | `api-reference.md` §19 |
 | `/access-requests/*` | `access.admin` | `api-reference-v29.md` §9.4 |
-| `/api-tokens/*` | `access.admin` | `api-reference-v24.md` §3 |
+| `/api-tokens/*` | `access.admin` (todos) o `tokens.own` (solo los propios) | `api-reference-v24.md` §3 |
 | `/audit-log`, `/audit-log/{id}` | `policy.admin` | `api-reference-v29.md` §11.3–§11.4 |
 | `POST /admin/crypto/rotate` | `policy.admin` | `api-reference.md` §13 |
 
