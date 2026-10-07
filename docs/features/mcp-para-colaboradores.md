@@ -3,12 +3,14 @@
 Guía operativa. Dos partes: lo que hace **quien administra** (una vez, y después una vez por
 persona) y lo que hace **cada colaborador** en su propia máquina.
 
-> **Qué expone hoy.** Once tools de solo lectura: el inventario (`list_databases`,
+> **Qué expone hoy.** Tools de solo lectura: el inventario (`list_databases`,
 > `list_environments`, `list_exports`, `list_clones`, `list_catalogs`), las que leen la
 > estructura de una base (`list_objects`, `check_freshness`, `get_schema`, `search_schema`,
-> `diff_schemas`) y `draft_query`, que **clasifica un texto SQL sin ejecutarlo**. Ninguna
-> devuelve filas ni cuerpos de vistas, rutinas o triggers. Para encontrar una tabla o columna
-> cuyo nombre exacto no se conoce, usar `search_schema`.
+> `diff_schemas`, `get_table_stats`) y `draft_query`, que **clasifica un texto SQL sin
+> ejecutarlo**. Esas no devuelven filas ni cuerpos de vistas, rutinas o triggers. Los cuerpos
+> los entrega solo `get_definition` (scope `data.definitions`, apagada por default; ver «MCP:
+> leer el código de vistas, triggers, eventos y rutinas») y las filas, las tools de datos. Para
+> encontrar una tabla o columna cuyo nombre exacto no se conoce, usar `search_schema`.
 
 ---
 
@@ -150,9 +152,11 @@ servidor queda **sin verificar** (fuera del MCP).
   gateway). En PostgreSQL el host no aplica.
 - **Grants fijos, definidos en el servidor** (`readonly_probe.MYSQL_READONLY_*`): `SELECT`,
   `SHOW VIEW`, `TRIGGER`, `EVENT` por base, y `SHOW_ROUTINE` global **solo en MySQL >= 8.0.20**.
-  **MariaDB no tiene `SHOW_ROUTINE`**, y MySQL anterior a 8.0.20 tampoco: ahí no se otorga (ni si
-  la versión no se puede leer; el detalle de auditoría lo dice) y el MCP no ve cuerpos de rutinas
-  (plan 12 §7.2). La versión se lee ANTES de tocar la cuenta. En
+  **MariaDB no tiene `SHOW_ROUTINE`**: ahí las rutinas se cubren con `SHOW CREATE ROUTINE` por base
+  **solo en MariaDB >= 11.3** (ver «Cuerpos de rutinas» más abajo). MySQL anterior a 8.0.20 y
+  MariaDB anterior a 11.3 no reciben ninguno de los dos (tampoco si la versión no se puede leer; el
+  detalle de auditoría lo dice) y el MCP no ve cuerpos de rutinas salvo con la bandera de más
+  abajo (plan 12 §7.2). La versión se lee ANTES de tocar la cuenta. En
   PostgreSQL: rol `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`,
   `default_transaction_read_only = on`, `CONNECT` por base y `USAGE` sobre `public`.
 - **Solo rota cuentas PROPIAS.** Si en el motor ya existe una cuenta con ese usuario, el gateway
@@ -186,6 +190,26 @@ servidor queda **sin verificar** (fuera del MCP).
 
 > **Solo desde la SPA/API.** El MCP no tiene una tool que provisione ni puede importar esta capa:
 > nunca toca la pseudo-root.
+
+#### Cuerpos de rutinas (procedimientos y funciones)
+
+`get_definition` (ver «MCP: leer el código de vistas, triggers, eventos y rutinas») necesita que la
+cuenta de solo lectura pueda leer el código de las rutinas. Cómo se logra depende del motor:
+
+- **MariaDB >= 11.3:** regenerar la credencial otorga `SHOW CREATE ROUTINE` por base. Una credencial
+  ya aprovisionada no lo recibe hasta regenerarla.
+- **MariaDB < 11.3 y MySQL 5.7:** no existe un grant por base; el único camino es `SELECT ON
+  mysql.proc`, que se enciende por servidor con la bandera `readonly_proc_grant`
+  (`PUT /api/v1/servers/3/readonly-credential/routine-bodies`; en la SPA, la sección colapsada
+  «Opciones avanzadas: servidores antiguos»). **Es server-wide:** la cuenta pasa a leer el código de
+  las rutinas de **todas** las bases del servidor, también las de otros proyectos; solo el filtrado
+  del gateway lo contiene, y por eso habilitarla exige escribir el texto de acknowledgement exacto.
+  Detalle y efectos en [`mcp-definiciones.md`](mcp-definiciones.md).
+
+> **Dónde se regenera.** En el panel «Acceso de agentes (MCP)» del **detalle del servidor**, con el
+> botón «Regenerar credencial». **No** en el modal «Acceso de agentes» de cada base: ese administra la
+> credencial de **datos** (`data.read`/`data.query`), que es otra cuenta y no otorga nada sobre
+> rutinas.
 
 #### Camino manual
 
@@ -259,7 +283,7 @@ Respuesta (recortada):
 { "data": {
     "id": 4,
     "token_id": "J5uBh8FFa52o3b7xKq2w",
-    "token": "dbgw.J5uBh8FFa52o3b7xKq2w.el-secreto-de-256-bits",  // ← UNA sola vez
+    "token": "datum.J5uBh8FFa52o3b7xKq2w.el-secreto-de-256-bits",  // ← UNA sola vez
     "name": "laptop-de-ana",
     "project_id": 1,
     "scopes": ["blueprints.read"],
@@ -271,10 +295,14 @@ Por default el token sale con `blueprints.read`, que alcanza **solo** para `list
 Para el resto, pedí los scopes al emitirlo: `"scopes": ["blueprints.read", "databases.read"]`.
 `tools/list` publica únicamente las tools que el token puede llamar.
 
+Los tokens nuevos llevan el prefijo `datum.`. Los emitidos antes conservan `dbgw.` y siguen
+funcionando: no hace falta reemitirlos por el cambio de nombre.
+
 | Scope | Tools |
 |---|---|
 | `blueprints.read` | `list_databases` |
-| `databases.read` | `list_objects`, `check_freshness`, `get_schema`, `search_schema`, `draft_query` |
+| `databases.read` | `list_objects`, `check_freshness`, `get_schema`, `search_schema`, `draft_query`, `get_table_stats` |
+| `data.definitions` | `get_definition` (ver [`mcp-definiciones.md`](mcp-definiciones.md)) |
 | `schema_diff.read` | `diff_schemas` |
 | `environments.read` | `list_environments` |
 | `exports.read` | `list_exports` |
@@ -365,7 +393,7 @@ Tres reglas que no son burocracia:
 Por un canal privado (gestor de contraseñas, mensaje directo). **No** por el chat del equipo ni
 por correo a una lista.
 
-El `token_id` —la primera parte, después de `dbgw.`— **no es secreto** y es lo que aparece en la
+El `token_id` —la primera parte, después de `datum.` (o de `dbgw.` en los legados)— **no es secreto** y es lo que aparece en la
 auditoría: sirve para hablar de "el token de Ana" sin exponer nada.
 
 ### B.3 Ampliar o recortar scopes sin reemitir
@@ -410,7 +438,7 @@ Tres pasos. Necesita: el **host del gateway** y su **token**.
 **bash / zsh** (`~/.bashrc`, `~/.zshrc`):
 
 ```bash
-export GATEWAY_MCP_TOKEN='dbgw.J5uBh8FFa52o3b7xKq2w.el-secreto'
+export GATEWAY_MCP_TOKEN='datum.J5uBh8FFa52o3b7xKq2w.el-secreto'
 ```
 
 ### B.2.1 Un token hereda los permisos de quien lo emitió
@@ -431,7 +459,7 @@ y el emisor se relee en cada request:
 **PowerShell** (perfil, `$PROFILE`):
 
 ```powershell
-$env:GATEWAY_MCP_TOKEN = 'dbgw.J5uBh8FFa52o3b7xKq2w.el-secreto'
+$env:GATEWAY_MCP_TOKEN = 'datum.J5uBh8FFa52o3b7xKq2w.el-secreto'
 ```
 
 Después, abrir una terminal nueva (o `source ~/.zshrc`).
@@ -606,6 +634,29 @@ cuenta del motor con `SELECT` sobre una sola base en una transacción `READ ONLY
 
 ---
 
+## MCP: leer el código de vistas, triggers, eventos y rutinas
+
+`get_definition` (scope `data.definitions`) entrega el **código** de hasta 3 objetos por llamada,
+pedidos por nombre y tipo. Lo que no existe vuelve en `missing[]`; un cuerpo de más de 64 KiB se
+rechaza con `too_large` en vez de cortarse. **No ejecuta nada:** el código se lee como texto
+(`SHOW CREATE ...` o `pg_get_*`) y nunca se corre ni se dispara. `get_table_stats` (scope
+`databases.read`) es su complemento: tamaño, motor y fechas de las tablas; `row_estimate` y
+`auto_increment` salen solo si el token además tiene `data.read`.
+
+Para habilitarlo, las dos cosas:
+
+1. En el `.env` del gateway, `MCP_SCHEMA_DEFINITIONS_ENABLED=true`, y reiniciar. Nace **apagado**: es
+   el kill switch, y apagarlo de nuevo retira la tool al instante de `tools/list`.
+2. Un token con el scope `data.definitions`. Lo emite solo un owner con el step-up abierto, igual que
+   `data.read` y `data.query`.
+
+Los cuerpos pueden contener secretos y son texto de terceros: emitir el scope solo a quien pueda ver el
+código de esa base. Si una rutina que existe no aparece, puede ser un tema de privilegios de la
+credencial de solo lectura (A.6, «Cuerpos de rutinas»). Contrato, límites y advertencias en
+[`mcp-definiciones.md`](mcp-definiciones.md).
+
+---
+
 ## Cuando alguien se va del equipo
 
 1. **Revocar sus tokens** (B.4). El acceso corta en el request siguiente, sin caché. Desactivar
@@ -633,12 +684,14 @@ cuenta del motor con `SELECT` sobre una sola base en una transacción `READ ONLY
   del motor con `SELECT` sobre **una sola base**, dentro de una transacción `READ ONLY` y con
   timeout del lado del servidor. Ver «`run_select`» más arriba.
 - **No escribe nada.** El techo de capacidades de un token excluye todo lo que mute y todo lo que
-  divulgue, salvo el par cerrado `data.read`/`data.query` (filas, con opt-in y credencial propios),
+  divulgue, salvo el conjunto cerrado `data.read`/`data.query` (filas, con opt-in y credencial propios) y
+  `data.definitions` (código de objetos, solo texto, tras su propio kill switch),
   y la intersección se aplica dos veces: al emitir y al autenticar.
 - **No usa la credencial pseudo-root.** Las tools que leen el catálogo van con la credencial de
   solo lectura del servidor (A.6), verificada por el motor, y con la sesión en `READ ONLY`.
-- **No devuelve cuerpos** de vistas, rutinas ni triggers, ni SQL de un diff: salen como
-  `body_omitted_reason: "scope_disabled"`. `diff_schemas` dice QUÉ difiere y nada más; no guarda
+- **No devuelve cuerpos** de vistas, rutinas ni triggers salvo por `get_definition`, con su scope y su
+  kill switch, y aun así solo como texto: nunca los ejecuta. En las demás tools salen como
+  `body_omitted_reason: "scope_disabled"`; tampoco devuelve SQL de un diff. `diff_schemas` dice QUÉ difiere y nada más; no guarda
   la comparación ni emite un `confirm_token`.
 
 El contrato técnico completo está en `docs/api-reference-v23.md` §9.
