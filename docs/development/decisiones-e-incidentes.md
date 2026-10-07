@@ -2562,3 +2562,88 @@ no tenga en el autoservicio un camino de salto.
 **Consecuencias conocidas.** Un token cuyo emisor se borró (`created_by_admin_id` sin FK) solo lo ve
 `access.admin`. Un `viewer` sin ningún grant puede emitir tokens de lectura sobre cualquier proyecto con
 las capacidades de su rol; el alcance por entorno no restringe un token (documentado en `token_actor`).
+
+## Particiones de capacidades (v41): revisor ≠ actor, grant-admin ≠ write, estructura ≠ código
+
+Tres capacidades se partieron tras una revisión independiente. Regla común: **cada rol hereda la capacidad
+nueva según lo que ya podía hacer**, de modo que nadie pierde un flujo legítimo salvo las dos restricciones
+intencionales de abajo. Contrato en `docs/api-reference-v41.md`.
+
+### `policy.admin` → `audit.read` + `crypto.rotate`
+
+**Por qué.** `policy.admin` juntaba un ACTOR (rotar la clave que cifra todas las credenciales) con su
+REVISOR (leer el rastro de esa rotación). Mientras la tenga una sola función no hay cambio de acceso, pero
+juntarlas en una capacidad impedía separarlas sin otra partición, y la separación de deberes ya probó (con
+`gateway.admin`) que el momento de partir es antes de necesitarlo. **Quién hereda:** ambas, solo la global
+`security_officer`, igual que `policy.admin` (ningún usuario gana ni pierde nada). `policy.admin` se retiró
+(`RETIRED_CAPABILITIES`, invariante 12) siguiendo el precedente de `gateway.admin`; al ser global nunca
+hubo `capability_grants` que la nombraran.
+
+**Por qué `audit.read` no divulga.** Con `discloses=true` el invariante 4 exigiría step-up en cada `GET` de
+la pantalla de auditoría. Lo que sí divulgaba era el `detail` de `query_console.*`: guarda el SQL con los
+literales (datos del tercero) y el historial de la consola SQL ya los enmascara para quien no tiene
+`sql_console.execute`; la auditoría no, así que era un camino lateral. Ahora
+`AuditLogController` aplica `sql_masking.mask_literals` con la misma regla de alcance (`can_at`) y marca
+`detail_masked`. El enmascarado es fail-closed (formato desconocido ⇒ se enmascara entero). `reader` es un
+keyword sin default para que una llamada que olvide quién lee falle con `TypeError`.
+
+### `engine_users.write` → + `engine_users.grant_admin` (delegar privilegios)
+
+**Por qué.** `engine_users.write` (que tiene `operator`) cubría el GRANT de rutina y también `WITH GRANT OPTION`
+y los privilegios del set GATE. Con la opción, la cuenta beneficiaria re-otorga lo suyo por fuera del gateway,
+sin su auditoría ni sus guards: es una escalada, no un GRANT más. **Quién hereda:** solo `owner` (sensible,
+step-up, segundo aprobador si se otorga suelta). **Restricción intencional: `operator` pierde esos grants.**
+Los grants simples no cambian y los perfiles tampoco (sus plantillas son política de `catalogs.write`).
+
+**Por qué en el controller y no solo en la ruta.** El patrón del repo para escalar por payload es
+`assert_at` en la ruta (``delete_database``). Acá la decisión depende del dialecto (qué privilegios son GATE),
+que solo conoce el adapter del servidor del usuario, y `provision_with_grants` también llama a
+`GrantController.grant_object` para sus grants iniciales: un solo punto cubre los dos caminos. La ruta de
+`provision` además verifica ANTES de crear la cuenta (si no, los grants fallarían uno a uno, best-effort, y
+quedaría un usuario creado a medias). `reassign-owner?provision=true` sí lo hace en la ruta, junto a su
+`assert_at(databases.drop)`.
+
+**Por qué este 403 nombra la capacidad.** `assert_capability` calla la capacidad para que un 403 no sea un
+mapa de la superficie. Un escalamiento por payload es distinto: quien llega ya tiene la capacidad base y eligió
+el payload que escala, así que nombrarla no revela nada y la SPA necesita el código para explicarlo. El código
+(`engine_user.grant_admin_required`) vive en `engine_user_catalog.py` y el helper (`scope.assert_at_with_code`)
+deja el mismo rastro agregado y el mismo step-up final que `assert_at`.
+
+**Por qué el criterio es el de la intención auditada.** `grant_object` ya trataba como operación GATE
+(`record_intent` fail-closed) exactamente `with_grant_option or requires_confirmation`. La capacidad usa esa
+misma condición: lo que se audita antes de ejecutar es lo que se exige poder delegar.
+
+**`reassign-owner?provision=true`.** Ya pedía `databases.drop` (solo `owner`), así que `operator` no pierde nada
+nuevo ahí; lo que cambia es que quien tenga `databases.drop` suelto necesita también `engine_users.grant_admin`.
+Se conserva el orden (primero el 403 opaco de `databases.drop`, después el nombrado). No se agregó
+`engine_users.write` a esa ruta: su piso sigue siendo `databases.write`.
+
+### `schema.definitions`: la estructura de una base no es lo mismo que su código
+
+**Por qué.** El snapshot de una base y las comparaciones de esquema devolvían los cuerpos de vistas,
+rutinas, triggers y eventos a cualquiera con `databases.read` / `schema_diff.read` (`viewer`). Un cuerpo es
+texto de un tercero con reglas de negocio y a veces secretos; el scope `data.definitions` del MCP ya lo
+trataba como divulgación, la SPA no. **Quién hereda:** `operator` y `owner`. **Restricción intencional:
+`viewer` deja de recibir los cuerpos** (sigue viendo la estructura: tablas, columnas, índices).
+
+**Por qué `discloses=false`.** Es lo que fijan los invariantes dado el reparto pedido: `operator` la hereda y el
+7b prohíbe que `operator` tenga una capacidad que divulga; marcarla divulgante exigiría además step-up en
+cada `GET` (invariante 4). Consecuencia que hay que saber: al estar en `operator` no es `owner − operator`,
+así que **otorgarla suelta a un `viewer` no pide segundo aprobador**, a diferencia de `data.definitions`. La
+protección real es la redacción de la respuesta, no la clasificación.
+
+**Por qué redactar en la capa de ruta y con marca.** `ServerController.snapshot` alimenta a
+`from-snapshot` (blueprint baseline), que necesita el dump completo; redactar ahí lo habría roto. La
+redacción vive en `definition_visibility` y se aplica donde la respuesta sale hacia el cliente. Un cuerpo
+vacío sin más significa «el objeto no tiene definición», así que cada objeto redactado lleva
+`redacted=true` (y en el `.sql` exportado, una línea de comentario): nunca un vacío silencioso.
+
+**Origen Y destino.** En una comparación los cuerpos salen de los dos lados, así que la capacidad se evalúa
+en ambos: con solo el destino, una comparación producción→desarrollo filtraría el código del lado donde la
+persona no puede leerlo. Un `reader` ausente (llamada olvidada) falla con `TypeError` y un lector que no es
+un `Actor` no ve cuerpos (fail-closed).
+
+**Lo que NO se cierra.** Las versiones de blueprint (`blueprints.read`, `viewer`) guardan el DDL completo que
+alguien creó desde un snapshot o adoptó de un diff, y un `viewer` las lee: este corte cierra el snapshot y las
+comparaciones, no la autoría de blueprints. Tampoco se tocó `execute-preview`/`adopt`/`execute` (quien puede
+aplicar el DDL ve lo que aplica). Y no se redactan columnas generadas ni `CHECK` de tablas: son estructura.

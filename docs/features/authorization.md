@@ -52,6 +52,7 @@ Generada desde `capability_matrix()` (32 filas). `✓` = sí, `—` = no. *Cursi
 | `engine_users.drop` | engine_users | drop | server | ✓ | — | ✓ | ✓ | — | ✓ | ✓ | owner |
 | `engine_users.secrets` | engine_users | secrets | server | — | ✓ | — | ✓ | — | ✓ | ✓ | owner |
 | `engine_users.credentials` | engine_users | credentials | server | ✓ | ✓ | — | ✓ | — | ✓ | ✓ | owner |
+| `engine_users.grant_admin` | engine_users | grant_admin | server | ✓ | — | — | ✓ | — | ✓ | ✓ | owner |
 | `databases.read` | databases | read | environment | — | — | — | — | ✓ | ✓ | — | viewer, operator, owner |
 | `databases.write` | databases | write | environment | ✓ | — | — | — | — | ✓ | — | operator, owner |
 | `databases.drop` | databases | drop | environment | ✓ | — | ✓ | ✓ | — | ✓ | ✓ | owner |
@@ -59,6 +60,7 @@ Generada desde `capability_matrix()` (32 filas). `✓` = sí, `—` = no. *Cursi
 | `blueprints.write` | blueprints | write | environment | ✓ | — | — | — | — | ✓ | — | operator, owner |
 | `blueprints.apply` | blueprints | apply | environment | ✓ | — | ✓ | ✓ | — | ✓ | ✓ | owner |
 | `blueprints.captures` | blueprints | captures | environment | — | ✓ | — | ✓ | — | ✓ | ✓ | owner |
+| `schema.definitions` | schema | definitions | environment | — | — | — | — | — | ✓ | — | operator, owner |
 | `schema_diff.read` | schema_diff | read | environment | — | — | — | — | ✓ | ✓ | — | viewer, operator, owner |
 | `schema_diff.execute` | schema_diff | execute | environment | ✓ | — | ✓ | ✓ | — | ✓ | ✓ | owner |
 | `clones.read` | clones | read | environment | — | — | — | — | — | ✓ | — | viewer, operator, owner |
@@ -75,18 +77,22 @@ Generada desde `capability_matrix()` (32 filas). `✓` = sí, `—` = no. *Cursi
 | `environments.read` | environments | read | global | — | — | — | — | — | — | — | viewer, operator, owner |
 | `environments.write` | environments | write | global | ✓ | — | — | ✓ | — | — | — | *security_officer* |
 | `access.admin` | access | admin | global | ✓ | — | — | ✓ | — | — | — | *access_admin* |
-| `policy.admin` | policy | admin | global | ✓ | — | — | ✓ | — | — | — | *security_officer* |
+| `audit.read` | audit | read | global | — | — | — | — | — | — | — | *security_officer* |
+| `crypto.rotate` | crypto | rotate | global | ✓ | — | — | ✓ | — | — | — | *security_officer* |
 
-Conteos: 16 con step-up, 7 destructivas, 24 otorgables, 11 sensibles, 3 permitidas a agentes.
+Conteos de la tabla original (anterior a `tokens.own`, `data.*`, v41): 16 con step-up, 7 destructivas, 24 otorgables, 11 sensibles, 3 permitidas a agentes. La tabla ya no está completa (`tokens.own` y `data.*` no figuran); manda `GET /authz/catalog`.
 
 **Qué tiene cada rol**, en palabras:
 
-- `viewer`: todas las lecturas. No muta ni divulga (invariante 3 del catálogo).
+- `viewer`: las lecturas de **estructura**. No muta ni divulga (invariante 3 del catálogo). Desde
+  v41 no recibe el CÓDIGO de vistas, rutinas, triggers y eventos (`schema.definitions`).
 - `operator`: `viewer` + la escritura **no destructiva y no divulgante**: `engine_users.write`,
-  `databases.write`, `blueprints.write` (solo autoría) y `exports.execute`. No divulga nada
-  (invariante 7b).
-- `owner`: todo lo **operativo** del alcance: `operator` + las 11 capacidades exclusivas de `owner`
-  (las *sensibles* de la tabla). No incluye ninguna capacidad global.
+  `databases.write`, `blueprints.write` (solo autoría), `exports.execute` y el código de los
+  objetos de esquema (`schema.definitions`). No divulga nada (invariante 7b; por eso
+  `schema.definitions` no se marca `discloses`: ver `api-reference-v41.md`). No delega privilegios
+  (`engine_users.grant_admin` es solo de `owner`).
+- `owner`: todo lo **operativo** del alcance: `operator` + las capacidades exclusivas de `owner`
+  (las *sensibles* de la tabla, 15 desde v41). No incluye ninguna capacidad global.
 
 `self.read`, `catalogs.read` y `environments.read` son globales pero de la cadena de roles: las
 tiene todo usuario.
@@ -96,7 +102,7 @@ tiene todo usuario.
 | Global | Capacidades | Deber |
 |---|---|---|
 | `access_admin` | `access.admin` (exactamente esa, invariante 10) | Administra usuarios del gateway, sus accesos, capacidades puntuales, tokens de agente, sesiones de otras personas, `scope-readiness` y `sod-report`. **Explícitamente no operativo**: no aplica migraciones, no dropea, no revela contraseñas. |
-| `security_officer` | `policy.admin`, `servers.admin`, `catalogs.write`, `environments.write` | Escribe **datos de política**: el inventario de servidores (host y credencial), los catálogos de privilegios/perfiles/charsets, los entornos y su política (incluida la apertura de una BD a agentes y la reclasificación), la rotación del cifrado y la **lectura de la auditoría**. No administra usuarios. |
+| `security_officer` | `audit.read`, `crypto.rotate`, `servers.admin`, `catalogs.write`, `environments.write` | Escribe **datos de política**: el inventario de servidores (host y credencial), los catálogos de privilegios/perfiles/charsets, los entornos y su política (incluida la apertura de una BD a agentes y la reclasificación), la rotación del cifrado y la **lectura de la auditoría**. No administra usuarios. |
 
 Los conjuntos son **disjuntos de a pares** (invariante 9) y ninguna global está en la cadena de
 roles (invariante 7). `gateway.admin`, la capacidad que tenían las dos, está **retirada**
@@ -357,7 +363,7 @@ contrato en `api-reference-v29.md` §10.
   `api_token_id` = PK del token y `admin_username = "token:<token_id>"`. Un token nunca se lee como
   una persona.
 
-**Quién lee la auditoría.** `GET /audit-log` y `GET /audit-log/{id}` exigen **`policy.admin`**
+**Quién lee la auditoría.** `GET /audit-log` y `GET /audit-log/{id}` exigen **`audit.read`**
 (`security_officer`). `access_admin` recibe `403`: quien hace los cambios de acceso no revisa el
 rastro que los registra. La lectura **no divulga** (dice quién hizo qué, no datos del tercero), así
 que un `GET` no pide step-up. Filtros y forma en `api-reference-v29.md` §11.3.
@@ -429,8 +435,8 @@ Contrato en `api-reference-v23.md` §9 y `api-reference-v24.md` §3; guía de us
 | `/gateway-users/{id}/capability-grants`, `/capability-grants/*` | `access.admin` | `api-reference.md` §19 |
 | `/access-requests/*` | `access.admin` | `api-reference-v29.md` §9.4 |
 | `/api-tokens/*` | `access.admin` (todos) o `tokens.own` (solo los propios) | `api-reference-v24.md` §3 |
-| `/audit-log`, `/audit-log/{id}` | `policy.admin` | `api-reference-v29.md` §11.3–§11.4 |
-| `POST /admin/crypto/rotate` | `policy.admin` | `api-reference.md` §13 |
+| `/audit-log`, `/audit-log/{id}` | `audit.read` | `api-reference-v29.md` §11.3–§11.4 |
+| `POST /admin/crypto/rotate` | `crypto.rotate` | `api-reference.md` §13 |
 
 ---
 
@@ -454,7 +460,7 @@ step-up. El razonamiento largo vive en los docstrings citados.
 | El arranque no revive ni re-eleva cuentas sin `ADMIN_RECOVERY=1`, y la recuperación solo devuelve `access_admin`. | Si un reinicio reparara solo, desactivar al administrador sería reversible por reinicio. |
 | Step-up activo por defecto, ventana de 5 min por sesión, no deslizante; el login cuenta. | Fricción mínima en flujos de varios requests sin dejar que una cookie robada mantenga abierta la ventana. |
 | Las cancelaciones están exentas de step-up (lista cerrada, chequeada en CI). | Frenar una operación destructiva nunca puede costar más que lanzarla. |
-| Leer la auditoría es `policy.admin`, no `access.admin`; no pide step-up. | El revisado no se revisa a sí mismo; la auditoría no divulga datos del tercero. |
+| Leer la auditoría es `audit.read` (antes `policy.admin`, partida en `audit.read` + `crypto.rotate`: ver `api-reference-v41.md`), no `access.admin`; no pide step-up. | El revisado no se revisa a sí mismo; la auditoría no divulga datos del tercero. |
 | `access_admin` puede ver y cerrar las sesiones de otra persona; no toca la contraseña. | Responder a un incidente sin tocar la credencial; ante una filtración se combina con desactivar la cuenta. |
 | Al leer, una combinación sin excepción pierde `security_officer`, no `owner` ni `access_admin`. | Quitar `access_admin` podría dejar al gateway sin quien lo repare; lo que se cae es la política. |
 | Una BD sin clasificar cuenta como el entorno más protegido. | "Sin entorno derivable" nunca puede significar "permitido". |

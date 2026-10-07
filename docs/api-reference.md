@@ -2368,8 +2368,8 @@ curl -b cookies.txt -X POST https://<host>/api/v1/permission-profiles \
 
 ## 13. Administración: cifrado (`/admin/crypto`)
 
-Operaciones de administración del cifrado de credenciales. Requiere `policy.admin` (solo la global
-`security_officer`) y step-up. No toca los motores destino (opera sobre la BD de metadatos).
+Operaciones de administración del cifrado de credenciales. Requiere `crypto.rotate` (solo la global
+`security_officer`; antes `policy.admin`, ver `api-reference-v41.md`) y step-up. No toca los motores destino (opera sobre la BD de metadatos).
 
 ### `POST /api/v1/admin/crypto/rotate`
 
@@ -2799,7 +2799,7 @@ la propia persona (`/auth/me`) y el acceso efectivo con procedencia.
 **Quién actúa.** Solo quien tiene la global `access_admin`: las rutas declaran `access.admin`,
 que `security_officer` no tiene (`403`; ver `api-reference-v29.md`). Todo es CSRF + sesión, como el resto de `/gateway-users`.
 Nadie se otorga ni se revoca capacidades a sí mismo. Las capacidades **globales** (`servers.admin`,
-`catalogs.*`, `environments.*`, `access.admin`, `policy.admin`, `self.read`) no se otorgan nunca.
+`catalogs.*`, `environments.*`, `access.admin`, `audit.read`, `crypto.rotate`, `self.read`) no se otorgan nunca.
 
 **Asignación (C3).** Lo que cuenta es la función: `access_admin` asigna cualquier capacidad
 otorgable, tenga o no la capacidad él mismo. Reemplaza al techo por tenencia
@@ -2997,8 +2997,8 @@ capas, separación de deberes, step-up) está explicado en
 | `/gateway-users/{id}/capability-grants`, `/capability-grants/pending`, `…/approve`, `…/reject` | `access.admin` | [§19](#19-capacidades-puntuales-gateway-usersidcapability-grants) |
 | `/access-requests/pending`, `/{id}`, `/{id}/approve`, `/{id}/reject`, `/{id}/cancel` | `access.admin` | `api-reference-v29.md` §9.4 |
 | `/api-tokens` (listar, crear, revocar) | `access.admin` | `api-reference-v24.md` §3 (y techo de agente en `api-reference-v23.md` §9) |
-| `GET /audit-log`, `GET /audit-log/{id}` | `policy.admin` | `api-reference-v29.md` §11.3–§11.4 |
-| `POST /admin/crypto/rotate` | `policy.admin` | [§13](#13-administración-cifrado-admincrypto) |
+| `GET /audit-log`, `GET /audit-log/{id}` | `audit.read` | `api-reference-v29.md` §11.3–§11.4 |
+| `POST /admin/crypto/rotate` | `crypto.rotate` | [§13](#13-administración-cifrado-admincrypto) |
 
 Todas las rutas de esta tabla que no son `GET` piden step-up (salvo `…/cancel` y las de
 `self.read`, cuya capacidad no lo exige). `v23` y `v24` tienen pasajes **históricos** marcados en

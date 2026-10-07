@@ -106,7 +106,7 @@ credenciales cifradas. El flag no le da nada que no tenga; lo que garantiza es q
 sea un acto explícito, acotado y auditado, y que un reinicio común nunca reviva una cuenta.
 
 Las dos globales no se solapan: `access_admin` = `{access.admin}` (usuarios, accesos,
-capacidades puntuales, tokens) y `security_officer` = `{policy.admin, servers.admin,
+capacidades puntuales, tokens) y `security_officer` = `{audit.read, crypto.rotate, servers.admin,
 catalogs.write, environments.write}`. Un `security_officer` **sin** `access_admin` no administra
 usuarios, y un `access_admin` sin `security_officer` no rota el cifrado (`api-reference-v29.md`).
 
@@ -295,7 +295,7 @@ entrar. Las filas ya vencidas y sin tachar no se cuentan ni se re-etiquetan: con
 real (`idle`/`absolute`) que les pone el próximo intento.
 
 **La auditoría la lee otra función.** Quien corta sesiones (`access_admin`) no lee
-`GET /audit-log`: eso es `policy.admin` (`security_officer`), para que el revisado no se revise a
+`GET /audit-log`: eso es `audit.read` (`security_officer`), para que el revisado no se revise a
 sí mismo. Contrato completo de las dos piezas en `api-reference-v29.md` §11.
 
 ## Migración a SSO (futuro)
