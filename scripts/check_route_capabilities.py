@@ -84,6 +84,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fastapi.routing import APIRoute  # noqa: E402
 
 from app.core.authz import (  # noqa: E402
+    declared_alternatives,
     declared_capability,
     declared_scope,
     declared_step_up_exempt,
@@ -294,6 +295,23 @@ def _capability_of(route: APIRoute) -> str | None:
     return walk(route.dependant)
 
 
+def _alternatives_of(route: APIRoute) -> tuple[str, ...]:
+    """
+    Las capacidades ALTERNATIVAS que acepta una ruta (``require_either``), recorriendo el árbol
+    resuelto. Una ruta ``access.admin`` o ``tokens.own`` declara la primera como piso y la segunda
+    como alternativa: sin leerla, la segunda pasaría por vocabulario muerto (chequeo 4).
+    """
+    found: list[str] = []
+
+    def walk(dependant) -> None:
+        found.extend(declared_alternatives(getattr(dependant, "call", None)))
+        for sub in getattr(dependant, "dependencies", []) or []:
+            walk(sub)
+
+    walk(route.dependant)
+    return tuple(found)
+
+
 def _uses_agent_auth(route: APIRoute) -> bool:
     """``True`` si la ruta cuelga de ``authenticate_agent``. Se detecta por el callable."""
     from app.core.mcp_auth import authenticate_agent
@@ -436,6 +454,19 @@ def main() -> int:
             if cap is not None:
                 migradas.append(f"{method} {path}")
                 usadas.add(cap)
+                for alternativa in _alternatives_of(route):
+                    usadas.add(alternativa)
+                    # Chequeo 3 también para las alternativas, y la trampa de la RETIRADA.
+                    if alternativa not in validas:
+                        errores.append(
+                            f"{method} {path} acepta '{alternativa}' como alternativa, que no "
+                            "está en el catálogo."
+                        )
+                    if alternativa in RETIRED_CAPABILITIES:
+                        errores.append(
+                            f"{method} {path} acepta '{alternativa}' como alternativa, que está "
+                            "RETIRADA."
+                        )
                 # Chequeo 3: la capacidad declarada es del catálogo cerrado.
                 if cap not in validas:
                     errores.append(

@@ -272,6 +272,51 @@ def require(capability: Capability, *, step_up: bool = True) -> Callable[[Reques
     return _dependency
 
 
+def require_either(
+    capability: Capability, alternative: Capability
+) -> Callable[[Request], Actor]:
+    """
+    Fábrica de la dependencia que acepta UNA de dos capacidades. Devuelve el ``Actor`` resuelto.
+
+    Existe para ``/api-tokens``: ``access.admin`` administra los tokens de todos y ``tokens.own``
+    solo los propios, sobre LAS MISMAS rutas. Duplicar los endpoints dejaba dos implementaciones
+    del techo del emisor, del step-up y de la auditoría que divergen en silencio (es el motivo de
+    ``_validate_scopes`` único); aceptar las dos capacidades en el guard y acotar por dueño en el
+    controller deja una sola. ``require`` y ``require_at`` no sirven: exigen UNA capacidad.
+
+    Esta dependencia **solo autoriza la capa 1**. Quién ve qué fila NO lo decide ella: la ruta
+    tiene que pasarle al controller el dueño al que se acota a quien no tiene ``capability``
+    (``api_token_controller.owner_scope_of``). Usarla sin ese filtro convertiría a ``alternative``
+    en ``capability`` para todos.
+
+    Step-up: se evalúa SIEMPRE con la spec de ``capability`` (``access.admin`` exige step-up en todo
+    método no seguro), no con la de ``alternative``. Si dependiera de la capacidad que el actor
+    casualmente tiene, quien solo tiene ``tokens.own`` emitiría y revocaría tokens sin contraseña
+    fresca, y el camino de autoservicio sería más laxo que el administrativo.
+
+    Marcadores: ``__gw_capability__`` lleva ``capability`` (la estricta, el piso que ven los
+    chequeos del script) y ``__gw_alternatives__`` lleva ``alternative``, para que la cobertura
+    siga siendo enumerable y ``alternative`` no se lea como vocabulario muerto.
+    """
+
+    def _dependency(request: Request) -> Actor:
+        actor = _identify(request)
+        holds_alternative = actor.has(alternative)
+        if not holds_alternative:
+            # El 403 y su rastro salen de ``assert_capability`` (una sola forma), con la capacidad
+            # estricta: la respuesta no nombra ninguna.
+            assert_capability(actor, capability, step_up=False)
+        assert_step_up(actor, capability, method=request.method)
+        return actor
+
+    _dependency.__gw_capability__ = capability.value  # type: ignore[attr-defined]
+    _dependency.__gw_alternatives__ = (alternative.value,)  # type: ignore[attr-defined]
+    _dependency.__name__ = (
+        f"require_{capability.value.replace('.', '_')}_or_{alternative.value.replace('.', '_')}"
+    )
+    return _dependency
+
+
 def require_at(
     capability: Capability,
     *,
@@ -347,6 +392,16 @@ def declared_capability(dependency: Callable) -> str | None:
     return getattr(dependency, "__gw_capability__", None)
 
 
+def declared_alternatives(dependency: Callable) -> tuple[str, ...]:
+    """
+    Las capacidades ALTERNATIVAS que acepta una dependencia (``require_either``), o ``()``.
+
+    Vive junto a ``declared_capability`` por el mismo motivo: productor y lector del marcador
+    en un solo lugar.
+    """
+    return tuple(getattr(dependency, "__gw_alternatives__", ()))
+
+
 # --------------------------------------------------------------------------- #
 # Alias públicos — lo ÚNICO que la capa de rutas importa                       #
 # --------------------------------------------------------------------------- #
@@ -355,6 +410,10 @@ def declared_capability(dependency: Callable) -> str | None:
 # el que un endpoint nuevo quedaría autenticado pero no autorizado.
 
 SelfRead = Annotated[Actor, Depends(require(Capability.SELF_READ))]
+#: Alias público de ``tokens.own`` (el catálogo exige uno por capacidad). Ninguna ruta lo usa solo:
+#: ``/api-tokens`` usa ``AccessAdminOrOwnTokens``. Sin el filtro por dueño del controller, este
+#: alias NO acota nada.
+TokensOwn = Annotated[Actor, Depends(require(Capability.TOKENS_OWN))]
 
 ServersRead = Annotated[Actor, Depends(require(Capability.SERVERS_READ))]
 ServersAdmin = Annotated[Actor, Depends(require(Capability.SERVERS_ADMIN))]
@@ -408,6 +467,11 @@ DataDefinitions = Annotated[Actor, Depends(require(Capability.DATA_DEFINITIONS))
 #: Usuarios del gateway, accesos, capacidades puntuales, tokens y preparación de alcances. Solo
 #: la global ``access_admin``.
 AccessAdmin = Annotated[Actor, Depends(require(Capability.ACCESS_ADMIN_CAP))]
+#: ``/api-tokens``: ``access.admin`` (todos los tokens) o ``tokens.own`` (solo los que emitió el
+#: actor). Quien no tiene ``access.admin`` TIENE que ser acotado por dueño en el controller.
+AccessAdminOrOwnTokens = Annotated[
+    Actor, Depends(require_either(Capability.ACCESS_ADMIN_CAP, Capability.TOKENS_OWN))
+]
 #: Política del propio gateway: rotación del cifrado y lectura de la auditoría. Solo la global
 #: ``security_officer``.
 PolicyAdmin = Annotated[Actor, Depends(require(Capability.POLICY_ADMIN))]

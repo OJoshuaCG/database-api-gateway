@@ -95,8 +95,9 @@ class GlobalCapability(StrEnum):
     """
     Capacidades globales y ortogonales a la cadena de roles.
 
-    ``ACCESS_ADMIN`` (capacidad ``access.admin``) administra usuarios, roles, grants y tokens,
-    y **nada más** (invariante 10). Es **explícitamente NO
+    ``ACCESS_ADMIN`` (capacidad ``access.admin``) administra usuarios, roles, grants y los tokens
+    de TODOS (cada persona administra los suyos con ``tokens.own``, que no es global), y
+    **nada más** (invariante 10). Es **explícitamente NO
     operativo**: no aplica migraciones, no dropea, no revela contraseñas. Esa separación es la
     mitad de la separación de deberes — sin ella, el único rol que puede operar en producción
     es también el que puede desarmar la política, y en un equipo de tres todos terminan ahí.
@@ -132,6 +133,10 @@ class Capability(StrEnum):
 
     # -- Propio del actor (los tres roles lo tienen) ------------------------ #
     SELF_READ = "self.read"
+    #: Emitir, listar, editar los scopes y revocar SOLO los tokens de API que el propio actor
+    #: emitió (``api_tokens.created_by_admin_id``). No es la administración de tokens ajenos: esa
+    #: sigue siendo ``access.admin``. Ver el comentario de su ``_spec``.
+    TOKENS_OWN = "tokens.own"
 
     # -- Inventario de servidores (plano de control) ------------------------ #
     SERVERS_READ = "servers.read"
@@ -202,8 +207,9 @@ class Capability(StrEnum):
     # ``security_officer`` también administraba usuarios: la separación de deberes quedaba
     # en el papel. Partida en dos, cada global tiene la suya y los conjuntos son disjuntos
     # (invariantes 9, 10 y 12). ``gateway.admin`` NO se puede reintroducir.
-    #: Usuarios del gateway, sus accesos, las capacidades puntuales, los tokens de API y el
-    #: reporte de preparación de alcances. Solo ``access_admin``.
+    #: Usuarios del gateway, sus accesos, las capacidades puntuales, TODOS los tokens de API (los
+    #: propios de cada persona los cubre ``tokens.own``) y el reporte de preparación de alcances.
+    #: Solo ``access_admin``.
     ACCESS_ADMIN_CAP = "access.admin"
     #: Rotación del cifrado y LECTURA de la auditoría (``GET /audit-log``). Solo
     #: ``security_officer``: quien revisa el rastro no puede ser quien hace los cambios de acceso
@@ -271,6 +277,28 @@ def _spec(
 
 CAPABILITIES: tuple[CapabilitySpec, ...] = (
     _spec(Capability.SELF_READ, "Ver su propia identidad y capacidades", axis="global"),
+    # `tokens.own` sigue el precedente de `self.read`: la tienen los tres roles, así que nadie
+    # necesita que se la asignen, y es del eje global (no hay entorno ni servidor al que anclarla,
+    # por eso tampoco es otorgable suelta ni genera lectura implícita).
+    # Cada flag está FIJADO por un invariante, no elegido:
+    #  - `mutates=False`: está en `viewer` y el invariante 3 prohíbe que `viewer` mute. No es que
+    #    emitir un token no escriba: es que lo que la capacidad entrega es una DELEGACIÓN de lo
+    #    que el propio actor ya puede (el token ejerce la intersección con su emisor, nunca más,
+    #    y el techo de agente excluye todo lo que mute). El riesgo de escribir la fila lo cubre
+    #    el step-up que la ruta exige con la spec de `access.admin` (`authz.require_either`), no
+    #    esta spec: `requires_step_up=False` acá es deliberado, porque el catálogo solo admite
+    #    step-up en lo que divulga o muta.
+    #  - `discloses=False`: expone únicamente los tokens del propio actor (filtro en el servidor,
+    #    ver `ApiTokenController`) y jamás el secreto, que no se guarda. Si divulgara, el
+    #    invariante 4 exigiría step-up en el GET y el 7b la sacaría de `operator`/`viewer`.
+    #  - `agent=False`: un token no puede emitir otro token. Está fuera del techo de agente y
+    #    por eso `parse_scopes` la descarta aunque la fila la diga.
+    #  - no sensible: no está en `owner − operator`, así que no entra en `_SENSITIVE_POLICY`.
+    _spec(
+        Capability.TOKENS_OWN,
+        "Emitir y administrar sus propios tokens de agente",
+        axis="global",
+    ),
     # `servers` no tiene nivel intermedio A PROPÓSITO: `read` ya expone host, puerto y usuario
     # pseudo-root de todo el parque —o sea reconocimiento de la infraestructura del cliente— y
     # `admin` es la llave maestra, porque editar un servidor puede RE-APUNTAR un server_id a
@@ -501,6 +529,8 @@ _BY_ID: Mapping[Capability, CapabilitySpec] = MappingProxyType(
 _VIEWER: frozenset[Capability] = frozenset(
     {
         Capability.SELF_READ,
+        # Como `self.read`: la tienen los tres roles (por monotonía, viewer ⊆ operator ⊆ owner).
+        Capability.TOKENS_OWN,
         Capability.SERVERS_READ,
         Capability.ENGINE_USERS_READ,
         Capability.DATABASES_READ,

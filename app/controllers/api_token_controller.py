@@ -44,6 +44,86 @@ def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def owner_scope_of(actor) -> int | None:
+    """
+    A qué dueño se acota lo que ve y toca ``actor`` en ``/api-tokens``: ``None`` = todos los
+    tokens (``access.admin``); un id = solo los que ese usuario emitió (``tokens.own``).
+
+    ``tokens.own`` no es "administrar tokens": es administrar LOS PROPIOS. El dueño de un token es
+    ``created_by_admin_id`` (la única columna que dice quién lo emitió; sin FK, así que un token
+    cuyo emisor se borró queda visible solo para ``access.admin``). Fail-CLOSED: quien no tiene
+    ``access.admin`` queda acotado a su id, y sin id resoluble es 403, nunca "todos". La ruta
+    llama esto y pasa el resultado a cada método; los métodos lo reciben como parámetro y no lo
+    infieren del actor porque ``update_token`` ya lo invocan llamadores internos con un actor que
+    no es ``access.admin`` y SIN acotar.
+    """
+    from app.core.actor import identity_of
+
+    capability_check = getattr(actor, "has", None)
+    if callable(capability_check) and capability_check(Capability.ACCESS_ADMIN_CAP):
+        return None
+    actor_id, _ = identity_of(actor)
+    if actor_id is None:
+        raise AppHttpException(
+            message="No tienes permiso para esta operación.",
+            status_code=403,
+            public_context={"code": CODE_FORBIDDEN},
+        )
+    return actor_id
+
+
+def _is_visible_to(fila: ApiToken, owner_scope: int | None) -> bool:
+    """``True`` si la fila entra en el alcance del actor: sin acotar, todas; acotado, las suyas."""
+    return owner_scope is None or fila.created_by_admin_id == owner_scope
+
+
+def _audit_mode(owner_scope: int | None) -> str:
+    """``propio`` (``tokens.own``) o ``administrador`` (``access.admin``), para el rastro."""
+    return "administrador" if owner_scope is None else "propio"
+
+
+def _token_not_found() -> AppHttpException:
+    """
+    El 404 de un token que no existe **y** el de uno que existe pero es de otra persona: UNA sola
+    forma (mensaje, código y status idénticos). Si el ajeno respondiera 403 —o un mensaje
+    distinto—, quien solo tiene ``tokens.own`` podría enumerar qué ids de token existen.
+    """
+    return AppHttpException(
+        message="Token no encontrado.",
+        status_code=404,
+        public_context={"code": CODE_NOT_FOUND},
+    )
+
+
+def _require_scopes_within_issuer_ceiling(
+    actor, scopes: list[str], *, already_held: frozenset[Capability] = frozenset()
+) -> None:
+    """
+    Camino de autoservicio: cada scope NUEVO tiene que estar entre las capacidades del propio
+    emisor (las de hoy, capa 1).
+
+    El token ya ejerce la intersección con su emisor al autenticar (``token_actor``), así que un
+    scope que el emisor no tiene quedaría inerte. Eso alcanzaba mientras solo ``access.admin``
+    emitía; con ``tokens.own`` cualquier ``viewer`` podría dejar ``data.read`` escrito en una fila
+    y activarlo el día que alguien lo promueva a ``owner``. Rechazar al escribir mantiene la
+    regla de que los datos son solo de ``owner`` (y su kill switch y su TTL propio) sin depender
+    de que nadie cambie de rol. ``already_held`` son los scopes que el token YA traía: conservar
+    uno que el emisor perdió no es agregar nada. Mismo 403 genérico que el resto.
+    """
+    capability_check = getattr(actor, "has", None)
+    for raw in scopes:
+        capability = Capability(raw)
+        if capability in already_held:
+            continue
+        if callable(capability_check) and capability_check(capability):
+            continue
+        raise AppHttpException(
+            message="No puedes dar a un token una capacidad que tú no tienes.",
+            status_code=403,
+            public_context={"code": CODE_FORBIDDEN},
+        )
+
+
 def _project_not_found(project_id: int) -> AppHttpException:
     """
     422 y no 404: el recurso de la ruta es el token; el proyecto es un CAMPO inválido del
@@ -246,18 +326,32 @@ class ApiTokenController:
             "created_at": t.created_at,
         }
 
-    def list_tokens(self, *, limit: int, offset: int) -> tuple[list[dict], int]:
+    def list_tokens(
+        self, *, limit: int, offset: int, owner_scope: int | None = None
+    ) -> tuple[list[dict], int]:
+        """
+        ``owner_scope`` (ver ``owner_scope_of``) acota el listado a los tokens de ese usuario. El
+        filtro va ANTES del ``count`` para que ``total`` y la paginación no delaten cuántos
+        tokens ajenos existen.
+        """
         session = self._session()
         try:
-            q = session.query(ApiToken).order_by(ApiToken.created_at.desc(), ApiToken.id.desc())
+            q = session.query(ApiToken)
+            if owner_scope is not None:
+                q = q.filter(ApiToken.created_by_admin_id == owner_scope)
+            q = q.order_by(ApiToken.created_at.desc(), ApiToken.id.desc())
             total = q.count()
             return [self._serialize(t) for t in q.limit(limit).offset(offset).all()], total
         finally:
             session.close()
 
-    def create_token(self, data: dict, *, admin) -> dict:
+    def create_token(self, data: dict, *, admin, owner_scope: int | None = None) -> dict:
         """
         Emite un token y devuelve el bearer **una sola vez**.
+
+        ``owner_scope`` distinto de ``None`` es el camino de AUTOSERVICIO (``tokens.own`` sin
+        ``access.admin``): además de todo lo de abajo, los scopes tienen que estar dentro de lo que
+        el emisor puede hoy y el emisor tiene que poder ver el proyecto al que ata el token.
 
         Valida el TTL contra el tope y los scopes contra el **techo de agente**, no contra el
         catálogo completo: el techo ya excluye toda capacidad que mute o divulgue, así que un
@@ -295,6 +389,8 @@ class ApiTokenController:
         validos = _validate_scopes(
             data.get("scopes") or [Capability.BLUEPRINTS_READ.value], admin=admin
         )
+        if owner_scope is not None:
+            _require_scopes_within_issuer_ceiling(admin, validos)
         if _data_token_ttl_cap_is_active() and _has_data_scope(validos):
             if dias > MCP_DATA_TOKEN_MAX_TTL_DAYS:
                 raise _ttl_too_long_for_data(dias)
@@ -303,7 +399,14 @@ class ApiTokenController:
         admin_id, _ = identity_of(admin)
         session = self._session()
         try:
-            if session.get(Project, int(project_id)) is None:
+            # El proyecto no tiene ACL por usuario: ``GET /projects/{id}`` lo ve cualquiera con
+            # ``blueprints.read``. Ese es el "puede acceder" que se exige en autoservicio, y la
+            # falla es el MISMO 422 de un proyecto inexistente (no confirma que exista).
+            issuer_can_see_projects = callable(getattr(admin, "has", None)) and admin.has(
+                Capability.BLUEPRINTS_READ
+            )
+            project_is_unreachable = owner_scope is not None and not issuer_can_see_projects
+            if project_is_unreachable or session.get(Project, int(project_id)) is None:
                 raise _project_not_found(int(project_id))
             fila = ApiToken(
                 token_id=token_id,
@@ -338,16 +441,20 @@ class ApiTokenController:
             touched_engine=False,
             detail=(
                 f"token={token_id} nombre='{data['name']}' proyecto={project_id} "
-                f"scopes=[{','.join(validos)}] ttl={dias}d"
+                f"scopes=[{','.join(validos)}] ttl={dias}d "
+                f"emisor={admin_id} modo={_audit_mode(owner_scope)}"
             ),
         )
         # El bearer viaja SOLO acá. `_serialize` no lo tiene, así que ningún listado posterior
         # puede devolverlo ni por accidente.
         return {**salida, "token": bearer}
 
-    def revoke_token(self, token_pk: int, *, admin) -> dict:
+    def revoke_token(self, token_pk: int, *, admin, owner_scope: int | None = None) -> dict:
         """
-        Revoca. Idempotente en el efecto y **409 si ya estaba revocado**, para que quien lo pide
+        Revoca. Con ``owner_scope``, un token de otra persona responde el MISMO 404 que uno
+        inexistente (``_token_not_found``), ANTES de cualquier otro estado (el 409 de "ya
+        revocado" confirmaría que existe).
+ Idempotente en el efecto y **409 si ya estaba revocado**, para que quien lo pide
         sepa que no fue su acción la que cortó el acceso.
 
         No hay "reactivar": ``revoked_at`` no se deshace. Un ciclo revocar/reactivar dejaría un
@@ -356,12 +463,8 @@ class ApiTokenController:
         session = self._session()
         try:
             fila = session.get(ApiToken, token_pk)
-            if fila is None:
-                raise AppHttpException(
-                    message="Token no encontrado.",
-                    status_code=404,
-                    public_context={"code": CODE_NOT_FOUND},
-                )
+            if fila is None or not _is_visible_to(fila, owner_scope):
+                raise _token_not_found()
             if fila.revoked_at is not None:
                 raise AppHttpException(
                     message="Este token ya estaba revocado.",
@@ -369,6 +472,7 @@ class ApiTokenController:
                     public_context={"code": CODE_ALREADY_REVOKED},
                 )
             fila.revoked_at = _utcnow()
+            token_owner_id = fila.created_by_admin_id
             session.commit()
             session.refresh(fila)
             salida = self._serialize(fila)
@@ -381,11 +485,16 @@ class ApiTokenController:
             target_type="api_token",
             target_id=token_pk,
             touched_engine=False,
-            detail=f"token={salida['token_id']} nombre='{salida['name']}'",
+            detail=(
+                f"token={salida['token_id']} nombre='{salida['name']}' "
+                f"emisor={token_owner_id} modo={_audit_mode(owner_scope)}"
+            ),
         )
         return salida
 
-    def update_token(self, token_pk: int, data: dict, *, admin) -> dict:
+    def update_token(
+        self, token_pk: int, data: dict, *, admin, owner_scope: int | None = None
+    ) -> dict:
         """
         Reemplaza los ``scopes`` de un token existente. **Solo los scopes**.
 
@@ -398,18 +507,19 @@ class ApiTokenController:
         impresión de haberlo tocado (mismo código que ``revoke_token``). Uno vencido sí se puede
         editar: es inofensivo y no justifica un código nuevo.
 
-        La auditoría registra scopes antes→después y nada más: ni secreto ni HMAC.
+        Con ``owner_scope`` (autoservicio) un token ajeno responde el MISMO 404 que uno inexistente,
+        antes del 409, y los scopes que se AGREGAN tienen que estar dentro de lo que el editor
+        puede hoy (``_require_scopes_within_issuer_ceiling``).
+
+        La auditoría registra scopes antes→después, quién lo editó y de quién es el token; ni
+        secreto ni HMAC.
         """
         validos = sorted(set(_validate_scopes(data["scopes"], admin=admin)))
         session = self._session()
         try:
             fila = session.get(ApiToken, token_pk)
-            if fila is None:
-                raise AppHttpException(
-                    message="Token no encontrado.",
-                    status_code=404,
-                    public_context={"code": CODE_NOT_FOUND},
-                )
+            if fila is None or not _is_visible_to(fila, owner_scope):
+                raise _token_not_found()
             if fila.revoked_at is not None:
                 raise AppHttpException(
                     message="Este token está revocado: no se puede editar.",
@@ -431,6 +541,12 @@ class ApiTokenController:
                 ),
                 key=lambda capability: capability.value,
             )
+            if owner_scope is not None:
+                _require_scopes_within_issuer_ceiling(
+                    admin,
+                    validos,
+                    already_held=frozenset(Capability(v) for v in antes),
+                )
             _require_editor_may_add_data_scopes(admin, fila, data_scopes_added)
             if _data_token_ttl_cap_is_active() and _has_data_scope(validos):
                 latest_allowed_expiry = _utcnow() + timedelta(days=MCP_DATA_TOKEN_MAX_TTL_DAYS)
@@ -440,6 +556,7 @@ class ApiTokenController:
                     # el tope).
                     raise _ttl_too_long_for_data(0)
             fila.scopes = ",".join(validos)
+            token_owner_id = fila.created_by_admin_id
             session.commit()
             session.refresh(fila)
             salida = self._serialize(fila)
@@ -454,7 +571,8 @@ class ApiTokenController:
             touched_engine=False,
             detail=(
                 f"token={salida['token_id']} nombre='{salida['name']}' "
-                f"scopes=[{','.join(antes)}]->[{','.join(validos)}]"
+                f"scopes=[{','.join(antes)}]->[{','.join(validos)}] "
+                f"emisor={token_owner_id} modo={_audit_mode(owner_scope)}"
             ),
         )
         return salida
