@@ -1,4 +1,4 @@
-# TODO — Database Gateway Project
+# TODO — Datum
 
 > **Backlog y bitácora del proyecto.** Este archivo es la fuente de verdad del detalle de cada
 > ítem: qué falta, por qué, y con qué quedó verificado lo ya entregado.

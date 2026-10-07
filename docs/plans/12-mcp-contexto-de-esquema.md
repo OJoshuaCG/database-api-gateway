@@ -1189,8 +1189,8 @@ argumento a favor del diseño, no solo de granularidad.
 
 ### 7.5 Ciclo de vida del token
 
-- **Formato `dbgw.<token_id>.<secreto>`**, con **punto** como separador y no `_`: el alfabeto de
-  `secrets.token_urlsafe` **incluye `_`**, así que `dbgw_<id>_<secreto>` es imparseable con
+- **Formato `datum.<token_id>.<secreto>`** (legacy `dbgw.` sigue aceptado), con **punto** como separador y no `_`: el alfabeto de
+  `secrets.token_urlsafe` **incluye `_`**, así que `datum_<id>_<secreto>` es imparseable con
   `split("_")` y produce un 401 intermitente e irreproducible. `token_id` de **24 chars** URL-safe
   **indexado** (el §8 declara `String(24)`; el número tiene que ser el mismo en los dos lados);
   `secreto` = `secrets.token_urlsafe(32)` (256 bits). Verificación = un lookup por `token_id` +
@@ -1200,7 +1200,7 @@ argumento a favor del diseño, no solo de granularidad.
   la vez lento y un vector de DoS de CPU con bearers basura. Argon2 estira entropía baja; un
   secreto de 256 bits no la tiene. Un `token_id` inexistente igual paga un HMAC contra una
   constante, para no filtrar existencia por tiempo.
-  Bonus: el prefijo `dbgw.` hace el secreto **matcheable por escáneres** de secretos.
+  Bonus: el prefijo `datum.` (y el legado `dbgw.`, que sigue aceptado) hace el secreto **matcheable por escáneres** de secretos.
 - **La clave del HMAC es un pepper derivado con HKDF-SHA256 de `SECRET_KEY`**, con la terna
   COMPLETA especificada —`length=32`, `salt=CRYPTO_KEY_SALT`, `info=b"api_token_hmac/v1"`— con el
   mismo criterio que `_derive_fernet_key` (`app/core/crypto.py:34-57`): sin la terna escrita, dos

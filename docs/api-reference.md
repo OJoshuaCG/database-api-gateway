@@ -1,6 +1,6 @@
-# API Reference — Database API Gateway
+# API Reference — Datum
 
-> Referencia completa para integrar el **Database API Gateway** en tu desarrollo.
+> Referencia completa para integrar **Datum** en tu desarrollo.
 > Documenta cada endpoint, sus parámetros, tipos y valores permitidos, ejemplos de
 > uso (`curl` + JSON) y el orden en que deben consumirse para cumplir cada propósito.
 >
@@ -79,7 +79,7 @@
 
 ## 1. ¿Qué es y qué problema resuelve?
 
-El **Database API Gateway** es un controlador central que permite a un administrador
+**Datum** es un controlador central que permite a un administrador
 gestionar **múltiples servidores remotos de bases de datos** (MySQL, MariaDB,
 PostgreSQL) a través de una única API HTTP, **sin exponer nunca las credenciales
 pseudo-root** de esos servidores.
@@ -99,7 +99,7 @@ Resuelve tres problemas:
 
 ```
                 ┌────────────────────────────────────┐
-  Admin  ─────▶ │   Database API Gateway              │
+  Admin  ─────▶ │   Datum                             │
  (cookie)       │   FastAPI + BD de metadatos (cifr.) │
                 └──────────────────┬─────────────────┘
                                    │  pseudo-root cifrada (Fernet)

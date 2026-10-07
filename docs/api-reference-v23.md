@@ -378,7 +378,7 @@ cambia ningún resultado, y no toca la BD para decidirlo.
 
 ### 9.1 `/api-tokens` — detrás de `access.admin` (antes de v29, `gateway.admin`)
 
-`POST` devuelve el bearer **una sola vez** (`dbgw.<id>.<secreto>`). Lo que persiste es su HMAC, así
+`POST` devuelve el bearer **una sola vez** (`datum.<id>.<secreto>`; el formato legado `dbgw.<id>.<secreto>` sigue aceptado). Lo que persiste es su HMAC, así
 que **no hay forma de volver a mostrarlo**: si se pierde, se emite otro.
 
 | Regla | Por qué |

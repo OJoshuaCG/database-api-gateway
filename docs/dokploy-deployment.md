@@ -413,7 +413,7 @@ curl -si -X POST https://gateway.tudominio.com/mcp \
 
 # Con token: lista las herramientas disponibles
 curl -s -X POST https://gateway.tudominio.com/mcp \
-     -H "Authorization: Bearer dbgw.<id>.<secreto>" \
+     -H "Authorization: Bearer datum.<id>.<secreto>" \
      -H 'Content-Type: application/json' \
      -H 'MCP-Protocol-Version: 2026-07-28' \
      -H 'Mcp-Method: tools/list' \

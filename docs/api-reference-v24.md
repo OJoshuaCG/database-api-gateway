@@ -393,7 +393,7 @@ Todo detrás de `access.admin` (antes de v29, `gateway.admin`). El `POST` tiene 
     "note": "Pipeline de nightly",
     "active": true,                            // revoked_at nulo Y expires_at futuro
     "created_at": "2026-09-09T12:00:00Z",
-    "token": "dbgw.k3f9qm2x.<secreto>"         // SOLO en el POST, una sola vez
+    "token": "datum.k3f9qm2x.<secreto>"        // SOLO en el POST, una sola vez
   },
   "message": "Token emitido. Copialo ahora: no se vuelve a mostrar."
 }
@@ -401,7 +401,7 @@ Todo detrás de `access.admin` (antes de v29, `gateway.admin`). El `POST` tiene 
 
 **`id` y `token_id` no son lo mismo y confundirlos rompe el `DELETE`.** `id` es la PK numérica y es
 lo que va en `DELETE /api-tokens/{token_pk}`. `token_id` es la parte pública del bearer
-(`dbgw.<token_id>.<secreto>`) y es lo que aparece en el rastro de auditoría: sirve para cruzar una
+(`datum.<token_id>.<secreto>`; legacy `dbgw.` sigue aceptado) y es lo que aparece en el rastro de auditoría: sirve para cruzar una
 fila `mcp.*` con el token que la originó, no para direccionar el recurso.
 
 **`scopes` de la respuesta son los scopes EFECTIVOS, no el eco del request.** El servidor

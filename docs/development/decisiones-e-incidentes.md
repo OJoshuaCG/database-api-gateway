@@ -2487,3 +2487,19 @@ está encendida (para poder apagarla).
 
 **Por qué no más.** No se intentó distinguir "no existe" de "no la veo" con una consulta extra: sin el
 privilegio la cuenta no puede probarlo, y afirmar certeza sería peor que avisar la duda.
+
+### Tokens de agente: prefijo `datum.` al emitir, `dbgw.` legado aceptado
+
+**Decisión.** Con el cambio de nombre del producto, los tokens nuevos se emiten como
+`datum.<token_id>.<secreto>`, pero el parseo acepta también `dbgw.<token_id>.<secreto>`
+(`ACCEPTED_TOKEN_PREFIXES` en `app/core/mcp_token_format.py`, compartido por `mcp_auth` y el
+`key_func` del limitador).
+
+**Por qué dos prefijos.** Los agentes ya configurados (`.mcp.json`, secretos de CI) llevan el
+bearer legado; rechazarlo obligaría a reemitir y redistribuir todos los tokens a la vez. El prefijo
+no entra en el HMAC (se calcula solo sobre el secreto) ni en la búsqueda (índice por `token_id`),
+así que no hay migración de filas: los tokens emitidos antes siguen valiendo hasta su `expires_at`.
+
+**Consecuencia operativa.** Los escáneres de secretos y las reglas de detección tienen que cubrir
+**los dos** prefijos mientras exista algún token legado vivo. Quitar `dbgw` de la tupla es el
+retiro del formato legado y rompe a todo agente que no haya rotado.
