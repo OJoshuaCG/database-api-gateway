@@ -104,10 +104,11 @@ class GlobalCapability(StrEnum):
 
     ``SECURITY_OFFICER`` escribe **datos de política**: los flags de ``Environment``, los
     catálogos que deciden qué llega al motor, el host y la credencial de un ``Server``, y la
-    rotación del cifrado, y **lee la auditoría** (las dos, ``policy.admin``). **No** administra usuarios: eso es
-    ``access.admin``, y los conjuntos de las dos globales son disjuntos (invariante 9). Regla general que lo justifica: **toda fila que un guard lee es una frontera de
-    privilegio**, así que su escritor necesita al menos el privilegio del guard que puede
-    apagar.
+    rotación del cifrado (``crypto.rotate``), y **lee la auditoría** (``audit.read``). **No**
+    administra usuarios: eso es ``access.admin``, y los conjuntos de las dos globales son
+    disjuntos (invariante 9). Regla general que lo justifica: **toda fila que un guard lee es una
+    frontera de privilegio**, así que su escritor necesita al menos el privilegio del guard que
+    puede apagar.
     """
 
     ACCESS_ADMIN = "access_admin"
@@ -148,6 +149,10 @@ class Capability(StrEnum):
     ENGINE_USERS_DROP = "engine_users.drop"
     ENGINE_USERS_SECRETS = "engine_users.secrets"
     ENGINE_USERS_CREDENTIALS = "engine_users.credentials"
+    #: Delegar privilegios del motor: WITH GRANT OPTION, privilegios sensibles (los del set GATE de
+    #: ``db_admin.privileges``) y entregar el control de una base al reasignar su dueño con
+    #: ``provision``. Se exige ADEMÁS de ``engine_users.write``. Solo ``owner``.
+    ENGINE_USERS_GRANT_ADMIN = "engine_users.grant_admin"
 
     # -- Bases de datos ----------------------------------------------------- #
     DATABASES_READ = "databases.read"
@@ -159,6 +164,13 @@ class Capability(StrEnum):
     BLUEPRINTS_WRITE = "blueprints.write"
     BLUEPRINTS_APPLY = "blueprints.apply"
     BLUEPRINTS_CAPTURES = "blueprints.captures"
+
+    # -- CÓDIGO de los objetos de esquema ----------------------------------- #
+    #: El CUERPO de vistas, vistas materializadas, rutinas, triggers y eventos en el snapshot de una
+    #: base y en las comparaciones de esquema. La ESTRUCTURA (tablas, columnas, índices) sigue en
+    #: ``databases.read`` / ``schema_diff.read``. La heredan ``operator`` y ``owner``, NO ``viewer``.
+    #: Es la contraparte de la SPA del scope ``data.definitions`` del MCP (que no cambia).
+    SCHEMA_DEFINITIONS = "schema.definitions"
 
     # -- Comparación de esquemas -------------------------------------------- #
     SCHEMA_DIFF_READ = "schema_diff.read"
@@ -198,8 +210,8 @@ class Capability(StrEnum):
     DATA_QUERY = "data.query"
     #: Definiciones de objetos de esquema (vistas, triggers, eventos, rutinas): el CUERPO de
     #: un objeto puede contener literales y reglas de negocio del tercero, así que divulga
-    #: aunque no lea filas. Hoy no habilita ninguna tool ni ruta: es solo el scope y su
-    #: kill switch.
+    #: aunque no lea filas. Habilita la tool ``get_definition`` del MCP (scope y kill switch
+    #: ``MCP_SCHEMA_DEFINITIONS_ENABLED``). El equivalente de la SPA es ``schema.definitions``.
     DATA_DEFINITIONS = "data.definitions"
 
     # -- Administración del acceso y de la política del gateway -------------- #
@@ -211,10 +223,14 @@ class Capability(StrEnum):
     #: propios de cada persona los cubre ``tokens.own``) y el reporte de preparación de alcances.
     #: Solo ``access_admin``.
     ACCESS_ADMIN_CAP = "access.admin"
-    #: Rotación del cifrado y LECTURA de la auditoría (``GET /audit-log``). Solo
-    #: ``security_officer``: quien revisa el rastro no puede ser quien hace los cambios de acceso
-    #: que el rastro registra (``access_admin``).
-    POLICY_ADMIN = "policy.admin"
+    #: LECTURA de la auditoría (``GET /audit-log``). Solo ``security_officer``: quien revisa el
+    #: rastro no puede ser quien hace los cambios de acceso que el rastro registra
+    #: (``access_admin``). Es el REVISOR; ``crypto.rotate`` es el ACTOR. Antes eran una sola
+    #: capacidad (``policy.admin``, retirada): quien rota las claves y quien revisa el rastro de
+    #: esa rotación son dos deberes distintos aunque hoy los reúna la misma función.
+    AUDIT_READ = "audit.read"
+    #: Rotación del cifrado (``POST /admin/crypto/rotate``). Solo ``security_officer``.
+    CRYPTO_ROTATE = "crypto.rotate"
 
 
 ScopeAxis = Literal["global", "environment", "server"]
@@ -355,6 +371,21 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         step_up=True,
         axis="server",
     ),
+    # `grant_admin`: DELEGAR privilegios del motor. `write` conserva el GRANT de rutina; esta suma lo
+    # que convierte a la cuenta beneficiaria en un punto de escalada: WITH GRANT OPTION (el
+    # beneficiario puede re-otorgar lo suyo a terceros, fuera del gateway y de su auditoría), los
+    # privilegios sensibles del set GATE y la entrega del control de una base al reasignar el dueño
+    # con `provision`. La exige la RUTA según el payload (``assert_at_with_code``), no el guard.
+    # Flags: `mutates` (cambia privilegios del motor); `discloses=False` (otorga, no lee datos);
+    # `step_up` (abre acceso a terceros); no destructiva (no borra nada); sensible por ser
+    # `owner − operator` y otorgable (eje `server`, como el resto de `engine_users.*`).
+    _spec(
+        Capability.ENGINE_USERS_GRANT_ADMIN,
+        "Otorgar con WITH GRANT OPTION, privilegios sensibles y entregar el control al reasignar dueño",
+        mutates=True,
+        step_up=True,
+        axis="server",
+    ),
     _spec(Capability.DATABASES_READ, "Ver bases y su estructura", agent=True),
     _spec(Capability.DATABASES_WRITE, "Crear y editar bases gestionadas", mutates=True),
     _spec(
@@ -384,6 +415,19 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         "Leer los resultados de SELECT capturados en una migración",
         discloses=True,
         step_up=True,
+    ),
+    # `schema.definitions`: el CÓDIGO de vistas, rutinas, triggers y eventos. Divulga (un cuerpo es
+    # texto de un tercero con reglas de negocio y a veces secretos) y aun así `discloses=False`: no es
+    # una omisión sino lo que FIJAN los invariantes dado el reparto pedido. La heredan `operator` y
+    # `owner`, y el 7b prohíbe que `operator` tenga una capacidad que divulga; marcarla
+    # `discloses=True` obligaría a sacarla de `operator` (y el 4 a exigirle step-up en cada GET).
+    # Por lo mismo no es sensible (está en `operator`, no en `owner − operator`): otorgarla suelta
+    # no pide segundo aprobador. El filtro real es de las rutas: sin ella, esos objetos salen con
+    # `redacted=true` y sin cuerpo. Eje por entorno (como `databases.read`), otorgable suelta sobre
+    # un entorno o servidor. Fuera del techo de agente: el scope del MCP es `data.definitions`.
+    _spec(
+        Capability.SCHEMA_DEFINITIONS,
+        "Ver el código de vistas, rutinas, triggers y eventos de una base",
     ),
     _spec(Capability.SCHEMA_DIFF_READ, "Comparar esquemas y ver el diff", agent=True),
     _spec(
@@ -482,9 +526,19 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         step_up=True,
         axis="global",
     ),
+    # `audit.read` NO divulga ni pide step-up, igual que lo hacía `policy.admin` en sus GET: el
+    # ``detail`` de las acciones ``query_console.*`` (el único que lleva literales de negocio del
+    # tercero) sale enmascarado para quien no tiene ``sql_console.execute``
+    # (``AuditLogController``), que es siempre el caso de ``security_officer``. Si divulgara, el
+    # invariante 4 exigiría step-up en cada GET de la pantalla de auditoría.
     _spec(
-        Capability.POLICY_ADMIN,
-        "Administrar la política del gateway: rotación del cifrado y lectura de la auditoría",
+        Capability.AUDIT_READ,
+        "Leer la auditoría del gateway",
+        axis="global",
+    ),
+    _spec(
+        Capability.CRYPTO_ROTATE,
+        "Rotar la clave de cifrado de las credenciales almacenadas",
         mutates=True,
         step_up=True,
         axis="global",
@@ -545,10 +599,14 @@ _VIEWER: frozenset[Capability] = frozenset(
     }
 )
 
-# `operator` acumula sobre `viewer` la escritura NO destructiva y NO divulgante. No incluye
+# `operator` acumula sobre `viewer` la escritura NO destructiva y NO divulgante, más el código de
+# los objetos de esquema (`schema.definitions`). No incluye
 # `*.drop`, `blueprints.apply`, `sql_console.execute`, `collation.execute` ni ninguna capacidad
-# que divulgue. Lo que se le niega por rol se le puede otorgar suelto (``capability_grants``).
+# marcada como que divulga. Lo que se le niega por rol se le puede otorgar suelto (``capability_grants``).
 _OPERATOR: frozenset[Capability] = _VIEWER | {
+    # El código de los objetos de esquema: `viewer` ve la estructura, no los cuerpos (restricción
+    # INTENCIONAL de la partición; ver el spec de la capacidad).
+    Capability.SCHEMA_DEFINITIONS,
     Capability.ENGINE_USERS_WRITE,
     Capability.DATABASES_WRITE,
     Capability.BLUEPRINTS_WRITE,
@@ -556,7 +614,7 @@ _OPERATOR: frozenset[Capability] = _VIEWER | {
 }
 
 # `owner` es todo lo OPERATIVO del alcance. NO incluye `servers.admin`, `catalogs.write`,
-# `access.admin` ni `policy.admin`: son datos de política, la llave del inventario o la
+# `access.admin`, `audit.read` ni `crypto.rotate`: son datos de política, la llave del inventario o la
 # administración del acceso, y van en
 # `security_officer` / `access_admin`. Que el rol operativo pudiera apagar la barrera de
 # producción es exactamente el agujero que la separación existe para cerrar.
@@ -570,6 +628,9 @@ _OWNER: frozenset[Capability] = _OPERATOR | {
     Capability.ENGINE_USERS_DROP,
     Capability.ENGINE_USERS_SECRETS,
     Capability.ENGINE_USERS_CREDENTIALS,
+    # Solo owner: delegar privilegios (WITH GRANT OPTION, sensibles) no es trabajo diario de
+    # ``operator``. Es la restricción INTENCIONAL de la partición: operator pierde esos grants.
+    Capability.ENGINE_USERS_GRANT_ADMIN,
     Capability.DATABASES_DROP,
     Capability.BLUEPRINTS_APPLY,
     Capability.BLUEPRINTS_CAPTURES,
@@ -597,7 +658,8 @@ GLOBAL_CAPABILITIES: Mapping[GlobalCapability, frozenset[Capability]] = MappingP
         GlobalCapability.ACCESS_ADMIN: frozenset({Capability.ACCESS_ADMIN_CAP}),
         GlobalCapability.SECURITY_OFFICER: frozenset(
             {
-                Capability.POLICY_ADMIN,
+                Capability.AUDIT_READ,
+                Capability.CRYPTO_ROTATE,
                 Capability.SERVERS_ADMIN,
                 Capability.CATALOGS_WRITE,
                 Capability.ENVIRONMENTS_WRITE,
@@ -737,7 +799,7 @@ def is_grantable(capability: Capability | str) -> bool:
     ¿Se puede otorgar SUELTA, sobre un entorno o servidor? Todo salvo el eje global.
 
     Las globales (``environments.write``, ``catalogs.write``, ``servers.admin``,
-    ``access.admin``, ``policy.admin``, ``self.read``, lecturas de política) no tienen un destino al que
+    ``access.admin``, ``audit.read``, ``crypto.rotate``, ``self.read``, lecturas de política) no tienen un destino al que
     anclarse, y otorgarlas por separado saltearía la separación de deberes. Una capacidad
     DESCONOCIDA no es otorgable: el lector falla cerrado.
     """
@@ -756,9 +818,9 @@ def is_sensitive(capability: Capability | str) -> bool:
     Antes eran las que divulgan o son de nivel ``drop`` (8). Al retirar el techo por tenencia
     (C3), ``blueprints.apply``, ``schema_diff.execute`` y ``collation.execute`` —destructivas y
     solo de ``owner``— quedaban otorgables por UN solo administrador, porque lo único que las
-    frenaba era que quien otorga tuviera ``owner``. El invariante 8 fija el conjunto (14: las 11 de siempre más ``data.read``, ``data.query`` y
-    ``data.definitions``) y
-    exige que siga conteniendo todo lo que divulga o es ``drop``.
+    frenaba era que quien otorga tuviera ``owner``. El invariante 8 fija el conjunto (15: las 11
+    de siempre más ``data.read``, ``data.query``, ``data.definitions`` y
+    ``engine_users.grant_admin``) y exige que siga conteniendo todo lo que divulga o es ``drop``.
     """
     try:
         cap = Capability(capability)
@@ -1006,6 +1068,7 @@ _SENSITIVE_POLICY: frozenset[str] = frozenset(
     {
         "engine_users.secrets",
         "engine_users.credentials",
+        "engine_users.grant_admin",
         "blueprints.captures",
         "clones.execute",
         "exports.download",
@@ -1026,8 +1089,11 @@ _SENSITIVE_POLICY: frozenset[str] = frozenset(
 
 
 #: Ids que existieron y NO pueden volver (invariante 12). ``scripts/check_route_capabilities.py``
-#: verifica además que ninguna ruta los declare.
-RETIRED_CAPABILITIES: frozenset[str] = frozenset({"gateway.admin"})
+#: verifica además que ninguna ruta los declare. ``policy.admin`` se retiró al partirse en
+#: ``audit.read`` + ``crypto.rotate``: es global (no otorgable), así que no pudo haber filas en
+#: ``capability_grants``; una fila legada en ``api_tokens.scopes`` o un grant a mano lo descartan
+#: los lectores igual que a ``gateway.admin`` (desconocido ⇒ ignorado).
+RETIRED_CAPABILITIES: frozenset[str] = frozenset({"gateway.admin", "policy.admin"})
 
 
 def _assert_invariants() -> None:
@@ -1103,7 +1169,7 @@ def _assert_invariants() -> None:
             if s.id in ROLE_CAPABILITIES[role]:
                 raise AssertionError(f"{s.id.value} es destructive y está en '{role.value}'.")
 
-    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 14 (owner
+    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 15 (owner
     #    menos operator, otorgables): si el catálogo crece, esto obliga a decidirlo a propósito.
     #    Y el criterio viejo (divulga o es `drop`) sigue contenido: ninguna otorgable que divulgue
     #    o borre puede quedar sin segundo aprobador.
@@ -1167,7 +1233,7 @@ def _assert_invariants() -> None:
     ):
         raise AssertionError("'access_admin' tiene que ser exactamente {access.admin}.")
 
-    # 12. `gateway.admin` está RETIRADA. Reintroducirla, aunque sea con otro significado,
+    # 12. `gateway.admin` y `policy.admin` están RETIRADAS. Reintroducirlas, aunque sea con otro significado,
     #     reabre la confusión de quién administra qué y le devuelve sentido a filas viejas de
     #     `api_tokens.scopes`/`capability_grants` que hoy los lectores descartan.
     retiradas = {c.value for c in Capability} & RETIRED_CAPABILITIES

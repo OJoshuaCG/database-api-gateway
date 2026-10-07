@@ -133,8 +133,19 @@ AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
 #: ``data.query`` lo consume ``run_select`` (tool del MCP, scope por tool) y ninguna ruta HTTP:
 #: ``data.read`` sí tiene ruta (el opt-in por base), pero el SQL libre de un agente no.
 #: ``data.definitions`` es solo scope de tool del MCP (sin ruta HTTP).
+#: ``engine_users.grant_admin`` la exige el PAYLOAD de rutas que ya declaran ``engine_users.write``
+#: o ``databases.write`` (``assert_at_with_code`` en el grant y en el reassign-owner con provision):
+#: ninguna ruta la declara como piso.
+#: ``schema.definitions`` no es el guard de ninguna ruta: el snapshot y las comparaciones se guardan
+#: con ``databases.read`` / ``schema_diff.read`` y la capacidad decide si la respuesta lleva el CÓDIGO
+#: de los objetos (``definition_visibility``) o lo trae redactado.
 NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset(
-    {Capability.DATA_QUERY, Capability.DATA_DEFINITIONS}
+    {
+        Capability.DATA_QUERY,
+        Capability.DATA_DEFINITIONS,
+        Capability.ENGINE_USERS_GRANT_ADMIN,
+        Capability.SCHEMA_DEFINITIONS,
+    }
 )
 
 #: Cuántas rutas declaran capacidad. **Solo puede SUBIR.** Ver "EL TRINQUETE".
@@ -478,7 +489,7 @@ def main() -> int:
                 if cap in RETIRED_CAPABILITIES:
                     errores.append(
                         f"{method} {path} declara '{cap}', que está RETIRADA: "
-                        "usá access.admin (accesos) o policy.admin (política)."
+                        "usá access.admin (accesos), audit.read (auditoría) o crypto.rotate (cifrado)."
                     )
                 continue
 

@@ -136,7 +136,7 @@ def test_the_scope_is_sensitive_and_needs_a_second_approver():
     assert cc.is_sensitive(SCOPE)
     assert cc.needs_second_approver(capability=SCOPE)
     assert "data.definitions" in cc._SENSITIVE_POLICY
-    assert len(cc._SENSITIVE_POLICY) == 14
+    assert len(cc._SENSITIVE_POLICY) == 15
 
 
 def test_issuing_a_token_with_the_scope_needs_a_fresh_step_up(monkeypatch):

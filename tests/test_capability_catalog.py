@@ -215,7 +215,8 @@ def test_access_admin_is_not_operational():
 
 
 # --------------------------------------------------------------------------- #
-# Separación de deberes: `gateway.admin` partida en `access.admin` + `policy.admin`  #
+# Separación de deberes: `gateway.admin` -> `access.admin` + `policy.admin` ->     #
+# `audit.read` + `crypto.rotate`                                                      #
 # --------------------------------------------------------------------------- #
 
 
@@ -229,7 +230,8 @@ def test_the_global_sets_are_pinned():
     )
     assert GLOBAL_CAPABILITIES[GlobalCapability.SECURITY_OFFICER] == frozenset(
         {
-            Capability.POLICY_ADMIN,
+            Capability.AUDIT_READ,
+            Capability.CRYPTO_ROTATE,
             Capability.SERVERS_ADMIN,
             Capability.CATALOGS_WRITE,
             Capability.ENVIRONMENTS_WRITE,
@@ -248,7 +250,7 @@ def test_global_sets_are_pairwise_disjoint():
         vistas |= caps
 
 
-@pytest.mark.parametrize("cap", [Capability.ACCESS_ADMIN_CAP, Capability.POLICY_ADMIN])
+@pytest.mark.parametrize("cap", [Capability.ACCESS_ADMIN_CAP, Capability.CRYPTO_ROTATE])
 def test_the_split_capabilities_are_global_mutating_step_up_and_never_agent(cap):
     s = cc.spec(cap)
     assert (s.mutates, s.requires_step_up, s.scope_axis) == (True, True, "global")
@@ -257,17 +259,19 @@ def test_the_split_capabilities_are_global_mutating_step_up_and_never_agent(cap)
     assert cap not in AGENT_ALLOWED
 
 
-def test_gateway_admin_is_retired():
+@pytest.mark.parametrize("retired", ["gateway.admin", "policy.admin"])
+def test_retired_capabilities_are_gone(retired):
     """
-    Invariante 12. ``gateway.admin`` no existe en el enum, no se parsea de ningún lado y está en
-    la lista de retiradas que también lee ``scripts/check_route_capabilities.py``.
+    Invariante 12. Una capacidad retirada no existe en el enum, no se parsea de ningún lado y
+    está en la lista que también lee ``scripts/check_route_capabilities.py``. ``policy.admin``
+    se retiró al partirse en ``audit.read`` + ``crypto.rotate``, igual que ``gateway.admin``.
     """
-    assert "gateway.admin" not in {c.value for c in Capability}
-    assert "gateway.admin" in cc.RETIRED_CAPABILITIES
-    assert not cc.is_grantable("gateway.admin")
-    assert cc.parse_scopes("gateway.admin") == frozenset()
+    assert retired not in {c.value for c in Capability}
+    assert retired in cc.RETIRED_CAPABILITIES
+    assert not cc.is_grantable(retired)
+    assert cc.parse_scopes(retired) == frozenset()
     with pytest.raises(ValueError):
-        Capability("gateway.admin")
+        Capability(retired)
 
 
 def test_a_security_officer_viewer_does_not_administer_access():
@@ -278,7 +282,8 @@ def test_a_security_officer_viewer_does_not_administer_access():
         role=GatewayRole.VIEWER,
         globals_=frozenset({GlobalCapability.SECURITY_OFFICER}),
     )
-    assert actor.has(Capability.POLICY_ADMIN)
+    assert actor.has(Capability.AUDIT_READ)
+    assert actor.has(Capability.CRYPTO_ROTATE)
     assert not actor.has(Capability.ACCESS_ADMIN_CAP)
 
 
@@ -290,7 +295,8 @@ def test_an_access_admin_viewer_does_not_rotate_crypto():
         globals_=frozenset({GlobalCapability.ACCESS_ADMIN}),
     )
     assert actor.has(Capability.ACCESS_ADMIN_CAP)
-    assert not actor.has(Capability.POLICY_ADMIN)
+    assert not actor.has(Capability.CRYPTO_ROTATE)
+    assert not actor.has(Capability.AUDIT_READ)
     assert actor.capabilities == (
         ROLE_CAPABILITIES[GatewayRole.VIEWER] | {Capability.ACCESS_ADMIN_CAP}
     )
@@ -344,7 +350,8 @@ def test_environments_write_belongs_only_to_security_officer():
         assert Capability.ENVIRONMENTS_WRITE not in caps
         assert Capability.ENVIRONMENTS_READ in caps
     assert "entornos" not in cc.spec(Capability.ACCESS_ADMIN_CAP).label
-    assert "entornos" not in cc.spec(Capability.POLICY_ADMIN).label
+    assert "entornos" not in cc.spec(Capability.CRYPTO_ROTATE).label
+    assert "entornos" not in cc.spec(Capability.AUDIT_READ).label
 
 
 # --------------------------------------------------------------------------- #

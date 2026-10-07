@@ -424,6 +424,11 @@ EngineUsersDrop = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_DROP)
 EngineUsersSecrets = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_SECRETS))]
 EngineUsersCredentials = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_CREDENTIALS))]
 
+#: Delegar privilegios del motor (WITH GRANT OPTION, sensibles, ``provision`` al reasignar dueño).
+#: Ninguna ruta lo usa como guard: la exige el PAYLOAD (``scope.assert_at_with_code``); existe
+#: porque el catálogo exige un alias público por capacidad.
+EngineUsersGrantAdmin = Annotated[Actor, Depends(require(Capability.ENGINE_USERS_GRANT_ADMIN))]
+
 DatabasesRead = Annotated[Actor, Depends(require(Capability.DATABASES_READ))]
 DatabasesWrite = Annotated[Actor, Depends(require(Capability.DATABASES_WRITE))]
 DatabasesDrop = Annotated[Actor, Depends(require(Capability.DATABASES_DROP))]
@@ -432,6 +437,11 @@ BlueprintsRead = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_READ))]
 BlueprintsWrite = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_WRITE))]
 BlueprintsApply = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_APPLY))]
 BlueprintsCaptures = Annotated[Actor, Depends(require(Capability.BLUEPRINTS_CAPTURES))]
+
+#: Código de vistas, rutinas, triggers y eventos. Ninguna ruta lo usa como guard (el guard de esas
+#: rutas es de estructura): lo decide el PAYLOAD de la respuesta (``definition_visibility``).
+#: Existe porque el catálogo exige un alias público por capacidad.
+SchemaDefinitions = Annotated[Actor, Depends(require(Capability.SCHEMA_DEFINITIONS))]
 
 SchemaDiffRead = Annotated[Actor, Depends(require(Capability.SCHEMA_DIFF_READ))]
 SchemaDiffExecute = Annotated[Actor, Depends(require(Capability.SCHEMA_DIFF_EXECUTE))]
@@ -472,6 +482,7 @@ AccessAdmin = Annotated[Actor, Depends(require(Capability.ACCESS_ADMIN_CAP))]
 AccessAdminOrOwnTokens = Annotated[
     Actor, Depends(require_either(Capability.ACCESS_ADMIN_CAP, Capability.TOKENS_OWN))
 ]
-#: Política del propio gateway: rotación del cifrado y lectura de la auditoría. Solo la global
-#: ``security_officer``.
-PolicyAdmin = Annotated[Actor, Depends(require(Capability.POLICY_ADMIN))]
+#: Lectura de la auditoría (``GET /audit-log``). Solo la global ``security_officer``.
+AuditRead = Annotated[Actor, Depends(require(Capability.AUDIT_READ))]
+#: Rotación del cifrado (``POST /admin/crypto/rotate``). Solo la global ``security_officer``.
+CryptoRotate = Annotated[Actor, Depends(require(Capability.CRYPTO_ROTATE))]
