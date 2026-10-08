@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ObjectKind = Literal["table", "view", "routine", "trigger", "sequence", "event"]
 #: Por qué un cuerpo no está disponible en ``list_objects``. ``flag_off`` y ``too_large`` se suman
@@ -46,11 +46,22 @@ class WarningOut(_Out):
     message: str
 
 
+#: Forma ÚNICA que puede tomar ``engine_version``: ``mayor.menor`` o ``mayor.menor.parche``. Se usa
+#: ``[0-9]`` y no ``\d`` porque el motor de regex de Pydantic es Unicode y ``\d`` aceptaría dígitos
+#: de otros alfabetos. Es la segunda barrera: la primera es ``public_engine_version``.
+ENGINE_VERSION_PATTERN = r"^[0-9]+(\.[0-9]+){1,2}$"
+
+
 class DatabaseRefOut(_Out):
     """La base a la que se refiere la respuesta. **Nunca** servidor, dirección ni credencial."""
 
     database_id: int
     engine: str
+    #: Solo dígitos y puntos (``11.8.3``), NUNCA la cadena cruda de ``VERSION()``: el empaquetado
+    #: (``-0+deb13u1 from Debian``) delata distribución y nivel de parche. El patrón hace que una
+    #: fuga sea imposible aunque un mapeador futuro olvide pasar por ``public_engine_version``.
+    #: ``None`` si la tool no tiene conexión al motor o la versión no se pudo leer.
+    engine_version: str | None = Field(default=None, pattern=ENGINE_VERSION_PATTERN)
 
 
 # ---- list_objects ---------------------------------------------------------- #

@@ -165,8 +165,29 @@ class ToolContext:
 
         return read_table_stats(self.actor, database_id, tables, self.capability)
 
-    def body_availability(self, resuelta, facade):
-        """Disponibilidad del cuerpo por tipo para este llamador. Ver ``target_resolution``."""
+    def body_availability(self, resuelta, facade, server_version: str | None = None):
+        """
+        Disponibilidad del cuerpo por tipo para este llamador. Ver ``target_resolution``.
+
+        ``server_version`` es la cadena cruda ya leída, para no repetir el ``VERSION()``.
+        """
         from app.controllers.target_resolution import body_availability
 
-        return body_availability(self.actor, resuelta, facade)
+        return body_availability(self.actor, resuelta, facade, server_version)
+
+    def engine_version(self, facade) -> str | None:
+        """
+        Versión LIMPIA del motor (``11.8.3``) leída con el façade ya abierto: sin conexión extra.
+
+        Es lo que va en ``database.engine_version`` de la respuesta. Nunca devuelve la cadena
+        cruda de ``VERSION()``: ver ``readonly_probe.public_engine_version`` para el porqué.
+        """
+        from app.controllers.target_resolution import read_engine_version
+
+        return read_engine_version(facade)
+
+    def public_engine_version(self, raw_version: str | None) -> str | None:
+        """Igual que ``engine_version`` pero a partir de una cadena cruda que el handler ya leyó."""
+        from app.controllers.target_resolution import public_engine_version
+
+        return public_engine_version(raw_version)

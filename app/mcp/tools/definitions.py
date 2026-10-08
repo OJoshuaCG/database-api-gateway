@@ -252,4 +252,10 @@ def get_definition(ctx: ToolContext, params: dict) -> dict:
                 ),
             )
         )
-    return _envelope(data, resuelta=batch.database, tracker=tracker, warnings=warnings)
+    return _envelope(
+        data,
+        resuelta=batch.database,
+        tracker=tracker,
+        warnings=warnings,
+        engine_version=batch.engine_version,
+    )

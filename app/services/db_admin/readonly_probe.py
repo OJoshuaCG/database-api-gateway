@@ -162,6 +162,38 @@ def _parse_server_version(version: str | None) -> tuple[int, int, int] | None:
     return major, minor, patch
 
 
+#: ``mayor.menor`` con ``.parche`` opcional. ``re.ASCII`` para que ``\d`` no acepte dígitos de otros
+#: alfabetos, y ``{1,9}`` por grupo para que una cadena absurdamente larga no pase como versión.
+_PUBLIC_VERSION_RE = re.compile(r"^\s*(\d{1,9})\.(\d{1,9})(?:\.(\d{1,9}))?", re.ASCII)
+
+
+def public_engine_version(version: str | None) -> str | None:
+    """
+    La versión del motor apta para mostrar a un agente: ``mayor.menor.parche`` (o ``mayor.menor``
+    si el motor no trae parche), solo dígitos y puntos; ``None`` si no se puede leer. PURA.
+
+    POR QUÉ SOLO DÍGITOS. La cadena cruda de ``VERSION()`` lleva el empaquetado del servidor
+    (``11.8.3-MariaDB-0+deb13u1 from Debian``): delata la distribución y el nivel de parche del
+    paquete, justo lo que un escáner de vulnerabilidades necesita para elegir qué probar. El agente
+    necesita saber si el motor es 11.8 o 10.6 para razonar sobre sintaxis, no cómo se compiló.
+    ``-log``, ``-MariaDB-...`` y ``(Debian ...)`` se descartan por construcción: no hay una lista
+    de sufijos que mantener ni uno que se pueda olvidar.
+
+    MariaDB antepone ``5.5.5-`` en ciertos handshakes (``5.5.5-10.11.6-MariaDB``): la versión real
+    viene DESPUÉS del prefijo, igual que en ``_parse_server_version``.
+    """
+    raw_version = version or ""
+    prefixed = _MARIADB_REPLICATION_PREFIX_RE.match(raw_version)
+    candidate = prefixed.group(1) if prefixed else raw_version
+    match = _PUBLIC_VERSION_RE.match(candidate)
+    if match is None:
+        return None
+    major, minor, patch = match.groups()
+    if patch is None:
+        return f"{major}.{minor}"
+    return f"{major}.{minor}.{patch}"
+
+
 def _is_mariadb(version: str | None, dialect: str) -> bool:
     return dialect == _DEFINITION_ENGINE_MARIADB or "mariadb" in (version or "").lower()
 
@@ -634,4 +666,5 @@ __all__ = [
     "MYSQL_PROC_TABLE",
     "proc_grant_supported",
     "postgres_role_violations",
+    "public_engine_version",
 ]

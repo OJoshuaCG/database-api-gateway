@@ -5,7 +5,7 @@ llamador y motor/versión, el tipo ``event`` y la garantía de que el índice NO
 Cubre S4.13 a S4.15 y la verdad por motor/versión del índice:
 
 - Sin el scope ``data.definitions`` (o con el kill switch apagado): ``scope_disabled`` en todo lo que
-  tiene cuerpo, y ni siquiera se consulta la versión.
+  tiene cuerpo, y la versión se consulta una sola vez, solo para ``engine_version``.
 - Con el scope: ``True`` salvo rutinas cuando motor/versión explican su ausencia (``flag_off``,
   ``engine_unsupported``), con el aviso ``mcp.warn.routines_not_visible``.
 - ``get_schema`` nunca emite ``flag_off`` ni ``too_large`` en ``body_omitted_reason``.
@@ -86,7 +86,8 @@ def test_s4_13_without_the_scope_every_body_is_scope_disabled_and_nothing_is_rea
     assert objetos["clientes"]["body_available"] is None
     assert objetos["clientes"]["unavailable_reason"] is None
     assert facade.llamadas_definition == [], "el índice no lee código"
-    assert facade.llamadas_version == 0, "sin scope no hace falta ni la versión"
+    # La versión se lee igual, pero SOLO para ``database.engine_version``: ningún cuerpo la usa.
+    assert facade.llamadas_version == 1, "sin scope, una lectura solo para engine_version"
     assert "mcp.warn.routines_not_visible" not in {w["code"] for w in sobre["warnings"]}
 
 
@@ -116,7 +117,7 @@ def test_a_kill_switch_turned_off_after_issuing_the_token_closes_the_bodies(
     sobre = _ok(actor, database_id)
 
     assert _por_nombre(sobre)["v_activos"]["unavailable_reason"] == "scope_disabled"
-    assert facade.llamadas_version == 0
+    assert facade.llamadas_version == 1, "la única lectura es la de engine_version"
 
 
 @pytest.mark.parametrize(

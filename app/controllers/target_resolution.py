@@ -42,6 +42,7 @@ aplica como **filtro** y lo que el agente recibe es la lista de lo que sí alcan
 enumerara lo negado sería el mismo oráculo por otra vía.
 """
 
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -49,6 +50,8 @@ from app.core.actor import Actor
 from app.exceptions import AppHttpException
 from app.services import mcp_catalog as codes
 from app.services.capability_catalog import Capability
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,6 +501,37 @@ def open_readonly(actor: Actor, database_id: int, capability: Capability):
         ) from exc
 
 
+def public_engine_version(raw_version: str | None) -> str | None:
+    """
+    La versión del motor lista para el agente (``11.8.3``), a partir de la cadena cruda de
+    ``VERSION()``. Delgada a propósito: la regla y el porqué de "solo dígitos" viven en
+    ``readonly_probe.public_engine_version``. Existe porque ``app/mcp/**`` no importa la capa de
+    servicios y llega a la regla por acá, vía ``ToolContext``.
+    """
+    from app.services.db_admin.readonly_probe import public_engine_version as parse_public_version
+
+    return parse_public_version(raw_version)
+
+
+def read_engine_version(facade) -> str | None:
+    """
+    Versión limpia del motor leída con el façade que la llamada YA tiene abierto.
+
+    Es un ``SELECT VERSION()`` más sobre la sesión existente: jamás abre otra conexión. Las tools
+    sin façade no llaman a esto y su ``engine_version`` queda en ``None``.
+
+    TOLERANTE A FALLOS: la versión es un dato informativo, y que su lectura falle no puede tumbar
+    ``list_objects`` ni ``get_schema``, que sin ella funcionan. Se devuelve ``None`` y se registra
+    solo el TIPO del error: el mensaje del motor puede traer host, usuario o fragmentos de
+    sentencia y no va a ningún log ni a la respuesta.
+    """
+    try:
+        return public_engine_version(facade.server_version())
+    except Exception as exc:  # noqa: BLE001 — dato informativo: nunca rompe la lectura principal
+        logger.warning("No se pudo leer la versión del motor (%s)", type(exc).__name__)
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # Código de objetos (get_definition) y disponibilidad de cuerpos en list_objects  #
 # --------------------------------------------------------------------------- #
@@ -524,6 +558,8 @@ class DefinitionBatch:
     missing: tuple[tuple[str, str, str | None], ...]
     consistent_structure: bool
     session_warnings: tuple[str, ...]
+    #: Versión limpia (``11.8.3``) del motor, o ``None`` si no se leyó. Nunca la cadena cruda.
+    engine_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -697,12 +733,17 @@ def read_definitions(
         )
 
     results: list = []
+    # Sin objetos presentes no se lee ninguna versión: ``get_definition`` con nombres ajenos al
+    # índice hace cero lecturas al motor, y la versión no justifica una. Entonces ``engine_version``
+    # sale ``None`` en ese caso.
+    engine_version: str | None = None
     with open_readonly(actor, database_id, capability) as (resuelta, facade):
         present, missing = _partition_by_index(objects, facade.object_index())
         if present:
             _record_definition_intent(actor, resuelta, present)
             try:
                 server_version = facade.server_version()
+                engine_version = public_engine_version(server_version)
                 engine = resuelta.database.engine
                 proc_flag = resuelta.readonly_proc_grant
                 for kind, name, routine_kind in present:
@@ -741,10 +782,13 @@ def read_definitions(
         missing=tuple(missing),
         consistent_structure=consistent_structure,
         session_warnings=session_warnings,
+        engine_version=engine_version,
     )
 
 
-def body_availability(actor: Actor, resuelta: AgentDatabase, facade) -> BodyAvailability:
+def body_availability(
+    actor: Actor, resuelta: AgentDatabase, facade, server_version: str | None = None
+) -> BodyAvailability:
     """
     ¿Se puede pedir el cuerpo de cada tipo con ``get_definition``? Solo con el scope del llamador y
     la versión del motor: NO ejecuta ningún ``SHOW CREATE`` (``list_objects`` es el índice barato y
@@ -755,6 +799,10 @@ def body_availability(actor: Actor, resuelta: AgentDatabase, facade) -> BodyAvai
       (``flag_off`` o ``engine_unsupported``); vistas, triggers y events salen disponibles. Que
       "disponible" no promete un cuerpo (un privilegio puede faltar): lo dice ``get_definition``
       por objeto. Lo que no puede afirmarse sin leer, no se afirma acá.
+
+    ``server_version`` es la cadena cruda ya leída por quien llama (``list_objects`` también la
+    necesita para ``engine_version``): con ella no se repite el ``VERSION()``. Un ``None`` (no
+    pasada, o ilegible) cae a leerla del façade.
     """
     from app.services.capability_catalog import data_capability_enabled
     from app.services.db_admin.readonly_probe import routine_body_reason
@@ -767,8 +815,9 @@ def body_availability(actor: Actor, resuelta: AgentDatabase, facade) -> BodyAvai
             reasons={kind: "scope_disabled" for kind in _KINDS_WITH_BODY},
             routines_may_be_hidden=False,
         )
+    raw_server_version = server_version if server_version is not None else facade.server_version()
     routine_reason = routine_body_reason(
-        resuelta.database.engine, facade.server_version(), resuelta.readonly_proc_grant
+        resuelta.database.engine, raw_server_version, resuelta.readonly_proc_grant
     )
     reasons: dict = {kind: None for kind in _KINDS_WITH_BODY}
     reasons["routine"] = routine_reason
@@ -797,6 +846,8 @@ class TableStatsBatch:
     row_estimates_included: bool
     consistent_structure: bool
     session_warnings: tuple[str, ...]
+    #: Versión limpia (``11.8.3``) del motor, o ``None`` si no se leyó. Nunca la cadena cruda.
+    engine_version: str | None = None
 
 
 def caller_may_see_row_estimates(actor: Actor) -> bool:
@@ -855,6 +906,7 @@ def read_table_stats(
             missing.extend(name for name in present if name not in read_names)
         consistent_structure = facade.consistent_structure
         session_warnings = tuple(facade.warnings)
+        engine_version = read_engine_version(facade)
 
     return TableStatsBatch(
         database=resuelta,
@@ -863,6 +915,7 @@ def read_table_stats(
         row_estimates_included=include_row_estimates,
         consistent_structure=consistent_structure,
         session_warnings=session_warnings,
+        engine_version=engine_version,
     )
 
 

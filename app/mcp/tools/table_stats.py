@@ -141,4 +141,10 @@ def get_table_stats(ctx: ToolContext, params: dict) -> dict:
         ),
         bodies_requested=False,
     )
-    return _envelope(data, resuelta=batch.database, tracker=tracker, warnings=warnings)
+    return _envelope(
+        data,
+        resuelta=batch.database,
+        tracker=tracker,
+        warnings=warnings,
+        engine_version=batch.engine_version,
+    )

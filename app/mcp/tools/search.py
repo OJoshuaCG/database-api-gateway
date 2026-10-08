@@ -224,6 +224,7 @@ def search_schema(ctx: ToolContext, params: dict) -> dict:
         indice = facade.object_index()
         tablas = exclude_internal_tables(indice.get("table", []))
         warnings = _warnings(resuelta, facade, bodies_requested=False)
+        engine_version = ctx.engine_version(facade)
 
         orden = _scan_order(q, tablas) if quiere_detalle else []
         a_leer = orden[:MCP_SEARCH_MAX_TABLES]
@@ -290,4 +291,6 @@ def search_schema(ctx: ToolContext, params: dict) -> dict:
         searched_kinds=list(kinds),
         next_step=out.SEARCH_NEXT_STEP,
     )
-    return _envelope(data, resuelta=resuelta, tracker=tracker, warnings=warnings)
+    return _envelope(
+        data, resuelta=resuelta, tracker=tracker, warnings=warnings, engine_version=engine_version
+    )

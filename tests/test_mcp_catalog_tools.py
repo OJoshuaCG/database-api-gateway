@@ -655,7 +655,7 @@ def test_output_field_sets_are_frozen():
             "started_at",
             "finished_at",
         },
-        out.DatabaseRefOut: {"database_id", "engine"},
+        out.DatabaseRefOut: {"database_id", "engine", "engine_version"},
         out.ObjectOut: {
             "kind",
             "name",

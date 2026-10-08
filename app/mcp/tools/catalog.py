@@ -110,7 +110,16 @@ def _warnings(resuelta, facade, *, bodies_requested: bool) -> list[out.WarningOu
     return w
 
 
-def _envelope(data, *, resuelta, tracker: Tracker, warnings) -> dict:
+def _envelope(
+    data, *, resuelta, tracker: Tracker, warnings, engine_version: str | None = None
+) -> dict:
+    """
+    El sobre común de las tools de catálogo.
+
+    ``engine_version`` ya viene LIMPIO (``11.8.3``, ver ``ToolContext.engine_version``) y es
+    ``None`` cuando la tool no tiene una conexión al motor de la que leerlo: este sobre nunca abre
+    una conexión por la versión. ``DatabaseRefOut`` rechaza cualquier valor que no sean dígitos.
+    """
     env = out.ToolEnvelope(
         notice=out.UNTRUSTED_NOTICE,
         data=data,
@@ -122,7 +131,9 @@ def _envelope(data, *, resuelta, tracker: Tracker, warnings) -> dict:
         warnings=warnings,
         generated_at=now_iso(),
         database=out.DatabaseRefOut(
-            database_id=resuelta.database.database_id, engine=resuelta.database.engine
+            database_id=resuelta.database.database_id,
+            engine=resuelta.database.engine,
+            engine_version=engine_version,
         ),
     )
     return env.model_dump(mode="json")
@@ -218,9 +229,12 @@ def list_objects(ctx: ToolContext, params: dict) -> dict:
     with ctx.open_readonly(database_id) as (resuelta, facade):
         indice = facade.object_index()
         warnings = _warnings(resuelta, facade, bodies_requested=False)
-        # Una consulta de VERSION() como mucho, y solo si el llamador tiene el scope: jamás un
-        # SHOW CREATE. Se calcula con la sesión abierta porque el façade se cierra al salir.
-        disponibilidad = ctx.body_availability(resuelta, facade)
+        # UNA consulta de VERSION(), compartida entre la disponibilidad de cuerpos y
+        # ``engine_version``: jamás un SHOW CREATE. Se calcula con la sesión abierta porque el
+        # façade se cierra al salir.
+        raw_server_version = facade.server_version()
+        engine_version = ctx.public_engine_version(raw_server_version)
+        disponibilidad = ctx.body_availability(resuelta, facade, raw_server_version)
         routines_listed_count = len(indice.get("routine", []))
         routines_not_visible_warning = _routines_not_visible_warning(
             engine=resuelta.database.engine,
@@ -281,7 +295,9 @@ def list_objects(ctx: ToolContext, params: dict) -> dict:
             )
         )
     data = out.ObjectIndexOut(objects=objetos, count=len(objetos))
-    return _envelope(data, resuelta=resuelta, tracker=tracker, warnings=warnings)
+    return _envelope(
+        data, resuelta=resuelta, tracker=tracker, warnings=warnings, engine_version=engine_version
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -307,6 +323,7 @@ def check_freshness(ctx: ToolContext, params: dict) -> dict:
     with ctx.open_readonly(database_id) as (resuelta, facade):
         version = facade.applied_version(resuelta.database.model_slug)
         warnings = _warnings(resuelta, facade, bodies_requested=False)
+        engine_version = ctx.engine_version(facade)
 
     hechos = freshness_facts(resuelta.database.database_id, version)
     data = out.FreshnessOut(
@@ -317,7 +334,13 @@ def check_freshness(ctx: ToolContext, params: dict) -> dict:
         blueprint=resuelta.database.model_slug,
         rule=out.FRESHNESS_RULE,
     )
-    return _envelope(data, resuelta=resuelta, tracker=Tracker(), warnings=warnings)
+    return _envelope(
+        data,
+        resuelta=resuelta,
+        tracker=Tracker(),
+        warnings=warnings,
+        engine_version=engine_version,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -528,6 +551,7 @@ def get_schema(ctx: ToolContext, params: dict) -> dict:
         triggers = facade.triggers() if "trigger" in por_kind else []
         secuencias = facade.sequences() if "sequence" in por_kind else []
         warnings = _warnings(resuelta, facade, bodies_requested=bool(set(por_kind) & _WITH_BODY))
+        engine_version = ctx.engine_version(facade)
 
     tracker = Tracker()
     objetos: list = []
@@ -543,7 +567,9 @@ def get_schema(ctx: ToolContext, params: dict) -> dict:
         objects=objetos,
         missing=[out.ObjectRefOut(kind=k, name=clean(n)) for (k, n) in faltantes],
     )
-    return _envelope(data, resuelta=resuelta, tracker=tracker, warnings=warnings)
+    return _envelope(
+        data, resuelta=resuelta, tracker=tracker, warnings=warnings, engine_version=engine_version
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -577,6 +603,8 @@ def diff_schemas(ctx: ToolContext, params: dict) -> dict:
     with ctx.open_readonly(origen) as (res_origen, fac_origen):
         snap_origen = fac_origen.snapshot()
         warnings = _warnings(res_origen, fac_origen, bodies_requested=False)
+        # El bloque ``database`` del sobre describe el lado origen, así que la versión es la suya.
+        engine_version = ctx.engine_version(fac_origen)
     with ctx.open_readonly(destino) as (res_destino, fac_destino):
         snap_destino = fac_destino.snapshot()
         for w in _warnings(res_destino, fac_destino, bodies_requested=False):
@@ -610,4 +638,10 @@ def diff_schemas(ctx: ToolContext, params: dict) -> dict:
         count=len(cambios),
         cross_flavor_warning=cross_flavor,
     )
-    return _envelope(data, resuelta=res_origen, tracker=Tracker(), warnings=warnings)
+    return _envelope(
+        data,
+        resuelta=res_origen,
+        tracker=Tracker(),
+        warnings=warnings,
+        engine_version=engine_version,
+    )
