@@ -747,6 +747,12 @@ CODE_GRANT_USER_INACTIVE = "access.grant_user_inactive"
 #: Alta masiva rechazada entera: al menos un destino falló. ``public_context.failures`` lleva
 #: ``[{scope_id, code, message}]`` (un código de este vocabulario por destino). No se insertó nada. 409.
 CODE_GRANT_BULK_FAILED = "access.grant_bulk_failed"
+#: Alta masiva con demasiados pares ``capacidades x destinos`` (tope ``BULK_MAX_TARGETS``). 422.
+CODE_GRANT_BULK_TOO_LARGE = "access.grant_bulk_too_large"
+#: Una decisión masiva falló por un error INESPERADO en ese ítem: mensaje fijo, sin el texto de la
+#: excepción (el detalle va al log). Solo aparece dentro de ``results[]``. Los fallos esperados
+#: llevan el código ``access.*`` propio de la regla que los bloqueó.
+CODE_GRANT_DECISION_FAILED = "access.grant_decision_failed"
 #: Quien pidió una capacidad sensible no puede aprobarla él mismo. 409.
 CODE_SELF_APPROVAL = "access.self_approval_forbidden"
 #: La solicitud ya no está pendiente (decidida, vencida o cancelada). 409.

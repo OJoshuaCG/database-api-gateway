@@ -50,14 +50,18 @@ import uuid
 
 from app.controllers import access_request_controller as access_requests
 from app.core.actor import identity_of
+from app.core.logger import get_logger
 from app.controllers.gateway_user_controller import CODE_NOT_FOUND
 from app.exceptions import AppHttpException
 from app.models.capability_grant_model import CapabilityGrantModel
 from app.models.user_model import UserModel
+from app.schemas.capability_grant import BULK_MAX_TARGETS
 from app.services import audit, sod_service
 from app.services.capability_catalog import (
     CODE_CAPABILITY_NOT_GRANTABLE,
     CODE_GRANT_BULK_FAILED,
+    CODE_GRANT_BULK_TOO_LARGE,
+    CODE_GRANT_DECISION_FAILED,
     CODE_GRANT_DUPLICATE,
     CODE_GRANT_NOT_FOUND,
     CODE_GRANT_NOT_PENDING,
@@ -73,6 +77,9 @@ from app.services.capability_catalog import (
     is_grantable,
     is_sensitive,
 )
+
+
+logger = get_logger(__name__)
 
 
 def _object_name(scope_type: str, scope_id: int) -> str:
@@ -388,65 +395,91 @@ class CapabilityGrantController:
                             reason="sod_conflict")
             raise
 
+    @staticmethod
+    def _action_before_decision(capability: str) -> str:
+        """Acción de auditoría para los rechazos previos a decidir el modo (misma regla que ``create``)."""
+        return (
+            "capability_grant.requested"
+            if is_sensitive(capability) and access_requests.four_eyes()
+            else "capability_grant.created"
+        )
+
     def create_bulk(self, user_id: int, data: dict, actor) -> dict:
         """
-        La misma capacidad sobre VARIOS destinos (``scope_ids``), todo o nada.
+        UNA o VARIAS capacidades sobre VARIOS destinos (``scope_ids``), todo o nada.
 
-        Se valida TODO antes de insertar: los chequeos de la persona y la capacidad (como
-        ``create``, el primero que falla corta) y, por destino, alcance existe / duplicado /
-        separación de deberes. Si algún destino falla, 409 ``access.grant_bulk_failed`` con
-        ``failures=[{scope_id, code, message}]`` (TODOS los que fallan) y no se inserta nada.
+        Se valida TODO antes de insertar: los chequeos de la persona y de cada capacidad (como
+        ``create``, el primero que falla corta) y, por PAR capacidad x destino, alcance existe /
+        duplicado / separación de deberes. Si algún par falla, 409 ``access.grant_bulk_failed`` con
+        ``failures=[{scope_id, capability, code, message}]`` (TODOS los que fallan) y no se inserta
+        nada. Los errores de la persona (auto-otorgamiento, desactivada) y de la capacidad (no
+        otorgable, no asignable) NO son de un par: se lanzan directo, igual que en el endpoint
+        individual.
 
-        ``access_requests.decide`` corre UNA vez: todas las filas nacen con el mismo modo. Las
-        filas entran en una sola transacción (``insert_many``); la auditoría es una por fila, con
-        un ``bulk_id`` común en el ``detail``, y la elevación sin segundo aprobador se audita una
-        vez por pedido (``record_unapproved``).
+        El modo de nacimiento (``access_requests.decide``) se evalúa POR CAPACIDAD: una sensible
+        nace ``pending`` y una común ``active`` dentro del mismo pedido. Todas las filas entran en
+        una sola transacción (``insert_many``); la auditoría es una por fila, con UN ``bulk_id`` para
+        todo el pedido, y la elevación sin segundo aprobador se audita una vez por pedido
+        (``record_unapproved``).
         """
-        capability = data["capability"]
+        capabilities = list(dict.fromkeys(data.get("capabilities") or [data["capability"]]))
         scope_type = data["scope_type"]
         scope_ids = list(dict.fromkeys(int(i) for i in data["scope_ids"]))
         override = data.get("sod_override")
-        sensitive = is_sensitive(capability)
-        action = (
-            "capability_grant.requested"
-            if sensitive and access_requests.four_eyes()
-            else "capability_grant.created"
-        )
+
+        if len(capabilities) * len(scope_ids) > BULK_MAX_TARGETS:
+            raise AppHttpException(
+                message=(
+                    f"Demasiados pares capacidad x destino: el máximo por pedido es "
+                    f"{BULK_MAX_TARGETS}."
+                ),
+                status_code=422,
+                public_context={"code": CODE_GRANT_BULK_TOO_LARGE},
+            )
 
         user = self._user_or_404(user_id)
         username = user["username"]
         first = scope_ids[0]
 
-        self._precheck_request(user, user_id, actor, capability, scope_type, first, action)
-        self._check_assignable(actor, username, capability, scope_type, first, action)
+        for capability in capabilities:
+            action = self._action_before_decision(capability)
+            self._precheck_request(user, user_id, actor, capability, scope_type, first, action)
+            self._check_assignable(actor, username, capability, scope_type, first, action)
 
         known = self.grants.scope_names([(scope_type, i) for i in scope_ids])
-        live = self.grants.live_scope_ids(user_id, capability, scope_type, scope_ids)
         failures: list[dict] = []
-        plans: dict[int, object] = {}
+        plans: dict[str, dict[int, object]] = {capability: {} for capability in capabilities}
 
-        def fail(scope_id: int, exc: AppHttpException) -> None:
+        def fail(capability: str, scope_id: int, exc: AppHttpException) -> None:
             public = dict(exc.public_context or {})
-            entry = {"scope_id": scope_id, "code": public.pop("code", None), "message": exc.message}
+            entry = {
+                "scope_id": scope_id,
+                "capability": capability,
+                "code": public.pop("code", None),
+                "message": exc.message,
+            }
             if public:
                 # ``access.sod_conflict`` trae ``conflicts`` y los límites del ``override``: la SPA
                 # los necesita para ofrecer la excepción de emergencia sobre todo el lote.
                 entry["context"] = public
             failures.append(entry)
 
-        for scope_id in scope_ids:
-            if (scope_type, scope_id) not in known:
-                fail(scope_id, self._scope_not_found())
-            elif scope_id in live:
-                fail(scope_id, self._duplicate())
-            else:
-                try:
-                    plans[scope_id] = self._sod_plan_for_target(
-                        user_id, username, actor, capability, scope_type, scope_id,
-                        override, action,
-                    )
-                except AppHttpException as exc:
-                    fail(scope_id, exc)
+        for capability in capabilities:
+            live = self.grants.live_scope_ids(user_id, capability, scope_type, scope_ids)
+            action = self._action_before_decision(capability)
+            for scope_id in scope_ids:
+                if (scope_type, scope_id) not in known:
+                    fail(capability, scope_id, self._scope_not_found())
+                elif scope_id in live:
+                    fail(capability, scope_id, self._duplicate())
+                else:
+                    try:
+                        plans[capability][scope_id] = self._sod_plan_for_target(
+                            user_id, username, actor, capability, scope_type, scope_id,
+                            override, action,
+                        )
+                    except AppHttpException as exc:
+                        fail(capability, scope_id, exc)
 
         if failures:
             raise AppHttpException(
@@ -455,50 +488,79 @@ class CapabilityGrantController:
                 public_context={"code": CODE_GRANT_BULK_FAILED, "failures": failures},
             )
 
-        elevaciones = (
-            [{"kind": "capability_grant", "capability": capability,
-              "scope_type": scope_type, "scope_id": i} for i in scope_ids]
-            if sensitive else []
-        )
-        # Una sola decisión para todo el lote (ver ``decide``): mismo modo en todas las filas.
-        distinct_plans = list({p.rules: p for p in plans.values() if p}.values())
-        modo = access_requests.decide(elevaciones, distinct_plans[0] if distinct_plans else None,
-                                      actor)
-        pending = modo == access_requests.MODE_WAIT
-        action = "capability_grant.requested" if pending else "capability_grant.created"
-        if distinct_plans and not pending:
-            for plan in distinct_plans:
-                sod_service.record_override_intent(plan, admin=actor, target_id=user_id,
-                                                   username=username)
+        entries: list[dict] = []
+        action_by_capability: dict[str, str] = {}
+        plans_to_apply: dict = {}
+        unapproved_elevations: list[dict] = []
+        unapproved_mode: str | None = None
+        unapproved_with_override = False
+        any_pending = False
+
+        for capability in capabilities:
+            elevaciones = (
+                [{"kind": "capability_grant", "capability": capability,
+                  "scope_type": scope_type, "scope_id": i} for i in scope_ids]
+                if is_sensitive(capability) else []
+            )
+            # Una decisión por capacidad (ver ``decide``): mismo modo en todas SUS filas.
+            distinct_plans = list({p.rules: p for p in plans[capability].values() if p}.values())
+            modo = access_requests.decide(
+                elevaciones, distinct_plans[0] if distinct_plans else None, actor
+            )
+            pending = modo == access_requests.MODE_WAIT
+            any_pending = any_pending or pending
+            action_by_capability[capability] = (
+                "capability_grant.requested" if pending else "capability_grant.created"
+            )
+            if distinct_plans and not pending:
+                for plan in distinct_plans:
+                    # Dos capacidades con las mismas reglas comparten excepción: se registra una vez.
+                    plans_to_apply.setdefault(plan.rules, plan)
+            if modo and not pending:
+                # ``decide`` solo devuelve BOOTSTRAP/UNAPPROVED, y ambos dependen del actor y de la
+                # config, no de la capacidad: todas las capacidades sin espera comparten el modo.
+                unapproved_mode = modo
+                unapproved_elevations.extend(elevaciones)
+                unapproved_with_override = unapproved_with_override or bool(distinct_plans)
+            stored_override = sod_service.override_payload(override) if distinct_plans else None
+            for scope_id in scope_ids:
+                entries.append({
+                    "capability": capability,
+                    "scope_id": scope_id,
+                    "pending": pending,
+                    "sod_override": stored_override,
+                })
+
+        for plan in plans_to_apply.values():
+            sod_service.record_override_intent(plan, admin=actor, target_id=user_id,
+                                               username=username)
 
         actor_id, _ = identity_of(actor)
         rows = self.grants.insert_many(
             user_id=user_id,
-            capability=capability,
             scope_type=scope_type,
-            scope_ids=scope_ids,
+            entries=entries,
             requested_by=actor_id,
-            pending=pending,
             reason=(data.get("reason") or "").strip() or None,
-            sod_override=sod_service.override_payload(override) if distinct_plans else None,
         )
-        if distinct_plans and not pending:
-            for plan in distinct_plans:
-                sod_service.apply_override(plan, user_id=user_id, admin=actor, username=username)
+        for plan in plans_to_apply.values():
+            sod_service.apply_override(plan, user_id=user_id, admin=actor, username=username)
         bulk_id = uuid.uuid4().hex
         for row in rows:
-            self._audit(action, actor, username, capability, scope_type, row["scope_id"],
+            self._audit(action_by_capability[row["capability"]], actor, username,
+                        row["capability"], scope_type, row["scope_id"],
                         grant_id=row["id"], before=None, after=row["status"],
                         reason=row.get("request_reason"), bulk_id=bulk_id)
-        if modo and not pending:
+        if unapproved_mode:
             access_requests.record_unapproved(
-                admin=actor, target_id=user_id, username=username, elevations=elevaciones,
-                origin="capability_grant", override=override if distinct_plans else None,
-                mode=modo,
+                admin=actor, target_id=user_id, username=username,
+                elevations=unapproved_elevations, origin="capability_grant",
+                override=override if unapproved_with_override else None,
+                mode=unapproved_mode,
             )
         return {
             "count": len(rows),
-            "pending": pending,
+            "pending": any_pending,
             "grants": self._serialize_many(rows),
         }
 
@@ -679,7 +741,12 @@ class CapabilityGrantController:
             raise self._not_pending()
         return row
 
-    def approve(self, grant_id: int, actor, reason: str | None = None) -> dict:
+    def approve(self, grant_id: int, actor, reason: str | None = None, *,
+                bulk_id: str | None = None) -> dict:
+        """
+        Pendiente → ``active``. ``bulk_id`` (solo lo pasa ``decide_bulk``) se copia al ``detail`` de
+        las filas de auditoría de ESTA decisión, éxito o fallo, para correlacionar el lote.
+        """
         self.expire_overdue()
         row = self._pending_or_error(grant_id)
         grantee = self.users.find_by_id(row["user_id"])
@@ -698,7 +765,8 @@ class CapabilityGrantController:
         if code is not None:
             self._audit("capability_grant.approved", actor, username, row["capability"],
                         row["scope_type"], row["scope_id"], grant_id=grant_id,
-                        before="pending", after="pending", status="failure", reason=code)
+                        before="pending", after="pending", status="failure", reason=code,
+                        bulk_id=bulk_id)
             if code == CODE_SOD_CONFLICT:
                 self._sod_plan(row)  # re-lanza el 409 (o el 422) con reglas y fuentes
                 raise sod_service.conflict_error(self._sod_uncovered(row["user_id"]))
@@ -723,7 +791,7 @@ class CapabilityGrantController:
                                        approved_by=actor_id)
         self._audit("capability_grant.approved", actor, username, row["capability"],
                     row["scope_type"], row["scope_id"], grant_id=grant_id,
-                    before="pending", after="active", reason=reason)
+                    before="pending", after="active", reason=reason, bulk_id=bulk_id)
         return self._serialize(self.grants.get(grant_id))
 
     @staticmethod
@@ -736,8 +804,12 @@ class CapabilityGrantController:
             return CODE_SELF_MODIFICATION
         return None
 
-    def reject(self, grant_id: int, actor, reason: str | None = None) -> dict:
-        """Pendiente → ``rejected``. Sin techo ni segundo aprobador: rechazar nunca da acceso."""
+    def reject(self, grant_id: int, actor, reason: str | None = None, *,
+               bulk_id: str | None = None) -> dict:
+        """
+        Pendiente → ``rejected``. Sin techo ni segundo aprobador: rechazar nunca da acceso.
+        ``bulk_id``: ver ``approve``.
+        """
         self.expire_overdue()
         row = self._pending_or_error(grant_id)
         grantee = self.users.find_by_id(row["user_id"])
@@ -748,6 +820,73 @@ class CapabilityGrantController:
             raise self._not_pending()
         self._audit("capability_grant.rejected", actor, (grantee or {}).get("username", ""),
                     row["capability"], row["scope_type"], row["scope_id"], grant_id=grant_id,
-                    before="pending", after="rejected", reason=reason)
+                    before="pending", after="rejected", reason=reason,
+                    bulk_id=bulk_id)
         sod_service.reconcile(row["user_id"])
         return self._serialize(self.grants.get(grant_id))
+
+    def decide_bulk(self, decision: str, ids: list[int], actor, reason: str | None = None) -> dict:
+        """
+        Aprueba o rechaza VARIAS solicitudes, MEJOR ESFUERZO: cada ítem es su propia decisión
+        (``approve``/``reject`` abren y cierran su propia sesión y hacen su compare-and-set), así
+        que uno que falla no frena ni revierte a los demás.
+
+        No reimplementa ninguna regla: delega en ``approve``/``reject`` y por lo tanto en
+        ``_block_reason``, la única fuente de las reglas de segundo aprobador. Una regla nueva ahí
+        rige acá sin tocar este método. Cada ítem conserva sus filas de auditoría (éxito y fallo)
+        con un ``bulk_id`` común, y se agrega UNA fila agregada ``capability_grant.bulk_decided``.
+
+        Un id inexistente se informa con el mismo código que da el endpoint individual
+        (``access.grant_not_found``). Un error inesperado se reduce a un código y mensaje fijos: el
+        texto de la excepción puede arrastrar SQL o hosts, así que solo se loguea su TIPO.
+        """
+        bulk_id = uuid.uuid4().hex
+        decide_one = self.approve if decision == "approve" else self.reject
+        results: list[dict] = []
+        for grant_id in ids:
+            try:
+                grant = decide_one(grant_id, actor, reason, bulk_id=bulk_id)
+                results.append({"id": grant_id, "ok": True, "grant": grant})
+            except AppHttpException as exc:
+                results.append({
+                    "id": grant_id,
+                    "ok": False,
+                    "code": (exc.public_context or {}).get("code"),
+                    "message": exc.message,
+                })
+            except Exception as exc:
+                logger.error(
+                    "decide_bulk: error inesperado (grant_id=%s, decision=%s): %s",
+                    grant_id, decision, type(exc).__name__,
+                )
+                results.append({
+                    "id": grant_id,
+                    "ok": False,
+                    "code": CODE_GRANT_DECISION_FAILED,
+                    "message": "No se pudo procesar esta solicitud. Inténtalo de nuevo.",
+                })
+
+        succeeded = sum(1 for item in results if item["ok"])
+        failed = len(results) - succeeded
+        audit.record(
+            "capability_grant.bulk_decided",
+            admin=actor,
+            target_type="capability_grant",
+            touched_engine=False,
+            detail=json.dumps(
+                {
+                    "bulk_id": bulk_id,
+                    "decision": decision,
+                    "requested": len(results),
+                    "succeeded": succeeded,
+                    "failed": failed,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        return {
+            "requested": len(results),
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": results,
+        }

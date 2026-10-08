@@ -304,16 +304,16 @@ class CapabilityGrantModel:
         self,
         *,
         user_id: int,
-        capability: str,
         scope_type: str,
-        scope_ids: list[int],
+        entries: list[dict],
         requested_by: int | None,
-        pending: bool,
         reason: str | None,
-        sod_override: dict | None = None,
     ) -> list[dict]:
         """
-        ``insert`` de VARIOS destinos en UNA transacción: o nacen todas o ninguna. Si el
+        ``insert`` de VARIOS pares capacidad x destino en UNA transacción: o nacen todas o ninguna.
+        Cada entrada es ``{capability, scope_id, pending, sod_override}``: el estado de nacimiento
+        se decide POR CAPACIDAD (una sensible nace ``pending`` y una común ``active`` en el mismo
+        lote), por eso ``pending`` viaja en la entrada y no como parámetro del lote. Si el
         ``UNIQUE`` hace perder a cualquiera (alta concurrente), se revierte el lote entero y se
         responde el mismo 409 que el chequeo previo.
         """
@@ -323,20 +323,22 @@ class CapabilityGrantModel:
             rows = [
                 CapabilityGrant(
                     user_id=user_id,
-                    capability=capability,
+                    capability=entry["capability"],
                     scope_type=scope_type,
-                    scope_id=scope_id,
-                    status="pending" if pending else "active",
+                    scope_id=entry["scope_id"],
+                    status="pending" if entry["pending"] else "active",
                     live_key=1,
                     requested_by=requested_by,
                     requested_at=now,
-                    expires_at=(now + PENDING_TTL) if pending else None,
+                    expires_at=(now + PENDING_TTL) if entry["pending"] else None,
                     request_reason=reason,
                     sod_override_json=(
-                        json.dumps(sod_override, ensure_ascii=False) if sod_override else None
+                        json.dumps(entry["sod_override"], ensure_ascii=False)
+                        if entry.get("sod_override")
+                        else None
                     ),
                 )
-                for scope_id in scope_ids
+                for entry in entries
             ]
             session.add_all(rows)
             try:

@@ -263,13 +263,15 @@ def create_capability_grants_bulk(
     actor: AccessAdmin, user_id: int, payload: CapabilityGrantBulkCreate
 ):
     """
-    Otorga la MISMA capacidad puntual sobre varios entornos o servidores (``scope_ids``, de 1 a
-    100, sin repetidos), todo o nada: se valida cada destino antes de insertar y entra en una sola
-    transacción. Todas las filas nacen con el mismo estado (``pending`` si la capacidad es
-    sensible, salvo ``ACCESS_FOUR_EYES=False``).
+    Otorga una o VARIAS capacidades puntuales (``capability`` o ``capabilities``, excluyentes)
+    sobre varios entornos o servidores (``scope_ids``, de 1 a 100, sin repetidos), todo o nada: se
+    valida cada par capacidad x destino antes de insertar y entra en una sola transacción. El total
+    de pares no puede pasar de 100 (422 ``access.grant_bulk_too_large``). El estado se decide POR
+    CAPACIDAD: las sensibles nacen ``pending`` (salvo ``ACCESS_FOUR_EYES=False``) y el resto
+    ``active``; ``pending`` en la respuesta es ``true`` si alguna nació pendiente.
 
-    Si algún destino falla: 409 ``access.grant_bulk_failed`` y ``public_context.failures`` lista
-    ``{scope_id, code, message[, context]}`` de cada uno (``access.grant_scope_not_found``,
+    Si algún par falla: 409 ``access.grant_bulk_failed`` y ``public_context.failures`` lista
+    ``{scope_id, capability, code, message[, context]}`` de cada uno (``access.grant_scope_not_found``,
     ``access.grant_duplicate``, ``access.sod_conflict``...; ``context`` es el resto del
     ``public_context`` del error, p. ej. ``conflicts`` y ``override`` del conflicto SoD). Los errores de la persona o de la
     capacidad son los de ``POST /{user_id}/capability-grants``.
