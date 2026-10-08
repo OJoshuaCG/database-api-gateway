@@ -2647,3 +2647,23 @@ un `Actor` no ve cuerpos (fail-closed).
 alguien creó desde un snapshot o adoptó de un diff, y un `viewer` las lee: este corte cierra el snapshot y las
 comparaciones, no la autoría de blueprints. Tampoco se tocó `execute-preview`/`adopt`/`execute` (quien puede
 aplicar el DDL ve lo que aplica). Y no se redactan columnas generadas ni `CHECK` de tablas: son estructura.
+
+### MCP: `database.engine_version` expone solo dígitos, nunca la cadena de build
+
+**Por qué.** Los agentes necesitan la versión del motor para razonar sobre sintaxis, pero la cadena cruda
+de `VERSION()` (`11.8.3-MariaDB-0+deb13u1 from Debian`) delata distribución y nivel de parche del paquete,
+dato útil para escanear vulnerabilidades. Se expone `mayor.menor[.parche]` y nada más.
+
+**Por qué por construcción y con dos barreras.** `readonly_probe.public_engine_version` toma los primeros
+dígitos en lugar de quitar sufijos conocidos: una lista de sufijos queda corta con la próxima distro.
+`DatabaseRefOut.engine_version` además lleva el patrón `^[0-9]+(\.[0-9]+){1,2}$` (con `[0-9]`, no `\d`: el
+regex de Pydantic es Unicode), así que un mapeador futuro que olvide la función no puede filtrar.
+
+**Por qué el prefijo `5.5.5-`.** MariaDB lo antepone en ciertos handshakes (`5.5.5-10.11.6-MariaDB`); la
+versión real va después. Es la misma regla que ya usa `_parse_server_version`.
+
+**Sin conexión extra.** La versión se lee con el façade que la tool ya tiene abierto. `get_definition` sin
+objetos presentes devuelve `null` en vez de leerla (cero lecturas al motor es una garantía de esa tool), y
+`diff_schemas` informa la del lado origen, que es el que describe su bloque `database`. Consecuencia
+visible: `list_objects` ahora lee `VERSION()` también sin el scope `data.definitions` (una vez, solo para
+este campo); los tests de `list_objects` que afirmaban cero lecturas de versión pasaron a afirmar una.
