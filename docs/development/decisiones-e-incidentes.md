@@ -2667,3 +2667,34 @@ objetos presentes devuelve `null` en vez de leerla (cero lecturas al motor es un
 `diff_schemas` informa la del lado origen, que es el que describe su bloque `database`. Consecuencia
 visible: `list_objects` ahora lee `VERSION()` también sin el scope `data.definitions` (una vez, solo para
 este campo); los tests de `list_objects` que afirmaban cero lecturas de versión pasaron a afirmar una.
+
+### Capacidades puntuales: decisión masiva de mejor esfuerzo, alta masiva todo o nada
+
+**Por qué la decisión (`POST /capability-grants/decisions`) es de mejor esfuerzo.** Aprobar es
+independiente por solicitud: cada una tiene su destinatario, su solicitante y su regla de
+separación de deberes, y que una esté bloqueada (auto-aprobación, persona desactivada, ya decidida)
+no dice nada sobre las otras. Un todo o nada obligaría a quien aprueba 20 pedidos a descartar el
+lote entero por uno. Cada ítem es su propia transacción (`approve`/`reject` abren y cierran su
+sesión y hacen su compare-and-set), así que no hay nada que revertir. La respuesta es siempre
+`200` con `results[]` por ítem; un error inesperado se reduce a `access.grant_decision_failed` con
+mensaje fijo y solo se loguea el TIPO de la excepción (el texto puede traer SQL o hosts).
+
+**Por qué reusa `approve`/`reject` y, con ellos, `_block_reason`.** Es la única fuente de las
+reglas de segundo aprobador (la bandeja `GET /pending` la usa también). Un lote que las copiara
+sería un camino paralelo que se desincroniza en silencio: la próxima regla agregada en
+`_block_reason` valdría para el endpoint individual y no para el masivo, justo el que aprueba
+más cosas por vez. Por eso `approve`/`reject` solo ganaron un `bulk_id` opcional para la auditoría.
+
+**Por qué el alta masiva sigue siendo todo o nada con varias capacidades.** Quien otorga elige un
+conjunto de capacidades y destinos como una sola intención: un alta a medias deja a la persona con
+un acceso que nadie pidió y obliga a limpiar a mano. Se validan TODOS los pares capacidad x destino
+antes de insertar y se informan todos los fallos (`failures[]` con `capability`). La decisión
+pending/active se evalúa por capacidad (una sensible nace pendiente, una común activa) porque la
+regla de cuatro ojos es de la capacidad, no del pedido; el `bulk_id` es uno solo para correlacionar.
+El tope es de 100 PARES (no de destinos) para que el costo de validar no crezca con la cantidad de
+capacidades.
+
+**Por qué no hace falta un step-up por ítem.** El step-up es una ventana de 5 minutos por sesión
+(`app/core/step_up.py`): una confirmación de contraseña cubre muchas llamadas. La fricción real
+era hacer 20 clics de aprobar y 20 diálogos de confirmación, no la contraseña.
+

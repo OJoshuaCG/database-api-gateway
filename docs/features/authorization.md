@@ -230,6 +230,13 @@ global, una capacidad puntual sensible o un `sod_override`. `operator` no es ele
 - vencen a los 7 días, con el mismo vencimiento perezoso;
 - solo quien pidió puede **cancelar** (`POST /access-requests/{id}/cancel`); los demás rechazan.
 
+**Capacidades puntuales: decidir en lote.** `POST /capability-grants/decisions` aprueba o rechaza
+hasta 100 solicitudes pendientes de una vez, **de mejor esfuerzo**: cada ítem aplica las mismas reglas
+que `approve`/`reject` (una sola fuente, `_block_reason`) y el que se bloquea no frena a los demás.
+Una confirmación de step-up (ventana de 5 minutos) cubre toda la llamada. Contrato en
+`api-reference-v43.md`. El alta masiva (`.../capability-grants/bulk`) acepta varias capacidades y
+decide pendiente/activa por capacidad, todo o nada.
+
 **Último `access_admin`.** No se puede desactivar ni quitarle la global al último `access_admin`
 activo con credencial: `409 access.last_admin_protected`. El candado corre dentro de la transacción
 de escritura, no solo como pre-chequeo.
@@ -349,7 +356,7 @@ contrato en `api-reference-v29.md` §10.
 - **Cambios de acceso con antes y después completos** (`gateway_user.update`,
   `gateway_user.access_set`): rol base, estado, globales y alcances, con tope de 200 por lado. Los
   datos de contacto se nombran pero no se copian.
-- Capacidades puntuales (`capability_grant.created|requested|approved|rejected|revoked|cancelled|expired`)
+- Capacidades puntuales (`capability_grant.created|requested|approved|rejected|revoked|cancelled|expired|bulk_decided`)
   y elevaciones (`access_request.created|approved|rejected|cancelled|expired`),
   `access.sod_override`, `access.sod_grandfathered`, `access.bootstrap_assignment`,
   `access.bootstrap_window_opened|closed`, `access.elevation_unapproved`, `access.admin_recovery`.
