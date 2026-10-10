@@ -89,6 +89,7 @@ from app.core.authz import (  # noqa: E402
     declared_scope,
     declared_step_up_exempt,
 )
+from app.core.integration_auth import declared_integration_scope  # noqa: E402
 from app.core.scope_targets import _RESOLVERS  # noqa: E402
 from app.services.capability_catalog import (  # noqa: E402
     RETIRED_CAPABILITIES,
@@ -97,6 +98,7 @@ from app.services.capability_catalog import (  # noqa: E402
     role_capabilities,
     spec,
 )
+from app.services.integration_scope_catalog import INTEGRATION_ALLOWED  # noqa: E402
 
 #: Rutas deliberadamente SIN autorización. Lista explícita y corta: la alternativa —una
 #: heurística por prefijo— es cómo `/api/v1/test/*` se quedó sin guard durante meses.
@@ -152,7 +154,7 @@ NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset(
 )
 
 #: Cuántas rutas declaran capacidad. **Solo puede SUBIR.** Ver "EL TRINQUETE".
-MIN_MIGRATED_ROUTES = 196
+MIN_MIGRATED_ROUTES = 208
 
 #: Rutas con capacidad de alcance que NO apuntan a ningún entorno, con el motivo. Es la autoría
 #: de blueprints y los proyectos (escribir una versión no la ejecuta en ninguna BD), más el borrado
@@ -450,6 +452,115 @@ def scope_errors(
     return errores
 
 
+#: Segmento de ruta que delimita la API de integración (bearer REST). Con la barra final a
+#: propósito: ``/integration-tokens`` es la gestión de tokens, con sesión, y NO pertenece acá.
+INTEGRATION_PATH_SEGMENT = "/integration/"
+
+
+def _integration_scope_of(route: APIRoute) -> str | None:
+    """El scope de integración que declara una ruta (``require_integration``), en el árbol resuelto."""
+
+    def walk(dependant) -> str | None:
+        declared = declared_integration_scope(getattr(dependant, "call", None))
+        if declared:
+            return declared
+        for sub in getattr(dependant, "dependencies", []) or []:
+            found = walk(sub)
+            if found:
+                return found
+        return None
+
+    return walk(route.dependant)
+
+
+def _has_session_guard(route: APIRoute) -> bool:
+    """
+    ``True`` si el árbol incluye un guard de SESIÓN: una dependencia con capacidad y sin el
+    marcador de integración. Una ruta bearer que además aceptara cookie reabriría la autoridad
+    ambiente (CSRF) que la separación de las dos autenticaciones existe para cerrar.
+    """
+
+    def walk(dependant) -> bool:
+        call = getattr(dependant, "call", None)
+        if declared_capability(call) and declared_integration_scope(call) is None:
+            return True
+        return any(walk(sub) for sub in getattr(dependant, "dependencies", []) or [])
+
+    return walk(route.dependant)
+
+
+def integration_errors(
+    app,
+    *,
+    allowed_capabilities: dict[str, str] | None = None,
+    expected_scopes: frozenset[str] | None = None,
+) -> list[str]:
+    """
+    Chequeo 9: la superficie de la API de integración es cerrada y coherente.
+
+    * toda ruta bajo ``/integration/`` declara un scope (``require_integration``) y viceversa;
+    * el scope pertenece al vocabulario cerrado (``INTEGRATION_ALLOWED``);
+    * la capacidad declarada es EXACTAMENTE la mapeada para ese scope;
+    * ninguna ruta de integración exige además un guard de sesión;
+    * cada scope esperado tiene al menos una ruta.
+
+    El step-up de estas rutas queda eximido por el marcador de integración (una máquina no puede
+    responder un prompt de password; el emisor lo pasa al crear o ampliar el token), así que el
+    chequeo 7 no necesita entradas en ``STEP_UP_EXEMPT`` y este chequeo enumera la exención.
+
+    Función aparte (como ``scope_errors``) para que el test la ejerza con apps sintéticas.
+    """
+    if allowed_capabilities is None:
+        allowed_capabilities = {
+            scope.value: capability.value for scope, capability in INTEGRATION_ALLOWED.items()
+        }
+    if expected_scopes is None:
+        expected_scopes = frozenset(allowed_capabilities)
+
+    errores: list[str] = []
+    cubiertos: set[str] = set()
+
+    for path, route in _iter_routes(app):
+        methods = ",".join(sorted(route.methods - {"HEAD", "OPTIONS"}))
+        in_integration_prefix = INTEGRATION_PATH_SEGMENT in path
+        scope = _integration_scope_of(route)
+
+        if scope is None:
+            if in_integration_prefix:
+                errores.append(
+                    f"{methods} {path} está bajo {INTEGRATION_PATH_SEGMENT} y no declara scope "
+                    "con require_integration."
+                )
+            continue
+
+        cubiertos.add(scope)
+        if not in_integration_prefix:
+            errores.append(
+                f"{methods} {path} declara el scope de integración '{scope}' fuera de "
+                f"{INTEGRATION_PATH_SEGMENT}."
+            )
+        if scope not in allowed_capabilities:
+            errores.append(
+                f"{methods} {path} declara el scope '{scope}', que no está en INTEGRATION_ALLOWED."
+            )
+        else:
+            declared = _capability_of(route)
+            if declared != allowed_capabilities[scope]:
+                errores.append(
+                    f"{methods} {path} declara la capacidad '{declared}' pero el scope '{scope}' "
+                    f"mapea a '{allowed_capabilities[scope]}'."
+                )
+        if _has_session_guard(route):
+            errores.append(
+                f"{methods} {path} es una ruta de integración y además exige un guard de sesión: "
+                "solo admite el bearer."
+            )
+
+    for scope in sorted(expected_scopes - cubiertos):
+        errores.append(f"El scope de integración '{scope}' no tiene ninguna ruta.")
+    return errores
+
+
 def main() -> int:
     from main import app
 
@@ -568,6 +679,8 @@ def main() -> int:
     )
 
     errores.extend(step_up_errors(app, exempt=STEP_UP_EXEMPT))
+
+    errores.extend(integration_errors(app))
 
     if "--list" in sys.argv:
         print(f"SCOPE_PENDING ({len(SCOPE_PENDING)}), SCOPE_EXEMPT ({len(SCOPE_EXEMPT)})")
