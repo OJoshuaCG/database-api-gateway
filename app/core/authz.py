@@ -414,6 +414,10 @@ SelfRead = Annotated[Actor, Depends(require(Capability.SELF_READ))]
 #: ``/api-tokens`` usa ``AccessAdminOrOwnTokens``. Sin el filtro por dueño del controller, este
 #: alias NO acota nada.
 TokensOwn = Annotated[Actor, Depends(require(Capability.TOKENS_OWN))]
+#: Alias público de ``integration_tokens.own``. Igual que ``TokensOwn``: ninguna ruta lo usa solo
+#: (``/integration-tokens`` usa ``require_either(access.admin, integration_tokens.own)``) y sin el
+#: filtro por dueño del controller no acota nada.
+IntegrationTokensOwn = Annotated[Actor, Depends(require(Capability.INTEGRATION_TOKENS_OWN))]
 
 ServersRead = Annotated[Actor, Depends(require(Capability.SERVERS_READ))]
 ServersAdmin = Annotated[Actor, Depends(require(Capability.SERVERS_ADMIN))]
@@ -484,6 +488,13 @@ AccessAdmin = Annotated[Actor, Depends(require(Capability.ACCESS_ADMIN_CAP))]
 #: actor). Quien no tiene ``access.admin`` TIENE que ser acotado por dueño en el controller.
 AccessAdminOrOwnTokens = Annotated[
     Actor, Depends(require_either(Capability.ACCESS_ADMIN_CAP, Capability.TOKENS_OWN))
+]
+#: ``/integration-tokens``: ``access.admin`` (lista y revoca los tokens de todos) o
+#: ``integration_tokens.own`` (administra los propios). Igual que ``AccessAdminOrOwnTokens``, quien
+#: no tiene ``access.admin`` TIENE que ser acotado por dueño en el controller.
+AccessAdminOrOwnIntegrationTokens = Annotated[
+    Actor,
+    Depends(require_either(Capability.ACCESS_ADMIN_CAP, Capability.INTEGRATION_TOKENS_OWN)),
 ]
 #: Lectura de la auditoría (``GET /audit-log``). Solo la global ``security_officer``.
 AuditRead = Annotated[Actor, Depends(require(Capability.AUDIT_READ))]

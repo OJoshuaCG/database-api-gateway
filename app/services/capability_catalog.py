@@ -138,6 +138,10 @@ class Capability(StrEnum):
     #: emitió (``api_tokens.created_by_admin_id``). No es la administración de tokens ajenos: esa
     #: sigue siendo ``access.admin``. Ver el comentario de su ``_spec``.
     TOKENS_OWN = "tokens.own"
+    #: Emitir, listar, editar y revocar SOLO los tokens de INTEGRACIÓN que el propio actor emitió
+    #: (``integration_tokens.created_by_admin_id``). Es la gemela de ``TOKENS_OWN`` para la API REST
+    #: de integración; la administración de tokens ajenos sigue siendo ``access.admin``.
+    INTEGRATION_TOKENS_OWN = "integration_tokens.own"
 
     # -- Inventario de servidores (plano de control) ------------------------ #
     SERVERS_READ = "servers.read"
@@ -319,6 +323,17 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
     _spec(
         Capability.TOKENS_OWN,
         "Emitir y administrar sus propios tokens de agente",
+        axis="global",
+    ),
+    # `integration_tokens.own` es la gemela de `tokens.own` y hereda SUS flags por las mismas
+    # razones (cada uno lo fija un invariante, no es una elección): `viewer` no muta ni divulga,
+    # así que `mutates=False`/`discloses=False` (el step-up de la ruta lo exige la spec de
+    # `access.admin` y, al agregar un scope de escritura, la del scope mapeado); `agent=False`
+    # porque un token no emite otro token (ni de agente ni de integración); eje global porque no
+    # hay entorno ni servidor al que anclarla, y por eso tampoco es otorgable ni sensible.
+    _spec(
+        Capability.INTEGRATION_TOKENS_OWN,
+        "Emitir y administrar sus propios tokens de integración",
         axis="global",
     ),
     # `servers` no tiene nivel intermedio A PROPÓSITO: `read` ya expone host, puerto y usuario
@@ -598,6 +613,7 @@ _VIEWER: frozenset[Capability] = frozenset(
         Capability.SELF_READ,
         # Como `self.read`: la tienen los tres roles (por monotonía, viewer ⊆ operator ⊆ owner).
         Capability.TOKENS_OWN,
+        Capability.INTEGRATION_TOKENS_OWN,
         Capability.SERVERS_READ,
         Capability.ENGINE_USERS_READ,
         Capability.DATABASES_READ,
