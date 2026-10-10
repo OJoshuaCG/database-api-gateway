@@ -13,7 +13,6 @@ LO QUE NO HACE: autenticar. Eso pasa antes, en la dependencia — así el kill s
 verificación del bearer quedan en un choke point único.
 """
 
-import json
 from typing import Any
 
 from app.core.actor import Actor
@@ -22,15 +21,11 @@ from app.exceptions import AppHttpException
 from app.mcp import jsonrpc, protocol
 from app.mcp.context import ToolContext
 from app.mcp.registry import BY_NAME, tools_for
+# ``MAX_RESULT_BYTES`` vive en ``result_budget`` (el tope y su fórmula de medida, compartidos con las
+# tools que miden antes de responder) y se reexporta acá: ``dispatch.MAX_RESULT_BYTES`` sigue siendo
+# el nombre con el que lo leen los tests y el assert de más abajo.
+from app.mcp.result_budget import MAX_RESULT_BYTES, serialized_result_bytes
 from app.services import audit
-
-#: Tope de bytes de la respuesta de una tool, **después** de serializar. El tope de objetos
-#: (antes de consultar) es responsabilidad de cada tool; éste es la red de abajo, para el caso
-#: en que N objetos chicos sumen una respuesta enorme.
-#:
-#: Se corta con un ERROR y **nunca truncando**: un JSON truncado que el agente parsea a medias
-#: es peor que un fallo, porque le hace creer que el esquema es más chico de lo que es.
-MAX_RESULT_BYTES = 512 * 1024
 
 # El presupuesto de filas de las tools de datos (``MCP_DATA_MAX_RESULT_BYTES``, truncando por fila)
 # tiene que dejar holgura bajo este tope: si lo igualara o superara, el recorte por fila nunca
@@ -245,11 +240,21 @@ def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Resp
         # LA traducción que este módulo existe para hacer: la negación del gate viaja como
         # contenido de TOOL, con su código del vocabulario cerrado. Un error de tool en el campo
         # `error` haría que el agente crea que el servidor está roto y reintente.
-        codigo = (exc.public_context or {}).get("code") or "mcp.error"
+        public_context = exc.public_context or {}
+        codigo = public_context.get("code") or "mcp.error"
+        # ``details`` viaja solo si es un dict: es el único dato estructurado que una tool puede
+        # sumar a su error (hoy, los tamaños de ``mcp.blueprint_sql_too_large``). Cualquier otra
+        # forma se descarta en lugar de serializar algo que el agente no puede interpretar.
+        error_details = public_context.get("details")
         _audit(
             spec.name, actor, ok=False, detail=f"denegado: {codigo}", touched_engine=spec.touches_engine
         )
-        return _ok(rid, jsonrpc.tool_error_result(codigo, exc.message))
+        return _ok(
+            rid,
+            jsonrpc.tool_error_result(
+                codigo, exc.message, details=error_details if isinstance(error_details, dict) else None
+            ),
+        )
     except Exception:  # noqa: BLE001 — ver el comentario
         # Cualquier otra cosa NO puede salir con detalle: un traceback o un `str(exc)` del motor
         # por este canal termina en el contexto de un modelo y de ahí en la pantalla de
@@ -265,8 +270,8 @@ def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Resp
         )
 
     payload_tool = jsonrpc.tool_result_payload(resultado)
-    serializado = json.dumps(payload_tool, ensure_ascii=False, default=str)
-    if len(serializado.encode("utf-8")) > MAX_RESULT_BYTES:
+    response_bytes = serialized_result_bytes(resultado)
+    if response_bytes > MAX_RESULT_BYTES:
         _audit(
             spec.name,
             actor,
@@ -290,7 +295,7 @@ def handle(payload: Any, actor: Actor, headers: dict[str, str]) -> protocol.Resp
         spec.name,
         actor,
         ok=True,
-        detail=f"{len(serializado)} bytes",
+        detail=f"{response_bytes} bytes",
         # ``run_select`` devuelve el sobre del borrador (``touches_engine: false``) cuando rechaza o
         # clasifica sin ejecutar: la fila no puede decir que se tocó el motor si no se conectó.
         touched_engine=spec.touches_engine

@@ -59,7 +59,7 @@ def tool_result_payload(payload: dict) -> dict:
     }
 
 
-def tool_error_result(code: str, message: str) -> dict:
+def tool_error_result(code: str, message: str, details: dict | None = None) -> dict:
     """
     El ``result`` de una tool que falló: ``isError: true``, **no** el campo ``error``.
 
@@ -70,10 +70,17 @@ def tool_error_result(code: str, message: str) -> dict:
     Lleva el ``code`` del vocabulario cerrado además del mensaje, porque el agente puede
     reaccionar a un código y no a una frase — y porque el mensaje está en español para el
     operador que lo va a leer.
+
+    ``details`` (opcional) es un objeto con datos que el agente puede usar para corregir el pedido,
+    por ejemplo los tamaños de una respuesta que no entró. Solo se publica si es un ``dict``: sin él
+    el error conserva exactamente la forma de siempre, ``{"error": {"code", "message"}}``.
     """
     import json
 
-    payload = {"error": {"code": code, "message": message}}
+    error = {"code": code, "message": message}
+    if isinstance(details, dict):
+        error["details"] = details
+    payload = {"error": error}
     return {
         "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
         "structuredContent": payload,

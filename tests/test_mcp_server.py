@@ -226,7 +226,13 @@ def test_tools_list_publishes_closed_schemas(client, admin_client, mcp_on):
     token = _crear_token(admin_client, project_id=pid)["token"]
 
     tools = _rpc(client, token, "tools/list").json()["result"]["tools"]
-    assert [t["name"] for t in tools] == ["list_databases"]
+    # El token por defecto tiene solo ``blueprints.read``: ve el inventario de bases y las dos
+    # tools de blueprints, que no abren ningún motor.
+    assert [t["name"] for t in tools] == [
+        "list_databases",
+        "list_blueprints",
+        "list_blueprint_migrations",
+    ]
     for t in tools:
         assert t["inputSchema"]["additionalProperties"] is False
 

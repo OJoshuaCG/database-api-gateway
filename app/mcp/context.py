@@ -67,6 +67,57 @@ class ToolContext:
 
         return open_readonly(self.actor, database_id, self.capability)
 
+    def list_blueprints(self):
+        """
+        Los blueprints visibles para este token (``BlueprintSummary``), sin SQL ni autoría.
+
+        Visible es "vinculado a mi proyecto y a ningún otro": la regla vive en el resolvedor, que
+        también responde el 413 si hay más de los que se pueden listar sin recortar.
+        """
+        from app.controllers.target_resolution import reachable_blueprints
+
+        return reachable_blueprints(self.actor, self.capability)
+
+    def list_blueprint_migrations(
+        self, blueprint_id: int, after_version: str | None, limit: int
+    ):
+        """
+        Una página de migraciones de un blueprint visible (``BlueprintMigrationPage``), sin cuerpos.
+
+        Un blueprint que el token no ve —ajeno, compartido o inexistente— responde igual:
+        ``mcp.not_found``. ``after_version`` y ``limit`` ya vienen validados por el handler.
+        """
+        from app.controllers.target_resolution import blueprint_migration_page
+
+        return blueprint_migration_page(
+            self.actor, self.capability, blueprint_id, after_version, limit
+        )
+
+    def assert_blueprint_sql_enabled(self) -> None:
+        """
+        Kill switch de ``get_blueprint_migration``: levanta 403 ``mcp.blueprint_sql_disabled`` si
+        está apagado.
+
+        Lo llama el handler ANTES de validar argumentos: apagado, no hay diferencia observable con
+        una tool que no existe. ``get_blueprint_migration`` lo vuelve a mirar.
+        """
+        from app.controllers.target_resolution import assert_blueprint_sql_enabled
+
+        assert_blueprint_sql_enabled()
+
+    def get_blueprint_migration(self, blueprint_id: int, version: str):
+        """
+        El SQL de UNA migración de un blueprint visible (``BlueprintMigrationSql``), ya redactado.
+
+        Recibe ``blueprint_id`` y ``version`` YA validados por el handler. Un blueprint que el token
+        no ve y una versión que no existe responden igual: ``mcp.not_found``. La auditoría
+        fail-closed y la lectura viven en ``target_resolution.read_blueprint_migration``; no abre
+        ninguna conexión a un motor.
+        """
+        from app.controllers.target_resolution import read_blueprint_migration
+
+        return read_blueprint_migration(self.actor, self.capability, blueprint_id, version)
+
     def draft_query(self, database_id: int, sql: str) -> dict:
         """
         Clasifica el SQL de un agente SIN ejecutarlo y devuelve el sobre ya armado.

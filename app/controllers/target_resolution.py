@@ -45,6 +45,7 @@ enumerara lo negado sería el mismo oráculo por otra vía.
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 
 from app.core.actor import Actor
 from app.exceptions import AppHttpException
@@ -95,6 +96,27 @@ def assert_agent_scope(actor: Actor, capability: Capability) -> None:
         )
 
 
+def _exclusive_model_ids(session):
+    """
+    Subconsulta con los blueprints que pertenecen a EXACTAMENTE un proyecto (columna ``model_id``).
+
+    Es la mitad del arreglo de la fuga cross-proyecto: sin esto, un blueprint compartido entre dos
+    proyectos hace que el token de uno alcance las bases (y las migraciones) del otro. Vive en un
+    solo lugar porque la regla de visibilidad tiene que ser idéntica para las bases y para los
+    blueprints: si cada camino arma su propia copia, una se relaja sin que la otra lo note.
+    """
+    from sqlalchemy import func
+
+    from app.models.project import ProjectDatabaseModel
+
+    return (
+        session.query(ProjectDatabaseModel.model_id)
+        .group_by(ProjectDatabaseModel.model_id)
+        .having(func.count(func.distinct(ProjectDatabaseModel.project_id)) == 1)
+        .subquery()
+    )
+
+
 def reachable_databases(actor: Actor, capability: Capability) -> list[ReachableDatabase]:
     """
     Las bases que el agente alcanza: proyecto del token **Y** entorno permite **Y** base con
@@ -109,8 +131,6 @@ def reachable_databases(actor: Actor, capability: Capability) -> list[ReachableD
     habilitar un entorno abriría de golpe todas sus bases, incluidas las que nadie revisó y las
     que se creen después.
     """
-    from sqlalchemy import func
-
     from app.core.database import Database
     from app.core.environments import MCP_MAX_OBJECTS
     from app.models.database_model import DatabaseModel
@@ -123,15 +143,8 @@ def reachable_databases(actor: Actor, capability: Capability) -> list[ReachableD
 
     session = Database().get_declarative_base_session()
     try:
-        # Blueprints que pertenecen a EXACTAMENTE un proyecto. Es la mitad del arreglo de la
-        # fuga cross-proyecto: sin esto, un blueprint compartido entre dos proyectos hace que el
-        # token de uno alcance las bases del otro.
-        exclusivos = (
-            session.query(ProjectDatabaseModel.model_id)
-            .group_by(ProjectDatabaseModel.model_id)
-            .having(func.count(func.distinct(ProjectDatabaseModel.project_id)) == 1)
-            .subquery()
-        )
+        # Es la mitad del arreglo de la fuga cross-proyecto: ver ``_exclusive_model_ids``.
+        exclusivos = _exclusive_model_ids(session)
         filas = (
             session.query(ManagedDatabase, Server, DatabaseModel, Environment)
             .join(Server, Server.id == ManagedDatabase.server_id)
@@ -241,8 +254,6 @@ def resolve_agent_database(
     """
     from datetime import UTC, datetime, timedelta
 
-    from sqlalchemy import func
-
     from app.core.database import Database
     from app.core.environments import MCP_READONLY_MAX_AGE_DAYS
     from app.models.database_model import DatabaseModel
@@ -259,12 +270,7 @@ def resolve_agent_database(
 
     session = Database().get_declarative_base_session()
     try:
-        exclusivos = (
-            session.query(ProjectDatabaseModel.model_id)
-            .group_by(ProjectDatabaseModel.model_id)
-            .having(func.count(func.distinct(ProjectDatabaseModel.project_id)) == 1)
-            .subquery()
-        )
+        exclusivos = _exclusive_model_ids(session)
         fila = (
             session.query(ManagedDatabase, Server, DatabaseModel, Environment)
             .join(Server, Server.id == ManagedDatabase.server_id)
@@ -1428,6 +1434,462 @@ def reachable_clone_jobs(actor: Actor, capability: Capability) -> list[dict]:
         ]
     finally:
         session.close()
+
+
+# --------------------------------------------------------------------------- #
+# Blueprints y sus migraciones (solo metadatos, nunca SQL)                       #
+# --------------------------------------------------------------------------- #
+#
+# Un blueprint es visible para un token si está vinculado a SU proyecto y a ningún otro
+# (``_exclusive_model_ids``), con independencia de si alguna de sus bases es alcanzable: el
+# blueprint es la plantilla, no la base. Estas consultas eligen columnas a mano y NUNCA cargan
+# ``up_sql``, ``down_sql`` ni las variantes por motor, que son LONGTEXT y pueden pesar megabytes.
+
+#: Tope de blueprints por listado. Sin paginación: pasarlo es un ERROR y no un recorte, porque una
+#: lista cortada le haría creer al agente que no hay más (mismo criterio que ``_MAX_JOBS``).
+MAX_BLUEPRINTS_PER_LIST = 100
+
+
+@dataclass(frozen=True, slots=True)
+class BlueprintSummary:
+    """Un blueprint del proyecto del token. Sin autoría: eso exigiría nombres de administradores."""
+
+    blueprint_id: int
+    slug: str
+    name: str
+    description: str | None
+    current_version: str
+    is_active: bool
+    charset: str | None
+    collation: str | None
+    migration_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class BlueprintMigrationSummary:
+    """Una migración sin cuerpos SQL: ``has_rollback`` dice si existe ``down_sql``, sin leerlo."""
+
+    version: str
+    name: str
+    kind: str
+    is_baseline: bool
+    reviewed: bool
+    has_rollback: bool
+    source_engine: str | None
+    has_procedural_objects: bool
+    checksum: str
+    created_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class BlueprintMigrationPage:
+    """Una página de migraciones de un blueprint visible, más el total del blueprint."""
+
+    blueprint_id: int
+    blueprint_slug: str
+    blueprint_current_version: str
+    migrations: tuple[BlueprintMigrationSummary, ...]
+    total: int
+    next_after_version: str | None
+
+
+def _blueprint_not_found() -> AppHttpException:
+    """
+    LA respuesta para un blueprint que no se puede ver. Un blueprint compartido con otro proyecto,
+    uno ajeno y uno inexistente tienen que producir exactamente el mismo código y el mismo mensaje:
+    cualquier diferencia le diría al agente que el blueprint existe.
+    """
+    return _deny(codes.CODE_NOT_FOUND, 404, "El blueprint no existe o no es de tu proyecto.")
+
+
+def reachable_blueprints(actor: Actor, capability: Capability) -> list[BlueprintSummary]:
+    """
+    Los blueprints visibles para el token, ordenados por ``slug``. Más de
+    ``MAX_BLUEPRINTS_PER_LIST`` es un 413 ``mcp.too_many_objects`` y nunca una lista cortada.
+
+    El conteo de migraciones sale de una subconsulta agrupada y un OUTER JOIN, así que un blueprint
+    sin migraciones aparece con ``0`` en lugar de desaparecer.
+    """
+    from sqlalchemy import func
+
+    from app.core.database import Database
+    from app.models.database_model import DatabaseModel
+    from app.models.model_migration import ModelMigration
+    from app.models.project import ProjectDatabaseModel
+
+    assert_agent_scope(actor, capability)
+
+    session = Database().get_declarative_base_session()
+    try:
+        exclusivos = _exclusive_model_ids(session)
+        migrations_per_model = (
+            session.query(
+                ModelMigration.model_id.label("model_id"),
+                func.count(ModelMigration.id).label("migration_count"),
+            )
+            .group_by(ModelMigration.model_id)
+            .subquery()
+        )
+        rows = (
+            session.query(
+                DatabaseModel.id,
+                DatabaseModel.slug,
+                DatabaseModel.name,
+                DatabaseModel.description,
+                DatabaseModel.current_version,
+                DatabaseModel.is_active,
+                DatabaseModel.charset,
+                DatabaseModel.collation,
+                func.coalesce(migrations_per_model.c.migration_count, 0),
+            )
+            .join(ProjectDatabaseModel, ProjectDatabaseModel.model_id == DatabaseModel.id)
+            .outerjoin(
+                migrations_per_model, migrations_per_model.c.model_id == DatabaseModel.id
+            )
+            .filter(
+                ProjectDatabaseModel.project_id == actor.project_id,
+                DatabaseModel.id.in_(session.query(exclusivos.c.model_id)),
+            )
+            .order_by(DatabaseModel.slug)
+            # Uno más que el tope para distinguir "justo el tope" de "se pasó".
+            .limit(MAX_BLUEPRINTS_PER_LIST + 1)
+            .all()
+        )
+        if len(rows) > MAX_BLUEPRINTS_PER_LIST:
+            raise AppHttpException(
+                message=(
+                    f"El proyecto tiene más de {MAX_BLUEPRINTS_PER_LIST} blueprints. No se "
+                    "trunca a propósito: una lista cortada haría creer que no hay más."
+                ),
+                status_code=413,
+                public_context={"code": codes.CODE_TOO_MANY_OBJECTS},
+            )
+        return [
+            BlueprintSummary(
+                blueprint_id=row[0],
+                slug=row[1],
+                name=row[2],
+                description=row[3],
+                current_version=row[4],
+                is_active=bool(row[5]),
+                charset=row[6],
+                collation=row[7],
+                migration_count=int(row[8]),
+            )
+            for row in rows
+        ]
+    finally:
+        session.close()
+
+
+def blueprint_migration_page(
+    actor: Actor,
+    capability: Capability,
+    blueprint_id: int,
+    after_version: str | None,
+    limit: int,
+) -> BlueprintMigrationPage:
+    """
+    Una página de migraciones de UN blueprint, sin cuerpos SQL, en orden numérico de versión.
+
+    La visibilidad se resuelve PRIMERO y con una consulta propia: si el blueprint no es visible
+    se responde ``mcp.not_found`` sin haber tocado ``model_migrations``, así que el costo y la
+    respuesta no distinguen un blueprint ajeno de uno inexistente.
+
+    ORDEN NUMÉRICO: ``version`` es ``String(10)`` y se crea con ``^\\d{4,10}$`` rellenada a 4
+    dígitos o más, de modo que ordenar por ``(length(version), version)`` equivale a ordenar por
+    el número (``0009`` < ``0010`` < ``10000``). Un orden alfabético puro pondría ``10000`` antes
+    que ``9999``. Se usa ``length`` y no ``char_length`` porque es la única que existe en los tres
+    motores; el patrón ``\\d`` de la API acepta también dígitos de otros alfabetos, y para esos
+    ``length`` (bytes en MySQL) y el orden alfabético no son numéricos: no los crea ningún camino
+    del producto, pero la garantía de orden vale solo para dígitos ASCII.
+
+    PAGINACIÓN POR CLAVE: ``after_version`` excluye todo lo ``<=`` en ese mismo orden. Si entre dos
+    pedidos se renumeran las migraciones, una versión puede saltearse o repetirse: es aceptado.
+    ``next_after_version`` es la última versión de la página solo si quedan más.
+    """
+    from sqlalchemy import and_, func, or_
+
+    from app.core.database import Database
+    from app.models.database_model import DatabaseModel
+    from app.models.model_migration import ModelMigration
+    from app.models.project import ProjectDatabaseModel
+
+    assert_agent_scope(actor, capability)
+    if not isinstance(blueprint_id, int) or isinstance(blueprint_id, bool) or blueprint_id < 1:
+        raise _blueprint_not_found()
+
+    session = Database().get_declarative_base_session()
+    try:
+        exclusivos = _exclusive_model_ids(session)
+        visible_blueprint = (
+            session.query(DatabaseModel.id, DatabaseModel.slug, DatabaseModel.current_version)
+            .join(ProjectDatabaseModel, ProjectDatabaseModel.model_id == DatabaseModel.id)
+            .filter(
+                DatabaseModel.id == blueprint_id,
+                ProjectDatabaseModel.project_id == actor.project_id,
+                DatabaseModel.id.in_(session.query(exclusivos.c.model_id)),
+            )
+            .first()
+        )
+        if visible_blueprint is None:
+            raise _blueprint_not_found()
+
+        total = (
+            session.query(func.count(ModelMigration.id))
+            .filter(ModelMigration.model_id == blueprint_id)
+            .scalar()
+        )
+
+        version_length = func.length(ModelMigration.version)
+        page_query = session.query(
+            ModelMigration.version,
+            ModelMigration.name,
+            ModelMigration.kind,
+            ModelMigration.is_baseline,
+            ModelMigration.reviewed,
+            ModelMigration.down_sql.isnot(None).label("has_rollback"),
+            ModelMigration.source_engine,
+            ModelMigration.has_non_portable,
+            ModelMigration.checksum,
+            ModelMigration.created_at,
+        ).filter(ModelMigration.model_id == blueprint_id)
+        if after_version is not None:
+            page_query = page_query.filter(
+                or_(
+                    version_length > len(after_version),
+                    and_(
+                        version_length == len(after_version),
+                        ModelMigration.version > after_version,
+                    ),
+                )
+            )
+        rows = (
+            page_query.order_by(version_length, ModelMigration.version)
+            # Uno más que el límite para saber si queda otra página sin una segunda consulta.
+            .limit(limit + 1)
+            .all()
+        )
+        has_more_pages = len(rows) > limit
+        page_rows = rows[:limit]
+        migrations = tuple(
+            BlueprintMigrationSummary(
+                version=row[0],
+                name=row[1],
+                kind=row[2],
+                is_baseline=bool(row[3]),
+                reviewed=bool(row[4]),
+                has_rollback=bool(row[5]),
+                source_engine=row[6],
+                has_procedural_objects=bool(row[7]),
+                checksum=row[8],
+                created_at=row[9],
+            )
+            for row in page_rows
+        )
+        next_after_version = migrations[-1].version if has_more_pages else None
+        return BlueprintMigrationPage(
+            blueprint_id=visible_blueprint[0],
+            blueprint_slug=visible_blueprint[1],
+            blueprint_current_version=visible_blueprint[2],
+            migrations=migrations,
+            total=int(total or 0),
+            next_after_version=next_after_version,
+        )
+    finally:
+        session.close()
+
+
+# --------------------------------------------------------------------------- #
+# SQL de una migración de blueprint (get_blueprint_migration)                    #
+# --------------------------------------------------------------------------- #
+#
+# A diferencia de las listas de arriba, ESTA lectura sí carga los cuerpos SQL: son texto de
+# terceros (una migración ``kind='data'`` lleva filas semilla) que llega al contexto de un modelo.
+# Por eso tiene su propio scope (``data.blueprint_sql``), su kill switch y una auditoría de
+# intención fail-closed. No abre ninguna conexión a un motor: lee la BD de metadatos del gateway.
+
+_BLUEPRINT_SQL_AUDIT_ACTION = "mcp.get_blueprint_migration"
+
+
+@dataclass(frozen=True, slots=True)
+class BlueprintMigrationSql:
+    """
+    Una migración con sus cuerpos SQL ya redactados (best effort), sin sesión abierta.
+
+    ``redactions`` es categoría -> cantidad, sumada sobre los tres cuerpos. Sin ``up_sql_mysql``,
+    ``up_sql_postgresql`` ni la traducción (diferidos) y sin autoría (exigiría nombres de
+    administradores).
+    """
+
+    blueprint_id: int
+    blueprint_slug: str
+    blueprint_current_version: str
+    version: str
+    name: str
+    kind: str
+    is_baseline: bool
+    reviewed: bool
+    source_engine: str | None
+    has_procedural_objects: bool
+    checksum: str
+    up_sql: str
+    down_sql: str | None
+    down_sql_suggested: str | None
+    created_at: datetime | None
+    redactions: dict[str, int]
+
+
+def assert_blueprint_sql_enabled() -> None:
+    """
+    Kill switch de ``get_blueprint_migration`` (``MCP_BLUEPRINT_SQL_ENABLED``), leído en CADA llamada.
+
+    Es el PRIMER paso de la tool y no lee ni el inventario: apagado, la respuesta no se distingue
+    por tiempo ni por efectos de "el blueprint no existe". Es un 403 con código propio. NO apaga la
+    lectura REST del SQL de migraciones (``blueprints.read``): solo la que llega a un agente.
+    """
+    from app.services.capability_catalog import data_capability_enabled
+
+    if not data_capability_enabled(Capability.DATA_BLUEPRINT_SQL):
+        raise _deny(
+            codes.CODE_BLUEPRINT_SQL_DISABLED,
+            403,
+            "La lectura del SQL de migraciones de blueprints está apagada en este gateway "
+            "(kill switch).",
+        )
+
+
+def _record_blueprint_sql_intent(actor: Actor, blueprint_id: int, version: str) -> None:
+    """
+    Intención de auditoría ANTES de entregar el SQL. FAIL-CLOSED: si no se puede escribir, el
+    agente recibe ``AUDIT_UNAVAILABLE`` y ningún cuerpo sale.
+
+    Guarda el token y la versión pedida, NUNCA un cuerpo. ``touched_engine`` es ``False``: no hay
+    conexión a ningún motor, pero la lectura exige rastro garantizado igual.
+    """
+    from app.core.logger import get_logger
+    from app.services import audit
+
+    detail = f"token={getattr(actor, 'token_id', None)} version={version}"
+    try:
+        audit.record_intent(
+            _BLUEPRINT_SQL_AUDIT_ACTION,
+            admin=actor,
+            target_type="database_model",
+            target_id=blueprint_id,
+            touched_engine=False,
+            detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-closed: sin auditoría no sale ningún cuerpo SQL
+        get_logger(__name__).error("Auditoría de intención caída; no se entrega SQL de migración")
+        raise _deny(
+            codes.REASON_AUDIT_UNAVAILABLE,
+            503,
+            "No se pudo registrar la auditoría; no se entregó ningún SQL.",
+        ) from exc
+
+
+def read_blueprint_migration(
+    actor: Actor, capability: Capability, blueprint_id: int, version: str
+) -> BlueprintMigrationSql:
+    """
+    ``get_blueprint_migration``: el SQL de UNA migración de un blueprint visible.
+
+    Orden (cada paso corta el siguiente):
+
+    1. **Kill switch** (``assert_blueprint_sql_enabled``): antes de leer nada.
+    2. Scope del token (``data.blueprint_sql``).
+    3. UNA consulta con el filtro de proyecto y de exclusividad dentro (migración JOIN blueprint
+       JOIN pivote): un blueprint ajeno, uno compartido, uno inexistente y una versión que no
+       existe fallan igual, con ``mcp.not_found`` y el mismo mensaje que las listas.
+    4. ``record_intent`` FAIL-CLOSED (token + versión, jamás un cuerpo).
+    5. Redacción de credenciales por cuerpo (``redact_definition``) con los conteos sumados.
+
+    Los cuerpos ya están en memoria cuando se audita: si la auditoría falla se descartan sin
+    entregarse. El tope de tamaño de la respuesta lo aplica el handler, que es quien conoce el
+    sobre completo.
+    """
+    from app.core.database import Database
+    from app.models.database_model import DatabaseModel
+    from app.models.model_migration import ModelMigration
+    from app.models.project import ProjectDatabaseModel
+    from app.services.db_admin.definition_redaction import redact_definition
+
+    assert_blueprint_sql_enabled()
+    assert_agent_scope(actor, capability)
+    blueprint_id_is_valid = (
+        isinstance(blueprint_id, int) and not isinstance(blueprint_id, bool) and blueprint_id >= 1
+    )
+    if not blueprint_id_is_valid or not isinstance(version, str):
+        raise _blueprint_not_found()
+
+    session = Database().get_declarative_base_session()
+    try:
+        exclusivos = _exclusive_model_ids(session)
+        row = (
+            session.query(
+                DatabaseModel.id,
+                DatabaseModel.slug,
+                DatabaseModel.current_version,
+                ModelMigration.version,
+                ModelMigration.name,
+                ModelMigration.kind,
+                ModelMigration.is_baseline,
+                ModelMigration.reviewed,
+                ModelMigration.source_engine,
+                ModelMigration.has_non_portable,
+                ModelMigration.checksum,
+                ModelMigration.up_sql,
+                ModelMigration.down_sql,
+                ModelMigration.down_sql_suggested,
+                ModelMigration.created_at,
+            )
+            .select_from(ModelMigration)
+            .join(DatabaseModel, DatabaseModel.id == ModelMigration.model_id)
+            .join(ProjectDatabaseModel, ProjectDatabaseModel.model_id == DatabaseModel.id)
+            .filter(
+                ModelMigration.model_id == blueprint_id,
+                ModelMigration.version == version,
+                ProjectDatabaseModel.project_id == actor.project_id,
+                DatabaseModel.id.in_(session.query(exclusivos.c.model_id)),
+            )
+            .first()
+        )
+    finally:
+        session.close()
+    if row is None:
+        raise _blueprint_not_found()
+
+    _record_blueprint_sql_intent(actor, row[0], row[3])
+
+    redaction_counts: dict[str, int] = {}
+
+    def redact_body(body: str | None) -> str | None:
+        if body is None:
+            return None
+        redacted = redact_definition(body)
+        for category, hits in redacted.redactions.items():
+            redaction_counts[category] = redaction_counts.get(category, 0) + hits
+        return redacted.text
+
+    return BlueprintMigrationSql(
+        blueprint_id=row[0],
+        blueprint_slug=row[1],
+        blueprint_current_version=row[2],
+        version=row[3],
+        name=row[4],
+        kind=row[5],
+        is_baseline=bool(row[6]),
+        reviewed=bool(row[7]),
+        source_engine=row[8],
+        has_procedural_objects=bool(row[9]),
+        checksum=row[10],
+        up_sql=redact_body(row[11]),
+        down_sql=redact_body(row[12]),
+        down_sql_suggested=redact_body(row[13]),
+        created_at=row[14],
+        redactions=redaction_counts,
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -85,6 +85,19 @@ WARN_ROUTINE_NOT_FOUND_OR_NOT_VISIBLE = "mcp.warn.routine_not_found_or_not_visib
 #: frontera: el aviso cuenta lo enmascarado, no promete que no quede nada.
 WARN_BODIES_REDACTED = "mcp.warn.bodies_redacted"
 
+#: ``get_blueprint_migration`` con el kill switch ``MCP_BLUEPRINT_SQL_ENABLED`` apagado. Se evalúa
+#: ANTES de leer el inventario, igual que ``mcp.definitions_disabled``.
+CODE_BLUEPRINT_SQL_DISABLED = "mcp.blueprint_sql_disabled"
+#: El SQL de la migración no entra en la respuesta. Se corta con un ERROR y nunca recortando: un
+#: ``up_sql`` cortado a mitad es peor que ausente. Viaja con ``details`` (``sql_bytes``,
+#: ``response_bytes``, ``max_response_bytes``) para que el agente sepa por cuánto no entró.
+CODE_BLUEPRINT_SQL_TOO_LARGE = "mcp.blueprint_sql_too_large"
+#: La migración es de datos-semilla (``kind='data'``): sus sentencias llevan filas de terceros, no
+#: solo estructura.
+WARN_BLUEPRINT_DATA_MIGRATION = "mcp.warn.blueprint_data_migration"
+#: Algún cuerpo SQL devuelto tuvo credenciales enmascaradas. Best effort, no una frontera.
+WARN_BLUEPRINT_SQL_REDACTED = "mcp.warn.blueprint_sql_redacted"
+
 #: ``search_schema`` no pudo leer todo lo que debía: el tope de tablas escaneadas por llamada
 #: (``MCP_SEARCH_MAX_TABLES``) o el presupuesto de tiempo lo cortaron. Los resultados son válidos
 #: pero PARCIALES para columnas y comentarios de las tablas no escaneadas.
