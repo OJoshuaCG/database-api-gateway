@@ -340,6 +340,27 @@ El resto tiene defaults sanos y solo se toca para ajustar:
 | `MCP_MAX_BODY_KIB`       | `256`         | Tope del cuerpo del POST, aplicado en la app           |
 | `MCP_RATE_LIMIT`         | `120/minute`  | Límite por token de agente (fallback: por IP)          |
 
+### API de integración (tokens bearer por usuario)
+
+También comparte el despliegue (`/api/v1/integration/*` y `/api/v1/integration-tokens`). Nace **apagada**: sin
+`INTEGRATION_API_ENABLED=True` toda ruta `/integration/*` responde `503 integration.disabled`. Se lee al
+importar el módulo: cambiarla exige redeploy.
+
+| Variable                                | Default      | Para qué                                                        |
+|-----------------------------------------|--------------|-----------------------------------------------------------------|
+| `INTEGRATION_API_ENABLED`               | `false`      | Kill switch                                                     |
+| `INTEGRATION_TOKEN_MAX_TTL_DAYS`        | `90`         | Vida máxima de un token de solo lectura                         |
+| `INTEGRATION_WRITE_TOKEN_MAX_TTL_DAYS`  | `30`         | Vida máxima con escritura (no puede superar la anterior)        |
+| `INTEGRATION_RATE_LIMIT`                | `120/minute` | Cupo por token                                                  |
+| `INTEGRATION_WRITE_RATE_LIMIT`          | `20/minute`  | Cupo adicional por token en escritura                           |
+| `INTEGRATION_DESTRUCTIVE_TOKEN_MAX_TTL_DAYS` | `7`     | Vida máxima con rollback/stamp (no puede superar la de escritura) |
+| `INTEGRATION_ALLOW_NON_EXPIRING_TOKENS` | `false`      | Permite emitir tokens sin expiración (lectura/escritura); nunca con rollback/stamp |
+| `INTEGRATION_DESTRUCTIVE_RATE_LIMIT`    | `5/minute`   | Cupo adicional por token en rollback/stamp                      |
+| `INTEGRATION_AUTH_FAILURE_RATE_LIMIT`   | `30/minute`  | Credenciales rechazadas por IP                                  |
+
+La revisión `b7d9f1a3c5e8` crea las tablas de tokens; la aplica el `entrypoint.sh` como cualquier otra. Guía
+completa en [`integration-api-tokens.md`](features/integration-api-tokens.md).
+
 ### Migraciones
 
 Las cinco revisiones que traen el MCP (`c8d9e0f1a2b3` → `a2b3c4d5e6f7`: roles del gateway,

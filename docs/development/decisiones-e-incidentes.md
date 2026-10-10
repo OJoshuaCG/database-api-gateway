@@ -2747,3 +2747,104 @@ secreto con una forma que no reconoce sale en claro, y la frontera real es el sc
 Se renombró `has_non_portable` a `has_procedural_objects` en la salida porque el test de subcadenas prohibidas
 rechaza toda clave que contenga `port`. El selector de scopes de la SPA (otro repositorio) sigue sin ofrecer
 `data.blueprint_sql`: seguimiento aparte.
+
+
+## Tokens de integración (REST) y API `/integration`
+
+Guía de uso en [`integration-api-tokens.md`](../features/integration-api-tokens.md); contrato en
+`api-reference-v45.md`. Esta sección cubre los diez scopes de lectura y escritura; revertir y marcar migraciones
+tiene su propia entrada cuando llegue.
+
+### Un vocabulario de scopes propio, que mapea a capacidades (no capacidades nuevas)
+
+**Por qué no son miembros de `Capability`.** Habrían disparado los invariantes 1, 6 y 8 del catálogo, entrado en
+los conjuntos de roles y aparecido en `/authz/catalog`, que la SPA usa para armar la matriz de accesos. Un
+`IntegrationScope` con `INTEGRATION_ALLOWED` (scope → capacidad) deja el catálogo humano intacto y fija su propia
+frontera con invariantes que fallan al importar (nada de `data`, `access`, `drop`, `credentials`, `grant_admin`,
+`secrets`; lo que muta mapea a lo que muta; conjunto literal fijo). El costo es un segundo vocabulario: por eso el
+chequeo 9 de `check_route_capabilities.py` exige que cada ruta `/integration/` declare su scope, que la capacidad
+declarada sea exactamente la mapeada y que ningún scope quede sin ruta.
+
+### El alcance efectivo se calcula en cada llamada
+
+`guardado ∩ vocabulario ∩ lo que el emisor tiene hoy`. Un snapshot al emitir habría dejado vivo un token cuyo
+emisor ya perdió el rol. Se paga una lectura del emisor por llamada; a cambio, bajar el rol suspende el scope en la
+siguiente llamada y subirlo lo reactiva sin reemitir. Un scope guardado que ya no está en el vocabulario se
+conserva y se informa como suspendido (un rollback de release no puede borrarlo en silencio).
+
+### La capa 2 se evalúa dos veces
+
+Explícita en `require_integration` y, además, `capability_resolution` trata `{"admin","integration"}` como
+actores con alcance humano. Sin lo segundo, los chequeos internos de capa 2 (`needs_target_resolution`,
+`grants_allow`, `has_relevant_grant`) devuelven temprano para todo actor que no sea `admin` y el token habría
+heredado la capa 1 sin la 2. El `api_token` del MCP queda **fuera** del conjunto a propósito.
+
+### Sin step-up en tiempo de ejecución
+
+Una máquina no puede responder un prompt de contraseña, así que `assert_step_up` falla cerrado para
+`actor.is_machine` y el bearer nunca lo invoca. La prueba de identidad la paga la persona al emitir, editar o
+revocar: se implementó con el guard de la ruta (`require_either` aplica el step-up de `access.admin` a todo método
+no seguro), más estricto que lo pedido en el diseño (solo al agregar un scope de escritura). Es deliberado y no hay
+que "aflojarlo".
+
+### `is_machine`, no ampliar `is_agent`
+
+`is_agent` gobierna comportamiento específico del MCP. Ampliarlo habría cambiado el MCP; `is_machine` (`api_token` o `integration`) es lo que usa el step-up. Cada uso de `is_agent` se revisó uno por
+uno.
+
+### Códigos de error y 403 uniforme
+
+Servidor inexistente y servidor fuera de la allowlist responden el mismo `403 integration.server_not_allowed`: un
+`404` para el primero permitiría enumerar ids con un token de otro proyecto. La especificación original pedía 404
+para el desconocido; el diseño y la implementación lo uniformaron.
+
+### Perfiles: el REST no chequea `grant_admin` al aplicar
+
+`apply_profile` nunca llama a `assert_grant_admin` (verificado), así que por la API humana un perfil con
+`ALL PRIVILEGES` o `GRANT OPTION` se aplica con `engine_users.write`. La API de integración no puede heredar ese
+hueco: precomprueba **todos** los ítems con `grant_admin_reason` y rechaza con `403` antes de aplicar uno solo. El
+hueco de la ruta humana queda fuera de alcance y señalado.
+
+### Aplicar migraciones: solo hacia adelante y con valores fijos
+
+`force=False` y `on_failure="auto"` no son parámetros del cliente. `force` es el override de cuarentena y en la SPA
+es un `Switch` sin fricción; ofrecerlo a una máquina sería abrir el guard de entornos con un campo. Una versión
+anterior a la actual se rechaza con un código propio (el controlador la trataría como no-op y el cliente creería
+que se revirtió). La guarda de migraciones destructivas de los entornos protegidos rige igual que para una persona.
+
+### El kill switch responde 503, y revocar siempre funciona
+
+Apagada, `/integration/*` y el alta/edición responden `503 integration.disabled` (no `404`: quien la encendió y no
+anda necesita saber que está apagada). Listar y revocar siguen funcionando: cortar un token filtrado no puede
+depender de que la superficie esté encendida.
+
+### Nivel destructivo: por qué rollback y stamp tienen un sobre propio
+
+Rollback y stamp se agregaron a pedido (CR-1) y se evalúan contra `blueprints.apply`, pero no se tratan como "otra
+escritura". Decisiones que no se deben simplificar:
+
+- **El step-up es del emisor, y explícito.** La guarda de la ruta de gestión chequea `access.admin`, no
+  `blueprints.apply`, así que sin una llamada propia a `assert_step_up(actor, Capability.BLUEPRINTS_APPLY)` agregar un
+  scope destructivo costaría lo mismo que agregar uno de lectura. En tiempo de ejecución el bearer no pide step-up
+  (D6). Con `STEP_UP_ENFORCED=false` el interruptor global manda: es una pregunta abierta si un scope destructivo
+  debería ignorarlo.
+- **Allowlist de blueprints vacía = denegar.** La allowlist se vacía por cascada si se borra un blueprint; la
+  compuerta genérica deja pasar una allowlist vacía, el adaptador destructivo no.
+- **Entorno sin clasificar = denegar.** `_env_policy_for` deja permisivas a las bases sin entorno para no romper
+  los `apply-all` existentes. Esa asimetría no se traslada a una máquina que no tiene historia que proteger.
+- **La prueba de historial existe porque `stamp` no escribe fila.** Sin ella, `stamp` seguido de `rollback` permitiría
+  ejecutar el `down_sql` de una versión que nunca corrió. Una fila sin dirección o sin versión (legada), una última
+  fila fallida o `down`, o un `checksum` distinto al vigente (definición editada después de correr) no prueban nada.
+- **`record_intent` va antes y falla cerrado**; el controlador humano no se tocó, así que sus guardas (confirmación,
+  `down_sql`, capturas sin revisar, checkpoint parcial) siguen siendo las de siempre.
+- **Stamp ya vigente es éxito sin cambios**, auditado con `touched_engine=False` y sin llamar al controlador; pero
+  solo si `expected_current_version` acierta: un reintento con una creencia vieja sigue siendo conflicto.
+- **TTL de 7 días con un tope de escritura menor**: el gateway no arranca si el tope destructivo supera al de
+  escritura; quien baje `INTEGRATION_WRITE_TOKEN_MAX_TTL_DAYS` de 7 debe bajar también el destructivo.
+
+### Lo que NO se cierra
+
+Quedan abiertos, y se señalan: la carrera check-then-write al asignar un blueprint (dos llamadas simultáneas sobre
+una base sin blueprint); el `generic_exception_handler` registra `str(exc)` de excepciones no mapeadas que no sean
+de SQLAlchemy (un error de motor mapeado no lleva texto del motor, pero uno inesperado va al log, no a la
+respuesta).

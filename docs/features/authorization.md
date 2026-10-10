@@ -369,7 +369,8 @@ contrato en `api-reference-v29.md` §10.
   Nunca cambian el `403` ni filtran la capacidad al cliente.
 - **Atribución de tokens**: una acción de un token de agente deja `admin_id = NULL`,
   `api_token_id` = PK del token y `admin_username = "token:<token_id>"`. Un token nunca se lee como
-  una persona.
+  una persona. Una llamada de un token de **integración** deja `actor_type = "integration"`,
+  `admin_id` = el emisor, `integration_token_id` = PK del token y `admin_username = "integration:<public_id>"`.
 
 **Quién lee la auditoría.** `GET /audit-log` y `GET /audit-log/{id}` exigen **`audit.read`**
 (`security_officer`). `access_admin` recibe `403`: quien hace los cambios de acceso no revisa el
@@ -413,6 +414,22 @@ mismo `422 gateway_user.not_found` (sin `410`, que era un oráculo de cuentas pe
 
 Contrato en `api-reference-v23.md` §9 y `api-reference-v24.md` §3; guía de uso en
 [mcp-para-colaboradores.md](mcp-para-colaboradores.md).
+
+### Tokens de integración (REST)
+
+Tercera credencial, distinta de la sesión y del token de agente: un bearer `datumint.<id>.<secret>` que
+automatiza un conjunto cerrado de operaciones (ver [integration-api-tokens.md](integration-api-tokens.md)).
+
+- **Vocabulario propio**: 10 scopes (4 de lectura, 6 de escritura), cada uno **mapeado** a una capacidad
+  existente (`INTEGRATION_ALLOWED`); no son capacidades y no salen en `/authz/catalog`. Invariantes que fallan al
+  importar: ningún scope mapea a nada de `data`, `access`, `drop`, `credentials`, `grant_admin` ni `secrets`; los
+  que mutan, mapean a capacidades que mutan; el conjunto es un literal fijo.
+- **Alcance efectivo** = guardado ∩ vocabulario ∩ lo que el emisor tiene hoy, en cada llamada; más la allowlist de
+  servidores del token y la capa 2 del emisor en el destino.
+- **Actor `integration`**: cuenta como máquina (`is_machine`): nunca responde un step-up, que paga la persona al
+  emitir o editar el token (`integration_tokens.own`, los tres roles; `access.admin` lista y revoca los de todos).
+  No puede acceder a datos del tercero ni emitir otros tokens.
+- Techos de vida: 90 días (solo lectura) y 30 (con escritura).
 
 ---
 

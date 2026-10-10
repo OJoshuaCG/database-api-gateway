@@ -298,6 +298,14 @@ real (`idle`/`absolute`) que les pone el próximo intento.
 `GET /audit-log`: eso es `audit.read` (`security_officer`), para que el revisado no se revise a
 sí mismo. Contrato completo de las dos piezas en `api-reference-v29.md` §11.
 
+## Bearer de integración (no es sesión)
+
+Las rutas `/api/v1/integration/*` se autentican **solo** con `Authorization: Bearer datumint.<id>.<secret>`
+(`app/core/integration_auth.py`) y nunca leen la cookie: no hay `sid`, ni CSRF, ni ventana de step-up. Al revés,
+`authenticated_session()` nunca lee `Authorization`, así que un bearer no abre ninguna ruta de la SPA. Toda falla de
+credencial (desconocido, malformado, revocado, vencido, emisor inactivo) es el mismo `401`, y los rechazos tienen
+cupo por IP antes de tocar la BD. Detalle y operación en [integration-api-tokens.md](integration-api-tokens.md).
+
 ## Migración a SSO (futuro)
 
 Toda resolución de sesión pasa por `authenticated_session()`, así que sustituir el login por
