@@ -183,7 +183,8 @@ def test_the_split_routes_declare_the_right_half(guard):
     assert vistas == {
         "/api/v1/gateway-users": 13,
         "/api/v1/api-tokens": 4,
-        "/api/v1/capability-grants": 3,
+        # pending, approve, reject y la aprobación en lote (POST /decisions).
+        "/api/v1/capability-grants": 4,
         "/api/v1/authz/scope-readiness": 1,
         "/api/v1/admin/crypto": 1,
         "/api/v1/audit-log": 2,
