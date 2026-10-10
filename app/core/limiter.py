@@ -38,9 +38,11 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from slowapi.wrappers import Limit
 
+from app.core.integration_token_format import INTEGRATION_TOKEN_PREFIX
 from app.core.mcp_token_format import ACCEPTED_TOKEN_PREFIXES
 
 from app.core.environments import (
+    INTEGRATION_RATE_LIMIT,
     LOGIN_USERNAME_RATE_LIMIT,
     MCP_RATE_LIMIT,
     RATE_LIMIT_DEFAULT,
@@ -248,5 +250,46 @@ def agent_token_key(request) -> str:
 mcp_limiter = Limiter(
     key_func=agent_token_key,
     default_limits=[MCP_RATE_LIMIT],
+    storage_uri=RATE_LIMIT_REDIS_URL if RATE_LIMIT_REDIS_ENABLED else "memory://",
+)
+
+
+def integration_token_key(request) -> str:
+    """
+    Clave del límite de tasa de la API de integración: el ``public_id`` del token, y la IP como
+    último recurso.
+
+    Por token y no por IP, por lo mismo que ``agent_token_key``: un CI comparte IP con otros jobs.
+    Se lee del header SIN verificar el HMAC (el ``key_func`` corre antes de las dependencias), así
+    que acota a quien tiene un token real; contra quien inventa ids lo que frena es el tope de
+    rechazos por IP de la autenticación (``INTEGRATION_AUTH_FAILURE_RATE_LIMIT``).
+
+    Solo reconoce el prefijo ``datumint``: un bearer de AGENTE no ocupa cupos de integración.
+    """
+    raw_header = request.headers.get("authorization") or ""
+    if raw_header.lower().startswith("bearer "):
+        header_parts = raw_header[7:].strip().split(".")
+        if (
+            len(header_parts) == 3
+            and header_parts[0] == INTEGRATION_TOKEN_PREFIX
+            and header_parts[1]
+        ):
+            return f"integration:{header_parts[1]}"
+    return f"ip:{get_remote_address(request)}"
+
+
+#: Los cupos de un token de integración son BUCKETS separados dentro de la misma instancia: se
+#: distinguen por el identificador que se le pasa a ``hit_or_429`` (``"integration", <bucket>,
+#: <public_id>``). Gastar el cupo base no consume el de escritura ni el de otro token. El bucket
+#: destructivo lo comparten rollback y stamp de un mismo token: son una sola superficie de riesgo.
+INTEGRATION_BUCKET_BASE = "base"
+INTEGRATION_BUCKET_WRITE = "write"
+INTEGRATION_BUCKET_DESTRUCTIVE = "destructive"
+
+#: Limitador propio de la API de integración. Instancia aparte: el eje es el token de integración
+#: (no la sesión ni el token de agente) y compartir instancia haría que se pisaran los cupos.
+integration_limiter = Limiter(
+    key_func=integration_token_key,
+    default_limits=[INTEGRATION_RATE_LIMIT],
     storage_uri=RATE_LIMIT_REDIS_URL if RATE_LIMIT_REDIS_ENABLED else "memory://",
 )

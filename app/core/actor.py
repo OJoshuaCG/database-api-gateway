@@ -60,7 +60,15 @@ from app.services.capability_catalog import (
     union_role,
 )
 
-ActorKind = Literal["admin", "api_token"]
+#: ``integration`` es el token bearer de la API REST de integración (``app/core/integration_auth.py``).
+#: Es una clase de actor propia —y no un ``api_token`` ni un ``admin``— porque es una MÁQUINA que
+#: ejerce el rol de una persona: el techo de agente del MCP no le aplica y el step-up no se le puede
+#: pedir. Mismo vocabulario que ``audit_log.actor_type``.
+ActorKind = Literal["admin", "api_token", "integration"]
+
+#: Clases de actor que son MÁQUINAS (no pueden contestar un prompt de contraseña ni actuar como la
+#: persona en credenciales). Un sitio nuevo que decida "¿es una persona?" usa ``Actor.is_machine``.
+MACHINE_ACTOR_KINDS: frozenset[str] = frozenset({"api_token", "integration"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +111,10 @@ class Actor:
     #: por request, no se congela al emitir). Es la entrada del techo del token: ver
     #: ``token_actor``. ``None`` en actores ``admin``.
     issuer: "Actor | None" = None
+    #: Solo en actores ``integration``: el PK de la fila ``integration_tokens``. Va aparte de
+    #: ``token_id`` (la parte PÚBLICA del bearer) y de ``id`` (el del EMISOR) porque la auditoría
+    #: persiste los tres con significados distintos. ``None`` en los demás.
+    token_pk: int | None = None
 
     def has(self, capability: Capability) -> bool:
         """La única pregunta que hace el gate de capacidad."""
@@ -110,7 +122,20 @@ class Actor:
 
     @property
     def is_agent(self) -> bool:
+        """Token de agente del MCP. NO incluye a la integración: gatea comportamiento del MCP."""
         return self.kind == "api_token"
+
+    @property
+    def is_machine(self) -> bool:
+        """
+        Cualquier credencial bearer sin persona detrás: token de agente o de integración.
+
+        Es la pregunta correcta para "¿puede esto contestar un step-up, cambiar una contraseña o
+        actuar con la identidad de un usuario?". ``is_agent`` NO sirve para eso: un actor de
+        integración lleva el ``id`` de su emisor, así que un sitio que solo excluya a los agentes
+        trataría a la máquina como si fuera la persona.
+        """
+        return self.kind in MACHINE_ACTOR_KINDS
 
 
 def admin_actor(
@@ -203,6 +228,48 @@ def token_actor(
     )
 
 
+def integration_actor(
+    *,
+    token_pk: int,
+    public_id: str,
+    name: str,
+    capabilities: frozenset[Capability],
+    issuer: Actor,
+) -> Actor:
+    """
+    Actor de un token de integración (API REST de integración).
+
+    ``capabilities`` son SOLO las capacidades mapeadas de los scopes efectivos del token
+    (``INTEGRATION_ALLOWED``): la capa 1 queda estrictamente acotada a lo que el token declara, no
+    a lo que su emisor puede. ``global_capabilities`` queda vacío a propósito: el invariante I3 del
+    catálogo de scopes garantiza que ninguna capacidad mapeada es global, y dejarlas vacías cierra
+    la otra vía por la que ``scope._permits`` sumaría capacidades del emisor.
+
+    La capa 2, en cambio, necesita el rol real del emisor para resolver el destino: por eso el
+    actor copia ``role``, ``base_role``, ``scope_roles`` y ``capability_grants`` del emisor tal como
+    están AHORA (el llamador relee al emisor por request). Si al emisor le quitan ``owner`` en
+    producción, el token lo pierde en producción en la siguiente llamada.
+
+    ``id`` es el del EMISOR: la auditoría atribuye la acción a la persona responsable, y lo que
+    distingue la máquina es ``kind``, ``token_id`` y ``token_pk``. Esa misma elección es la que
+    obliga a los sitios que leen ``id`` para actuar "como el usuario" a preguntar ``is_machine``.
+    """
+    return Actor(
+        kind="integration",
+        id=issuer.id,
+        username=name,
+        capabilities=capabilities,
+        role=issuer.role,
+        base_role=issuer.base_role,
+        global_capabilities=frozenset(),
+        token_id=public_id,
+        scope_roles=issuer.scope_roles,
+        capability_grants=issuer.capability_grants,
+        issuer=issuer,
+        token_pk=token_pk,
+    )
+
+
 def identity_of(subject: "Actor | dict | None") -> tuple[int | None, str | None]:
     """
     ``(id, username)`` de una identidad, sea un ``Actor`` o el ``dict`` legado.
@@ -230,7 +297,7 @@ def identity_of(subject: "Actor | dict | None") -> tuple[int | None, str | None]
 
 def actor_type_of(subject: "Actor | dict | None") -> str:
     """
-    La CLASE de actor (``"admin"`` | ``"api_token"``) de una identidad, para persistirla.
+    La CLASE de actor (``"admin"`` | ``"api_token"`` | ``"integration"``) de una identidad, para persistirla.
 
     Sale del propio actor y no de un parámetro que el llamador pueda equivocar. Un ``dict``
     legado o ``None`` son siempre ``"admin"``, que es la verdad histórica: antes de los tokens

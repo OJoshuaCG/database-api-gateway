@@ -89,6 +89,22 @@ def test_security_officer_reads_the_audit_newest_first(so_client):
     assert r.json()["pagination"]["total"] == 5
 
 
+def test_audit_filters_by_the_integration_actor_type(so_client):
+    _seed_set()
+    integration_row_id = _seed(
+        action="integration.call",
+        actor_type="integration",
+        admin_id=7,
+        admin_username="integration:abc",
+        target_id=6,
+    )
+
+    response = _get(so_client, actor_type="integration")
+
+    assert _ids(response) == [integration_row_id]
+    assert response.json()["data"][0]["actor_type"] == "integration"
+
+
 def test_audit_filters(so_client):
     ids = _seed_set()
     assert set(_ids(_get(so_client, action="access.*"))) == {ids["a1"], ids["a2"]}

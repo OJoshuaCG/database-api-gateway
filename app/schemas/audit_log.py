@@ -20,7 +20,7 @@ class AuditLogOut(BaseModel):
     id: int
     created_at: datetime
     request_id: str | None = None
-    actor_type: str = Field(..., description="admin | api_token | system | anonymous")
+    actor_type: str = Field(..., description="admin | api_token | integration | system | anonymous")
     admin_id: int | None = Field(None, description="Usuario del gateway; NULL si fue un token")
     admin_username: str | None = Field(
         None, description="Username desnormalizado, o 'token:<token_id>' si fue un token"

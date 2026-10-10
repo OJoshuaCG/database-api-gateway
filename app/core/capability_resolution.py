@@ -22,7 +22,10 @@ LAS REGLAS (decisiones de negocio, no negociables acá)
   retirada ``gateway.admin`` (desconocida) no acuña nada.
 - Un destino global (sin entorno ni servidor) no coincide con ninguna capacidad puntual.
 - Escribir/ejecutar implica la lectura de su módulo (``IMPLIED_READ``).
-- Los tokens de agente nunca ganan capacidades puntuales: su rama no pasa por acá.
+- Los tokens de agente nunca ganan capacidades puntuales: su rama no pasa por acá. El token de
+  INTEGRACIÓN sí resuelve la capa 2 como una persona (``HUMAN_SCOPED_ACTOR_KINDS``): ejerce el
+  rol REAL de su emisor en el destino, y sus propias capacidades de capa 1 ya vienen acotadas a
+  los scopes del token.
 
 Este módulo no importa ``actor`` ni ``scope`` en el nivel superior (ambos lo importan a él); lo
 que necesita de ``scope`` lo toma de forma diferida.
@@ -53,6 +56,13 @@ logger = logging.getLogger(__name__)
 
 #: Alcances sobre los que se puede otorgar una capacidad puntual (sin global, D2).
 GRANT_SCOPE_TYPES: tuple[str, ...] = ("environment", "server")
+
+#: Clases de actor cuya capa 2 se resuelve contra el rol/grants de una PERSONA. ``api_token`` (el
+#: agente del MCP) queda AFUERA a propósito: su frontera de destino es el ``project_id`` y nunca
+#: gana capacidades puntuales. ``integration`` entra porque su actor copia el rol, los alcances y
+#: las capacidades puntuales de su emisor (``integration_actor``); sin esto la capa 2 sería un
+#: no-op para la integración y un token con ``owner`` en desarrollo podría operar en producción.
+HUMAN_SCOPED_ACTOR_KINDS: frozenset[str] = frozenset({"admin", "integration"})
 
 #: ``(capacidad, scope_type, scope_id)``: la forma TIPADA que lleva el ``Actor``.
 CapabilityGrantKey = tuple[Capability, str, int]
@@ -117,7 +127,7 @@ def grants_allow(
     Coincide por entorno (``environment_id`` del destino YA resuelto, fail-closed) o por servidor.
     Un destino sin entorno ni servidor no coincide con nada. Pura: no toca la BD.
     """
-    if actor.kind != "admin":
+    if actor.kind not in HUMAN_SCOPED_ACTOR_KINDS:
         return False
     for granted, scope_type, scope_id in actor.capability_grants:
         if capability not in expand(granted):
@@ -132,7 +142,7 @@ def grants_allow(
 
 def has_relevant_grant(actor: "Actor", capability: Capability) -> bool:
     """¿Hay alguna capacidad puntual que, en ALGÚN alcance, concedería ``capability``?"""
-    return actor.kind == "admin" and any(
+    return actor.kind in HUMAN_SCOPED_ACTOR_KINDS and any(
         capability in expand(granted) for granted, _, _ in actor.capability_grants
     )
 
@@ -141,12 +151,12 @@ def needs_target_resolution(actor: "Actor", capability: Capability) -> bool:
     """
     ¿Hay que resolver el destino (BD) para decidir la capa 2? Camino rápido de D8.
 
-    No hace falta si el actor no es humano, o si no tiene alcances por rol NI capacidades
+    No hace falta si el actor no es de alcance humano (un token de agente del MCP), o si no tiene alcances por rol NI capacidades
     puntuales relevantes para ``capability``. Sí hace falta si tiene alcances por rol (como
     siempre). Con capacidades puntuales relevantes y sin alcances, el rol base manda salvo que
     ya lo permita —en cuyo caso tampoco hace falta resolver—; la decisión es de ``capability_at``.
     """
-    if actor.kind != "admin":
+    if actor.kind not in HUMAN_SCOPED_ACTOR_KINDS:
         return False
     return bool(actor.scope_roles) or has_relevant_grant(actor, capability)
 

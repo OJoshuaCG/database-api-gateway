@@ -41,7 +41,10 @@ y ``data.blueprint_sql``; invariante 13). Un token no tiene contraseña que reco
 step-up de esas cuatro lo cumple el EMISOR al emitir o editar el token
 (``api_token_controller._validate_scopes`` llama a ``assert_step_up`` con el actor humano), nunca
 el token. Si un actor de token llegara igual a ``assert_step_up``, es 403 ``access.forbidden``:
-pedirle un step-up a una máquina es un prompt que nadie puede contestar.
+pedirle un step-up a una máquina es un prompt que nadie puede contestar. Lo mismo vale para el
+token de INTEGRACIÓN (``Actor.is_machine``), que sí puede llegar acá: su autenticación exime el
+step-up por llamada con el marcador ``__gw_integration_scope__`` (enumerable por el script de
+cobertura de rutas) y nunca delega la pregunta a este módulo.
 """
 
 from __future__ import annotations
@@ -112,9 +115,12 @@ def assert_step_up(actor: Actor, capability: Capability, *, method: str | None =
     """
     if not spec(capability).requires_step_up:
         return
-    if actor.is_agent:
-        # Inalcanzable salvo por la excepción de datos (inv. 11/13), y esa la cumple el emisor,
-        # no el token; escrito igual. Ver el docstring del módulo.
+    if actor.is_machine:
+        # Token de agente: inalcanzable salvo por la excepción de datos (inv. 11/13), y esa la
+        # cumple el emisor, no el token; escrito igual. Token de INTEGRACIÓN: llega acá de verdad
+        # (``blueprints.apply`` pide step-up) y falla cerrado a propósito: el step-up del emisor
+        # se exige al crear o editar el token (D6), nunca por llamada, porque una máquina no puede
+        # contestar un prompt de contraseña. Ver el docstring del módulo.
         raise AppHttpException(
             message="No tienes permiso para esta operación.",
             status_code=403,

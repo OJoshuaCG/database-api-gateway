@@ -31,7 +31,7 @@ def list_audit_log(
     ),
     admin_id: int | None = Query(None, ge=1, description="Usuario del gateway que actuó"),
     admin_username: str | None = Query(None, max_length=128, description="Username exacto"),
-    actor_type: Literal["admin", "api_token", "system", "anonymous"] | None = Query(None),
+    actor_type: Literal["admin", "api_token", "integration", "system", "anonymous"] | None = Query(None),
     api_token_id: int | None = Query(None, ge=1, description="PK del token de agente"),
     target_type: str | None = Query(None, max_length=64),
     target_id: int | None = Query(None, description="Id del objeto (junto con target_type)"),

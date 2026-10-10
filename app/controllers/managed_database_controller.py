@@ -335,9 +335,12 @@ class ManagedDatabaseController:
                 status_code=403,
                 public_context={"code": dcodes.CODE_DATA_ACCESS_IDENTITY_REQUIRED},
             )
-        if getattr(admin, "is_agent", False):
+        # `is_machine` y no `is_agent`: el actor de integración lleva el `id` de su EMISOR, así que
+        # el control del segundo aprobador (que compara ids) leería a la máquina como la persona
+        # que abre o aprueba el acceso a datos.
+        if getattr(admin, "is_machine", False):
             raise AppHttpException(
-                message="Un token de agente no administra el acceso a datos.",
+                message="Un token no administra el acceso a datos.",
                 status_code=403,
                 public_context={"code": dcodes.CODE_DATA_ACCESS_IDENTITY_REQUIRED},
             )

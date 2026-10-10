@@ -145,10 +145,11 @@ class AuthController:
 
         **Nunca se registra ninguna password**, ni su largo, en el detalle de auditoría.
         """
-        if actor.is_agent:
+        if actor.is_machine:
             # Inalcanzable hoy (la API solo autentica por cookie), y escrito igual: si mañana un
-            # bearer llega a `/api/v1`, un token de agente no puede reescribir la credencial de
-            # una persona.
+            # bearer llega a `/api/v1`, una máquina no puede reescribir la credencial de una
+            # persona. `is_machine` y no `is_agent`: el actor de integración lleva el `id` de su
+            # EMISOR, así que sin cubrirlo este camino cambiaría la contraseña del emisor.
             raise AppHttpException(
                 message="Solo una sesión de usuario puede cambiar su contraseña.",
                 status_code=403,
@@ -213,7 +214,9 @@ class AuthController:
         Verifica con el MISMO ``verify_password`` que el login. **Nunca se audita la contraseña**,
         ni su largo.
         """
-        if actor.is_agent or not sid:
+        # `is_machine` por la misma razón que en `change_password`: el actor de integración lleva
+        # el `id` del emisor y verificaría la contraseña de una persona.
+        if actor.is_machine or not sid:
             raise AppHttpException(
                 message="Solo una sesión de usuario puede confirmar su contraseña.",
                 status_code=403,

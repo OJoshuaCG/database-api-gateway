@@ -65,6 +65,10 @@ def _reset_schema_and_state() -> None:
     from app.core.mcp_auth import reset_rejection_state
 
     reset_rejection_state()
+    # Mismo motivo para la API de integración: su limitador y su agregador son estado del proceso.
+    from app.core.integration_auth import reset_integration_auth_state
+
+    reset_integration_auth_state()
     # Mismo motivo para el agregador de denegaciones (`access.denied`): sin esto, el 403 de un
     # test se come la fila del mismo (actor, código, ruta) en el siguiente.
     from app.core.denial_audit import reset_denial_state

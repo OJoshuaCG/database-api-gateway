@@ -31,29 +31,49 @@ def _safe_get(ctxvar: ContextVar) -> str | None:
     return value or None
 
 
+#: Prefijo del ``admin_username`` de un actor de integración. Ningún username real lo imita sin
+#: que se note, y deja distinguir de un vistazo "lo hizo un token de integración" de "lo hizo
+#: una persona".
+INTEGRATION_USERNAME_PREFIX = "integration:"
+
+
 def audit_identity(
     subject: "dict | Actor | None",
-) -> tuple[int | None, str | None, int | None]:
+) -> tuple[int | None, str | None, int | None, int | None]:
     """
-    ``(admin_id, admin_username, api_token_id)`` tal como se persisten en ``audit_log``.
+    ``(admin_id, admin_username, api_token_id, integration_token_id)`` tal como se persisten en
+    ``audit_log``.
 
-    Un token NO va en ``admin_id``: el PK del token y el id de un usuario comparten el espacio de
-    enteros, así que ``WHERE admin_id = 3`` mezclaba al usuario 3 con el token 3. Y su ``name``
-    (texto libre que elige quien lo acuña) tampoco va en ``admin_username``: un token llamado
-    "alice" se leía como filas de la persona alice. Para un token: ``admin_id`` NULL,
-    ``api_token_id`` = PK, y ``admin_username = "token:<token_id>"`` (la parte PÚBLICA del
-    bearer, nunca el secreto), con un prefijo que ningún username real puede imitar sin que se
-    note.
+    Un token de AGENTE NO va en ``admin_id``: el PK del token y el id de un usuario comparten el
+    espacio de enteros, así que ``WHERE admin_id = 3`` mezclaba al usuario 3 con el token 3. Y su
+    ``name`` (texto libre que elige quien lo acuña) tampoco va en ``admin_username``: un token
+    llamado "alice" se leía como filas de la persona alice. Para un token de agente:
+    ``admin_id`` NULL, ``api_token_id`` = PK, y ``admin_username = "token:<token_id>"`` (la parte
+    PÚBLICA del bearer, nunca el secreto).
+
+    Un token de INTEGRACIÓN es distinto a propósito: ``admin_id`` es el EMISOR. Quien lo emitió es
+    el responsable humano de lo que la integración hace en su nombre, y el filtro "qué hizo esta
+    persona" tiene que encontrarlo. Lo que lo distingue de una acción manual del emisor es
+    ``actor_type = "integration"``, el prefijo ``integration:<public_id>`` en el username y
+    ``integration_token_id`` = PK del token (columna propia: no comparte espacio con ``api_token_id``).
 
     Es local a la auditoría a propósito: ``identity_of`` lo leen también decisiones de
     autorización (``_guard_owner`` de exportación) y autoría de otras tablas, que no son lo que
     este cambio corrige.
     """
-    if getattr(subject, "kind", None) == "api_token":
+    subject_kind = getattr(subject, "kind", None)
+    if subject_kind == "api_token":
         token_id = getattr(subject, "token_id", None)
-        return None, (f"token:{token_id}" if token_id else None), subject.id
+        return None, (f"token:{token_id}" if token_id else None), subject.id, None
+    if subject_kind == "integration":
+        public_id = getattr(subject, "token_id", None)
+        issuer_id = subject.id
+        integration_username = (
+            f"{INTEGRATION_USERNAME_PREFIX}{public_id}" if public_id else None
+        )
+        return issuer_id, integration_username, None, getattr(subject, "token_pk", None)
     admin_id, admin_username = identity_of(subject)
-    return admin_id, admin_username, None
+    return admin_id, admin_username, None, None
 
 
 def _build(
@@ -74,7 +94,7 @@ def _build(
     grantor: str | None,
     actor_type: str | None = None,
 ) -> AuditLog:
-    admin_id, admin_username, api_token_id = audit_identity(admin)
+    admin_id, admin_username, api_token_id, integration_token_id = audit_identity(admin)
     # Override explícito: expiración y cancelación automáticas las hace el SISTEMA, no una
     # persona; sin esto quedarían atribuidas a quien disparó la lectura que las barrió (D11).
     actor_type = actor_type or actor_type_of(admin)
@@ -84,6 +104,7 @@ def _build(
         admin_username=admin_username,
         actor_type=actor_type,
         api_token_id=api_token_id,
+        integration_token_id=integration_token_id,
         action=action,
         target_type=target_type,
         target_id=target_id,

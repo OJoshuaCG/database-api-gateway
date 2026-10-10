@@ -157,7 +157,8 @@ def _require_issuer_step_up(admin, capability: Capability) -> None:
             status_code=403,
             public_context={"code": CODE_STEP_UP_REQUIRED},
         )
-    if admin.is_agent:
+    # `is_machine`: ningún bearer (agente o integración) puede cumplir el step-up del emisor.
+    if admin.is_machine:
         raise AppHttpException(
             message="No tienes permiso para esta operación.",
             status_code=403,

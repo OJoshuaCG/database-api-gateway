@@ -64,7 +64,15 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
         ]
         logger.warning(" | ".join(logger_params))
 
-    return JSONResponse(status_code=429, content={"detail": detail_error})
+    # Only the integration API attaches ``retry_after_seconds`` (its clients are scripts that must
+    # back off); every other limiter keeps the historical header-less 429.
+    retry_after_seconds = getattr(exc, "retry_after_seconds", None)
+    response_headers = (
+        {"Retry-After": str(retry_after_seconds)} if retry_after_seconds is not None else None
+    )
+    return JSONResponse(
+        status_code=429, content={"detail": detail_error}, headers=response_headers
+    )
 
 
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
