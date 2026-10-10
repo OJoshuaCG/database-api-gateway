@@ -42,6 +42,11 @@ from app.models.enums import (
     ServerStatus,
 )
 from app.models.export_job import ExportArtifact, ExportJob, ExportJobItem
+from app.models.integration_token import (
+    IntegrationToken,
+    IntegrationTokenBlueprint,
+    IntegrationTokenServer,
+)
 from app.models.managed_database import ManagedDatabase
 from app.models.managed_database_data_credential import ManagedDatabaseDataCredential
 from app.models.migration_select_result import MigrationSelectResult
@@ -74,6 +79,9 @@ __all__ = [
     "Server",
     "ServerUser",
     "DatabaseModel",
+    "IntegrationToken",
+    "IntegrationTokenBlueprint",
+    "IntegrationTokenServer",
     "ManagedDatabase",
     "ManagedDatabaseDataCredential",
     "Environment",

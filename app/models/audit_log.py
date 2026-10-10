@@ -89,7 +89,10 @@ class AuditLog(Base, TimestampMixin):
         nullable=False,
         default="admin",
         server_default="admin",
-        comment="admin | api_token. Las filas históricas son todas 'admin', que es la verdad",
+        comment=(
+            "admin | api_token | integration. Las filas históricas son todas 'admin', que es "
+            "la verdad"
+        ),
     )
 
     # El token, cuando el actor es uno. **Nunca el secreto**: solo el id de la fila.
@@ -98,6 +101,18 @@ class AuditLog(Base, TimestampMixin):
         nullable=True,
         index=True,
         comment="Token de agente que originó la operación, si el actor fue un token",
+    )
+
+    # El token de INTEGRACIÓN, cuando el actor es uno. Columna propia y no `api_token_id`: son dos
+    # tablas con PK independientes que comparten el espacio de enteros, y `WHERE api_token_id = 3`
+    # mezclaría el token de agente 3 con el de integración 3. En estas filas `admin_id` es el
+    # EMISOR (el responsable humano); esta columna dice QUÉ credencial actuó. Solo el PK, nunca
+    # el secreto.
+    integration_token_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        index=True,
+        comment="Token de integración que originó la operación, si el actor fue uno. Solo el id",
     )
 
     def __repr__(self) -> str:

@@ -91,6 +91,33 @@ def api_token_pepper() -> bytes:
     return hkdf.derive(SECRET_KEY.encode("utf-8"))
 
 
+#: `info` del pepper de los tokens de integración. DISTINTO del de los tokens de agente a
+#: propósito: con el mismo `info` los dos peppers serían el mismo material y un dump de
+#: `api_tokens` permitiría verificar offline un secreto de `integration_tokens` (y al revés).
+_HKDF_INFO_INTEGRATION_TOKEN = b"integration_token_hmac/v1"
+
+
+def integration_token_pepper() -> bytes:
+    """
+    32 bytes derivados de ``SECRET_KEY`` con HKDF, para el HMAC de los tokens de integración.
+
+    Misma construcción y mismas consecuencias que ``api_token_pepper`` (rotar ``SECRET_KEY``
+    invalida los tokens; rotar la DEK no), pero con su propio ``info``: la separación de
+    dominio es lo que impide que una credencial de un sistema valide en el otro.
+    """
+    if not SECRET_KEY:
+        raise CryptoConfigError(
+            "SECRET_KEY no está definido; no se pueden verificar tokens de integración."
+        )
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=CRYPTO_KEY_SALT.encode("utf-8"),
+        info=_HKDF_INFO_INTEGRATION_TOKEN,
+    )
+    return hkdf.derive(SECRET_KEY.encode("utf-8"))
+
+
 def _kek_key() -> bytes:
     if not SECRET_KEY:
         raise CryptoConfigError(

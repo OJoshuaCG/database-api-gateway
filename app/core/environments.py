@@ -621,6 +621,79 @@ if _QUERY_LIMIT_WARNINGS:
     for _aviso in _QUERY_LIMIT_WARNINGS:
         _query_logging.getLogger(__name__).warning(_aviso)
 
+# ======= API de integración (tokens bearer por usuario) ======= #
+# Regla compartida por las variables de tasa: "<entero >= 1>/<periodo>" (formato de SlowAPI).
+_INTEGRATION_RATE_LIMIT_PATTERN = re.compile(r"^\s*(\d+)\s*/\s*[A-Za-z]+\s*$")
+
+
+def _positive_rate_limit_env(env, name: str, default: str) -> str:
+    """
+    Límite de tasa ``<N>/<periodo>`` con N >= 1. Un cero significaría "sin cupo" (o "sin límite"
+    según quien lo lea), así que es un error de configuración y no un valor: impide arrancar.
+    """
+    raw = env.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    candidate = str(raw).strip()
+    match = _INTEGRATION_RATE_LIMIT_PATTERN.match(candidate)
+    if match is None or int(match.group(1)) < 1:
+        raise ValueError(f"{name} inválido: debe tener la forma '<entero >= 1>/<periodo>'.")
+    return candidate
+
+
+# KILL SWITCH de la API de integración. Nace APAGADO: expone operaciones que MUTAN sobre bases de
+# terceros con un bearer, y no puede quedar habilitado por el default de un despliegue que nadie
+# configuró. Apagado, las rutas /integration responden 503 y la gestión de tokens no crea ni edita.
+INTEGRATION_API_ENABLED = os.getenv("INTEGRATION_API_ENABLED", "false").lower() == "true"
+# Tope de vida de un token de integración. Sin tokens perpetuos: vive en el repo y los secretos
+# de CI de un proyecto web ajeno.
+INTEGRATION_TOKEN_MAX_TTL_DAYS = _positive_int_env(os.environ, "INTEGRATION_TOKEN_MAX_TTL_DAYS", 90)
+# Tope MÁS CORTO para un token con algún scope de escritura: la credencial que puede mutar es la
+# que más conviene rotar seguido. Nunca puede superar el tope general.
+INTEGRATION_WRITE_TOKEN_MAX_TTL_DAYS = _positive_int_env(
+    os.environ, "INTEGRATION_WRITE_TOKEN_MAX_TTL_DAYS", 30
+)
+# Tope MÁS CORTO todavía para un token con algún scope destructivo (revertir una migración ejecuta
+# el down_sql y puede perder datos de forma irreversible): una credencial filtrada con ese poder
+# tiene que vencer en días, no en semanas. Nunca puede superar el tope de escritura.
+INTEGRATION_DESTRUCTIVE_TOKEN_MAX_TTL_DAYS = _positive_int_env(
+    os.environ, "INTEGRATION_DESTRUCTIVE_TOKEN_MAX_TTL_DAYS", 7
+)
+# Cupo por TOKEN (no por IP: un CI comparte IP con otros jobs) de todas las llamadas, y cupo
+# adicional, más estrecho, para los scopes de escritura y otro todavía más estrecho para los
+# destructivos.
+INTEGRATION_RATE_LIMIT = _positive_rate_limit_env(os.environ, "INTEGRATION_RATE_LIMIT", "120/minute")
+INTEGRATION_WRITE_RATE_LIMIT = _positive_rate_limit_env(
+    os.environ, "INTEGRATION_WRITE_RATE_LIMIT", "20/minute"
+)
+INTEGRATION_DESTRUCTIVE_RATE_LIMIT = _positive_rate_limit_env(
+    os.environ, "INTEGRATION_DESTRUCTIVE_RATE_LIMIT", "5/minute"
+)
+# Tope de credenciales RECHAZADAS por IP. El cupo por token no frena a quien inventa un token_id
+# distinto por request (cada uno es un cupo nuevo); este sí, y corre ANTES de tocar la BD.
+INTEGRATION_AUTH_FAILURE_RATE_LIMIT = _positive_rate_limit_env(
+    os.environ, "INTEGRATION_AUTH_FAILURE_RATE_LIMIT", "30/minute"
+)
+# Permite emitir tokens SIN expiración (lectura y/o escritura). Nace apagado: una credencial que
+# nunca vence y vive en el repo o los secretos de CI de otro proyecto solo se rota si alguien la
+# revoca a mano, así que el despliegue tiene que optar explícitamente. Los tokens con scopes
+# destructivos siguen sujetos a su tope aunque esto esté encendido.
+INTEGRATION_ALLOW_NON_EXPIRING_TOKENS = (
+    os.getenv("INTEGRATION_ALLOW_NON_EXPIRING_TOKENS", "false").lower() == "true"
+)
+if INTEGRATION_WRITE_TOKEN_MAX_TTL_DAYS > INTEGRATION_TOKEN_MAX_TTL_DAYS:
+    raise ValueError(
+        "INTEGRATION_WRITE_TOKEN_MAX_TTL_DAYS no puede superar INTEGRATION_TOKEN_MAX_TTL_DAYS: "
+        "el token que puede escribir no puede vivir más que el de solo lectura."
+    )
+if INTEGRATION_DESTRUCTIVE_TOKEN_MAX_TTL_DAYS > INTEGRATION_WRITE_TOKEN_MAX_TTL_DAYS:
+    raise ValueError(
+        "INTEGRATION_DESTRUCTIVE_TOKEN_MAX_TTL_DAYS no puede superar "
+        "INTEGRATION_WRITE_TOKEN_MAX_TTL_DAYS: el token que puede revertir migraciones no puede "
+        "vivir más que el que solo escribe. Si bajaste el tope de escritura por debajo de 7 días, "
+        "bajá también el destructivo."
+    )
+
 # ======= Startup validation ======= #
 # La cuenta del MCP se interpola (quoteada) en CREATE USER / GRANT al aprovisionar. Se valida acá
 # con las MISMAS reglas que `identifiers.validate_identifier` / `validate_host` (copiadas a
