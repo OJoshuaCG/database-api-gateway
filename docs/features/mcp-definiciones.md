@@ -93,6 +93,16 @@ deploy y queda fuera del MCP hasta que se acepte el riesgo con la bandera o se q
 - El tope de 3 sale del presupuesto de respuesta del MCP (512 KiB), que cuenta cada resultado dos veces:
   3 x 64 KiB x 2 = 384 KiB.
 
+## Scope hermano: `data.blueprint_sql`
+
+`get_blueprint_migration` entrega el SQL de una migración de blueprint (puede llevar filas semilla de
+terceros) y sigue las mismas reglas que `get_definition`: tool ausente de `tools/list` con su kill switch
+apagado (`MCP_BLUEPRINT_SQL_ENABLED`, independiente), scope solo de owner con step-up, texto no confiable
+sin recortar y redacción de credenciales best effort. Difiere en que lee la BD de metadatos del gateway y
+no abre ninguna conexión a un motor, y en su error de tamaño propio (`mcp.blueprint_sql_too_large`).
+Contrato y límites en [`mcp-para-colaboradores.md`](mcp-para-colaboradores.md), sección «MCP: blueprints y
+el SQL de sus migraciones».
+
 ## Qué todavía no se verificó
 
 - **El `GRANT SHOW CREATE ROUTINE` de MariaDB** se verificó en vivo solo en la versión **11.8.3**: al

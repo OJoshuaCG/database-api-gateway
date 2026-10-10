@@ -92,7 +92,8 @@ Conteos de la tabla original (anterior a `tokens.own`, `data.*`, v41): 16 con st
   `schema.definitions` no se marca `discloses`: ver `api-reference-v41.md`). No delega privilegios
   (`engine_users.grant_admin` es solo de `owner`).
 - `owner`: todo lo **operativo** del alcance: `operator` + las capacidades exclusivas de `owner`
-  (las *sensibles* de la tabla, 15 desde v41). No incluye ninguna capacidad global.
+  (las *sensibles* de la tabla: 16 desde v44, que suma `data.blueprint_sql`; eran 15 desde v41). No
+  incluye ninguna capacidad global.
 
 `self.read`, `catalogs.read` y `environments.read` son globales pero de la cadena de roles: las
 tiene todo usuario.

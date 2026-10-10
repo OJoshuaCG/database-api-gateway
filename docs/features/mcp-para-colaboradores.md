@@ -4,13 +4,16 @@ Guía operativa. Dos partes: lo que hace **quien administra** (una vez, y despu�
 persona) y lo que hace **cada colaborador** en su propia máquina.
 
 > **Qué expone hoy.** Tools de solo lectura: el inventario (`list_databases`,
-> `list_environments`, `list_exports`, `list_clones`, `list_catalogs`), las que leen la
-> estructura de una base (`list_objects`, `check_freshness`, `get_schema`, `search_schema`,
-> `diff_schemas`, `get_table_stats`) y `draft_query`, que **clasifica un texto SQL sin
-> ejecutarlo**. Esas no devuelven filas ni cuerpos de vistas, rutinas o triggers. Los cuerpos
+> `list_environments`, `list_exports`, `list_clones`, `list_catalogs`), el de blueprints
+> (`list_blueprints`, `list_blueprint_migrations`), las que leen la estructura de una base
+> (`list_objects`, `check_freshness`, `get_schema`, `search_schema`, `diff_schemas`,
+> `get_table_stats`) y `draft_query`, que **clasifica un texto SQL sin ejecutarlo**. Esas no
+> devuelven filas, cuerpos de vistas, rutinas o triggers, ni SQL de migraciones. Los cuerpos
 > los entrega solo `get_definition` (scope `data.definitions`, apagada por default; ver «MCP:
-> leer el código de vistas, triggers, eventos y rutinas») y las filas, las tools de datos. Para
-> encontrar una tabla o columna cuyo nombre exacto no se conoce, usar `search_schema`.
+> leer el código de vistas, triggers, eventos y rutinas»), el SQL de las migraciones solo
+> `get_blueprint_migration` (scope `data.blueprint_sql`, apagada por default; ver «MCP:
+> blueprints y el SQL de sus migraciones») y las filas, las tools de datos. Para encontrar una
+> tabla o columna cuyo nombre exacto no se conoce, usar `search_schema`.
 
 ---
 
@@ -291,8 +294,10 @@ Respuesta (recortada):
 } }
 ```
 
-Por default el token sale con `blueprints.read`, que alcanza **solo** para `list_databases`.
-Para el resto, pedí los scopes al emitirlo: `"scopes": ["blueprints.read", "databases.read"]`.
+Por default el token sale con `blueprints.read`, que alcanza **solo** para `list_databases`,
+`list_blueprints` y `list_blueprint_migrations`. Para el resto, pedí los scopes al emitirlo:
+`"scopes": ["blueprints.read", "databases.read"]`. El scope `data.blueprint_sql` **nunca** viaja por
+default.
 `tools/list` publica únicamente las tools que el token puede llamar.
 
 Los tokens nuevos llevan el prefijo `datum.`. Los emitidos antes conservan `dbgw.` y siguen
@@ -300,7 +305,8 @@ funcionando: no hace falta reemitirlos por el cambio de nombre.
 
 | Scope | Tools |
 |---|---|
-| `blueprints.read` | `list_databases` |
+| `blueprints.read` | `list_databases`, `list_blueprints`, `list_blueprint_migrations` |
+| `data.blueprint_sql` | `get_blueprint_migration` (ver «MCP: blueprints y el SQL de sus migraciones») |
 | `databases.read` | `list_objects`, `check_freshness`, `get_schema`, `search_schema`, `draft_query`, `get_table_stats` |
 | `data.definitions` | `get_definition` (ver [`mcp-definiciones.md`](mcp-definiciones.md)) |
 | `schema_diff.read` | `diff_schemas` |
@@ -657,6 +663,72 @@ credencial de solo lectura (A.6, «Cuerpos de rutinas»). Contrato, límites y a
 
 ---
 
+## MCP: blueprints y el SQL de sus migraciones
+
+Tres tools leen la **BD de metadatos del gateway**; ninguna abre una conexión a un motor ni escribe:
+
+| Tool | Scope | Qué devuelve |
+|---|---|---|
+| `list_blueprints` | `blueprints.read` | Los blueprints del proyecto del token, por `slug`: id, nombre, descripción, versión actual, si está activo, charset, collation y cantidad de migraciones. Sin SQL. |
+| `list_blueprint_migrations` | `blueprints.read` | Una página de las migraciones de UN blueprint, en orden numérico de versión (`0009` antes que `0010`): versión, nombre, tipo, `is_baseline`, `reviewed`, `has_rollback`, motor de origen, `has_procedural_objects`, checksum y fecha. Sin SQL. |
+| `get_blueprint_migration` | `data.blueprint_sql` | El SQL de UNA migración: `up_sql`, `down_sql` (rollback confirmado) y `down_sql_suggested`, más los metadatos y `sql_bytes`. |
+
+Las dos listas existen siempre. `list_blueprints` **no pagina**: con más de 100 blueprints visibles
+responde `413 mcp.too_many_objects` en vez de entregar una lista cortada.
+`list_blueprint_migrations {blueprint_id, after_version?, limit?}` pagina por clave (`limit` de 1 a 200,
+100 por defecto): `next_after_version` es la última versión de la página si quedan más, y `total` es la
+cantidad completa. Si se renumeran las migraciones entre dos pedidos, una versión puede saltearse o
+repetirse.
+
+### Qué blueprints ve un token
+
+Uno es visible **solo si está vinculado al proyecto del token y a ningún otro proyecto**, haya o no una
+base alcanzable que lo use. Un blueprint compartido entre dos proyectos no lo ve ninguno de los dos
+agentes. Un blueprint ajeno, uno compartido, uno inexistente y una versión que no existe responden
+**exactamente igual**: `mcp.not_found` con el mismo mensaje (hay un test que lo compara byte a byte), para
+que la respuesta no confirme que el blueprint existe.
+
+### Habilitar `get_blueprint_migration`
+
+Las dos cosas; con una sola, la tool no existe para el agente:
+
+1. En el `.env` del gateway, `MCP_BLUEPRINT_SQL_ENABLED=true`, y reiniciar. Nace **apagado**: es el kill
+   switch. Apagado, la tool no está en `tools/list`, el scope queda inerte (se descarta al leer los scopes
+   del token) y si se la invoca igual responde `403 mcp.blueprint_sql_disabled`. Es independiente de los
+   kill switches de `data.read`, `data.query` y `data.definitions`.
+2. Un token con el scope `data.blueprint_sql`. Lo emite solo un owner con el step-up abierto, es sensible
+   (el alta suelta pide segundo aprobador) y es agente-grantable: es la cuarta capacidad de la excepción de
+   datos (`AGENT_DATA_EXCEPTIONS`, ahora `data.read`, `data.query`, `data.definitions` y
+   `data.blueprint_sql`).
+
+### Límites y avisos
+
+- **El SQL es texto de terceros, no confiable.** Una migración de tipo `data` lleva filas semilla; por eso
+  trae el aviso `mcp.warn.blueprint_data_migration`. Los tres cuerpos salen en `untrusted_fields`
+  (`data.up_sql`, `data.down_sql`, `data.down_sql_suggested`), bajo el `notice` de la respuesta, y **nunca
+  se recortan**. El control real es que ninguna tool del MCP escribe.
+- **La redacción de credenciales es best effort y no es una frontera.** Enmascara patrones conocidos
+  (`IDENTIFIED BY '...'`, `PASSWORD '...'`, URIs con contraseña, bloques PEM, asignaciones a variables que
+  delatan un secreto) con el mismo redactor que `get_definition`, y `redactions` cuenta por categoría, nunca
+  el valor. Puede dejar pasar un secreto con otra forma: la frontera es el scope `data.blueprint_sql`,
+  emitilo solo a quien pueda ver ese SQL.
+- **Tamaño.** Si la respuesta no entra en el tope de 512 KiB del MCP (que cuenta el JSON dos veces), la
+  llamada falla con `413 mcp.blueprint_sql_too_large` y `details: {sql_bytes, response_bytes,
+  max_response_bytes}`, sin ningún cuerpo: un SQL cortado a mitad es peor que ausente.
+- **Auditoría fail-closed.** Antes de entregar el SQL se escribe una fila de intención (token y versión,
+  nunca un cuerpo); si no se puede escribir, la respuesta es `AUDIT_UNAVAILABLE` y no sale nada.
+- Quedan fuera de esta versión `up_sql_mysql`, `up_sql_postgresql`, la traducción por motor y la autoría
+  (quién creó la migración).
+
+### El REST y el MCP no usan el mismo scope
+
+Por la API REST, quien tiene `blueprints.read` (incluido un `viewer`) ya lee el SQL de las migraciones.
+`data.blueprint_sql` **no cambia eso**: solo controla lo que llega a un agente, porque es texto de terceros
+que viaja al contexto de un modelo. Un token de agente con `blueprints.read` ve el inventario y los
+metadatos, pero no el SQL.
+
+---
+
 ## Cuando alguien se va del equipo
 
 1. **Revocar sus tokens** (B.4). El acceso corta en el request siguiente, sin caché. Desactivar
@@ -684,13 +756,15 @@ credencial de solo lectura (A.6, «Cuerpos de rutinas»). Contrato, límites y a
   del motor con `SELECT` sobre **una sola base**, dentro de una transacción `READ ONLY` y con
   timeout del lado del servidor. Ver «`run_select`» más arriba.
 - **No escribe nada.** El techo de capacidades de un token excluye todo lo que mute y todo lo que
-  divulgue, salvo el conjunto cerrado `data.read`/`data.query` (filas, con opt-in y credencial propios) y
-  `data.definitions` (código de objetos, solo texto, tras su propio kill switch),
+  divulgue, salvo el conjunto cerrado `data.read`/`data.query` (filas, con opt-in y credencial propios),
+  `data.definitions` (código de objetos, solo texto, tras su propio kill switch) y `data.blueprint_sql`
+  (SQL de migraciones de blueprints, solo texto, tras su propio kill switch),
   y la intersección se aplica dos veces: al emitir y al autenticar.
 - **No usa la credencial pseudo-root.** Las tools que leen el catálogo van con la credencial de
   solo lectura del servidor (A.6), verificada por el motor, y con la sesión en `READ ONLY`.
 - **No devuelve cuerpos** de vistas, rutinas ni triggers salvo por `get_definition`, con su scope y su
-  kill switch, y aun así solo como texto: nunca los ejecuta. En las demás tools salen como
+  kill switch, y aun así solo como texto: nunca los ejecuta. El SQL de las migraciones de blueprints sale
+  solo por `get_blueprint_migration` (scope `data.blueprint_sql`, también con su kill switch). En las demás tools salen como
   `body_omitted_reason: "scope_disabled"`; tampoco devuelve SQL de un diff. `diff_schemas` dice QUÉ difiere y nada más; no guarda
   la comparación ni emite un `confirm_token`.
 

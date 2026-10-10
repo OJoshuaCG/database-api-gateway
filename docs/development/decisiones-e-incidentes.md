@@ -2698,3 +2698,52 @@ capacidades.
 (`app/core/step_up.py`): una confirmación de contraseña cubre muchas llamadas. La fricción real
 era hacer 20 clics de aprobar y 20 diálogos de confirmación, no la contraseña.
 
+
+### MCP: tools de blueprints y `data.blueprint_sql` (la excepción de datos pasa de 3 a 4)
+
+**Por qué un scope propio y no `blueprints.read`.** El SQL de una migración `kind='data'` son filas semilla de
+terceros, y lo que una tool entrega a un agente va al contexto de un LLM. Por la API REST ese SQL ya lo lee
+quien tiene `blueprints.read` (un `viewer` incluido) y **eso no cambia**: el scope nuevo gobierna solo el
+canal del agente. Las dos listas (metadatos, sin SQL) quedan bajo `blueprints.read`.
+
+**Por qué el nombre `data.blueprint_sql` y por qué la excepción crece.** El invariante 13 del catálogo obliga a
+que toda capacidad de agente que divulga viva en el módulo `data` y en el literal `AGENT_DATA_EXCEPTIONS`.
+Un nombre fuera de `data` habría exigido tocar el invariante o declarar la capacidad como no divulgante, que
+es mentira (precedente: `schema.definitions` es de la SPA y no divulga; `data.definitions` es del MCP y sí).
+Elegir el nombre correcto da de regalo owner-only, segundo aprobador, step-up del emisor y tope de TTL de datos.
+El conjunto pasa de tres a cuatro miembros y las sensibles de 15 a 16; los tests que fijaban `3` y `15` se
+actualizaron (no se aflojaron).
+
+**Por qué el invariante 6 se relaja en forma cerrada.** Exigía que toda tool de datos abriera el motor, y esta
+no: lee la BD de metadatos. Se resolvió con `_METADATA_DATA_SCOPES = {data.blueprint_sql}`, afirmado como
+subconjunto de `AGENT_DATA_EXCEPTIONS`, y `touches_engine is (scope not in _METADATA_DATA_SCOPES)`, que vale en
+los dos sentidos: ni una tool de metadatos puede abrir el motor, ni una de filas declararse sin motor. No se
+quitó la exigencia del tag `data` ni del aviso de contenido no confiable de terceros.
+
+**Por qué kill switch propio (`MCP_BLUEPRINT_SQL_ENABLED`, apagado) e independiente.** Es la misma política de
+las otras tres lecturas de datos: sin el switch la tool no existe y el scope es inerte, y se retira sin
+revertir código. Se mira de nuevo en cada llamada.
+
+**Por qué un blueprint es visible solo si es EXCLUSIVO del proyecto.** Es la misma regla que ya cerró la fuga
+cross-proyecto de `reachable_databases` (un blueprint compartido deja a todos sin verlo). Se extrajo
+`_exclusive_model_ids` para que bases y blueprints no tengan dos copias que se desincronicen. Un blueprint
+ajeno, compartido o inexistente y una versión inexistente comparten código y mensaje (`mcp.not_found`): un
+mensaje distinto confirmaría que el blueprint existe. La igualdad la prueba un test, no se supone.
+
+**Por qué un error con `details` y no recortar.** Un `up_sql` cortado a mitad es peor que ausente: el agente
+razonaría sobre una migración incompleta creyéndola entera. La tool mide la respuesta con la MISMA fórmula que
+el despachador (`app/mcp/result_budget.py`, compartido) y falla con `mcp.blueprint_sql_too_large` y
+`{sql_bytes, response_bytes, max_response_bytes}`; así lo que la tool acepta nunca lo rechaza después
+`mcp.result_too_large`. `tool_error_result` ganó un `details` opcional que viaja solo si es un `dict`
+(ningún error previo lo usaba).
+
+**Por qué la auditoría de intención es fail-closed.** Mismo criterio que `get_definition`: sin fila de intención
+no sale ningún cuerpo (`AUDIT_UNAVAILABLE`). La fila lleva token y versión, nunca SQL, y `touched_engine` en
+falso (no hay conexión a un motor, pero la lectura exige rastro igual).
+
+**Lo que NO se cierra.** La redacción de credenciales es best effort con el redactor de definiciones: un
+secreto con una forma que no reconoce sale en claro, y la frontera real es el scope. Quedan fuera
+`up_sql_mysql`, `up_sql_postgresql`, la traducción por motor y la autoría (exigiría nombres de administradores).
+Se renombró `has_non_portable` a `has_procedural_objects` en la salida porque el test de subcadenas prohibidas
+rechaza toda clave que contenga `port`. El selector de scopes de la SPA (otro repositorio) sigue sin ofrecer
+`data.blueprint_sql`: seguimiento aparte.
