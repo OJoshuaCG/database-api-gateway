@@ -473,6 +473,9 @@ DataRead = Annotated[Actor, Depends(require(Capability.DATA_READ))]
 DataQuery = Annotated[Actor, Depends(require(Capability.DATA_QUERY))]
 #: Igual que ``DataQuery``: ninguna ruta HTTP lo usa. Lo consume la tool ``get_definition`` del MCP.
 DataDefinitions = Annotated[Actor, Depends(require(Capability.DATA_DEFINITIONS))]
+#: Igual que ``DataDefinitions``: ninguna ruta HTTP lo usa. Lo consume la tool
+#: ``get_blueprint_migration`` del MCP.
+DataBlueprintSql = Annotated[Actor, Depends(require(Capability.DATA_BLUEPRINT_SQL))]
 
 #: Usuarios del gateway, accesos, capacidades puntuales, tokens y preparación de alcances. Solo
 #: la global ``access_admin``.

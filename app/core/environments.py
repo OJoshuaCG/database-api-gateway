@@ -515,6 +515,13 @@ MCP_DATA_QUERY_ENABLED = os.getenv("MCP_DATA_QUERY_ENABLED", "false").lower() ==
 MCP_SCHEMA_DEFINITIONS_ENABLED = (
     os.getenv("MCP_SCHEMA_DEFINITIONS_ENABLED", "false").lower() == "true"
 )
+# Kill switch del scope `data.blueprint_sql` (SQL de las migraciones de un blueprint). Mismo
+# contrato que los de arriba y también independiente: APAGADO por defecto, con el scope inerte.
+# El SQL de una migración puede llevar filas semilla (`kind='data'`) y literales de terceros que el
+# agente enviaría a un LLM, por eso no se enciende solo al desplegar el código.
+MCP_BLUEPRINT_SQL_ENABLED = (
+    os.getenv("MCP_BLUEPRINT_SQL_ENABLED", "false").lower() == "true"
+)
 # Tope PROPIO, en días, de la vida de un token con scope de datos. `0` (el valor por defecto) lo
 # desactiva: el token vive lo mismo que cualquiera, hasta `MCP_TOKEN_MAX_TTL_DAYS`. Un valor >= 1
 # lo vuelve a activar y debe ser menor que ese tope general para tener efecto: un bearer que lee

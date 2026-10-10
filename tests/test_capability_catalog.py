@@ -114,6 +114,7 @@ def test_the_disclosing_capabilities_are_the_expected_ones():
         Capability.DATA_READ,
         Capability.DATA_QUERY,
         Capability.DATA_DEFINITIONS,
+        Capability.DATA_BLUEPRINT_SQL,
     }
 
 

@@ -26,12 +26,13 @@ SENSITIVE = {
     "data.read",
     "data.query",
     "data.definitions",
+    "data.blueprint_sql",
     # Partición de ``engine_users.write``: delegar privilegios es solo de owner.
     "engine_users.grant_admin",
 }
 
 
-def test_sensitive_set_is_exactly_the_fifteen_policy_capabilities():
+def test_sensitive_set_is_exactly_the_sixteen_policy_capabilities():
     assert {s.id.value for s in CAPABILITIES if cc.is_sensitive(s.id)} == SENSITIVE
 
 

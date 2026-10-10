@@ -61,7 +61,7 @@ def test_it_is_sensitive_and_needs_a_second_approver():
     assert cc.is_sensitive(CAP)
     assert cc.needs_second_approver(capability=CAP)
     assert "engine_users.grant_admin" in cc._SENSITIVE_POLICY
-    assert len(cc._SENSITIVE_POLICY) == 15
+    assert len(cc._SENSITIVE_POLICY) == 16
     assert CAP in cc.OWNER_ONLY_CAPABILITIES
 
 

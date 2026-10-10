@@ -213,6 +213,12 @@ class Capability(StrEnum):
     #: aunque no lea filas. Habilita la tool ``get_definition`` del MCP (scope y kill switch
     #: ``MCP_SCHEMA_DEFINITIONS_ENABLED``). El equivalente de la SPA es ``schema.definitions``.
     DATA_DEFINITIONS = "data.definitions"
+    #: SQL de las migraciones de un blueprint (``up_sql``, ``down_sql``): el cuerpo puede llevar
+    #: filas semilla (``kind='data'``) y literales de terceros que el agente enviaría a un LLM, así
+    #: que divulga aunque no lea una base. Habilita la tool ``get_blueprint_migration`` del MCP
+    #: (scope y kill switch ``MCP_BLUEPRINT_SQL_ENABLED``). La lectura REST de ese SQL sigue bajo
+    #: ``blueprints.read``: este scope no la cambia.
+    DATA_BLUEPRINT_SQL = "data.blueprint_sql"
 
     # -- Administración del acceso y de la política del gateway -------------- #
     # Eran UNA sola capacidad (``gateway.admin``) y la tenían las dos globales, así que
@@ -570,6 +576,13 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         step_up=True,
         agent=True,
     ),
+    _spec(
+        Capability.DATA_BLUEPRINT_SQL,
+        "Leer el SQL de las migraciones de un blueprint (MCP)",
+        discloses=True,
+        step_up=True,
+        agent=True,
+    ),
 )
 
 _BY_ID: Mapping[Capability, CapabilitySpec] = MappingProxyType(
@@ -643,6 +656,7 @@ _OWNER: frozenset[Capability] = _OPERATOR | {
     # Solo owner (NO ``_OPERATOR``): el invariante 7b prohíbe que operator divulgue y el 13
     # exige que cada capacidad de la excepción sea exclusiva de owner.
     Capability.DATA_DEFINITIONS,
+    Capability.DATA_BLUEPRINT_SQL,
 }
 
 ROLE_CAPABILITIES: Mapping[GatewayRole, frozenset[Capability]] = MappingProxyType(
@@ -678,12 +692,17 @@ AGENT_ALLOWED: frozenset[Capability] = frozenset(
 )
 
 #: La ÚNICA excepción al "un token nunca divulga" (invariante 5) y al "step-up ⇒ no agente"
-#: (invariante 11). CERRADA: el invariante 13 la fija a la terna literal, así que agregar un miembro
+#: (invariante 11). CERRADA: el invariante 13 la fija al conjunto literal, así que agregar un miembro
 #: exige editar a propósito el código y el invariante, y un ``foo.read`` que divulgue y sea de
 #: agente sigue rompiendo el import. Mutar NO tiene excepción. El step-up del emisor, el TTL
 #: propio del token de datos y la auditoría se derivan de pertenecer a este conjunto.
 AGENT_DATA_EXCEPTIONS: frozenset[Capability] = frozenset(
-    {Capability.DATA_READ, Capability.DATA_QUERY, Capability.DATA_DEFINITIONS}
+    {
+        Capability.DATA_READ,
+        Capability.DATA_QUERY,
+        Capability.DATA_DEFINITIONS,
+        Capability.DATA_BLUEPRINT_SQL,
+    }
 )
 
 #: Capacidad de datos → nombre del kill switch (``app.core.environments``) que la enciende.
@@ -692,6 +711,7 @@ _DATA_KILL_SWITCH: Mapping[Capability, str] = MappingProxyType(
         Capability.DATA_READ: "MCP_DATA_READ_ENABLED",
         Capability.DATA_QUERY: "MCP_DATA_QUERY_ENABLED",
         Capability.DATA_DEFINITIONS: "MCP_SCHEMA_DEFINITIONS_ENABLED",
+        Capability.DATA_BLUEPRINT_SQL: "MCP_BLUEPRINT_SQL_ENABLED",
     }
 )
 
@@ -824,8 +844,8 @@ def is_sensitive(capability: Capability | str) -> bool:
     Antes eran las que divulgan o son de nivel ``drop`` (8). Al retirar el techo por tenencia
     (C3), ``blueprints.apply``, ``schema_diff.execute`` y ``collation.execute`` —destructivas y
     solo de ``owner``— quedaban otorgables por UN solo administrador, porque lo único que las
-    frenaba era que quien otorga tuviera ``owner``. El invariante 8 fija el conjunto (15: las 11
-    de siempre más ``data.read``, ``data.query``, ``data.definitions`` y
+    frenaba era que quien otorga tuviera ``owner``. El invariante 8 fija el conjunto (16: las 11
+    de siempre más ``data.read``, ``data.query``, ``data.definitions``, ``data.blueprint_sql`` y
     ``engine_users.grant_admin``) y exige que siga conteniendo todo lo que divulga o es ``drop``.
     """
     try:
@@ -1085,6 +1105,7 @@ _SENSITIVE_POLICY: frozenset[str] = frozenset(
         "data.read",
         "data.query",
         "data.definitions",
+        "data.blueprint_sql",
         # C3: sin el techo por tenencia, estas tres (destructivas, solo de owner) las otorgaba
         # un solo administrador. Ver `is_sensitive`.
         "blueprints.apply",
@@ -1132,7 +1153,7 @@ def _assert_invariants() -> None:
         if s.discloses and not s.requires_step_up:
             raise AssertionError(f"{s.id.value} divulga y no exige step-up.")
 
-    # 5. El techo de agente. Un token nunca puede mutar, y nunca puede divulgar SALVO las tres
+    # 5. El techo de agente. Un token nunca puede mutar, y nunca puede divulgar SALVO las cuatro
     #    de ``AGENT_DATA_EXCEPTIONS`` (fijadas por el invariante 13).
     for s in CAPABILITIES:
         if s.agent_allowed and s.mutates:
@@ -1175,7 +1196,7 @@ def _assert_invariants() -> None:
             if s.id in ROLE_CAPABILITIES[role]:
                 raise AssertionError(f"{s.id.value} es destructive y está en '{role.value}'.")
 
-    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 15 (owner
+    # 8. Capacidades puntuales. La política fija las sensibles en EXACTAMENTE estas 16 (owner
     #    menos operator, otorgables): si el catálogo crece, esto obliga a decidirlo a propósito.
     #    Y el criterio viejo (divulga o es `drop`) sigue contenido: ninguna otorgable que divulgue
     #    o borre puede quedar sin segundo aprobador.
@@ -1212,7 +1233,7 @@ def _assert_invariants() -> None:
     # 11. Step-up ⇒ NO agente. Un token no tiene contraseña que reconfirmar: una capacidad con
     #     step-up en el techo de agente sería una operación que el agente nunca puede completar
     #     o, peor, un incentivo a eximir a los tokens del step-up. Ver `app/core/step_up.py`.
-    #     Relajado SOLO para ``AGENT_DATA_EXCEPTIONS``: el step-up de esas tres lo cumple el
+    #     Relajado SOLO para ``AGENT_DATA_EXCEPTIONS``: el step-up de esas cuatro lo cumple el
     #     EMISOR al emitir el token (``_validate_scopes``), no el token.
     for s in CAPABILITIES:
         if s.requires_step_up and s.agent_allowed and s.id not in AGENT_DATA_EXCEPTIONS:
@@ -1247,16 +1268,21 @@ def _assert_invariants() -> None:
         raise AssertionError(f"Capacidades retiradas reintroducidas: {sorted(retiradas)}")
 
 
-    # 13. La excepción de datos está FIJADA. El conjunto es la terna literal, y cada miembro divulga
-    #     sin mutar, es solo de owner, exige step-up, es sensible y no es una lectura implícita de
-    #     otra capacidad. Sin esto, "excepción" se vuelve un conjunto al que cualquiera agrega un
-    #     miembro y el techo de agente deja de significar algo.
+    # 13. La excepción de datos está FIJADA. El conjunto es el literal de cuatro, y cada miembro
+    #     divulga sin mutar, es solo de owner, exige step-up, es sensible y no es una lectura
+    #     implícita de otra capacidad. Sin esto, "excepción" se vuelve un conjunto al que cualquiera
+    #     agrega un miembro y el techo de agente deja de significar algo.
     if AGENT_DATA_EXCEPTIONS != frozenset(
-        {Capability.DATA_READ, Capability.DATA_QUERY, Capability.DATA_DEFINITIONS}
+        {
+            Capability.DATA_READ,
+            Capability.DATA_QUERY,
+            Capability.DATA_DEFINITIONS,
+            Capability.DATA_BLUEPRINT_SQL,
+        }
     ):
         raise AssertionError(
             "AGENT_DATA_EXCEPTIONS tiene que ser exactamente "
-            "{data.read, data.query, data.definitions}."
+            "{data.read, data.query, data.definitions, data.blueprint_sql}."
         )
     implied_values = set().union(*IMPLIED_READ.values()) if IMPLIED_READ else set()
     for cap in AGENT_DATA_EXCEPTIONS:

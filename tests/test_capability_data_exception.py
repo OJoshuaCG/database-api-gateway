@@ -3,12 +3,12 @@ La excepción CERRADA del catálogo para ``data.read`` / ``data.query`` (S35-S38
 
 QUÉ SE FIJA
 -----------
-- S35: el catálogo importa con EXACTAMENTE las dos excepciones (``AGENT_DATA_EXCEPTIONS``).
+- S35: el catálogo importa con EXACTAMENTE las cuatro excepciones (``AGENT_DATA_EXCEPTIONS``).
 - S36: una capacidad que divulga y es de agente FUERA de la excepción rompe el import (inv. 5).
 - S37: una capacidad de agente que muta rompe el import, ``data.*`` incluida (inv. 5).
 - S38: ``viewer`` y ``operator`` nunca las tienen; solo ``owner``, y son sensibles (segundo
   aprobador al otorgarlas sueltas).
-- Invariante 13: el conjunto está fijado al par literal y cada miembro cumple el contrato.
+- Invariante 13: el conjunto está fijado al conjunto literal de cuatro y cada miembro cumple el contrato.
 - Kill switch: con el switch de la capacidad apagado su scope queda INERTE (``parse_scopes``), pero
   ``parse_stored_scopes`` lo conserva para mostrarlo y editarlo.
 
@@ -31,7 +31,12 @@ from app.services.capability_catalog import (
     GatewayRole,
 )
 
-PAR = {Capability.DATA_READ, Capability.DATA_QUERY, Capability.DATA_DEFINITIONS}
+EXCEPCION = {
+    Capability.DATA_READ,
+    Capability.DATA_QUERY,
+    Capability.DATA_DEFINITIONS,
+    Capability.DATA_BLUEPRINT_SQL,
+}
 
 
 def _con_spec(monkeypatch, cap: Capability, **cambios) -> None:
@@ -43,19 +48,19 @@ def _con_spec(monkeypatch, cap: Capability, **cambios) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# S35: el catálogo carga con exactamente las dos excepciones                    #
+# S35: el catálogo carga con exactamente las cuatro excepciones                 #
 # --------------------------------------------------------------------------- #
 
 
-def test_the_catalog_loads_with_exactly_the_two_data_exceptions():
+def test_the_catalog_loads_with_exactly_the_four_data_exceptions():
     cc._assert_invariants()  # no levanta
-    assert AGENT_DATA_EXCEPTIONS == frozenset(PAR)
+    assert AGENT_DATA_EXCEPTIONS == frozenset(EXCEPCION)
     disclosing_agents = {s.id for s in CAPABILITIES if s.agent_allowed and s.discloses}
-    assert disclosing_agents == PAR
+    assert disclosing_agents == EXCEPCION
     assert not {s.id for s in CAPABILITIES if s.agent_allowed and s.mutates}
 
 
-@pytest.mark.parametrize("cap", sorted(PAR, key=lambda c: c.value))
+@pytest.mark.parametrize("cap", sorted(EXCEPCION, key=lambda c: c.value))
 def test_each_data_capability_has_the_contract_flags(cap):
     s = cc.spec(cap)
     assert s.module == "data"
@@ -83,7 +88,7 @@ def test_s37_an_agent_capability_that_mutates_breaks_the_import(monkeypatch):
         cc._assert_invariants()
 
 
-@pytest.mark.parametrize("cap", sorted(PAR, key=lambda c: c.value))
+@pytest.mark.parametrize("cap", sorted(EXCEPCION, key=lambda c: c.value))
 def test_s37_a_data_capability_that_mutates_breaks_the_import(monkeypatch, cap):
     """La excepción es de DIVULGACIÓN: mutar no tiene excepción ni siquiera para ``data.*``."""
     _con_spec(monkeypatch, cap, mutates=True)
@@ -103,11 +108,11 @@ def test_a_step_up_capability_in_the_agent_ceiling_outside_the_exception_breaks_
 # --------------------------------------------------------------------------- #
 
 
-def test_inv13_the_exception_set_is_pinned_to_the_literal_pair(monkeypatch):
+def test_inv13_the_exception_set_is_pinned_to_the_literal_set(monkeypatch):
     """Agregar un miembro (aun uno coherente con inv. 5 y 11) obliga a tocar el invariante."""
     _con_spec(monkeypatch, Capability.EXPORTS_DOWNLOAD, agent_allowed=True)
     monkeypatch.setattr(
-        cc, "AGENT_DATA_EXCEPTIONS", frozenset(PAR | {Capability.EXPORTS_DOWNLOAD})
+        cc, "AGENT_DATA_EXCEPTIONS", frozenset(EXCEPCION | {Capability.EXPORTS_DOWNLOAD})
     )
     with pytest.raises(AssertionError, match="exactamente"):
         cc._assert_invariants()
@@ -143,34 +148,40 @@ def test_inv13_a_data_capability_without_step_up_breaks_the_import(monkeypatch):
 
 @pytest.mark.parametrize("role", [GatewayRole.VIEWER, GatewayRole.OPERATOR])
 def test_s38_viewer_and_operator_never_get_the_data_scopes(role):
-    assert not (PAR & cc.ROLE_CAPABILITIES[role])
-    assert not (PAR & cc.role_capabilities(role))
+    assert not (EXCEPCION & cc.ROLE_CAPABILITIES[role])
+    assert not (EXCEPCION & cc.role_capabilities(role))
 
 
 def test_s38_only_owner_has_them_and_no_global_function_does():
-    assert PAR <= cc.ROLE_CAPABILITIES[GatewayRole.OWNER]
-    assert PAR <= cc.OWNER_ONLY_CAPABILITIES
+    assert EXCEPCION <= cc.ROLE_CAPABILITIES[GatewayRole.OWNER]
+    assert EXCEPCION <= cc.OWNER_ONLY_CAPABILITIES
     for caps in cc.GLOBAL_CAPABILITIES.values():
-        assert not (PAR & caps)
+        assert not (EXCEPCION & caps)
 
 
 def test_the_data_capabilities_are_grantable_sensitive_and_need_a_second_approver():
-    for cap in PAR:
+    for cap in EXCEPCION:
         assert cc.is_grantable(cap)
         assert cc.is_sensitive(cap)
         assert cc.needs_second_approver(capability=cap)
         assert cap not in cc.IMPLIED_READ  # no hay lectura de nivel viewer en el módulo "data"
     assert not any(cap in implied for implied in cc.IMPLIED_READ.values())
     rows = {r["id"]: r for r in cc.capability_matrix()}
-    for cap in PAR:
+    for cap in EXCEPCION:
         assert rows[cap.value]["sensitive"] and rows[cap.value]["agent_allowed"]
         assert rows[cap.value]["discloses"] and not rows[cap.value]["mutates"]
 
 
-def test_the_sensitive_set_is_the_old_eleven_plus_the_three_data_capabilities_and_grant_admin():
+def test_the_sensitive_set_is_the_old_eleven_plus_the_four_data_capabilities_and_grant_admin():
     sensibles = {s.id.value for s in CAPABILITIES if cc.is_sensitive(s.id)}
-    assert len(sensibles) == 15
-    assert {"data.read", "data.query", "data.definitions", "engine_users.grant_admin"} <= sensibles
+    assert len(sensibles) == 16
+    assert {
+        "data.read",
+        "data.query",
+        "data.definitions",
+        "data.blueprint_sql",
+        "engine_users.grant_admin",
+    } <= sensibles
     assert sensibles == cc._SENSITIVE_POLICY
 
 

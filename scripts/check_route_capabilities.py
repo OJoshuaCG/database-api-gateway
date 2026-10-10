@@ -133,6 +133,8 @@ AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
 #: ``data.query`` lo consume ``run_select`` (tool del MCP, scope por tool) y ninguna ruta HTTP:
 #: ``data.read`` sí tiene ruta (el opt-in por base), pero el SQL libre de un agente no.
 #: ``data.definitions`` es solo scope de tool del MCP (sin ruta HTTP).
+#: ``data.blueprint_sql`` también: la lectura REST del SQL de una migración sigue bajo
+#: ``blueprints.read``.
 #: ``engine_users.grant_admin`` la exige el PAYLOAD de rutas que ya declaran ``engine_users.write``
 #: o ``databases.write`` (``assert_at_with_code`` en el grant y en el reassign-owner con provision):
 #: ninguna ruta la declara como piso.
@@ -143,6 +145,7 @@ NON_ROUTE_CAPABILITIES: frozenset[Capability] = frozenset(
     {
         Capability.DATA_QUERY,
         Capability.DATA_DEFINITIONS,
+        Capability.DATA_BLUEPRINT_SQL,
         Capability.ENGINE_USERS_GRANT_ADMIN,
         Capability.SCHEMA_DEFINITIONS,
     }

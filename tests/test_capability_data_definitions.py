@@ -3,7 +3,7 @@ El scope ``data.definitions`` (S3 de ``mcp-schema-definitions``): existe, es ine
 
 QUÉ SE FIJA
 -----------
-- La excepción cerrada es EXACTAMENTE la terna ``{data.read, data.query, data.definitions}``.
+- La excepción cerrada es EXACTAMENTE ``{data.read, data.query, data.definitions, data.blueprint_sql}``.
 - Kill switch ``MCP_SCHEMA_DEFINITIONS_ENABLED``: nace apagado y, apagado, el scope queda inerte
   (``parse_scopes`` y el token lo descartan) aunque siga guardado y visible.
 - Solo ``owner`` lo tiene; es sensible (segundo aprobador al otorgarlo suelto) y el emisor de un
@@ -44,11 +44,16 @@ def _emisor(*, role: GatewayRole = GatewayRole.OWNER, fresco: bool):
     )
 
 
-def test_the_data_exception_set_is_exactly_the_literal_triple():
+def test_the_data_exception_set_is_exactly_the_literal_quartet():
     assert AGENT_DATA_EXCEPTIONS == frozenset(
-        {Capability.DATA_READ, Capability.DATA_QUERY, Capability.DATA_DEFINITIONS}
+        {
+            Capability.DATA_READ,
+            Capability.DATA_QUERY,
+            Capability.DATA_DEFINITIONS,
+            Capability.DATA_BLUEPRINT_SQL,
+        }
     )
-    assert len(AGENT_DATA_EXCEPTIONS) == 3
+    assert len(AGENT_DATA_EXCEPTIONS) == 4
 
 
 def test_the_scope_lives_in_the_data_module_and_in_the_agent_ceiling():
@@ -136,7 +141,7 @@ def test_the_scope_is_sensitive_and_needs_a_second_approver():
     assert cc.is_sensitive(SCOPE)
     assert cc.needs_second_approver(capability=SCOPE)
     assert "data.definitions" in cc._SENSITIVE_POLICY
-    assert len(cc._SENSITIVE_POLICY) == 15
+    assert len(cc._SENSITIVE_POLICY) == 16
 
 
 def test_issuing_a_token_with_the_scope_needs_a_fresh_step_up(monkeypatch):
