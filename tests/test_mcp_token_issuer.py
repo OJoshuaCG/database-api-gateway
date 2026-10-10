@@ -14,7 +14,6 @@ Límite declarado: se acotan capacidades, NO el alcance por entorno (el modelo d
 denegación por entorno).
 """
 
-import pytest
 from sqlalchemy import text
 
 from app.core.actor import Actor, admin_actor, token_actor
