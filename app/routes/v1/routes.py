@@ -7,6 +7,7 @@ from app.routes.v1 import (
     authz,
     capability_grants,
     gateway_users,
+    integration_tokens,
     auth,
     charset_collation_options,
     collation_batches,
@@ -32,6 +33,7 @@ router = APIRouter()
 router.include_router(auth.router)
 router.include_router(authz.router)
 router.include_router(api_tokens.router)
+router.include_router(integration_tokens.router)
 router.include_router(gateway_users.router)
 router.include_router(capability_grants.router)
 router.include_router(access_requests.router)
